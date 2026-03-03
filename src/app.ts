@@ -1,0 +1,1143 @@
+import type { AgentCardAction, AgentInfo } from "./agents";
+import type {
+  AdminEventPayload,
+  ChatEventPayload,
+  McpHttpServerSettings,
+  RuntimeAgent,
+} from "./bridge";
+import {
+  addRecentWorkspace,
+  cancelConversation,
+  closeConversation,
+  interruptAgent,
+  listAgents,
+  onAdminEvent,
+  onChatEvent,
+  openWorkspaceDialog,
+  terminateAgent,
+} from "./bridge";
+import { CommandPalette } from "./command_palette";
+import { ConnectionDialog } from "./connection_dialog";
+import { registerDebugUiBridge } from "./debug_ui_bridge";
+import { HomeView } from "./home_view";
+import {
+  EscapeStack,
+  formatShortcut,
+  KeyboardManager,
+  setCheatSheetEscapeStack,
+  showCheatSheet,
+} from "./keyboard";
+import { NotificationManager } from "./notifications";
+import { ProjectStateManager } from "./project_state";
+import { ProjectSidebar } from "./projects";
+import { adjustFontSize, SettingsPanel } from "./settings";
+import { promptForText } from "./text_prompt";
+import type { ChatEvent } from "./types";
+import {
+  normalizeRemoteWorkspaceInput,
+  parseRemoteWorkspaceUri,
+  workspaceDisplayName,
+} from "./workspace";
+import { WorkspaceView } from "./workspace_view";
+
+const HOME_BRIDGE_VIEW_ID = "__home_bridge__";
+const HOME_BRIDGE_LABEL = "Bridge";
+const INTERNAL_TITLE_AGENT_PREFIX = "__internal_title__";
+
+export class AppController {
+  private notifications!: NotificationManager;
+  private keyboard!: KeyboardManager;
+  private commandPalette!: CommandPalette;
+  private settingsPanel!: SettingsPanel;
+  private homeView!: HomeView;
+  private projectState!: ProjectStateManager;
+  private connectionDialog = new ConnectionDialog();
+  private settingsTabViewEl!: HTMLElement;
+  private escapeStack!: EscapeStack;
+  private bridgeControlEnabled = true;
+  private runtimeAgents = new Map<number, RuntimeAgent>();
+  private runtimeAgentsByProjectId = new Map<string, RuntimeAgent[]>();
+  private hiddenRuntimeAgentIds = new Set<number>();
+  private runtimeAgentSyncTimer: number | null = null;
+  private runtimeAgentSyncInFlight: Promise<void> | null = null;
+
+  private workspaceViews = new Map<string, WorkspaceView>();
+  private activeWorkspaceId: string | null = null;
+  private homeBridgeView!: WorkspaceView;
+
+  constructor() {
+    this.initializeTheme();
+    this.buildSharedComponents();
+  }
+
+  async init(): Promise<void> {
+    this.registerCommands();
+    this.registerKeyboardShortcuts();
+    this.wireDockButtons();
+
+    await onChatEvent((payload) => this.routeChatEvent(payload));
+    await onAdminEvent((payload) => this.routeAdminEvent(payload));
+    await registerDebugUiBridge();
+    document
+      .getElementById("open-workspace-btn")!
+      .addEventListener("click", () => this.openWorkspace());
+    document
+      .getElementById("open-remote-workspace-btn")!
+      .addEventListener("click", () => this.openRemoteWorkspace());
+
+    await this.bootstrapStartup();
+    this.startRuntimeAgentSync();
+  }
+
+  showError(msg: string): void {
+    this.notifications.error(msg);
+  }
+
+  persistActiveProjectUiState(): void {}
+
+  private getActiveView(): WorkspaceView | null {
+    if (!this.activeWorkspaceId) return null;
+    return this.workspaceViews.get(this.activeWorkspaceId) ?? null;
+  }
+
+  private getViewByAdminId(adminId: number): WorkspaceView | null {
+    for (const view of this.workspaceViews.values()) {
+      if (view.ownsAdminId(adminId)) return view;
+    }
+    return null;
+  }
+
+  private initializeTheme(): void {
+    const root = document.documentElement;
+    const stored = localStorage.getItem("tyde-theme");
+    if (stored === "light" || stored === "dark") {
+      root.dataset.theme = stored === "light" ? "light" : "";
+      return;
+    }
+    const prefersDark = window.matchMedia(
+      "(prefers-color-scheme: dark)",
+    ).matches;
+    root.dataset.theme = prefersDark ? "" : "light";
+  }
+
+  private buildSharedComponents(): void {
+    window
+      .matchMedia("(prefers-color-scheme: dark)")
+      .addEventListener("change", (e) => {
+        if (localStorage.getItem("tyde-theme")) return;
+        document.documentElement.dataset.theme = e.matches ? "" : "light";
+      });
+
+    this.projectState = new ProjectStateManager();
+
+    this.notifications = new NotificationManager();
+    this.notifications.requestPermission();
+    const bellContainer = document.getElementById("notification-bell")!;
+    bellContainer.appendChild(this.notifications.createBellButton());
+
+    this.commandPalette = new CommandPalette();
+    this.commandPalette.onError = (msg) => this.notifications.error(msg);
+
+    this.escapeStack = new EscapeStack();
+    this.keyboard = new KeyboardManager(this.escapeStack);
+    setCheatSheetEscapeStack(this.escapeStack);
+
+    const originalShow = this.commandPalette.show.bind(this.commandPalette);
+    const originalHide = this.commandPalette.hide.bind(this.commandPalette);
+    this.commandPalette.show = () => {
+      originalShow();
+      this.escapeStack.push("command-palette", () =>
+        this.commandPalette.hide(),
+      );
+    };
+    this.commandPalette.hide = () => {
+      originalHide();
+      this.escapeStack.remove("command-palette");
+    };
+
+    const settingsTabViewEl = document.createElement("div");
+    settingsTabViewEl.className = "settings-tab-view hidden";
+    settingsTabViewEl.dataset.testid = "settings-tab-view";
+    this.settingsTabViewEl = settingsTabViewEl;
+    this.settingsPanel = new SettingsPanel(settingsTabViewEl);
+    this.settingsPanel.onClose = () => this.closeSettings();
+
+    settingsTabViewEl.classList.add("settings-overlay");
+    const container = document.getElementById("workspace-container")!;
+    container.appendChild(settingsTabViewEl);
+    this.homeBridgeView = new WorkspaceView({
+      projectId: HOME_BRIDGE_VIEW_ID,
+      workspacePath: "",
+      projectName: HOME_BRIDGE_LABEL,
+      notifications: this.notifications,
+      mode: "bridge",
+      bridgeChatLabel: HOME_BRIDGE_LABEL,
+      bridgeChatEnabled: this.bridgeControlEnabled,
+      bridgeChatDisabledReason: this.bridgeChatDisabledReason(),
+      getBridgeProjects: () =>
+        this.projectState.projects.map((project) => ({
+          name: project.name,
+          workspacePath: project.workspacePath,
+        })),
+      availableWidgets: ["sessions", "agents"],
+    });
+    this.homeBridgeView.root.style.display = "none";
+    container.appendChild(this.homeBridgeView.root);
+    this.workspaceViews.set(HOME_BRIDGE_VIEW_ID, this.homeBridgeView);
+
+    const homeViewEl = document.createElement("div");
+    homeViewEl.className = "home-view-container";
+    this.homeBridgeView.getHomeViewContainer()?.appendChild(homeViewEl);
+
+    this.homeView = new HomeView(homeViewEl, this.projectState);
+    this.homeView.onOpenWorkspace = () => this.openWorkspace();
+    this.homeView.onOpenRemoteWorkspace = () => this.openRemoteWorkspace();
+    this.homeView.onNewBridgeChat = (backendOverride) => {
+      void this.homeBridgeView
+        .createNewConversationTab(undefined, backendOverride)
+        .catch((err) => {
+          console.error("Failed to create bridge conversation:", err);
+          this.notifications.error(
+            err instanceof Error
+              ? err.message
+              : "Failed to create bridge conversation",
+          );
+        });
+    };
+    this.homeView.onSwitchProject = (id) => this.switchToWorkspace(id);
+    this.homeView.resolveProjectAgentCounts = (projectId) =>
+      this.getProjectAgentCounts(projectId);
+    this.homeView.resolveAllAgents = async () => {
+      const agents = await listAgents();
+      return agents.filter((agent) => this.shouldDisplayRuntimeAgent(agent));
+    };
+    this.homeView.onAgentAction = (agent, action) => {
+      void this.handleRuntimeAgentAction(agent, action);
+    };
+    this.homeView.onAgentClick = (agent) => {
+      this.openRuntimeAgentInWorkspace(agent);
+    };
+    this.homeView.setBridgeChatAvailability(
+      this.bridgeControlEnabled,
+      this.bridgeChatDisabledReason(),
+      HOME_BRIDGE_LABEL,
+    );
+    this.homeBridgeView.onRuntimeAgentAction = (agent, action) => {
+      void this.handleRuntimeAgentAction(agent, action);
+    };
+    this.homeBridgeView.onRuntimeAgentClick = (agent) => {
+      const runtimeAgent = agent.agentId
+        ? this.runtimeAgents.get(agent.agentId)
+        : undefined;
+      if (!runtimeAgent) return;
+      this.openRuntimeAgentInWorkspace(runtimeAgent);
+    };
+    this.settingsPanel.onMcpHttpSettingsChange = (settings) => {
+      this.handleBridgeControlSettingsChange(settings);
+    };
+    this.settingsPanel.refreshMcpHttpServerSettings();
+
+    const projectRail = document.getElementById("project-rail")!;
+    new ProjectSidebar(
+      projectRail,
+      this.projectState,
+      (id: string) => this.switchToWorkspace(id),
+      () => this.switchToHome(),
+      () => this.handleAddProject(),
+      (id) => this.handleRemoveProject(id),
+    );
+
+    const sidebarOnChange = this.projectState.onChange;
+    this.projectState.onChange = () => {
+      sidebarOnChange?.();
+      this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
+      this.homeView.render();
+    };
+
+    const sidePanel = document.getElementById("side-panel");
+    if (sidePanel) {
+      sidePanel.classList.remove("visible");
+      (sidePanel as HTMLElement).style.display = "none";
+    }
+
+    this.commandPalette.onFileSelect = (content, path) => {
+      const view = this.getActiveView();
+      if (view) view.openFileViewerTab(content, path);
+    };
+  }
+
+  private getOrCreateWorkspaceView(
+    projectId: string,
+    workspacePath: string,
+    projectName: string,
+  ): WorkspaceView {
+    const existing = this.workspaceViews.get(projectId);
+    if (existing) return existing;
+
+    const view = new WorkspaceView({
+      projectId,
+      workspacePath,
+      projectName,
+      notifications: this.notifications,
+    });
+
+    const viewContainer = document.getElementById("workspace-container")!;
+    viewContainer.appendChild(view.root);
+
+    view.onConversationIdsChange = (conversationIds) => {
+      this.projectState.setProjectConversationIds(projectId, conversationIds);
+    };
+    view.onAgentsChange = () => {
+      if (this.projectState.isHomeActive()) {
+        this.homeView.render();
+      }
+    };
+    view.onRuntimeAgentAction = (agent, action) => {
+      void this.handleRuntimeAgentAction(agent, action);
+    };
+    this.projectState.setProjectConversationIds(
+      projectId,
+      view.getConversationIds(),
+    );
+    view.syncRuntimeAgents(this.runtimeAgentsByProjectId.get(projectId) ?? []);
+
+    this.workspaceViews.set(projectId, view);
+    return view;
+  }
+
+  private getProjectAgentCounts(projectId: string): {
+    total: number;
+    active: number;
+  } {
+    const view = this.workspaceViews.get(projectId);
+    if (!view) {
+      const project = this.projectState.projects.find(
+        (p) => p.id === projectId,
+      );
+      const runtimeAgents = this.runtimeAgentsByProjectId.get(projectId) ?? [];
+      const runtimeConversationIds = new Set(
+        runtimeAgents.map((agent) => agent.conversation_id),
+      );
+      const persistedConversationIds = project?.conversationIds ?? [];
+      const totalConversationIds = new Set<number>(persistedConversationIds);
+      for (const conversationId of runtimeConversationIds) {
+        totalConversationIds.add(conversationId);
+      }
+      const activeRuntimeAgents = runtimeAgents.filter(
+        (agent) =>
+          agent.status === "queued" ||
+          agent.status === "running" ||
+          agent.status === "waiting_input",
+      ).length;
+      const activeConversationIds = persistedConversationIds.filter(
+        (id) => !runtimeConversationIds.has(id),
+      ).length;
+      return {
+        total: totalConversationIds.size,
+        active: activeConversationIds + activeRuntimeAgents,
+      };
+    }
+    const agents = view.getAgentsPanel().getAgents();
+    const total = agents.length;
+    const active = agents.filter((agent) => agent.status === "running").length;
+    return { total, active };
+  }
+
+  private startRuntimeAgentSync(): void {
+    if (this.runtimeAgentSyncTimer !== null) return;
+    void this.refreshRuntimeAgents();
+    this.runtimeAgentSyncTimer = window.setInterval(() => {
+      void this.refreshRuntimeAgents();
+    }, 500);
+  }
+
+  private refreshRuntimeAgents(): Promise<void> {
+    if (this.runtimeAgentSyncInFlight) {
+      return this.runtimeAgentSyncInFlight;
+    }
+
+    this.runtimeAgentSyncInFlight = (async () => {
+      try {
+        const agents = await listAgents();
+        this.runtimeAgents = new Map(
+          agents.map((agent) => [agent.agent_id, agent]),
+        );
+        this.applyRuntimeAgents(agents);
+      } catch (err) {
+        console.warn("Failed to refresh runtime agents:", err);
+      } finally {
+        this.runtimeAgentSyncInFlight = null;
+      }
+    })();
+
+    return this.runtimeAgentSyncInFlight;
+  }
+
+  private applyRuntimeAgents(agents: RuntimeAgent[]): void {
+    const visibleAgents = agents.filter((agent) =>
+      this.shouldDisplayRuntimeAgent(agent),
+    );
+    const byProjectId = new Map<string, RuntimeAgent[]>();
+
+    for (const project of this.projectState.projects) {
+      byProjectId.set(project.id, []);
+    }
+
+    for (const agent of visibleAgents) {
+      const project = this.resolveProjectForRuntimeAgent(agent);
+      if (!project) continue;
+      const bucket = byProjectId.get(project.id) ?? [];
+      bucket.push(agent);
+      byProjectId.set(project.id, bucket);
+    }
+
+    this.runtimeAgentsByProjectId = byProjectId;
+    this.homeView.setAgents(visibleAgents);
+
+    for (const project of this.projectState.projects) {
+      const view = this.workspaceViews.get(project.id);
+      if (!view) continue;
+      view.syncRuntimeAgents(byProjectId.get(project.id) ?? []);
+    }
+
+    this.homeBridgeView.syncRuntimeAgentPreviews(visibleAgents);
+
+    if (this.projectState.isHomeActive()) {
+      this.homeView.render();
+    }
+  }
+
+  private openRuntimeAgentInWorkspace(agent: RuntimeAgent): void {
+    const project = this.resolveProjectForRuntimeAgent(agent);
+    if (!project) return;
+    this.switchToWorkspace(project.id);
+    const view = this.workspaceViews.get(project.id);
+    if (!view) return;
+    view.syncRuntimeAgent(agent);
+    view.focusConversation(agent.conversation_id, agent.name);
+  }
+
+  private resolveProjectForRuntimeAgent(
+    agent: RuntimeAgent,
+  ): { id: string; workspacePath: string } | null {
+    for (const [projectId, view] of this.workspaceViews) {
+      if (projectId === HOME_BRIDGE_VIEW_ID) continue;
+      if (!view.ownsConversation(agent.conversation_id)) continue;
+      const project = this.projectState.projects.find(
+        (entry) => entry.id === projectId,
+      );
+      if (project) return project;
+    }
+
+    let bestMatch: { id: string; workspacePath: string } | null = null;
+    let bestLength = -1;
+    for (const project of this.projectState.projects) {
+      if (!this.runtimeAgentMatchesProject(agent, project.workspacePath))
+        continue;
+      if (project.workspacePath.length <= bestLength) continue;
+      bestMatch = project;
+      bestLength = project.workspacePath.length;
+    }
+    return bestMatch;
+  }
+
+  private runtimeAgentMatchesProject(
+    agent: RuntimeAgent,
+    workspacePath: string,
+  ): boolean {
+    const normalizedWorkspace = this.normalizeWorkspacePath(workspacePath);
+    if (!normalizedWorkspace) return false;
+    return agent.workspace_roots.some((root) => {
+      const normalizedRoot = this.normalizeWorkspacePath(root);
+      if (!normalizedRoot) return false;
+      return (
+        normalizedRoot === normalizedWorkspace ||
+        normalizedRoot.startsWith(`${normalizedWorkspace}/`) ||
+        normalizedWorkspace.startsWith(`${normalizedRoot}/`)
+      );
+    });
+  }
+
+  private normalizeWorkspacePath(path: string): string {
+    return path.replace(/\\/g, "/").replace(/\/+$/, "");
+  }
+
+  private shouldDisplayRuntimeAgent(agent: RuntimeAgent): boolean {
+    if (this.hiddenRuntimeAgentIds.has(agent.agent_id)) return false;
+
+    const name = agent.name.trim();
+    if (name.startsWith(INTERNAL_TITLE_AGENT_PREFIX)) return false;
+
+    // Backward compatibility for older title helpers created before the internal prefix.
+    if (/^title\s+\d+$/i.test(name)) return false;
+
+    return true;
+  }
+
+  private async handleRuntimeAgentAction(
+    agent: RuntimeAgent | AgentInfo,
+    action: AgentCardAction,
+  ): Promise<void> {
+    const agentId = "agent_id" in agent ? agent.agent_id : agent.agentId;
+    if (!agentId) return;
+
+    try {
+      if (action === "interrupt") {
+        await interruptAgent(agentId);
+        await this.refreshRuntimeAgents();
+        return;
+      }
+      if (action === "terminate") {
+        await terminateAgent(agentId);
+        await this.refreshRuntimeAgents();
+        return;
+      }
+
+      this.hiddenRuntimeAgentIds.add(agentId);
+      this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
+    } catch (err) {
+      const actionLabel =
+        action === "interrupt"
+          ? "interrupt"
+          : action === "terminate"
+            ? "terminate"
+            : "remove";
+      this.notifications.error(
+        `Failed to ${actionLabel} agent: ${String(err)}`,
+      );
+    }
+  }
+
+  private bridgeChatDisabledReason(): string {
+    return "Enable Loopback MCP Control in Settings to start Bridge chats.";
+  }
+
+  private handleBridgeControlSettingsChange(
+    settings: McpHttpServerSettings,
+  ): void {
+    this.bridgeControlEnabled = settings.enabled;
+    const reason = this.bridgeChatDisabledReason();
+    this.homeView.setBridgeChatAvailability(
+      settings.enabled,
+      reason,
+      HOME_BRIDGE_LABEL,
+    );
+    this.homeBridgeView.updateNewConversationAvailability(
+      settings.enabled,
+      reason,
+    );
+  }
+
+  private switchToWorkspace(projectId: string): void {
+    if (this.activeWorkspaceId) {
+      const current = this.workspaceViews.get(this.activeWorkspaceId);
+      current?.hide();
+    }
+
+    const project = this.projectState.projects.find((p) => p.id === projectId);
+    if (!project) return;
+
+    const view = this.getOrCreateWorkspaceView(
+      project.id,
+      project.workspacePath,
+      project.name,
+    );
+    view.show();
+    this.activeWorkspaceId = projectId;
+
+    this.projectState.switchProject(projectId);
+    this.commandPalette.setWorkspaceRoot(project.workspacePath);
+    document.querySelector(".app-title")!.textContent =
+      `Tyde — ${project.name}`;
+
+    this.homeView.hide();
+    this.homeBridgeView.hide();
+    this.settingsTabViewEl.classList.add("hidden");
+  }
+
+  private switchToHome(): void {
+    if (this.activeWorkspaceId) {
+      const current = this.workspaceViews.get(this.activeWorkspaceId);
+      current?.hide();
+    }
+    this.activeWorkspaceId = HOME_BRIDGE_VIEW_ID;
+    this.projectState.switchToHome();
+    this.homeBridgeView.show();
+    this.homeView.show();
+    this.commandPalette.setWorkspaceRoot("");
+    this.settingsTabViewEl.classList.add("hidden");
+    document.querySelector(".app-title")!.textContent = "Tyde";
+  }
+
+  private routeChatEvent(payload: ChatEventPayload): void {
+    if (this.tryRouteChatEvent(payload)) {
+      return;
+    }
+
+    void this.refreshRuntimeAgents()
+      .then(() => {
+        this.tryRouteChatEvent(payload);
+      })
+      .catch((err) =>
+        console.error(
+          "Failed to refresh runtime agents for chat event routing:",
+          err,
+        ),
+      );
+  }
+
+  private tryRouteChatEvent(payload: ChatEventPayload): boolean {
+    for (const view of this.workspaceViews.values()) {
+      if (!view.ownsConversation(payload.conversation_id)) continue;
+      view.handleChatEvent(payload);
+      if (view.projectId !== HOME_BRIDGE_VIEW_ID) {
+        this.updateProjectStatusFromEvent(view.projectId, payload.event);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private updateProjectStatusFromEvent(
+    projectId: string,
+    event: ChatEvent,
+  ): void {
+    if (event.kind === "StreamStart") {
+      this.projectState.updateProjectStatus(projectId, "active");
+      return;
+    }
+    if (event.kind === "StreamEnd") {
+      this.projectState.updateProjectStatus(projectId, "idle");
+      return;
+    }
+    if (event.kind === "SubprocessExit") {
+      this.projectState.updateProjectStatus(projectId, "idle");
+      return;
+    }
+  }
+
+  private routeAdminEvent(payload: AdminEventPayload): void {
+    const event = payload.event;
+    if (event.kind === "SubprocessStderr") {
+      console.warn(`[admin:${payload.admin_id}] stderr:`, event.data);
+    }
+    if (event.kind === "SubprocessExit") {
+      console.warn(
+        `[admin:${payload.admin_id}] exited with code:`,
+        event.data.exit_code,
+      );
+    }
+    const sourceView = this.getViewByAdminId(payload.admin_id);
+    if (event.kind === "Settings") {
+      if (this.settingsPanel.adminId !== payload.admin_id) return;
+      this.settingsPanel.handleSettingsData(event.data);
+      return;
+    }
+    if (event.kind === "ModuleSchemas") {
+      if (this.settingsPanel.adminId !== payload.admin_id) return;
+      this.settingsPanel.handleModuleSchemas(event.data.schemas);
+      return;
+    }
+    if (event.kind === "ProfilesList") {
+      if (this.settingsPanel.adminId !== payload.admin_id) return;
+      this.settingsPanel.handleProfilesList(event.data);
+      return;
+    }
+    if (event.kind === "SubprocessExit") {
+      if (sourceView) sourceView.handleAdminEvent(payload);
+      return;
+    }
+    if (event.kind === "SessionsList") {
+      if (sourceView) {
+        sourceView.handleAdminEvent(payload);
+        return;
+      }
+      if (this.activeWorkspaceId) {
+        const view = this.workspaceViews.get(this.activeWorkspaceId);
+        if (view) view.handleAdminEvent(payload);
+      }
+    }
+  }
+
+  private async openWorkspacePath(dir: string): Promise<void> {
+    const remote = parseRemoteWorkspaceUri(dir);
+    if (remote) {
+      await this.connectionDialog.show(remote.host);
+    }
+
+    const displayName = workspaceDisplayName(dir);
+
+    let project = this.projectState.projects.find(
+      (p) => p.workspacePath === dir,
+    );
+    if (!project) {
+      project = this.projectState.addProject(dir);
+      project.name = displayName;
+    }
+
+    const view = this.getOrCreateWorkspaceView(
+      project.id,
+      project.workspacePath,
+      project.name,
+    );
+    this.switchToWorkspace(project.id);
+
+    if (remote) {
+      try {
+        await view.createNewConversationTab();
+      } catch (err) {
+        console.error("Remote connection failed:", err);
+      }
+    }
+
+    addRecentWorkspace(dir);
+  }
+
+  private async openWorkspace(): Promise<void> {
+    const dir = await openWorkspaceDialog();
+    if (!dir) return;
+    await this.openWorkspacePath(dir);
+  }
+
+  private async openRemoteWorkspace(): Promise<void> {
+    const raw = await promptForText({
+      title: "Open Remote Workspace",
+      description: "Enter user@host:/absolute/path or ssh://user@host/path",
+      placeholder: "user@host:/absolute/path",
+      confirmLabel: "Open",
+    });
+    if (raw === null) return;
+
+    const remoteUri = normalizeRemoteWorkspaceInput(raw);
+    if (!remoteUri) {
+      this.notifications.error(
+        "Invalid remote workspace format. Use user@host:/path.",
+      );
+      return;
+    }
+
+    await this.openWorkspacePath(remoteUri);
+  }
+
+  private async handleAddProject(): Promise<void> {
+    const dir = await openWorkspaceDialog();
+    if (!dir) return;
+    await this.openWorkspacePath(dir);
+  }
+
+  private handleRemoveProject(projectId: string): void {
+    const project = this.projectState.projects.find((p) => p.id === projectId);
+    if (!project) return;
+
+    const view = this.workspaceViews.get(projectId);
+    if (view) {
+      const conversationIds = view.getConversationIds();
+      for (const cid of conversationIds) {
+        const tab = view.getTabManager().getTabByConversationId(cid);
+        if (tab) {
+          view.getTabManager().closeTab(tab.id);
+        } else {
+          closeConversation(cid).catch((err) =>
+            console.error(
+              "Failed to close conversation on project removal:",
+              err,
+            ),
+          );
+        }
+      }
+      view.destroy();
+      view.root.remove();
+      this.workspaceViews.delete(projectId);
+    }
+
+    this.projectState.removeProject(projectId);
+
+    const active = this.projectState.getActiveProject();
+    if (active) {
+      this.switchToWorkspace(active.id);
+      return;
+    }
+
+    this.switchToHome();
+  }
+
+  private wireDockButtons(): void {
+    document.getElementById("left-dock-btn")!.addEventListener("click", () => {
+      this.getActiveView()?.getLayout().toggleLeftPanel();
+    });
+    document
+      .getElementById("bottom-dock-btn")!
+      .addEventListener("click", () => {
+        this.getActiveView()?.getLayout().toggleBottomPanel();
+      });
+    document.getElementById("right-dock-btn")!.addEventListener("click", () => {
+      this.getActiveView()?.getLayout().toggleRightPanel();
+    });
+
+    document.getElementById("left-dock-btn")!.title = "Toggle left dock";
+    document.getElementById("bottom-dock-btn")!.title = "Toggle bottom dock";
+    document.getElementById("right-dock-btn")!.title =
+      `Toggle right dock (${formatShortcut("Ctrl+B")})`;
+    document.getElementById("open-workspace-btn")!.title = "Open Workspace";
+    document.getElementById("open-remote-workspace-btn")!.title =
+      "Open Remote Workspace";
+  }
+
+  private openSettings(): void {
+    if (!this.settingsTabViewEl.classList.contains("hidden")) {
+      this.closeSettings();
+      return;
+    }
+    this.settingsPanel.refreshMcpHttpServerSettings();
+    const view = this.getActiveView();
+    if (view) {
+      this.settingsPanel.adminId = view.getAdminId();
+    }
+    this.settingsTabViewEl.classList.remove("hidden");
+    this.escapeStack.push("settings", () => this.closeSettings());
+  }
+
+  private closeSettings(): void {
+    this.settingsTabViewEl.classList.add("hidden");
+    this.escapeStack.remove("settings");
+  }
+
+  private registerCommands(): void {
+    const cp = this.commandPalette;
+
+    cp.registerCommand({
+      id: "switch-git",
+      label: "Switch to Git panel",
+      shortcut: formatShortcut("Ctrl+2"),
+      execute: () => {
+        this.getActiveView()?.getLayout().switchTab("git");
+      },
+    });
+    cp.registerCommand({
+      id: "switch-files",
+      label: "Switch to Files panel",
+      shortcut: formatShortcut("Ctrl+3"),
+      execute: () => {
+        this.getActiveView()?.getLayout().switchTab("files");
+      },
+    });
+    cp.registerCommand({
+      id: "switch-diff",
+      label: "Switch to Diff panel",
+      shortcut: formatShortcut("Ctrl+4"),
+      execute: () => {
+        const view = this.getActiveView();
+        if (!view) return;
+        const fileTab = view.getTabManager().getPreferredFileTab();
+        if (fileTab) {
+          view.getTabManager().switchTo(fileTab.id);
+        } else {
+          view.getLayout().switchTab("diff");
+        }
+      },
+    });
+    cp.registerCommand({
+      id: "toggle-right-panel",
+      label: "Toggle right dock",
+      shortcut: formatShortcut("Ctrl+B"),
+      execute: () => this.getActiveView()?.getLayout().toggleRightPanel(),
+    });
+    cp.registerCommand({
+      id: "open-settings",
+      label: "Open Settings",
+      shortcut: formatShortcut("Ctrl+,"),
+      execute: () => {
+        this.openSettings();
+      },
+    });
+    cp.registerCommand({
+      id: "open-sessions",
+      label: "Open Sessions",
+      execute: () => {
+        void this.getActiveView()?.requestSessionsList();
+      },
+    });
+    cp.registerCommand({
+      id: "clear-chat",
+      label: "Clear Chat",
+      shortcut: formatShortcut("Ctrl+L"),
+      execute: () => this.getActiveView()?.getChatPanel().clearChat(),
+    });
+    cp.registerCommand({
+      id: "cancel-operation",
+      label: "Cancel Operation",
+      shortcut: "Escape",
+      execute: () => {
+        const cid = this.getActiveView()?.getActiveConversationId();
+        if (cid !== null && cid !== undefined) cancelConversation(cid);
+      },
+    });
+    cp.registerCommand({
+      id: "refresh-git",
+      label: "Refresh Git Status",
+      shortcut: formatShortcut("Ctrl+Shift+R"),
+      execute: () => this.getActiveView()?.getGitPanel().refresh(),
+    });
+    cp.registerCommand({
+      id: "toggle-fullscreen-chat",
+      label: "Toggle Full-Screen Chat",
+      shortcut: formatShortcut("Ctrl+Shift+F"),
+      execute: () => this.getActiveView()?.getLayout().toggleFullScreenChat(),
+    });
+    cp.registerCommand({
+      id: "focus-chat",
+      label: "Focus Chat Input",
+      shortcut: formatShortcut("Ctrl+1"),
+      execute: () => {
+        void this.getActiveView()?.focusChatTabOrCreate();
+      },
+    });
+    cp.registerCommand({
+      id: "keyboard-shortcuts",
+      label: "Keyboard Shortcuts",
+      shortcut: formatShortcut("Ctrl+/"),
+      execute: () => showCheatSheet(),
+    });
+    cp.registerCommand({
+      id: "open-workspace",
+      label: "Open Workspace",
+      execute: () => this.openWorkspace(),
+    });
+    cp.registerCommand({
+      id: "open-remote-workspace",
+      label: "Open Remote Workspace",
+      execute: () => this.openRemoteWorkspace(),
+    });
+    cp.registerCommand({
+      id: "toggle-theme",
+      label: "Toggle Theme",
+      execute: () => {
+        const root = document.documentElement;
+        const isCurrentlyLight = root.dataset.theme === "light";
+        const newTheme = isCurrentlyLight ? "dark" : "light";
+        root.dataset.theme = newTheme === "light" ? "light" : "";
+        localStorage.setItem("tyde-theme", newTheme);
+      },
+    });
+    cp.registerCommand({
+      id: "toggle-settings",
+      label: "Toggle Settings",
+      execute: () => {
+        this.openSettings();
+      },
+    });
+    cp.registerCommand({
+      id: "toggle-sessions",
+      label: "Toggle Sessions",
+      execute: () => {
+        void this.getActiveView()?.requestSessionsList();
+      },
+    });
+    cp.registerCommand({
+      id: "toggle-task-list",
+      label: "Toggle Task List",
+      shortcut: formatShortcut("Ctrl+J"),
+      execute: () => {
+        this.getActiveView()?.getChatPanel().toggleActiveTaskBar();
+      },
+    });
+    cp.registerCommand({
+      id: "switch-workspace",
+      label: "Switch Workspace",
+      execute: () => this.openWorkspace(),
+    });
+    cp.registerCommand({
+      id: "new-conversation",
+      label: "New Conversation",
+      shortcut: formatShortcut("Ctrl+N"),
+      execute: async () => {
+        const view = this.getActiveView();
+        if (!view) {
+          await this.openWorkspace();
+          return;
+        }
+        try {
+          await view.createNewConversationTab();
+        } catch (err) {
+          console.error("Failed to create conversation:", err);
+          this.notifications.error("Failed to create conversation");
+        }
+      },
+    });
+    cp.registerCommand({
+      id: "close-tab",
+      label: "Close Tab",
+      shortcut: formatShortcut("Ctrl+W"),
+      execute: () => {
+        const view = this.getActiveView();
+        if (!view) return;
+        const active = view.getTabManager().getActiveTab();
+        if (active) view.getTabManager().closeTab(active.id);
+      },
+    });
+    cp.registerCommand({
+      id: "close-all-tabs",
+      label: "Close All Tabs",
+      execute: () => {
+        const view = this.getActiveView();
+        if (!view) return;
+        view.getTabManager().closeAll();
+        view.showEmptyState();
+      },
+    });
+  }
+
+  private registerKeyboardShortcuts(): void {
+    const kb = this.keyboard;
+
+    kb.register("Ctrl+K", () => this.commandPalette.toggle());
+    kb.register("Ctrl+P", () => this.commandPalette.toggle());
+    kb.register("Ctrl+N", async () => {
+      const view = this.getActiveView();
+      if (!view) {
+        await this.openWorkspace();
+        return;
+      }
+      try {
+        await view.createNewConversationTab();
+      } catch (err) {
+        console.error("Failed to create conversation:", err);
+        this.notifications.error("Failed to create conversation");
+      }
+    });
+    kb.register("Ctrl+,", () => {
+      this.openSettings();
+    });
+    kb.register("Ctrl+L", () =>
+      this.getActiveView()?.getChatPanel().clearChat(),
+    );
+    kb.register("Ctrl+B", () =>
+      this.getActiveView()?.getLayout().toggleRightPanel(),
+    );
+    kb.register("Ctrl+J", () =>
+      this.getActiveView()?.getChatPanel().toggleActiveTaskBar(),
+    );
+    kb.register("Ctrl+/", () => showCheatSheet());
+    kb.register("Ctrl+Shift+F", () =>
+      this.getActiveView()?.getLayout().toggleFullScreenChat(),
+    );
+    kb.register("Ctrl+Shift+R", () =>
+      this.getActiveView()?.getGitPanel().refresh(),
+    );
+    kb.register("Ctrl+1", () => {
+      void this.getActiveView()?.focusChatTabOrCreate();
+    });
+    kb.register("Ctrl+2", () => {
+      this.getActiveView()?.getLayout().switchTab("git");
+    });
+    kb.register("Ctrl+3", () => {
+      this.getActiveView()?.getLayout().switchTab("files");
+    });
+    kb.register("Ctrl+4", () => {
+      const view = this.getActiveView();
+      if (!view) return;
+      const fileTab = view.getTabManager().getPreferredFileTab();
+      if (fileTab) {
+        view.getTabManager().switchTo(fileTab.id);
+      } else {
+        view.getLayout().switchTab("diff");
+      }
+    });
+    kb.register("Ctrl+5", () => {
+      this.openSettings();
+    });
+    kb.register("Ctrl+W", () => {
+      const view = this.getActiveView();
+      if (!view) return;
+      const active = view.getTabManager().getActiveTab();
+      if (active) view.getTabManager().closeTab(active.id);
+    });
+    kb.register("Ctrl+Tab", () => {
+      const view = this.getActiveView();
+      if (!view) return;
+      const tabs = view.getTabManager().getTabs();
+      const active = view.getTabManager().getActiveTab();
+      if (tabs.length < 2 || !active) return;
+      const idx = tabs.findIndex((t) => t.id === active.id);
+      view.getTabManager().switchTo(tabs[(idx + 1) % tabs.length].id);
+    });
+    kb.register("Ctrl+Shift+Tab", () => {
+      const view = this.getActiveView();
+      if (!view) return;
+      const tabs = view.getTabManager().getTabs();
+      const active = view.getTabManager().getActiveTab();
+      if (tabs.length < 2 || !active) return;
+      const idx = tabs.findIndex((t) => t.id === active.id);
+      view
+        .getTabManager()
+        .switchTo(tabs[(idx - 1 + tabs.length) % tabs.length].id);
+    });
+    kb.register("Ctrl+=", () => adjustFontSize(1));
+    kb.register("Ctrl+-", () => adjustFontSize(-1));
+    kb.register("Escape", () => {
+      const view = this.getActiveView();
+      if (!view) return;
+      if (view.getChatPanel().isTyping()) {
+        const cid = view.getActiveConversationId();
+        if (cid !== null) cancelConversation(cid);
+        return;
+      }
+      view.getChatPanel().focusInput();
+    });
+
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (key !== "f" && key !== "g") return;
+      if (this.isEditableTarget(e.target)) return;
+
+      const view = this.getActiveView();
+      if (!view) return;
+
+      const handled =
+        key === "f"
+          ? view.focusFindInActiveFileViewer()
+          : view.focusGoToLineInActiveFileViewer();
+      if (!handled) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    kb.enable();
+  }
+
+  private isEditableTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    if (target.closest('[data-keyboard-shortcuts="off"]')) return true;
+    if (target.isContentEditable) return true;
+    return (
+      target.closest(
+        'input, textarea, [contenteditable="true"], [contenteditable=""]',
+      ) !== null
+    );
+  }
+
+  private async bootstrapStartup(): Promise<void> {
+    const startupProject = this.projectState.getActiveProject();
+
+    if (!startupProject) {
+      this.switchToHome();
+      return;
+    }
+
+    const view = this.getOrCreateWorkspaceView(
+      startupProject.id,
+      startupProject.workspacePath,
+      startupProject.name,
+    );
+    this.switchToWorkspace(startupProject.id);
+
+    try {
+      await view.ensureAdminSubprocess();
+      this.settingsPanel.adminId = view.getAdminId();
+    } catch (err) {
+      console.error("Failed to spawn admin subprocess:", err);
+    }
+  }
+}

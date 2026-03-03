@@ -1,0 +1,32 @@
+{
+  "productName": "Tyde",
+  "mainBinaryName": "tyde",
+  "version": "0.1.0",
+  "identifier": "com.tyde.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "externalBin": [
+      "binaries/tycode-subprocess"
+    ]
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Tyde",
+        "width": 1200,
+        "height": 800,
+        "dragDropEnabled": false
+      }
+    ]
+  }
+}
