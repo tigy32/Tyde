@@ -1,0 +1,29 @@
+[package]
+name = "tyde"
+version = "0.1.0"
+edition = "2021"
+default-run = "tyde"
+
+[lib]
+name = "tyde_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "rt", "time", "fs", "net"] }
+tracing = "0.1"
+tycode-core = { git = "https://github.com/tigy32/Tycode" }
+portable-pty = "0.8"
+notify = "6"
+base64 = "0.22"
+axum = "0.8"
+parking_lot = "0.12"
+rmcp = { version = "0.2.1", features = ["transport-streamable-http-server", "transport-worker"] }

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tyde</title>
+    <link rel="icon" type="image/png" href="/tycode-tiger.png">
+    <link rel="stylesheet" href="/src/styles.css">
+</head>
+<body>
+    <div id="app">
+        <header class="app-header">
+            <div class="header-left">
+                <span class="app-title" data-testid="app-title">Tyde</span>
+                <button id="open-workspace-btn" class="header-btn" title="Open Workspace">Open Workspace</button>
+                <button id="open-remote-workspace-btn" class="header-btn" title="Open Remote Workspace">Open Remote</button>
+            </div>
+            <div class="header-right">
+                <div id="notification-bell"></div>
+                <button id="left-dock-btn" class="header-btn" title="Toggle left dock" data-testid="left-dock-btn">Left</button>
+                <button id="bottom-dock-btn" class="header-btn" title="Toggle bottom dock">Bottom</button>
+                <button id="right-dock-btn" class="header-btn" title="Toggle right dock" data-testid="right-dock-btn">Right</button>
+            </div>
+        </header>
+        <div class="app-body">
+          <div id="project-rail"></div>
+          <div class="main-content" id="workspace-container">
+          </div>
+        </div>
+        <div class="side-panel" id="side-panel">
+            <div class="side-panel-header">
+                <span class="side-panel-title"></span>
+                <button class="side-panel-close">&times;</button>
+            </div>
+            <div class="side-panel-content" id="side-panel-content"></div>
+        </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
