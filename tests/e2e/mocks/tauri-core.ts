@@ -382,6 +382,17 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         }
       }
 
+      await emitChatEvent(id, {
+        kind: 'ConversationRegistered',
+        data: {
+          agent_id: null,
+          workspace_roots: workspaceRoots,
+          backend_kind: backendKind,
+          name: 'Conversation',
+          parent_agent_id: null,
+        },
+      });
+
       return id;
     }
 

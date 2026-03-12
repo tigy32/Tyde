@@ -386,7 +386,7 @@ export class WorkspaceView {
       this.onAgentsChange?.(agents);
     };
     this.agentsPanel.onAgentAction = (agent, action) => {
-      if (agent.kind === "runtime" && agent.agentId) {
+      if (agent.agentId) {
         this.onRuntimeAgentAction?.(agent, action);
         return;
       }
@@ -774,7 +774,7 @@ export class WorkspaceView {
     }
 
     for (const existing of this.agentsPanel.getAgents()) {
-      if (existing.kind !== "runtime") continue;
+      if (!existing.agentId) continue;
       if (nextConversationIds.has(existing.conversationId)) continue;
       this.agentsPanel.removeAgent(existing.conversationId);
     }
@@ -788,8 +788,7 @@ export class WorkspaceView {
     }
 
     for (const existing of this.agentsPanel.getAgents()) {
-      if (existing.kind !== "runtime") continue;
-      if (this.conversationIds.has(existing.conversationId)) continue;
+      if (!existing.agentId) continue;
       if (nextConversationIds.has(existing.conversationId)) continue;
       this.agentsPanel.removeAgent(existing.conversationId);
     }
@@ -964,7 +963,6 @@ export class WorkspaceView {
         prompt,
         backendKind,
         undefined,
-        true,
         `${INTERNAL_TITLE_AGENT_PREFIX}${conversationId}`,
         true,
       );
@@ -1152,13 +1150,11 @@ export class WorkspaceView {
     );
     this.registerConversation({
       conversationId: id,
-      kind: "conversation",
       name: tab.title,
-      status: "completed",
       summary: "Ready",
+      isTyping: false,
       createdAt: Date.now(),
       projectId: this.projectId,
-      keepAliveWithoutTab: true,
     });
     this.tabManager.switchTo(tab.id);
     this.layout.setHomeMode(false);
@@ -1600,8 +1596,8 @@ export class WorkspaceView {
       if (tab.kind === "chat" && tab.conversationId !== null) {
         const conversationId = tab.conversationId;
         const agent = this.agentsPanel.getAgentByConversationId(conversationId);
-        const keepAliveWithoutTab = agent?.keepAliveWithoutTab === true;
-        if (!keepAliveWithoutTab) {
+        const shouldPreserve = agent?.runtimeStatus != null;
+        if (!shouldPreserve) {
           this.closeConversationPermanently(conversationId);
         }
       }
@@ -1877,14 +1873,8 @@ export class WorkspaceView {
 
     this.agentsPanel.onAgentClick = (agent) => {
       const focused = this.focusConversation(agent.conversationId, agent.name);
-      if (!focused && agent.kind === "runtime") {
+      if (!focused && agent.agentId) {
         this.onRuntimeAgentClick?.(agent);
-      }
-      if (agent.isTyping !== undefined) {
-        this.chatPanel.restoreConversationTypingState(
-          agent.conversationId,
-          agent.isTyping,
-        );
       }
     };
 
@@ -1908,13 +1898,11 @@ export class WorkspaceView {
 
       this.registerConversation({
         conversationId: id,
-        kind: "conversation",
         name: agentName,
-        status: "running",
         summary: "Applying feedback...",
+        isTyping: true,
         createdAt: Date.now(),
         projectId: this.projectId,
-        keepAliveWithoutTab: true,
       });
       this.eventRouter.registerFeedbackAgent(id, filePath);
       await this.applyDefaultSpawnProfile(id, backendKind);
@@ -1936,7 +1924,8 @@ export class WorkspaceView {
         await sendMessage(id, message);
       } catch (err) {
         this.agentsPanel.updateAgent(id, {
-          status: "error",
+          isTyping: false,
+          hasError: true,
           summary: String(err),
         });
         this.eventRouter.unregisterFeedbackAgent(id);
@@ -2167,19 +2156,6 @@ export class WorkspaceView {
     return "tycode";
   }
 
-  private runtimeAgentStatusToPanelStatus(
-    status: RuntimeAgent["status"],
-  ): AgentInfo["status"] {
-    if (
-      status === "queued" ||
-      status === "running" ||
-      status === "waiting_input"
-    )
-      return "running";
-    if (status === "failed" || status === "cancelled") return "error";
-    return "completed";
-  }
-
   private runtimeAgentSummaryFallback(status: RuntimeAgent["status"]): string {
     if (status === "queued") return "Queued";
     if (status === "running") return "Running...";
@@ -2190,18 +2166,31 @@ export class WorkspaceView {
   }
 
   private runtimeAgentToPanelInfo(agent: RuntimeAgent): AgentInfo {
+    // Preserve the existing panel name if the runtime name is a generic default.
+    // This avoids overwriting user-set conversation titles with "Bridge" etc.
+    let name = agent.name.trim() || `Agent ${agent.agent_id}`;
+    const existing = this.agentsPanel.getAgentByConversationId(
+      agent.conversation_id,
+    );
+    if (existing?.name && (name === "Bridge" || name === "Conversation")) {
+      name = existing.name;
+    }
+    const isTyping =
+      this.chatPanel.getConversationTypingState(agent.conversation_id) ??
+      existing?.isTyping ??
+      false;
     return {
       agentId: agent.agent_id,
       conversationId: agent.conversation_id,
-      kind: "runtime",
-      name: agent.name.trim() || `Agent ${agent.agent_id}`,
-      status: this.runtimeAgentStatusToPanelStatus(agent.status),
+      name,
       summary:
         agent.summary.trim() || this.runtimeAgentSummaryFallback(agent.status),
+      isTyping,
+      hasError: agent.status === "failed" || agent.status === "cancelled",
       createdAt: agent.created_at_ms,
       projectId: this.projectId,
-      keepAliveWithoutTab: agent.keep_alive_without_tab,
       runtimeStatus: agent.status,
+      parentAgentId: agent.parent_agent_id,
     };
   }
 

@@ -6,20 +6,20 @@ export interface AgentInfo {
   agentId?: number;
   conversationId: number;
   name: string;
-  kind?: "conversation" | "runtime";
-  status: "running" | "completed" | "error";
   summary: string;
-  isTyping?: boolean;
+  isTyping: boolean;
+  hasError?: boolean;
   createdAt: number;
   projectId: string;
-  keepAliveWithoutTab?: boolean;
   runtimeStatus?: RuntimeAgentStatus;
+  parentAgentId?: number | null;
 }
 
 export class AgentsPanel {
   private container: HTMLElement;
   private agents: AgentInfo[] = [];
   private projectFilter: string | null = null;
+  private collapsedParents: Set<number> = new Set();
   public onAgentClick: ((agent: AgentInfo) => void) | null = null;
   public onAgentAction:
     | ((agent: AgentInfo, action: AgentCardAction) => void)
@@ -102,13 +102,51 @@ export class AgentsPanel {
       return;
     }
 
-    filtered.sort((a, b) => b.createdAt - a.createdAt);
+    // Build parent→children map keyed by agentId
+    const childrenByParent = new Map<number, AgentInfo[]>();
+    const roots: AgentInfo[] = [];
+
+    for (const agent of filtered) {
+      if (
+        agent.parentAgentId != null &&
+        filtered.some((a) => a.agentId === agent.parentAgentId)
+      ) {
+        const siblings = childrenByParent.get(agent.parentAgentId) ?? [];
+        siblings.push(agent);
+        childrenByParent.set(agent.parentAgentId, siblings);
+      } else {
+        roots.push(agent);
+      }
+    }
+
+    roots.sort((a, b) => b.createdAt - a.createdAt);
+    for (const children of childrenByParent.values()) {
+      children.sort((a, b) => b.createdAt - a.createdAt);
+    }
 
     const list = document.createElement("div");
     list.className = "agents-list";
-    for (const agent of filtered) {
-      list.appendChild(this.buildCard(agent));
+
+    for (const root of roots) {
+      const children =
+        root.agentId != null ? (childrenByParent.get(root.agentId) ?? []) : [];
+      list.appendChild(this.buildCard(root, children.length));
+
+      if (children.length > 0) {
+        const collapsed =
+          root.agentId != null && this.collapsedParents.has(root.agentId);
+        if (!collapsed) {
+          for (const child of children) {
+            const grandchildren =
+              child.agentId != null
+                ? (childrenByParent.get(child.agentId) ?? [])
+                : [];
+            list.appendChild(this.buildCard(child, grandchildren.length, true));
+          }
+        }
+      }
     }
+
     this.container.appendChild(list);
   }
 
@@ -127,19 +165,70 @@ export class AgentsPanel {
     return el;
   }
 
-  private buildCard(agent: AgentInfo): HTMLElement {
+  private buildCard(
+    agent: AgentInfo,
+    childCount: number = 0,
+    isChild: boolean = false,
+  ): HTMLElement {
     const card = document.createElement("div");
-    card.className = `agent-card agent-card-${agent.status}`;
+    const statusClass = agent.isTyping
+      ? "running"
+      : agent.hasError
+        ? "error"
+        : "completed";
+    card.className = `agent-card agent-card-${statusClass}`;
+    if (isChild) card.classList.add("agent-card-child");
     card.dataset.testid = "agent-card";
 
     const header = document.createElement("div");
     header.className = "agent-card-header";
 
+    const titleRow = document.createElement("div");
+    titleRow.className = "agent-card-title-row";
+
+    if (childCount > 0 && agent.agentId != null) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "agent-card-collapse-toggle";
+      toggle.dataset.testid = "agent-card-collapse";
+      const collapsed = this.collapsedParents.has(agent.agentId);
+      toggle.textContent = collapsed ? "▶" : "▼";
+      toggle.title = collapsed ? "Expand sub-agents" : "Collapse sub-agents";
+      toggle.setAttribute("aria-label", toggle.title);
+      toggle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (agent.agentId == null) return;
+        if (this.collapsedParents.has(agent.agentId)) {
+          this.collapsedParents.delete(agent.agentId);
+        } else {
+          this.collapsedParents.add(agent.agentId);
+        }
+        this.render();
+      });
+      titleRow.appendChild(toggle);
+    }
+
     const title = document.createElement("span");
     title.className = "agent-card-title";
     title.textContent = agent.name;
-    header.appendChild(title);
-    header.appendChild(this.buildStatusIndicator(agent));
+    titleRow.appendChild(title);
+
+    header.appendChild(titleRow);
+
+    const headerRight = document.createElement("div");
+    headerRight.className = "agent-card-header-right";
+
+    if (childCount > 0) {
+      const badge = document.createElement("span");
+      badge.className = "agent-card-child-badge";
+      badge.dataset.testid = "agent-card-child-badge";
+      badge.textContent = `${childCount} sub-agent${childCount === 1 ? "" : "s"}`;
+      headerRight.appendChild(badge);
+    }
+
+    const statusEl = this.buildStatusIndicator(agent);
+    if (statusEl) headerRight.appendChild(statusEl);
+    header.appendChild(headerRight);
 
     const summary = document.createElement("div");
     summary.className = "agent-card-summary";
@@ -170,29 +259,26 @@ export class AgentsPanel {
     return card;
   }
 
-  private buildStatusIndicator(agent: AgentInfo): HTMLElement {
+  private buildStatusIndicator(agent: AgentInfo): HTMLElement | null {
     if (agent.runtimeStatus === "waiting_input") {
       const icon = document.createElement("span");
       icon.className = "agent-status-icon";
       icon.textContent = "⏸";
       return icon;
     }
-    if (agent.status === "running") {
+    if (agent.isTyping) {
       const spinner = document.createElement("div");
       spinner.className = "loading-spinner";
       return spinner;
     }
-    const icon = document.createElement("span");
-    icon.className = "agent-status-icon";
-    icon.textContent = agent.status === "completed" ? "✓" : "✗";
-    return icon;
+    return null;
   }
 
   private buildActionRow(agent: AgentInfo): HTMLElement | null {
     const row = document.createElement("div");
     row.className = "agent-card-actions";
 
-    const isRuntime = agent.kind === "runtime" && Boolean(agent.agentId);
+    const isRuntime = agent.runtimeStatus != null && Boolean(agent.agentId);
     if (isRuntime) {
       if (this.canInterrupt(agent)) {
         row.appendChild(this.buildActionButton(agent, "interrupt"));
@@ -203,7 +289,7 @@ export class AgentsPanel {
       if (this.canRemove(agent)) {
         row.appendChild(this.buildActionButton(agent, "remove"));
       }
-    } else if (agent.status === "running") {
+    } else if (agent.isTyping) {
       row.appendChild(this.buildActionButton(agent, "interrupt"));
     } else {
       row.appendChild(this.buildActionButton(agent, "remove"));
@@ -239,12 +325,12 @@ export class AgentsPanel {
 
   private actionTooltip(agent: AgentInfo, action: AgentCardAction): string {
     if (action === "interrupt") {
-      return agent.kind === "runtime"
+      return agent.runtimeStatus != null
         ? "Interrupt this agent run"
         : "Interrupt this conversation";
     }
     if (action === "terminate") return "Terminate this agent";
-    return agent.kind === "runtime"
+    return agent.runtimeStatus != null
       ? "Remove this agent card"
       : "Close and remove this conversation";
   }
@@ -288,15 +374,14 @@ export class AgentsPanel {
     return (
       a.agentId === b.agentId &&
       a.conversationId === b.conversationId &&
-      a.kind === b.kind &&
       a.name === b.name &&
-      a.status === b.status &&
       a.summary === b.summary &&
       a.isTyping === b.isTyping &&
+      a.hasError === b.hasError &&
       a.createdAt === b.createdAt &&
       a.projectId === b.projectId &&
-      a.keepAliveWithoutTab === b.keepAliveWithoutTab &&
-      a.runtimeStatus === b.runtimeStatus
+      a.runtimeStatus === b.runtimeStatus &&
+      a.parentAgentId === b.parentAgentId
     );
   }
 }

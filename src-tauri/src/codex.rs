@@ -8,7 +8,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
 use crate::subprocess::ImageAttachment;
@@ -43,7 +43,7 @@ impl CodexSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers).await
     }
 
@@ -51,7 +51,7 @@ impl CodexSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers).await
     }
 
@@ -59,7 +59,7 @@ impl CodexSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers).await
     }
 
@@ -68,8 +68,8 @@ impl CodexSession {
         ephemeral: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
-        let rpc = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers)?;
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let (rpc, inbound_rx) = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers)?;
 
         rpc.request(
             "initialize",
@@ -125,7 +125,7 @@ impl CodexSession {
             .and_then(Value::as_str)
             .map(|s| s.to_string());
 
-        let (event_tx, _) = broadcast::channel(512);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(CodexInner {
             rpc,
@@ -148,25 +148,13 @@ impl CodexSession {
 
         let forward_inner = Arc::clone(&inner);
         tokio::spawn(async move {
-            let mut rx = forward_inner.rpc.subscribe();
-            loop {
-                let msg = match rx.recv().await {
-                    Ok(msg) => msg,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Codex notification lagged, missed {n} messages");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
+            let mut rx = inbound_rx;
+            while let Some(msg) = rx.recv().await {
                 forward_inner.handle_inbound(msg).await;
             }
         });
 
-        Ok(Self { inner })
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self.inner.event_tx.subscribe()
+        Ok((Self { inner }, event_rx))
     }
 
     pub fn command_handle(&self) -> CodexCommandHandle {
@@ -232,7 +220,7 @@ struct CodexState {
 
 struct CodexInner {
     rpc: CodexRpc,
-    event_tx: broadcast::Sender<Value>,
+    event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<CodexState>,
 }
 
@@ -1722,7 +1710,7 @@ impl CodexInner {
 
     fn emit_event(&self, event: Value) {
         if let Err(e) = self.event_tx.send(event) {
-            tracing::trace!("broadcast send failed (no receivers): {e}");
+            tracing::trace!("event send failed: {e}");
         }
     }
 }
@@ -1967,9 +1955,7 @@ fn apply_reasoning_delta_to_state(
     }
     if let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
         let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-        estimate.reasoning_bytes = estimate
-            .reasoning_bytes
-            .saturating_add(delta.len() as u64);
+        estimate.reasoning_bytes = estimate.reasoning_bytes.saturating_add(delta.len() as u64);
     }
 
     Some(json!({
@@ -2689,8 +2675,8 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
         match &server.transport {
             StartupMcpTransport::Http {
                 url,
+                headers,
                 bearer_token_env_var,
-                ..
             } => {
                 let trimmed_url = url.trim();
                 if trimmed_url.is_empty() {
@@ -2706,6 +2692,13 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
                         "{base}.bearer_token_env_var={}",
                         toml_quoted(env_var)
                     ));
+                }
+                for (key, value) in headers {
+                    let key = key.trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    overrides.push(format!("{base}.http_headers.{key}={}", toml_quoted(value)));
                 }
             }
             StartupMcpTransport::Stdio { command, args, env } => {
@@ -2739,7 +2732,6 @@ struct CodexRpc {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingRpcMap,
     next_id: AtomicU64,
-    inbound_tx: broadcast::Sender<CodexInbound>,
     child: Arc<Mutex<Option<Child>>>,
 }
 
@@ -2747,7 +2739,7 @@ impl CodexRpc {
     fn spawn(
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         let config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
         let mut child = if let Some(host) = ssh_host {
             use crate::remote::shell_quote_command;
@@ -2803,7 +2795,7 @@ impl CodexRpc {
 
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
-        let (inbound_tx, _) = broadcast::channel(1024);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
 
         let stdout_pending = Arc::clone(&pending);
         let stdout_inbound = inbound_tx.clone();
@@ -2885,17 +2877,15 @@ impl CodexRpc {
             }
         });
 
-        Ok(Self {
-            stdin: Arc::new(Mutex::new(stdin)),
-            pending,
-            next_id: AtomicU64::new(1),
-            inbound_tx,
-            child: child_ref,
-        })
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<CodexInbound> {
-        self.inbound_tx.subscribe()
+        Ok((
+            Self {
+                stdin: Arc::new(Mutex::new(stdin)),
+                pending,
+                next_id: AtomicU64::new(1),
+                child: child_ref,
+            },
+            inbound_rx,
+        ))
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {

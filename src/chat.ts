@@ -1497,6 +1497,10 @@ export class ChatPanel {
     return !view.typingIndicator.classList.contains("hidden");
   }
 
+  getConversationTypingState(conversationId: number): boolean | undefined {
+    return this.typingByConversation.get(conversationId);
+  }
+
   isStreaming(): boolean {
     if (this.activeConversationId === null) return false;
     const view = this.views.get(this.activeConversationId);

@@ -8,10 +8,61 @@ use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdout, Command};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
 use crate::subprocess::ImageAttachment;
+
+/// Handle returned by SubAgentEmitter::on_subagent_spawned.
+/// Holds the per-sub-agent event channel.
+#[allow(dead_code)]
+pub struct SubAgentHandle {
+    pub agent_id: u64,
+    pub conversation_id: u64,
+    pub event_tx: mpsc::UnboundedSender<Value>,
+}
+
+/// Trait for handling Claude Code sub-agent lifecycle events.
+/// Implemented by the Tauri app layer (`lib.rs`) to register sub-agents
+/// in the AgentRuntime and create their conversations.
+///
+/// Methods return BoxFutures since async trait methods are not yet stable.
+pub trait SubAgentEmitter: Send + Sync {
+    /// Called when a root agent spawns a sub-agent (tool_use with Task/Agent tool).
+    /// Returns a handle with the sub-agent's event channel.
+    fn on_subagent_spawned(
+        &self,
+        tool_use_id: String,
+        name: String,
+        description: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>;
+
+    /// Called when a sub-agent completes (tool_result received for the spawn tool).
+    fn on_subagent_completed(
+        &self,
+        tool_use_id: &str,
+        agent_id: u64,
+        success: bool,
+        final_response: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
+/// Per-sub-agent stream state, tracking its own summary and segment.
+struct SubAgentStream {
+    handle: SubAgentHandle,
+    summary: ClaudeStdoutSummary,
+    segment: SegmentState,
+    message_id: String,
+    has_explicit_task_prompt: bool,
+    /// A local ClaudeInner that routes events to the sub-agent's channel.
+    inner: Arc<ClaudeInner>,
+}
+
+#[derive(Default)]
+struct PendingSubAgentPrompt {
+    tool_use_id: String,
+    partial_json: String,
+}
 
 const CLAUDE_AGENT_NAME: &str = "claude";
 const CLAUDE_ESTIMATED_CONTEXT_WINDOW: u64 = 200_000;
@@ -40,7 +91,7 @@ impl ClaudeSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers).await
     }
 
@@ -48,7 +99,7 @@ impl ClaudeSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers).await
     }
 
@@ -57,7 +108,7 @@ impl ClaudeSession {
         no_session_persistence: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
                 .ok_or("Expected remote workspace roots for SSH session")?;
@@ -70,7 +121,7 @@ impl ClaudeSession {
         } else {
             (pick_workspace_root(workspace_roots)?, None)
         };
-        let (event_tx, _) = broadcast::channel(512);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(ClaudeInner {
             event_tx,
@@ -86,14 +137,16 @@ impl ClaudeSession {
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
+                subagent_emitter: None,
             }),
         });
 
-        Ok(Self { inner })
+        Ok((Self { inner }, event_rx))
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self.inner.event_tx.subscribe()
+    pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        let mut state = self.inner.state.lock().await;
+        state.subagent_emitter = Some(emitter);
     }
 
     pub fn command_handle(&self) -> ClaudeCommandHandle {
@@ -116,6 +169,7 @@ struct ActiveTurn {
     cancel_tx: Option<oneshot::Sender<()>>,
 }
 
+#[derive(Default)]
 struct ClaudeState {
     workspace_root: String,
     ssh_host: Option<String>,
@@ -128,10 +182,11 @@ struct ClaudeState {
     last_cumulative_usage: Option<Value>,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
 }
 
 struct ClaudeInner {
-    event_tx: broadcast::Sender<Value>,
+    event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<ClaudeState>,
 }
 
@@ -532,8 +587,7 @@ impl ClaudeInner {
                             known_context_window,
                         );
                         if !text.is_empty() {
-                            self.add_conversation_bytes(text.len() as u64)
-                                .await;
+                            self.add_conversation_bytes(text.len() as u64).await;
                         }
                         self.emit_stream_end(
                             text,
@@ -579,8 +633,7 @@ impl ClaudeInner {
                             known_context_window,
                         );
                         if !partial.is_empty() {
-                            self.add_conversation_bytes(partial.len() as u64)
-                                .await;
+                            self.add_conversation_bytes(partial.len() as u64).await;
                         }
                         self.emit_stream_end(
                             partial,
@@ -790,10 +843,15 @@ impl ClaudeInner {
             }
         };
 
+        let subagent_emitter = {
+            let state = self.state.lock().await;
+            state.subagent_emitter.clone()
+        };
         let stdout_task = tokio::spawn(read_claude_stdout(
             stdout,
             Arc::clone(self),
             message_id.to_string(),
+            subagent_emitter,
         ));
         let stderr_task = tokio::spawn(read_claude_stderr(stderr));
 
@@ -1067,7 +1125,7 @@ impl ClaudeInner {
 
     fn emit_event(&self, event: Value) {
         if let Err(e) = self.event_tx.send(event) {
-            tracing::trace!("broadcast send failed (no receivers): {e}");
+            tracing::trace!("event send failed: {e}");
         }
     }
 
@@ -1251,7 +1309,8 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
                 );
                 config.insert(
                     "env".to_string(),
-                    serde_json::to_value(env).expect("HashMap<String, String> is always serializable"),
+                    serde_json::to_value(env)
+                        .expect("HashMap<String, String> is always serializable"),
                 );
                 servers.insert(name.to_string(), Value::Object(config));
             }
@@ -1270,15 +1329,72 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
     )
 }
 
+/// Tool names that indicate a sub-agent spawn in Claude Code.
+const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Agent"];
+
+fn is_subagent_tool_name(name: &str) -> bool {
+    SUBAGENT_TOOL_NAMES.contains(&name)
+}
+
+/// Extract `parent_tool_use_id` from a Claude Code stream-json event.
+/// Returns `None` for root-level events, `Some(id)` for sub-agent events.
+fn extract_parent_tool_use_id(value: &Value) -> Option<&str> {
+    value
+        .get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Extract sub-agent spawn info from a tool_use content block.
+fn extract_spawn_description(input: Option<&Value>) -> String {
+    let Some(input) = input else {
+        return String::new();
+    };
+
+    for key in ["prompt", "task", "instruction", "message", "description"] {
+        if let Some(text) = input.get(key).and_then(extract_reasoning_text) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn extract_spawn_info(block: &Value) -> Option<(String, String, String)> {
+    let name = block.get("name").and_then(Value::as_str)?;
+    if !is_subagent_tool_name(name) {
+        return None;
+    }
+    let id = block.get("id").and_then(Value::as_str)?.to_string();
+    let input = block.get("input");
+    let description = extract_spawn_description(input);
+    let agent_name = input
+        .and_then(|i| i.get("subagent_type").or(i.get("name")))
+        .and_then(Value::as_str)
+        .unwrap_or(name)
+        .to_string();
+    Some((id, agent_name, description))
+}
+
 async fn read_claude_stdout(
     stdout: ChildStdout,
     inner: Arc<ClaudeInner>,
     base_message_id: String,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
 ) -> (ClaudeStdoutSummary, SegmentState) {
     let mut summary = ClaudeStdoutSummary::default();
     let mut segment = SegmentState::default();
     let mut current_message_id = base_message_id.clone();
     let mut lines = BufReader::new(stdout).lines();
+
+    // Sub-agent tracking: tool_use_id → SubAgentStream
+    let mut subagent_streams: HashMap<String, SubAgentStream> = HashMap::new();
+    // Root pending Task/Agent tool args by content block index so we can
+    // surface the initial task prompt as soon as input_json_delta is complete.
+    let mut pending_subagent_prompts: HashMap<u64, PendingSubAgentPrompt> = HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
@@ -1289,11 +1405,35 @@ async fn read_claude_stdout(
         let value = match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => value,
             Err(_) => {
-                // Claude can emit verbose/plaintext diagnostics on stdout.
-                // Ignore non-JSON lines so they never leak into assistant message content.
+                tracing::warn!("Non-JSON line from Claude CLI: {trimmed}");
                 continue;
             }
         };
+
+        // Check if this event belongs to a sub-agent
+        if let Some(parent_id) = extract_parent_tool_use_id(&value) {
+            if let Some(stream) = subagent_streams.get_mut(parent_id) {
+                consume_subagent_event(stream, &value);
+            }
+            // If we don't have a stream for this parent_id, the spawn hasn't been
+            // detected yet (or emitter is None). Drop the event silently — it would
+            // have contaminated the root stream otherwise.
+            continue;
+        }
+
+        // Root-level event: check if it contains a sub-agent spawn (tool_use)
+        if let Some(ref emitter) = subagent_emitter {
+            detect_subagent_spawns(
+                &value,
+                emitter.as_ref(),
+                &mut subagent_streams,
+                &mut pending_subagent_prompts,
+            )
+            .await;
+        } else {
+            let event_type = value.get("type").and_then(Value::as_str).unwrap_or("?");
+            tracing::trace!("read_claude_stdout: no subagent_emitter set, skipping spawn detection for event type={event_type}");
+        }
 
         consume_claude_stream_value(
             &value,
@@ -1303,11 +1443,320 @@ async fn read_claude_stdout(
             &base_message_id,
             &mut current_message_id,
         );
+
+        // Check if root received a tool_result for a sub-agent tool
+        if let Some(ref emitter) = subagent_emitter {
+            detect_subagent_completions(&value, emitter.as_ref(), &mut subagent_streams).await;
+        }
+    }
+
+    // Flush any remaining sub-agent streams
+    for (_tool_use_id, mut stream) in subagent_streams.drain() {
+        flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
+        if phase_has_pending_output(&stream.summary, &stream.segment) {
+            close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+        }
     }
 
     flush_pending_tool_uses(&mut summary, &mut segment);
 
     (summary, segment)
+}
+
+fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
+    let mut sa_message_id = stream.message_id.clone();
+    consume_claude_stream_value(
+        value,
+        &mut stream.summary,
+        &mut stream.segment,
+        &stream.inner,
+        &stream.message_id,
+        &mut sa_message_id,
+    );
+    stream.message_id = sa_message_id;
+}
+
+fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description: &str) {
+    let trimmed = description.trim();
+    if stream.has_explicit_task_prompt || trimmed.is_empty() {
+        return;
+    }
+    stream.has_explicit_task_prompt = true;
+    stream.inner.emit_event(json!({
+        "kind": "MessageAdded",
+        "data": {
+            "timestamp": unix_now_ms(),
+            "sender": "User",
+            "content": trimmed,
+            "tool_calls": [],
+            "images": [],
+        }
+    }));
+}
+
+fn normalize_stream_event_for_spawn(value: &Value) -> Option<Value> {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if event_type == "stream_event" {
+        let event = value.get("event")?;
+        if event.is_object() {
+            return Some(event.clone());
+        }
+        let event_name = event.as_str()?;
+        if is_stream_event_type(event_name) {
+            return Some(merge_data_with_type(
+                event_name,
+                value.get("data").unwrap_or(&Value::Null),
+            ));
+        }
+        return None;
+    }
+    if is_stream_event_type(event_type) {
+        return Some(value.clone());
+    }
+    None
+}
+
+fn track_pending_subagent_prompt_event(
+    value: &Value,
+    streams: &mut HashMap<String, SubAgentStream>,
+    pending_prompts: &mut HashMap<u64, PendingSubAgentPrompt>,
+) {
+    fn maybe_emit_prompt_from_pending(
+        pending: &PendingSubAgentPrompt,
+        streams: &mut HashMap<String, SubAgentStream>,
+    ) {
+        let Ok(parsed) = serde_json::from_str::<Value>(&pending.partial_json) else {
+            return;
+        };
+        let description = extract_spawn_description(Some(&parsed));
+        let Some(stream) = streams.get_mut(&pending.tool_use_id) else {
+            return;
+        };
+        emit_subagent_task_prompt_if_needed(stream, &description);
+    }
+
+    let Some(event) = normalize_stream_event_for_spawn(value) else {
+        return;
+    };
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "content_block_start" => {
+            let Some(index) = content_block_index(&event) else {
+                return;
+            };
+            let Some(block) = event.get("content_block") else {
+                return;
+            };
+            let Some((tool_use_id, _name, description)) = extract_spawn_info(block) else {
+                return;
+            };
+            pending_prompts.insert(
+                index,
+                PendingSubAgentPrompt {
+                    tool_use_id: tool_use_id.clone(),
+                    partial_json: String::new(),
+                },
+            );
+            if let Some(stream) = streams.get_mut(&tool_use_id) {
+                emit_subagent_task_prompt_if_needed(stream, &description);
+            }
+        }
+        "content_block_delta" => {
+            let Some(index) = content_block_index(&event) else {
+                return;
+            };
+            let Some(delta) = event.get("delta") else {
+                return;
+            };
+            if delta.get("type").and_then(Value::as_str) != Some("input_json_delta") {
+                return;
+            }
+            let Some(partial) = extract_tool_json_delta(delta) else {
+                return;
+            };
+            let Some(pending) = pending_prompts.get_mut(&index) else {
+                return;
+            };
+            pending.partial_json.push_str(partial);
+            maybe_emit_prompt_from_pending(pending, streams);
+        }
+        "content_block_stop" => {
+            let Some(index) = content_block_index(&event) else {
+                return;
+            };
+            if let Some(pending) = pending_prompts.remove(&index) {
+                maybe_emit_prompt_from_pending(&pending, streams);
+            }
+        }
+        "message_stop" => {
+            for pending in pending_prompts.values() {
+                maybe_emit_prompt_from_pending(pending, streams);
+            }
+            pending_prompts.clear();
+        }
+        _ => {}
+    }
+}
+
+/// Scan a root-level event for tool_use blocks that spawn sub-agents.
+async fn detect_subagent_spawns(
+    value: &Value,
+    emitter: &dyn SubAgentEmitter,
+    streams: &mut HashMap<String, SubAgentStream>,
+    pending_prompts: &mut HashMap<u64, PendingSubAgentPrompt>,
+) {
+    track_pending_subagent_prompt_event(value, streams, pending_prompts);
+
+    // Sub-agent spawns appear as tool_use content blocks in assistant messages
+    // or as content_block_start events in the stream.
+    let blocks = collect_tool_use_blocks(value);
+    if blocks.is_empty() {
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("?");
+        tracing::trace!(
+            "detect_subagent_spawns: no tool_use blocks found in event type={event_type}"
+        );
+    }
+    for block in blocks {
+        let block_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let block_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        tracing::info!(
+            "detect_subagent_spawns: found tool_use block: name={block_name} id={block_id}"
+        );
+        if let Some((tool_use_id, name, description)) = extract_spawn_info(&block) {
+            if let Some(stream) = streams.get_mut(&tool_use_id) {
+                emit_subagent_task_prompt_if_needed(stream, &description);
+                continue; // Already registered
+            }
+            tracing::info!(
+                "detect_subagent_spawns: spawning sub-agent tool_use_id={tool_use_id} name={name}"
+            );
+            let has_explicit_task_prompt = !description.trim().is_empty();
+            let handle = emitter
+                .on_subagent_spawned(tool_use_id.clone(), name, description)
+                .await;
+            // Create a ClaudeInner that routes to the sub-agent's event channel
+            let sa_inner = Arc::new(ClaudeInner {
+                event_tx: handle.event_tx.clone(),
+                state: Mutex::new(ClaudeState::default()),
+            });
+            let sa_message_id = format!("subagent-{}", tool_use_id);
+
+            streams.insert(
+                tool_use_id,
+                SubAgentStream {
+                    handle,
+                    summary: ClaudeStdoutSummary::default(),
+                    segment: SegmentState::default(),
+                    message_id: sa_message_id,
+                    has_explicit_task_prompt,
+                    inner: sa_inner,
+                },
+            );
+        }
+    }
+}
+
+/// Detect tool_result events for sub-agent tools and finalize the sub-agent.
+async fn detect_subagent_completions(
+    value: &Value,
+    emitter: &dyn SubAgentEmitter,
+    streams: &mut HashMap<String, SubAgentStream>,
+) {
+    // tool_result appears in "user" type messages with content blocks
+    let msg_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if msg_type != "user" {
+        return;
+    }
+    let content = match value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    {
+        Some(c) => c,
+        None => return,
+    };
+    for block in content {
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if block_type != "tool_result" {
+            continue;
+        }
+        let tool_use_id = match block.get("tool_use_id").and_then(Value::as_str) {
+            Some(id) => id,
+            None => continue,
+        };
+        let final_response = extract_subagent_final_response(block);
+        if let Some(mut stream) = streams.remove(tool_use_id) {
+            flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
+            if phase_has_pending_output(&stream.summary, &stream.segment) {
+                close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+            }
+            let is_error = block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            emitter
+                .on_subagent_completed(
+                    tool_use_id,
+                    stream.handle.agent_id,
+                    !is_error,
+                    final_response,
+                )
+                .await;
+        }
+    }
+}
+
+/// Collect tool_use blocks from various event shapes.
+fn collect_tool_use_blocks(value: &Value) -> Vec<Value> {
+    let mut blocks = Vec::new();
+
+    // From stream_event content_block_start
+    if let Some(event) = normalize_stream_event_for_spawn(value) {
+        let inner_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if inner_type == "content_block_start" {
+            if let Some(block) = event.get("content_block") {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    blocks.push(block.clone());
+                }
+            }
+        }
+    }
+
+    // From "assistant" messages with content array
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if event_type == "assistant" {
+        if let Some(content) = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        {
+            for block in content {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    blocks.push(block.clone());
+                }
+            }
+        }
+    }
+
+    blocks
 }
 
 async fn read_claude_stderr(stderr: tokio::process::ChildStderr) -> String {
@@ -1573,7 +2022,12 @@ fn consume_assistant_message(
         close_current_phase(summary, segment, inner);
     }
 
-    if has_payload {
+    let is_duplicate = next_message_id
+        .as_ref()
+        .zip(segment.current_claude_message_id.as_ref())
+        .is_some_and(|(next, current)| next == current);
+
+    if has_payload && !is_duplicate {
         maybe_emit_next_stream_start(
             segment,
             inner,
@@ -1769,7 +2223,6 @@ fn reset_phase_state(summary: &mut ClaudeStdoutSummary, segment: &mut SegmentSta
     summary.tool_io_bytes = 0;
     summary.reasoning_bytes = 0;
     segment.has_content = false;
-    segment.current_claude_message_id = None;
 }
 
 fn close_current_phase(
@@ -2068,6 +2521,9 @@ fn consume_stream_event(
         }
         "message_stop" => {
             flush_pending_tool_uses(summary, segment);
+            if !summary.tool_calls.is_empty() {
+                close_current_phase(summary, segment, inner);
+            }
         }
         _ if is_reasoning_marker(event_type) => {
             if let Some(text) = extract_reasoning_text(event) {
@@ -2099,9 +2555,7 @@ fn append_reasoning_text(
     if separate_with_newline && !summary.streamed_reasoning.is_empty() {
         summary.streamed_reasoning.push('\n');
     }
-    summary.reasoning_bytes = summary
-        .reasoning_bytes
-        .saturating_add(trimmed.len() as u64);
+    summary.reasoning_bytes = summary.reasoning_bytes.saturating_add(trimmed.len() as u64);
     summary.streamed_reasoning.push_str(trimmed);
 }
 
@@ -2213,11 +2667,10 @@ fn extract_reasoning_from_result(value: &Value) -> Option<String> {
 }
 
 fn is_reasoning_marker(marker: &str) -> bool {
-    let normalized = marker.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-    normalized.contains("thinking") || normalized.contains("reasoning")
+    matches!(
+        marker.trim(),
+        "thinking" | "thinking_delta" | "reasoning" | "reasoning_delta" | "reasoning_summary"
+    )
 }
 
 fn extract_reasoning_text(value: &Value) -> Option<String> {
@@ -2356,6 +2809,59 @@ fn extract_tool_result_content(block: &Value) -> String {
         }
     }
     serde_json::to_string(content).unwrap_or_default()
+}
+
+fn strip_trailing_subagent_usage_block(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let Some(usage_start) = trimmed.rfind("<usage>") else {
+        return trimmed.to_string();
+    };
+    let usage_tail = &trimmed[usage_start..];
+    if !usage_tail.contains("</usage>") {
+        return trimmed.to_string();
+    }
+    let after_usage = usage_tail
+        .split_once("</usage>")
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or_default();
+    if !after_usage.is_empty() {
+        return trimmed.to_string();
+    }
+    trimmed[..usage_start].trim_end().to_string()
+}
+
+fn strip_trailing_subagent_agent_id_line(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let Some(line_start) = trimmed.rfind("\nagentId:") else {
+        if trimmed.starts_with("agentId:") {
+            return String::new();
+        }
+        return trimmed.to_string();
+    };
+    let tail = trimmed[line_start + 1..].trim();
+    if !tail.starts_with("agentId:") {
+        return trimmed.to_string();
+    }
+    trimmed[..line_start].trim_end().to_string()
+}
+
+fn sanitize_subagent_final_response(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let without_usage = strip_trailing_subagent_usage_block(trimmed);
+    if without_usage == trimmed {
+        return trimmed.to_string();
+    }
+    strip_trailing_subagent_agent_id_line(&without_usage)
+}
+
+fn extract_subagent_final_response(block: &Value) -> Option<String> {
+    let raw = extract_tool_result_content(block);
+    let cleaned = sanitize_subagent_final_response(&raw);
+    normalize_nonempty(&cleaned)
 }
 
 fn first_line_trimmed(text: &str, max_chars: usize) -> String {
@@ -3893,7 +4399,7 @@ async fn delete_claude_session_remote(
     Ok(())
 }
 
-fn unix_now_ms() -> u64 {
+pub(crate) fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -3903,7 +4409,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{broadcast, oneshot};
+    use tokio::sync::oneshot;
     use tokio::time::{timeout, Duration};
 
     fn make_image(data: &str, media_type: &str) -> ImageAttachment {
@@ -3915,8 +4421,8 @@ mod tests {
         }
     }
 
-    fn make_test_inner() -> (ClaudeInner, broadcast::Receiver<Value>) {
-        let (event_tx, event_rx) = broadcast::channel(16);
+    fn make_test_inner() -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = ClaudeInner {
             event_tx,
             state: Mutex::new(ClaudeState {
@@ -3931,6 +4437,7 @@ mod tests {
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
+                subagent_emitter: None,
             }),
         };
         (inner, event_rx)
@@ -4322,6 +4829,58 @@ mod tests {
 
         assert!(rx.try_recv().is_err());
 
+        // content_block_stop finalises the tool_use block
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_stop",
+                    "index": 0
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        // message_stop ends the assistant turn — emits early ToolRequest
+        // BEFORE the tool executes so the UI shows "Running..."
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_stop"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        let early_tool_request = rx.recv().await.expect("early tool request at message_stop");
+        assert_eq!(event_kind(&early_tool_request), Some("ToolRequest"));
+        assert_eq!(
+            early_tool_request
+                .get("data")
+                .and_then(|data| data.get("tool_type"))
+                .and_then(|tool_type| tool_type.get("kind"))
+                .and_then(Value::as_str),
+            Some("ModifyFile")
+        );
+        assert_eq!(
+            early_tool_request
+                .get("data")
+                .and_then(|data| data.get("tool_type"))
+                .and_then(|tool_type| tool_type.get("file_path"))
+                .and_then(Value::as_str),
+            Some("/tmp/example.txt")
+        );
+
+        // Tool result arrives — close_current_phase emits StreamEnd, then ToolExecutionCompleted
         consume_claude_stream_value(
             &json!({
                 "type": "user",
@@ -4346,35 +4905,10 @@ mod tests {
         let stream_end = rx.recv().await.expect("stream end event");
         assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
         assert_eq!(
-            stream_end_message(&stream_end)
-                .get("content")
-                .and_then(Value::as_str),
-            Some("")
-        );
-        assert_eq!(
             stream_end_tool_call_ids(&stream_end),
             vec!["toolu_edit".to_string()]
         );
         assert_eq!(stream_end_total_tokens(&stream_end), Some(80));
-
-        let tool_request = rx.recv().await.expect("tool request event");
-        assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
-        assert_eq!(
-            tool_request
-                .get("data")
-                .and_then(|data| data.get("tool_type"))
-                .and_then(|tool_type| tool_type.get("kind"))
-                .and_then(Value::as_str),
-            Some("ModifyFile")
-        );
-        assert_eq!(
-            tool_request
-                .get("data")
-                .and_then(|data| data.get("tool_type"))
-                .and_then(|tool_type| tool_type.get("file_path"))
-                .and_then(Value::as_str),
-            Some("/tmp/example.txt")
-        );
 
         let completion = rx.recv().await.expect("tool completion event");
         assert_eq!(event_kind(&completion), Some("ToolExecutionCompleted"));
@@ -4496,6 +5030,31 @@ mod tests {
     }
 
     #[test]
+    fn collect_tool_use_blocks_handles_stream_event_string_envelope() {
+        let payload = json!({
+            "type": "stream_event",
+            "event": "content_block_start",
+            "data": {
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_spawn",
+                    "name": "Task",
+                    "input": { "description": "Spawn test sub-agent" }
+                }
+            }
+        });
+
+        let blocks = collect_tool_use_blocks(&payload);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].get("id").and_then(Value::as_str),
+            Some("toolu_spawn")
+        );
+        assert_eq!(blocks[0].get("name").and_then(Value::as_str), Some("Task"));
+    }
+
+    #[test]
     fn direct_stream_event_type_is_consumed() {
         let (inner, _rx) = make_test_inner();
         let mut summary = ClaudeStdoutSummary::default();
@@ -4522,24 +5081,30 @@ mod tests {
         assert_eq!(summary.streamed_text, "world");
     }
 
-    fn make_live_test_inner(workspace_root: String) -> Arc<ClaudeInner> {
-        let (event_tx, _) = broadcast::channel(64);
-        Arc::new(ClaudeInner {
-            event_tx,
-            state: Mutex::new(ClaudeState {
-                workspace_root,
-                ssh_host: None,
-                session_id: None,
-                ephemeral: true,
-                model: None,
-                effort: Some("high".to_string()),
-                permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
-                startup_mcp_config_json: None,
-                last_cumulative_usage: None,
-                conversation_bytes_total: 0,
-                active_turn: None,
+    fn make_live_test_inner(
+        workspace_root: String,
+    ) -> (Arc<ClaudeInner>, mpsc::UnboundedReceiver<Value>) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(ClaudeInner {
+                event_tx,
+                state: Mutex::new(ClaudeState {
+                    workspace_root,
+                    ssh_host: None,
+                    session_id: None,
+                    ephemeral: true,
+                    model: None,
+                    effort: Some("high".to_string()),
+                    permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
+                    startup_mcp_config_json: None,
+                    last_cumulative_usage: None,
+                    conversation_bytes_total: 0,
+                    active_turn: None,
+                    subagent_emitter: None,
+                }),
             }),
-        })
+            event_rx,
+        )
     }
 
     async fn run_live_claude_turn(
@@ -4550,7 +5115,7 @@ mod tests {
     ) -> TurnOutcome {
         let workspace_root = std::env::var("TYDE_CLAUDE_TEST_WORKSPACE")
             .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
-        let inner = make_live_test_inner(workspace_root.clone());
+        let (inner, _rx) = make_live_test_inner(workspace_root.clone());
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let outcome = inner
             .run_turn(
@@ -4585,8 +5150,7 @@ mod tests {
     }
 
     async fn collect_live_claude_events(prompt: &str, workspace_root: String) -> Vec<Value> {
-        let inner = make_live_test_inner(workspace_root);
-        let mut rx = inner.event_tx.subscribe();
+        let (inner, mut rx) = make_live_test_inner(workspace_root);
         inner.clone().start_turn(prompt.to_string(), None).await;
 
         let mut events = Vec::new();
@@ -4594,7 +5158,7 @@ mod tests {
             let event = timeout(Duration::from_secs(180), rx.recv())
                 .await
                 .expect("timed out waiting for live Claude event")
-                .expect("live Claude event");
+                .expect("live Claude event channel closed");
             let is_done = event_kind(&event) == Some("TypingStatusChanged")
                 && event.get("data").and_then(Value::as_bool) == Some(false);
             events.push(event);
@@ -4762,9 +5326,7 @@ mod tests {
                         == Some(first_tool_call_id.as_str())
             })
             .unwrap_or_else(|| {
-                panic!(
-                    "Expected ToolRequest for live Claude tool call. Events:\n{events_dump}"
-                )
+                panic!("Expected ToolRequest for live Claude tool call. Events:\n{events_dump}")
             });
         let completion_index = events
             .iter()
@@ -5344,5 +5906,88 @@ mod tests {
 
         // result_context_window should be extracted from modelUsage
         assert_eq!(summary.result_context_window, Some(200_000));
+    }
+
+    #[test]
+    fn sanitize_subagent_final_response_strips_claude_task_metadata() {
+        let raw = "hello world\nagentId: a26bad2 (for resuming to continue this agent's work if needed)\n<usage>total_tokens: 5513\ntool_uses: 0\nduration_ms: 1387</usage>";
+        assert_eq!(sanitize_subagent_final_response(raw), "hello world");
+    }
+
+    #[test]
+    fn sanitize_subagent_final_response_keeps_regular_text() {
+        let raw = "here is plain output\nwith two lines";
+        assert_eq!(sanitize_subagent_final_response(raw), raw);
+    }
+
+    #[test]
+    fn extract_spawn_description_prefers_prompt_over_description() {
+        let input = json!({
+            "description": "Spawn test sub-agent",
+            "prompt": "Say \"hello world\" and nothing else."
+        });
+        assert_eq!(
+            extract_spawn_description(Some(&input)),
+            "Say \"hello world\" and nothing else."
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_subagent_prompt_is_emitted_on_content_block_stop() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = SubAgentHandle {
+            agent_id: 1,
+            conversation_id: 1,
+            event_tx: event_tx.clone(),
+        };
+        let mut streams = HashMap::new();
+        streams.insert(
+            "toolu_spawn".to_string(),
+            SubAgentStream {
+                handle,
+                summary: ClaudeStdoutSummary::default(),
+                segment: SegmentState::default(),
+                message_id: "subagent-toolu_spawn".to_string(),
+                has_explicit_task_prompt: false,
+                inner: Arc::new(ClaudeInner {
+                    event_tx,
+                    state: Mutex::new(ClaudeState::default()),
+                }),
+            },
+        );
+
+        let mut pending_prompts = HashMap::new();
+        pending_prompts.insert(
+            0,
+            PendingSubAgentPrompt {
+                tool_use_id: "toolu_spawn".to_string(),
+                partial_json: "{\"prompt\":\"Say \\\"hello world\\\" and nothing else.\"}"
+                    .to_string(),
+            },
+        );
+
+        let stop_event = json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_stop",
+                "index": 0
+            }
+        });
+
+        track_pending_subagent_prompt_event(&stop_event, &mut streams, &mut pending_prompts);
+
+        let emitted = event_rx
+            .recv()
+            .await
+            .expect("prompt message should be emitted");
+        assert_eq!(
+            emitted.get("kind").and_then(Value::as_str),
+            Some("MessageAdded")
+        );
+        assert_eq!(
+            emitted.pointer("/data/content").and_then(Value::as_str),
+            Some("Say \"hello world\" and nothing else.")
+        );
+        assert!(pending_prompts.is_empty());
     }
 }

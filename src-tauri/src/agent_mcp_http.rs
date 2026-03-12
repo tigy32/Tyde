@@ -1,11 +1,14 @@
+use parking_lot::Mutex;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 
 use axum::{response::IntoResponse, routing::get, Json, Router};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    handler::server::{
+        router::tool::ToolRouter,
+        tool::{Extension, Parameters},
+    },
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::{
@@ -66,8 +69,6 @@ struct SpawnAgentToolInput {
     backend_kind: Option<String>,
     /// Parent agent ID if this is a sub-agent.
     parent_agent_id: Option<u64>,
-    /// Keep the agent alive even when no UI tab is open.
-    keep_alive_without_tab: Option<bool>,
     /// Human-readable name for the agent.
     name: Option<String>,
     /// Whether this is an ephemeral (non-persisted) session.
@@ -128,10 +129,18 @@ fn spawn_request_from(input: SpawnAgentToolInput) -> SpawnAgentRequest {
         prompt: input.prompt,
         backend_kind: input.backend_kind,
         parent_agent_id: input.parent_agent_id,
-        keep_alive_without_tab: input.keep_alive_without_tab,
         name: input.name,
         ephemeral: input.ephemeral,
     }
+}
+
+/// Extract the caller's agent ID from the `X-Tyde-Agent-Id` HTTP header.
+/// This header is set by `startup_mcp_servers_for_agent` when the MCP server
+/// config is injected into each agent's session.
+fn caller_agent_id_from_parts(parts: &http::request::Parts) -> Option<u64> {
+    let header = parts.headers.get("x-tyde-agent-id")?;
+    let s = header.to_str().ok()?;
+    s.parse::<u64>().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -146,9 +155,16 @@ impl TydeAgentMcpServer {
     async fn tyde_spawn_agent(
         &self,
         Parameters(input): Parameters<SpawnAgentToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match spawn_agent_internal(&self.app, app_state.inner(), spawn_request_from(input)).await {
+        let mut request = spawn_request_from(input);
+        // Use the caller's agent ID from the HTTP header as parent, unless
+        // the caller explicitly provided a parent_agent_id in the request.
+        if request.parent_agent_id.is_none() {
+            request.parent_agent_id = caller_agent_id_from_parts(&parts);
+        }
+        match spawn_agent_internal(&self.app, app_state.inner(), request).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
         }
@@ -160,17 +176,21 @@ impl TydeAgentMcpServer {
     async fn tyde_run_agent(
         &self,
         Parameters(input): Parameters<RunAgentToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        let request = SpawnAgentRequest {
+        let explicit_parent = input.parent_agent_id;
+        let mut request = SpawnAgentRequest {
             workspace_roots: input.workspace_roots,
             prompt: input.prompt,
             backend_kind: input.backend_kind,
-            parent_agent_id: input.parent_agent_id,
-            keep_alive_without_tab: Some(true),
+            parent_agent_id: explicit_parent,
             name: input.name,
             ephemeral: Some(false),
         };
+        if request.parent_agent_id.is_none() {
+            request.parent_agent_id = caller_agent_id_from_parts(&parts);
+        }
         match run_agent_internal(&self.app, app_state.inner(), request).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),

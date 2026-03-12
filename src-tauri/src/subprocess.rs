@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::remote::parse_remote_workspace_roots;
 
@@ -20,7 +20,6 @@ pub struct ImageAttachment {
 
 pub struct SubprocessBridge {
     stdin: Arc<Mutex<ChildStdin>>,
-    event_tx: broadcast::Sender<Value>,
     child: Arc<Mutex<Option<Child>>>,
 }
 
@@ -29,7 +28,7 @@ impl SubprocessBridge {
         subprocess_path: &str,
         workspace_roots: &[String],
         mcp_servers_json: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let remote_roots = parse_remote_workspace_roots(workspace_roots)?;
 
         let roots_json = match &remote_roots {
@@ -73,7 +72,7 @@ impl SubprocessBridge {
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
 
-        let (event_tx, _) = broadcast::channel(256);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let tx = event_tx.clone();
         let child_for_reader = Arc::new(Mutex::new(Some(child)));
@@ -106,11 +105,13 @@ impl SubprocessBridge {
             }
         });
 
-        Ok(Self {
-            stdin: Arc::new(Mutex::new(stdin)),
-            event_tx,
-            child: child_for_reader.clone(),
-        })
+        Ok((
+            Self {
+                stdin: Arc::new(Mutex::new(stdin)),
+                child: child_for_reader.clone(),
+            },
+            event_rx,
+        ))
     }
 
     /// Callers must clone this before dropping a std::sync::Mutex guard
@@ -125,10 +126,6 @@ impl SubprocessBridge {
             .write_all(format!("{line}\n").as_bytes())
             .await
             .map_err(|e| format!("{e:?}"))
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self.event_tx.subscribe()
     }
 
     pub async fn is_alive(&self) -> bool {
@@ -166,7 +163,9 @@ impl SubprocessBridge {
 impl Drop for SubprocessBridge {
     fn drop(&mut self) {
         let Ok(mut guard) = self.child.try_lock() else {
-            tracing::warn!("SubprocessBridge::drop: could not acquire lock, child process may be leaked");
+            tracing::warn!(
+                "SubprocessBridge::drop: could not acquire lock, child process may be leaked"
+            );
             return;
         };
         if let Some(child) = guard.as_mut() {

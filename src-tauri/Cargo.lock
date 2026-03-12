@@ -5643,6 +5643,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "http 1.4.0",
  "notify",
  "parking_lot",
  "portable-pty",

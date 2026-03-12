@@ -8768,6 +8768,70 @@ body {
   flex-shrink: 0;
 }
 
+/* --- Agent hierarchy: child cards --- */
+.agent-card-child {
+  margin-left: 16px;
+  border-left-width: 2px;
+  opacity: 0.92;
+  padding: 6px 10px;
+}
+
+.agent-card-child .agent-card-title {
+  font-size: calc(var(--base-font-size) * 0.8571);
+}
+
+.agent-card-child .agent-card-footer {
+  margin-top: 3px;
+}
+
+.agent-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.agent-card-header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.agent-card-collapse-toggle {
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: calc(var(--base-font-size) * 0.7143);
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: 3px;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.agent-card-collapse-toggle:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.agent-card-child-badge {
+  font-size: calc(var(--base-font-size) * 0.7143);
+  color: var(--text-tertiary);
+  background: var(--bg-tertiary);
+  padding: 1px 6px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
 /* === Remote Connection Dialog === */
 .conn-dialog-overlay {
   position: fixed;

@@ -180,7 +180,9 @@ impl TerminalManager {
 
     pub fn resize(&self, terminal_id: u64, cols: u16, rows: u16) -> Result<(), String> {
         if cols < 2 || rows < 1 {
-            return Err(format!("Invalid terminal dimensions: cols={cols} (min 2), rows={rows} (min 1)"));
+            return Err(format!(
+                "Invalid terminal dimensions: cols={cols} (min 2), rows={rows} (min 1)"
+            ));
         }
 
         let session = self

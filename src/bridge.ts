@@ -20,6 +20,19 @@ export interface ChatEventPayload {
   event: ChatEvent;
 }
 
+export interface ConversationRegisteredData {
+  agent_id: number | null;
+  workspace_roots: string[];
+  backend_kind: string;
+  name: string;
+  parent_agent_id: number | null;
+}
+
+export interface ConversationRegisteredPayload {
+  conversation_id: number;
+  data: ConversationRegisteredData;
+}
+
 export type BackendKind = "tycode" | "codex" | "claude";
 
 export type RuntimeAgentStatus =
@@ -36,7 +49,6 @@ export interface RuntimeAgent {
   workspace_roots: string[];
   backend_kind: string;
   parent_agent_id: number | null;
-  keep_alive_without_tab: boolean;
   name: string;
   status: RuntimeAgentStatus;
   summary: string;
@@ -241,13 +253,23 @@ export async function updateSettings(
 }
 
 export function onChatEvent(
-  callback: (payload: ChatEventPayload) => void,
+  onRegistered: (payload: ConversationRegisteredPayload) => void,
+  onEvent: (payload: ChatEventPayload) => void,
 ): Promise<UnlistenFn> {
   return listen<{ conversation_id: number; event: unknown }>(
     "chat-event",
     (event) => {
+      const raw = event.payload.event as { kind?: string; data?: unknown };
+      if (raw.kind === "ConversationRegistered") {
+        onRegistered({
+          conversation_id: event.payload.conversation_id,
+          data: raw.data as ConversationRegisteredData,
+        });
+        return;
+      }
+
       try {
-        callback({
+        onEvent({
           conversation_id: event.payload.conversation_id,
           event: parseChatEvent(event.payload.event),
         });
@@ -643,7 +665,6 @@ export async function spawnAgent(
   prompt: string,
   backendKind?: BackendKind,
   parentAgentId?: number,
-  keepAliveWithoutTab?: boolean,
   name?: string,
   ephemeral?: boolean,
 ): Promise<SpawnAgentResponse> {
@@ -652,7 +673,6 @@ export async function spawnAgent(
     prompt,
     backendKind,
     parentAgentId,
-    keepAliveWithoutTab,
     name,
     ephemeral,
   }).catch((err) => {

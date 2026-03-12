@@ -6,9 +6,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
-use crate::claude::{ClaudeCommandHandle, ClaudeSession};
+use crate::claude::{ClaudeCommandHandle, ClaudeSession, SubAgentEmitter};
 use crate::codex::{CodexCommandHandle, CodexSession};
 use crate::subprocess::{ImageAttachment, SubprocessBridge};
 
@@ -259,34 +259,30 @@ impl BackendSession {
         workspace_roots: &[String],
         ephemeral: bool,
         startup_mcp_servers: &[StartupMcpServer],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         match kind {
             // Tycode subprocess currently has no "no-session-persistence" mode.
-            BackendKind::Tycode => Ok(Self::Tycode(SubprocessBridge::spawn(
-                executable_path,
-                workspace_roots,
-                tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
-            )?)),
+            BackendKind::Tycode => {
+                let (bridge, rx) = SubprocessBridge::spawn(
+                    executable_path,
+                    workspace_roots,
+                    tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
+                )?;
+                Ok((Self::Tycode(bridge), rx))
+            }
             BackendKind::Codex => {
                 let ssh_host = if executable_path.is_empty() {
                     None
                 } else {
                     Some(executable_path.to_string())
                 };
-                if ephemeral {
-                    Ok(Self::Codex(
-                        CodexSession::spawn_ephemeral(
-                            workspace_roots,
-                            ssh_host,
-                            startup_mcp_servers,
-                        )
-                        .await?,
-                    ))
+                let (session, rx) = if ephemeral {
+                    CodexSession::spawn_ephemeral(workspace_roots, ssh_host, startup_mcp_servers)
+                        .await?
                 } else {
-                    Ok(Self::Codex(
-                        CodexSession::spawn(workspace_roots, ssh_host, startup_mcp_servers).await?,
-                    ))
-                }
+                    CodexSession::spawn(workspace_roots, ssh_host, startup_mcp_servers).await?
+                };
+                Ok((Self::Codex(session), rx))
             }
             BackendKind::Claude => {
                 let ssh_host = if executable_path.is_empty() {
@@ -294,21 +290,13 @@ impl BackendSession {
                 } else {
                     Some(executable_path.to_string())
                 };
-                if ephemeral {
-                    Ok(Self::Claude(
-                        ClaudeSession::spawn_ephemeral(
-                            workspace_roots,
-                            ssh_host,
-                            startup_mcp_servers,
-                        )
-                        .await?,
-                    ))
+                let (session, rx) = if ephemeral {
+                    ClaudeSession::spawn_ephemeral(workspace_roots, ssh_host, startup_mcp_servers)
+                        .await?
                 } else {
-                    Ok(Self::Claude(
-                        ClaudeSession::spawn(workspace_roots, ssh_host, startup_mcp_servers)
-                            .await?,
-                    ))
-                }
+                    ClaudeSession::spawn(workspace_roots, ssh_host, startup_mcp_servers).await?
+                };
+                Ok((Self::Claude(session), rx))
             }
         }
     }
@@ -317,22 +305,21 @@ impl BackendSession {
         kind: BackendKind,
         executable_path: &str,
         workspace_roots: &[String],
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         match kind {
-            BackendKind::Tycode => Ok(Self::Tycode(SubprocessBridge::spawn(
-                executable_path,
-                workspace_roots,
-                None,
-            )?)),
+            BackendKind::Tycode => {
+                let (bridge, rx) = SubprocessBridge::spawn(executable_path, workspace_roots, None)?;
+                Ok((Self::Tycode(bridge), rx))
+            }
             BackendKind::Codex => {
                 let ssh_host = if executable_path.is_empty() {
                     None
                 } else {
                     Some(executable_path.to_string())
                 };
-                Ok(Self::Codex(
-                    CodexSession::spawn_admin(workspace_roots, ssh_host, &[]).await?,
-                ))
+                let (session, rx) =
+                    CodexSession::spawn_admin(workspace_roots, ssh_host, &[]).await?;
+                Ok((Self::Codex(session), rx))
             }
             BackendKind::Claude => {
                 let ssh_host = if executable_path.is_empty() {
@@ -340,9 +327,8 @@ impl BackendSession {
                 } else {
                     Some(executable_path.to_string())
                 };
-                Ok(Self::Claude(
-                    ClaudeSession::spawn(workspace_roots, ssh_host, &[]).await?,
-                ))
+                let (session, rx) = ClaudeSession::spawn(workspace_roots, ssh_host, &[]).await?;
+                Ok((Self::Claude(session), rx))
             }
         }
     }
@@ -352,14 +338,6 @@ impl BackendSession {
             Self::Tycode(_) => BackendKind::Tycode,
             Self::Codex(_) => BackendKind::Codex,
             Self::Claude(_) => BackendKind::Claude,
-        }
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
-        match self {
-            Self::Tycode(bridge) => bridge.subscribe(),
-            Self::Codex(session) => session.subscribe(),
-            Self::Claude(session) => session.subscribe(),
         }
     }
 
@@ -376,6 +354,12 @@ impl BackendSession {
             Self::Tycode(_) => None,
             Self::Codex(session) => session.session_id().await,
             Self::Claude(session) => session.session_id().await,
+        }
+    }
+
+    pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        if let Self::Claude(session) = self {
+            session.set_subagent_emitter(emitter).await;
         }
     }
 

@@ -32,7 +32,6 @@ pub struct AgentInfo {
     pub workspace_roots: Vec<String>,
     pub backend_kind: String,
     pub parent_agent_id: Option<u64>,
-    pub keep_alive_without_tab: bool,
     pub name: String,
     pub status: AgentStatus,
     pub summary: String,
@@ -107,18 +106,54 @@ impl AgentRuntime {
         out
     }
 
+    pub fn children_of(&self, agent_id: u64) -> Vec<AgentInfo> {
+        let mut children: Vec<AgentInfo> = self
+            .agents
+            .values()
+            .filter(|a| a.parent_agent_id == Some(agent_id))
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        children
+    }
+
+    /// Reserve an agent ID without registering the agent yet.
+    /// Use `register_agent_with_id` to complete registration later.
+    pub fn reserve_agent_id(&mut self) -> u64 {
+        let id = self.next_agent_id;
+        self.next_agent_id += 1;
+        id
+    }
+
     pub fn register_agent(
         &mut self,
         conversation_id: u64,
         workspace_roots: Vec<String>,
         backend_kind: String,
         parent_agent_id: Option<u64>,
-        keep_alive_without_tab: bool,
+        name: String,
+    ) -> AgentInfo {
+        let agent_id = self.reserve_agent_id();
+        self.register_agent_with_id(
+            agent_id,
+            conversation_id,
+            workspace_roots,
+            backend_kind,
+            parent_agent_id,
+            name,
+        )
+    }
+
+    pub fn register_agent_with_id(
+        &mut self,
+        agent_id: u64,
+        conversation_id: u64,
+        workspace_roots: Vec<String>,
+        backend_kind: String,
+        parent_agent_id: Option<u64>,
         name: String,
     ) -> AgentInfo {
         let now = now_ms();
-        let agent_id = self.next_agent_id;
-        self.next_agent_id += 1;
 
         let info = AgentInfo {
             agent_id,
@@ -126,7 +161,6 @@ impl AgentRuntime {
             workspace_roots,
             backend_kind,
             parent_agent_id,
-            keep_alive_without_tab,
             name,
             status: AgentStatus::Queued,
             summary: "Queued".to_string(),
@@ -256,18 +290,40 @@ impl AgentRuntime {
                 } else {
                     summarize_text(&normalized_message, MAX_SUMMARY_LEN)
                 };
-                self.update_status_for_conversation(
-                    conversation_id,
-                    AgentStatus::Completed,
-                    Some(summary),
-                    None,
-                    "stream_end",
-                    if normalized_message.is_empty() {
-                        None
-                    } else {
-                        Some(normalized_message)
-                    },
-                )
+                let has_tool_calls = event
+                    .get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.get("tool_calls"))
+                    .and_then(Value::as_array)
+                    .map(|calls| !calls.is_empty())
+                    .unwrap_or(false);
+                if has_tool_calls {
+                    self.update_status_for_conversation(
+                        conversation_id,
+                        AgentStatus::Running,
+                        Some(summary),
+                        None,
+                        "stream_end_tool_loop",
+                        if normalized_message.is_empty() {
+                            None
+                        } else {
+                            Some(normalized_message)
+                        },
+                    )
+                } else {
+                    self.update_status_for_conversation(
+                        conversation_id,
+                        AgentStatus::Completed,
+                        Some(summary),
+                        None,
+                        "stream_end",
+                        if normalized_message.is_empty() {
+                            None
+                        } else {
+                            Some(normalized_message)
+                        },
+                    )
+                }
             }
             "Error" => {
                 let error = event
@@ -581,7 +637,6 @@ mod tests {
             vec!["/tmp".into()],
             "tycode".into(),
             None,
-            true,
             "test".into(),
         );
         let agent_id = info.agent_id;
@@ -668,7 +723,6 @@ mod tests {
             vec!["/tmp".into()],
             "tycode".into(),
             None,
-            true,
             "test".into(),
         );
         rt.mark_agent_running(info.agent_id, Some("Running...".into()));
@@ -694,7 +748,6 @@ mod tests {
             vec!["/tmp".into()],
             "tycode".into(),
             None,
-            true,
             "test".into(),
         );
 
@@ -729,7 +782,6 @@ mod tests {
             vec!["/tmp".into()],
             "tycode".into(),
             None,
-            true,
             "test".into(),
         );
         assert_eq!(
@@ -771,6 +823,58 @@ mod tests {
     }
 
     #[test]
+    fn stream_end_with_tool_calls_keeps_agent_running() {
+        let mut rt = AgentRuntime::new();
+        let info = rt.register_agent(
+            450,
+            vec!["/tmp".into()],
+            "claude".into(),
+            None,
+            "tool-loop".into(),
+        );
+
+        rt.record_chat_event(
+            450,
+            &json!({
+                "kind": "StreamStart",
+                "data": {}
+            }),
+        );
+        rt.record_chat_event(
+            450,
+            &json!({
+                "kind": "StreamEnd",
+                "data": {
+                    "message": {
+                        "content": "Using tools...",
+                        "tool_calls": [{ "id": "toolu_1", "name": "Task", "arguments": {} }]
+                    }
+                }
+            }),
+        );
+
+        let after_loop = rt.get_agent(info.agent_id).unwrap();
+        assert_eq!(after_loop.status, AgentStatus::Running);
+        assert!(after_loop.ended_at_ms.is_none());
+
+        rt.record_chat_event(
+            450,
+            &json!({
+                "kind": "StreamEnd",
+                "data": {
+                    "message": {
+                        "content": "Final answer",
+                        "tool_calls": []
+                    }
+                }
+            }),
+        );
+        let completed = rt.get_agent(info.agent_id).unwrap();
+        assert_eq!(completed.status, AgentStatus::Completed);
+        assert!(completed.ended_at_ms.is_some());
+    }
+
+    #[test]
     fn collect_result_falls_back_to_summary_when_no_last_message() {
         let mut rt = AgentRuntime::new();
         let info = rt.register_agent(
@@ -778,7 +882,6 @@ mod tests {
             vec!["/tmp".into()],
             "tycode".into(),
             None,
-            true,
             "test".into(),
         );
 

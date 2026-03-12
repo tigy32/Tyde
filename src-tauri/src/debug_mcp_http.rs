@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 
 use axum::{response::IntoResponse, routing::get, Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};

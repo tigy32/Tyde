@@ -138,6 +138,46 @@ export function toolIcon(kind: string): string {
   return icons[kind] ?? "⚙";
 }
 
+const SPAWN_TOOL_NAMES = new Set([
+  "Task",
+  "Agent",
+  "tyde_spawn_agent",
+  "tyde_run_agent",
+]);
+
+export function isSpawnTool(toolName: string): boolean {
+  return SPAWN_TOOL_NAMES.has(toolName);
+}
+
+function extractSpawnDetail(
+  _toolName: string,
+  toolType: ToolRequestType,
+): string {
+  if (toolType.kind !== "Other") return "";
+  const args = toolType.args as Record<string, unknown> | null;
+  if (!args || typeof args !== "object") return "";
+
+  // Claude Code: Task/Agent tools may include both a short "description" label
+  // and the actual instruction in "prompt".
+  // MCP: tyde_spawn_agent/tyde_run_agent use "name" and "prompt".
+  const name = typeof args.name === "string" ? args.name : null;
+  const description =
+    typeof args.description === "string" ? args.description : null;
+  const subagentType =
+    typeof args.subagent_type === "string" ? args.subagent_type : null;
+  const prompt = typeof args.prompt === "string" ? args.prompt : null;
+  const task = typeof args.task === "string" ? args.task : null;
+  const instruction =
+    typeof args.instruction === "string" ? args.instruction : null;
+  const message = typeof args.message === "string" ? args.message : null;
+
+  const label = name ?? subagentType ?? "";
+  const detail = prompt ?? task ?? instruction ?? message ?? description ?? "";
+
+  if (label && detail) return `${label}: ${detail}`;
+  return label || detail;
+}
+
 export function countLines(text: string): number {
   if (!text) return 0;
   return text.split("\n").length;
@@ -480,6 +520,7 @@ function completionHeaderDetail(
 export function toolRequestSummary(
   state: ToolState,
   toolCallId: string,
+  toolName: string,
   toolType: ToolRequestType,
 ): HTMLElement | null {
   switch (toolType.kind) {
@@ -528,8 +569,18 @@ export function toolRequestSummary(
           <div class="tool-request-meta">${escapeHtml(toolType.workspace_root)}</div>`;
       return wrap;
     }
-    case "Other":
+    case "Other": {
+      if (isSpawnTool(toolName)) {
+        const spawnDetail = extractSpawnDetail(toolName, toolType);
+        if (spawnDetail) {
+          const wrap = document.createElement("div");
+          wrap.className = "tool-request-summary";
+          wrap.innerHTML = `<div class="tool-request-row">${escapeHtml(spawnDetail)}</div>`;
+          return wrap;
+        }
+      }
       return null;
+    }
   }
 }
 
@@ -837,16 +888,17 @@ function updatePendingCard(
   card: HTMLElement,
   state: ToolState,
   toolCallId: string,
+  toolName: string,
   toolType: ToolRequestType,
 ): void {
   const statusEl = card.querySelector(".tool-status-text");
   if (statusEl) {
-    statusEl.textContent = "Running...";
+    statusEl.textContent = isSpawnTool(toolName) ? "Spawned" : "Running...";
     statusEl.classList.remove("pending");
   }
   const iconEl = card.querySelector(".tool-status-icon");
   if (iconEl) {
-    iconEl.textContent = toolIcon(toolType.kind);
+    iconEl.textContent = isSpawnTool(toolName) ? "🤖" : toolIcon(toolType.kind);
   }
   setCardHeaderDetail(card, toolRequestHeaderDetail(toolType), true);
   const details = card.querySelector(".tool-details") as HTMLElement | null;
@@ -856,7 +908,7 @@ function updatePendingCard(
   )) {
     existingSummary.remove();
   }
-  const summary = toolRequestSummary(state, toolCallId, toolType);
+  const summary = toolRequestSummary(state, toolCallId, toolName, toolType);
   if (!summary) return;
   details.appendChild(summary);
   setCardExpandedState(
@@ -892,9 +944,12 @@ export function createPendingToolCards(
     state.toolHostByCall.set(toolCall.id, appendTarget);
     if (state.toolCards.has(toolCall.id)) continue;
 
+    const isSpawn = isSpawnTool(toolCall.name);
+
     const card = document.createElement("div");
     card.className = "tool-card tool-call-item";
-    card.dataset.testid = "tool-card";
+    if (isSpawn) card.classList.add("tool-card-spawn");
+    card.dataset.testid = isSpawn ? "tool-card-spawn" : "tool-card";
     card.setAttribute("role", "region");
     card.setAttribute("aria-label", toolCall.name);
 
@@ -903,11 +958,11 @@ export function createPendingToolCards(
 
     const icon = document.createElement("span");
     icon.className = "tool-status-icon";
-    icon.textContent = "⚙";
+    icon.textContent = isSpawn ? "🤖" : "⚙";
 
     const name = document.createElement("span");
     name.className = "tool-name";
-    name.textContent = toolCall.name;
+    name.textContent = isSpawn ? "Sub-agent" : toolCall.name;
 
     const status = document.createElement("span");
     status.className = "tool-status-text pending";
@@ -947,7 +1002,7 @@ export function handleToolRequest(
 ): void {
   const existingCard = state.toolCards.get(toolCallId);
   if (existingCard) {
-    updatePendingCard(existingCard, state, toolCallId, toolType);
+    updatePendingCard(existingCard, state, toolCallId, toolName, toolType);
     scrollToBottom();
     return;
   }
@@ -970,9 +1025,12 @@ export function handleToolRequest(
     }
   }
 
+  const isSpawn = isSpawnTool(toolName);
+
   const card = document.createElement("div");
   card.className = "tool-card tool-call-item";
-  card.dataset.testid = "tool-card";
+  if (isSpawn) card.classList.add("tool-card-spawn");
+  card.dataset.testid = isSpawn ? "tool-card-spawn" : "tool-card";
   card.setAttribute("role", "region");
   card.setAttribute("aria-label", toolName);
 
@@ -981,18 +1039,21 @@ export function handleToolRequest(
 
   const icon = document.createElement("span");
   icon.className = "tool-status-icon";
-  icon.textContent = toolIcon(toolType.kind);
+  icon.textContent = isSpawn ? "🤖" : toolIcon(toolType.kind);
 
   const name = document.createElement("span");
   name.className = "tool-name";
-  name.textContent = toolName;
+  name.textContent = isSpawn ? "Sub-agent" : toolName;
 
   const detail = document.createElement("span");
   detail.className = "tool-header-detail";
+  if (isSpawn) {
+    detail.textContent = extractSpawnDetail(toolName, toolType);
+  }
 
   const status = document.createElement("span");
   status.className = "tool-status-text";
-  status.textContent = "Running...";
+  status.textContent = isSpawn ? "Spawned" : "Running...";
 
   const chevron = document.createElement("span");
   chevron.className = "tool-chevron";
@@ -1012,7 +1073,7 @@ export function handleToolRequest(
   header.addEventListener("click", createToggleHandler(details, chevron));
   setCardHeaderDetail(card, toolRequestHeaderDetail(toolType), true);
 
-  const summary = toolRequestSummary(state, toolCallId, toolType);
+  const summary = toolRequestSummary(state, toolCallId, toolName, toolType);
   if (summary) {
     details.appendChild(summary);
     setCardExpandedState(

@@ -25,5 +25,6 @@ portable-pty = "0.8"
 notify = "6"
 base64 = "0.22"
 axum = "0.8"
+http = "1"
 parking_lot = "0.12"
 rmcp = { version = "0.2.1", features = ["transport-streamable-http-server", "transport-worker"] }

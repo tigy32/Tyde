@@ -13,13 +13,14 @@ mod remote;
 mod subprocess;
 mod terminal;
 
+use parking_lot::Mutex as SyncMutex;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex as SyncMutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 use tokio::fs as tokio_fs;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::admin::AdminManager;
 use crate::agent_runtime::{
@@ -37,6 +38,7 @@ use crate::agent_runtime::{
 use crate::backend::{
     BackendKind, BackendSession, SessionCommand, StartupMcpServer, StartupMcpTransport,
 };
+use crate::claude::{SubAgentEmitter, SubAgentHandle};
 use crate::conversation::ConversationManager;
 use crate::file_service::{FileContent, FileEntry};
 use crate::file_watch::FileWatchManager;
@@ -47,6 +49,251 @@ use crate::remote::{
 };
 use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
+
+/// Implements SubAgentEmitter for Claude Code sessions. Registers sub-agents
+/// in the Tyde AgentRuntime and creates per-sub-agent event forwarding.
+///
+/// For non-bridge conversations, `parent_agent_id` starts as `None`. The first
+/// time a sub-agent is spawned, the parent conversation is lazily registered in
+/// the AgentRuntime so that the parent-child hierarchy is visible in the UI.
+struct ClaudeSubAgentEmitter {
+    app: tauri::AppHandle,
+    agent_runtime: Arc<Mutex<AgentRuntime>>,
+    agent_runtime_notify: Arc<Notify>,
+    parent_agent_id: Option<u64>,
+    /// Lazily populated when `parent_agent_id` is `None` and the first
+    /// sub-agent is spawned. Subsequent sub-agents reuse this value.
+    lazy_parent_agent_id: Mutex<Option<u64>>,
+    parent_conversation_id: u64,
+    workspace_roots: Vec<String>,
+}
+
+impl ClaudeSubAgentEmitter {
+    /// Resolve the parent agent_id. If no explicit parent was set (non-bridge
+    /// conversations), lazily register the parent conversation in the runtime.
+    async fn resolve_parent_agent_id(&self) -> Option<u64> {
+        if let Some(id) = self.parent_agent_id {
+            return Some(id);
+        }
+        let mut lazy = self.lazy_parent_agent_id.lock().await;
+        if let Some(id) = *lazy {
+            return Some(id);
+        }
+        // Register the parent conversation in the runtime so sub-agents
+        // can reference it as their parent.
+        let mut runtime = self.agent_runtime.lock().await;
+        let info = runtime.register_agent(
+            self.parent_conversation_id,
+            self.workspace_roots.clone(),
+            "claude".to_string(),
+            None,
+            "Conversation".to_string(),
+        );
+        runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
+        let id = info.agent_id;
+        *lazy = Some(id);
+        Some(id)
+    }
+}
+
+impl SubAgentEmitter for ClaudeSubAgentEmitter {
+    fn on_subagent_spawned(
+        &self,
+        tool_use_id: String,
+        name: String,
+        description: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>> {
+        Box::pin(async move {
+            let parent_agent_id = self.resolve_parent_agent_id().await;
+
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+            let conversation_id = {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                tool_use_id.hash(&mut hasher);
+                self.parent_conversation_id
+                    .wrapping_add(1_000_000)
+                    .wrapping_add(hasher.finish() % 1_000_000)
+            };
+
+            let agent_info = {
+                let mut runtime = self.agent_runtime.lock().await;
+                let display_name = if name.is_empty() {
+                    "Sub-agent".to_string()
+                } else {
+                    name
+                };
+                let info = runtime.register_agent(
+                    conversation_id,
+                    self.workspace_roots.clone(),
+                    "claude".to_string(),
+                    parent_agent_id,
+                    display_name,
+                );
+                runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
+                info
+            };
+            self.agent_runtime_notify.notify_waiters();
+
+            tracing::info!(
+                "Claude sub-agent spawned: agent_id={}, conversation_id={}, parent={:?}, tool_use_id={}",
+                agent_info.agent_id,
+                conversation_id,
+                parent_agent_id,
+                tool_use_id,
+            );
+
+            // Forward sub-agent events to the frontend
+            let app = self.app.clone();
+            let runtime = Arc::clone(&self.agent_runtime);
+            let notify = Arc::clone(&self.agent_runtime_notify);
+            let registration = serde_json::json!({
+                "kind": "ConversationRegistered",
+                "data": {
+                    "agent_id": agent_info.agent_id,
+                    "workspace_roots": self.workspace_roots,
+                    "backend_kind": "claude",
+                    "name": &agent_info.name,
+                    "parent_agent_id": parent_agent_id,
+                }
+            });
+            tokio::spawn(forward_events(
+                app.clone(),
+                conversation_id,
+                event_rx,
+                runtime,
+                notify,
+                registration,
+            ));
+
+            // Queue a synthetic user message with the parent task text when available.
+            let initial_message = description.trim().to_string();
+            if !initial_message.is_empty() {
+                let _ = event_tx.send(serde_json::json!({
+                    "kind": "MessageAdded",
+                    "data": {
+                        "timestamp": crate::claude::unix_now_ms(),
+                        "content": initial_message,
+                        "sender": "User",
+                        "tool_calls": [],
+                        "images": [],
+                    }
+                }));
+            }
+            let _ = event_tx.send(serde_json::json!({
+                "kind": "TypingStatusChanged",
+                "data": true,
+            }));
+
+            SubAgentHandle {
+                agent_id: agent_info.agent_id,
+                conversation_id,
+                event_tx,
+            }
+        })
+    }
+
+    fn on_subagent_completed(
+        &self,
+        tool_use_id: &str,
+        agent_id: u64,
+        success: bool,
+        final_response: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let tool_use_id = tool_use_id.to_string();
+        Box::pin(async move {
+            let final_response = final_response
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| text.to_string());
+
+            let (conversation_id, maybe_event) = {
+                let mut runtime = self.agent_runtime.lock().await;
+                let conv_id = runtime.conversation_id_for_agent(agent_id);
+                let current_info = runtime.get_agent(agent_id);
+                let already_terminal = current_info
+                    .as_ref()
+                    .map(|info| info.status.is_terminal())
+                    .unwrap_or(false);
+                let final_response_differs = match (
+                    final_response.as_ref(),
+                    current_info
+                        .as_ref()
+                        .and_then(|info| info.last_message.as_ref()),
+                ) {
+                    (Some(next), Some(existing)) => next != existing,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                let should_emit_terminal_event = !already_terminal || final_response_differs;
+
+                if !should_emit_terminal_event || conv_id.is_none() {
+                    (conv_id, None)
+                } else {
+                    let summary = final_response.clone().unwrap_or_else(|| {
+                        if success {
+                            "Completed".to_string()
+                        } else {
+                            "Failed".to_string()
+                        }
+                    });
+                    let event = serde_json::json!({
+                        "kind": if success { "StreamEnd" } else { "Error" },
+                        "data": if success {
+                            serde_json::json!({
+                                "message": {
+                                    "timestamp": crate::claude::unix_now_ms(),
+                                    "sender": { "Assistant": { "agent": "Claude" } },
+                                    "content": summary,
+                                    "tool_calls": [],
+                                    "images": [],
+                                }
+                            })
+                        } else {
+                            serde_json::json!(summary)
+                        }
+                    });
+                    if let Some(cid) = conv_id {
+                        runtime.record_chat_event(cid, &event);
+                    }
+                    (conv_id, Some(event))
+                }
+            };
+            self.agent_runtime_notify.notify_waiters();
+
+            // Emit to the frontend so the EventRouter updates typing/status.
+            if let (Some(conv_id), Some(event)) = (conversation_id, maybe_event) {
+                let payload = ChatEventPayload {
+                    conversation_id: conv_id,
+                    event,
+                };
+                if let Err(e) = self.app.emit("chat-event", &payload) {
+                    tracing::warn!("Failed to emit sub-agent completion event: {e:?}");
+                }
+            }
+            if let Some(conv_id) = conversation_id {
+                let typing_payload = ChatEventPayload {
+                    conversation_id: conv_id,
+                    event: serde_json::json!({
+                        "kind": "TypingStatusChanged",
+                        "data": false,
+                    }),
+                };
+                if let Err(e) = self.app.emit("chat-event", &typing_payload) {
+                    tracing::warn!("Failed to emit sub-agent typing stop event: {e:?}");
+                }
+            }
+
+            tracing::info!(
+                "Claude sub-agent completed: agent_id={}, tool_use_id={}, success={}",
+                agent_id,
+                tool_use_id,
+                success,
+            );
+        })
+    }
+}
 
 pub(crate) struct AppState {
     manager: Mutex<ConversationManager>,
@@ -233,7 +480,6 @@ pub(crate) struct SpawnAgentRequest {
     pub(crate) prompt: String,
     pub(crate) backend_kind: Option<String>,
     pub(crate) parent_agent_id: Option<u64>,
-    pub(crate) keep_alive_without_tab: Option<bool>,
     pub(crate) name: Option<String>,
     pub(crate) ephemeral: Option<bool>,
 }
@@ -508,6 +754,14 @@ fn startup_mcp_servers_for_new_sessions(
     state: &AppState,
     include_agent_control: bool,
 ) -> Result<Vec<StartupMcpServer>, String> {
+    startup_mcp_servers_for_agent(state, include_agent_control, None)
+}
+
+fn startup_mcp_servers_for_agent(
+    state: &AppState,
+    include_agent_control: bool,
+    caller_agent_id: Option<u64>,
+) -> Result<Vec<StartupMcpServer>, String> {
     let mut servers = Vec::new();
 
     if include_agent_control {
@@ -523,11 +777,16 @@ fn startup_mcp_servers_for_new_sessions(
             return Err("Tyde MCP control server URL is unavailable".to_string());
         }
 
+        let mut headers = HashMap::new();
+        if let Some(agent_id) = caller_agent_id {
+            headers.insert("X-Tyde-Agent-Id".to_string(), agent_id.to_string());
+        }
+
         servers.push(StartupMcpServer {
             name: "tyde_agent_control".to_string(),
             transport: StartupMcpTransport::Http {
                 url,
-                headers: HashMap::new(),
+                headers,
                 bearer_token_env_var: None,
             },
         });
@@ -808,11 +1067,22 @@ async fn create_conversation(
             .as_deref(),
         Some("bridge")
     );
+
+    // For Bridge conversations, reserve an agent_id upfront so we can embed it
+    // in the MCP startup config. The MCP server uses this to auto-inject
+    // parent_agent_id when spawning sub-agents.
+    let reserved_agent_id = if include_agent_control {
+        let mut runtime = state.agent_runtime.lock().await;
+        Some(runtime.reserve_agent_id())
+    } else {
+        None
+    };
+
     let resolved_path =
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers =
-        startup_mcp_servers_for_new_sessions(state.inner(), include_agent_control)?;
-    let session = BackendSession::spawn(
+        startup_mcp_servers_for_agent(state.inner(), include_agent_control, reserved_agent_id)?;
+    let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
         &workspace_roots,
@@ -821,13 +1091,54 @@ async fn create_conversation(
     )
     .await?;
 
-    let (id, rx) = {
+    let id = {
         let mut mgr = state.manager.lock().await;
-        let id = mgr.create_conversation(session, &workspace_roots);
-        let session = mgr.get(id).ok_or("Conversation not found")?;
-        let rx = session.subscribe();
-        (id, rx)
+        mgr.create_conversation(session, &workspace_roots)
     };
+
+    // For Bridge conversations, complete the agent registration using the
+    // reserved ID so it appears in the hierarchy and sub-agents can reference it.
+    if let Some(agent_id) = reserved_agent_id {
+        let mut runtime = state.agent_runtime.lock().await;
+        let info = runtime.register_agent_with_id(
+            agent_id,
+            id,
+            workspace_roots.clone(),
+            backend_kind.as_str().to_string(),
+            None,
+            "Bridge".to_string(),
+        );
+        runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
+        drop(runtime);
+        state.agent_runtime_notify.notify_waiters();
+    }
+
+    {
+        let mgr = state.manager.lock().await;
+        let session = mgr.get(id).ok_or("Conversation not found")?;
+        session
+            .set_subagent_emitter(Arc::new(ClaudeSubAgentEmitter {
+                app: app.clone(),
+                agent_runtime: state.agent_runtime.clone(),
+                agent_runtime_notify: state.agent_runtime_notify.clone(),
+                parent_agent_id: reserved_agent_id,
+                lazy_parent_agent_id: Mutex::new(None),
+                parent_conversation_id: id,
+                workspace_roots: workspace_roots.clone(),
+            }))
+            .await;
+    }
+
+    let registration = serde_json::json!({
+        "kind": "ConversationRegistered",
+        "data": {
+            "agent_id": reserved_agent_id,
+            "workspace_roots": workspace_roots,
+            "backend_kind": backend_kind.as_str(),
+            "name": if reserved_agent_id.is_some() { "Bridge" } else { "Conversation" },
+            "parent_agent_id": null,
+        }
+    });
 
     tokio::spawn(forward_events(
         app.clone(),
@@ -835,6 +1146,7 @@ async fn create_conversation(
         rx,
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
+        registration,
     ));
     Ok(id)
 }
@@ -842,20 +1154,23 @@ async fn create_conversation(
 async fn forward_events(
     app: tauri::AppHandle,
     conversation_id: u64,
-    mut rx: broadcast::Receiver<Value>,
+    mut rx: mpsc::UnboundedReceiver<Value>,
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
+    registration: Value,
 ) {
-    loop {
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("Event receiver lagged, missed {n} events");
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => return,
-        };
+    let reg_payload = ChatEventPayload {
+        conversation_id,
+        event: registration,
+    };
+    if let Ok(debug_payload) = serde_json::to_value(&reg_payload) {
+        record_debug_event_from_app(&app, "chat", debug_payload);
+    }
+    if let Err(e) = app.emit("chat-event", &reg_payload) {
+        tracing::warn!("Failed to emit ConversationRegistered event: {e:?}");
+    }
 
+    while let Some(event) = rx.recv().await {
         let changed = {
             let mut runtime = agent_runtime.lock().await;
             runtime.record_chat_event(conversation_id, &event)
@@ -986,7 +1301,6 @@ pub(crate) async fn spawn_agent_internal(
         prompt,
         backend_kind,
         parent_agent_id,
-        keep_alive_without_tab,
         name,
         ephemeral,
     } = request;
@@ -1013,7 +1327,7 @@ pub(crate) async fn spawn_agent_internal(
     let resolved_path =
         resolve_backend_executable_path(app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state, false)?;
-    let session = BackendSession::spawn(
+    let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
         &workspace_roots,
@@ -1022,13 +1336,53 @@ pub(crate) async fn spawn_agent_internal(
     )
     .await?;
 
-    let (conversation_id, rx) = {
+    let display_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+
+    let conversation_id = {
         let mut mgr = state.manager.lock().await;
-        let id = mgr.create_conversation(session, &workspace_roots);
-        let session = mgr.get(id).ok_or("Conversation not found")?;
-        let rx = session.subscribe();
-        (id, rx)
+        mgr.create_conversation(session, &workspace_roots)
     };
+
+    let info = {
+        let mut runtime = state.agent_runtime.lock().await;
+        runtime.register_agent(
+            conversation_id,
+            workspace_roots.clone(),
+            backend_kind.as_str().to_string(),
+            parent_agent_id,
+            display_name.unwrap_or_else(|| format!("Agent {conversation_id}")),
+        )
+    };
+    state.agent_runtime_notify.notify_waiters();
+
+    // Set up the sub-agent emitter AFTER registration so we know this agent's id.
+    // Sub-agents spawned by this agent will have parent_agent_id = info.agent_id.
+    {
+        let mgr = state.manager.lock().await;
+        let session = mgr.get(conversation_id).ok_or("Conversation not found")?;
+        session
+            .set_subagent_emitter(Arc::new(ClaudeSubAgentEmitter {
+                app: app.clone(),
+                agent_runtime: state.agent_runtime.clone(),
+                agent_runtime_notify: state.agent_runtime_notify.clone(),
+                parent_agent_id: Some(info.agent_id),
+                lazy_parent_agent_id: Mutex::new(None),
+                parent_conversation_id: conversation_id,
+                workspace_roots: workspace_roots.clone(),
+            }))
+            .await;
+    }
+
+    let registration = serde_json::json!({
+        "kind": "ConversationRegistered",
+        "data": {
+            "agent_id": info.agent_id,
+            "workspace_roots": workspace_roots,
+            "backend_kind": backend_kind.as_str(),
+            "name": info.name,
+            "parent_agent_id": parent_agent_id,
+        }
+    });
 
     tokio::spawn(forward_events(
         app.clone(),
@@ -1036,26 +1390,8 @@ pub(crate) async fn spawn_agent_internal(
         rx,
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
+        registration,
     ));
-
-    let display_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| format!("Agent {conversation_id}"));
-    let keep_alive = keep_alive_without_tab.unwrap_or(true);
-
-    let info = {
-        let mut runtime = state.agent_runtime.lock().await;
-        runtime.register_agent(
-            conversation_id,
-            workspace_roots,
-            backend_kind.as_str().to_string(),
-            parent_agent_id,
-            keep_alive,
-            display_name,
-        )
-    };
-    state.agent_runtime_notify.notify_waiters();
 
     execute_conversation_command(
         app,
@@ -1134,6 +1470,40 @@ pub(crate) async fn interrupt_agent_internal(
             .ok_or(format!("Agent {agent_id} not found"))?
     };
 
+    // Cascade interrupt to child agents first
+    let child_ids: Vec<u64> = {
+        let runtime = state.agent_runtime.lock().await;
+        runtime
+            .children_of(agent_id)
+            .iter()
+            .filter(|c| !c.status.is_terminal())
+            .map(|c| c.agent_id)
+            .collect()
+    };
+    for child_id in child_ids {
+        let _ = Box::pin(interrupt_agent_internal(
+            app,
+            state,
+            AgentIdRequest { agent_id: child_id },
+        ))
+        .await;
+    }
+
+    let has_session = {
+        let mgr = state.manager.lock().await;
+        mgr.get(conversation_id).is_some()
+    };
+    if !has_session {
+        let changed = {
+            let mut runtime = state.agent_runtime.lock().await;
+            runtime.mark_conversation_closed(conversation_id, Some("Cancelled".to_string()))
+        };
+        if changed {
+            state.agent_runtime_notify.notify_waiters();
+        }
+        return Ok(());
+    }
+
     execute_conversation_command(
         app,
         state,
@@ -1164,6 +1534,24 @@ pub(crate) async fn terminate_agent_internal(
             .conversation_id_for_agent(agent_id)
             .ok_or(format!("Agent {agent_id} not found"))?
     };
+
+    // Cascade termination to child agents first
+    let child_ids: Vec<u64> = {
+        let runtime = state.agent_runtime.lock().await;
+        runtime
+            .children_of(agent_id)
+            .iter()
+            .filter(|c| !c.status.is_terminal())
+            .map(|c| c.agent_id)
+            .collect()
+    };
+    for child_id in child_ids {
+        let _ = Box::pin(terminate_agent_internal(
+            state,
+            AgentIdRequest { agent_id: child_id },
+        ))
+        .await;
+    }
 
     let session = {
         let mut mgr = state.manager.lock().await;
@@ -1434,7 +1822,6 @@ async fn spawn_agent(
     prompt: String,
     backend_kind: Option<String>,
     parent_agent_id: Option<u64>,
-    keep_alive_without_tab: Option<bool>,
     name: Option<String>,
     ephemeral: Option<bool>,
 ) -> Result<SpawnAgentResponse, String> {
@@ -1446,7 +1833,6 @@ async fn spawn_agent(
             prompt,
             backend_kind,
             parent_agent_id,
-            keep_alive_without_tab,
             name,
             ephemeral,
         },
@@ -1565,7 +1951,9 @@ fn set_mcp_http_server_enabled(
                 debug_mcp_http_enabled: debug_enabled,
                 debug_mcp_http_autoload: debug_autoload,
             }) {
-                tracing::error!("Failed to revert app settings after MCP HTTP server start failure: {e}");
+                tracing::error!(
+                    "Failed to revert app settings after MCP HTTP server start failure: {e}"
+                );
             }
             return Err(format!("Failed to start MCP HTTP server: {err}"));
         }
@@ -1581,7 +1969,9 @@ fn set_mcp_http_server_enabled(
             debug_mcp_http_enabled: debug_enabled,
             debug_mcp_http_autoload: debug_autoload,
         }) {
-            tracing::error!("Failed to revert app settings after MCP HTTP server start failure: {e}");
+            tracing::error!(
+                "Failed to revert app settings after MCP HTTP server start failure: {e}"
+            );
         }
         return Err("Failed to start MCP HTTP server".to_string());
     }
@@ -1627,7 +2017,9 @@ fn set_debug_mcp_http_server_enabled(
                 debug_mcp_http_enabled: false,
                 debug_mcp_http_autoload: false,
             }) {
-                tracing::error!("Failed to revert app settings after debug MCP HTTP server start failure: {e}");
+                tracing::error!(
+                    "Failed to revert app settings after debug MCP HTTP server start failure: {e}"
+                );
             }
             return Err(format!("Failed to start debug MCP HTTP server: {err}"));
         }
@@ -1644,7 +2036,9 @@ fn set_debug_mcp_http_server_enabled(
             debug_mcp_http_enabled: false,
             debug_mcp_http_autoload: false,
         }) {
-            tracing::error!("Failed to revert app settings after debug MCP HTTP server start failure: {e}");
+            tracing::error!(
+                "Failed to revert app settings after debug MCP HTTP server start failure: {e}"
+            );
         }
         return Err("Failed to start debug MCP HTTP server".to_string());
     }
@@ -1858,14 +2252,11 @@ async fn create_admin_subprocess(
 ) -> Result<u64, String> {
     let backend_kind = resolve_requested_backend_kind(backend_kind)?;
     let path = resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
-    let session = BackendSession::spawn_admin(backend_kind, &path, &workspace_roots).await?;
+    let (session, rx) = BackendSession::spawn_admin(backend_kind, &path, &workspace_roots).await?;
 
-    let (id, rx) = {
+    let id = {
         let mut mgr = state.admin.lock().await;
-        let id = mgr.create(session);
-        let session = mgr.get(id).ok_or("Admin subprocess not found")?;
-        let rx = session.subscribe();
-        (id, rx)
+        mgr.create(session)
     };
 
     tokio::spawn(forward_admin_events(app, id, rx));
@@ -1875,17 +2266,9 @@ async fn create_admin_subprocess(
 async fn forward_admin_events(
     app: tauri::AppHandle,
     admin_id: u64,
-    mut rx: broadcast::Receiver<Value>,
+    mut rx: mpsc::UnboundedReceiver<Value>,
 ) {
-    loop {
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("Admin event receiver lagged, missed {n} events");
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => return,
-        };
+    while let Some(event) = rx.recv().await {
         let payload = AdminEventPayload { admin_id, event };
         if let Ok(debug_payload) = serde_json::to_value(&payload) {
             record_debug_event_from_app(&app, "admin", debug_payload);
@@ -2214,7 +2597,7 @@ async fn restart_subprocess(
     let resolved_path =
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state.inner(), false)?;
-    let session = BackendSession::spawn(
+    let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
         &workspace_roots,
@@ -2222,7 +2605,17 @@ async fn restart_subprocess(
         &startup_mcp_servers,
     )
     .await?;
-    let rx = session.subscribe();
+
+    let registration = serde_json::json!({
+        "kind": "ConversationRegistered",
+        "data": {
+            "agent_id": null,
+            "workspace_roots": &workspace_roots,
+            "backend_kind": backend_kind.as_str(),
+            "name": "Conversation",
+            "parent_agent_id": null,
+        }
+    });
 
     {
         let mut mgr = state.manager.lock().await;
@@ -2235,6 +2628,7 @@ async fn restart_subprocess(
         rx,
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
+        registration,
     ));
     Ok(())
 }
@@ -2488,11 +2882,11 @@ fn hide_main_window(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex as SyncMutex;
     use std::collections::HashMap;
     use std::process::Command;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
-    use parking_lot::Mutex as SyncMutex;
     use std::time::Duration;
 
     use super::*;
@@ -2647,7 +3041,6 @@ mod tests {
                 vec!["/tmp".into()],
                 "tycode".into(),
                 None,
-                true,
                 "test".into(),
             );
             assert!(runtime.mark_agent_running(info.agent_id, Some("Running...".into())));
@@ -2693,7 +3086,6 @@ mod tests {
                 vec!["/tmp".into()],
                 "tycode".into(),
                 None,
-                true,
                 "test".into(),
             );
             assert!(runtime.mark_agent_running(info.agent_id, Some("Running...".into())));

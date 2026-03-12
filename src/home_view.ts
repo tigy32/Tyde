@@ -21,6 +21,7 @@ export class HomeView {
   private cachedAgents: RuntimeAgent[] | null = null;
   private agentsLoading = false;
   private actionListenerController: AbortController | null = null;
+  private collapsedParents: Set<number> = new Set();
   onOpenWorkspace: (() => void) | null = null;
   onOpenRemoteWorkspace: (() => void) | null = null;
   onNewBridgeChat: ((backendOverride?: BackendKind) => void) | null = null;
@@ -107,6 +108,8 @@ export class HomeView {
     agentsTab.addEventListener("click", () => {
       if (this.activeTab === "agents") return;
       this.activeTab = "agents";
+      // Force a fresh fetch when switching to the agents tab
+      this.cachedAgents = null;
       this.render();
     });
 
@@ -140,53 +143,110 @@ export class HomeView {
       return section;
     }
 
-    const sorted = [...agents].sort(
-      (a, b) => b.created_at_ms - a.created_at_ms,
-    );
+    // Build parent→children map for hierarchy display
+    const childrenByParent = new Map<number, RuntimeAgent[]>();
+    const roots: RuntimeAgent[] = [];
+    for (const agent of agents) {
+      if (
+        agent.parent_agent_id != null &&
+        agents.some((a) => a.agent_id === agent.parent_agent_id)
+      ) {
+        const siblings = childrenByParent.get(agent.parent_agent_id) ?? [];
+        siblings.push(agent);
+        childrenByParent.set(agent.parent_agent_id, siblings);
+      } else {
+        roots.push(agent);
+      }
+    }
+
+    roots.sort((a, b) => b.created_at_ms - a.created_at_ms);
+
     const list = document.createElement("div");
     list.className = "home-agents-list";
 
-    for (const agent of sorted) {
-      list.appendChild(this.buildAgentCard(agent));
+    for (const agent of roots) {
+      const children = childrenByParent.get(agent.agent_id) ?? [];
+      list.appendChild(this.buildAgentCard(agent, children.length, false));
+      if (children.length > 0 && !this.collapsedParents.has(agent.agent_id)) {
+        children.sort((a, b) => a.created_at_ms - b.created_at_ms);
+        for (const child of children) {
+          list.appendChild(this.buildAgentCard(child, 0, true));
+        }
+      }
     }
 
     section.appendChild(list);
     return section;
   }
 
-  private buildAgentCard(agent: RuntimeAgent): HTMLElement {
+  private buildAgentCard(
+    agent: RuntimeAgent,
+    childCount: number,
+    isChild: boolean,
+  ): HTMLElement {
     const card = document.createElement("div");
     card.className = `agent-card agent-card-${this.agentStatusClass(agent.status)}`;
+    if (isChild) card.classList.add("agent-card-child");
     card.dataset.testid = "home-agent-card";
 
     const header = document.createElement("div");
     header.className = "agent-card-header";
 
+    const titleRow = document.createElement("div");
+    titleRow.className = "agent-card-title-row";
+
+    if (childCount > 0) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "agent-card-collapse-toggle";
+      toggle.dataset.testid = "agent-card-collapse";
+      const collapsed = this.collapsedParents.has(agent.agent_id);
+      toggle.textContent = collapsed ? "▶" : "▼";
+      toggle.title = collapsed ? "Expand sub-agents" : "Collapse sub-agents";
+      toggle.setAttribute("aria-label", toggle.title);
+      toggle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (this.collapsedParents.has(agent.agent_id)) {
+          this.collapsedParents.delete(agent.agent_id);
+        } else {
+          this.collapsedParents.add(agent.agent_id);
+        }
+        this.render();
+      });
+      titleRow.appendChild(toggle);
+    }
+
     const title = document.createElement("span");
     title.className = "agent-card-title";
     title.textContent = agent.name || `Agent #${agent.agent_id}`;
+    titleRow.appendChild(title);
+    header.appendChild(titleRow);
 
-    const statusEl = document.createElement("span");
-    if (agent.status === "running" || agent.status === "queued") {
-      statusEl.className = "loading-spinner";
-    } else if (agent.status === "waiting_input") {
-      statusEl.className = "agent-status-icon";
-      statusEl.textContent = "⏸";
-    } else {
-      statusEl.className = "agent-status-icon";
-      statusEl.textContent =
-        agent.status === "completed"
-          ? "✓"
-          : agent.status === "failed"
-            ? "✗"
-            : "⏸";
+    const headerRight = document.createElement("div");
+    headerRight.className = "agent-card-header-right";
+
+    if (childCount > 0) {
+      const badge = document.createElement("span");
+      badge.className = "agent-card-child-badge";
+      badge.dataset.testid = "agent-card-child-badge";
+      badge.textContent = `${childCount} sub-agent${childCount === 1 ? "" : "s"}`;
+      headerRight.appendChild(badge);
     }
 
-    header.appendChild(title);
-    header.appendChild(statusEl);
+    if (agent.status === "running" || agent.status === "queued") {
+      const statusEl = document.createElement("div");
+      statusEl.className = "loading-spinner";
+      headerRight.appendChild(statusEl);
+    } else if (agent.status === "waiting_input") {
+      const statusEl = document.createElement("span");
+      statusEl.className = "agent-status-icon";
+      statusEl.textContent = "⏸";
+      headerRight.appendChild(statusEl);
+    }
+    header.appendChild(headerRight);
     card.appendChild(header);
 
-    if (agent.workspace_roots.length > 0) {
+    if (!isChild && agent.workspace_roots.length > 0) {
       const workspace = document.createElement("div");
       workspace.className = "home-agent-workspace";
       const root = agent.workspace_roots[0];

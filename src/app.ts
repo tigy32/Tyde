@@ -2,6 +2,7 @@ import type { AgentCardAction, AgentInfo } from "./agents";
 import type {
   AdminEventPayload,
   ChatEventPayload,
+  ConversationRegisteredPayload,
   McpHttpServerSettings,
   RuntimeAgent,
 } from "./bridge";
@@ -75,7 +76,10 @@ export class AppController {
     this.registerKeyboardShortcuts();
     this.wireDockButtons();
 
-    await onChatEvent((payload) => this.routeChatEvent(payload));
+    await onChatEvent(
+      (registered) => this.handleConversationRegistered(registered),
+      (payload) => this.routeChatEvent(payload),
+    );
     await onAdminEvent((payload) => this.routeAdminEvent(payload));
     await registerDebugUiBridge();
     document
@@ -339,7 +343,7 @@ export class AppController {
     }
     const agents = view.getAgentsPanel().getAgents();
     const total = agents.length;
-    const active = agents.filter((agent) => agent.status === "running").length;
+    const active = agents.filter((agent) => agent.isTyping).length;
     return { total, active };
   }
 
@@ -569,21 +573,80 @@ export class AppController {
     document.querySelector(".app-title")!.textContent = "Tyde";
   }
 
+  private handleConversationRegistered(
+    payload: ConversationRegisteredPayload,
+  ): void {
+    const project = this.resolveProjectForWorkspaceRoots(
+      payload.data.workspace_roots,
+    );
+    if (!project) {
+      console.error(
+        `ConversationRegistered: no project found for workspace_roots`,
+        payload.data.workspace_roots,
+      );
+      return;
+    }
+    const view = this.workspaceViews.get(project.id);
+    if (!view) {
+      console.error(
+        `ConversationRegistered: no workspace view for project ${project.id}`,
+      );
+      return;
+    }
+
+    const agent: RuntimeAgent = {
+      agent_id: payload.data.agent_id ?? 0,
+      conversation_id: payload.conversation_id,
+      workspace_roots: payload.data.workspace_roots,
+      backend_kind: payload.data.backend_kind,
+      parent_agent_id: payload.data.parent_agent_id,
+      name: payload.data.name,
+      status: "running",
+      summary: "",
+      created_at_ms: Date.now(),
+      updated_at_ms: Date.now(),
+      ended_at_ms: null,
+      last_error: null,
+      last_message: null,
+    };
+    view.syncRuntimeAgent(agent);
+  }
+
+  private resolveProjectForWorkspaceRoots(
+    workspaceRoots: string[],
+  ): { id: string; workspacePath: string } | null {
+    let bestMatch: { id: string; workspacePath: string } | null = null;
+    let bestLength = -1;
+    for (const project of this.projectState.projects) {
+      const normalizedWorkspace = this.normalizeWorkspacePath(
+        project.workspacePath,
+      );
+      if (!normalizedWorkspace) continue;
+      const matches = workspaceRoots.some((root) => {
+        const normalizedRoot = this.normalizeWorkspacePath(root);
+        if (!normalizedRoot) return false;
+        return (
+          normalizedRoot === normalizedWorkspace ||
+          normalizedRoot.startsWith(`${normalizedWorkspace}/`) ||
+          normalizedWorkspace.startsWith(`${normalizedRoot}/`)
+        );
+      });
+      if (!matches) continue;
+      if (project.workspacePath.length <= bestLength) continue;
+      bestMatch = project;
+      bestLength = project.workspacePath.length;
+    }
+    return bestMatch;
+  }
+
   private routeChatEvent(payload: ChatEventPayload): void {
     if (this.tryRouteChatEvent(payload)) {
       return;
     }
-
-    void this.refreshRuntimeAgents()
-      .then(() => {
-        this.tryRouteChatEvent(payload);
-      })
-      .catch((err) =>
-        console.error(
-          "Failed to refresh runtime agents for chat event routing:",
-          err,
-        ),
-      );
+    console.error(
+      `routeChatEvent: no workspace view owns conversation ${payload.conversation_id}. ` +
+        `ConversationRegistered event may not have been received.`,
+    );
   }
 
   private tryRouteChatEvent(payload: ChatEventPayload): boolean {

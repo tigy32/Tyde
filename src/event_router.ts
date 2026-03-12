@@ -113,7 +113,7 @@ export class EventRouter {
         if (tab) tabManager.setStreaming(tab.id, true);
         if (agent) {
           agentsPanel.updateAgent(conversationId, {
-            status: "running",
+            isTyping: true,
             summary: "Running...",
           });
         }
@@ -148,7 +148,6 @@ export class EventRouter {
           if (event.data === true) {
             agentsPanel.updateAgent(conversationId, {
               isTyping: true,
-              status: "running",
               summary: "Running...",
             });
           } else {
@@ -160,7 +159,6 @@ export class EventRouter {
               normalizedSummary.startsWith("using ");
             agentsPanel.updateAgent(conversationId, {
               isTyping: false,
-              status: "completed",
               summary: waiting
                 ? "Waiting for your input"
                 : staleRunningSummary
@@ -181,7 +179,7 @@ export class EventRouter {
             "Tool execution failed",
           );
           agentsPanel.updateAgent(conversationId, {
-            ...(event.data.success ? {} : { status: "error" as const }),
+            ...(event.data.success ? {} : { hasError: true }),
             summary: event.data.success
               ? `Completed ${event.data.tool_name}`
               : failureSummary,
@@ -205,22 +203,18 @@ export class EventRouter {
           notifications.error("AI backend disconnected");
         }
         if (agent) {
-          if (agent.isTyping) {
-            agentsPanel.updateAgent(conversationId, { isTyping: false });
-          }
           if (event.data.exit_code !== 0) {
             agentsPanel.updateAgent(conversationId, {
               isTyping: false,
-              status: "error",
+              hasError: true,
               summary:
                 event.data.exit_code === null
                   ? "Backend exited unexpectedly"
                   : `Backend exited (${event.data.exit_code})`,
             });
-          } else if (agent.status === "running") {
+          } else {
             agentsPanel.updateAgent(conversationId, {
               isTyping: false,
-              status: "completed",
               summary: summarizeText(agent.summary, "Completed"),
             });
           }
@@ -236,7 +230,7 @@ export class EventRouter {
         if (agent) {
           agentsPanel.updateAgent(conversationId, {
             isTyping: false,
-            status: "error",
+            hasError: true,
             summary: event.data,
           });
         }
@@ -279,28 +273,16 @@ export class EventRouter {
         }
         break;
       case "ToolRequest":
-        if (event.kind === "ToolRequest") {
-          if (event.data.tool_name === "ask_user_question") {
-            this.waitingForUserInput.add(conversationId);
-          }
+        if (event.data.tool_name === "ask_user_question") {
+          this.waitingForUserInput.add(conversationId);
         }
-        if (event.kind === "ToolRequest" && agent) {
-          const isTyping =
-            this.typingByConversation.get(conversationId) === true;
-          if (isTyping) {
-            agentsPanel.updateAgent(conversationId, {
-              status: "running",
-              summary:
-                event.data.tool_name === "ask_user_question"
-                  ? "Waiting for your input"
-                  : `Using ${event.data.tool_name}...`,
-            });
-          } else if (event.data.tool_name === "ask_user_question") {
-            agentsPanel.updateAgent(conversationId, {
-              status: "completed",
-              summary: "Waiting for your input",
-            });
-          }
+        if (agent) {
+          agentsPanel.updateAgent(conversationId, {
+            summary:
+              event.data.tool_name === "ask_user_question"
+                ? "Waiting for your input"
+                : `Using ${event.data.tool_name}...`,
+          });
         }
         break;
       case "OperationCancelled":
