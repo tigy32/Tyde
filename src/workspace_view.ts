@@ -2183,6 +2183,7 @@ export class WorkspaceView {
       agentId: agent.agent_id,
       conversationId: agent.conversation_id,
       name,
+      agentType: agent.agent_type,
       summary:
         agent.summary.trim() || this.runtimeAgentSummaryFallback(agent.status),
       isTyping,

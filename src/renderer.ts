@@ -385,20 +385,7 @@ export function wrapWithTruncation(
 ): string {
   if (rawLength <= threshold) return html;
 
-  return `<div class="truncatable collapsed">
-    <div class="truncatable-content">${html}</div>
-    <div class="truncatable-fade"></div>
-    <button class="truncatable-toggle" onclick="
-      const container = this.closest('.truncatable');
-      if (container.classList.contains('collapsed')) {
-        container.classList.remove('collapsed');
-        this.textContent = 'Show less';
-      } else {
-        container.classList.add('collapsed');
-        this.textContent = 'Show more';
-      }
-    ">Show more</button>
-  </div>`;
+  return `<div class="truncatable collapsed"><div class="truncatable-content">${html}</div><div class="truncatable-fade"></div><button class="truncatable-toggle" onclick="const container = this.closest('.truncatable'); if (container.classList.contains('collapsed')) { container.classList.remove('collapsed'); this.textContent = 'Show less'; } else { container.classList.add('collapsed'); this.textContent = 'Show more'; }">Show more</button></div>`;
 }
 
 export function renderCommandOutput(

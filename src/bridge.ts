@@ -25,6 +25,7 @@ export interface ConversationRegisteredData {
   workspace_roots: string[];
   backend_kind: string;
   name: string;
+  agent_type: string | null;
   parent_agent_id: number | null;
 }
 
@@ -50,6 +51,7 @@ export interface RuntimeAgent {
   backend_kind: string;
   parent_agent_id: number | null;
   name: string;
+  agent_type: string | null;
   status: RuntimeAgentStatus;
   summary: string;
   created_at_ms: number;

@@ -35,6 +35,7 @@ pub trait SubAgentEmitter: Send + Sync {
         tool_use_id: String,
         name: String,
         description: String,
+        agent_type: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>;
 
     /// Called when a sub-agent completes (tool_result received for the spawn tool).
@@ -1363,7 +1364,7 @@ fn extract_spawn_description(input: Option<&Value>) -> String {
     String::new()
 }
 
-fn extract_spawn_info(block: &Value) -> Option<(String, String, String)> {
+fn extract_spawn_info(block: &Value) -> Option<(String, String, String, String)> {
     let name = block.get("name").and_then(Value::as_str)?;
     if !is_subagent_tool_name(name) {
         return None;
@@ -1371,12 +1372,27 @@ fn extract_spawn_info(block: &Value) -> Option<(String, String, String)> {
     let id = block.get("id").and_then(Value::as_str)?.to_string();
     let input = block.get("input");
     let description = extract_spawn_description(input);
-    let agent_name = input
+    let agent_type = input
         .and_then(|i| i.get("subagent_type").or(i.get("name")))
         .and_then(Value::as_str)
-        .unwrap_or(name)
+        .unwrap_or("")
         .to_string();
-    Some((id, agent_name, description))
+    // Prefer the short "description" field (3-5 word label) as the display name,
+    // falling back to subagent_type or the tool name.
+    let agent_name = input
+        .and_then(|i| i.get("description"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if !agent_type.is_empty() {
+                agent_type.clone()
+            } else {
+                name.to_string()
+            }
+        });
+    Some((id, agent_name, description, agent_type))
 }
 
 async fn read_claude_stdout(
@@ -1553,7 +1569,7 @@ fn track_pending_subagent_prompt_event(
             let Some(block) = event.get("content_block") else {
                 return;
             };
-            let Some((tool_use_id, _name, description)) = extract_spawn_info(block) else {
+            let Some((tool_use_id, _name, description, _agent_type)) = extract_spawn_info(block) else {
                 return;
             };
             pending_prompts.insert(
@@ -1628,17 +1644,17 @@ async fn detect_subagent_spawns(
         tracing::info!(
             "detect_subagent_spawns: found tool_use block: name={block_name} id={block_id}"
         );
-        if let Some((tool_use_id, name, description)) = extract_spawn_info(&block) {
+        if let Some((tool_use_id, name, description, agent_type)) = extract_spawn_info(&block) {
             if let Some(stream) = streams.get_mut(&tool_use_id) {
                 emit_subagent_task_prompt_if_needed(stream, &description);
                 continue; // Already registered
             }
             tracing::info!(
-                "detect_subagent_spawns: spawning sub-agent tool_use_id={tool_use_id} name={name}"
+                "detect_subagent_spawns: spawning sub-agent tool_use_id={tool_use_id} name={name} agent_type={agent_type}"
             );
             let has_explicit_task_prompt = !description.trim().is_empty();
             let handle = emitter
-                .on_subagent_spawned(tool_use_id.clone(), name, description)
+                .on_subagent_spawned(tool_use_id.clone(), name, description, agent_type)
                 .await;
             // Create a ClaudeInner that routes to the sub-agent's event channel
             let sa_inner = Arc::new(ClaudeInner {

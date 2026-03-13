@@ -6,6 +6,7 @@ export interface AgentInfo {
   agentId?: number;
   conversationId: number;
   name: string;
+  agentType?: string | null;
   summary: string;
   isTyping: boolean;
   hasError?: boolean;
@@ -218,6 +219,14 @@ export class AgentsPanel {
     const headerRight = document.createElement("div");
     headerRight.className = "agent-card-header-right";
 
+    if (agent.agentType) {
+      const typeBadge = document.createElement("span");
+      typeBadge.className = "agent-card-type-badge";
+      typeBadge.dataset.testid = "agent-card-type-badge";
+      typeBadge.textContent = agent.agentType;
+      headerRight.appendChild(typeBadge);
+    }
+
     if (childCount > 0) {
       const badge = document.createElement("span");
       badge.className = "agent-card-child-badge";
@@ -375,6 +384,7 @@ export class AgentsPanel {
       a.agentId === b.agentId &&
       a.conversationId === b.conversationId &&
       a.name === b.name &&
+      a.agentType === b.agentType &&
       a.summary === b.summary &&
       a.isTyping === b.isTyping &&
       a.hasError === b.hasError &&
