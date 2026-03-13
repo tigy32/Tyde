@@ -601,6 +601,7 @@ export class AppController {
       backend_kind: payload.data.backend_kind,
       parent_agent_id: payload.data.parent_agent_id,
       name: payload.data.name,
+      agent_type: payload.data.agent_type ?? null,
       status: "running",
       summary: "",
       created_at_ms: Date.now(),

@@ -523,8 +523,8 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-top: 8px;
-  padding-top: 6px;
+  margin-top: 4px;
+  padding-top: 3px;
   border-top: 1px solid var(--border-primary);
   font-size: calc(var(--base-font-size) * 0.8571);
   color: var(--text-tertiary);
@@ -1079,7 +1079,7 @@ body {
   border: none;
   border-left: none;
   border-radius: 4px;
-  padding: 4px 6px;
+  padding: 2px 6px;
   margin: 0;
   font-size: 0.9em;
   width: 100%;
@@ -1158,9 +1158,19 @@ body {
 }
 
 .tool-details.expanded {
-  max-height: 1200px;
-  margin-top: 8px;
-  overflow-x: auto;
+  max-height: none;
+  margin-top: 2px;
+}
+
+.tool-card-spawn .tool-details.expanded {
+  margin-top: 2px;
+}
+
+.spawn-result-content {
+  font-family: var(--font-sans);
+  font-size: calc(var(--base-font-size) * 0.93);
+  line-height: 1.5;
+  padding: 2px 4px;
 }
 
 .tool-request-summary {
@@ -3710,10 +3720,15 @@ body {
 
 /* === Tool Result Types === */
 .tool-result {
-  margin-top: 6px;
-  padding: 6px 8px;
+  margin-top: 0;
+  padding: 0;
   border-radius: 4px;
   font-size: 0.85em;
+}
+
+.tool-result-spawn {
+  margin-top: 2px;
+  padding: 0;
 }
 
 .tool-result-modify {
@@ -3789,8 +3804,6 @@ body {
 }
 
 .tool-result-output {
-  max-height: 200px;
-  overflow-y: auto;
   font-family: var(--font-mono);
   font-size: 0.9em;
   white-space: pre-wrap;
@@ -3798,7 +3811,6 @@ body {
 }
 
 .tool-result-output-full {
-  max-height: none;
   overflow: visible;
 }
 
@@ -3843,14 +3855,7 @@ body {
   font-family: var(--font-mono);
   font-size: 0.9em;
   white-space: pre-wrap;
-  max-height: 300px;
-  overflow-y: auto;
   color: var(--text-primary);
-}
-
-.tool-result-pre-full {
-  max-height: none;
-  overflow: visible;
 }
 
 .tool-result-error {
@@ -3953,8 +3958,9 @@ body {
 }
 
 .truncatable.collapsed .truncatable-content {
-  max-height: 400px;
+  max-height: 200px;
   overflow: hidden;
+  padding-bottom: 20px;
 }
 
 .truncatable-fade {
@@ -3964,30 +3970,39 @@ body {
 .truncatable.collapsed .truncatable-fade {
   display: block;
   position: absolute;
-  bottom: 28px;
+  bottom: 0;
   left: 0;
   right: 0;
-  height: 60px;
+  height: 28px;
   background: linear-gradient(transparent, var(--assistant-msg-bg));
   pointer-events: none;
+}
+
+.tool-result-section .truncatable.collapsed .truncatable-fade {
+  background: linear-gradient(transparent, var(--bg-secondary));
 }
 
 .truncatable-toggle {
   display: block;
   background: transparent;
-  border: 1px solid var(--border-secondary);
+  border: none;
   color: var(--accent-link);
   cursor: pointer;
-  font-size: 0.85em;
+  font-size: calc(var(--base-font-size) * 0.85);
   padding: 4px 12px;
-  border-radius: 3px;
-  margin-top: 8px;
   width: 100%;
   text-align: center;
 }
 
+.truncatable.collapsed .truncatable-toggle {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+}
+
 .truncatable-toggle:hover {
-  background: var(--bg-tertiary);
+  text-decoration: underline;
 }
 
 /* === Stream Error Banner === */
@@ -8240,7 +8255,6 @@ body {
 .inline-diff-preview {
   border: 1px solid var(--border-primary);
   border-radius: 4px;
-  overflow: hidden;
   font-size: 12px;
 }
 
@@ -8821,6 +8835,16 @@ body {
 .agent-card-collapse-toggle:hover {
   background: var(--bg-tertiary);
   color: var(--text-primary);
+}
+
+.agent-card-type-badge {
+  font-size: calc(var(--base-font-size) * 0.7143);
+  color: var(--accent-link);
+  background: color-mix(in srgb, var(--accent-link) 15%, transparent);
+  padding: 1px 6px;
+  border-radius: 8px;
+  white-space: nowrap;
+  text-transform: capitalize;
 }
 
 .agent-card-child-badge {

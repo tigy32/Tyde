@@ -33,6 +33,7 @@ pub struct AgentInfo {
     pub backend_kind: String,
     pub parent_agent_id: Option<u64>,
     pub name: String,
+    pub agent_type: Option<String>,
     pub status: AgentStatus,
     pub summary: String,
     pub created_at_ms: u64,
@@ -162,6 +163,7 @@ impl AgentRuntime {
             backend_kind,
             parent_agent_id,
             name,
+            agent_type: None,
             status: AgentStatus::Queued,
             summary: "Queued".to_string(),
             created_at_ms: now,
@@ -180,6 +182,12 @@ impl AgentRuntime {
             Some("Queued".to_string()),
         );
         info
+    }
+
+    pub fn update_agent_type(&mut self, agent_id: u64, agent_type: Option<String>) {
+        if let Some(info) = self.agents.get_mut(&agent_id) {
+            info.agent_type = agent_type;
+        }
     }
 
     pub fn mark_agent_running(&mut self, agent_id: u64, summary: Option<String>) -> bool {

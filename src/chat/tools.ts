@@ -1,6 +1,6 @@
 import { createTwoFilesPatch } from "diff";
 import type { ToolUseData } from "../core_types";
-import { escapeHtml } from "../renderer";
+import { escapeHtml, renderContent, wrapWithTruncation } from "../renderer";
 import type { ToolExecutionResult, ToolRequestType } from "../types";
 
 export type ToolOutputMode = "summary" | "compact" | "verbose";
@@ -8,7 +8,6 @@ export type ToolOutputMode = "summary" | "compact" | "verbose";
 export type DiffDisplayMode = ToolOutputMode;
 const TOOL_OUTPUT_MODE_KEY = "tyde-tool-output-mode";
 const LEGACY_DIFF_MODE_KEY = "tyde-diff-display-mode";
-const DEFAULT_MAX_DIFF_LINES = 20;
 const COMPACT_MAX_READ_FILES = 8;
 const COMPACT_MAX_SEARCH_TYPES = 12;
 
@@ -189,10 +188,9 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-export function createPreBlock(text: string, fullHeight = false): HTMLElement {
+export function createPreBlock(text: string): HTMLElement {
   const pre = document.createElement("pre");
   pre.className = "tool-result-pre";
-  if (fullHeight) pre.classList.add("tool-result-pre-full");
   pre.textContent = text;
   return pre;
 }
@@ -204,8 +202,12 @@ export function buildCommandOutputBlock(
 ): HTMLElement {
   const wrapper = document.createElement("div");
   wrapper.className = `tool-result-output ${className}`;
-  if (fullHeight) wrapper.classList.add("tool-result-output-full");
-  wrapper.appendChild(createPreBlock(output, fullHeight));
+  if (fullHeight) {
+    wrapper.appendChild(createPreBlock(output));
+  } else {
+    const pre = createPreBlock(output);
+    wrapper.innerHTML = wrapWithTruncation(pre.outerHTML, output.length, 0);
+  }
   return wrapper;
 }
 
@@ -230,7 +232,7 @@ function renderInlineDiff(
   before: string,
   after: string,
   filePath: string,
-  maxLines: number | null,
+  truncate: boolean,
 ): HTMLElement {
   const patch = createTwoFilesPatch(filePath, filePath, before, after, "", "", {
     context: 2,
@@ -246,10 +248,6 @@ function renderInlineDiff(
   }
 
   const diffLines = lines.slice(startIdx);
-  const totalLines = diffLines.length;
-  const displayLines =
-    maxLines !== null ? diffLines.slice(0, maxLines) : diffLines;
-  const truncated = maxLines !== null && totalLines > maxLines;
 
   const container = document.createElement("div");
   container.className = "inline-diff-preview";
@@ -257,7 +255,7 @@ function renderInlineDiff(
   const pre = document.createElement("pre");
   pre.className = "inline-diff-code";
 
-  for (const line of displayLines) {
+  for (const line of diffLines) {
     const lineEl = document.createElement("div");
     lineEl.className = "inline-diff-line";
 
@@ -277,11 +275,14 @@ function renderInlineDiff(
 
   container.appendChild(pre);
 
-  if (truncated) {
-    const indicator = document.createElement("div");
-    indicator.className = "inline-diff-truncated";
-    indicator.textContent = `[${totalLines - maxLines!} more lines...]`;
-    container.appendChild(indicator);
+  if (truncate) {
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = wrapWithTruncation(
+      container.outerHTML,
+      diffLines.length,
+      0,
+    );
+    return wrapper;
   }
 
   return container;
@@ -466,6 +467,9 @@ function toolRequestHeaderDetail(toolType: ToolRequestType): string {
     case "RunCommand":
       return formatHeaderDetail(toolType.command, 96);
     case "ReadFiles":
+      if (toolType.file_paths.length === 1) {
+        return formatHeaderDetail(toolType.file_paths[0], 72);
+      }
       return `${toolType.file_paths.length} ${suffixForCount(toolType.file_paths.length, "file", "files")}`;
     case "SearchTypes":
       return `search ${toolType.type_name}`;
@@ -479,6 +483,7 @@ function toolRequestHeaderDetail(toolType: ToolRequestType): string {
 function completionHeaderDetail(
   card: HTMLElement,
   result: ToolExecutionResult,
+  toolName: string,
 ): string {
   const base = cardHeaderBaseDetail(card);
   switch (result.kind) {
@@ -498,6 +503,9 @@ function completionHeaderDetail(
         0,
       );
       const fileCount = result.files.length;
+      if (fileCount === 1) {
+        return `${formatHeaderDetail(result.files[0].path, 72)} · ${formatBytes(totalBytes)}`;
+      }
       return `read ${fileCount} ${suffixForCount(fileCount, "file", "files")} · ${formatBytes(totalBytes)}`;
     }
     case "SearchTypes":
@@ -511,6 +519,9 @@ function completionHeaderDetail(
     case "Error":
       return `error · ${summarizeSingleLine(result.short_message, 90)}`;
     case "Other": {
+      if (isSpawnTool(toolName) && typeof result.result === "string") {
+        return `response · ${formatBytes(result.result.length)}`;
+      }
       const serialized = safeJsonStringify(result.result, false);
       return `result json · ${formatBytes(serialized.length)}`;
     }
@@ -534,14 +545,10 @@ export function toolRequestSummary(
       });
       return null;
     }
-    case "RunCommand": {
-      const wrap = document.createElement("div");
-      wrap.className = "tool-request-summary";
-      wrap.innerHTML = `<div class="tool-request-row"><code class="inline-code">${escapeHtml(toolType.command)}</code></div>
-          <div class="tool-request-meta">${escapeHtml(toolType.working_directory)}</div>`;
-      return wrap;
-    }
+    case "RunCommand":
+      return null;
     case "ReadFiles": {
+      if (toolType.file_paths.length === 1) return null;
       const wrap = document.createElement("div");
       wrap.className = "tool-request-summary";
       const preview = toolType.file_paths
@@ -588,6 +595,7 @@ export function toolResultElement(
   state: ToolState,
   toolCallId: string,
   result: ToolExecutionResult,
+  toolName: string,
 ): HTMLElement | null {
   switch (result.kind) {
     case "ModifyFile": {
@@ -600,13 +608,12 @@ export function toolResultElement(
         if (mode === "summary" || !diffEntry) return;
         const diffContainer = document.createElement("div");
         diffContainer.className = "inline-diff-container";
-        const maxLines = mode === "compact" ? DEFAULT_MAX_DIFF_LINES : null;
         diffContainer.appendChild(
           renderInlineDiff(
             diffEntry.before,
             diffEntry.after,
             diffEntry.filePath,
-            maxLines,
+            mode === "compact",
           ),
         );
         root.appendChild(diffContainer);
@@ -625,60 +632,31 @@ export function toolResultElement(
         const hasStderr = stderrLines > 0;
 
         if (mode === "summary") {
-          const parts = [`exit ${result.exit_code}`];
-          if (hasStdout) parts.push(`stdout ${stdoutLines}L`);
-          if (hasStderr) parts.push(`stderr ${stderrLines}L`);
-          if (!hasStdout && !hasStderr) parts.push("no output");
-          root.appendChild(createMetaLine(parts.join(" · ")));
           return;
         }
 
         const fullHeight = mode === "verbose";
-        const header = document.createElement("div");
-        header.className = "tool-result-command-header";
-
-        const icon = document.createElement("span");
-        icon.className = "tool-result-icon";
-        icon.textContent = "▶";
-
-        const exit = document.createElement("span");
-        exit.className =
-          result.exit_code === 0
-            ? "tool-result-exit-success"
-            : "tool-result-exit-failure";
-        exit.textContent = `exit ${result.exit_code}`;
-        header.append(icon, exit);
-        root.appendChild(header);
 
         if (!hasStdout && !hasStderr) {
-          root.appendChild(createMetaLine("No command output"));
           return;
         }
 
         if (hasStdout) {
           root.appendChild(
-            createToolResultSection(
-              `stdout (${stdoutLines} lines)`,
-              buildCommandOutputBlock(
-                result.stdout,
-                "tool-result-stdout",
-                fullHeight,
-              ),
-              fullHeight || (result.exit_code === 0 && !hasStderr),
+            buildCommandOutputBlock(
+              result.stdout,
+              "tool-result-stdout",
+              fullHeight,
             ),
           );
         }
 
         if (hasStderr) {
           root.appendChild(
-            createToolResultSection(
-              `stderr (${stderrLines} lines)`,
-              buildCommandOutputBlock(
-                result.stderr,
-                "tool-result-stderr",
-                fullHeight,
-              ),
-              fullHeight || result.exit_code !== 0,
+            buildCommandOutputBlock(
+              result.stderr,
+              "tool-result-stderr",
+              fullHeight,
             ),
           );
         }
@@ -689,19 +667,12 @@ export function toolResultElement(
     case "ReadFiles": {
       const root = document.createElement("div");
       root.className = "tool-result tool-result-read";
-      const totalBytes = result.files.reduce(
-        (sum, file) => sum + file.bytes,
-        0,
-      );
       const updateResult = (mode: ToolOutputMode) => {
         root.replaceChildren();
-        if (mode === "summary") {
-          const suffix = result.files.length === 1 ? "" : "s";
-          root.appendChild(
-            createMetaLine(
-              `Read ${result.files.length} file${suffix} · ${formatBytes(totalBytes)}`,
-            ),
-          );
+        if (
+          mode === "summary" ||
+          (mode === "compact" && result.files.length === 1)
+        ) {
           return;
         }
 
@@ -787,10 +758,7 @@ export function toolResultElement(
         root.appendChild(
           createToolResultSection(
             "Documentation",
-            createPreBlock(
-              documentation || "No documentation returned",
-              fullHeight,
-            ),
+            createPreBlock(documentation || "No documentation returned"),
             fullHeight,
           ),
         );
@@ -832,7 +800,7 @@ export function toolResultElement(
           root.appendChild(
             createToolResultSection(
               "Details",
-              createPreBlock(result.detailed_message, fullHeight),
+              createPreBlock(result.detailed_message),
               true,
             ),
           );
@@ -842,6 +810,9 @@ export function toolResultElement(
       return root;
     }
     case "Other": {
+      if (isSpawnTool(toolName) && typeof result.result === "string") {
+        return renderSpawnToolResult(result.result);
+      }
       const root = document.createElement("div");
       root.className = "tool-result tool-result-docs";
       const jsonCompact = safeJsonStringify(result.result, false);
@@ -857,7 +828,7 @@ export function toolResultElement(
         root.appendChild(
           createToolResultSection(
             "Result JSON",
-            createPreBlock(jsonPretty, mode === "verbose"),
+            createPreBlock(jsonPretty),
             mode === "verbose",
           ),
         );
@@ -866,6 +837,25 @@ export function toolResultElement(
       return root;
     }
   }
+}
+
+function renderSpawnToolResult(text: string): HTMLElement {
+  const root = document.createElement("div");
+  root.className = "tool-result tool-result-spawn";
+  const rendered = renderContent(text);
+  const updateResult = (mode: ToolOutputMode) => {
+    root.replaceChildren();
+    if (mode === "summary") return;
+    const content = document.createElement("div");
+    content.className = "message-content spawn-result-content";
+    content.innerHTML =
+      mode === "verbose"
+        ? rendered
+        : wrapWithTruncation(rendered, text.length, 0);
+    root.appendChild(content);
+  };
+  bindToolOutputRenderer(root, updateResult);
+  return root;
 }
 
 function createToggleHandler(
@@ -1091,7 +1081,7 @@ export function handleToolRequest(
 export function handleToolCompleted(
   state: ToolState,
   toolCallId: string,
-  _toolName: string,
+  toolName: string,
   toolResult: ToolExecutionResult,
   success: boolean,
   scrollToBottom: () => void,
@@ -1102,7 +1092,7 @@ export function handleToolCompleted(
   const header = card.querySelector(".tool-card-header") as HTMLElement | null;
   const statusEl = card.querySelector(".tool-status-text");
 
-  setCardHeaderDetail(card, completionHeaderDetail(card, toolResult));
+  setCardHeaderDetail(card, completionHeaderDetail(card, toolResult, toolName));
 
   if (toolResult.kind === "ModifyFile" && header && statusEl) {
     const diffId = state.toolDiffByCall.get(toolCallId);
@@ -1127,7 +1117,7 @@ export function handleToolCompleted(
   }
 
   const details = card.querySelector(".tool-details") as HTMLElement | null;
-  const resultEl = toolResultElement(state, toolCallId, toolResult);
+  const resultEl = toolResultElement(state, toolCallId, toolResult, toolName);
   if (details && resultEl) {
     details.appendChild(resultEl);
   }

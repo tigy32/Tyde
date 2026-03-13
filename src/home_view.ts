@@ -225,6 +225,14 @@ export class HomeView {
     const headerRight = document.createElement("div");
     headerRight.className = "agent-card-header-right";
 
+    if (agent.agent_type) {
+      const typeBadge = document.createElement("span");
+      typeBadge.className = "agent-card-type-badge";
+      typeBadge.dataset.testid = "agent-card-type-badge";
+      typeBadge.textContent = agent.agent_type;
+      headerRight.appendChild(typeBadge);
+    }
+
     if (childCount > 0) {
       const badge = document.createElement("span");
       badge.className = "agent-card-child-badge";
@@ -408,6 +416,8 @@ export class HomeView {
       const candidate = next[index];
       return (
         agent.agent_id === candidate.agent_id &&
+        agent.name === candidate.name &&
+        agent.agent_type === candidate.agent_type &&
         agent.status === candidate.status &&
         agent.summary === candidate.summary &&
         agent.updated_at_ms === candidate.updated_at_ms &&

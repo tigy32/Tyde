@@ -102,6 +102,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
         tool_use_id: String,
         name: String,
         description: String,
+        agent_type: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>> {
         Box::pin(async move {
             let parent_agent_id = self.resolve_parent_agent_id().await;
@@ -123,13 +124,15 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                 } else {
                     name
                 };
-                let info = runtime.register_agent(
+                let mut info = runtime.register_agent(
                     conversation_id,
                     self.workspace_roots.clone(),
                     "claude".to_string(),
                     parent_agent_id,
                     display_name,
                 );
+                info.agent_type = if agent_type.is_empty() { None } else { Some(agent_type) };
+                runtime.update_agent_type(info.agent_id, info.agent_type.clone());
                 runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
                 info
             };
@@ -154,6 +157,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                     "workspace_roots": self.workspace_roots,
                     "backend_kind": "claude",
                     "name": &agent_info.name,
+                    "agent_type": &agent_info.agent_type,
                     "parent_agent_id": parent_agent_id,
                 }
             });
