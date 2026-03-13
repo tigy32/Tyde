@@ -21,6 +21,8 @@ export class ProjectSidebar {
   private onSwitchToHome: () => void;
   private onAddProject: () => void;
   private onRemoveProject: (id: string) => void;
+  onCreateWorkbench: ((parentProjectId: string) => void) | null = null;
+  onRemoveWorkbench: ((projectId: string) => void) | null = null;
 
   constructor(
     container: HTMLElement,
@@ -81,13 +83,17 @@ export class ProjectSidebar {
     homeItem.addEventListener("click", () => this.onSwitchToHome());
     this.container.appendChild(homeItem);
 
-    // Project list
+    // Project list — render parents with their workbenches grouped
     const list = document.createElement("div");
     list.className = "rail-projects";
 
     for (const project of this.stateManager.projects) {
-      const item = this.createProjectItem(project);
-      list.appendChild(item);
+      // Skip workbenches here — they're rendered under their parent
+      if (project.parentProjectId) continue;
+      list.appendChild(this.createProjectItem(project));
+      for (const workbench of this.stateManager.getWorkbenches(project.id)) {
+        list.appendChild(this.createWorkbenchItem(workbench));
+      }
     }
 
     this.container.appendChild(list);
@@ -152,6 +158,51 @@ export class ProjectSidebar {
     return item;
   }
 
+  private createWorkbenchItem(project: Project): HTMLElement {
+    const item = document.createElement("div");
+    item.className = "rail-project-item rail-workbench-item";
+    item.dataset.testid = "rail-workbench-item";
+    item.dataset.projectId = project.id;
+
+    if (project.id === this.stateManager.activeProjectId) {
+      item.classList.add("active");
+    }
+
+    // Workbench icon (branch-like indicator)
+    const avatar = document.createElement("div");
+    avatar.className = "rail-avatar rail-workbench-avatar";
+    avatar.textContent = "⑂";
+    const colorIndex = project.id.charCodeAt(0) % AVATAR_COLORS.length;
+    avatar.style.background = AVATAR_COLORS[colorIndex];
+
+    // Activity dot
+    if (project.status !== "idle") {
+      const dot = document.createElement("span");
+      dot.className = `rail-activity-dot ${project.status}`;
+      avatar.appendChild(dot);
+    }
+
+    item.appendChild(avatar);
+
+    // Label
+    const label = document.createElement("span");
+    label.className = "rail-project-name";
+    label.dataset.testid = "rail-project-name";
+    label.textContent = project.name;
+    item.appendChild(label);
+
+    // Click to switch
+    item.addEventListener("click", () => this.onSwitchProject(project.id));
+
+    // Context menu
+    item.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      this.showWorkbenchContextMenu(e.clientX, e.clientY, project);
+    });
+
+    return item;
+  }
+
   private showContextMenu(x: number, y: number, project: Project): void {
     this.dismissContextMenu();
 
@@ -177,6 +228,15 @@ export class ProjectSidebar {
       this.stateManager.renameProject(project.id, trimmed);
     });
 
+    const newWorkbenchItem = document.createElement("div");
+    newWorkbenchItem.className = "rail-context-menu-item";
+    newWorkbenchItem.dataset.testid = "rail-context-new-workbench";
+    newWorkbenchItem.textContent = "New Workbench";
+    newWorkbenchItem.addEventListener("click", () => {
+      menu.remove();
+      this.onCreateWorkbench?.(project.id);
+    });
+
     const closeItem = document.createElement("div");
     closeItem.className = "rail-context-menu-item";
     closeItem.textContent = "Close Project";
@@ -186,10 +246,61 @@ export class ProjectSidebar {
     });
 
     menu.appendChild(renameItem);
+    menu.appendChild(newWorkbenchItem);
     menu.appendChild(closeItem);
     document.body.appendChild(menu);
 
     // Dismiss on outside click
+    const dismiss = () => {
+      menu.remove();
+      document.removeEventListener("click", dismiss);
+    };
+    document.addEventListener("click", dismiss, { once: true });
+  }
+
+  private showWorkbenchContextMenu(
+    x: number,
+    y: number,
+    project: Project,
+  ): void {
+    this.dismissContextMenu();
+
+    const menu = document.createElement("div");
+    menu.className = "rail-context-menu";
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+
+    const renameItem = document.createElement("div");
+    renameItem.className = "rail-context-menu-item";
+    renameItem.textContent = "Rename";
+    renameItem.addEventListener("click", async () => {
+      menu.remove();
+      const name = await promptForText({
+        title: "Workbench Name",
+        defaultValue: project.name,
+        placeholder: "Workbench name",
+        confirmLabel: "Rename",
+      });
+      if (name === null) return;
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      this.stateManager.renameProject(project.id, trimmed);
+    });
+
+    const removeItem = document.createElement("div");
+    removeItem.className =
+      "rail-context-menu-item rail-context-menu-item-danger";
+    removeItem.dataset.testid = "rail-context-remove-workbench";
+    removeItem.textContent = "Remove Workbench";
+    removeItem.addEventListener("click", () => {
+      menu.remove();
+      this.onRemoveWorkbench?.(project.id);
+    });
+
+    menu.appendChild(renameItem);
+    menu.appendChild(removeItem);
+    document.body.appendChild(menu);
+
     const dismiss = () => {
       menu.remove();
       document.removeEventListener("click", dismiss);

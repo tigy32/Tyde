@@ -2447,6 +2447,20 @@ async fn git_diff_base_content(
 }
 
 #[tauri::command]
+async fn git_worktree_add(
+    working_dir: String,
+    path: String,
+    branch: String,
+) -> Result<(), String> {
+    git_service::git_worktree_add(&working_dir, &path, &branch).await
+}
+
+#[tauri::command]
+async fn git_worktree_remove(working_dir: String, path: String) -> Result<(), String> {
+    git_service::git_worktree_remove(&working_dir, &path).await
+}
+
+#[tauri::command]
 async fn git_discard(working_dir: String, paths: Vec<String>) -> Result<(), String> {
     git_service::git_discard(&working_dir, &paths).await
 }
@@ -2819,6 +2833,8 @@ pub fn run() {
             git_diff,
             git_diff_base_content,
             git_discard,
+            git_worktree_add,
+            git_worktree_remove,
             list_directory,
             read_file_content,
             sync_file_watch_paths,

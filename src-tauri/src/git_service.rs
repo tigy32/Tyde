@@ -291,6 +291,20 @@ pub async fn git_current_branch(working_dir: &str) -> Result<String, String> {
     }
 }
 
+pub async fn git_worktree_add(
+    working_dir: &str,
+    path: &str,
+    branch: &str,
+) -> Result<(), String> {
+    run_git(working_dir, &["worktree", "add", "-b", branch, path]).await?;
+    Ok(())
+}
+
+pub async fn git_worktree_remove(working_dir: &str, path: &str) -> Result<(), String> {
+    run_git(working_dir, &["worktree", "remove", "--force", path]).await?;
+    Ok(())
+}
+
 pub async fn git_discard(working_dir: &str, paths: &[String]) -> Result<(), String> {
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
 

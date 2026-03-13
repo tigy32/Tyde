@@ -596,7 +596,16 @@ export class HomeView {
     grid.className = "home-project-grid";
 
     for (const project of this.projectState.projects) {
+      // Skip workbenches — they're rendered under their parent
+      if (project.parentProjectId) continue;
       grid.appendChild(this.buildProjectCard(project));
+
+      const workbenches = this.projectState.getWorkbenches(project.id);
+      for (const wb of workbenches) {
+        const wbCard = this.buildProjectCard(wb);
+        wbCard.classList.add("home-workbench-card");
+        grid.appendChild(wbCard);
+      }
     }
 
     section.appendChild(grid);
@@ -614,7 +623,9 @@ export class HomeView {
 
     const avatar = document.createElement("div");
     avatar.className = "home-card-avatar";
-    avatar.textContent = project.name.charAt(0).toUpperCase();
+    avatar.textContent = project.parentProjectId
+      ? "⑂"
+      : project.name.charAt(0).toUpperCase();
 
     const nameCol = document.createElement("div");
     nameCol.className = "home-card-name-col";

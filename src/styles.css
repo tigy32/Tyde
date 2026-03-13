@@ -7321,6 +7321,37 @@ body {
   cursor: pointer;
 }
 
+.rail-context-menu-item:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.05));
+}
+
+.rail-context-menu-item-danger {
+  color: #ef5350;
+}
+
+.rail-context-menu-item-danger:hover {
+  background: rgba(239, 83, 80, 0.1);
+}
+
+/* Workbench items in the project rail */
+.rail-workbench-item {
+  padding-left: 20px;
+}
+
+.rail-workbench-avatar {
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  border-radius: 4px;
+  font-size: calc(var(--base-font-size) * 0.857);
+}
+
+/* Workbench cards in home view */
+.home-workbench-card {
+  margin-left: 24px;
+  border-left: 2px solid var(--border-color, #2a2a3e);
+}
+
 /* === Workbench Layout (VSCode-style) === */
 #tiling-root {
   display: flex;

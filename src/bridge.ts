@@ -372,6 +372,31 @@ export async function gitDiscard(
   });
 }
 
+export async function gitWorktreeAdd(
+  workingDir: string,
+  path: string,
+  branch: string,
+): Promise<void> {
+  return invoke<void>("git_worktree_add", { workingDir, path, branch }).catch(
+    (err) => {
+      console.error("bridge: gitWorktreeAdd failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
+export async function gitWorktreeRemove(
+  workingDir: string,
+  path: string,
+): Promise<void> {
+  return invoke<void>("git_worktree_remove", { workingDir, path }).catch(
+    (err) => {
+      console.error("bridge: gitWorktreeRemove failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
 export async function listDirectory(
   path: string,
   showHidden: boolean = false,

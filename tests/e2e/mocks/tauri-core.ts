@@ -780,6 +780,10 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       }
       return [];
 
+    case 'git_worktree_add':
+    case 'git_worktree_remove':
+      return null;
+
     case 'git_stage':
     case 'git_unstage':
     case 'git_commit':

@@ -22,6 +22,7 @@ High-confidence smoke tests that validate end-to-end user workflows. Each test f
 | `settings.test.ts` | Settings overlay: open/close, backend data, providers, profiles, module schemas |
 | `remote.test.ts` | Remote SSH: connection dialog, step completion, auto-dismiss, failure handling |
 | `git.test.ts` | Git panel: non-git project handling |
+| `workbench.test.ts` | Workbenches: create git worktree, switch, rename, remove, sidebar/home grouping |
 
 ## Fixture Pattern
 

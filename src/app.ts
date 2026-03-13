@@ -10,6 +10,8 @@ import {
   addRecentWorkspace,
   cancelConversation,
   closeConversation,
+  gitWorktreeAdd,
+  gitWorktreeRemove,
   interruptAgent,
   listAgents,
   onAdminEvent,
@@ -242,7 +244,7 @@ export class AppController {
     this.settingsPanel.refreshMcpHttpServerSettings();
 
     const projectRail = document.getElementById("project-rail")!;
-    new ProjectSidebar(
+    const sidebar = new ProjectSidebar(
       projectRail,
       this.projectState,
       (id: string) => this.switchToWorkspace(id),
@@ -250,6 +252,12 @@ export class AppController {
       () => this.handleAddProject(),
       (id) => this.handleRemoveProject(id),
     );
+    sidebar.onCreateWorkbench = (parentId) => {
+      void this.createWorkbench(parentId);
+    };
+    sidebar.onRemoveWorkbench = (projectId) => {
+      void this.removeWorkbench(projectId);
+    };
 
     const sidebarOnChange = this.projectState.onChange;
     this.projectState.onChange = () => {
@@ -822,6 +830,100 @@ export class AppController {
       return;
     }
 
+    this.switchToHome();
+  }
+
+  private async createWorkbench(parentProjectId: string): Promise<void> {
+    const parent = this.projectState.projects.find(
+      (p) => p.id === parentProjectId,
+    );
+    if (!parent) return;
+
+    const branchName = await promptForText({
+      title: "New Workbench",
+      description: `Create a git worktree branch from "${parent.name}"`,
+      placeholder: "Branch name (e.g. feature-login)",
+      confirmLabel: "Create",
+      validate: (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) return "Branch name is required";
+        if (/\s/.test(trimmed)) return "Branch name cannot contain spaces";
+        if (/[~^:?*[\\]/.test(trimmed))
+          return "Branch name contains invalid characters";
+        return null;
+      },
+    });
+    if (branchName === null) return;
+    const branch = branchName.trim();
+
+    const parentPath = parent.workspacePath;
+    const worktreePath = `${parentPath}--${branch}`;
+
+    try {
+      await gitWorktreeAdd(parentPath, worktreePath, branch);
+    } catch (err) {
+      this.notifications.error(
+        `Failed to create workbench: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    const project = this.projectState.addWorkbench(
+      parentProjectId,
+      worktreePath,
+      branch,
+      "git-worktree",
+    );
+    this.switchToWorkspace(project.id);
+  }
+
+  private async removeWorkbench(projectId: string): Promise<void> {
+    const project = this.projectState.projects.find((p) => p.id === projectId);
+    if (!project || !project.parentProjectId) return;
+
+    const parent = this.projectState.projects.find(
+      (p) => p.id === project.parentProjectId,
+    );
+    if (!parent) return;
+
+    // Close workspace view
+    const view = this.workspaceViews.get(projectId);
+    if (view) {
+      const conversationIds = view.getConversationIds();
+      for (const cid of conversationIds) {
+        const tab = view.getTabManager().getTabByConversationId(cid);
+        if (tab) {
+          view.getTabManager().closeTab(tab.id);
+        } else {
+          closeConversation(cid).catch((err) =>
+            console.error(
+              "Failed to close conversation on workbench removal:",
+              err,
+            ),
+          );
+        }
+      }
+      view.destroy();
+      view.root.remove();
+      this.workspaceViews.delete(projectId);
+    }
+
+    // Remove the git worktree
+    try {
+      await gitWorktreeRemove(parent.workspacePath, project.workspacePath);
+    } catch (err) {
+      this.notifications.error(
+        `Failed to remove workbench: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    this.projectState.removeProject(projectId);
+
+    const active = this.projectState.getActiveProject();
+    if (active) {
+      this.switchToWorkspace(active.id);
+      return;
+    }
     this.switchToHome();
   }
 

@@ -107,8 +107,11 @@ export const sel = {
   // Rail
   railAddBtn: '[data-testid="rail-add-btn"]',
   railProjectItem: '[data-testid="rail-project-item"]',
+  railWorkbenchItem: '[data-testid="rail-workbench-item"]',
   railProjectName: '[data-testid="rail-project-name"]',
   railHomeItem: '[data-testid="rail-home-item"]',
+  railContextNewWorkbench: '[data-testid="rail-context-new-workbench"]',
+  railContextRemoveWorkbench: '[data-testid="rail-context-remove-workbench"]',
 
   // Dock
   leftDockBtn: '[data-testid="left-dock-btn"]',

@@ -1,5 +1,7 @@
 export type ProjectStatus = "idle" | "active" | "needs_attention";
 
+export type WorkbenchKind = "git-worktree";
+
 export interface Project {
   id: string;
   name: string;
@@ -7,6 +9,8 @@ export interface Project {
   conversationIds: number[];
   activeConversationId: number | null;
   status: ProjectStatus;
+  parentProjectId: string | null;
+  workbenchKind: WorkbenchKind | null;
 }
 
 interface PersistedState {
@@ -14,6 +18,8 @@ interface PersistedState {
     id: string;
     name: string;
     workspacePath: string;
+    parentProjectId?: string | null;
+    workbenchKind?: WorkbenchKind | null;
   }>;
   activeProjectId: string | null;
   sidebarCollapsed: boolean;
@@ -43,6 +49,8 @@ export class ProjectStateManager {
       conversationIds: [],
       activeConversationId: null,
       status: "idle",
+      parentProjectId: null,
+      workbenchKind: null,
     };
     this.projects.push(project);
     this.onChange?.();
@@ -50,9 +58,65 @@ export class ProjectStateManager {
     return project;
   }
 
+  addWorkbench(
+    parentProjectId: string,
+    workspacePath: string,
+    name: string,
+    kind: WorkbenchKind,
+  ): Project {
+    const project: Project = {
+      id: crypto.randomUUID(),
+      name,
+      workspacePath,
+      conversationIds: [],
+      activeConversationId: null,
+      status: "idle",
+      parentProjectId,
+      workbenchKind: kind,
+    };
+    // Insert right after the parent and its existing workbenches
+    const parentIndex = this.projects.findIndex(
+      (p) => p.id === parentProjectId,
+    );
+    let insertIndex = parentIndex + 1;
+    while (
+      insertIndex < this.projects.length &&
+      this.projects[insertIndex].parentProjectId === parentProjectId
+    ) {
+      insertIndex++;
+    }
+    this.projects.splice(insertIndex, 0, project);
+    this.onChange?.();
+    this.persist();
+    return project;
+  }
+
+  getWorkbenches(parentId: string): Project[] {
+    return this.projects.filter((p) => p.parentProjectId === parentId);
+  }
+
+  isWorkbench(id: string): boolean {
+    const project = this.projects.find((p) => p.id === id);
+    return (
+      project?.parentProjectId !== null &&
+      project?.parentProjectId !== undefined
+    );
+  }
+
+  getParentProject(id: string): Project | null {
+    const project = this.projects.find((p) => p.id === id);
+    if (!project?.parentProjectId) return null;
+    return this.projects.find((p) => p.id === project.parentProjectId) ?? null;
+  }
+
   removeProject(id: string): void {
-    this.projects = this.projects.filter((p) => p.id !== id);
-    if (this.activeProjectId === id) {
+    // Also remove child workbenches when removing a parent
+    const childIds = this.projects
+      .filter((p) => p.parentProjectId === id)
+      .map((p) => p.id);
+    const removeIds = new Set([id, ...childIds]);
+    this.projects = this.projects.filter((p) => !removeIds.has(p.id));
+    if (removeIds.has(this.activeProjectId!)) {
       this.activeProjectId = this.projects[0]?.id ?? null;
     }
     this.onChange?.();
@@ -154,6 +218,8 @@ export class ProjectStateManager {
         id: p.id,
         name: p.name,
         workspacePath: p.workspacePath,
+        parentProjectId: p.parentProjectId,
+        workbenchKind: p.workbenchKind,
       })),
       activeProjectId: this.activeProjectId,
       sidebarCollapsed: this.sidebarCollapsed,
@@ -183,6 +249,8 @@ export class ProjectStateManager {
       conversationIds: [],
       activeConversationId: null,
       status: "idle" as const,
+      parentProjectId: p.parentProjectId ?? null,
+      workbenchKind: p.workbenchKind ?? null,
     }));
     this.activeProjectId = state.activeProjectId;
     this.sidebarCollapsed = state.sidebarCollapsed;
