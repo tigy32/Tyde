@@ -144,7 +144,7 @@ fn caller_agent_id_from_parts(parts: &http::request::Parts) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Tools (6 tools — push-oriented API)
+// MCP Tools (6 tools — agent orchestration)
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -258,6 +258,7 @@ impl TydeAgentMcpServer {
             Err(err) => Ok(err_text(err)),
         }
     }
+
 }
 
 #[tool_handler]

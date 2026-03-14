@@ -6,6 +6,8 @@ mod claude;
 mod codex;
 mod conversation;
 mod debug_mcp_http;
+mod dev_instance;
+mod driver_mcp_http;
 mod file_service;
 mod file_watch;
 mod git_service;
@@ -311,14 +313,15 @@ pub(crate) struct AppState {
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
     mcp_http_enabled: SyncMutex<bool>,
-    debug_mcp_http_enabled: SyncMutex<bool>,
-    debug_mcp_http_autoload: SyncMutex<bool>,
+    driver_mcp_http_enabled: SyncMutex<bool>,
+    driver_mcp_http_autoload: SyncMutex<bool>,
     debug_event_log: SyncMutex<DebugEventLog>,
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
+    dev_instance: SyncMutex<Option<dev_instance::DevInstance>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -331,21 +334,21 @@ struct ChatEventPayload {
 struct AppSettings {
     #[serde(default = "default_mcp_http_enabled")]
     mcp_http_enabled: bool,
-    #[serde(default = "default_debug_mcp_http_enabled")]
-    debug_mcp_http_enabled: bool,
-    #[serde(default = "default_debug_mcp_http_autoload")]
-    debug_mcp_http_autoload: bool,
+    #[serde(default = "default_driver_mcp_http_enabled")]
+    driver_mcp_http_enabled: bool,
+    #[serde(default = "default_driver_mcp_http_autoload")]
+    driver_mcp_http_autoload: bool,
 }
 
 fn default_mcp_http_enabled() -> bool {
     true
 }
 
-fn default_debug_mcp_http_enabled() -> bool {
+fn default_driver_mcp_http_enabled() -> bool {
     false
 }
 
-fn default_debug_mcp_http_autoload() -> bool {
+fn default_driver_mcp_http_autoload() -> bool {
     false
 }
 
@@ -353,8 +356,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             mcp_http_enabled: default_mcp_http_enabled(),
-            debug_mcp_http_enabled: default_debug_mcp_http_enabled(),
-            debug_mcp_http_autoload: default_debug_mcp_http_autoload(),
+            driver_mcp_http_enabled: default_driver_mcp_http_enabled(),
+            driver_mcp_http_autoload: default_driver_mcp_http_autoload(),
         }
     }
 }
@@ -367,7 +370,7 @@ struct McpHttpServerSettings {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct DebugMcpHttpServerSettings {
+struct DriverMcpHttpServerSettings {
     enabled: bool,
     autoload: bool,
     running: bool,
@@ -468,7 +471,7 @@ struct DebugSnapshot {
     terminal_ids: Vec<u64>,
     runtime_agents: Vec<AgentInfo>,
     agent_mcp_http: McpHttpServerSettings,
-    debug_mcp_http: DebugMcpHttpServerSettings,
+    driver_mcp_http: DriverMcpHttpServerSettings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -688,7 +691,7 @@ fn load_app_settings() -> AppSettings {
         }
     };
 
-    match serde_json::from_str::<AppSettings>(&raw) {
+    let mut settings = match serde_json::from_str::<AppSettings>(&raw) {
         Ok(settings) => settings,
         Err(err) => {
             tracing::error!(
@@ -697,7 +700,17 @@ fn load_app_settings() -> AppSettings {
             );
             AppSettings::default()
         }
+    };
+
+    // Allow env vars to override settings (used by dev instances spawned from the host).
+    if let Ok(val) = std::env::var("TYDE_MCP_HTTP_ENABLED") {
+        settings.mcp_http_enabled = val == "true" || val == "1";
     }
+    if let Ok(val) = std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED") {
+        settings.driver_mcp_http_enabled = val == "true" || val == "1";
+    }
+
+    settings
 }
 
 fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
@@ -716,6 +729,14 @@ fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
         .map_err(|err| format!("Failed to write app settings to {}: {err}", path.display()))
 }
 
+fn app_settings_from_state(state: &AppState) -> AppSettings {
+    AppSettings {
+        mcp_http_enabled: *state.mcp_http_enabled.lock(),
+        driver_mcp_http_enabled: *state.driver_mcp_http_enabled.lock(),
+        driver_mcp_http_autoload: *state.driver_mcp_http_autoload.lock(),
+    }
+}
+
 fn current_mcp_http_server_settings(enabled: bool) -> McpHttpServerSettings {
     McpHttpServerSettings {
         enabled,
@@ -724,15 +745,15 @@ fn current_mcp_http_server_settings(enabled: bool) -> McpHttpServerSettings {
     }
 }
 
-fn current_debug_mcp_http_server_settings(
+fn current_driver_mcp_http_server_settings(
     enabled: bool,
     autoload: bool,
-) -> DebugMcpHttpServerSettings {
-    DebugMcpHttpServerSettings {
+) -> DriverMcpHttpServerSettings {
+    DriverMcpHttpServerSettings {
         enabled,
         autoload,
-        running: debug_mcp_http::is_debug_mcp_http_server_running(),
-        url: debug_mcp_http::debug_mcp_http_server_url(),
+        running: driver_mcp_http::is_driver_mcp_http_server_running(),
+        url: driver_mcp_http::driver_mcp_http_server_url(),
     }
 }
 
@@ -830,27 +851,22 @@ fn startup_mcp_servers_for_agent(
         });
     }
 
-    let enabled = *state.debug_mcp_http_enabled.lock();
-    let autoload = *state.debug_mcp_http_autoload.lock();
-    if !(enabled && autoload) {
-        return Ok(servers);
+    let driver_enabled = *state.driver_mcp_http_enabled.lock();
+    let driver_autoload = *state.driver_mcp_http_autoload.lock();
+    if driver_enabled && driver_autoload {
+        if let Some(url) = driver_mcp_http::driver_mcp_http_server_url() {
+            if !url.trim().is_empty() {
+                servers.push(StartupMcpServer {
+                    name: "tyde_driver".to_string(),
+                    transport: StartupMcpTransport::Http {
+                        url,
+                        headers: HashMap::new(),
+                        bearer_token_env_var: None,
+                    },
+                });
+            }
+        }
     }
-
-    let Some(url) = debug_mcp_http::debug_mcp_http_server_url() else {
-        return Ok(servers);
-    };
-    if url.trim().is_empty() {
-        return Ok(servers);
-    }
-
-    servers.push(StartupMcpServer {
-        name: "tyde_debug".to_string(),
-        transport: StartupMcpTransport::Http {
-            url,
-            headers: HashMap::new(),
-            bearer_token_env_var: None,
-        },
-    });
 
     Ok(servers)
 }
@@ -931,8 +947,8 @@ pub(crate) async fn debug_snapshot_internal(state: &AppState) -> Result<DebugSna
     };
 
     let agent_enabled = *state.mcp_http_enabled.lock();
-    let debug_enabled = *state.debug_mcp_http_enabled.lock();
-    let debug_autoload = *state.debug_mcp_http_autoload.lock();
+    let driver_enabled = *state.driver_mcp_http_enabled.lock();
+    let driver_autoload = *state.driver_mcp_http_autoload.lock();
 
     Ok(DebugSnapshot {
         timestamp_ms: now_ms(),
@@ -941,7 +957,7 @@ pub(crate) async fn debug_snapshot_internal(state: &AppState) -> Result<DebugSna
         terminal_ids,
         runtime_agents,
         agent_mcp_http: current_mcp_http_server_settings(agent_enabled),
-        debug_mcp_http: current_debug_mcp_http_server_settings(debug_enabled, debug_autoload),
+        driver_mcp_http: current_driver_mcp_http_server_settings(driver_enabled, driver_autoload),
     })
 }
 
@@ -2179,30 +2195,13 @@ fn set_mcp_http_server_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<McpHttpServerSettings, String> {
-    let debug_enabled = *state.debug_mcp_http_enabled.lock();
-    let debug_autoload = *state.debug_mcp_http_autoload.lock();
-    {
-        *state.mcp_http_enabled.lock() = enabled;
-    }
-
-    save_app_settings(&AppSettings {
-        mcp_http_enabled: enabled,
-        debug_mcp_http_enabled: debug_enabled,
-        debug_mcp_http_autoload: debug_autoload,
-    })?;
+    *state.mcp_http_enabled.lock() = enabled;
+    save_app_settings(&app_settings_from_state(&state))?;
 
     if enabled {
         if let Err(err) = agent_mcp_http::start_agent_mcp_http_server(&app) {
             *state.mcp_http_enabled.lock() = false;
-            if let Err(e) = save_app_settings(&AppSettings {
-                mcp_http_enabled: false,
-                debug_mcp_http_enabled: debug_enabled,
-                debug_mcp_http_autoload: debug_autoload,
-            }) {
-                tracing::error!(
-                    "Failed to revert app settings after MCP HTTP server start failure: {e}"
-                );
-            }
+            let _ = save_app_settings(&app_settings_from_state(&state));
             return Err(format!("Failed to start MCP HTTP server: {err}"));
         }
     } else {
@@ -2212,111 +2211,70 @@ fn set_mcp_http_server_enabled(
     let status = current_mcp_http_server_settings(enabled);
     if enabled && !status.running {
         *state.mcp_http_enabled.lock() = false;
-        if let Err(e) = save_app_settings(&AppSettings {
-            mcp_http_enabled: false,
-            debug_mcp_http_enabled: debug_enabled,
-            debug_mcp_http_autoload: debug_autoload,
-        }) {
-            tracing::error!(
-                "Failed to revert app settings after MCP HTTP server start failure: {e}"
-            );
-        }
+        let _ = save_app_settings(&app_settings_from_state(&state));
         return Err("Failed to start MCP HTTP server".to_string());
     }
     Ok(status)
 }
 
 #[tauri::command]
-fn get_debug_mcp_http_server_settings(
+fn get_driver_mcp_http_server_settings(
     state: tauri::State<'_, AppState>,
-) -> Result<DebugMcpHttpServerSettings, String> {
-    let enabled = *state.debug_mcp_http_enabled.lock();
-    let autoload = *state.debug_mcp_http_autoload.lock();
-    Ok(current_debug_mcp_http_server_settings(enabled, autoload))
+) -> Result<DriverMcpHttpServerSettings, String> {
+    let enabled = *state.driver_mcp_http_enabled.lock();
+    let autoload = *state.driver_mcp_http_autoload.lock();
+    Ok(current_driver_mcp_http_server_settings(enabled, autoload))
 }
 
 #[tauri::command]
-fn set_debug_mcp_http_server_enabled(
+fn set_driver_mcp_http_server_enabled(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     enabled: bool,
-) -> Result<DebugMcpHttpServerSettings, String> {
-    let agent_enabled = *state.mcp_http_enabled.lock();
-    let mut debug_autoload = *state.debug_mcp_http_autoload.lock();
+) -> Result<DriverMcpHttpServerSettings, String> {
     if !enabled {
-        debug_autoload = false;
-        *state.debug_mcp_http_autoload.lock() = false;
+        *state.driver_mcp_http_autoload.lock() = false;
     }
-    {
-        *state.debug_mcp_http_enabled.lock() = enabled;
-    }
-
-    save_app_settings(&AppSettings {
-        mcp_http_enabled: agent_enabled,
-        debug_mcp_http_enabled: enabled,
-        debug_mcp_http_autoload: debug_autoload,
-    })?;
+    *state.driver_mcp_http_enabled.lock() = enabled;
+    save_app_settings(&app_settings_from_state(&state))?;
 
     if enabled {
-        if let Err(err) = debug_mcp_http::start_debug_mcp_http_server(&app) {
-            *state.debug_mcp_http_enabled.lock() = false;
-            if let Err(e) = save_app_settings(&AppSettings {
-                mcp_http_enabled: agent_enabled,
-                debug_mcp_http_enabled: false,
-                debug_mcp_http_autoload: false,
-            }) {
-                tracing::error!(
-                    "Failed to revert app settings after debug MCP HTTP server start failure: {e}"
-                );
-            }
-            return Err(format!("Failed to start debug MCP HTTP server: {err}"));
+        if let Err(err) = driver_mcp_http::start_driver_mcp_http_server(&app) {
+            *state.driver_mcp_http_enabled.lock() = false;
+            let _ = save_app_settings(&app_settings_from_state(&state));
+            return Err(format!("Failed to start driver MCP HTTP server: {err}"));
         }
     } else {
-        debug_mcp_http::stop_debug_mcp_http_server();
+        driver_mcp_http::stop_driver_mcp_http_server();
     }
 
-    let status = current_debug_mcp_http_server_settings(enabled, debug_autoload);
+    let driver_autoload = *state.driver_mcp_http_autoload.lock();
+    let status = current_driver_mcp_http_server_settings(enabled, driver_autoload);
     if enabled && !status.running {
-        *state.debug_mcp_http_enabled.lock() = false;
-        *state.debug_mcp_http_autoload.lock() = false;
-        if let Err(e) = save_app_settings(&AppSettings {
-            mcp_http_enabled: agent_enabled,
-            debug_mcp_http_enabled: false,
-            debug_mcp_http_autoload: false,
-        }) {
-            tracing::error!(
-                "Failed to revert app settings after debug MCP HTTP server start failure: {e}"
-            );
-        }
-        return Err("Failed to start debug MCP HTTP server".to_string());
+        *state.driver_mcp_http_enabled.lock() = false;
+        *state.driver_mcp_http_autoload.lock() = false;
+        let _ = save_app_settings(&app_settings_from_state(&state));
+        return Err("Failed to start driver MCP HTTP server".to_string());
     }
     Ok(status)
 }
 
 #[tauri::command]
-fn set_debug_mcp_http_server_autoload_enabled(
+fn set_driver_mcp_http_server_autoload_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
-) -> Result<DebugMcpHttpServerSettings, String> {
-    let agent_enabled = *state.mcp_http_enabled.lock();
-    let debug_enabled = *state.debug_mcp_http_enabled.lock();
-    if enabled && !debug_enabled {
-        return Err("Enable debug MCP server before enabling auto-load".to_string());
+) -> Result<DriverMcpHttpServerSettings, String> {
+    let driver_enabled = *state.driver_mcp_http_enabled.lock();
+    if enabled && !driver_enabled {
+        return Err("Enable driver MCP server before enabling auto-load".to_string());
     }
 
-    let autoload = enabled && debug_enabled;
-    {
-        *state.debug_mcp_http_autoload.lock() = autoload;
-    }
+    let autoload = enabled && driver_enabled;
+    *state.driver_mcp_http_autoload.lock() = autoload;
+    save_app_settings(&app_settings_from_state(&state))?;
 
-    save_app_settings(&AppSettings {
-        mcp_http_enabled: agent_enabled,
-        debug_mcp_http_enabled: debug_enabled,
-        debug_mcp_http_autoload: autoload,
-    })?;
-
-    Ok(current_debug_mcp_http_server_settings(
-        debug_enabled,
+    Ok(current_driver_mcp_http_server_settings(
+        driver_enabled,
         autoload,
     ))
 }
@@ -3065,6 +3023,7 @@ fn resolve_shell_path() {
     std::env::set_var("PATH", &resolved);
 }
 
+#[cfg(target_os = "linux")]
 fn detect_system_dark_mode() -> bool {
     let output = Command::new("dbus-send")
         .args([
@@ -3094,8 +3053,8 @@ pub fn run() {
         std::env::set_var("GTK_THEME", "Adwaita:dark");
     }
     let mut app_settings = load_app_settings();
-    if !app_settings.debug_mcp_http_enabled {
-        app_settings.debug_mcp_http_autoload = false;
+    if !app_settings.driver_mcp_http_enabled {
+        app_settings.driver_mcp_http_autoload = false;
     }
 
     tauri::Builder::default()
@@ -3110,13 +3069,14 @@ pub fn run() {
             agent_runtime: Arc::new(Mutex::new(AgentRuntime::new())),
             agent_runtime_notify: Arc::new(Notify::new()),
             mcp_http_enabled: SyncMutex::new(app_settings.mcp_http_enabled),
-            debug_mcp_http_enabled: SyncMutex::new(app_settings.debug_mcp_http_enabled),
-            debug_mcp_http_autoload: SyncMutex::new(app_settings.debug_mcp_http_autoload),
+            driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
+            driver_mcp_http_autoload: SyncMutex::new(app_settings.driver_mcp_http_autoload),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
+            dev_instance: SyncMutex::new(None),
         })
         .setup(|app| {
             initialize_tray(app)?;
@@ -3128,13 +3088,19 @@ pub fn run() {
             } else {
                 tracing::info!("Agent MCP HTTP server disabled by app settings");
             }
-            let debug_mcp_http_enabled = *app.state::<AppState>().debug_mcp_http_enabled.lock();
-            if debug_mcp_http_enabled {
+            // Debug MCP server is only started on dev instances via TYDE_DEBUG_MCP_HTTP_ENABLED env var.
+            if std::env::var("TYDE_DEBUG_MCP_HTTP_ENABLED").is_ok_and(|v| v == "true" || v == "1") {
                 if let Err(err) = debug_mcp_http::start_debug_mcp_http_server(app.handle()) {
                     tracing::warn!("Debug MCP HTTP server failed to start: {err}");
                 }
+            }
+            let driver_mcp_http_enabled = *app.state::<AppState>().driver_mcp_http_enabled.lock();
+            if driver_mcp_http_enabled {
+                if let Err(err) = driver_mcp_http::start_driver_mcp_http_server(app.handle()) {
+                    tracing::warn!("Driver MCP HTTP server failed to start: {err}");
+                }
             } else {
-                tracing::info!("Debug MCP HTTP server disabled by app settings");
+                tracing::info!("Driver MCP HTTP server disabled by app settings");
             }
             if let Some(window) = app.get_webview_window("main") {
                 let window_handle = window.clone();
@@ -3169,9 +3135,9 @@ pub fn run() {
             collect_agent_result,
             get_mcp_http_server_settings,
             set_mcp_http_server_enabled,
-            get_debug_mcp_http_server_settings,
-            set_debug_mcp_http_server_enabled,
-            set_debug_mcp_http_server_autoload_enabled,
+            get_driver_mcp_http_server_settings,
+            set_driver_mcp_http_server_enabled,
+            set_driver_mcp_http_server_autoload_enabled,
             submit_debug_ui_response,
             get_settings,
             list_models,
@@ -3293,13 +3259,14 @@ mod tests {
             agent_runtime: Arc::new(Mutex::new(AgentRuntime::new())),
             agent_runtime_notify: Arc::new(Notify::new()),
             mcp_http_enabled: SyncMutex::new(true),
-            debug_mcp_http_enabled: SyncMutex::new(false),
-            debug_mcp_http_autoload: SyncMutex::new(false),
+            driver_mcp_http_enabled: SyncMutex::new(false),
+            driver_mcp_http_autoload: SyncMutex::new(false),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
+            dev_instance: SyncMutex::new(None),
         }
     }
 
