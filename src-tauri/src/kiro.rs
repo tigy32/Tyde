@@ -18,6 +18,7 @@ use crate::subprocess::ImageAttachment;
 const KIRO_AGENT_NAME: &str = "kiro";
 const KIRO_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
+const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 
 #[derive(Clone)]
 pub struct KiroCommandHandle {
@@ -61,13 +62,13 @@ impl KiroSession {
 
     async fn spawn_with_mode(
         workspace_roots: &[String],
-        _ephemeral: bool,
+        ephemeral: bool,
         admin_session: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let roots =
-            resolve_kiro_session_roots(workspace_roots, ssh_host.as_deref(), admin_session).await?;
+            resolve_kiro_session_roots(workspace_roots, ssh_host.as_deref(), admin_session, ephemeral).await?;
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &["acp"])
             .with_local_cwd(roots.session_cwd.clone());
         if ssh_host.is_some() {
@@ -1693,6 +1694,7 @@ async fn resolve_kiro_session_roots(
     workspace_roots: &[String],
     ssh_host: Option<&str>,
     admin_session: bool,
+    ephemeral: bool,
 ) -> Result<KiroSessionRoots, String> {
     if let Some(host) = ssh_host {
         let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
@@ -1704,10 +1706,12 @@ async fn resolve_kiro_session_roots(
             .ok_or("No remote workspace root found")?;
         let session_cwd = if admin_session {
             join_posix_path(&scope_root, KIRO_ADMIN_SESSION_SUBDIR)
+        } else if ephemeral {
+            join_posix_path(&scope_root, KIRO_EPHEMERAL_SESSION_SUBDIR)
         } else {
             scope_root.clone()
         };
-        if admin_session {
+        if admin_session || ephemeral {
             ensure_remote_directory(host, &session_cwd).await?;
         }
         return Ok(KiroSessionRoots {
@@ -1722,6 +1726,15 @@ async fn resolve_kiro_session_roots(
         tokio::fs::create_dir_all(&dir).await.map_err(|err| {
             format!(
                 "Failed to create Kiro admin directory '{}': {err}",
+                dir.display()
+            )
+        })?;
+        dir.to_string_lossy().to_string()
+    } else if ephemeral {
+        let dir = PathBuf::from(&scope_root).join(".tyde").join("kiro-ephemeral");
+        tokio::fs::create_dir_all(&dir).await.map_err(|err| {
+            format!(
+                "Failed to create Kiro ephemeral directory '{}': {err}",
                 dir.display()
             )
         })?;
@@ -2003,6 +2016,11 @@ async fn list_local_kiro_session_metadata(
 
         // Skip admin/agent sessions (cwd ends with .tyde/kiro-admin)
         if session_cwd.contains(KIRO_ADMIN_SESSION_SUBDIR) {
+            continue;
+        }
+
+        // Skip ephemeral sessions (title generation, etc.)
+        if session_cwd.contains(KIRO_EPHEMERAL_SESSION_SUBDIR) {
             continue;
         }
 
