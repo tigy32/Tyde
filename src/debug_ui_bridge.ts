@@ -325,6 +325,8 @@ async function handleClick(params: Record<string, unknown>): Promise<unknown> {
     throw new Error("click requires non-empty selector");
   }
   const el = getElementAt(selector, params.index);
+  const tag = el.tagName.toLowerCase();
+  const visible = isVisible(el);
   if (el instanceof HTMLElement) {
     el.focus();
   }
@@ -346,8 +348,8 @@ async function handleClick(params: Record<string, unknown>): Promise<unknown> {
     selector,
     index: normalizeIndex(params.index),
     clicked: true,
-    tag: el.tagName.toLowerCase(),
-    visible: isVisible(el),
+    tag,
+    visible,
   };
 }
 

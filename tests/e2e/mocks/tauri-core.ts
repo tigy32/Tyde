@@ -105,9 +105,9 @@ let nextTerminalId = 70_000;
 const terminalWorkspaceById = new Map<number, string>();
 let mockMcpHttpServerEnabled = true;
 const mockMcpHttpServerUrl = 'http://127.0.0.1:47771/mcp';
-let mockDebugMcpHttpServerEnabled = false;
-let mockDebugMcpHttpServerAutoload = false;
-const mockDebugMcpHttpServerUrl = 'http://127.0.0.1:47772/mcp';
+let mockDriverMcpHttpServerEnabled = false;
+let mockDriverMcpHttpServerAutoload = false;
+const mockDriverMcpHttpServerUrl = 'http://127.0.0.1:47772/mcp';
 
 function syncMockMcpSettingsFromStorage(): void {
   try {
@@ -627,43 +627,43 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'get_debug_mcp_http_server_settings':
+    case 'get_driver_mcp_http_server_settings':
       return {
-        enabled: mockDebugMcpHttpServerEnabled,
-        autoload: mockDebugMcpHttpServerAutoload,
-        running: mockDebugMcpHttpServerEnabled,
-        url: mockDebugMcpHttpServerEnabled ? mockDebugMcpHttpServerUrl : null,
+        enabled: mockDriverMcpHttpServerEnabled,
+        autoload: mockDriverMcpHttpServerAutoload,
+        running: mockDriverMcpHttpServerEnabled,
+        url: mockDriverMcpHttpServerEnabled ? mockDriverMcpHttpServerUrl : null,
       };
 
-    case 'set_debug_mcp_http_server_enabled': {
+    case 'set_driver_mcp_http_server_enabled': {
       if (typeof args?.enabled !== 'boolean') {
-        throw new Error('set_debug_mcp_http_server_enabled requires boolean enabled');
+        throw new Error('set_driver_mcp_http_server_enabled requires boolean enabled');
       }
-      mockDebugMcpHttpServerEnabled = args.enabled;
-      if (!mockDebugMcpHttpServerEnabled) {
-        mockDebugMcpHttpServerAutoload = false;
+      mockDriverMcpHttpServerEnabled = args.enabled;
+      if (!mockDriverMcpHttpServerEnabled) {
+        mockDriverMcpHttpServerAutoload = false;
       }
       return {
-        enabled: mockDebugMcpHttpServerEnabled,
-        autoload: mockDebugMcpHttpServerAutoload,
-        running: mockDebugMcpHttpServerEnabled,
-        url: mockDebugMcpHttpServerEnabled ? mockDebugMcpHttpServerUrl : null,
+        enabled: mockDriverMcpHttpServerEnabled,
+        autoload: mockDriverMcpHttpServerAutoload,
+        running: mockDriverMcpHttpServerEnabled,
+        url: mockDriverMcpHttpServerEnabled ? mockDriverMcpHttpServerUrl : null,
       };
     }
 
-    case 'set_debug_mcp_http_server_autoload_enabled': {
+    case 'set_driver_mcp_http_server_autoload_enabled': {
       if (typeof args?.enabled !== 'boolean') {
-        throw new Error('set_debug_mcp_http_server_autoload_enabled requires boolean enabled');
+        throw new Error('set_driver_mcp_http_server_autoload_enabled requires boolean enabled');
       }
-      if (args.enabled && !mockDebugMcpHttpServerEnabled) {
-        throw new Error('Enable debug MCP server before enabling auto-load');
+      if (args.enabled && !mockDriverMcpHttpServerEnabled) {
+        throw new Error('Enable driver MCP server before enabling auto-load');
       }
-      mockDebugMcpHttpServerAutoload = args.enabled && mockDebugMcpHttpServerEnabled;
+      mockDriverMcpHttpServerAutoload = args.enabled && mockDriverMcpHttpServerEnabled;
       return {
-        enabled: mockDebugMcpHttpServerEnabled,
-        autoload: mockDebugMcpHttpServerAutoload,
-        running: mockDebugMcpHttpServerEnabled,
-        url: mockDebugMcpHttpServerEnabled ? mockDebugMcpHttpServerUrl : null,
+        enabled: mockDriverMcpHttpServerEnabled,
+        autoload: mockDriverMcpHttpServerAutoload,
+        running: mockDriverMcpHttpServerEnabled,
+        url: mockDriverMcpHttpServerEnabled ? mockDriverMcpHttpServerUrl : null,
       };
     }
 

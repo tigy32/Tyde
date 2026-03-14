@@ -94,7 +94,7 @@ export interface McpHttpServerSettings {
   url: string | null;
 }
 
-export interface DebugMcpHttpServerSettings {
+export interface DriverMcpHttpServerSettings {
   enabled: boolean;
   autoload: boolean;
   running: boolean;
@@ -607,35 +607,35 @@ export async function setMcpHttpServerEnabled(
   });
 }
 
-export async function getDebugMcpHttpServerSettings(): Promise<DebugMcpHttpServerSettings> {
-  return invoke<DebugMcpHttpServerSettings>(
-    "get_debug_mcp_http_server_settings",
+export async function getDriverMcpHttpServerSettings(): Promise<DriverMcpHttpServerSettings> {
+  return invoke<DriverMcpHttpServerSettings>(
+    "get_driver_mcp_http_server_settings",
   ).catch((err) => {
-    console.error("bridge: getDebugMcpHttpServerSettings failed:", err);
+    console.error("bridge: getDriverMcpHttpServerSettings failed:", err);
     throw new Error(friendlyError(String(err)));
   });
 }
 
-export async function setDebugMcpHttpServerEnabled(
+export async function setDriverMcpHttpServerEnabled(
   enabled: boolean,
-): Promise<DebugMcpHttpServerSettings> {
-  return invoke<DebugMcpHttpServerSettings>(
-    "set_debug_mcp_http_server_enabled",
+): Promise<DriverMcpHttpServerSettings> {
+  return invoke<DriverMcpHttpServerSettings>(
+    "set_driver_mcp_http_server_enabled",
     { enabled },
   ).catch((err) => {
-    console.error("bridge: setDebugMcpHttpServerEnabled failed:", err);
+    console.error("bridge: setDriverMcpHttpServerEnabled failed:", err);
     throw new Error(friendlyError(String(err)));
   });
 }
 
-export async function setDebugMcpHttpServerAutoloadEnabled(
+export async function setDriverMcpHttpServerAutoloadEnabled(
   enabled: boolean,
-): Promise<DebugMcpHttpServerSettings> {
-  return invoke<DebugMcpHttpServerSettings>(
-    "set_debug_mcp_http_server_autoload_enabled",
+): Promise<DriverMcpHttpServerSettings> {
+  return invoke<DriverMcpHttpServerSettings>(
+    "set_driver_mcp_http_server_autoload_enabled",
     { enabled },
   ).catch((err) => {
-    console.error("bridge: setDebugMcpHttpServerAutoloadEnabled failed:", err);
+    console.error("bridge: setDriverMcpHttpServerAutoloadEnabled failed:", err);
     throw new Error(friendlyError(String(err)));
   });
 }

@@ -19,35 +19,30 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-
 use crate::{
-    debug_events_since_internal, debug_snapshot_internal, debug_ui_action_internal, AppState,
-    DebugEventsSinceRequest,
+    debug_mcp_http::extract_valid_png_data,
+    dev_instance, AppState,
 };
 
-const DEBUG_MCP_HTTP_BIND_ENV: &str = "TYDE_DEBUG_MCP_HTTP_BIND_ADDR";
-const DEFAULT_BIND_ADDR: &str = "127.0.0.1:47772";
+const DRIVER_MCP_HTTP_BIND_ENV: &str = "TYDE_DRIVER_MCP_HTTP_BIND_ADDR";
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:47773";
 const MCP_PATH: &str = "/mcp";
-const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
-struct RunningDebugMcpHttpServer {
+struct RunningDriverMcpHttpServer {
     url: String,
-    /// Dropping this sender signals graceful shutdown to the server task.
-    #[allow(dead_code)]
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-static RUNNING_DEBUG_MCP_HTTP_SERVER: LazyLock<Mutex<Option<RunningDebugMcpHttpServer>>> =
+static RUNNING_DRIVER_MCP_HTTP_SERVER: LazyLock<Mutex<Option<RunningDriverMcpHttpServer>>> =
     LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone)]
-struct TydeDebugMcpServer {
+struct TydeDriverMcpServer {
     app: tauri::AppHandle,
     tool_router: ToolRouter<Self>,
 }
 
-impl TydeDebugMcpServer {
+impl TydeDriverMcpServer {
     fn new(app: tauri::AppHandle) -> Self {
         Self {
             app,
@@ -55,6 +50,20 @@ impl TydeDebugMcpServer {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tool input types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct DevInstanceStartToolInput {
+    /// Path to the Tyde project root directory to build and run.
+    project_dir: String,
+}
+
+/// Empty input — no parameters needed.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct EmptyInput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct DebugEventsToolInput {
@@ -139,6 +148,10 @@ struct WaitForToolInput {
     timeout_ms: Option<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn ok_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::json(value)?]))
 }
@@ -147,249 +160,257 @@ fn err_text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
-pub(crate) fn validate_png_base64(data: &str) -> Result<(), String> {
-    let trimmed = data.trim();
-    if trimmed.is_empty() {
-        return Err("Screenshot response missing image data".to_string());
-    }
-
-    let decoded = BASE64_STANDARD
-        .decode(trimmed)
-        .map_err(|_| "Screenshot response contained invalid base64 image data".to_string())?;
-    if decoded.len() < PNG_SIGNATURE.len() || !decoded.starts_with(&PNG_SIGNATURE) {
-        return Err("Screenshot response image payload is not a PNG".to_string());
-    }
-
-    Ok(())
-}
-
-pub(crate) fn extract_valid_png_data(value: &serde_json::Value) -> Result<&str, String> {
-    let data = value
-        .get("data")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .ok_or_else(|| "Screenshot response missing data".to_string())?;
-    let mime_type = value
-        .get("mime_type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("image/png");
-    if mime_type != "image/png" {
-        return Err(format!(
-            "Screenshot encoding failed: expected image/png but got {mime_type}"
-        ));
-    }
-    validate_png_base64(data)?;
-    Ok(data)
-}
-
-async fn call_ui_action(
+/// Proxy a tool call to the dev instance's debug MCP server.
+/// Returns an error CallToolResult if no dev instance is running.
+async fn proxy_tool(
     app: &tauri::AppHandle,
-    action: &str,
-    params: serde_json::Value,
-    timeout_ms: Option<u64>,
-) -> Result<serde_json::Value, String> {
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<CallToolResult, McpError> {
     let app_state = app.state::<AppState>();
-    debug_ui_action_internal(app, app_state.inner(), action, params, timeout_ms).await
+    match dev_instance::proxy_debug_tool_call(app_state.inner(), tool_name, arguments).await {
+        Ok(value) => match serde_json::from_value::<CallToolResult>(value.clone()) {
+            Ok(result) => Ok(result),
+            Err(_) => ok_json(value),
+        },
+        Err(err) => Ok(err_text(err)),
+    }
 }
+
+// ---------------------------------------------------------------------------
+// MCP Tools — 13 tools: 2 dev instance lifecycle + 11 proxied debug tools
+// ---------------------------------------------------------------------------
 
 #[tool_router]
-impl TydeDebugMcpServer {
-    #[tool(description = "Get a runtime snapshot of Tyde app state useful for debugging.")]
-    async fn tyde_debug_snapshot(&self) -> Result<CallToolResult, McpError> {
+impl TydeDriverMcpServer {
+    // -- Dev instance lifecycle ------------------------------------------------
+
+    #[tool(
+        description = "Build and launch a Tyde dev instance with hot-reload. Runs `npx tauri dev` in the given project directory, waits for the debug MCP server to become ready, and returns the debug MCP URL. Only one dev instance can run at a time. The tyde_debug_* tools on this server will target the launched instance. This may take several minutes on first build."
+    )]
+    async fn tyde_dev_instance_start(
+        &self,
+        Parameters(input): Parameters<DevInstanceStartToolInput>,
+    ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match debug_snapshot_internal(app_state.inner()).await {
+        match dev_instance::start_dev_instance(app_state.inner(), input.project_dir).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
         }
     }
 
-    #[tool(description = "Read Tyde debug event log entries after a sequence number.")]
+    #[tool(
+        description = "Stop the running Tyde dev instance. Kills the dev process and cleans up. The tyde_debug_* tools will return errors until a new instance is started."
+    )]
+    async fn tyde_dev_instance_stop(
+        &self,
+        Parameters(_input): Parameters<EmptyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        match dev_instance::stop_dev_instance(app_state.inner()).await {
+            Ok(value) => ok_json(value),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    // -- Proxied debug tools ---------------------------------------------------
+
+    #[tool(description = "Get a runtime snapshot of the dev instance's app state.")]
+    async fn tyde_debug_snapshot(
+        &self,
+        Parameters(_input): Parameters<EmptyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        proxy_tool(&self.app, "tyde_debug_snapshot", serde_json::json!({})).await
+    }
+
+    #[tool(description = "Read debug event log entries from the dev instance.")]
     async fn tyde_debug_events_since(
         &self,
         Parameters(input): Parameters<DebugEventsToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let app_state = self.app.state::<AppState>();
-        let request = DebugEventsSinceRequest {
-            since_seq: input.since_seq,
-            limit: input.limit,
-            stream: input.stream,
-        };
-        match debug_events_since_internal(app_state.inner(), request).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        let args = serde_json::json!({
+            "since_seq": input.since_seq,
+            "limit": input.limit,
+            "stream": input.stream,
+        });
+        proxy_tool(&self.app, "tyde_debug_events_since", args).await
     }
 
-    #[tool(description = "Query DOM elements in the Tyde UI by CSS selector.")]
+    #[tool(description = "Query DOM elements in the dev instance by CSS selector.")]
     async fn tyde_debug_query_elements(
         &self,
         Parameters(input): Parameters<QueryElementsToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "include_text": input.include_text,
             "include_html": input.include_html,
             "max_nodes": input.max_nodes,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "query_elements", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_query_elements", args).await
     }
 
-    #[tool(description = "Get text from the first (or indexed) UI element matching selector.")]
+    #[tool(description = "Get text from a UI element in the dev instance.")]
     async fn tyde_debug_get_text(
         &self,
         Parameters(input): Parameters<GetTextToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "index": input.index,
             "max_length": input.max_length,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "get_text", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_get_text", args).await
     }
 
-    #[tool(description = "List active data-testid values in the Tyde UI.")]
+    #[tool(description = "List active data-testid values in the dev instance.")]
     async fn tyde_debug_list_testids(
         &self,
         Parameters(input): Parameters<ListTestIdsToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "pattern": input.pattern,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "list_testids", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_list_testids", args).await
     }
 
-    #[tool(description = "Capture a PNG screenshot of Tyde UI (optionally by selector).")]
+    #[tool(description = "Capture a PNG screenshot of the dev instance (optionally by selector).")]
     async fn tyde_debug_capture_screenshot(
         &self,
         Parameters(input): Parameters<CaptureScreenshotToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout_ms = Some(input.timeout_ms.unwrap_or(30_000));
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "index": input.index,
             "max_dimension": input.max_dimension,
-            "timeout_ms": timeout_ms,
+            "timeout_ms": input.timeout_ms,
         });
-        let value = match call_ui_action(&self.app, "capture_screenshot", params, timeout_ms).await
+
+        let app_state = self.app.state::<AppState>();
+        let value = match dev_instance::proxy_debug_tool_call(
+            app_state.inner(),
+            "tyde_debug_capture_screenshot",
+            args,
+        )
+        .await
         {
             Ok(value) => value,
             Err(err) => return Ok(err_text(err)),
         };
 
-        let data = match extract_valid_png_data(&value) {
-            Ok(data) => data.to_string(),
-            Err(err) => return Ok(err_text(err)),
-        };
+        // The proxy returns the raw CallToolResult JSON. Extract the screenshot
+        // content so we can return a proper Content::image to the client.
+        // The dev instance's debug MCP returns content[1] as the JSON metadata.
+        let content_arr = value.get("content").and_then(|c| c.as_array());
+        if let Some(items) = content_arr {
+            // Look for the JSON metadata item that has `data` and `mime_type` fields.
+            for item in items {
+                if let Some(json_text) = item.get("text").and_then(|t| t.as_str()) {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(json_text) {
+                        if let Ok(data) = extract_valid_png_data(&meta) {
+                            let out = vec![
+                                Content::image(data.to_string(), "image/png".to_string()),
+                                Content::json(meta)?,
+                            ];
+                            return Ok(CallToolResult::success(out));
+                        }
+                    }
+                }
+            }
+        }
 
-        let out = vec![
-            Content::image(data, "image/png".to_string()),
-            Content::json(value)?,
-        ];
-        Ok(CallToolResult::success(out))
+        // If we couldn't extract the image, return the raw proxy result.
+        match serde_json::from_value::<CallToolResult>(value.clone()) {
+            Ok(result) => Ok(result),
+            Err(_) => ok_json(value),
+        }
     }
 
-    #[tool(description = "Click a UI element in Tyde by CSS selector.")]
+    #[tool(description = "Click a UI element in the dev instance by CSS selector.")]
     async fn tyde_debug_click(
         &self,
         Parameters(input): Parameters<SelectorIndexToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "index": input.index,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "click", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_click", args).await
     }
 
-    #[tool(description = "Type text into a Tyde UI element by CSS selector.")]
+    #[tool(description = "Type text into a UI element in the dev instance.")]
     async fn tyde_debug_type(
         &self,
         Parameters(input): Parameters<TypeToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "text": input.text,
             "index": input.index,
             "append": input.append,
             "submit": input.submit,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "type", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_type", args).await
     }
 
-    #[tool(description = "Dispatch a keyboard event in the Tyde UI.")]
+    #[tool(description = "Dispatch a keyboard event in the dev instance.")]
     async fn tyde_debug_keypress(
         &self,
         Parameters(input): Parameters<KeyPressToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "key": input.key,
             "code": input.code,
             "ctrl": input.ctrl,
             "alt": input.alt,
             "shift": input.shift,
             "meta": input.meta,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "keypress", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_keypress", args).await
     }
 
-    #[tool(description = "Scroll a Tyde UI element (or window if selector omitted).")]
+    #[tool(description = "Scroll a UI element (or window) in the dev instance.")]
     async fn tyde_debug_scroll(
         &self,
         Parameters(input): Parameters<ScrollToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "index": input.index,
             "dx": input.dx,
             "dy": input.dy,
+            "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "scroll", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_scroll", args).await
     }
 
-    #[tool(description = "Wait for a selector condition in Tyde UI.")]
+    #[tool(description = "Wait for a selector condition in the dev instance.")]
     async fn tyde_debug_wait_for(
         &self,
         Parameters(input): Parameters<WaitForToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let params = serde_json::json!({
+        let args = serde_json::json!({
             "selector": input.selector,
             "index": input.index,
             "state": input.state,
             "timeout_ms": input.timeout_ms,
         });
-        match call_ui_action(&self.app, "wait_for", params, input.timeout_ms).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        proxy_tool(&self.app, "tyde_debug_wait_for", args).await
     }
 }
 
 #[tool_handler]
-impl ServerHandler for TydeDebugMcpServer {
+impl ServerHandler for TydeDriverMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for debugging Tyde itself: inspect UI, capture screenshots, inspect event logs, and drive UI actions. All tools operate on the local Tyde instance."
+                "Tools for spawning and controlling a Tyde dev instance. Use tyde_dev_instance_start to build and launch a dev instance, then use the tyde_debug_* tools to interact with its UI. All debug tools proxy to the dev instance — they never target the host."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -398,13 +419,17 @@ impl ServerHandler for TydeDebugMcpServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HTTP server lifecycle
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
 }
 
-pub(crate) fn start_debug_mcp_http_server(app: &tauri::AppHandle) -> Result<(), String> {
-    let mut guard = RUNNING_DEBUG_MCP_HTTP_SERVER.lock();
+pub(crate) fn start_driver_mcp_http_server(app: &tauri::AppHandle) -> Result<(), String> {
+    let mut guard = RUNNING_DRIVER_MCP_HTTP_SERVER.lock();
     if guard.is_some() {
         return Ok(());
     }
@@ -414,7 +439,7 @@ pub(crate) fn start_debug_mcp_http_server(app: &tauri::AppHandle) -> Result<(), 
         Ok(listener) => listener,
         Err(err) => {
             tracing::warn!(
-                "Debug MCP HTTP server failed to bind {bind_addr}: {err}; retrying on ephemeral loopback port"
+                "Driver MCP HTTP server failed to bind {bind_addr}: {err}; retrying on ephemeral loopback port"
             );
             match std::net::TcpListener::bind("127.0.0.1:0") {
                 Ok(listener) => listener,
@@ -437,10 +462,10 @@ pub(crate) fn start_debug_mcp_http_server(app: &tauri::AppHandle) -> Result<(), 
     };
 
     let public_url = format!("http://{local_addr}{MCP_PATH}");
-    tracing::info!("Debug MCP HTTP server listening at {public_url}");
+    tracing::info!("Driver MCP HTTP server listening at {public_url}");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    *guard = Some(RunningDebugMcpHttpServer {
+    *guard = Some(RunningDriverMcpHttpServer {
         url: public_url.clone(),
         shutdown_tx: Some(shutdown_tx),
     });
@@ -452,15 +477,15 @@ pub(crate) fn start_debug_mcp_http_server(app: &tauri::AppHandle) -> Result<(), 
         let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => listener,
             Err(err) => {
-                tracing::warn!("Debug MCP HTTP server failed to create async listener: {err}");
+                tracing::warn!("Driver MCP HTTP server failed to create async listener: {err}");
                 clear_running_server_if_url(&cleanup_url);
                 return;
             }
         };
 
-        let mcp_service: StreamableHttpService<TydeDebugMcpServer, LocalSessionManager> =
+        let mcp_service: StreamableHttpService<TydeDriverMcpServer, LocalSessionManager> =
             StreamableHttpService::new(
-                move || Ok(TydeDebugMcpServer::new(app_handle.clone())),
+                move || Ok(TydeDriverMcpServer::new(app_handle.clone())),
                 Default::default(),
                 StreamableHttpServerConfig {
                     stateful_mode: true,
@@ -476,16 +501,39 @@ pub(crate) fn start_debug_mcp_http_server(app: &tauri::AppHandle) -> Result<(), 
             let _ = shutdown_rx.await;
         });
         if let Err(err) = server.await {
-            tracing::warn!("Debug MCP HTTP server stopped: {err}");
+            tracing::warn!("Driver MCP HTTP server stopped: {err}");
         }
         clear_running_server_if_url(&cleanup_url);
     });
     Ok(())
 }
 
+pub(crate) fn stop_driver_mcp_http_server() -> bool {
+    let running = RUNNING_DRIVER_MCP_HTTP_SERVER.lock().take();
+
+    let Some(mut running) = running else {
+        return false;
+    };
+
+    if let Some(tx) = running.shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+    true
+}
+
+pub(crate) fn is_driver_mcp_http_server_running() -> bool {
+    RUNNING_DRIVER_MCP_HTTP_SERVER.lock().is_some()
+}
+
+pub(crate) fn driver_mcp_http_server_url() -> Option<String> {
+    RUNNING_DRIVER_MCP_HTTP_SERVER
+        .lock()
+        .as_ref()
+        .map(|running| running.url.clone())
+}
 
 fn clear_running_server_if_url(url: &str) {
-    let mut guard = RUNNING_DEBUG_MCP_HTTP_SERVER.lock();
+    let mut guard = RUNNING_DRIVER_MCP_HTTP_SERVER.lock();
     let should_clear = guard.as_ref().map(|running| running.url.as_str()) == Some(url);
     if should_clear {
         guard.take();
@@ -498,7 +546,7 @@ async fn healthz_handler() -> impl IntoResponse {
 
 fn resolve_bind_addr() -> SocketAddr {
     let requested =
-        std::env::var(DEBUG_MCP_HTTP_BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+        std::env::var(DRIVER_MCP_HTTP_BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
     resolve_bind_addr_value(&requested)
 }
 
@@ -507,7 +555,7 @@ fn resolve_bind_addr_value(requested: &str) -> SocketAddr {
         Ok(addr) if addr.ip().is_loopback() => addr,
         Ok(addr) => {
             tracing::warn!(
-                "Ignoring non-loopback {DEBUG_MCP_HTTP_BIND_ENV}={addr}; falling back to {DEFAULT_BIND_ADDR}"
+                "Ignoring non-loopback {DRIVER_MCP_HTTP_BIND_ENV}={addr}; falling back to {DEFAULT_BIND_ADDR}"
             );
             DEFAULT_BIND_ADDR
                 .parse()
@@ -515,7 +563,7 @@ fn resolve_bind_addr_value(requested: &str) -> SocketAddr {
         }
         Err(err) => {
             tracing::warn!(
-                "Invalid {DEBUG_MCP_HTTP_BIND_ENV}='{requested}': {err}; falling back to {DEFAULT_BIND_ADDR}"
+                "Invalid {DRIVER_MCP_HTTP_BIND_ENV}='{requested}': {err}; falling back to {DEFAULT_BIND_ADDR}"
             );
             DEFAULT_BIND_ADDR
                 .parse()
@@ -530,37 +578,18 @@ mod tests {
 
     #[test]
     fn resolve_bind_addr_accepts_loopback() {
-        let addr = resolve_bind_addr_value("127.0.0.1:5001");
-        assert_eq!(addr, "127.0.0.1:5001".parse().expect("valid socket addr"));
+        let addr = resolve_bind_addr_value("127.0.0.1:5002");
+        assert_eq!(addr, "127.0.0.1:5002".parse().expect("valid socket addr"));
     }
 
     #[test]
     fn resolve_bind_addr_rejects_non_loopback() {
-        let addr = resolve_bind_addr_value("0.0.0.0:5001");
+        let addr = resolve_bind_addr_value("0.0.0.0:5002");
         assert_eq!(
             addr,
             DEFAULT_BIND_ADDR
                 .parse()
                 .expect("default bind address should parse")
         );
-    }
-
-    #[test]
-    fn validate_png_base64_accepts_valid_png() {
-        // 1x1 transparent PNG
-        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7m6i0AAAAASUVORK5CYII=";
-        assert!(validate_png_base64(png).is_ok());
-    }
-
-    #[test]
-    fn validate_png_base64_rejects_invalid_base64() {
-        let err = validate_png_base64("not-base64!").expect_err("expected invalid base64");
-        assert!(err.contains("invalid base64"));
-    }
-
-    #[test]
-    fn validate_png_base64_rejects_non_png_payload() {
-        let err = validate_png_base64("aGVsbG8=").expect_err("expected non-png to be rejected");
-        assert!(err.contains("not a PNG"));
     }
 }

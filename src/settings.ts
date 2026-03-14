@@ -7,14 +7,14 @@ import {
   type BackendDependencyStatus,
   type BackendDepResult,
   checkBackendDependencies as checkBackendDependenciesBridge,
-  type DebugMcpHttpServerSettings,
-  getDebugMcpHttpServerSettings as getDebugMcpHttpServerSettingsBridge,
+  type DriverMcpHttpServerSettings,
+  getDriverMcpHttpServerSettings as getDriverMcpHttpServerSettingsBridge,
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
   installBackendDependency as installBackendDependencyBridge,
   type McpHttpServerSettings,
-  setDebugMcpHttpServerAutoloadEnabled as setDebugMcpHttpServerAutoloadEnabledBridge,
-  setDebugMcpHttpServerEnabled as setDebugMcpHttpServerEnabledBridge,
   setDisabledBackends as setDisabledBackendsBridge,
+  setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
+  setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
   setMcpHttpServerEnabled as setMcpHttpServerEnabledBridge,
 } from "./bridge";
 import {
@@ -453,14 +453,14 @@ export class SettingsPanel {
   };
   private mcpHttpStatusLoading = false;
   private mcpHttpStatusError: string | null = null;
-  private debugMcpHttpServerSettings: DebugMcpHttpServerSettings = {
+  private driverMcpHttpServerSettings: DriverMcpHttpServerSettings = {
     enabled: false,
     autoload: false,
     running: false,
     url: null,
   };
-  private debugMcpHttpStatusLoading = false;
-  private debugMcpHttpStatusError: string | null = null;
+  private driverMcpHttpStatusLoading = false;
+  private driverMcpHttpStatusError: string | null = null;
   private moduleSchemas: any[] = [];
   private profiles: string[] = [];
   private activeProfile: string | null = null;
@@ -501,7 +501,7 @@ export class SettingsPanel {
     this.activeTab = loadActiveTab();
     applyAppearanceToDocument(this.appearance);
     this.refreshMcpHttpServerSettings();
-    this.refreshDebugMcpHttpServerSettings();
+    this.refreshDriverMcpHttpServerSettings();
     this.refreshBackendDependencies();
     this.render();
   }
@@ -556,20 +556,20 @@ export class SettingsPanel {
       });
   }
 
-  refreshDebugMcpHttpServerSettings(): void {
-    this.debugMcpHttpStatusLoading = true;
-    this.debugMcpHttpStatusError = null;
-    getDebugMcpHttpServerSettingsBridge()
+  refreshDriverMcpHttpServerSettings(): void {
+    this.driverMcpHttpStatusLoading = true;
+    this.driverMcpHttpStatusError = null;
+    getDriverMcpHttpServerSettingsBridge()
       .then((settings) => {
-        this.debugMcpHttpServerSettings = settings;
+        this.driverMcpHttpServerSettings = settings;
       })
       .catch((err) => {
-        this.debugMcpHttpStatusError =
+        this.driverMcpHttpStatusError =
           err instanceof Error ? err.message : String(err);
-        console.error("Failed to load debug MCP HTTP server settings:", err);
+        console.error("Failed to load driver MCP HTTP server settings:", err);
       })
       .finally(() => {
-        this.debugMcpHttpStatusLoading = false;
+        this.driverMcpHttpStatusLoading = false;
         if (this.activeTab === "tyde") {
           this.rerenderPanelContent("tyde", () => this.buildTydeContent());
         }
@@ -1926,38 +1926,41 @@ export class SettingsPanel {
       });
   }
 
-  private setDebugMcpHttpServerEnabled(enabled: boolean): void {
-    this.debugMcpHttpStatusLoading = true;
-    this.debugMcpHttpStatusError = null;
-    setDebugMcpHttpServerEnabledBridge(enabled)
+  private setDriverMcpHttpServerEnabled(enabled: boolean): void {
+    this.driverMcpHttpStatusLoading = true;
+    this.driverMcpHttpStatusError = null;
+    setDriverMcpHttpServerEnabledBridge(enabled)
       .then((settings) => {
-        this.debugMcpHttpServerSettings = settings;
+        this.driverMcpHttpServerSettings = settings;
       })
       .catch((err) => {
-        this.debugMcpHttpStatusError =
+        this.driverMcpHttpStatusError =
           err instanceof Error ? err.message : String(err);
-        console.error("Failed to update debug MCP HTTP server setting:", err);
+        console.error("Failed to update driver MCP HTTP server setting:", err);
       })
       .finally(() => {
-        this.debugMcpHttpStatusLoading = false;
+        this.driverMcpHttpStatusLoading = false;
         this.rerenderPanelContent("tyde", () => this.buildTydeContent());
       });
   }
 
-  private setDebugMcpHttpServerAutoloadEnabled(enabled: boolean): void {
-    this.debugMcpHttpStatusLoading = true;
-    this.debugMcpHttpStatusError = null;
-    setDebugMcpHttpServerAutoloadEnabledBridge(enabled)
+  private setDriverMcpHttpServerAutoloadEnabled(enabled: boolean): void {
+    this.driverMcpHttpStatusLoading = true;
+    this.driverMcpHttpStatusError = null;
+    setDriverMcpHttpServerAutoloadEnabledBridge(enabled)
       .then((settings) => {
-        this.debugMcpHttpServerSettings = settings;
+        this.driverMcpHttpServerSettings = settings;
       })
       .catch((err) => {
-        this.debugMcpHttpStatusError =
+        this.driverMcpHttpStatusError =
           err instanceof Error ? err.message : String(err);
-        console.error("Failed to update debug MCP HTTP autoload setting:", err);
+        console.error(
+          "Failed to update driver MCP HTTP autoload setting:",
+          err,
+        );
       })
       .finally(() => {
-        this.debugMcpHttpStatusLoading = false;
+        this.driverMcpHttpStatusLoading = false;
         this.rerenderPanelContent("tyde", () => this.buildTydeContent());
       });
   }
@@ -2026,10 +2029,10 @@ export class SettingsPanel {
     return section;
   }
 
-  private buildDebugMcpRuntimeControl(): HTMLElement {
+  private buildDriverMcpRuntimeControl(): HTMLElement {
     const section = el("div", { class: "settings-section" });
     section.appendChild(
-      el("h3", { class: "settings-section-header" }, "Tyde MCP Debug Server"),
+      el("h3", { class: "settings-section-header" }, "Tyde MCP Driver Server"),
     );
 
     const field = el("div", { class: "settings-field" });
@@ -2039,33 +2042,33 @@ export class SettingsPanel {
       el(
         "label",
         { class: "settings-label", "data-testid": "settings-label" },
-        "Enable Loopback MCP Debugging",
+        "Enable MCP Driver",
       ),
     );
     labelCol.appendChild(
       el(
         "p",
         { class: "settings-description" },
-        "When enabled, local MCP clients can inspect Tyde logs and drive Tyde UI actions for debugging.",
+        "When enabled, agents can spawn dev instances and remotely debug them via MCP.",
       ),
     );
 
-    const statusText = this.debugMcpHttpStatusLoading
+    const statusText = this.driverMcpHttpStatusLoading
       ? "Updating..."
-      : this.debugMcpHttpServerSettings.running
-        ? this.debugMcpHttpServerSettings.url
-          ? `Running at ${this.debugMcpHttpServerSettings.url}`
+      : this.driverMcpHttpServerSettings.running
+        ? this.driverMcpHttpServerSettings.url
+          ? `Running at ${this.driverMcpHttpServerSettings.url}`
           : "Running"
         : "Disabled";
     labelCol.appendChild(
       el("p", { class: "settings-description" }, statusText),
     );
-    if (this.debugMcpHttpStatusError) {
+    if (this.driverMcpHttpStatusError) {
       labelCol.appendChild(
         el(
           "p",
           { class: "settings-description" },
-          `Error: ${this.debugMcpHttpStatusError}`,
+          `Error: ${this.driverMcpHttpStatusError}`,
         ),
       );
     }
@@ -2074,12 +2077,12 @@ export class SettingsPanel {
     const toggle = el("label", { class: "settings-toggle" });
     const input = el("input", {
       type: "checkbox",
-      "data-testid": "settings-debug-mcp-http-enabled",
+      "data-testid": "settings-driver-mcp-http-enabled",
     }) as HTMLInputElement;
-    input.checked = this.debugMcpHttpServerSettings.enabled;
-    input.disabled = this.debugMcpHttpStatusLoading;
+    input.checked = this.driverMcpHttpServerSettings.enabled;
+    input.disabled = this.driverMcpHttpStatusLoading;
     input.addEventListener("change", () => {
-      this.setDebugMcpHttpServerEnabled(input.checked);
+      this.setDriverMcpHttpServerEnabled(input.checked);
     });
     toggle.appendChild(input);
     toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
@@ -2100,7 +2103,7 @@ export class SettingsPanel {
       el(
         "p",
         { class: "settings-description" },
-        "When enabled, new chat sessions start with this debug MCP server preconfigured.",
+        "When enabled, new chat sessions start with the driver MCP server preconfigured.",
       ),
     );
     autoRow.appendChild(autoLabelCol);
@@ -2108,14 +2111,14 @@ export class SettingsPanel {
     const autoToggle = el("label", { class: "settings-toggle" });
     const autoInput = el("input", {
       type: "checkbox",
-      "data-testid": "settings-debug-mcp-http-autoload",
+      "data-testid": "settings-driver-mcp-http-autoload",
     }) as HTMLInputElement;
-    autoInput.checked = this.debugMcpHttpServerSettings.autoload;
+    autoInput.checked = this.driverMcpHttpServerSettings.autoload;
     autoInput.disabled =
-      this.debugMcpHttpStatusLoading ||
-      !this.debugMcpHttpServerSettings.enabled;
+      this.driverMcpHttpStatusLoading ||
+      !this.driverMcpHttpServerSettings.enabled;
     autoInput.addEventListener("change", () => {
-      this.setDebugMcpHttpServerAutoloadEnabled(autoInput.checked);
+      this.setDriverMcpHttpServerAutoloadEnabled(autoInput.checked);
     });
     autoToggle.appendChild(autoInput);
     autoToggle.appendChild(el("span", { class: "settings-toggle-slider" }));
@@ -2141,7 +2144,7 @@ export class SettingsPanel {
   private buildTydeContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
     frag.appendChild(this.buildMcpRuntimeControl());
-    frag.appendChild(this.buildDebugMcpRuntimeControl());
+    frag.appendChild(this.buildDriverMcpRuntimeControl());
     return frag;
   }
 

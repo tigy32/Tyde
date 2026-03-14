@@ -145,7 +145,7 @@ describe('Settings panel', () => {
     const debugMcpToggle = await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
       if (!panel) return { exists: false, checked: true };
-      const input = panel.querySelector('[data-testid="settings-debug-mcp-http-enabled"]') as HTMLInputElement | null;
+      const input = panel.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
       if (!input) return { exists: false, checked: true };
       return { exists: true, checked: input.checked };
     }, sel.settingsTabPanel);
@@ -155,7 +155,7 @@ describe('Settings panel', () => {
     const debugMcpAutoloadInitial = await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
       if (!panel) return { exists: false, checked: true, disabled: false };
-      const input = panel.querySelector('[data-testid="settings-debug-mcp-http-autoload"]') as HTMLInputElement | null;
+      const input = panel.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
       if (!input) return { exists: false, checked: true, disabled: false };
       return { exists: true, checked: input.checked, disabled: input.disabled };
     }, sel.settingsTabPanel);
@@ -165,7 +165,7 @@ describe('Settings panel', () => {
 
     await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-debug-mcp-http-enabled"]') as HTMLInputElement;
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement;
       input.checked = !input.checked;
       input.dispatchEvent(new Event('change', { bubbles: true }));
     }, sel.settingsTabPanel);
@@ -173,14 +173,14 @@ describe('Settings panel', () => {
 
     const debugMcpToggleAfter = await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-debug-mcp-http-enabled"]') as HTMLInputElement | null;
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
       return input?.checked ?? false;
     }, sel.settingsTabPanel);
     expect(debugMcpToggleAfter).toBe(true);
 
     const debugMcpAutoloadAfterEnable = await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-debug-mcp-http-autoload"]') as HTMLInputElement | null;
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
       if (!input) return { checked: true, disabled: true };
       return { checked: input.checked, disabled: input.disabled };
     }, sel.settingsTabPanel);
@@ -189,7 +189,7 @@ describe('Settings panel', () => {
 
     await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-debug-mcp-http-autoload"]') as HTMLInputElement;
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement;
       input.checked = !input.checked;
       input.dispatchEvent(new Event('change', { bubbles: true }));
     }, sel.settingsTabPanel);
@@ -197,7 +197,7 @@ describe('Settings panel', () => {
 
     const debugMcpAutoloadAfterToggle = await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-debug-mcp-http-autoload"]') as HTMLInputElement | null;
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
       return input?.checked ?? false;
     }, sel.settingsTabPanel);
     expect(debugMcpAutoloadAfterToggle).toBe(true);
