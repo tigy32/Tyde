@@ -245,13 +245,16 @@ export async function getModuleSchemas(conversationId: number): Promise<void> {
 export async function updateSettings(
   conversationId: number,
   settings: Record<string, unknown>,
+  persist?: boolean,
 ): Promise<void> {
-  return invoke<void>("update_settings", { conversationId, settings }).catch(
-    (err) => {
-      console.error("bridge: updateSettings failed:", err);
-      throw new Error(friendlyError(String(err)));
-    },
-  );
+  return invoke<void>("update_settings", {
+    conversationId,
+    settings,
+    persist: persist ?? false,
+  }).catch((err) => {
+    console.error("bridge: updateSettings failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
 }
 
 export function onChatEvent(

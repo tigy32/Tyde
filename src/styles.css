@@ -8497,6 +8497,10 @@ body {
     color-mix(in srgb, var(--border-primary) 65%, transparent);
 }
 
+.tab-title + .settings-profile-section {
+  border-top: none;
+}
+
 .settings-profile-section .settings-label {
   display: block;
   font-size: var(--text-xs);

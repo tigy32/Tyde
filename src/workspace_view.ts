@@ -26,7 +26,6 @@ import {
   syncFileWatchPaths,
   terminateAgent,
   unwatchWorkspaceDir,
-  updateSettings,
   waitForAgent,
   watchWorkspaceDir,
 } from "./bridge";
@@ -1200,17 +1199,6 @@ export class WorkspaceView {
     await this.applyDefaultSpawnProfile(id, backendKind);
     if (this.mode === "bridge") {
       this.pendingSessionAliases.set(id, tab.title);
-    }
-    if (this.mode === "bridge" && backendKind === "tycode") {
-      await updateSettings(id, {
-        default_agent: "coordinator",
-        autonomy_level: "fully_autonomous",
-      }).catch((err) => {
-        console.warn(
-          `Failed to apply ${this.bridgeChatLabel} Tycode defaults to conversation ${id}:`,
-          err,
-        );
-      });
     }
     if (this.mode === "bridge" && options?.bootstrap !== false) {
       await sendMessage(id, this.buildBridgeBootstrapPrompt());

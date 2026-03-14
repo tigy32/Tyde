@@ -2,9 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARIES_DIR="$SCRIPT_DIR/src-tauri/binaries"
-
-TARGET_TRIPLE="${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
 
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Steven Hershey (743QY8VN34)}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-tycode-notary}"
@@ -38,44 +35,6 @@ sign_and_notarize() {
     log "Signed and notarized: $target"
 }
 
-ensure_subprocess() {
-    local dest="$BINARIES_DIR/tycode-subprocess-${TARGET_TRIPLE}"
-    if [ -f "$dest" ]; then
-        log "Subprocess binary already exists at $dest"
-        return 0
-    fi
-
-    local version
-    version="$(cat "$SCRIPT_DIR/src-tauri/subprocess_version.txt")"
-    local url="https://github.com/tigy32/Tycode/releases/download/v${version}/tycode-subprocess-${TARGET_TRIPLE}.tar.xz"
-
-    log "Downloading tycode-subprocess v${version} for ${TARGET_TRIPLE}"
-    mkdir -p "$BINARIES_DIR"
-
-    local tmp_dir
-    tmp_dir="$(mktemp -d)"
-    trap "rm -rf '$tmp_dir'" EXIT
-
-    curl -sSfL "$url" -o "$tmp_dir/subprocess.tar.xz" \
-        || error "Failed to download subprocess from $url"
-
-    tar -xJf "$tmp_dir/subprocess.tar.xz" -C "$tmp_dir" \
-        || error "Failed to extract subprocess archive"
-
-    local extracted=""
-    extracted="$(find "$tmp_dir" -type f \( -name "tycode-subprocess" -o -name "tycode-subprocess-${TARGET_TRIPLE}" \) | head -n 1 || true)"
-    if [ -z "$extracted" ] || [ ! -f "$extracted" ]; then
-        error "Expected binary 'tycode-subprocess' not found in archive"
-    fi
-
-    cp "$extracted" "$dest"
-    chmod +x "$dest"
-    rm -rf "$tmp_dir"
-    trap - EXIT
-
-    log "Subprocess binary installed at $dest"
-}
-
 ensure_tauri_cli() {
     local tauri_bin="$SCRIPT_DIR/node_modules/.bin/tauri"
     if [[ -x "$tauri_bin" ]]; then
@@ -92,7 +51,6 @@ ensure_tauri_cli() {
 }
 
 cmd_release() {
-    ensure_subprocess
     ensure_tauri_cli
     log "Building Tyde release bundle"
     cd "$SCRIPT_DIR"
@@ -124,19 +82,12 @@ cmd_release() {
 }
 
 cmd_debug() {
-    ensure_subprocess
     ensure_tauri_cli
     log "Building Tyde debug bundle"
     cd "$SCRIPT_DIR"
     # DMG packaging can fail in local debug environments; app bundle is enough for smoke testing.
     "$SCRIPT_DIR/node_modules/.bin/tauri" build --debug --bundles app
     log "Debug build complete."
-}
-
-cmd_clean() {
-    log "Cleaning sidecar binaries"
-    rm -rf "$BINARIES_DIR"
-    log "Clean complete."
 }
 
 cmd_setup() {
@@ -153,18 +104,13 @@ Usage: $(basename "$0") [command]
 Commands:
   release   Build release bundle (default)
   debug     Build debug bundle
-  clean     Remove sidecar binaries
   setup     Install frontend dependencies
-
-Environment:
-  CARGO_BUILD_TARGET   Override Rust target triple (default: host triple)
 EOF
 }
 
 case "${1:-release}" in
     release) cmd_release ;;
     debug)   cmd_debug ;;
-    clean)   cmd_clean ;;
     setup)   cmd_setup ;;
     -h|--help|help) usage ;;
     *) error "Unknown command: $1. Run with --help for usage." ;;

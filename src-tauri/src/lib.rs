@@ -31,7 +31,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 use tokio::fs as tokio_fs;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::admin::AdminManager;
 use crate::agent_runtime::{
@@ -163,6 +163,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                     "parent_agent_id": parent_agent_id,
                 }
             });
+            let (settings_tx, _) = watch::channel(Value::Null);
             tokio::spawn(forward_events(
                 app.clone(),
                 conversation_id,
@@ -170,6 +171,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                 runtime,
                 notify,
                 registration,
+                settings_tx,
             ));
 
             // Queue a synthetic user message with the parent task text when available.
@@ -316,6 +318,7 @@ pub(crate) struct AppState {
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
     disabled_backends: SyncMutex<HashSet<String>>,
+    settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1349,6 +1352,12 @@ async fn create_conversation(
         }
     });
 
+    let (settings_tx, _) = watch::channel(Value::Null);
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.insert(id, settings_tx.clone());
+    }
+
     tokio::spawn(forward_events(
         app.clone(),
         id,
@@ -1356,6 +1365,7 @@ async fn create_conversation(
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
         registration,
+        settings_tx,
     ));
     Ok(id)
 }
@@ -1367,6 +1377,7 @@ async fn forward_events(
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
     registration: Value,
+    settings_tx: watch::Sender<Value>,
 ) {
     let reg_payload = ChatEventPayload {
         conversation_id,
@@ -1380,6 +1391,12 @@ async fn forward_events(
     }
 
     while let Some(event) = rx.recv().await {
+        if event.get("kind").and_then(|k| k.as_str()) == Some("Settings") {
+            if let Some(data) = event.get("data") {
+                let _ = settings_tx.send(data.clone());
+            }
+        }
+
         let changed = {
             let mut runtime = agent_runtime.lock().await;
             runtime.record_chat_event(conversation_id, &event)
@@ -1495,6 +1512,10 @@ async fn close_conversation(
             .ok_or("Conversation not found")?
     };
     session.shutdown().await;
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.remove(&conversation_id);
+    }
     let changed = {
         let mut runtime = state.agent_runtime.lock().await;
         runtime.mark_conversation_closed(conversation_id, Some("Conversation closed".to_string()))
@@ -1604,6 +1625,12 @@ pub(crate) async fn spawn_agent_internal(
         }
     });
 
+    let (settings_tx, _) = watch::channel(Value::Null);
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.insert(conversation_id, settings_tx.clone());
+    }
+
     tokio::spawn(forward_events(
         app.clone(),
         conversation_id,
@@ -1611,6 +1638,7 @@ pub(crate) async fn spawn_agent_internal(
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
         registration,
+        settings_tx,
     ));
 
     execute_conversation_command(
@@ -2444,14 +2472,78 @@ async fn update_settings(
     state: tauri::State<'_, AppState>,
     conversation_id: u64,
     settings: Value,
+    persist: Option<bool>,
 ) -> Result<(), String> {
+    let persist = persist.unwrap_or(false);
+
+    // Only tycode supports GetSettings → Settings event round-trip.
+    // Other backends (codex, claude, kiro) get a direct pass-through.
+    let is_tycode = {
+        let mgr = state.manager.lock().await;
+        mgr.backend_kind(conversation_id) == Some(BackendKind::Tycode)
+    };
+
+    if !is_tycode {
+        return execute_conversation_command(
+            &app,
+            &state,
+            conversation_id,
+            SessionCommand::UpdateSettings {
+                settings,
+                persist,
+            },
+        )
+        .await;
+    }
+
+    // Tycode: read-modify-write so we don't clobber unrelated fields.
+    // The subprocess replaces its entire session state with whatever we send.
+    // 1. Subscribe to the settings watch *before* requesting, so we don't miss the response.
+    let mut settings_rx = {
+        let watchers = state.settings_watch.lock().await;
+        let tx = watchers
+            .get(&conversation_id)
+            .ok_or("Settings watch not found for conversation")?;
+        tx.subscribe()
+    };
+    // Mark current value as seen so changed() waits for the next send.
+    settings_rx.borrow_and_update();
+
+    // 2. Ask the subprocess for its current settings.
+    execute_conversation_command(
+        &app,
+        &state,
+        conversation_id,
+        SessionCommand::GetSettings,
+    )
+    .await?;
+
+    // 3. Wait for the Settings event to come back through forward_events.
+    settings_rx
+        .changed()
+        .await
+        .map_err(|_| "Settings watch channel closed")?;
+    let current = settings_rx.borrow_and_update().clone();
+
+    // 4. Merge the caller's patch on top of the current settings.
+    let merged = match (current, settings) {
+        (Value::Object(mut base), Value::Object(patch)) => {
+            for (k, v) in patch {
+                base.insert(k, v);
+            }
+            Value::Object(base)
+        }
+        (_, patch) => patch,
+    };
+
+    // 5. Write back the merged settings.
     execute_conversation_command(
         &app,
         &state,
         conversation_id,
         SessionCommand::UpdateSettings {
-            settings,
-            persist: true,
+            settings: merged,
+            persist,
         },
     )
     .await
@@ -2860,6 +2952,12 @@ async fn restart_subprocess(
         mgr.insert(conversation_id, session, workspace_roots);
     }
 
+    let (settings_tx, _) = watch::channel(Value::Null);
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.insert(conversation_id, settings_tx.clone());
+    }
+
     tokio::spawn(forward_events(
         app,
         conversation_id,
@@ -2867,6 +2965,7 @@ async fn restart_subprocess(
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
         registration,
+        settings_tx,
     ));
     Ok(())
 }
@@ -2991,6 +3090,7 @@ pub fn run() {
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
+            settings_watch: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
             initialize_tray(app)?;
@@ -3170,6 +3270,7 @@ mod tests {
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
+            settings_watch: Mutex::new(HashMap::new()),
         }
     }
 

@@ -254,10 +254,14 @@ export function createSessionSettings(
   saveBtn.title = "Save session defaults";
   saveBtn.textContent = "💾";
   saveBtn.addEventListener("click", () => {
-    updateSettings(conversationId, {
-      autonomy_level: currentAutonomy,
-      reasoning_effort: currentReasoning,
-    });
+    updateSettings(
+      conversationId,
+      {
+        autonomy_level: currentAutonomy,
+        reasoning_effort: currentReasoning,
+      },
+      true,
+    );
   });
 
   profileInner.appendChild(profileSelect);

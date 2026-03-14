@@ -1551,12 +1551,22 @@ describe('Agents panel parity', () => {
       { timeout: 5000, timeoutMsg: 'Expected no running agent cards after typing has stopped' },
     );
 
-    const cards = await $$(sel.agentCard);
-    await browser.execute((el: HTMLElement) => el.click(), cards[0]);
+    await browser.execute((cardSel: string) => {
+      const card = Array.from(document.querySelectorAll(cardSel))
+        .find((el) => (el as HTMLElement).offsetParent !== null) as HTMLElement | undefined;
+      card?.click();
+    }, sel.agentCard);
 
     await browser.waitUntil(
-      async () => (await (await $$(sel.assistantMessage)).length) > 0,
-      { timeout: 5000, timeoutMsg: 'Expected assistant history to be present when opening feedback agent' },
+      async () => {
+        const msgs = await $$(sel.assistantMessage);
+        for (const msg of msgs) {
+          const text = await msg.getText();
+          if (text.includes('Mock response to:')) return true;
+        }
+        return false;
+      },
+      { timeout: 5000, timeoutMsg: 'Expected assistant history with mock response text when opening feedback agent' },
     );
 
     const assistantMessages = await $$(sel.assistantMessage);

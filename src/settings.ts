@@ -648,7 +648,6 @@ export class SettingsPanel {
     );
     searchWrap.appendChild(searchInput);
     nav.appendChild(searchWrap);
-    nav.appendChild(this.buildDefaultBackendSection());
 
     const uiExpanded =
       this.activeTab === "appearance" ||
@@ -1152,6 +1151,7 @@ export class SettingsPanel {
 
   private buildBackendsContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    frag.appendChild(this.buildDefaultBackendSection());
     const enabledPrefs = getEnabledBackendPreferences();
 
     const backends: { kind: BackendKind; label: string; binary: string }[] = [
