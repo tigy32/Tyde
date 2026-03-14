@@ -139,6 +139,7 @@ export class WorkspaceView {
   private homeViewContainer: HTMLElement | null = null;
   private centerNewTabBtn: HTMLButtonElement | null = null;
   private centerNewTabMenuBtn: HTMLButtonElement | null = null;
+  private centerNewTabMenu: HTMLDivElement | null = null;
   private centerNewTabMenuItems: Partial<
     Record<BackendKind, HTMLButtonElement>
   > = {};
@@ -519,6 +520,7 @@ export class WorkspaceView {
 
     this.centerNewTabBtn = centerNewTabBtn;
     this.centerNewTabMenuBtn = centerNewTabMenuBtn;
+    this.centerNewTabMenu = centerNewTabMenu;
     this.centerNewTabMenuItems = {
       tycode: tycodeMenuItem,
       codex: codexMenuItem,
@@ -754,6 +756,32 @@ export class WorkspaceView {
       enabled,
       this.newConversationDisabledReason,
     );
+  }
+
+  refreshNewChatMenu(): void {
+    const menu = this.centerNewTabMenu;
+    if (!menu) return;
+    while (menu.firstChild) menu.removeChild(menu.firstChild);
+    const enabledSet = new Set(getEnabledBackends());
+    if (enabledSet.size === 0) {
+      const hint = document.createElement("div");
+      hint.className = "center-tab-new-menu-empty";
+      hint.textContent =
+        "No backends enabled. Enable at least one in Settings → Backends.";
+      menu.appendChild(hint);
+    }
+    const order: (keyof typeof this.centerNewTabMenuItems)[] = [
+      "tycode",
+      "codex",
+      "claude",
+      "kiro",
+    ];
+    for (const kind of order) {
+      const item = this.centerNewTabMenuItems[kind];
+      if (item && enabledSet.has(kind)) {
+        menu.appendChild(item);
+      }
+    }
   }
 
   showEmptyState(): void {

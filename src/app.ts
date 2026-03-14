@@ -34,7 +34,11 @@ import {
 import { NotificationManager } from "./notifications";
 import { ProjectStateManager } from "./project_state";
 import { ProjectSidebar } from "./projects";
-import { adjustFontSize, SettingsPanel } from "./settings";
+import {
+  adjustFontSize,
+  initializeBackendDependencies,
+  SettingsPanel,
+} from "./settings";
 import { promptForText } from "./text_prompt";
 import type { ChatEvent } from "./types";
 import {
@@ -95,6 +99,9 @@ export class AppController {
       .getElementById("feedback-btn")!
       .addEventListener("click", () => showFeedbackDialog());
 
+    await initializeBackendDependencies();
+    this.refreshAllBackendMenus();
+
     await this.bootstrapStartup();
     this.startRuntimeAgentSync();
   }
@@ -104,6 +111,13 @@ export class AppController {
   }
 
   persistActiveProjectUiState(): void {}
+
+  private refreshAllBackendMenus(): void {
+    for (const view of this.workspaceViews.values()) {
+      view.refreshNewChatMenu();
+    }
+    this.homeView.render();
+  }
 
   private getActiveView(): WorkspaceView | null {
     if (!this.activeWorkspaceId) return null;
@@ -171,6 +185,7 @@ export class AppController {
     this.settingsTabViewEl = settingsTabViewEl;
     this.settingsPanel = new SettingsPanel(settingsTabViewEl);
     this.settingsPanel.onClose = () => this.closeSettings();
+    this.settingsPanel.onBackendsChanged = () => this.refreshAllBackendMenus();
 
     settingsTabViewEl.classList.add("settings-overlay");
     const container = document.getElementById("workspace-container")!;
