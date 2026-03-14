@@ -14,9 +14,6 @@
     "targets": "all",
     "icon": [
       "icons/icon.png"
-    ],
-    "externalBin": [
-      "binaries/tycode-subprocess"
     ]
   },
   "app": {

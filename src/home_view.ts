@@ -1,6 +1,7 @@
 import type { AgentCardAction } from "./agents";
 import type { BackendKind, RuntimeAgent } from "./bridge";
 import type { Project, ProjectStateManager } from "./project_state";
+import { getEnabledBackends } from "./settings";
 
 const STATUS_COLORS: Record<string, string> = {
   active: "#4CAF50",
@@ -21,6 +22,7 @@ export class HomeView {
   private cachedAgents: RuntimeAgent[] | null = null;
   private agentsLoading = false;
   private actionListenerController: AbortController | null = null;
+  private bridgeMenuOpen = false;
   private collapsedParents: Set<number> = new Set();
   private homeHideInactive = false;
   private homeHideSubAgents = false;
@@ -601,12 +603,21 @@ export class HomeView {
     menu.setAttribute("role", "menu");
     menu.dataset.testid = "home-bridge-menu";
 
-    const backends: { kind: BackendKind; label: string }[] = [
+    const allBackends: { kind: BackendKind; label: string }[] = [
       { kind: "tycode", label: "Tycode" },
       { kind: "codex", label: "Codex" },
       { kind: "claude", label: "Claude" },
       { kind: "kiro", label: "Kiro" },
     ];
+    const enabledSet = new Set(getEnabledBackends());
+    const backends = allBackends.filter((b) => enabledSet.has(b.kind));
+    if (backends.length === 0) {
+      const hint = document.createElement("div");
+      hint.className = "home-bridge-menu-empty";
+      hint.textContent =
+        "No backends enabled. Enable at least one in Settings → Backends.";
+      menu.appendChild(hint);
+    }
     for (const { kind, label } of backends) {
       const item = document.createElement("button");
       item.className = "home-bridge-menu-item";
@@ -620,29 +631,26 @@ export class HomeView {
       menu.appendChild(item);
     }
 
-    const positionMenu = (): void => {
-      const rect = splitContainer.getBoundingClientRect();
-      menu.style.top = `${rect.bottom + 4}px`;
-      menu.style.left = `${rect.left}px`;
-      menu.style.minWidth = `${rect.width}px`;
-    };
-
     const openMenu = (): void => {
-      if (!this.bridgeChatEnabled || !menu.hidden) return;
-      if (!menu.isConnected) document.body.appendChild(menu);
-      menu.style.visibility = "hidden";
+      if (!this.bridgeChatEnabled || this.bridgeMenuOpen) return;
+      this.bridgeMenuOpen = true;
       menu.hidden = false;
-      positionMenu();
-      menu.style.visibility = "";
       menuBtn.setAttribute("aria-expanded", "true");
       splitContainer.classList.add("open");
     };
 
     const closeMenu = (): void => {
+      this.bridgeMenuOpen = false;
       menu.hidden = true;
       menuBtn.setAttribute("aria-expanded", "false");
       splitContainer.classList.remove("open");
     };
+
+    if (this.bridgeMenuOpen) {
+      menu.hidden = false;
+      menuBtn.setAttribute("aria-expanded", "true");
+      splitContainer.classList.add("open");
+    }
 
     menuBtn.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -669,6 +677,7 @@ export class HomeView {
 
     splitContainer.appendChild(bridgeBtn);
     splitContainer.appendChild(menuBtn);
+    splitContainer.appendChild(menu);
 
     // -- Other action buttons --
     const openBtn = document.createElement("button");

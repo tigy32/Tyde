@@ -4,12 +4,17 @@ import {
   adminListProfiles,
   adminSwitchProfile,
   adminUpdateSettings,
+  type BackendDependencyStatus,
+  type BackendDepResult,
+  checkBackendDependencies as checkBackendDependenciesBridge,
   type DebugMcpHttpServerSettings,
   getDebugMcpHttpServerSettings as getDebugMcpHttpServerSettingsBridge,
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
+  installBackendDependency as installBackendDependencyBridge,
   type McpHttpServerSettings,
   setDebugMcpHttpServerAutoloadEnabled as setDebugMcpHttpServerAutoloadEnabledBridge,
   setDebugMcpHttpServerEnabled as setDebugMcpHttpServerEnabledBridge,
+  setDisabledBackends as setDisabledBackendsBridge,
   setMcpHttpServerEnabled as setMcpHttpServerEnabledBridge,
 } from "./bridge";
 import {
@@ -161,6 +166,78 @@ export function setDefaultSpawnProfile(profileName: string | null): void {
     localStorage.setItem(DEFAULT_SPAWN_PROFILE_STORAGE_KEY, normalized);
   } catch (err) {
     console.error("Failed to save default spawn profile to localStorage:", err);
+  }
+}
+
+// --- Backend enable/disable persistence ---
+
+const ENABLED_BACKENDS_STORAGE_KEY = "tyde-enabled-backends";
+const ALL_BACKENDS: BackendKind[] = ["tycode", "codex", "claude", "kiro"];
+
+let cachedDependencyStatus: Record<BackendKind, BackendDepResult> | null = null;
+
+export function setCachedDependencyStatus(
+  status: BackendDependencyStatus,
+): void {
+  cachedDependencyStatus = {
+    tycode: status.tycode,
+    codex: status.codex,
+    claude: status.claude,
+    kiro: status.kiro,
+  };
+}
+
+export function getCachedDependencyStatus(): Record<
+  BackendKind,
+  BackendDepResult
+> | null {
+  return cachedDependencyStatus;
+}
+
+export function getEnabledBackendPreferences(): BackendKind[] {
+  const raw = localStorage.getItem(ENABLED_BACKENDS_STORAGE_KEY);
+  if (!raw) return [...ALL_BACKENDS];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [...ALL_BACKENDS];
+    return parsed.filter((b: string) =>
+      (ALL_BACKENDS as string[]).includes(b),
+    ) as BackendKind[];
+  } catch {
+    return [...ALL_BACKENDS];
+  }
+}
+
+export function setEnabledBackendPreferences(backends: BackendKind[]): void {
+  localStorage.setItem(ENABLED_BACKENDS_STORAGE_KEY, JSON.stringify(backends));
+}
+
+export function isBackendEnabled(kind: BackendKind): boolean {
+  const prefs = getEnabledBackendPreferences();
+  if (!prefs.includes(kind)) return false;
+  if (cachedDependencyStatus && !cachedDependencyStatus[kind].available)
+    return false;
+  return true;
+}
+
+export function getEnabledBackends(): BackendKind[] {
+  return ALL_BACKENDS.filter(isBackendEnabled);
+}
+
+function syncDisabledBackendsToRust(): void {
+  const disabled = ALL_BACKENDS.filter((b) => !isBackendEnabled(b));
+  setDisabledBackendsBridge(disabled).catch((err) => {
+    console.error("Failed to sync disabled backends to Rust:", err);
+  });
+}
+
+export async function initializeBackendDependencies(): Promise<void> {
+  try {
+    const status = await checkBackendDependenciesBridge();
+    setCachedDependencyStatus(status);
+    syncDisabledBackendsToRust();
+  } catch (err) {
+    console.error("Failed to initialize backend dependencies:", err);
   }
 }
 
@@ -390,6 +467,12 @@ export class SettingsPanel {
   private defaultSpawnProfile: string | null = getDefaultSpawnProfile();
   private activeTab: SettingsTabId;
   private searchQuery = "";
+  private backendDependencyStatus: Record<
+    BackendKind,
+    BackendDepResult
+  > | null = null;
+  private installingBackends: Set<BackendKind> = new Set();
+  private backendInstallError: Map<BackendKind, string> = new Map();
   private _adminId: number | null = null;
 
   get adminId(): number | null {
@@ -418,6 +501,7 @@ export class SettingsPanel {
     applyAppearanceToDocument(this.appearance);
     this.refreshMcpHttpServerSettings();
     this.refreshDebugMcpHttpServerSettings();
+    this.refreshBackendDependencies();
     this.render();
   }
 
@@ -491,6 +575,29 @@ export class SettingsPanel {
       });
   }
 
+  refreshBackendDependencies(): void {
+    checkBackendDependenciesBridge()
+      .then((status) => {
+        this.backendDependencyStatus = {
+          tycode: status.tycode,
+          codex: status.codex,
+          claude: status.claude,
+          kiro: status.kiro,
+        };
+        setCachedDependencyStatus(status);
+        syncDisabledBackendsToRust();
+        if (this.activeTab === "backends") {
+          this.rerenderPanelContent("backends", () =>
+            this.buildBackendsContent(),
+          );
+        }
+        this.syncProfileDropdown();
+      })
+      .catch((err) => {
+        console.error("Failed to check backend dependencies:", err);
+      });
+  }
+
   // --- Persistence ---
 
   private persistToBackend(): void {
@@ -544,7 +651,9 @@ export class SettingsPanel {
     nav.appendChild(this.buildDefaultBackendSection());
 
     const uiExpanded =
-      this.activeTab === "appearance" || this.activeTab === "tyde";
+      this.activeTab === "appearance" ||
+      this.activeTab === "backends" ||
+      this.activeTab === "tyde";
     const aiExpanded = !uiExpanded;
 
     // Tyde Settings collapsible group
@@ -562,6 +671,18 @@ export class SettingsPanel {
     );
     appearanceBtn.addEventListener("click", () => this.switchTab("appearance"));
     uiItems.appendChild(appearanceBtn);
+    const backendsBtn = el(
+      "button",
+      {
+        class: "nav-item",
+        "data-tab": "backends",
+        role: "tab",
+        "data-testid": "settings-nav-item",
+      },
+      "Backends",
+    );
+    backendsBtn.addEventListener("click", () => this.switchTab("backends"));
+    uiItems.appendChild(backendsBtn);
     const tydeBtn = el(
       "button",
       {
@@ -605,6 +726,7 @@ export class SettingsPanel {
 
     // Tab panels
     content.appendChild(this.buildAppearancePanel());
+    content.appendChild(this.buildBackendsPanel());
     content.appendChild(this.buildTydePanel());
     content.appendChild(this.buildGeneralPanel());
     content.appendChild(this.buildProvidersPanel());
@@ -676,7 +798,9 @@ export class SettingsPanel {
 
   private syncNavGroupsForActiveTab(): void {
     const uiActive =
-      this.activeTab === "appearance" || this.activeTab === "tyde";
+      this.activeTab === "appearance" ||
+      this.activeTab === "backends" ||
+      this.activeTab === "tyde";
     this.setNavGroupExpanded("ui", uiActive);
     this.setNavGroupExpanded("ai", !uiActive);
   }
@@ -1010,6 +1134,139 @@ export class SettingsPanel {
     ) as HTMLElement | null;
     if (outputControl)
       this.setActiveSegment(outputControl, getToolOutputMode());
+  }
+
+  // ========== BACKENDS TAB ==========
+
+  private buildBackendsPanel(): HTMLElement {
+    const section = el("section", {
+      class: "tab-panel",
+      "data-panel": "backends",
+      role: "tabpanel",
+      "data-testid": "settings-tab-panel",
+    });
+    section.appendChild(el("h2", { class: "tab-title" }, "Backends"));
+    section.appendChild(this.buildBackendsContent());
+    return section;
+  }
+
+  private buildBackendsContent(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    const enabledPrefs = getEnabledBackendPreferences();
+
+    const backends: { kind: BackendKind; label: string; binary: string }[] = [
+      { kind: "tycode", label: "Tycode", binary: "tycode-subprocess" },
+      { kind: "codex", label: "Codex", binary: "codex" },
+      { kind: "claude", label: "Claude Code", binary: "claude" },
+      { kind: "kiro", label: "Kiro", binary: "kiro-cli" },
+    ];
+
+    for (const { kind, label, binary } of backends) {
+      const dep = this.backendDependencyStatus?.[kind];
+      const depMissing = dep !== undefined && !dep.available;
+
+      const section = el("div", { class: "settings-section" });
+      const field = el("div", { class: "settings-field" });
+      const row = el("div", { class: "settings-toggle-row" });
+      const labelCol = el("div", { class: "settings-toggle-label-col" });
+
+      labelCol.appendChild(
+        el(
+          "label",
+          { class: "settings-label", "data-testid": "settings-label" },
+          label,
+        ),
+      );
+
+      if (depMissing) {
+        labelCol.appendChild(
+          el(
+            "p",
+            { class: "settings-description settings-backend-warning" },
+            `"${binary}" was not found in PATH. Install it to enable this backend.`,
+          ),
+        );
+
+        const installing = this.installingBackends.has(kind);
+        const installError = this.backendInstallError.get(kind);
+
+        const installBtn = el("button", {
+          class: "settings-install-btn",
+          "data-testid": `settings-backend-${kind}-install`,
+        }) as HTMLButtonElement;
+        installBtn.textContent = installing ? "Installing..." : "Install";
+        installBtn.disabled = installing;
+        installBtn.addEventListener("click", () => {
+          this.installingBackends.add(kind);
+          this.backendInstallError.delete(kind);
+          this.rerenderPanelContent("backends", () =>
+            this.buildBackendsContent(),
+          );
+          installBackendDependencyBridge(kind)
+            .then(() => {
+              this.installingBackends.delete(kind);
+              this.refreshBackendDependencies();
+            })
+            .catch((err) => {
+              this.installingBackends.delete(kind);
+              this.backendInstallError.set(kind, String(err));
+              this.rerenderPanelContent("backends", () =>
+                this.buildBackendsContent(),
+              );
+            });
+        });
+        labelCol.appendChild(installBtn);
+
+        if (installError) {
+          labelCol.appendChild(
+            el(
+              "p",
+              { class: "settings-description settings-backend-warning" },
+              installError,
+            ),
+          );
+        }
+      } else {
+        labelCol.appendChild(
+          el(
+            "p",
+            { class: "settings-description" },
+            `Enable or disable the ${label} backend.`,
+          ),
+        );
+      }
+
+      row.appendChild(labelCol);
+
+      const toggle = el("label", { class: "settings-toggle" });
+      const input = el("input", {
+        type: "checkbox",
+        "data-testid": `settings-backend-${kind}-enabled`,
+      }) as HTMLInputElement;
+      input.checked = enabledPrefs.includes(kind) && !depMissing;
+      input.disabled = depMissing;
+      input.addEventListener("change", () => {
+        const current = getEnabledBackendPreferences();
+        if (input.checked) {
+          if (!current.includes(kind)) current.push(kind);
+        } else {
+          const idx = current.indexOf(kind);
+          if (idx !== -1) current.splice(idx, 1);
+        }
+        setEnabledBackendPreferences(current);
+        syncDisabledBackendsToRust();
+        this.syncProfileDropdown();
+      });
+      toggle.appendChild(input);
+      toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
+      row.appendChild(toggle);
+
+      field.appendChild(row);
+      section.appendChild(field);
+      frag.appendChild(section);
+    }
+
+    return frag;
   }
 
   // ========== GENERAL TAB ==========
@@ -2702,23 +2959,25 @@ export class SettingsPanel {
 
     if (backendSelect) {
       backendSelect.innerHTML = "";
-      const tycode = el("option", { value: "tycode" }, "Tycode");
-      const codex = el("option", { value: "codex" }, "Codex");
-      const claude = el("option", { value: "claude" }, "Claude Code");
-      const kiro = el("option", { value: "kiro" }, "Kiro");
-      if (this.defaultBackend === "tycode") {
-        tycode.selected = true;
-      } else if (this.defaultBackend === "codex") {
-        codex.selected = true;
-      } else if (this.defaultBackend === "kiro") {
-        kiro.selected = true;
-      } else {
-        claude.selected = true;
+      const enabledBackends = getEnabledBackends();
+      const backendLabels: Record<BackendKind, string> = {
+        tycode: "Tycode",
+        codex: "Codex",
+        claude: "Claude Code",
+        kiro: "Kiro",
+      };
+      for (const kind of enabledBackends) {
+        const opt = el("option", { value: kind }, backendLabels[kind]);
+        if (kind === this.defaultBackend) opt.selected = true;
+        backendSelect.appendChild(opt);
       }
-      backendSelect.appendChild(tycode);
-      backendSelect.appendChild(codex);
-      backendSelect.appendChild(claude);
-      backendSelect.appendChild(kiro);
+      if (
+        enabledBackends.length > 0 &&
+        !enabledBackends.includes(this.defaultBackend)
+      ) {
+        this.defaultBackend = enabledBackends[0];
+        setDefaultBackend(this.defaultBackend);
+      }
     }
 
     if (profileSelect) {

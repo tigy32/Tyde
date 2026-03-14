@@ -102,9 +102,9 @@ pub fn shell_quote_command(args: &[String]) -> String {
         .join(" ")
 }
 
-const SUBPROCESS_VERSION: &str = env!("SUBPROCESS_VERSION");
-const SUBPROCESS_GIT_REPO: &str = "https://github.com/tigy32/Tycode";
-const SUBPROCESS_CRATE_NAME: &str = "tycode-subprocess";
+pub(crate) const SUBPROCESS_VERSION: &str = env!("SUBPROCESS_VERSION");
+pub(crate) const SUBPROCESS_GIT_REPO: &str = "https://github.com/tigy32/Tycode";
+pub(crate) const SUBPROCESS_CRATE_NAME: &str = "tycode-subprocess";
 
 fn ssh_control_socket_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME")

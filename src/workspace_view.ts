@@ -41,7 +41,11 @@ import { Layout, type PersistentWidgetId } from "./layout";
 import type { NotificationManager } from "./notifications";
 import { logTabPerf, perfNow } from "./perf_debug";
 import { SessionsPanel } from "./sessions";
-import { getDefaultBackend, getDefaultSpawnProfile } from "./settings";
+import {
+  getDefaultBackend,
+  getDefaultSpawnProfile,
+  getEnabledBackends,
+} from "./settings";
 import type { TabState } from "./tabs";
 import { TabManager } from "./tabs";
 import { TerminalService } from "./terminal";
@@ -261,10 +265,25 @@ export class WorkspaceView {
     kiroMenuItem.setAttribute("role", "menuitem");
     kiroMenuItem.dataset.testid = "center-new-tab-kiro";
 
-    centerNewTabMenu.appendChild(tycodeMenuItem);
-    centerNewTabMenu.appendChild(codexMenuItem);
-    centerNewTabMenu.appendChild(claudeMenuItem);
-    centerNewTabMenu.appendChild(kiroMenuItem);
+    const menuItems: { kind: BackendKind; el: HTMLButtonElement }[] = [
+      { kind: "tycode", el: tycodeMenuItem },
+      { kind: "codex", el: codexMenuItem },
+      { kind: "claude", el: claudeMenuItem },
+      { kind: "kiro", el: kiroMenuItem },
+    ];
+    const enabledSet = new Set(getEnabledBackends());
+    if (enabledSet.size === 0) {
+      const hint = document.createElement("div");
+      hint.className = "center-tab-new-menu-empty";
+      hint.textContent =
+        "No backends enabled. Enable at least one in Settings → Backends.";
+      centerNewTabMenu.appendChild(hint);
+    }
+    for (const { kind, el: item } of menuItems) {
+      if (enabledSet.has(kind)) {
+        centerNewTabMenu.appendChild(item);
+      }
+    }
     centerNewTabSplit.appendChild(centerNewTabBtn);
     centerNewTabSplit.appendChild(centerNewTabMenuBtn);
 
@@ -1226,14 +1245,25 @@ export class WorkspaceView {
   }
 
   private supportedSessionBackends(): BackendKind[] {
-    const backends: BackendKind[] = ["tycode"];
-    if (this.resolveWorkspaceRootsForBackend("codex").length > 0) {
+    const enabled = new Set(getEnabledBackends());
+    const backends: BackendKind[] = [];
+    if (enabled.has("tycode")) backends.push("tycode");
+    if (
+      enabled.has("codex") &&
+      this.resolveWorkspaceRootsForBackend("codex").length > 0
+    ) {
       backends.push("codex");
     }
-    if (this.resolveWorkspaceRootsForBackend("claude").length > 0) {
+    if (
+      enabled.has("claude") &&
+      this.resolveWorkspaceRootsForBackend("claude").length > 0
+    ) {
       backends.push("claude");
     }
-    if (this.resolveWorkspaceRootsForBackend("kiro").length > 0) {
+    if (
+      enabled.has("kiro") &&
+      this.resolveWorkspaceRootsForBackend("kiro").length > 0
+    ) {
       backends.push("kiro");
     }
     return backends;
@@ -1999,6 +2029,25 @@ export class WorkspaceView {
     preferredBackend?: BackendKind,
   ): BackendKind {
     const preferred = preferredBackend ?? getDefaultBackend();
+    const enabled = getEnabledBackends();
+    if (enabled.length === 0) {
+      throw new Error(
+        "No backends are enabled. Enable at least one backend in Settings → Backends.",
+      );
+    }
+    if (!enabled.includes(preferred)) {
+      const backendLabels: Record<string, string> = {
+        tycode: "Tycode",
+        codex: "Codex",
+        claude: "Claude",
+        kiro: "Kiro",
+      };
+      const label = backendLabels[preferred] ?? preferred;
+      this.notifications.warning(
+        `${label} backend is disabled. Using ${backendLabels[enabled[0]] ?? "Tycode"}.`,
+      );
+      return enabled[0];
+    }
     if (
       (preferred === "codex" ||
         preferred === "claude" ||

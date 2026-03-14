@@ -417,10 +417,6 @@ export class AppController {
     }
 
     this.homeBridgeView.syncRuntimeAgentPreviews(visibleAgents);
-
-    if (this.projectState.isHomeActive()) {
-      this.homeView.render();
-    }
   }
 
   private openRuntimeAgentInWorkspace(agent: RuntimeAgent): void {

@@ -858,6 +858,45 @@ export function onTerminalExit(
   });
 }
 
+export interface BackendDepResult {
+  available: boolean;
+  binary_name: string;
+}
+
+export interface BackendDependencyStatus {
+  tycode: BackendDepResult;
+  codex: BackendDepResult;
+  claude: BackendDepResult;
+  kiro: BackendDepResult;
+}
+
+export async function checkBackendDependencies(): Promise<BackendDependencyStatus> {
+  return invoke<BackendDependencyStatus>("check_backend_dependencies").catch(
+    (err) => {
+      console.error("bridge: checkBackendDependencies failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
+export async function setDisabledBackends(backends: string[]): Promise<void> {
+  return invoke<void>("set_disabled_backends", { backends }).catch((err) => {
+    console.error("bridge: setDisabledBackends failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
+export async function installBackendDependency(
+  backendKind: string,
+): Promise<void> {
+  return invoke<void>("install_backend_dependency", { backendKind }).catch(
+    (err) => {
+      console.error("bridge: installBackendDependency failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
 export async function openWorkspaceDialog(): Promise<string | null> {
   try {
     const selected = await open({

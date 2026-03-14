@@ -4898,6 +4898,39 @@ body {
   background: var(--text-white);
 }
 
+.settings-toggle input:disabled + .settings-toggle-slider {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.settings-backend-warning {
+  color: var(--color-warning);
+}
+
+.settings-install-btn {
+  margin-top: 4px;
+  padding: 4px 12px;
+  font-size: calc(var(--base-font-size) * 0.8571);
+  border-radius: 4px;
+  border: 1px solid var(--border-primary);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+
+.settings-install-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.settings-install-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Settings Textarea */
 .settings-textarea {
   background: var(--bg-input);
@@ -7554,6 +7587,13 @@ body {
   background: var(--bg-tertiary);
 }
 
+.center-tab-new-menu-empty {
+  padding: 8px 10px;
+  font-size: calc(var(--base-font-size) * 0.8571);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
 .center-content {
   position: relative;
   flex: 1;
@@ -7923,6 +7963,7 @@ body {
 .home-bridge-split {
   display: inline-flex;
   align-items: stretch;
+  position: relative;
 }
 
 .home-bridge-split-main {
@@ -7937,7 +7978,11 @@ body {
 }
 
 .home-bridge-menu {
-  position: fixed;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  min-width: 100%;
   z-index: 1200;
   background: var(--bg-secondary);
   border: 1px solid var(--border-secondary);
@@ -7968,6 +8013,13 @@ body {
 
 .home-bridge-menu-item:hover {
   background: var(--bg-tertiary);
+}
+
+.home-bridge-menu-empty {
+  padding: 8px 10px;
+  font-size: calc(var(--base-font-size) * 0.8571);
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .home-projects-section {

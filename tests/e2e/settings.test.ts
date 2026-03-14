@@ -202,6 +202,79 @@ describe('Settings panel', () => {
     }, sel.settingsTabPanel);
     expect(debugMcpAutoloadAfterToggle).toBe(true);
 
+    // --- Backends tab ---
+    await browser.execute((navItemSel: string) => {
+      const btn = document.querySelector(navItemSel + '[data-tab="backends"]') as HTMLButtonElement | null;
+      btn?.click();
+    }, sel.settingsNavItem);
+    await browser.pause(300);
+
+    // Verify backends panel is visible with toggle controls
+    const backendsPanel = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      if (!panel) return { exists: false, toggleCount: 0 };
+      const toggles = panel.querySelectorAll('input[type="checkbox"]');
+      return { exists: true, toggleCount: toggles.length };
+    }, sel.settingsTabPanel);
+    expect(backendsPanel.exists).toBe(true);
+    expect(backendsPanel.toggleCount).toBe(4);
+
+    // All backends should be enabled by default (assuming deps are available)
+    const allEnabled = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      if (!panel) return false;
+      const toggles = panel.querySelectorAll('input[type="checkbox"]:not(:disabled)');
+      return Array.from(toggles).every(t => (t as HTMLInputElement).checked);
+    }, sel.settingsTabPanel);
+    expect(allEnabled).toBe(true);
+
+    // Disable codex backend via change event
+    await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      const input = panel?.querySelector('[data-testid="settings-backend-codex-enabled"]') as HTMLInputElement;
+      if (input && !input.disabled) {
+        input.checked = false;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, sel.settingsTabPanel);
+    await browser.pause(200);
+
+    // Verify codex toggle is now unchecked
+    const codexAfter = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      const input = panel?.querySelector('[data-testid="settings-backend-codex-enabled"]') as HTMLInputElement | null;
+      return input?.checked ?? true;
+    }, sel.settingsTabPanel);
+    expect(codexAfter).toBe(false);
+
+    // Verify default backend dropdown no longer shows codex
+    const backendOptions = await browser.execute(() => {
+      const select = document.querySelector('[data-testid="default-backend-select"]') as HTMLSelectElement | null;
+      if (!select) return [];
+      return Array.from(select.options).map(o => o.value);
+    });
+    expect(backendOptions).not.toContain('codex');
+    expect(backendOptions).toContain('tycode');
+
+    // No install buttons should be visible when all deps are available
+    const installBtnCount = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      if (!panel) return -1;
+      return panel.querySelectorAll('.settings-install-btn').length;
+    }, sel.settingsTabPanel);
+    expect(installBtnCount).toBe(0);
+
+    // Re-enable codex to avoid affecting later tests
+    await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      const input = panel?.querySelector('[data-testid="settings-backend-codex-enabled"]') as HTMLInputElement;
+      if (input && !input.disabled) {
+        input.checked = true;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, sel.settingsTabPanel);
+    await browser.pause(200);
+
     // --- Profiles dropdown ---
     const profileOptions = await browser.execute((profileSel: string) => {
       const select = document.querySelector(profileSel) as HTMLSelectElement | null;

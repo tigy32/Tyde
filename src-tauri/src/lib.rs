@@ -16,7 +16,7 @@ mod subprocess;
 mod terminal;
 
 use parking_lot::Mutex as SyncMutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ use crate::file_watch::FileWatchManager;
 use crate::git_service::GitFileStatus;
 use crate::remote::{
     connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots,
-    validate_remote_cli,
+    validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
 use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
@@ -315,6 +315,7 @@ pub(crate) struct AppState {
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
+    disabled_backends: SyncMutex<HashSet<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -546,6 +547,21 @@ enum WaitUntil {
     Terminal,
 }
 
+fn is_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
 fn subprocess_path() -> Result<String, String> {
     if let Ok(path) = std::env::var("TYDE_SUBPROCESS_PATH") {
         tracing::info!("Found subprocess via TYDE_SUBPROCESS_PATH env var");
@@ -556,13 +572,26 @@ fn subprocess_path() -> Result<String, String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let sibling = parent.join("tycode-subprocess");
-            if sibling.exists() {
+            if is_executable(&sibling) {
                 tracing::info!("Found subprocess as sibling of current executable");
                 return Ok(sibling.to_string_lossy().to_string());
             }
         }
     }
     tracing::warn!("Subprocess not found as sibling of current executable");
+
+    // Check on-demand install location: ~/.tycode/v{VERSION}/bin/tycode-subprocess
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let installed = PathBuf::from(&home).join(format!(
+            ".tycode/v{}/bin/{}",
+            SUBPROCESS_VERSION, SUBPROCESS_CRATE_NAME
+        ));
+        if is_executable(&installed) {
+            tracing::info!("Found subprocess in on-demand install location");
+            return Ok(installed.to_string_lossy().to_string());
+        }
+    }
+    tracing::warn!("Subprocess not found in on-demand install location");
 
     // `cargo tauri dev` runs from the source root, not target/debug/,
     // so walk up from cwd looking for a cargo workspace's target directory.
@@ -575,12 +604,12 @@ fn subprocess_path() -> Result<String, String> {
 
             if is_workspace {
                 let debug = dir.join("target/debug/tycode-subprocess");
-                if debug.exists() {
+                if is_executable(&debug) {
                     tracing::info!("Found subprocess in workspace target/debug");
                     return Ok(debug.to_string_lossy().to_string());
                 }
                 let release = dir.join("target/release/tycode-subprocess");
-                if release.exists() {
+                if is_executable(&release) {
                     tracing::info!("Found subprocess in workspace target/release");
                     return Ok(release.to_string_lossy().to_string());
                 }
@@ -1065,6 +1094,170 @@ fn wait_condition_met(status: AgentStatus, until: WaitUntil) -> bool {
     }
 }
 
+#[derive(Serialize)]
+struct BackendDepResult {
+    available: bool,
+    binary_name: String,
+}
+
+#[derive(Serialize)]
+struct BackendDependencyStatus {
+    tycode: BackendDepResult,
+    codex: BackendDepResult,
+    claude: BackendDepResult,
+    kiro: BackendDepResult,
+}
+
+#[tauri::command]
+fn check_backend_dependencies() -> BackendDependencyStatus {
+    let which_cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+
+    let check = |binary: &str| -> BackendDepResult {
+        let available = Command::new(which_cmd)
+            .arg(binary)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        BackendDepResult {
+            available,
+            binary_name: binary.to_string(),
+        }
+    };
+
+    BackendDependencyStatus {
+        tycode: BackendDepResult {
+            available: subprocess_path().is_ok(),
+            binary_name: "tycode-subprocess".to_string(),
+        },
+        codex: check("codex"),
+        claude: check("claude"),
+        kiro: check("kiro-cli"),
+    }
+}
+
+#[tauri::command]
+fn set_disabled_backends(
+    state: tauri::State<'_, AppState>,
+    backends: Vec<String>,
+) -> Result<(), String> {
+    let mut disabled = state.disabled_backends.lock();
+    disabled.clear();
+    for b in backends {
+        disabled.insert(b);
+    }
+    Ok(())
+}
+
+fn detect_local_target() -> Result<String, String> {
+    let os = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else if cfg!(target_os = "linux") {
+        "unknown-linux-musl"
+    } else if cfg!(target_os = "windows") {
+        "pc-windows-msvc"
+    } else {
+        return Err("Unsupported operating system".to_string());
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        return Err("Unsupported architecture".to_string());
+    };
+
+    Ok(format!("{arch}-{os}"))
+}
+
+async fn install_tycode_subprocess() -> Result<(), String> {
+    let target = detect_local_target()?;
+    let archive = format!("{SUBPROCESS_CRATE_NAME}-{target}.tar.xz");
+    let url = format!(
+        "{SUBPROCESS_GIT_REPO}/releases/download/v{SUBPROCESS_VERSION}/{archive}"
+    );
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "Could not determine home directory".to_string())?;
+    let install_dir = format!("{home}/.tycode/v{SUBPROCESS_VERSION}/bin");
+
+    let cmd = format!(
+        "TMP=$(mktemp -d) && \
+         curl -sSfL \"{url}\" | tar -xJ -C \"$TMP\" && \
+         mkdir -p \"{install_dir}\" && \
+         find \"$TMP\" -name \"{SUBPROCESS_CRATE_NAME}\" -type f -exec mv {{}} \"{install_dir}/{SUBPROCESS_CRATE_NAME}\" \\; && \
+         chmod +x \"{install_dir}/{SUBPROCESS_CRATE_NAME}\" && \
+         rm -rf \"$TMP\""
+    );
+    let output = tokio::process::Command::new("sh")
+        .args(["-c", &cmd])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run install command: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Failed to install tycode-subprocess v{SUBPROCESS_VERSION} ({target}): {stderr}"
+        ));
+    }
+    Ok(())
+}
+
+async fn install_codex() -> Result<(), String> {
+    let output = tokio::process::Command::new("npm")
+        .args(["install", "-g", "@openai/codex"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run npm: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to install codex: {stderr}"));
+    }
+    Ok(())
+}
+
+async fn install_claude_code() -> Result<(), String> {
+    let output = tokio::process::Command::new("sh")
+        .args(["-c", "curl -fsSL https://claude.ai/install.sh | bash"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run install command: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to install claude-code: {stderr}"));
+    }
+    Ok(())
+}
+
+async fn install_kiro() -> Result<(), String> {
+    let output = tokio::process::Command::new("sh")
+        .args(["-c", "curl -fsSL https://cli.kiro.dev/install | bash"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run install script: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to install kiro: {stderr}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn install_backend_dependency(backend_kind: String) -> Result<(), String> {
+    match backend_kind.as_str() {
+        "tycode" => install_tycode_subprocess().await,
+        "codex" => install_codex().await,
+        "claude" => install_claude_code().await,
+        "kiro" => install_kiro().await,
+        other => Err(format!("Unknown backend kind: {other}")),
+    }
+}
+
 #[tauri::command]
 async fn create_conversation(
     app: tauri::AppHandle,
@@ -1344,6 +1537,12 @@ pub(crate) async fn spawn_agent_internal(
     }
 
     let backend_kind = resolve_requested_backend_kind(backend_kind)?;
+    {
+        let disabled = state.disabled_backends.lock();
+        if disabled.contains(backend_kind.as_str()) {
+            return Err(format!("Backend '{}' is disabled", backend_kind.as_str()));
+        }
+    }
     let ephemeral = ephemeral.unwrap_or(false);
     let resolved_path =
         resolve_backend_executable_path(app, &workspace_roots, backend_kind).await?;
@@ -2791,6 +2990,7 @@ pub fn run() {
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
+            disabled_backends: SyncMutex::new(HashSet::new()),
         })
         .setup(|app| {
             initialize_tray(app)?;
@@ -2822,6 +3022,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            check_backend_dependencies,
+            set_disabled_backends,
+            install_backend_dependency,
             create_conversation,
             send_message,
             cancel_conversation,
@@ -2943,7 +3146,7 @@ fn hide_main_window(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex as SyncMutex;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::process::Command;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -2966,6 +3169,7 @@ mod tests {
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
+            disabled_backends: SyncMutex::new(HashSet::new()),
         }
     }
 
