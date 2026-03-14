@@ -54,11 +54,11 @@ cmd_release() {
     ensure_tauri_cli
     log "Building Tyde release bundle"
     cd "$SCRIPT_DIR"
-    local bundle_flags=()
     if [[ "$(uname)" == "Linux" ]]; then
-        bundle_flags=(--bundles appimage)
+        "$SCRIPT_DIR/node_modules/.bin/tauri" build --bundles appimage
+    else
+        "$SCRIPT_DIR/node_modules/.bin/tauri" build
     fi
-    "$SCRIPT_DIR/node_modules/.bin/tauri" build "${bundle_flags[@]}"
 
     local bundle_dir="$SCRIPT_DIR/src-tauri/target/release/bundle"
 
