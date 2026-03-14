@@ -2806,14 +2806,6 @@ body {
   color: var(--text-secondary);
 }
 
-.diff-panel-linenum-active {
-  cursor: crosshair;
-}
-
-.diff-panel-linenum-active:hover {
-  background: rgba(56, 139, 253, 0.12);
-}
-
 .diff-panel-marker {
   display: inline-block;
   width: 16px;
@@ -6869,27 +6861,23 @@ body {
 
 /* --- Inline File Feedback --- */
 
-.diff-panel-line-selected {
-  background: rgba(56, 139, 253, 0.15) !important;
-}
-
-.diff-panel-native-selected {
-  background: rgba(56, 139, 253, 0.12);
-}
-
-.diff-panel-line-preview {
-  background: rgba(56, 139, 253, 0.08);
-}
-
 .file-selection-actions {
-  display: inline-flex;
+  position: sticky;
+  bottom: 0;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  position: absolute;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-primary);
   z-index: 5;
-  left: 48px;
-  margin: 0;
-  transform: translateY(4px);
+}
+
+.file-selection-action-label {
+  font-size: calc(var(--base-font-size) * 0.7857);
+  color: var(--text-tertiary);
+  margin-right: 4px;
 }
 
 .file-selection-action-btn {

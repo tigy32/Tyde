@@ -270,7 +270,6 @@ export class DiffPanel {
   private selectionAnchor: number | null = null;
   private selectionEnd: number | null = null;
   private selectionComplete = false;
-  private selectedFilePath: string | null = null;
   private feedbackBoxes: Map<string, FeedbackBox> = new Map();
   private fileSearchOpen = false;
   private fileSearchQuery = "";
@@ -294,7 +293,7 @@ export class DiffPanel {
   private fileGoToLineFlashIndex: number | null = null;
   private fileGoToLineFlashTimer: number | null = null;
   private fileWordWrap = false;
-  private nativeSelectionRafId: number | null = null;
+  private nativeSelectionTimerId: number | null = null;
   private virtualizedFileView: VirtualizedFileViewState | null = null;
 
   onViewDiff: ((filePath: string, diffContent: string) => void) | null = null;
@@ -700,7 +699,7 @@ export class DiffPanel {
     this.selectionAnchor = null;
     this.selectionEnd = null;
     this.selectionComplete = false;
-    this.selectedFilePath = null;
+
     this.fileSearchQuery = "";
     this.fileSearchCaseSensitive = false;
     this.fileSearchWholeWord = false;
@@ -728,9 +727,9 @@ export class DiffPanel {
       window.clearTimeout(this.fileGoToLineFlashTimer);
       this.fileGoToLineFlashTimer = null;
     }
-    if (this.nativeSelectionRafId !== null) {
-      window.cancelAnimationFrame(this.nativeSelectionRafId);
-      this.nativeSelectionRafId = null;
+    if (this.nativeSelectionTimerId !== null) {
+      window.clearTimeout(this.nativeSelectionTimerId);
+      this.nativeSelectionTimerId = null;
     }
     this.fileWordWrap = false;
     this.render();
@@ -1578,39 +1577,28 @@ export class DiffPanel {
   }
 
   private scheduleNativeSelectionSync(): void {
-    if (this.nativeSelectionRafId !== null) return;
-    this.nativeSelectionRafId = window.requestAnimationFrame(() => {
-      this.nativeSelectionRafId = null;
+    if (this.nativeSelectionTimerId !== null) {
+      window.clearTimeout(this.nativeSelectionTimerId);
+    }
+    this.nativeSelectionTimerId = window.setTimeout(() => {
+      this.nativeSelectionTimerId = null;
       this.syncNativeSelectionHighlight();
-    });
+    }, 100);
   }
 
   private syncNativeSelectionHighlight(): void {
-    this.clearNativeSelectionHighlights();
-    this.container.querySelector(".file-selection-actions-native")?.remove();
+    this.removeSelectionActions();
 
     const context = this.getNativeSelectionContext();
     if (!context) return;
 
-    for (const lineActions of this.container.querySelectorAll(
-      ".file-selection-actions-line",
-    )) {
-      lineActions.remove();
-    }
-
-    for (const lineEl of context.selectedElements) {
-      lineEl.classList.add("diff-panel-native-selected");
-    }
-
-    this.renderNativeSelectionActions(context);
-  }
-
-  private clearNativeSelectionHighlights(): void {
-    for (const el of this.container.querySelectorAll(
-      ".diff-panel-native-selected",
-    )) {
-      el.classList.remove("diff-panel-native-selected");
-    }
+    this.renderSelectionActions(
+      context.text,
+      context.startLine,
+      context.endLine,
+      context.filePath,
+      context.text.split("\n"),
+    );
   }
 
   private getNativeSelectionContext(): NativeSelectionContext | null {
@@ -2060,10 +2048,6 @@ export class DiffPanel {
     num.addEventListener("click", (e) =>
       this.handleLineClick(e, lineIndex, tab.filePath),
     );
-    num.addEventListener("mouseenter", () =>
-      this.handleLineNumHover(lineIndex),
-    );
-    num.addEventListener("mouseleave", () => this.clearPreviewHighlights());
 
     lineEl.appendChild(num);
     lineEl.appendChild(textSpan);
@@ -2251,13 +2235,6 @@ export class DiffPanel {
     }
 
     state.wrapperEl.replaceChildren(frag);
-
-    if (
-      this.selectionAnchor !== null &&
-      this.selectedFilePath === state.tab.filePath
-    ) {
-      this.updateLineSelection();
-    }
     this.enqueueVirtualizedHighlights(
       state,
       virtualItems.map((item) => item.index),
@@ -2425,14 +2402,13 @@ export class DiffPanel {
   private handleLineClick(
     e: MouseEvent,
     lineIndex: number,
-    filePath: string,
+    _filePath: string,
   ): void {
     e.stopPropagation();
 
     if (this.selectionAnchor !== null && e.shiftKey) {
       this.selectionEnd = lineIndex;
       this.selectionComplete = true;
-      this.selectedFilePath = filePath;
       this.updateLineSelection();
       return;
     }
@@ -2442,7 +2418,6 @@ export class DiffPanel {
       this.selectionAnchor = lineIndex;
       this.selectionEnd = null;
       this.selectionComplete = false;
-      this.selectedFilePath = filePath;
       this.updateLineSelection();
       return;
     }
@@ -2462,138 +2437,85 @@ export class DiffPanel {
     this.selectionAnchor = lineIndex;
     this.selectionEnd = null;
     this.selectionComplete = false;
-    this.selectedFilePath = filePath;
     this.updateLineSelection();
   }
 
   private updateLineSelection(): void {
-    this.clearSelectionVisuals();
+    this.removeSelectionActions();
     if (this.selectionAnchor === null) return;
+    if (!this.selectionComplete || this.selectionEnd === null) return;
 
-    const view = this.container.querySelector(".diff-panel-content-view");
-    if (!view) return;
-
-    if (!this.selectionComplete || this.selectionEnd === null) {
-      view
-        .querySelector<HTMLElement>(
-          `.diff-panel-file-line[data-line-index="${this.selectionAnchor}"]`,
-        )
-        ?.classList.add("diff-panel-line-selected");
-      for (const el of view.querySelectorAll(".diff-panel-linenum")) {
-        el.classList.add("diff-panel-linenum-active");
-      }
-      return;
-    }
-
-    const start = Math.min(this.selectionAnchor, this.selectionEnd);
-    const end = Math.max(this.selectionAnchor, this.selectionEnd);
-
-    for (let i = start; i <= end; i++) {
-      view
-        .querySelector<HTMLElement>(
-          `.diff-panel-file-line[data-line-index="${i}"]`,
-        )
-        ?.classList.add("diff-panel-line-selected");
-    }
-
-    for (const el of view.querySelectorAll(".diff-panel-linenum-active")) {
-      el.classList.remove("diff-panel-linenum-active");
-    }
-
-    this.renderLineSelectionActions(view, start, end);
-  }
-
-  private renderLineSelectionActions(
-    view: Element,
-    start: number,
-    end: number,
-  ): void {
-    const lastLineEl = view.querySelector<HTMLElement>(
-      `.diff-panel-file-line[data-line-index="${end}"]`,
-    );
-    if (!lastLineEl) return;
-
-    const actions = document.createElement("div");
-    actions.className = "file-selection-actions file-selection-actions-line";
-
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.className = "file-selection-action-btn";
-    copyBtn.textContent = "Copy";
-    copyBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void this.copyLineRangeWithStatus(start, end, copyBtn);
-    });
-    actions.appendChild(copyBtn);
-
-    const feedbackBtn = document.createElement("button");
-    feedbackBtn.type = "button";
-    feedbackBtn.className =
-      "file-selection-action-btn file-selection-action-primary";
-    feedbackBtn.textContent = "Give Feedback";
-    feedbackBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const tab = this.getActiveTab();
-      if (!tab) return;
-      const lines = this.getFileLines(tab).slice(start, end + 1);
-      this.showFeedbackInput(start, end, tab.filePath, lines);
-    });
-    actions.appendChild(feedbackBtn);
-
-    lastLineEl.after(actions);
-  }
-
-  private renderNativeSelectionActions(context: NativeSelectionContext): void {
-    const lastLineEl =
-      context.selectedElements[context.selectedElements.length - 1];
-    if (!lastLineEl) return;
-
-    const actions = document.createElement("div");
-    actions.className = "file-selection-actions file-selection-actions-native";
-
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.className = "file-selection-action-btn";
-    copyBtn.textContent = "Copy";
-    copyBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      void this.copyTextWithStatus(context.text, copyBtn);
-    });
-    actions.appendChild(copyBtn);
-
-    const feedbackBtn = document.createElement("button");
-    feedbackBtn.type = "button";
-    feedbackBtn.className =
-      "file-selection-action-btn file-selection-action-primary";
-    feedbackBtn.textContent = "Give Feedback";
-    feedbackBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const lines = context.text.split("\n");
-      this.showFeedbackInput(
-        context.startLine,
-        context.endLine,
-        context.filePath,
-        lines,
-        lastLineEl,
-      );
-    });
-    actions.appendChild(feedbackBtn);
-
-    lastLineEl.after(actions);
-  }
-
-  private async copyLineRangeWithStatus(
-    start: number,
-    end: number,
-    button: HTMLButtonElement,
-  ): Promise<void> {
     const tab = this.getActiveTab();
     if (!tab || tab.type !== "file") return;
 
-    const selected = this.getFileLines(tab)
-      .slice(start, end + 1)
-      .join("\n");
-    await this.copyTextWithStatus(selected, button);
+    const start = Math.min(this.selectionAnchor, this.selectionEnd);
+    const end = Math.max(this.selectionAnchor, this.selectionEnd);
+    const lines = this.getFileLines(tab).slice(start, end + 1);
+
+    this.renderSelectionActions(
+      lines.join("\n"),
+      start,
+      end,
+      tab.filePath,
+      lines,
+    );
+  }
+
+  private removeSelectionActions(): void {
+    for (const el of this.container.querySelectorAll(
+      ".file-selection-actions",
+    )) {
+      el.remove();
+    }
+  }
+
+  private renderSelectionActions(
+    text: string,
+    startLine: number,
+    endLine: number,
+    filePath: string,
+    lines: string[],
+  ): void {
+    this.removeSelectionActions();
+
+    const view = this.container.querySelector<HTMLElement>(
+      ".diff-panel-content-view, .diff-panel-sbs-wrapper",
+    );
+    if (!view) return;
+
+    const actions = document.createElement("div");
+    actions.className = "file-selection-actions";
+
+    const label = document.createElement("span");
+    label.className = "file-selection-action-label";
+    label.textContent =
+      startLine === endLine
+        ? `Line ${startLine + 1}`
+        : `Lines ${startLine + 1}\u2013${endLine + 1}`;
+    actions.appendChild(label);
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "file-selection-action-btn";
+    copyBtn.textContent = "Copy";
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.copyTextWithStatus(text, copyBtn);
+    });
+    actions.appendChild(copyBtn);
+
+    const feedbackBtn = document.createElement("button");
+    feedbackBtn.type = "button";
+    feedbackBtn.className =
+      "file-selection-action-btn file-selection-action-primary";
+    feedbackBtn.textContent = "Give Feedback";
+    feedbackBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.showFeedbackInput(startLine, endLine, filePath, lines);
+    });
+    actions.appendChild(feedbackBtn);
+
+    view.appendChild(actions);
   }
 
   private async copyTextWithStatus(
@@ -2621,51 +2543,7 @@ export class DiffPanel {
   }
 
   private clearSelectionVisuals(): void {
-    for (const el of this.container.querySelectorAll(
-      ".diff-panel-line-selected",
-    )) {
-      el.classList.remove("diff-panel-line-selected");
-    }
-    for (const el of this.container.querySelectorAll(
-      ".diff-panel-linenum-active",
-    )) {
-      el.classList.remove("diff-panel-linenum-active");
-    }
-    this.clearPreviewHighlights();
-    for (const actionEl of this.container.querySelectorAll(
-      ".file-selection-actions",
-    )) {
-      actionEl.remove();
-    }
-  }
-
-  private handleLineNumHover(lineIndex: number): void {
-    if (this.selectionAnchor === null || this.selectionComplete) return;
-    if (lineIndex === this.selectionAnchor) return;
-    const start = Math.min(this.selectionAnchor, lineIndex);
-    const end = Math.max(this.selectionAnchor, lineIndex);
-    this.showPreviewRange(start, end);
-  }
-
-  private showPreviewRange(start: number, end: number): void {
-    this.clearPreviewHighlights();
-    const view = this.container.querySelector(".diff-panel-content-view");
-    if (!view) return;
-    for (let i = start; i <= end; i++) {
-      view
-        .querySelector<HTMLElement>(
-          `.diff-panel-file-line[data-line-index="${i}"]`,
-        )
-        ?.classList.add("diff-panel-line-preview");
-    }
-  }
-
-  private clearPreviewHighlights(): void {
-    for (const el of this.container.querySelectorAll(
-      ".diff-panel-line-preview",
-    )) {
-      el.classList.remove("diff-panel-line-preview");
-    }
+    this.removeSelectionActions();
   }
 
   private handleFileSelectionCopy(e: ClipboardEvent): void {

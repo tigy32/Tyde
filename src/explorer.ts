@@ -450,15 +450,12 @@ export class FileExplorer {
     }
   }
 
-  private revealInFileManager(path: string, isDir: boolean): void {
-    const dirPath = isDir ? path : path.substring(0, path.lastIndexOf("/"));
-    invoke("plugin:opener|reveal_item_in_dir", { path }).catch((firstErr) => {
-      console.error("reveal_item_in_dir failed:", firstErr);
-      invoke("plugin:shell|open", { path: dirPath }).catch((err) => {
-        console.error(err);
+  private revealInFileManager(path: string, _isDir: boolean): void {
+    invoke("plugin:opener|reveal_item_in_dir", { paths: [path] }).catch(
+      (err) => {
         this.onError?.(`Failed to reveal path: ${String(err)}`);
-      });
-    });
+      },
+    );
   }
 
   private renderHeader(): HTMLElement {
