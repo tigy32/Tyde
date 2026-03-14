@@ -441,6 +441,7 @@ export class SettingsPanel {
   onClose: (() => void) | null = null;
   onMcpHttpSettingsChange: ((settings: McpHttpServerSettings) => void) | null =
     null;
+  onBackendsChanged: (() => void) | null = null;
 
   private container: HTMLElement;
   private appearance: AppearanceSettings;
@@ -592,6 +593,7 @@ export class SettingsPanel {
           );
         }
         this.syncProfileDropdown();
+        this.onBackendsChanged?.();
       })
       .catch((err) => {
         console.error("Failed to check backend dependencies:", err);
@@ -1256,6 +1258,7 @@ export class SettingsPanel {
         setEnabledBackendPreferences(current);
         syncDisabledBackendsToRust();
         this.syncProfileDropdown();
+        this.onBackendsChanged?.();
       });
       toggle.appendChild(input);
       toggle.appendChild(el("span", { class: "settings-toggle-slider" }));

@@ -1239,7 +1239,7 @@ async fn install_claude_code() -> Result<(), String> {
 
 async fn install_kiro() -> Result<(), String> {
     let output = tokio::process::Command::new("sh")
-        .args(["-c", "curl -fsSL https://cli.kiro.dev/install | bash"])
+        .args(["-c", "curl -fsSL https://cli.kiro.dev/install | bash -s -- --force"])
         .output()
         .await
         .map_err(|e| format!("Failed to run install script: {e}"))?;
@@ -3036,7 +3036,7 @@ fn resolve_shell_path() {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
 
     let output = match Command::new(&shell)
-        .args(["-l", "-c", "echo $PATH"])
+        .args(["-li", "-c", "echo $PATH"])
         .output()
     {
         Ok(o) => o,
