@@ -21,6 +21,9 @@ export class AgentsPanel {
   private agents: AgentInfo[] = [];
   private projectFilter: string | null = null;
   private collapsedParents: Set<number> = new Set();
+  private hideInactive = false;
+  private hideSubAgents = false;
+  private searchQuery = "";
   public onAgentClick: ((agent: AgentInfo) => void) | null = null;
   public onAgentAction:
     | ((agent: AgentInfo, action: AgentCardAction) => void)
@@ -92,10 +95,7 @@ export class AgentsPanel {
   render(): void {
     this.container.innerHTML = "";
 
-    const header = document.createElement("div");
-    header.className = "agents-panel-header";
-    header.innerHTML = '<span class="agents-panel-title">Agents</span>';
-    this.container.appendChild(header);
+    this.container.appendChild(this.buildToolbar());
 
     const filtered = this.filteredAgents();
     if (filtered.length === 0) {
@@ -152,8 +152,86 @@ export class AgentsPanel {
   }
 
   private filteredAgents(): AgentInfo[] {
-    if (this.projectFilter === null) return [...this.agents];
-    return this.agents.filter((a) => a.projectId === this.projectFilter);
+    let result = [...this.agents];
+    if (this.projectFilter !== null) {
+      result = result.filter((a) => a.projectId === this.projectFilter);
+    }
+    if (this.hideInactive) {
+      result = result.filter((a) => this.isActive(a));
+    }
+    if (this.hideSubAgents) {
+      result = result.filter((a) => a.parentAgentId == null);
+    }
+    if (this.searchQuery) {
+      const q = this.searchQuery.toLowerCase();
+      result = result.filter(
+        (a) =>
+          a.name.toLowerCase().includes(q) ||
+          a.summary.toLowerCase().includes(q),
+      );
+    }
+    return result;
+  }
+
+  private isActive(agent: AgentInfo): boolean {
+    if (agent.runtimeStatus != null) {
+      return (
+        agent.runtimeStatus === "queued" ||
+        agent.runtimeStatus === "running" ||
+        agent.runtimeStatus === "waiting_input"
+      );
+    }
+    return agent.isTyping;
+  }
+
+  private buildToolbar(): HTMLElement {
+    const toolbar = document.createElement("div");
+    toolbar.className = "agents-toolbar";
+    toolbar.dataset.testid = "agents-toolbar";
+
+    const searchInput = document.createElement("input");
+    searchInput.type = "text";
+    searchInput.className = "agents-search";
+    searchInput.placeholder = "Search agents\u2026";
+    searchInput.setAttribute("aria-label", "Search agents");
+    searchInput.value = this.searchQuery;
+    searchInput.addEventListener("input", () => {
+      this.searchQuery = searchInput.value;
+      this.render();
+    });
+
+    const hideInactiveBtn = document.createElement("button");
+    hideInactiveBtn.type = "button";
+    hideInactiveBtn.className = "agents-toolbar-btn";
+    if (this.hideInactive)
+      hideInactiveBtn.classList.add("agents-toolbar-btn-active");
+    hideInactiveBtn.dataset.testid = "agents-hide-inactive";
+    hideInactiveBtn.textContent = "◑";
+    hideInactiveBtn.title = "Hide inactive agents";
+    hideInactiveBtn.setAttribute("aria-label", "Hide inactive agents");
+    hideInactiveBtn.addEventListener("click", () => {
+      this.hideInactive = !this.hideInactive;
+      this.render();
+    });
+
+    const hideSubBtn = document.createElement("button");
+    hideSubBtn.type = "button";
+    hideSubBtn.className = "agents-toolbar-btn";
+    if (this.hideSubAgents)
+      hideSubBtn.classList.add("agents-toolbar-btn-active");
+    hideSubBtn.dataset.testid = "agents-hide-subagents";
+    hideSubBtn.textContent = "⊟";
+    hideSubBtn.title = "Hide sub-agents";
+    hideSubBtn.setAttribute("aria-label", "Hide sub-agents");
+    hideSubBtn.addEventListener("click", () => {
+      this.hideSubAgents = !this.hideSubAgents;
+      this.render();
+    });
+
+    toolbar.appendChild(searchInput);
+    toolbar.appendChild(hideInactiveBtn);
+    toolbar.appendChild(hideSubBtn);
+    return toolbar;
   }
 
   private buildEmptyState(): HTMLElement {

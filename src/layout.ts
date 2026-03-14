@@ -37,7 +37,7 @@ const STATE_MARKER = "__WORKBENCH_LAYOUT_V1__";
 const WIDGET_TITLES: Record<WidgetId, string> = {
   git: "Git",
   files: "Files",
-  sessions: "Sessions",
+  sessions: "History",
   agents: "Agents",
   terminal: "Terminal",
 };
@@ -69,12 +69,12 @@ function defaultState(): WorkbenchState {
     },
     widgetOrder: {
       left: ["files", "git"],
-      right: ["sessions", "agents"],
+      right: ["agents", "sessions"],
       bottom: ["terminal"],
     },
     activeWidget: {
       left: "files",
-      right: "sessions",
+      right: "agents",
       bottom: "terminal",
     },
     centerView: "chat",
@@ -258,7 +258,7 @@ function migrateLegacyDefaultDocking(state: WorkbenchState): WorkbenchState {
     },
     activeWidget: {
       left: state.activeWidget.left ?? "files",
-      right: "sessions",
+      right: "agents",
       bottom: "terminal",
     },
     rightVisible: true,
