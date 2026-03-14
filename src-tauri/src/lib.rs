@@ -2709,6 +2709,23 @@ async fn shutdown_all_subprocesses(state: tauri::State<'_, AppState>) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+async fn submit_feedback(feedback: String) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let params = [("entry.515008519", feedback.as_str())];
+    let res = client
+        .post("https://docs.google.com/forms/d/e/1FAIpQLSfcaoYqtm0FRdibE5qJhVYONUbKAMn6KTIopx40Fk8l9yn2vA/formResponse")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send feedback: {e}"))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Feedback submission failed with status {}", res.status()));
+    }
+    Ok(())
+}
+
 /// Resolves the user's login shell PATH and sets it process-wide.
 /// macOS GUI apps launched from Dock/Finder inherit launchd's minimal PATH
 /// (/usr/bin:/bin:/usr/sbin:/sbin), missing Homebrew, Cargo, nvm, etc.
@@ -2866,6 +2883,7 @@ pub fn run() {
             write_terminal,
             resize_terminal,
             close_terminal,
+            submit_feedback,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

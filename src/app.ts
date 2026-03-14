@@ -22,6 +22,7 @@ import {
 import { CommandPalette } from "./command_palette";
 import { ConnectionDialog } from "./connection_dialog";
 import { registerDebugUiBridge } from "./debug_ui_bridge";
+import { showFeedbackDialog } from "./feedback_dialog";
 import { HomeView } from "./home_view";
 import {
   EscapeStack,
@@ -90,6 +91,9 @@ export class AppController {
     document
       .getElementById("open-remote-workspace-btn")!
       .addEventListener("click", () => this.openRemoteWorkspace());
+    document
+      .getElementById("feedback-btn")!
+      .addEventListener("click", () => showFeedbackDialog());
 
     await this.bootstrapStartup();
     this.startRuntimeAgentSync();
@@ -1150,6 +1154,11 @@ export class AppController {
         view.getTabManager().closeAll();
         view.showEmptyState();
       },
+    });
+    cp.registerCommand({
+      id: "send-feedback",
+      label: "Send Feedback",
+      execute: () => showFeedbackDialog(),
     });
   }
 

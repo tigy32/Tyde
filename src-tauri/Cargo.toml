@@ -28,4 +28,5 @@ base64 = "0.22"
 axum = "0.8"
 http = "1"
 parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rmcp = { version = "0.2.1", features = ["transport-streamable-http-server", "transport-worker"] }
