@@ -8642,18 +8642,69 @@ body {
   background: var(--bg-secondary);
 }
 
-.agents-panel-header {
+.agents-toolbar {
   display: flex;
   align-items: center;
-  padding: 8px 12px;
+  gap: 4px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--border-primary);
   flex-shrink: 0;
 }
 
-.agents-panel-title {
-  font-weight: 600;
-  font-size: calc(var(--base-font-size) * 0.9286);
-  color: var(--text-bright);
+.agents-search {
+  flex: 1;
+  min-width: 60px;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-input);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: calc(var(--base-font-size) * 0.8571);
+  font-family: var(--font-sans);
+}
+
+.agents-search:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+.agents-search::placeholder {
+  color: var(--text-tertiary);
+}
+
+.agents-toolbar-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: calc(var(--base-font-size) * 0.8571);
+  line-height: 1;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    border-color 0.15s;
+}
+
+.agents-toolbar-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.agents-toolbar-btn-active {
+  background: color-mix(in srgb, var(--accent-primary) 18%, var(--bg-primary));
+  border-color: color-mix(
+    in srgb,
+    var(--accent-primary) 55%,
+    var(--border-primary)
+  );
+  color: var(--text-primary);
 }
 
 .agents-empty-state {

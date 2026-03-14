@@ -73,6 +73,19 @@ async function openAgentsWidget(): Promise<void> {
   }, sel.dockWidgetTab);
 }
 
+async function openSessionsWidget(): Promise<void> {
+  await browser.waitUntil(
+    async () => (await (await $$(sel.dockWidgetTab)).length) > 0,
+    { timeout: 5000, timeoutMsg: 'Expected dock widget tabs to be available' },
+  );
+
+  await browser.execute((tabSel: string) => {
+    const tabs = Array.from(document.querySelectorAll(tabSel)) as HTMLElement[];
+    const tab = tabs.find((el) => el.offsetParent !== null && (el.textContent ?? '').trim() === 'History');
+    tab?.click();
+  }, sel.dockWidgetTab);
+}
+
 async function clickVisibleSessionsRefresh(timeoutMsg: string): Promise<void> {
   await browser.waitUntil(
     async () => browser.execute((buttonSel: string) => {
@@ -991,6 +1004,7 @@ describe('Chat tab lifecycle', () => {
     });
 
     // --- Sessions panel loads data ---
+    await openSessionsWidget();
     await browser.waitUntil(
       async () => (await getVisibleSessionsPanelText()).length > 0,
       { timeout: 5000, timeoutMsg: 'Expected visible sessions panel in workspace view' },
@@ -1086,6 +1100,7 @@ describe('Sessions backend behavior', () => {
     const input = await $(sel.messageInput);
     await input.waitForDisplayed({ timeout: 5000 });
 
+    await openSessionsWidget();
     await browser.waitUntil(
       async () => (await getVisibleSessionsPanelText()).length > 0,
       { timeout: 5000, timeoutMsg: 'Expected visible sessions panel in workspace view' },
@@ -1553,7 +1568,7 @@ describe('Agents panel parity', () => {
   it('shows runtime agents in both the project and home agents views and supports interrupt/remove controls', async () => {
     await openWorkspace();
 
-    await spawnRuntimeAgent('Bridge Worker', { completionDelayMs: 5000 });
+    await spawnRuntimeAgent('Bridge Worker', { completionDelayMs: 15000 });
     await openAgentsWidget();
 
     await browser.waitUntil(
@@ -1568,11 +1583,19 @@ describe('Agents panel parity', () => {
       { timeout: 5000, timeoutMsg: 'Expected runtime agent to appear in the project Agents widget' },
     );
 
-    const interruptBtn = await $(sel.agentCardInterrupt);
-    const terminateBtn = await $(sel.agentCardTerminate);
-    await interruptBtn.waitForDisplayed({ timeout: 5000 });
-    await terminateBtn.waitForDisplayed({ timeout: 5000 });
-    await interruptBtn.click();
+    await browser.waitUntil(
+      async () => browser.execute((intSel: string, termSel: string) => {
+        const visible = (s: string) => Array.from(document.querySelectorAll(s))
+          .find((el) => (el as HTMLElement).offsetParent !== null) as HTMLElement | undefined;
+        return !!(visible(intSel) && visible(termSel));
+      }, sel.agentCardInterrupt, sel.agentCardTerminate),
+      { timeout: 5000, timeoutMsg: 'Expected interrupt and terminate buttons to be visible on the runtime agent card' },
+    );
+    await browser.execute((intSel: string) => {
+      const btn = Array.from(document.querySelectorAll(intSel))
+        .find((el) => (el as HTMLElement).offsetParent !== null) as HTMLElement | undefined;
+      btn?.click();
+    }, sel.agentCardInterrupt);
 
     await browser.waitUntil(
       async () => (await (await $$(sel.agentCardRemove)).length) > 0,
