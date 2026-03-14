@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::claude::{ClaudeCommandHandle, ClaudeSession, SubAgentEmitter};
 use crate::codex::{CodexCommandHandle, CodexSession};
+use crate::kiro::{KiroCommandHandle, KiroSession};
 use crate::subprocess::{ImageAttachment, SubprocessBridge};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub enum BackendKind {
     Tycode,
     Codex,
     Claude,
+    Kiro,
 }
 
 impl BackendKind {
@@ -25,6 +27,7 @@ impl BackendKind {
             Self::Tycode => "tycode",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Kiro => "kiro",
         }
     }
 }
@@ -43,6 +46,7 @@ impl FromStr for BackendKind {
             "tycode" => Ok(Self::Tycode),
             "codex" => Ok(Self::Codex),
             "claude" | "claude_code" => Ok(Self::Claude),
+            "kiro" => Ok(Self::Kiro),
             other => Err(format!("Unsupported backend '{other}'")),
         }
     }
@@ -101,6 +105,7 @@ pub enum BackendCommandHandle {
     Tycode(Arc<Mutex<ChildStdin>>),
     Codex(CodexCommandHandle),
     Claude(ClaudeCommandHandle),
+    Kiro(KiroCommandHandle),
 }
 
 impl BackendCommandHandle {
@@ -119,6 +124,7 @@ impl BackendCommandHandle {
             }
             Self::Codex(handle) => handle.execute(command).await,
             Self::Claude(handle) => handle.execute(command).await,
+            Self::Kiro(handle) => handle.execute(command).await,
         }
     }
 }
@@ -250,6 +256,7 @@ pub enum BackendSession {
     Tycode(SubprocessBridge),
     Codex(CodexSession),
     Claude(ClaudeSession),
+    Kiro(KiroSession),
 }
 
 impl BackendSession {
@@ -298,6 +305,20 @@ impl BackendSession {
                 };
                 Ok((Self::Claude(session), rx))
             }
+            BackendKind::Kiro => {
+                let ssh_host = if executable_path.is_empty() {
+                    None
+                } else {
+                    Some(executable_path.to_string())
+                };
+                let (session, rx) = if ephemeral {
+                    KiroSession::spawn_ephemeral(workspace_roots, ssh_host, startup_mcp_servers)
+                        .await?
+                } else {
+                    KiroSession::spawn(workspace_roots, ssh_host, startup_mcp_servers).await?
+                };
+                Ok((Self::Kiro(session), rx))
+            }
         }
     }
 
@@ -330,6 +351,16 @@ impl BackendSession {
                 let (session, rx) = ClaudeSession::spawn(workspace_roots, ssh_host, &[]).await?;
                 Ok((Self::Claude(session), rx))
             }
+            BackendKind::Kiro => {
+                let ssh_host = if executable_path.is_empty() {
+                    None
+                } else {
+                    Some(executable_path.to_string())
+                };
+                let (session, rx) =
+                    KiroSession::spawn_admin(workspace_roots, ssh_host, &[]).await?;
+                Ok((Self::Kiro(session), rx))
+            }
         }
     }
 
@@ -338,6 +369,7 @@ impl BackendSession {
             Self::Tycode(_) => BackendKind::Tycode,
             Self::Codex(_) => BackendKind::Codex,
             Self::Claude(_) => BackendKind::Claude,
+            Self::Kiro(_) => BackendKind::Kiro,
         }
     }
 
@@ -346,6 +378,7 @@ impl BackendSession {
             Self::Tycode(bridge) => BackendCommandHandle::Tycode(bridge.stdin()),
             Self::Codex(session) => BackendCommandHandle::Codex(session.command_handle()),
             Self::Claude(session) => BackendCommandHandle::Claude(session.command_handle()),
+            Self::Kiro(session) => BackendCommandHandle::Kiro(session.command_handle()),
         }
     }
 
@@ -354,6 +387,7 @@ impl BackendSession {
             Self::Tycode(_) => None,
             Self::Codex(session) => session.session_id().await,
             Self::Claude(session) => session.session_id().await,
+            Self::Kiro(session) => session.session_id().await,
         }
     }
 
@@ -368,6 +402,7 @@ impl BackendSession {
             Self::Tycode(bridge) => bridge.shutdown().await,
             Self::Codex(session) => session.shutdown().await,
             Self::Claude(session) => session.shutdown().await,
+            Self::Kiro(session) => session.shutdown().await,
         }
     }
 }

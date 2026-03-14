@@ -34,7 +34,7 @@ export interface ConversationRegisteredPayload {
   data: ConversationRegisteredData;
 }
 
-export type BackendKind = "tycode" | "codex" | "claude";
+export type BackendKind = "tycode" | "codex" | "claude" | "kiro";
 
 export type RuntimeAgentStatus =
   | "queued"

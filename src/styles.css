@@ -5618,14 +5618,30 @@ body {
 
 .session-card-backend-tycode {
   color: var(--text-secondary);
+  border-color: var(--border-secondary);
+  background: transparent;
 }
 
 .session-card-backend-codex {
-  color: var(--accent-primary);
+  color: color-mix(in srgb, var(--accent-primary) 78%, var(--text-primary));
+  border-color: color-mix(
+    in srgb,
+    var(--accent-primary) 56%,
+    var(--border-secondary)
+  );
+  background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
 }
 
 .session-card-backend-claude {
-  color: var(--color-warning);
+  color: color-mix(in srgb, #ff9f43 88%, var(--text-primary));
+  border-color: color-mix(in srgb, #ff9f43 56%, var(--border-secondary));
+  background: color-mix(in srgb, #ff9f43 16%, transparent);
+}
+
+.session-card-backend-kiro {
+  color: color-mix(in srgb, #a472ff 88%, var(--text-primary));
+  border-color: color-mix(in srgb, #a472ff 56%, var(--border-secondary));
+  background: color-mix(in srgb, #a472ff 16%, transparent);
 }
 
 .session-card-separator {

@@ -77,6 +77,9 @@ export function createSessionSettings(
   let claudeModel: string | null = null;
   let _claudeModelsLoaded = false;
 
+  let kiroModel: string | null = null;
+  let _kiroModelsLoaded = false;
+
   const panel = document.createElement("div");
   panel.className = "session-settings-panel";
   panel.dataset.testid = "session-settings-panel";
@@ -108,6 +111,9 @@ export function createSessionSettings(
   const claudeGrid = document.createElement("div");
   claudeGrid.className = "session-settings-grid";
 
+  const kiroGrid = document.createElement("div");
+  kiroGrid.className = "session-settings-grid";
+
   toggle.addEventListener("click", () => {
     const hidden = content.style.display === "none";
     content.style.display = hidden ? "" : "none";
@@ -121,7 +127,11 @@ export function createSessionSettings(
         console.error("Failed to list profiles on toggle:", err),
       );
     }
-    if (backendKind === "codex" || backendKind === "claude") {
+    if (
+      backendKind === "codex" ||
+      backendKind === "claude" ||
+      backendKind === "kiro"
+    ) {
       listModels(conversationId).catch((err) =>
         console.error("Failed to list models on toggle:", err),
       );
@@ -380,9 +390,38 @@ export function createSessionSettings(
   claudeGrid.appendChild(claudeEffortRow);
   claudeGrid.appendChild(claudeModelRow);
 
+  // --- Kiro settings ---
+
+  const kiroModelRow = document.createElement("div");
+  kiroModelRow.className = "session-settings-row";
+
+  const kiroModelLabel = document.createElement("label");
+  kiroModelLabel.className = "session-settings-label";
+  kiroModelLabel.textContent = "Model";
+
+  const kiroModelSelect = document.createElement("select");
+  kiroModelSelect.className = "session-profile-select";
+
+  const kiroDefaultOpt = document.createElement("option");
+  kiroDefaultOpt.value = "";
+  kiroDefaultOpt.textContent = "Default";
+  kiroModelSelect.appendChild(kiroDefaultOpt);
+
+  kiroModelSelect.addEventListener("change", () => {
+    const next = kiroModelSelect.value;
+    kiroModel = next.length > 0 ? next : null;
+    updateSettings(conversationId, { model: kiroModel });
+  });
+
+  kiroModelRow.appendChild(kiroModelLabel);
+  kiroModelRow.appendChild(kiroModelSelect);
+
+  kiroGrid.appendChild(kiroModelRow);
+
   content.appendChild(tycodeGrid);
   content.appendChild(codexGrid);
   content.appendChild(claudeGrid);
+  content.appendChild(kiroGrid);
 
   panel.appendChild(toggle);
   panel.appendChild(content);
@@ -416,10 +455,13 @@ export function createSessionSettings(
         ? "Session Settings (Codex)"
         : backendKind === "claude"
           ? "Session Settings (Claude)"
-          : "Session Settings";
+          : backendKind === "kiro"
+            ? "Session Settings (Kiro)"
+            : "Session Settings";
     tycodeGrid.style.display = backendKind === "tycode" ? "" : "none";
     codexGrid.style.display = backendKind === "codex" ? "" : "none";
     claudeGrid.style.display = backendKind === "claude" ? "" : "none";
+    kiroGrid.style.display = backendKind === "kiro" ? "" : "none";
   };
   syncBackendVisibility();
 
@@ -475,6 +517,18 @@ export function createSessionSettings(
         } else if (modelRaw === null) {
           claudeModel = null;
           claudeModelSelect.value = "";
+        }
+        return;
+      }
+
+      if (backendKind === "kiro") {
+        const modelRaw = data.model;
+        if (typeof modelRaw === "string") {
+          kiroModel = modelRaw.trim().length > 0 ? modelRaw.trim() : null;
+          kiroModelSelect.value = kiroModel ?? "";
+        } else if (modelRaw === null) {
+          kiroModel = null;
+          kiroModelSelect.value = "";
         }
         return;
       }
@@ -539,6 +593,9 @@ export function createSessionSettings(
       } else if (backendKind === "claude") {
         _claudeModelsLoaded = true;
         populateModelSelect(claudeModelSelect, data.models, claudeModel);
+      } else if (backendKind === "kiro") {
+        _kiroModelsLoaded = true;
+        populateModelSelect(kiroModelSelect, data.models, kiroModel);
       }
     },
 
@@ -554,7 +611,11 @@ export function createSessionSettings(
             console.error("Failed to list profiles on backend switch:", err),
           );
         }
-        if (backendKind === "codex" || backendKind === "claude") {
+        if (
+          backendKind === "codex" ||
+          backendKind === "claude" ||
+          backendKind === "kiro"
+        ) {
           listModels(conversationId).catch((err) =>
             console.error("Failed to list models on backend switch:", err),
           );

@@ -276,7 +276,11 @@ export class ChatPanel {
       listProfiles(conversationId).catch((err) =>
         console.error("Failed to list profiles for conversation:", err),
       );
-    } else if (backendKind === "codex" || backendKind === "claude") {
+    } else if (
+      backendKind === "codex" ||
+      backendKind === "claude" ||
+      backendKind === "kiro"
+    ) {
       listModels(conversationId).catch((err) =>
         console.error("Failed to list models for conversation:", err),
       );
@@ -585,6 +589,8 @@ export class ChatPanel {
         this.setConversationBackendKind(conversationId, "codex");
       } else if (agent === "claude" || agent === "claude_code") {
         this.setConversationBackendKind(conversationId, "claude");
+      } else if (agent === "kiro") {
+        this.setConversationBackendKind(conversationId, "kiro");
       }
     }
 

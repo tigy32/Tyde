@@ -27,7 +27,7 @@ const DEFAULT_BACKEND_STORAGE_KEY = "tyde-default-backend";
 
 const VALID_THEME = ["system", "dark", "light"] as const;
 type ThemeMode = (typeof VALID_THEME)[number];
-export type BackendKind = "tycode" | "codex" | "claude";
+export type BackendKind = "tycode" | "codex" | "claude" | "kiro";
 
 interface AppearanceSettings {
   theme: ThemeMode;
@@ -111,6 +111,7 @@ function normalizeBackendKind(value: string | null | undefined): BackendKind {
   const normalized = (value ?? "").trim().toLowerCase();
   if (normalized === "codex") return "codex";
   if (normalized === "claude" || normalized === "claude_code") return "claude";
+  if (normalized === "kiro") return "kiro";
   return "tycode";
 }
 
@@ -2704,16 +2705,20 @@ export class SettingsPanel {
       const tycode = el("option", { value: "tycode" }, "Tycode");
       const codex = el("option", { value: "codex" }, "Codex");
       const claude = el("option", { value: "claude" }, "Claude Code");
+      const kiro = el("option", { value: "kiro" }, "Kiro");
       if (this.defaultBackend === "tycode") {
         tycode.selected = true;
       } else if (this.defaultBackend === "codex") {
         codex.selected = true;
+      } else if (this.defaultBackend === "kiro") {
+        kiro.selected = true;
       } else {
         claude.selected = true;
       }
       backendSelect.appendChild(tycode);
       backendSelect.appendChild(codex);
       backendSelect.appendChild(claude);
+      backendSelect.appendChild(kiro);
     }
 
     if (profileSelect) {

@@ -287,7 +287,9 @@ export class SessionsPanel {
         ? "Codex"
         : session.backendKind === "claude"
           ? "Claude"
-          : "Tycode";
+          : session.backendKind === "kiro"
+            ? "Kiro"
+            : "Tycode";
     meta.appendChild(backend);
 
     const dot0 = document.createElement("span");
@@ -424,6 +426,7 @@ export class SessionsPanel {
     if (normalized === "codex") return "codex";
     if (normalized === "claude" || normalized === "claude_code")
       return "claude";
+    if (normalized === "kiro") return "kiro";
     return "tycode";
   }
 

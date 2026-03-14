@@ -500,6 +500,7 @@ export class HomeView {
       { kind: "tycode", label: "Tycode" },
       { kind: "codex", label: "Codex" },
       { kind: "claude", label: "Claude" },
+      { kind: "kiro", label: "Kiro" },
     ];
     for (const { kind, label } of backends) {
       const item = document.createElement("button");

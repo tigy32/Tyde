@@ -251,9 +251,20 @@ export class WorkspaceView {
     claudeMenuItem.setAttribute("role", "menuitem");
     claudeMenuItem.dataset.testid = "center-new-tab-claude";
 
+    const kiroMenuItem = document.createElement("button");
+    kiroMenuItem.type = "button";
+    kiroMenuItem.className = "center-tab-new-menu-item";
+    kiroMenuItem.textContent =
+      this.mode === "bridge"
+        ? `New Kiro ${this.bridgeChatLabel}`
+        : "New Kiro Chat";
+    kiroMenuItem.setAttribute("role", "menuitem");
+    kiroMenuItem.dataset.testid = "center-new-tab-kiro";
+
     centerNewTabMenu.appendChild(tycodeMenuItem);
     centerNewTabMenu.appendChild(codexMenuItem);
     centerNewTabMenu.appendChild(claudeMenuItem);
+    centerNewTabMenu.appendChild(kiroMenuItem);
     centerNewTabSplit.appendChild(centerNewTabBtn);
     centerNewTabSplit.appendChild(centerNewTabMenuBtn);
 
@@ -445,6 +456,10 @@ export class WorkspaceView {
       closeCenterNewTabMenu();
       this.startNewConversation(undefined, "claude");
     });
+    kiroMenuItem.addEventListener("click", () => {
+      closeCenterNewTabMenu();
+      this.startNewConversation(undefined, "kiro");
+    });
 
     const handleMenuOutsidePointer = (event: PointerEvent): void => {
       const target = event.target as Node | null;
@@ -490,6 +505,7 @@ export class WorkspaceView {
       tycode: tycodeMenuItem,
       codex: codexMenuItem,
       claude: claudeMenuItem,
+      kiro: kiroMenuItem,
     };
 
     this.chatPanel.notificationManager = config.notifications;
@@ -594,21 +610,23 @@ export class WorkspaceView {
 
     for (const entry of restorable) {
       const backendKind = entry.backendKind as BackendKind;
+      let cid: number | null = null;
       try {
-        const cid = await this.createNewConversationTab(
-          entry.title,
-          backendKind,
-          { bootstrap: false },
-        );
+        cid = await this.createNewConversationTab(entry.title, backendKind, {
+          bootstrap: false,
+        });
+        await resumeSession(cid, entry.sessionId!);
         this.conversationSessionMap.set(cid, {
           sessionId: entry.sessionId!,
           backendKind,
         });
-        await resumeSession(cid, entry.sessionId!);
         const tab = this.tabManager.getTabByConversationId(cid);
         if (tab) tabIds.push(tab.id);
       } catch (err) {
         console.warn(`Failed to restore session ${entry.sessionId}:`, err);
+        if (cid !== null) {
+          this.disposeFailedResumeConversation(cid);
+        }
       }
     }
 
@@ -1215,6 +1233,9 @@ export class WorkspaceView {
     if (this.resolveWorkspaceRootsForBackend("claude").length > 0) {
       backends.push("claude");
     }
+    if (this.resolveWorkspaceRootsForBackend("kiro").length > 0) {
+      backends.push("kiro");
+    }
     return backends;
   }
 
@@ -1639,23 +1660,37 @@ export class WorkspaceView {
 
   private wireSessionCallbacks(): void {
     this.sessionsPanel.onResumeSession = async (sessionId, backendKind) => {
+      let cid: number | null = null;
       try {
+        const existingConversationId = this.findConversationBySession(
+          sessionId,
+          backendKind,
+        );
+        if (existingConversationId !== null) {
+          this.focusConversation(existingConversationId);
+          this.sessionsPanel.setActiveSession(sessionId, backendKind);
+          this.sessionsPanel.setResuming(null);
+          this.gitPanel.requestRefresh();
+          return;
+        }
+
         // Always resume into a fresh tab; use saved alias as tab label if available.
         const savedAlias = this.sessionsPanel.getSessionAlias(
           sessionId,
           backendKind,
         );
-        const cid = await this.createNewConversationTab(
-          savedAlias,
-          backendKind,
-          { bootstrap: false },
-        );
-        this.conversationSessionMap.set(cid, { sessionId, backendKind });
+        cid = await this.createNewConversationTab(savedAlias, backendKind, {
+          bootstrap: false,
+        });
         await resumeSession(cid, sessionId);
+        this.conversationSessionMap.set(cid, { sessionId, backendKind });
         this.sessionsPanel.setActiveSession(sessionId, backendKind);
         this.sessionsPanel.setResuming(null);
         this.gitPanel.requestRefresh();
       } catch (err) {
+        if (cid !== null) {
+          this.disposeFailedResumeConversation(cid);
+        }
         this.sessionsPanel.setResuming(null);
         this.notifications.error(`Failed to resume session: ${String(err)}`);
       }
@@ -1691,9 +1726,15 @@ export class WorkspaceView {
           await adminDeleteSession(adminId, sessionId);
           await this.refreshSessionsForBackend(backendKind);
           if (this.hasSession(backendKind, sessionId)) {
-            throw new Error(
-              "Delete command returned, but the session still exists.",
-            );
+            if (backendKind === "kiro") {
+              await new Promise((resolve) => setTimeout(resolve, 250));
+              await this.refreshSessionsForBackend(backendKind);
+            }
+            if (this.hasSession(backendKind, sessionId)) {
+              throw new Error(
+                "Delete command returned, but the session still exists.",
+              );
+            }
           }
           // Close the tab if this session is currently open.
           for (const [cid, info] of this.conversationSessionMap) {
@@ -1959,16 +2000,30 @@ export class WorkspaceView {
   ): BackendKind {
     const preferred = preferredBackend ?? getDefaultBackend();
     if (
-      (preferred === "codex" || preferred === "claude") &&
+      (preferred === "codex" ||
+        preferred === "claude" ||
+        preferred === "kiro") &&
       this.resolveWorkspaceRootsForBackend(preferred).length === 0
     ) {
       if (this.mode === "bridge") {
+        const backendLabel =
+          preferred === "codex"
+            ? "Codex"
+            : preferred === "claude"
+              ? "Claude"
+              : "Kiro";
         this.notifications.warning(
-          `${preferred === "codex" ? "Codex" : "Claude"} ${this.bridgeChatLabel} chats require at least one open local project. Using Tycode.`,
+          `${backendLabel} ${this.bridgeChatLabel} chats require at least one open local project. Using Tycode.`,
         );
       } else {
+        const backendLabel =
+          preferred === "codex"
+            ? "Codex"
+            : preferred === "claude"
+              ? "Claude"
+              : "Kiro";
         this.notifications.warning(
-          `${preferred === "codex" ? "Codex" : "Claude"} backend does not support remote SSH workspaces yet. Using Tycode.`,
+          `${backendLabel} backend does not support remote SSH workspaces yet. Using Tycode.`,
         );
       }
       return "tycode";
@@ -2152,7 +2207,7 @@ export class WorkspaceView {
   }
 
   private normalizeRuntimeAgentBackendKind(raw: string): BackendKind {
-    if (raw === "codex" || raw === "claude") return raw;
+    if (raw === "codex" || raw === "claude" || raw === "kiro") return raw;
     return "tycode";
   }
 
@@ -2208,6 +2263,15 @@ export class WorkspaceView {
     this.disposeConversation(conversationId);
   }
 
+  private disposeFailedResumeConversation(conversationId: number): void {
+    const tab = this.tabManager.getTabByConversationId(conversationId);
+    if (tab) {
+      this.tabManager.closeTab(tab.id);
+      return;
+    }
+    this.closeConversationPermanently(conversationId, false);
+  }
+
   private registerConversation(agent: AgentInfo): void {
     this.conversationIds.add(agent.conversationId);
     this.agentsPanel.upsertAgent(agent);
@@ -2229,6 +2293,22 @@ export class WorkspaceView {
     this.titleGenerationRequested.delete(conversationId);
     this.sessionsRefreshRequestedForConversation.delete(conversationId);
     this.emitConversationIdsChanged();
+  }
+
+  private findConversationBySession(
+    sessionId: string,
+    backendKind: BackendKind,
+  ): number | null {
+    for (const [conversationId, info] of this.conversationSessionMap) {
+      if (
+        info.sessionId === sessionId &&
+        info.backendKind === backendKind &&
+        this.conversationIds.has(conversationId)
+      ) {
+        return conversationId;
+      }
+    }
+    return null;
   }
 
   private emitConversationIdsChanged(): void {

@@ -76,11 +76,27 @@ ensure_subprocess() {
     log "Subprocess binary installed at $dest"
 }
 
+ensure_tauri_cli() {
+    local tauri_bin="$SCRIPT_DIR/node_modules/.bin/tauri"
+    if [[ -x "$tauri_bin" ]]; then
+        return 0
+    fi
+
+    log "Tauri CLI not found in node_modules; installing frontend dependencies"
+    cd "$SCRIPT_DIR"
+    npm install --include=dev
+
+    if [[ ! -x "$tauri_bin" ]]; then
+        error "Tauri CLI still missing after npm install. Expected $tauri_bin"
+    fi
+}
+
 cmd_release() {
     ensure_subprocess
+    ensure_tauri_cli
     log "Building Tyde release bundle"
     cd "$SCRIPT_DIR"
-    npx tauri build
+    "$SCRIPT_DIR/node_modules/.bin/tauri" build
 
     local bundle_dir="$SCRIPT_DIR/src-tauri/target/release/bundle"
 
@@ -109,9 +125,11 @@ cmd_release() {
 
 cmd_debug() {
     ensure_subprocess
+    ensure_tauri_cli
     log "Building Tyde debug bundle"
     cd "$SCRIPT_DIR"
-    npx tauri build --debug
+    # DMG packaging can fail in local debug environments; app bundle is enough for smoke testing.
+    "$SCRIPT_DIR/node_modules/.bin/tauri" build --debug --bundles app
     log "Debug build complete."
 }
 

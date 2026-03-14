@@ -9,6 +9,8 @@ mod debug_mcp_http;
 mod file_service;
 mod file_watch;
 mod git_service;
+mod kiro;
+mod acp;
 mod remote;
 mod subprocess;
 mod terminal;
@@ -1017,6 +1019,16 @@ async fn resolve_backend_executable_path(
                 None => Ok(String::new()),
             }
         }
+        BackendKind::Kiro => {
+            let remote_roots = parse_remote_workspace_roots(workspace_roots)?;
+            match &remote_roots {
+                Some((host, _)) => {
+                    validate_remote_cli(app, host, "kiro-cli").await?;
+                    Ok(host.clone())
+                }
+                None => Ok(String::new()),
+            }
+        }
     }
 }
 
@@ -1227,8 +1239,13 @@ async fn execute_conversation_command(
     match handle.execute(command).await {
         Ok(()) => Ok(()),
         Err(err) => {
-            let mut mgr = state.manager.lock().await;
-            mgr.remove(conversation_id);
+            let removed_session = {
+                let mut mgr = state.manager.lock().await;
+                mgr.remove(conversation_id)
+            };
+            if let Some(session) = removed_session {
+                session.shutdown().await;
+            }
             let changed = {
                 let mut runtime = state.agent_runtime.lock().await;
                 runtime.mark_conversation_failed(conversation_id, err.clone())
@@ -2296,9 +2313,13 @@ async fn execute_admin_command(
     match handle.execute(command).await {
         Ok(()) => Ok(()),
         Err(err) => {
-            // Remove bridge so Drop fires RAII kill
-            let mut mgr = state.admin.lock().await;
-            mgr.remove(admin_id);
+            let removed_session = {
+                let mut mgr = state.admin.lock().await;
+                mgr.remove(admin_id)
+            };
+            if let Some(session) = removed_session {
+                session.shutdown().await;
+            }
             Err(err)
         }
     }
