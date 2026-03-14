@@ -5903,6 +5903,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "portable-pty",
+ "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",

@@ -9048,3 +9048,24 @@ body {
 .conn-dialog-close-btn:hover {
   background: var(--bg-primary);
 }
+
+/* Feedback dialog */
+.feedback-textarea {
+  resize: vertical;
+  min-height: 80px;
+  font-family: inherit;
+  line-height: 1.4;
+}
+
+.feedback-status {
+  font-size: calc(var(--base-font-size) * 0.8571);
+  min-height: 1.2em;
+}
+
+.feedback-status-error {
+  color: var(--color-error);
+}
+
+.feedback-status-success {
+  color: var(--color-success);
+}
