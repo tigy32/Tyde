@@ -3065,8 +3065,34 @@ fn resolve_shell_path() {
     std::env::set_var("PATH", &resolved);
 }
 
+fn detect_system_dark_mode() -> bool {
+    let output = Command::new("dbus-send")
+        .args([
+            "--session",
+            "--dest=org.freedesktop.portal.Desktop",
+            "--print-reply=literal",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings.Read",
+            "string:org.freedesktop.appearance",
+            "string:color-scheme",
+        ])
+        .output();
+    match output {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            // color-scheme: 1 = dark, 2 = light, 0 = no preference
+            text.contains("uint32 1")
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn run() {
     resolve_shell_path();
+    #[cfg(target_os = "linux")]
+    if detect_system_dark_mode() {
+        std::env::set_var("GTK_THEME", "Adwaita:dark");
+    }
     let mut app_settings = load_app_settings();
     if !app_settings.debug_mcp_http_enabled {
         app_settings.debug_mcp_http_autoload = false;
@@ -3114,8 +3140,11 @@ pub fn run() {
                 let window_handle = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = window_handle.hide();
+                        if cfg!(target_os = "macos") {
+                            api.prevent_close();
+                            let _ = window_handle.hide();
+                        }
+                        // On Linux/Windows, let the close proceed normally and exit the app
                     }
                 });
             }

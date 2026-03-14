@@ -34,6 +34,7 @@
           openssl
           libayatana-appindicator
           gsettings-desktop-schemas
+          dbus
         ];
       in
       {
@@ -50,6 +51,7 @@
           shellHook = ''
             export GIO_MODULE_PATH="${pkgs.glib-networking}/lib/gio/modules"
             export XDG_DATA_DIRS="${glib-schemas}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+            export DBUS_SESSION_BUS_ADDRESS="''${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
             export PATH="$PWD/node_modules/.bin:$PATH"
             export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath tauriNativeDeps}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           '';
