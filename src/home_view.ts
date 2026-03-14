@@ -22,6 +22,10 @@ export class HomeView {
   private agentsLoading = false;
   private actionListenerController: AbortController | null = null;
   private collapsedParents: Set<number> = new Set();
+  private homeHideInactive = false;
+  private homeHideSubAgents = false;
+  private homeHideOtherWorkspaces = false;
+  private homeSearchQuery = "";
   onOpenWorkspace: (() => void) | null = null;
   onOpenRemoteWorkspace: (() => void) | null = null;
   onNewBridgeChat: ((backendOverride?: BackendKind) => void) | null = null;
@@ -123,16 +127,19 @@ export class HomeView {
     section.className = "home-agents-section";
     section.dataset.testid = "home-agents-section";
 
+    section.appendChild(this.buildAgentsToolbar());
+
     if (this.agentsLoading && !this.cachedAgents) {
       const loading = document.createElement("div");
       loading.className = "panel-loading";
-      loading.innerHTML = '<div class="loading-spinner"></div> Loading agents…';
+      loading.innerHTML =
+        '<div class="loading-spinner"></div> Loading agents\u2026';
       section.appendChild(loading);
       return section;
     }
 
-    const agents = this.cachedAgents ?? [];
-    if (agents.length === 0) {
+    const filtered = this.filteredHomeAgents();
+    if (filtered.length === 0) {
       const empty = document.createElement("div");
       empty.className = "agents-empty-state";
       empty.innerHTML =
@@ -146,10 +153,10 @@ export class HomeView {
     // Build parent→children map for hierarchy display
     const childrenByParent = new Map<number, RuntimeAgent[]>();
     const roots: RuntimeAgent[] = [];
-    for (const agent of agents) {
+    for (const agent of filtered) {
       if (
         agent.parent_agent_id != null &&
-        agents.some((a) => a.agent_id === agent.parent_agent_id)
+        filtered.some((a) => a.agent_id === agent.parent_agent_id)
       ) {
         const siblings = childrenByParent.get(agent.parent_agent_id) ?? [];
         siblings.push(agent);
@@ -177,6 +184,104 @@ export class HomeView {
 
     section.appendChild(list);
     return section;
+  }
+
+  private buildAgentsToolbar(): HTMLElement {
+    const toolbar = document.createElement("div");
+    toolbar.className = "agents-toolbar";
+    toolbar.dataset.testid = "home-agents-toolbar";
+
+    const searchInput = document.createElement("input");
+    searchInput.type = "text";
+    searchInput.className = "agents-search";
+    searchInput.placeholder = "Search agents\u2026";
+    searchInput.setAttribute("aria-label", "Search agents");
+    searchInput.value = this.homeSearchQuery;
+    searchInput.addEventListener("input", () => {
+      this.homeSearchQuery = searchInput.value;
+      this.render();
+    });
+
+    const hideInactiveBtn = document.createElement("button");
+    hideInactiveBtn.type = "button";
+    hideInactiveBtn.className = "agents-toolbar-btn";
+    if (this.homeHideInactive)
+      hideInactiveBtn.classList.add("agents-toolbar-btn-active");
+    hideInactiveBtn.dataset.testid = "home-agents-hide-inactive";
+    hideInactiveBtn.textContent = "◑";
+    hideInactiveBtn.title = "Hide inactive agents";
+    hideInactiveBtn.setAttribute("aria-label", "Hide inactive agents");
+    hideInactiveBtn.addEventListener("click", () => {
+      this.homeHideInactive = !this.homeHideInactive;
+      this.render();
+    });
+
+    const hideSubBtn = document.createElement("button");
+    hideSubBtn.type = "button";
+    hideSubBtn.className = "agents-toolbar-btn";
+    if (this.homeHideSubAgents)
+      hideSubBtn.classList.add("agents-toolbar-btn-active");
+    hideSubBtn.dataset.testid = "home-agents-hide-subagents";
+    hideSubBtn.textContent = "⊟";
+    hideSubBtn.title = "Hide sub-agents";
+    hideSubBtn.setAttribute("aria-label", "Hide sub-agents");
+    hideSubBtn.addEventListener("click", () => {
+      this.homeHideSubAgents = !this.homeHideSubAgents;
+      this.render();
+    });
+
+    const hideOtherBtn = document.createElement("button");
+    hideOtherBtn.type = "button";
+    hideOtherBtn.className = "agents-toolbar-btn";
+    if (this.homeHideOtherWorkspaces)
+      hideOtherBtn.classList.add("agents-toolbar-btn-active");
+    hideOtherBtn.dataset.testid = "home-agents-hide-other-workspaces";
+    hideOtherBtn.textContent = "⌂";
+    hideOtherBtn.title = "Hide agents from other workspaces";
+    hideOtherBtn.setAttribute(
+      "aria-label",
+      "Hide agents from other workspaces",
+    );
+    hideOtherBtn.addEventListener("click", () => {
+      this.homeHideOtherWorkspaces = !this.homeHideOtherWorkspaces;
+      this.render();
+    });
+
+    toolbar.appendChild(searchInput);
+    toolbar.appendChild(hideInactiveBtn);
+    toolbar.appendChild(hideSubBtn);
+    toolbar.appendChild(hideOtherBtn);
+    return toolbar;
+  }
+
+  private filteredHomeAgents(): RuntimeAgent[] {
+    const agents = this.cachedAgents ?? [];
+    let result = [...agents];
+    if (this.homeHideInactive) {
+      result = result.filter(
+        (a) =>
+          a.status === "queued" ||
+          a.status === "running" ||
+          a.status === "waiting_input",
+      );
+    }
+    if (this.homeHideSubAgents) {
+      result = result.filter((a) => a.parent_agent_id == null);
+    }
+    if (this.homeHideOtherWorkspaces) {
+      result = result.filter(
+        (a) => a.parent_agent_id != null || a.workspace_roots.length === 0,
+      );
+    }
+    if (this.homeSearchQuery) {
+      const q = this.homeSearchQuery.toLowerCase();
+      result = result.filter(
+        (a) =>
+          a.name.toLowerCase().includes(q) ||
+          a.summary.toLowerCase().includes(q),
+      );
+    }
+    return result;
   }
 
   private buildAgentCard(
