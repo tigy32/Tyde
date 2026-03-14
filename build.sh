@@ -54,7 +54,11 @@ cmd_release() {
     ensure_tauri_cli
     log "Building Tyde release bundle"
     cd "$SCRIPT_DIR"
-    "$SCRIPT_DIR/node_modules/.bin/tauri" build
+    local bundle_flags=()
+    if [[ "$(uname)" == "Linux" ]]; then
+        bundle_flags=(--bundles appimage)
+    fi
+    "$SCRIPT_DIR/node_modules/.bin/tauri" build "${bundle_flags[@]}"
 
     local bundle_dir="$SCRIPT_DIR/src-tauri/target/release/bundle"
 
@@ -85,8 +89,11 @@ cmd_debug() {
     ensure_tauri_cli
     log "Building Tyde debug bundle"
     cd "$SCRIPT_DIR"
-    # DMG packaging can fail in local debug environments; app bundle is enough for smoke testing.
-    "$SCRIPT_DIR/node_modules/.bin/tauri" build --debug --bundles app
+    local bundle_type="app"
+    if [[ "$(uname)" == "Linux" ]]; then
+        bundle_type="appimage"
+    fi
+    "$SCRIPT_DIR/node_modules/.bin/tauri" build --debug --bundles "$bundle_type"
     log "Debug build complete."
 }
 
