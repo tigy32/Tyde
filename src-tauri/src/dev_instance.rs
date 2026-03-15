@@ -4,6 +4,7 @@ use std::sync::Arc;
 use parking_lot::Mutex as SyncMutex;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::AppState;
 
@@ -200,6 +201,15 @@ pub(crate) async fn start_dev_instance(
         }
     }
 
+    // Verify node_modules exists so we get a clear error instead of npx
+    // hanging on an interactive "install?" prompt or silently failing.
+    let node_modules = std::path::Path::new(&project_dir).join("node_modules");
+    if !node_modules.exists() {
+        return Err(format!(
+            "node_modules not found in {project_dir}. Run `npm install` first."
+        ));
+    }
+
     // Find available ports by binding to :0 and reading the assigned ports.
     // We need two: one for the debug MCP server, one for Vite (to avoid
     // colliding with the host's Vite on 5173).
@@ -229,8 +239,8 @@ pub(crate) async fn start_dev_instance(
     // - TYDE_DEBUG_MCP_HTTP_ENABLED: enable debug MCP in the child
     // - TYDE_MCP_HTTP_ENABLED=false: disable agent control MCP (recursion prevention)
     // - TYDE_DRIVER_MCP_HTTP_ENABLED=false: disable driver MCP (recursion prevention)
-    let mut child = tokio::process::Command::new("npx")
-        .args(["tauri", "dev", "--config", &tauri_config_override])
+    let mut cmd = tokio::process::Command::new("npx");
+    cmd.args(["tauri", "dev", "--config", &tauri_config_override])
         .current_dir(&project_dir)
         .env("TYDE_VITE_PORT", vite_port.to_string())
         .env(
@@ -240,10 +250,45 @@ pub(crate) async fn start_dev_instance(
         .env("TYDE_DEBUG_MCP_HTTP_ENABLED", "true")
         .env("TYDE_MCP_HTTP_ENABLED", "false")
         .env("TYDE_DRIVER_MCP_HTTP_ENABLED", "false")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Spawn in its own process group so we can kill the entire tree later.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn `npx tauri dev`: {e}"))?;
+
+    // Drain stdout/stderr in background tasks so the child process doesn't
+    // block when the OS pipe buffer fills up. Stderr is collected into a
+    // shared buffer so we can surface build errors if the process exits early.
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "dev_instance::stdout", "{line}");
+            }
+        });
+    }
+    let stderr_tail: Arc<SyncMutex<Vec<String>>> = Arc::new(SyncMutex::new(Vec::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail = Arc::clone(&stderr_tail);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "dev_instance::stderr", "{line}");
+                let mut buf = tail.lock();
+                buf.push(line);
+                // Keep only the last 50 lines to avoid unbounded growth.
+                if buf.len() > 50 {
+                    buf.remove(0);
+                }
+            }
+        });
+    }
 
     // Poll healthz until the dev instance's debug MCP server is ready.
     // Check if the child process has exited on each iteration so we fail
@@ -256,10 +301,10 @@ pub(crate) async fn start_dev_instance(
 
     loop {
         if start.elapsed() > poll_timeout {
-            let _ = child.kill().await;
+            kill_process_tree(&mut child).await;
+            let tail = stderr_tail.lock().join("\n");
             return Err(format!(
-                "Dev instance did not become ready within {}s. \
-                 The build may have failed — check the project for compilation errors.",
+                "Dev instance did not become ready within {}s.\n\nstderr:\n{tail}",
                 poll_timeout.as_secs()
             ));
         }
@@ -268,9 +313,11 @@ pub(crate) async fn start_dev_instance(
             .try_wait()
             .map_err(|e| format!("Failed to check dev instance process: {e}"))?
         {
+            // Give the stderr drain task a moment to finish reading.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let tail = stderr_tail.lock().join("\n");
             return Err(format!(
-                "Dev instance process exited before becoming ready (exit status: {exit_status}). \
-                 The build likely failed — check the project for compilation errors."
+                "Dev instance exited with {exit_status} before becoming ready.\n\nstderr:\n{tail}"
             ));
         }
 
@@ -313,9 +360,7 @@ pub(crate) async fn stop_dev_instance(state: &AppState) -> Result<DevInstanceSto
         .take()
         .ok_or_else(|| "No dev instance is running.".to_string())?;
 
-    if let Err(e) = instance.child.kill().await {
-        tracing::warn!("Failed to kill dev instance process: {e}");
-    }
+    kill_process_tree(&mut instance.child).await;
 
     tracing::info!(
         "Dev instance stopped (was: {})",
@@ -323,6 +368,49 @@ pub(crate) async fn stop_dev_instance(state: &AppState) -> Result<DevInstanceSto
     );
 
     Ok(DevInstanceStopResult { status: "stopped" })
+}
+
+/// Kill the child and its entire process tree.
+///
+/// On Unix, we spawned with `process_group(0)` so the child's PID is also its
+/// PGID. Sending SIGTERM to the negative PGID kills every process in the group
+/// (npx → cargo → the Tauri binary, vite, etc.). We then wait for the child so
+/// it doesn't become a zombie.
+///
+/// Falls back to `child.kill()` (SIGKILL to just the direct child) if the
+/// process group kill fails or we can't determine the PID.
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // kill(-pgid, SIGTERM) — kills every process in the group.
+            let pgid = pid as i32;
+            let result = tokio::process::Command::new("kill")
+                .args(["--", &format!("-{pgid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            match result {
+                Ok(status) if status.success() => {
+                    // Wait for the child to be reaped so it doesn't zombie.
+                    let _ = child.wait().await;
+                    return;
+                }
+                Ok(status) => {
+                    tracing::warn!("kill process group (pgid={pgid}) exited with {status}");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to kill process group (pgid={pgid}): {e}");
+                }
+            }
+        }
+    }
+
+    // Fallback: kill just the direct child.
+    if let Err(e) = child.kill().await {
+        tracing::warn!("Failed to kill dev instance process: {e}");
+    }
 }
 
 /// Proxy an MCP tool call to the running dev instance.
