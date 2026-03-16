@@ -1,6 +1,11 @@
 import { createTwoFilesPatch } from "diff";
 import type { ToolUseData } from "../core_types";
-import { escapeHtml, renderContent, wrapWithTruncation } from "../renderer";
+import {
+  escapeHtml,
+  hideTruncationIfNotNeeded,
+  renderContent,
+  wrapWithTruncation,
+} from "../renderer";
 import type { ToolExecutionResult, ToolRequestType } from "../types";
 
 export type ToolOutputMode = "summary" | "compact" | "verbose";
@@ -207,6 +212,7 @@ export function buildCommandOutputBlock(
   } else {
     const pre = createPreBlock(output);
     wrapper.innerHTML = wrapWithTruncation(pre.outerHTML, output.length, 0);
+    hideTruncationIfNotNeeded(wrapper);
   }
   return wrapper;
 }
@@ -282,6 +288,7 @@ function renderInlineDiff(
       diffLines.length,
       0,
     );
+    hideTruncationIfNotNeeded(wrapper);
     return wrapper;
   }
 
@@ -853,6 +860,7 @@ function renderSpawnToolResult(text: string): HTMLElement {
         ? rendered
         : wrapWithTruncation(rendered, text.length, 0);
     root.appendChild(content);
+    hideTruncationIfNotNeeded(content);
   };
   bindToolOutputRenderer(root, updateResult);
   return root;

@@ -1,4 +1,8 @@
-import { renderContent, wrapWithTruncation } from "../renderer";
+import {
+  hideTruncationIfNotNeeded,
+  renderContent,
+  wrapWithTruncation,
+} from "../renderer";
 import type { ChatMessage, MessageSender, TokenUsage } from "../types";
 import { normalizeReasoningText } from "./reasoning";
 
@@ -317,6 +321,7 @@ export function createMessageElement(
       renderContent(message.content),
       message.content.length,
     );
+    hideTruncationIfNotNeeded(contentEl);
   }
   el.appendChild(contentEl);
 
