@@ -230,7 +230,6 @@ struct ClaudeStdoutSummary {
     tool_name_by_id: HashMap<String, String>,
     tool_call_by_id: HashMap<String, ClaudeToolCall>,
     tool_modify_preview_by_id: HashMap<String, ClaudeModifyPreview>,
-    last_emitted_cumulative_usage: Option<Value>,
     tool_io_bytes: u64,
     reasoning_bytes: u64,
     emitted_phase_count: u64,
@@ -553,19 +552,15 @@ impl ClaudeInner {
                         }
                     }
 
-                    // summary.usage holds per-API-call values from the last
-                    // stream event / assistant message.  Use these for the token
-                    // badge and context breakdown (they represent the actual
-                    // prompt that hit the model).
-                    //
                     // result_cumulative_usage holds cumulative session totals
                     // from the `result` event — feed that into the cross-turn
                     // normalizer so the next process invocation can subtract it.
-                    let cumulative_for_tracking = summary
-                        .result_cumulative_usage
-                        .clone()
-                        .or_else(|| summary.usage.clone());
-                    let _ = self.normalize_usage_for_turn(cumulative_for_tracking).await;
+                    // Never fall back to summary.usage (per-API-call) here —
+                    // mixing the two scales corrupts the differential math for
+                    // subsequent turns.
+                    let _ = self
+                        .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
+                        .await;
                     let known_context_window = summary.result_context_window;
                     if let Some(phase) = take_phase_emission(&mut summary) {
                         let text = phase.text;
@@ -607,11 +602,9 @@ impl ClaudeInner {
                 }
                 TurnOutcome::Cancelled { summary } => {
                     let mut summary = summary;
-                    let cumulative_for_tracking = summary
-                        .result_cumulative_usage
-                        .clone()
-                        .or_else(|| summary.usage.clone());
-                    let _ = self.normalize_usage_for_turn(cumulative_for_tracking).await;
+                    let _ = self
+                        .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
+                        .await;
                     let known_context_window = summary.result_context_window;
                     if let Some(phase) = take_phase_emission(&mut summary) {
                         let partial = phase.text;
@@ -654,11 +647,9 @@ impl ClaudeInner {
                 }
                 TurnOutcome::Failed { summary, error } => {
                     let mut summary = summary;
-                    let cumulative_for_tracking = summary
-                        .result_cumulative_usage
-                        .take()
-                        .or_else(|| summary.usage.take());
-                    let _ = self.normalize_usage_for_turn(cumulative_for_tracking).await;
+                    let _ = self
+                        .normalize_usage_for_turn(summary.result_cumulative_usage.take())
+                        .await;
                     let detail = summary.error_message().unwrap_or(error);
                     self.emit_error(&detail);
                 }
@@ -1090,6 +1081,11 @@ impl ClaudeInner {
     }
 
     fn emit_tool_request(&self, tool_call: &ClaudeToolCall) {
+        if claude_is_todo_write_tool_name(&tool_call.name) {
+            if let Some(task_update) = claude_task_update_from_todo_write(&tool_call.arguments) {
+                self.emit_event(task_update);
+            }
+        }
         self.emit_event(json!({
             "kind": "ToolRequest",
             "data": {
@@ -2181,18 +2177,12 @@ fn maybe_emit_next_stream_start(
 }
 
 fn phase_usage_for_emission(summary: &mut ClaudeStdoutSummary) -> Option<Value> {
-    let current_usage = summary
-        .usage
-        .as_ref()
-        .or(summary.result_cumulative_usage.as_ref())?;
-    let usage = derive_turn_token_usage(
-        current_usage,
-        summary.last_emitted_cumulative_usage.as_ref(),
-    );
-    if usage.is_some() {
-        summary.last_emitted_cumulative_usage = Some(current_usage.clone());
-    }
-    usage
+    // Return the raw usage from stream events as-is.  These values are
+    // session-cumulative (they grow across API calls within a process
+    // invocation), which is exactly what the token badge and context
+    // breakdown need — they should reflect what the latest API call
+    // actually consumed, not a delta from the previous call.
+    summary.usage.clone()
 }
 
 fn take_phase_emission(summary: &mut ClaudeStdoutSummary) -> Option<ClaudePhaseEmission> {
@@ -3165,6 +3155,46 @@ fn claude_is_read_tool_name(tool_name: &str) -> bool {
         normalize_tool_name(tool_name).as_str(),
         "read" | "notebookread"
     )
+}
+
+fn claude_is_todo_write_tool_name(tool_name: &str) -> bool {
+    normalize_tool_name(tool_name) == "todowrite"
+}
+
+/// Convert a TodoWrite tool call's arguments into a TaskUpdate event value.
+///
+/// Claude Code's TodoWrite sends `{ "todos": [{ "content": "...", "status": "...", "activeForm": "..." }, ...] }`.
+/// We map this to our protocol's `TaskUpdate` → `TaskList { title, tasks: [Task { id, description, status }] }`.
+/// For in-progress tasks the `activeForm` field is used as the description (present-tense),
+/// otherwise `content` (imperative form).
+fn claude_task_update_from_todo_write(arguments: &Value) -> Option<Value> {
+    let todos = arguments.get("todos")?.as_array()?;
+    let mut tasks = Vec::with_capacity(todos.len());
+    for (i, todo) in todos.iter().enumerate() {
+        let status = todo.get("status").and_then(Value::as_str).unwrap_or("pending");
+        let description = if status == "in_progress" {
+            todo.get("activeForm")
+                .and_then(Value::as_str)
+                .or_else(|| todo.get("content").and_then(Value::as_str))
+        } else {
+            todo.get("content")
+                .and_then(Value::as_str)
+                .or_else(|| todo.get("activeForm").and_then(Value::as_str))
+        }
+        .unwrap_or("");
+        tasks.push(json!({
+            "id": i,
+            "description": description,
+            "status": status,
+        }));
+    }
+    Some(json!({
+        "kind": "TaskUpdate",
+        "data": {
+            "title": "",
+            "tasks": tasks,
+        }
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -4671,7 +4701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn top_level_assistant_boundaries_emit_separate_stream_ends_with_delta_usage() {
+    async fn top_level_assistant_boundaries_emit_separate_stream_ends_with_cumulative_usage() {
         let (inner, mut rx) = make_test_inner();
         let mut summary = ClaudeStdoutSummary::default();
         let mut segment = SegmentState::default();
@@ -4762,7 +4792,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Second answer")
         );
-        assert_eq!(stream_end_total_tokens(&second_end), Some(180));
+        assert_eq!(stream_end_total_tokens(&second_end), Some(300));
     }
 
     #[tokio::test]
@@ -4861,8 +4891,7 @@ mod tests {
             &mut current_id,
         );
 
-        // message_stop ends the assistant turn — emits early ToolRequest
-        // BEFORE the tool executes so the UI shows "Running..."
+        // message_stop closes the phase: StreamEnd (with tool calls) then ToolRequest
         consume_claude_stream_value(
             &json!({
                 "type": "stream_event",
@@ -4877,10 +4906,18 @@ mod tests {
             &mut current_id,
         );
 
-        let early_tool_request = rx.recv().await.expect("early tool request at message_stop");
-        assert_eq!(event_kind(&early_tool_request), Some("ToolRequest"));
+        let stream_end = rx.recv().await.expect("stream end at message_stop");
+        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
         assert_eq!(
-            early_tool_request
+            stream_end_tool_call_ids(&stream_end),
+            vec!["toolu_edit".to_string()]
+        );
+        assert_eq!(stream_end_total_tokens(&stream_end), Some(80));
+
+        let tool_request = rx.recv().await.expect("tool request after stream end");
+        assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
+        assert_eq!(
+            tool_request
                 .get("data")
                 .and_then(|data| data.get("tool_type"))
                 .and_then(|tool_type| tool_type.get("kind"))
@@ -4888,7 +4925,7 @@ mod tests {
             Some("ModifyFile")
         );
         assert_eq!(
-            early_tool_request
+            tool_request
                 .get("data")
                 .and_then(|data| data.get("tool_type"))
                 .and_then(|tool_type| tool_type.get("file_path"))
@@ -4896,7 +4933,7 @@ mod tests {
             Some("/tmp/example.txt")
         );
 
-        // Tool result arrives — close_current_phase emits StreamEnd, then ToolExecutionCompleted
+        // Tool result arrives — phase already closed, only ToolExecutionCompleted
         consume_claude_stream_value(
             &json!({
                 "type": "user",
@@ -4917,14 +4954,6 @@ mod tests {
             &base_id,
             &mut current_id,
         );
-
-        let stream_end = rx.recv().await.expect("stream end event");
-        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
-        assert_eq!(
-            stream_end_tool_call_ids(&stream_end),
-            vec!["toolu_edit".to_string()]
-        );
-        assert_eq!(stream_end_total_tokens(&stream_end), Some(80));
 
         let completion = rx.recv().await.expect("tool completion event");
         assert_eq!(event_kind(&completion), Some("ToolExecutionCompleted"));
@@ -5922,6 +5951,66 @@ mod tests {
 
         // result_context_window should be extracted from modelUsage
         assert_eq!(summary.result_context_window, Some(200_000));
+    }
+
+    #[test]
+    fn phase_usage_returns_raw_usage() {
+        // phase_usage_for_emission returns summary.usage as-is (no
+        // differential math) so the token badge and context breakdown
+        // reflect what the latest API call actually consumed.
+        let mut summary = ClaudeStdoutSummary::default();
+
+        // No usage set → None.
+        assert!(phase_usage_for_emission(&mut summary).is_none());
+
+        summary.usage = Some(json!({
+            "input_tokens": 150_000,
+            "output_tokens": 500,
+            "total_tokens": 150_500,
+            "cached_prompt_tokens": 120_000,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0
+        }));
+
+        let phase1 = phase_usage_for_emission(&mut summary).expect("should return usage");
+        assert_eq!(phase1.get("input_tokens").and_then(Value::as_u64), Some(150_000));
+        assert_eq!(phase1.get("output_tokens").and_then(Value::as_u64), Some(500));
+        assert_eq!(phase1.get("cached_prompt_tokens").and_then(Value::as_u64), Some(120_000));
+    }
+
+    #[test]
+    fn todo_write_emits_task_update() {
+        let arguments = json!({
+            "todos": [
+                {"content": "Fix the bug", "status": "completed", "activeForm": "Fixing the bug"},
+                {"content": "Run tests", "status": "in_progress", "activeForm": "Running tests"},
+                {"content": "Deploy", "status": "pending", "activeForm": "Deploying"},
+            ]
+        });
+        let event = claude_task_update_from_todo_write(&arguments)
+            .expect("should produce a TaskUpdate event");
+        assert_eq!(event.get("kind").and_then(Value::as_str), Some("TaskUpdate"));
+        let data = event.get("data").expect("should have data");
+        let tasks = data.get("tasks").and_then(Value::as_array).expect("should have tasks");
+        assert_eq!(tasks.len(), 3);
+
+        // Completed task uses `content` (imperative form).
+        assert_eq!(tasks[0].get("description").and_then(Value::as_str), Some("Fix the bug"));
+        assert_eq!(tasks[0].get("status").and_then(Value::as_str), Some("completed"));
+
+        // In-progress task uses `activeForm` (present-tense).
+        assert_eq!(tasks[1].get("description").and_then(Value::as_str), Some("Running tests"));
+        assert_eq!(tasks[1].get("status").and_then(Value::as_str), Some("in_progress"));
+
+        // Pending task uses `content`.
+        assert_eq!(tasks[2].get("description").and_then(Value::as_str), Some("Deploy"));
+        assert_eq!(tasks[2].get("status").and_then(Value::as_str), Some("pending"));
+    }
+
+    #[test]
+    fn todo_write_returns_none_for_missing_todos() {
+        assert!(claude_task_update_from_todo_write(&json!({})).is_none());
+        assert!(claude_task_update_from_todo_write(&json!({"todos": "not an array"})).is_none());
     }
 
     #[test]
