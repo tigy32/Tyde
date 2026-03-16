@@ -12,8 +12,8 @@ The backend contract is the stability boundary for UI behavior (streaming, tool 
 ## Canonical Contracts
 
 - Tyde runtime command model: `src-tauri/src/backend.rs` (`SessionCommand`).
-- Tyde frontend event/tool schema: `src/core_types.ts`.
-- Tyde runtime parser constraints: `src/protocol.ts`.
+- Tyde frontend event/tool schema: `@tyde/protocol` package (`core_types.ts`, `types.ts`).
+- Tyde runtime parser constraints: `@tyde/protocol` package (`protocol.ts`).
 - Canonical Tycode subprocess/event model:
   - `tycode-core/src/chat/events.rs` (Tycode repo)
   - `tycode-core/src/chat/actor.rs` (Tycode repo)
@@ -22,7 +22,7 @@ The backend contract is the stability boundary for UI behavior (streaming, tool 
   - `tycode-subprocess/src/lib.rs` (Tycode repo)
   - `tests/e2e/chat.test.ts`
 
-`src/core_types.ts` defines the JSON shape Tyde consumes, but the event lifecycle semantics come from Tycode's actor/AI/tool loop. Backend adapters must preserve those semantics, not just the field names.
+`@tyde/protocol` defines the JSON shape Tyde consumes, but the event lifecycle semantics come from Tycode's actor/AI/tool loop. Backend adapters must preserve those semantics, not just the field names.
 
 ## Wire-Level Requirements (Tycode JSON Subprocess)
 

@@ -1,9 +1,9 @@
+import type { ChatMessage, MessageSender, TokenUsage } from "@tyde/protocol";
 import {
   hideTruncationIfNotNeeded,
   renderContent,
   wrapWithTruncation,
 } from "../renderer";
-import type { ChatMessage, MessageSender, TokenUsage } from "../types";
 import { normalizeReasoningText } from "./reasoning";
 
 export function formatCompact(n: number): string {
@@ -36,23 +36,9 @@ export function extractAgentName(sender: MessageSender): string | null {
 }
 
 export function resolveModelLabel(modelInfo: unknown): string | null {
-  if (!modelInfo) return null;
-  if (typeof modelInfo === "string") return modelInfo;
-  if (typeof modelInfo !== "object") return null;
-
-  const obj = modelInfo as Record<string, unknown>;
-  if (typeof obj.display_name === "string") return obj.display_name;
-  if (typeof obj.model_id === "string") return obj.model_id;
-  if (typeof obj.model === "string") return obj.model;
-
-  if (obj.model && typeof obj.model === "object") {
-    const nested = obj.model as Record<string, unknown>;
-    if (typeof nested.display_name === "string") return nested.display_name;
-    if (typeof nested.model_id === "string") return nested.model_id;
-    if (typeof nested.model === "string") return nested.model;
-  }
-
-  return null;
+  if (!modelInfo || typeof modelInfo !== "object") return null;
+  const model = (modelInfo as Record<string, unknown>).model;
+  return typeof model === "string" ? model : null;
 }
 
 export function formatRelativeTime(epochMs: number): string {
