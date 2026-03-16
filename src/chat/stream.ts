@@ -1,5 +1,5 @@
+import type { ChatMessage } from "@tyde/protocol";
 import { escapeHtml, renderContent } from "../renderer";
-import type { ChatMessage } from "../types";
 import { normalizeReasoningText } from "./reasoning";
 
 const STREAMING_CURSOR_ARTIFACT_RE =

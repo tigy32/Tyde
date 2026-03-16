@@ -1,3 +1,12 @@
+import type {
+  ChatEvent,
+  ChatMessage,
+  ContextBreakdown,
+  ImageAttachment,
+  TaskList,
+  ToolExecutionResult,
+  ToolRequestType,
+} from "@tyde/protocol";
 import {
   type BackendKind,
   cancelConversation,
@@ -39,15 +48,6 @@ import { formatShortcut } from "./keyboard";
 import type { NotificationManager } from "./notifications";
 import { logTabPerf, perfNow } from "./perf_debug";
 import { TaskPanel } from "./tasks";
-import type {
-  ChatEvent,
-  ChatMessage,
-  ContextBreakdown,
-  ImageAttachment,
-  TaskList,
-  ToolExecutionResult,
-  ToolRequestType,
-} from "./types";
 
 interface QueuedMessage {
   text: string;

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { FileEntry } from "@tyde/protocol";
 import { listDirectory, readFileContent } from "./bridge";
 import { escapeHtml } from "./renderer";
-import type { FileEntry } from "./types";
 
 const EXPLORER_BASE_INDENT_PX = 6;
 const EXPLORER_NEST_INDENT_PX = 0;

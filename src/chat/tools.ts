@@ -1,12 +1,15 @@
+import type {
+  ToolExecutionResult,
+  ToolRequestType,
+  ToolUseData,
+} from "@tyde/protocol";
 import { createTwoFilesPatch } from "diff";
-import type { ToolUseData } from "../core_types";
 import {
   escapeHtml,
   hideTruncationIfNotNeeded,
   renderContent,
   wrapWithTruncation,
 } from "../renderer";
-import type { ToolExecutionResult, ToolRequestType } from "../types";
 
 export type ToolOutputMode = "summary" | "compact" | "verbose";
 // Legacy alias for existing imports in older code paths.

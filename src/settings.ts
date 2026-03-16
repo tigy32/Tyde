@@ -6,6 +6,7 @@ import {
   adminUpdateSettings,
   type BackendDependencyStatus,
   type BackendDepResult,
+  type BackendKind,
   checkBackendDependencies as checkBackendDependenciesBridge,
   type DriverMcpHttpServerSettings,
   getDriverMcpHttpServerSettings as getDriverMcpHttpServerSettingsBridge,
@@ -32,7 +33,6 @@ const DEFAULT_BACKEND_STORAGE_KEY = "tyde-default-backend";
 
 const VALID_THEME = ["system", "dark", "light"] as const;
 type ThemeMode = (typeof VALID_THEME)[number];
-export type BackendKind = "tycode" | "codex" | "claude" | "kiro";
 
 interface AppearanceSettings {
   theme: ThemeMode;

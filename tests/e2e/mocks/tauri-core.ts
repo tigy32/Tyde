@@ -222,13 +222,7 @@ function makeAssistantMessage(content: string, inputTokens: number): Record<stri
     content,
     reasoning: null,
     tool_calls: [],
-    model_info: {
-      model: {
-        provider: 'mock',
-        model_id: 'mock-model',
-        display_name: 'Mock Model',
-      },
-    },
+    model_info: { model: 'MockModel' },
     token_usage: {
       input_tokens: inputTokens,
       output_tokens: 1_000,

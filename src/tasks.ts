@@ -1,4 +1,4 @@
-import type { ContextBreakdown, TaskItem, TaskList } from "./types";
+import type { ContextBreakdown, TaskItem, TaskList } from "@tyde/protocol";
 
 type SummaryView = "context" | "tasks";
 

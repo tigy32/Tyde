@@ -1,8 +1,8 @@
 import { confirm } from "@tauri-apps/plugin-dialog";
+import type { SessionMetadata } from "@tyde/protocol";
 import type { BackendKind } from "./bridge";
 import { escapeHtml } from "./renderer";
 import { promptForText } from "./text_prompt";
-import type { SessionMetadata } from "./types";
 
 interface NormalizedSession {
   key: string;

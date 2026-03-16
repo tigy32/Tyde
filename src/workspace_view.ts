@@ -1,3 +1,4 @@
+import type { SessionMetadata } from "@tyde/protocol";
 import { type AgentCardAction, type AgentInfo, AgentsPanel } from "./agents";
 import type {
   AdminEventPayload,
@@ -49,7 +50,6 @@ import type { TabState } from "./tabs";
 import { TabManager } from "./tabs";
 import { TerminalService } from "./terminal";
 import type { PanelType } from "./tiling/types";
-import type { SessionMetadata } from "./types";
 
 interface WorkspaceViewConfig {
   projectId: string;

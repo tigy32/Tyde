@@ -1,5 +1,5 @@
+import type { FileEntry as BridgeFileEntry } from "@tyde/protocol";
 import { escapeHtml } from "./renderer";
-import type { FileEntry as BridgeFileEntry } from "./types";
 
 interface Command {
   id: string;

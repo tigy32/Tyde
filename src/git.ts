@@ -1,3 +1,4 @@
+import type { GitFileStatus } from "@tyde/protocol";
 import { applyPatch } from "diff";
 import {
   gitCommit,
@@ -10,7 +11,6 @@ import {
   gitUnstage,
 } from "./bridge";
 import { escapeHtml } from "./renderer";
-import type { GitFileStatus } from "./types";
 
 export class GitPanel {
   private container: HTMLElement;
