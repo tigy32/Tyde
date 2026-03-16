@@ -1,3 +1,4 @@
+import type { ChatEvent } from "@tyde/protocol";
 import type { AgentCardAction, AgentInfo } from "./agents";
 import type {
   AdminEventPayload,
@@ -40,7 +41,6 @@ import {
   SettingsPanel,
 } from "./settings";
 import { promptForText } from "./text_prompt";
-import type { ChatEvent } from "./types";
 import {
   normalizeRemoteWorkspaceInput,
   parseRemoteWorkspaceUri,

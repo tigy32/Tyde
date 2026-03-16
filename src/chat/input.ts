@@ -1,4 +1,4 @@
-import type { ImageAttachment } from "../types";
+import type { ImageAttachment } from "@tyde/protocol";
 import { SUPPORTED_IMAGE_EXTENSIONS } from "./input_handler";
 
 export interface InputState {

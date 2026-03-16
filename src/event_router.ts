@@ -1,3 +1,4 @@
+import type { ChatEvent, ChatMessage } from "@tyde/protocol";
 import type { AgentsPanel } from "./agents";
 import type { ChatPanel } from "./chat";
 import type { DiffPanel } from "./diff_panel";
@@ -5,7 +6,6 @@ import type { GitPanel } from "./git";
 import type { NotificationManager } from "./notifications";
 import type { SessionsPanel } from "./sessions";
 import type { TabManager } from "./tabs";
-import type { ChatEvent, ChatMessage } from "./types";
 
 interface EventRouterDeps {
   chatPanel: ChatPanel;

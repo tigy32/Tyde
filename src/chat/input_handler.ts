@@ -1,5 +1,5 @@
+import type { ImageAttachment } from "@tyde/protocol";
 import { cancelConversation, sendMessage } from "../bridge";
-import type { ImageAttachment } from "../types";
 
 export const SUPPORTED_IMAGE_EXTENSIONS = new Set([
   ".png",
