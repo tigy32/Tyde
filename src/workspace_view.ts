@@ -1031,7 +1031,7 @@ export class WorkspaceView {
         true,
       );
       titleAgentId = spawned.agent_id;
-      await waitForAgent(titleAgentId, "terminal", 15_000);
+      await waitForAgent(titleAgentId, 15_000);
       const result = await collectAgentResult(titleAgentId);
       const rawTitle =
         result.final_message ??
@@ -1663,7 +1663,7 @@ export class WorkspaceView {
       if (tab.kind === "chat" && tab.conversationId !== null) {
         const conversationId = tab.conversationId;
         const agent = this.agentsPanel.getAgentByConversationId(conversationId);
-        const shouldPreserve = agent?.runtimeStatus != null;
+        const shouldPreserve = agent?.agentId != null;
         if (!shouldPreserve) {
           this.closeConversationPermanently(conversationId);
         }
@@ -2276,15 +2276,6 @@ export class WorkspaceView {
     return "tycode";
   }
 
-  private runtimeAgentSummaryFallback(status: RuntimeAgent["status"]): string {
-    if (status === "queued") return "Queued";
-    if (status === "running") return "Running...";
-    if (status === "waiting_input") return "Waiting for your input";
-    if (status === "failed") return "Failed";
-    if (status === "cancelled") return "Cancelled";
-    return "Completed";
-  }
-
   private runtimeAgentToPanelInfo(agent: RuntimeAgent): AgentInfo {
     // Preserve the existing panel name if the runtime name is a generic default.
     // This avoids overwriting user-set conversation titles with "Bridge" etc.
@@ -2296,21 +2287,21 @@ export class WorkspaceView {
       name = existing.name;
     }
     const isTyping =
-      this.chatPanel.getConversationTypingState(agent.conversation_id) ??
-      existing?.isTyping ??
-      false;
+      agent.is_running &&
+      (this.chatPanel.getConversationTypingState(agent.conversation_id) ??
+        existing?.isTyping ??
+        true);
     return {
       agentId: agent.agent_id,
       conversationId: agent.conversation_id,
       name,
       agentType: agent.agent_type,
       summary:
-        agent.summary.trim() || this.runtimeAgentSummaryFallback(agent.status),
+        agent.summary.trim() || (agent.is_running ? "Running..." : "Completed"),
       isTyping,
-      hasError: agent.status === "failed" || agent.status === "cancelled",
+      hasError: agent.last_error != null,
       createdAt: agent.created_at_ms,
       projectId: this.projectId,
-      runtimeStatus: agent.status,
       parentAgentId: agent.parent_agent_id,
     };
   }

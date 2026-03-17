@@ -37,7 +37,7 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::admin::AdminManager;
 use crate::agent_runtime::{
-    AgentEventBatch, AgentInfo, AgentRuntime, AgentStatus, CollectedAgentResult,
+    AgentEventBatch, AgentInfo, AgentRuntime, CollectedAgentResult,
 };
 use crate::backend::{
     BackendKind, BackendSession, SessionCommand, StartupMcpServer, StartupMcpTransport,
@@ -222,9 +222,9 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                 let mut runtime = self.agent_runtime.lock().await;
                 let conv_id = runtime.conversation_id_for_agent(agent_id);
                 let current_info = runtime.get_agent(agent_id);
-                let already_terminal = current_info
+                let already_stopped = current_info
                     .as_ref()
-                    .map(|info| info.status.is_terminal())
+                    .map(|info| !info.is_running)
                     .unwrap_or(false);
                 let final_response_differs = match (
                     final_response.as_ref(),
@@ -236,7 +236,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                     (Some(_), None) => true,
                     _ => false,
                 };
-                let should_emit_terminal_event = !already_terminal || final_response_differs;
+                let should_emit_terminal_event = !already_stopped || final_response_differs;
 
                 if !should_emit_terminal_event || conv_id.is_none() {
                     (conv_id, None)
@@ -511,7 +511,6 @@ pub(crate) struct AgentIdRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct WaitForAgentRequest {
     pub(crate) agent_id: u64,
-    pub(crate) until: Option<String>,
     pub(crate) timeout_ms: Option<u64>,
 }
 
@@ -531,7 +530,7 @@ pub(crate) struct AwaitAgentsRequest {
 #[derive(Serialize, Clone)]
 pub(crate) struct AgentResult {
     pub(crate) agent_id: u64,
-    pub(crate) status: AgentStatus,
+    pub(crate) is_running: bool,
     pub(crate) message: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) summary: String,
@@ -541,16 +540,6 @@ pub(crate) struct AgentResult {
 pub(crate) struct AwaitAgentsResponse {
     pub(crate) ready: Vec<AgentResult>,
     pub(crate) still_running: Vec<u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WaitUntil {
-    /// Agent is not actively processing: any status except Queued/Running.
-    Idle,
-    Completed,
-    Failed,
-    NeedsInput,
-    Terminal,
 }
 
 fn is_executable(path: &std::path::Path) -> bool {
@@ -1077,39 +1066,6 @@ async fn resolve_backend_executable_path(
                 None => Ok(String::new()),
             }
         }
-    }
-}
-
-fn parse_wait_until(until: Option<String>) -> Result<WaitUntil, String> {
-    let Some(raw) = until else {
-        return Ok(WaitUntil::Idle);
-    };
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "" | "idle" => Ok(WaitUntil::Idle),
-        "terminal" | "done" => Ok(WaitUntil::Terminal),
-        "completed" | "complete" => Ok(WaitUntil::Completed),
-        "failed" | "error" => Ok(WaitUntil::Failed),
-        "needs_input" | "needs-input" | "waiting_input" | "waiting-input" | "input" => {
-            Ok(WaitUntil::NeedsInput)
-        }
-        other => Err(format!(
-            "Unsupported wait condition '{other}'. Supported values: idle, terminal, completed, failed, needs_input"
-        )),
-    }
-}
-
-fn wait_condition_met(status: AgentStatus, until: WaitUntil) -> bool {
-    match until {
-        // Typing=false / active-stream state is not currently tracked on AgentInfo.
-        // Use status as the best idle proxy:
-        // - active: queued/running
-        // - idle: waiting_input/completed/failed/cancelled
-        WaitUntil::Idle => !matches!(status, AgentStatus::Queued | AgentStatus::Running),
-        WaitUntil::Completed => status == AgentStatus::Completed,
-        WaitUntil::Failed => status == AgentStatus::Failed,
-        WaitUntil::NeedsInput => status == AgentStatus::WaitingInput,
-        WaitUntil::Terminal => status.is_terminal(),
     }
 }
 
@@ -1740,7 +1696,7 @@ pub(crate) async fn interrupt_agent_internal(
         runtime
             .children_of(agent_id)
             .iter()
-            .filter(|c| !c.status.is_terminal())
+            .filter(|c| c.is_running)
             .map(|c| c.agent_id)
             .collect()
     };
@@ -1805,7 +1761,7 @@ pub(crate) async fn terminate_agent_internal(
         runtime
             .children_of(agent_id)
             .iter()
-            .filter(|c| !c.status.is_terminal())
+            .filter(|c| c.is_running)
             .map(|c| c.agent_id)
             .collect()
     };
@@ -1855,10 +1811,8 @@ pub(crate) async fn wait_for_agent_internal(
 ) -> Result<AgentInfo, String> {
     let WaitForAgentRequest {
         agent_id,
-        until,
         timeout_ms,
     } = request;
-    let wait_until = parse_wait_until(until)?;
     let idle_timeout = timeout_ms.unwrap_or(60_000).clamp(1, 30 * 60 * 1000);
     let idle_duration = tokio::time::Duration::from_millis(idle_timeout);
     // Cap total wall time at 10x the idle timeout to prevent infinite waits.
@@ -1874,7 +1828,7 @@ pub(crate) async fn wait_for_agent_internal(
                 .get_agent(agent_id)
                 .ok_or(format!("Agent {agent_id} not found"))?
         };
-        if wait_condition_met(current.status.clone(), wait_until) {
+        if !current.is_running {
             return Ok(current);
         }
 
@@ -1917,7 +1871,7 @@ pub(crate) async fn collect_agent_result_internal(
 fn agent_result_from_info(info: &AgentInfo) -> AgentResult {
     AgentResult {
         agent_id: info.agent_id,
-        status: info.status.clone(),
+        is_running: info.is_running,
         message: info.last_message.clone(),
         error: info.last_error.clone(),
         summary: info.summary.clone(),
@@ -1933,7 +1887,6 @@ pub(crate) async fn run_agent_internal(
     let spawn_resp = spawn_agent_internal(app, state, request).await?;
     let wait_request = WaitForAgentRequest {
         agent_id: spawn_resp.agent_id,
-        until: Some("idle".to_string()),
         timeout_ms: None,
     };
     let info = wait_for_agent_internal(state, wait_request).await?;
@@ -1970,11 +1923,11 @@ pub(crate) async fn await_agents_internal(
                     ids.clone()
                 }
                 None => {
-                    // Watch all non-terminal agents.
+                    // Watch all running agents.
                     runtime
                         .list_agents()
                         .iter()
-                        .filter(|a| !a.status.is_terminal())
+                        .filter(|a| a.is_running)
                         .map(|a| a.agent_id)
                         .collect()
                 }
@@ -1994,8 +1947,7 @@ pub(crate) async fn await_agents_internal(
                 if info.updated_at_ms > newest {
                     newest = info.updated_at_ms;
                 }
-                let is_idle = !matches!(info.status, AgentStatus::Queued | AgentStatus::Running);
-                if is_idle {
+                if !info.is_running {
                     ready.push(agent_result_from_info(&info));
                 } else {
                     still_running.push(id);
@@ -2150,14 +2102,12 @@ async fn list_agents(state: tauri::State<'_, AppState>) -> Result<Vec<AgentInfo>
 async fn wait_for_agent(
     state: tauri::State<'_, AppState>,
     agent_id: u64,
-    until: Option<String>,
     timeout_ms: Option<u64>,
 ) -> Result<AgentInfo, String> {
     wait_for_agent_internal(
         state.inner(),
         WaitForAgentRequest {
             agent_id,
-            until,
             timeout_ms,
         },
     )
@@ -3270,129 +3220,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_wait_until_defaults_to_idle() {
-        assert_eq!(parse_wait_until(None).unwrap(), WaitUntil::Idle);
-        assert_eq!(parse_wait_until(Some("".into())).unwrap(), WaitUntil::Idle);
-        assert_eq!(
-            parse_wait_until(Some("idle".into())).unwrap(),
-            WaitUntil::Idle
-        );
-    }
-
-    #[test]
-    fn parse_wait_until_explicit_values_preserved() {
-        assert_eq!(
-            parse_wait_until(Some("terminal".into())).unwrap(),
-            WaitUntil::Terminal
-        );
-        assert_eq!(
-            parse_wait_until(Some("done".into())).unwrap(),
-            WaitUntil::Terminal
-        );
-        assert_eq!(
-            parse_wait_until(Some("completed".into())).unwrap(),
-            WaitUntil::Completed
-        );
-        assert_eq!(
-            parse_wait_until(Some("complete".into())).unwrap(),
-            WaitUntil::Completed
-        );
-        assert_eq!(
-            parse_wait_until(Some("failed".into())).unwrap(),
-            WaitUntil::Failed
-        );
-        assert_eq!(
-            parse_wait_until(Some("error".into())).unwrap(),
-            WaitUntil::Failed
-        );
-        assert_eq!(
-            parse_wait_until(Some("needs_input".into())).unwrap(),
-            WaitUntil::NeedsInput
-        );
-        assert_eq!(
-            parse_wait_until(Some("waiting-input".into())).unwrap(),
-            WaitUntil::NeedsInput
-        );
-        assert_eq!(
-            parse_wait_until(Some("input".into())).unwrap(),
-            WaitUntil::NeedsInput
-        );
-    }
-
-    #[test]
-    fn parse_wait_until_rejects_unknown() {
-        let err = parse_wait_until(Some("bogus".into())).unwrap_err();
-        assert!(err.contains("Unsupported wait condition 'bogus'"));
-        assert!(err.contains("Supported values: idle, terminal, completed, failed, needs_input"));
-    }
-
-    #[test]
-    fn wait_condition_idle_matches_non_active_statuses() {
-        // Idle = not Queued and not Running
-        assert!(!wait_condition_met(AgentStatus::Queued, WaitUntil::Idle));
-        assert!(!wait_condition_met(AgentStatus::Running, WaitUntil::Idle));
-        assert!(wait_condition_met(
-            AgentStatus::WaitingInput,
-            WaitUntil::Idle
-        ));
-        assert!(wait_condition_met(AgentStatus::Completed, WaitUntil::Idle));
-        assert!(wait_condition_met(AgentStatus::Failed, WaitUntil::Idle));
-        assert!(wait_condition_met(AgentStatus::Cancelled, WaitUntil::Idle));
-    }
-
-    #[test]
-    fn wait_condition_terminal_unchanged() {
-        assert!(!wait_condition_met(
-            AgentStatus::Queued,
-            WaitUntil::Terminal
-        ));
-        assert!(!wait_condition_met(
-            AgentStatus::Running,
-            WaitUntil::Terminal
-        ));
-        assert!(!wait_condition_met(
-            AgentStatus::WaitingInput,
-            WaitUntil::Terminal
-        ));
-        assert!(wait_condition_met(
-            AgentStatus::Completed,
-            WaitUntil::Terminal
-        ));
-        assert!(wait_condition_met(AgentStatus::Failed, WaitUntil::Terminal));
-        assert!(wait_condition_met(
-            AgentStatus::Cancelled,
-            WaitUntil::Terminal
-        ));
-    }
-
-    #[test]
-    fn wait_condition_specific_statuses() {
-        assert!(wait_condition_met(
-            AgentStatus::Completed,
-            WaitUntil::Completed
-        ));
-        assert!(!wait_condition_met(
-            AgentStatus::Failed,
-            WaitUntil::Completed
-        ));
-        assert!(wait_condition_met(AgentStatus::Failed, WaitUntil::Failed));
-        assert!(!wait_condition_met(
-            AgentStatus::Completed,
-            WaitUntil::Failed
-        ));
-        assert!(wait_condition_met(
-            AgentStatus::WaitingInput,
-            WaitUntil::NeedsInput
-        ));
-        assert!(!wait_condition_met(
-            AgentStatus::Running,
-            WaitUntil::NeedsInput
-        ));
-    }
-
     #[tokio::test]
-    async fn wait_for_agent_without_until_waits_for_idle() {
+    async fn wait_for_agent_waits_for_not_running() {
         let state = test_app_state();
         let conversation_id = 9001;
         let agent_id = {
@@ -3412,7 +3241,6 @@ mod tests {
             &state,
             WaitForAgentRequest {
                 agent_id,
-                until: None,
                 timeout_ms: Some(1_000),
             },
         );
@@ -3422,80 +3250,15 @@ mod tests {
                 let mut runtime = state.agent_runtime.lock().await;
                 let changed = runtime.record_chat_event(
                     conversation_id,
-                    &json!({
-                        "kind": "ToolRequest",
-                        "data": { "tool_name": "ask_user_question" }
-                    }),
+                    &json!({ "kind": "TypingStatusChanged", "data": false }),
                 );
                 assert!(changed);
             }
             state.agent_runtime_notify.notify_waiters();
         };
         let (result, _) = tokio::join!(wait_fut, notifier);
-        let agent = result.expect("wait_for_agent should return once agent is idle");
-        assert_eq!(agent.status, AgentStatus::WaitingInput);
-    }
-
-    #[tokio::test]
-    async fn wait_for_agent_explicit_terminal_still_works() {
-        let state = test_app_state();
-        let conversation_id = 9002;
-        let agent_id = {
-            let mut runtime = state.agent_runtime.lock().await;
-            let info = runtime.register_agent(
-                conversation_id,
-                vec!["/tmp".into()],
-                "tycode".into(),
-                None,
-                "test".into(),
-            );
-            assert!(runtime.mark_agent_running(info.agent_id, Some("Running...".into())));
-            info.agent_id
-        };
-
-        let wait_fut = wait_for_agent_internal(
-            &state,
-            WaitForAgentRequest {
-                agent_id,
-                until: Some("terminal".to_string()),
-                timeout_ms: Some(1_000),
-            },
-        );
-        let notifier = async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            {
-                let mut runtime = state.agent_runtime.lock().await;
-                let changed = runtime.record_chat_event(
-                    conversation_id,
-                    &json!({
-                        "kind": "StreamEnd",
-                        "data": { "message": { "content": "Done." } }
-                    }),
-                );
-                assert!(changed);
-            }
-            state.agent_runtime_notify.notify_waiters();
-        };
-        let (result, _) = tokio::join!(wait_fut, notifier);
-        let agent = result.expect("terminal wait should still resolve");
-        assert_eq!(agent.status, AgentStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn wait_for_agent_invalid_until_returns_clear_error() {
-        let state = test_app_state();
-        let err = wait_for_agent_internal(
-            &state,
-            WaitForAgentRequest {
-                agent_id: 42,
-                until: Some("bogus".into()),
-                timeout_ms: Some(1_000),
-            },
-        )
-        .await
-        .expect_err("invalid wait condition should fail fast");
-        assert!(err.contains("Unsupported wait condition 'bogus'"));
-        assert!(err.contains("Supported values: idle, terminal, completed, failed, needs_input"));
+        let agent = result.expect("wait_for_agent should return once agent stops running");
+        assert!(!agent.is_running);
     }
 
     #[test]

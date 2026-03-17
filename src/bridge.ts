@@ -36,7 +36,6 @@ export type {
   RemoteConnectionProgress,
   RuntimeAgent,
   RuntimeAgentEventBatch,
-  RuntimeAgentStatus,
   SpawnAgentResponse,
   TerminalExitPayload,
   TerminalOutputPayload,
@@ -185,12 +184,8 @@ export function listAgents() {
   return execute("list_agents", {} as Record<string, never>);
 }
 
-export function waitForAgent(
-  agentId: number,
-  until?: "idle" | "completed" | "failed" | "needs_input" | "terminal",
-  timeoutMs?: number,
-) {
-  return execute("wait_for_agent", { agentId, until, timeoutMs });
+export function waitForAgent(agentId: number, timeoutMs?: number) {
+  return execute("wait_for_agent", { agentId, timeoutMs });
 }
 
 export function agentEventsSince(sinceSeq = 0, limit = 200) {

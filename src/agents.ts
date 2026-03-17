@@ -1,5 +1,3 @@
-import type { RuntimeAgentStatus } from "./bridge";
-
 export type AgentCardAction = "interrupt" | "terminate" | "remove";
 
 export interface AgentInfo {
@@ -12,7 +10,6 @@ export interface AgentInfo {
   hasError?: boolean;
   createdAt: number;
   projectId: string;
-  runtimeStatus?: RuntimeAgentStatus;
   parentAgentId?: number | null;
 }
 
@@ -174,13 +171,6 @@ export class AgentsPanel {
   }
 
   private isActive(agent: AgentInfo): boolean {
-    if (agent.runtimeStatus != null) {
-      return (
-        agent.runtimeStatus === "queued" ||
-        agent.runtimeStatus === "running" ||
-        agent.runtimeStatus === "waiting_input"
-      );
-    }
     return agent.isTyping;
   }
 
@@ -347,12 +337,6 @@ export class AgentsPanel {
   }
 
   private buildStatusIndicator(agent: AgentInfo): HTMLElement | null {
-    if (agent.runtimeStatus === "waiting_input") {
-      const icon = document.createElement("span");
-      icon.className = "agent-status-icon";
-      icon.textContent = "⏸";
-      return icon;
-    }
     if (agent.isTyping) {
       const spinner = document.createElement("div");
       spinner.className = "loading-spinner";
@@ -365,15 +349,11 @@ export class AgentsPanel {
     const row = document.createElement("div");
     row.className = "agent-card-actions";
 
-    const isRuntime = agent.runtimeStatus != null && Boolean(agent.agentId);
-    if (isRuntime) {
-      if (this.canInterrupt(agent)) {
+    if (agent.agentId != null) {
+      if (agent.isTyping) {
         row.appendChild(this.buildActionButton(agent, "interrupt"));
-      }
-      if (this.canTerminate(agent)) {
         row.appendChild(this.buildActionButton(agent, "terminate"));
-      }
-      if (this.canRemove(agent)) {
+      } else {
         row.appendChild(this.buildActionButton(agent, "remove"));
       }
     } else if (agent.isTyping) {
@@ -412,34 +392,14 @@ export class AgentsPanel {
 
   private actionTooltip(agent: AgentInfo, action: AgentCardAction): string {
     if (action === "interrupt") {
-      return agent.runtimeStatus != null
+      return agent.agentId != null
         ? "Interrupt this agent run"
         : "Interrupt this conversation";
     }
     if (action === "terminate") return "Terminate this agent";
-    return agent.runtimeStatus != null
+    return agent.agentId != null
       ? "Remove this agent card"
       : "Close and remove this conversation";
-  }
-
-  private canInterrupt(agent: AgentInfo): boolean {
-    return (
-      agent.runtimeStatus === "queued" ||
-      agent.runtimeStatus === "running" ||
-      agent.runtimeStatus === "waiting_input"
-    );
-  }
-
-  private canTerminate(agent: AgentInfo): boolean {
-    return this.canInterrupt(agent);
-  }
-
-  private canRemove(agent: AgentInfo): boolean {
-    return (
-      agent.runtimeStatus === "completed" ||
-      agent.runtimeStatus === "failed" ||
-      agent.runtimeStatus === "cancelled"
-    );
   }
 
   private formatRelativeTime(epochMs: number): string {
@@ -468,7 +428,6 @@ export class AgentsPanel {
       a.hasError === b.hasError &&
       a.createdAt === b.createdAt &&
       a.projectId === b.projectId &&
-      a.runtimeStatus === b.runtimeStatus &&
       a.parentAgentId === b.parentAgentId
     );
   }
