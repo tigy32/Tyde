@@ -355,10 +355,7 @@ export class AppController {
         totalConversationIds.add(conversationId);
       }
       const activeRuntimeAgents = runtimeAgents.filter(
-        (agent) =>
-          agent.status === "queued" ||
-          agent.status === "running" ||
-          agent.status === "waiting_input",
+        (agent) => agent.is_running,
       ).length;
       const activeConversationIds = persistedConversationIds.filter(
         (id) => !runtimeConversationIds.has(id),
@@ -609,13 +606,11 @@ export class AppController {
       );
       return;
     }
-    const view = this.workspaceViews.get(project.id);
-    if (!view) {
-      console.error(
-        `ConversationRegistered: no workspace view for project ${project.id}`,
-      );
-      return;
-    }
+    const view = this.getOrCreateWorkspaceView(
+      project.id,
+      project.workspacePath,
+      project.name,
+    );
 
     const agent: RuntimeAgent = {
       agent_id: payload.data.agent_id ?? 0,
@@ -625,7 +620,7 @@ export class AppController {
       parent_agent_id: payload.data.parent_agent_id,
       name: payload.data.name,
       agent_type: payload.data.agent_type ?? null,
-      status: "running",
+      is_running: true,
       summary: "",
       created_at_ms: Date.now(),
       updated_at_ms: Date.now(),
@@ -638,8 +633,9 @@ export class AppController {
 
   private resolveProjectForWorkspaceRoots(
     workspaceRoots: string[],
-  ): { id: string; workspacePath: string } | null {
-    let bestMatch: { id: string; workspacePath: string } | null = null;
+  ): { id: string; workspacePath: string; name: string } | null {
+    let bestMatch: { id: string; workspacePath: string; name: string } | null =
+      null;
     let bestLength = -1;
     for (const project of this.projectState.projects) {
       const normalizedWorkspace = this.normalizeWorkspacePath(

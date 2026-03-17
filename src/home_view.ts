@@ -260,12 +260,7 @@ export class HomeView {
     const agents = this.cachedAgents ?? [];
     let result = [...agents];
     if (this.homeHideInactive) {
-      result = result.filter(
-        (a) =>
-          a.status === "queued" ||
-          a.status === "running" ||
-          a.status === "waiting_input",
-      );
+      result = result.filter((a) => a.is_running);
     }
     if (this.homeHideSubAgents) {
       result = result.filter((a) => a.parent_agent_id == null);
@@ -292,7 +287,7 @@ export class HomeView {
     isChild: boolean,
   ): HTMLElement {
     const card = document.createElement("div");
-    card.className = `agent-card agent-card-${this.agentStatusClass(agent.status)}`;
+    card.className = `agent-card agent-card-${this.agentStatusClass(agent)}`;
     if (isChild) card.classList.add("agent-card-child");
     card.dataset.testid = "home-agent-card";
 
@@ -348,14 +343,9 @@ export class HomeView {
       headerRight.appendChild(badge);
     }
 
-    if (agent.status === "running" || agent.status === "queued") {
+    if (agent.is_running) {
       const statusEl = document.createElement("div");
       statusEl.className = "loading-spinner";
-      headerRight.appendChild(statusEl);
-    } else if (agent.status === "waiting_input") {
-      const statusEl = document.createElement("span");
-      statusEl.className = "agent-status-icon";
-      statusEl.textContent = "⏸";
       headerRight.appendChild(statusEl);
     }
     header.appendChild(headerRight);
@@ -407,11 +397,10 @@ export class HomeView {
     }
   }
 
-  private agentStatusClass(status: string): string {
-    if (status === "running" || status === "queued") return "running";
-    if (status === "completed") return "completed";
-    if (status === "failed" || status === "cancelled") return "error";
-    return "running";
+  private agentStatusClass(agent: RuntimeAgent): string {
+    if (agent.is_running) return "running";
+    if (agent.last_error != null) return "error";
+    return "completed";
   }
 
   private formatRelativeTime(epochMs: number): string {
@@ -495,11 +484,7 @@ export class HomeView {
   }
 
   private canInterrupt(agent: RuntimeAgent): boolean {
-    return (
-      agent.status === "queued" ||
-      agent.status === "running" ||
-      agent.status === "waiting_input"
-    );
+    return agent.is_running;
   }
 
   private canTerminate(agent: RuntimeAgent): boolean {
@@ -507,11 +492,7 @@ export class HomeView {
   }
 
   private canRemove(agent: RuntimeAgent): boolean {
-    return (
-      agent.status === "completed" ||
-      agent.status === "failed" ||
-      agent.status === "cancelled"
-    );
+    return !agent.is_running;
   }
 
   private sameRuntimeAgents(
@@ -525,7 +506,7 @@ export class HomeView {
         agent.agent_id === candidate.agent_id &&
         agent.name === candidate.name &&
         agent.agent_type === candidate.agent_type &&
-        agent.status === candidate.status &&
+        agent.is_running === candidate.is_running &&
         agent.summary === candidate.summary &&
         agent.updated_at_ms === candidate.updated_at_ms &&
         agent.ended_at_ms === candidate.ended_at_ms

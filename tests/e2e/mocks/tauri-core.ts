@@ -17,14 +17,6 @@ const conversations = new Map<number, ConversationState>();
 let nextAdminId = 50_000;
 const adminSubprocesses = new Map<number, AdminState>();
 
-type MockRuntimeAgentStatus =
-  | 'queued'
-  | 'running'
-  | 'waiting_input'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
 interface MockRuntimeAgent {
   agent_id: number;
   conversation_id: number;
@@ -33,7 +25,7 @@ interface MockRuntimeAgent {
   parent_agent_id: number | null;
   keep_alive_without_tab: boolean;
   name: string;
-  status: MockRuntimeAgentStatus;
+  is_running: boolean;
   summary: string;
   created_at_ms: number;
   updated_at_ms: number;
@@ -47,7 +39,7 @@ interface MockRuntimeAgentEvent {
   agent_id: number;
   conversation_id: number;
   kind: string;
-  status: MockRuntimeAgentStatus;
+  is_running: boolean;
   timestamp_ms: number;
   message: string | null;
 }
@@ -125,17 +117,13 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function isTerminalRuntimeStatus(status: MockRuntimeAgentStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled';
-}
-
 function pushRuntimeEvent(agent: MockRuntimeAgent, kind: string, message: string | null): void {
   runtimeEvents.push({
     seq: nextRuntimeEventSeq++,
     agent_id: agent.agent_id,
     conversation_id: agent.conversation_id,
     kind,
-    status: agent.status,
+    is_running: agent.is_running,
     timestamp_ms: Date.now(),
     message,
   });
@@ -146,19 +134,19 @@ function pushRuntimeEvent(agent: MockRuntimeAgent, kind: string, message: string
 
 function updateRuntimeAgent(
   agentId: number,
-  status: MockRuntimeAgentStatus,
+  isRunning: boolean,
   summary: string,
   kind: string,
   options?: { lastMessage?: string | null; lastError?: string | null },
 ): void {
   const agent = runtimeAgents.get(agentId);
   if (!agent) return;
-  agent.status = status;
+  agent.is_running = isRunning;
   agent.summary = summary;
   agent.updated_at_ms = Date.now();
   agent.last_message = options?.lastMessage ?? agent.last_message;
-  agent.last_error = options?.lastError ?? (status === 'failed' ? agent.last_error : null);
-  agent.ended_at_ms = isTerminalRuntimeStatus(status) ? Date.now() : null;
+  agent.last_error = options?.lastError ?? agent.last_error;
+  agent.ended_at_ms = isRunning ? null : Date.now();
   pushRuntimeEvent(agent, kind, summary);
 }
 
@@ -450,7 +438,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         parent_agent_id: parentAgentId,
         keep_alive_without_tab: keepAliveWithoutTab,
         name: typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : `Agent ${agentId}`,
-        status: 'queued',
+        is_running: false,
         summary: 'Queued',
         created_at_ms: now,
         updated_at_ms: now,
@@ -463,11 +451,11 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
 
       void (async () => {
         await sleep(20);
-        updateRuntimeAgent(agentId, 'running', 'Running...', 'stream_start');
+        updateRuntimeAgent(agentId, true, 'Running...', 'stream_start');
         if (completionDelayMs === 0) return;
         await sleep(completionDelayMs);
         const finalMessage = `Mock runtime agent response: ${prompt}`;
-        updateRuntimeAgent(agentId, 'completed', finalMessage, 'stream_end', { lastMessage: finalMessage });
+        updateRuntimeAgent(agentId, false, finalMessage, 'typing_stopped', { lastMessage: finalMessage });
       })();
 
       return { agent_id: agentId, conversation_id: conversationId };
@@ -481,11 +469,11 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       const agent = runtimeAgents.get(agentId);
       if (!agent) throw new Error(`Agent ${agentId} not found`);
 
-      updateRuntimeAgent(agentId, 'running', 'Running...', 'typing_started');
+      updateRuntimeAgent(agentId, true, 'Running...', 'typing_started');
       void (async () => {
         await sleep(60);
         const finalMessage = `Mock runtime follow-up: ${message}`;
-        updateRuntimeAgent(agentId, 'completed', finalMessage, 'stream_end', { lastMessage: finalMessage });
+        updateRuntimeAgent(agentId, false, finalMessage, 'typing_stopped', { lastMessage: finalMessage });
       })();
       return null;
     }
@@ -494,7 +482,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       const agentId = Number(args?.agentId);
       if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
       if (!runtimeAgents.has(agentId)) throw new Error(`Agent ${agentId} not found`);
-      updateRuntimeAgent(agentId, 'cancelled', 'Operation cancelled', 'operation_cancelled');
+      updateRuntimeAgent(agentId, false, 'Operation cancelled', 'operation_cancelled');
       return null;
     }
 
@@ -502,7 +490,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       const agentId = Number(args?.agentId);
       if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
       if (!runtimeAgents.has(agentId)) throw new Error(`Agent ${agentId} not found`);
-      updateRuntimeAgent(agentId, 'cancelled', 'Terminated', 'agent_closed');
+      updateRuntimeAgent(agentId, false, 'Terminated', 'agent_closed');
       return null;
     }
 
@@ -519,45 +507,16 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
 
     case 'wait_for_agent': {
       const agentId = Number(args?.agentId);
-      const untilRaw = typeof args?.until === 'string' ? args.until.trim().toLowerCase() : '';
       const timeoutMs = Number.isFinite(Number(args?.timeoutMs))
         ? Math.max(1, Math.min(30 * 60 * 1000, Number(args?.timeoutMs)))
         : 60_000;
       if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
 
-      type WaitUntil = 'idle' | 'terminal' | 'completed' | 'failed' | 'needs_input';
-      const waitUntil: WaitUntil = (() => {
-        if (untilRaw === '' || untilRaw === 'idle') return 'idle';
-        if (untilRaw === 'terminal' || untilRaw === 'done') return 'terminal';
-        if (untilRaw === 'completed' || untilRaw === 'complete') return 'completed';
-        if (untilRaw === 'failed' || untilRaw === 'error') return 'failed';
-        if (
-          untilRaw === 'needs_input'
-          || untilRaw === 'needs-input'
-          || untilRaw === 'waiting_input'
-          || untilRaw === 'waiting-input'
-          || untilRaw === 'input'
-        ) {
-          return 'needs_input';
-        }
-        throw new Error(
-          `Unsupported wait condition '${untilRaw}'. Supported values: idle, terminal, completed, failed, needs_input`,
-        );
-      })();
-
-      const met = (status: MockRuntimeAgentStatus): boolean => {
-        if (waitUntil === 'idle') return status !== 'queued' && status !== 'running';
-        if (waitUntil === 'completed') return status === 'completed';
-        if (waitUntil === 'failed') return status === 'failed';
-        if (waitUntil === 'needs_input') return status === 'waiting_input';
-        return isTerminalRuntimeStatus(status); // terminal
-      };
-
       const deadline = Date.now() + timeoutMs;
       while (Date.now() <= deadline) {
         const agent = runtimeAgents.get(agentId);
         if (!agent) throw new Error(`Agent ${agentId} not found`);
-        if (met(agent.status)) {
+        if (!agent.is_running) {
           return { ...agent, workspace_roots: [...agent.workspace_roots] };
         }
         await sleep(20);

@@ -8,23 +8,6 @@ const MAX_SUMMARY_LEN: usize = 180;
 const MAX_MESSAGE_LEN: usize = 4_000;
 const DEFAULT_EVENT_LOG_LIMIT: usize = 5_000;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStatus {
-    Queued,
-    Running,
-    WaitingInput,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl AgentStatus {
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
     pub agent_id: u64,
@@ -34,7 +17,7 @@ pub struct AgentInfo {
     pub parent_agent_id: Option<u64>,
     pub name: String,
     pub agent_type: Option<String>,
-    pub status: AgentStatus,
+    pub is_running: bool,
     pub summary: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -49,7 +32,7 @@ pub struct AgentEvent {
     pub agent_id: u64,
     pub conversation_id: u64,
     pub kind: String,
-    pub status: AgentStatus,
+    pub is_running: bool,
     pub timestamp_ms: u64,
     pub message: Option<String>,
 }
@@ -164,7 +147,7 @@ impl AgentRuntime {
             parent_agent_id,
             name,
             agent_type: None,
-            status: AgentStatus::Queued,
+            is_running: false,
             summary: "Queued".to_string(),
             created_at_ms: now,
             updated_at_ms: now,
@@ -178,7 +161,7 @@ impl AgentRuntime {
             agent_id,
             conversation_id,
             "agent_spawned",
-            AgentStatus::Queued,
+            false,
             Some("Queued".to_string()),
         );
         info
@@ -191,9 +174,9 @@ impl AgentRuntime {
     }
 
     pub fn mark_agent_running(&mut self, agent_id: u64, summary: Option<String>) -> bool {
-        self.update_status_for_agent(
+        self.update_agent(
             agent_id,
-            AgentStatus::Running,
+            Some(true),
             summary,
             None,
             "agent_running",
@@ -202,9 +185,13 @@ impl AgentRuntime {
     }
 
     pub fn mark_conversation_failed(&mut self, conversation_id: u64, message: String) -> bool {
-        self.update_status_for_conversation(
-            conversation_id,
-            AgentStatus::Failed,
+        let agent_id = match self.conversation_to_agent.get(&conversation_id).copied() {
+            Some(id) => id,
+            None => return false,
+        };
+        self.update_agent(
+            agent_id,
+            Some(false),
             Some(message.clone()),
             Some(message),
             "agent_failed",
@@ -221,20 +208,9 @@ impl AgentRuntime {
             Some(id) => id,
             None => return false,
         };
-
-        let is_terminal = self
-            .agents
-            .get(&agent_id)
-            .map(|agent| agent.status.is_terminal())
-            .unwrap_or(false);
-
-        if is_terminal {
-            return false;
-        }
-
-        self.update_status_for_agent(
+        self.update_agent(
             agent_id,
-            AgentStatus::Cancelled,
+            Some(false),
             Some(message.unwrap_or_else(|| "Conversation closed".to_string())),
             None,
             "agent_closed",
@@ -246,44 +222,22 @@ impl AgentRuntime {
         let Some(kind) = event.get("kind").and_then(Value::as_str) else {
             return false;
         };
-        if !self.conversation_to_agent.contains_key(&conversation_id) {
-            return false;
-        }
+        let agent_id = match self.conversation_to_agent.get(&conversation_id).copied() {
+            Some(id) => id,
+            None => return false,
+        };
 
         match kind {
-            "StreamStart" => self.update_status_for_conversation(
-                conversation_id,
-                AgentStatus::Running,
-                Some("Running...".to_string()),
-                None,
-                "stream_start",
-                None,
-            ),
-            "ToolRequest" => {
-                let tool_name = event
-                    .get("data")
-                    .and_then(|d| d.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
-                if tool_name == "ask_user_question" {
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::WaitingInput,
-                        Some("Waiting for your input".to_string()),
-                        None,
-                        "tool_request_input",
-                        None,
-                    )
-                } else {
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::Running,
-                        Some(format!("Using {tool_name}...")),
-                        None,
-                        "tool_request",
-                        None,
-                    )
-                }
+            "TypingStatusChanged" => {
+                let typing = event.get("data").and_then(Value::as_bool).unwrap_or(false);
+                self.update_agent(
+                    agent_id,
+                    Some(typing),
+                    Some(if typing { "Running...".to_string() } else { "Completed".to_string() }),
+                    None,
+                    if typing { "typing_started" } else { "typing_stopped" },
+                    None,
+                )
             }
             "StreamEnd" => {
                 let message = event
@@ -294,44 +248,23 @@ impl AgentRuntime {
                     .unwrap_or_default();
                 let normalized_message = normalize_message(message);
                 let summary = if normalized_message.is_empty() {
-                    "Completed".to_string()
+                    None
                 } else {
-                    summarize_text(&normalized_message, MAX_SUMMARY_LEN)
+                    Some(summarize_text(&normalized_message, MAX_SUMMARY_LEN))
                 };
-                let has_tool_calls = event
-                    .get("data")
-                    .and_then(|d| d.get("message"))
-                    .and_then(|m| m.get("tool_calls"))
-                    .and_then(Value::as_array)
-                    .map(|calls| !calls.is_empty())
-                    .unwrap_or(false);
-                if has_tool_calls {
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::Running,
-                        Some(summary),
-                        None,
-                        "stream_end_tool_loop",
-                        if normalized_message.is_empty() {
-                            None
-                        } else {
-                            Some(normalized_message)
-                        },
-                    )
+                let last_message = if normalized_message.is_empty() {
+                    None
                 } else {
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::Completed,
-                        Some(summary),
-                        None,
-                        "stream_end",
-                        if normalized_message.is_empty() {
-                            None
-                        } else {
-                            Some(normalized_message)
-                        },
-                    )
-                }
+                    Some(normalized_message)
+                };
+                self.update_agent(
+                    agent_id,
+                    None, // don't touch is_running — TypingStatusChanged is authoritative
+                    summary,
+                    None,
+                    "stream_end",
+                    last_message,
+                )
             }
             "Error" => {
                 let error = event
@@ -339,12 +272,27 @@ impl AgentRuntime {
                     .and_then(Value::as_str)
                     .unwrap_or("Agent failed")
                     .to_string();
-                self.update_status_for_conversation(
-                    conversation_id,
-                    AgentStatus::Failed,
+                self.update_agent(
+                    agent_id,
+                    None,
                     Some(error.clone()),
                     Some(error),
                     "error",
+                    None,
+                )
+            }
+            "ToolRequest" => {
+                let tool_name = event
+                    .get("data")
+                    .and_then(|d| d.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                self.update_agent(
+                    agent_id,
+                    None,
+                    Some(format!("Using {tool_name}...")),
+                    None,
+                    "tool_request",
                     None,
                 )
             }
@@ -355,9 +303,9 @@ impl AgentRuntime {
                     .and_then(Value::as_str)
                     .unwrap_or("Operation cancelled")
                     .to_string();
-                self.update_status_for_conversation(
-                    conversation_id,
-                    AgentStatus::Cancelled,
+                self.update_agent(
+                    agent_id,
+                    None,
                     Some(message),
                     None,
                     "operation_cancelled",
@@ -369,11 +317,10 @@ impl AgentRuntime {
                     .get("data")
                     .and_then(|d| d.get("exit_code"))
                     .and_then(Value::as_i64);
-
                 if code == Some(0) {
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::Completed,
+                    self.update_agent(
+                        agent_id,
+                        Some(false),
                         Some("Completed".to_string()),
                         None,
                         "subprocess_exit_ok",
@@ -384,9 +331,9 @@ impl AgentRuntime {
                         Some(c) => format!("Backend exited ({c})"),
                         None => "Backend exited unexpectedly".to_string(),
                     };
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::Failed,
+                    self.update_agent(
+                        agent_id,
+                        Some(false),
                         Some(message.clone()),
                         Some(message),
                         "subprocess_exit_error",
@@ -394,20 +341,15 @@ impl AgentRuntime {
                     )
                 }
             }
-            "TypingStatusChanged" => {
-                let typing = event.get("data").and_then(Value::as_bool).unwrap_or(false);
-                if typing {
-                    self.update_status_for_conversation(
-                        conversation_id,
-                        AgentStatus::Running,
-                        Some("Running...".to_string()),
-                        None,
-                        "typing_started",
-                        None,
-                    )
-                } else {
-                    false
-                }
+            "StreamStart" => {
+                self.update_agent(
+                    agent_id,
+                    None,
+                    Some("Running...".to_string()),
+                    None,
+                    "stream_start",
+                    None,
+                )
             }
             _ => false,
         }
@@ -435,15 +377,14 @@ impl AgentRuntime {
             .ok_or_else(|| format!("Agent {agent_id} not found"))?
             .clone();
 
-        if !agent.status.is_terminal() {
+        if agent.is_running {
             return Err(format!(
-                "Agent {agent_id} is still {:?}; collect_result requires a terminal state",
-                agent.status
+                "Agent {agent_id} is still running; collect_result requires a stopped agent",
             ));
         }
 
         let final_message = agent.last_message.clone().or_else(|| {
-            if agent.status == AgentStatus::Completed && !agent.summary.trim().is_empty() {
+            if !agent.summary.trim().is_empty() {
                 Some(agent.summary.clone())
             } else {
                 None
@@ -458,33 +399,10 @@ impl AgentRuntime {
         })
     }
 
-    fn update_status_for_conversation(
-        &mut self,
-        conversation_id: u64,
-        status: AgentStatus,
-        summary: Option<String>,
-        last_error: Option<String>,
-        event_kind: &str,
-        last_message: Option<String>,
-    ) -> bool {
-        let agent_id = match self.conversation_to_agent.get(&conversation_id).copied() {
-            Some(id) => id,
-            None => return false,
-        };
-        self.update_status_for_agent(
-            agent_id,
-            status,
-            summary,
-            last_error,
-            event_kind,
-            last_message,
-        )
-    }
-
-    fn update_status_for_agent(
+    fn update_agent(
         &mut self,
         agent_id: u64,
-        status: AgentStatus,
+        is_running: Option<bool>,
         summary: Option<String>,
         last_error: Option<String>,
         event_kind: &str,
@@ -498,27 +416,23 @@ impl AgentRuntime {
                 return false;
             };
 
-            // Once an agent reaches a terminal state, reject non-terminal transitions.
-            // Late events (e.g. TypingStatusChanged) must not revert a finished agent.
-            if agent.status.is_terminal() && !status.is_terminal() {
-                return false;
-            }
-
-            if agent.status != status {
-                changed = true;
-            }
-            agent.status = status.clone();
-            agent.updated_at_ms = now;
-
-            if status.is_terminal() {
-                if agent.ended_at_ms.is_none() {
+            if let Some(running) = is_running {
+                if agent.is_running != running {
+                    agent.is_running = running;
                     changed = true;
                 }
-                agent.ended_at_ms = Some(now);
-            } else if agent.ended_at_ms.is_some() {
-                changed = true;
-                agent.ended_at_ms = None;
+                if !running {
+                    if agent.ended_at_ms.is_none() {
+                        changed = true;
+                    }
+                    agent.ended_at_ms = Some(now);
+                } else if agent.ended_at_ms.is_some() {
+                    changed = true;
+                    agent.ended_at_ms = None;
+                }
             }
+
+            agent.updated_at_ms = now;
 
             if let Some(summary_value) = summary {
                 let normalized = summarize_text(&summary_value, MAX_SUMMARY_LEN);
@@ -528,17 +442,12 @@ impl AgentRuntime {
                 }
             }
 
-            if status == AgentStatus::Failed {
-                if let Some(err) = last_error {
-                    let normalized = summarize_text(&err, MAX_MESSAGE_LEN);
-                    if agent.last_error.as_deref() != Some(normalized.as_str()) {
-                        agent.last_error = Some(normalized);
-                        changed = true;
-                    }
+            if let Some(err) = last_error {
+                let normalized = summarize_text(&err, MAX_MESSAGE_LEN);
+                if agent.last_error.as_deref() != Some(normalized.as_str()) {
+                    agent.last_error = Some(normalized);
+                    changed = true;
                 }
-            } else if agent.last_error.is_some() {
-                changed = true;
-                agent.last_error = None;
             }
 
             if let Some(msg) = last_message {
@@ -556,7 +465,7 @@ impl AgentRuntime {
 
             (
                 agent.conversation_id,
-                agent.status.clone(),
+                agent.is_running,
                 if agent.summary.is_empty() {
                     None
                 } else {
@@ -565,12 +474,12 @@ impl AgentRuntime {
             )
         };
 
-        let (conversation_id, current_status, message) = event_payload;
+        let (conversation_id, running, message) = event_payload;
         self.push_event(
             agent_id,
             conversation_id,
             event_kind,
-            current_status,
+            running,
             message,
         );
 
@@ -582,7 +491,7 @@ impl AgentRuntime {
         agent_id: u64,
         conversation_id: u64,
         kind: &str,
-        status: AgentStatus,
+        is_running: bool,
         message: Option<String>,
     ) {
         let event = AgentEvent {
@@ -590,7 +499,7 @@ impl AgentRuntime {
             agent_id,
             conversation_id,
             kind: kind.to_string(),
-            status,
+            is_running,
             timestamp_ms: now_ms(),
             message,
         };
@@ -638,7 +547,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_runtime_with_completed_agent() -> (AgentRuntime, u64) {
+    fn make_runtime_with_stopped_agent() -> (AgentRuntime, u64) {
         let mut rt = AgentRuntime::new();
         let info = rt.register_agent(
             100,
@@ -649,74 +558,58 @@ mod tests {
         );
         let agent_id = info.agent_id;
 
-        // Drive agent to Completed via StreamEnd
+        // Start typing, then stop
+        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
         rt.record_chat_event(
             100,
-            &json!({
-                "kind": "StreamStart",
-                "data": {}
-            }),
+            &json!({ "kind": "StreamEnd", "data": { "message": { "content": "Done with the task" } } }),
         );
-        rt.record_chat_event(
-            100,
-            &json!({
-                "kind": "StreamEnd",
-                "data": { "message": { "content": "Done with the task" } }
-            }),
-        );
+        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": false }));
 
-        assert_eq!(
-            rt.get_agent(agent_id).unwrap().status,
-            AgentStatus::Completed
-        );
+        assert!(!rt.get_agent(agent_id).unwrap().is_running);
         (rt, agent_id)
     }
 
     #[test]
-    fn terminal_state_rejects_non_terminal_transition() {
-        let (mut rt, agent_id) = make_runtime_with_completed_agent();
+    fn typing_status_controls_is_running() {
+        let mut rt = AgentRuntime::new();
+        let info = rt.register_agent(100, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        assert!(!rt.get_agent(info.agent_id).unwrap().is_running);
 
-        // A late TypingStatusChanged(true) must NOT revert Completed -> Running
-        let changed = rt.record_chat_event(
-            100,
-            &json!({
-                "kind": "TypingStatusChanged",
-                "data": true
-            }),
-        );
-        assert!(!changed);
+        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
+        assert!(rt.get_agent(info.agent_id).unwrap().is_running);
 
-        let agent = rt.get_agent(agent_id).unwrap();
-        assert_eq!(agent.status, AgentStatus::Completed);
+        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": false }));
+        let agent = rt.get_agent(info.agent_id).unwrap();
+        assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
     }
 
     #[test]
-    fn terminal_state_preserves_last_message() {
-        let (mut rt, agent_id) = make_runtime_with_completed_agent();
+    fn stream_end_updates_summary_and_message_not_is_running() {
+        let mut rt = AgentRuntime::new();
+        let info = rt.register_agent(100, vec!["/tmp".into()], "tycode".into(), None, "test".into());
 
-        // StreamStart after completion must be rejected
-        let changed = rt.record_chat_event(
+        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
+        rt.record_chat_event(
             100,
-            &json!({
-                "kind": "StreamStart",
-                "data": {}
-            }),
+            &json!({ "kind": "StreamEnd", "data": { "message": { "content": "Done with the task" } } }),
         );
-        assert!(!changed);
 
-        let agent = rt.get_agent(agent_id).unwrap();
+        let agent = rt.get_agent(info.agent_id).unwrap();
+        // StreamEnd should NOT stop the agent — only TypingStatusChanged does that
+        assert!(agent.is_running);
         assert_eq!(agent.last_message.as_deref(), Some("Done with the task"));
     }
 
     #[test]
-    fn collect_result_succeeds_for_terminal_agent() {
-        let (rt, agent_id) = make_runtime_with_completed_agent();
+    fn collect_result_succeeds_for_stopped_agent() {
+        let (rt, agent_id) = make_runtime_with_stopped_agent();
 
         let result = rt.collect_result(agent_id);
         assert!(result.is_ok());
         let collected = result.unwrap();
-        assert_eq!(collected.agent.status, AgentStatus::Completed);
+        assert!(!collected.agent.is_running);
         assert_eq!(
             collected.final_message.as_deref(),
             Some("Done with the task")
@@ -726,18 +619,12 @@ mod tests {
     #[test]
     fn collect_result_errors_for_running_agent() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(
-            200,
-            vec!["/tmp".into()],
-            "tycode".into(),
-            None,
-            "test".into(),
-        );
+        let info = rt.register_agent(200, vec!["/tmp".into()], "tycode".into(), None, "test".into());
         rt.mark_agent_running(info.agent_id, Some("Running...".into()));
 
         let result = rt.collect_result(info.agent_id);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Running"));
+        assert!(result.unwrap_err().contains("still running"));
     }
 
     #[test]
@@ -749,162 +636,67 @@ mod tests {
     }
 
     #[test]
-    fn failed_agent_preserves_error_after_late_events() {
+    fn error_event_sets_last_error() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(
-            300,
-            vec!["/tmp".into()],
-            "tycode".into(),
-            None,
-            "test".into(),
-        );
+        let info = rt.register_agent(300, vec!["/tmp".into()], "tycode".into(), None, "test".into());
 
-        rt.record_chat_event(
-            300,
-            &json!({
-                "kind": "Error",
-                "data": "Something went wrong"
-            }),
-        );
-
-        // Late typing event must not clear the error
-        rt.record_chat_event(
-            300,
-            &json!({
-                "kind": "TypingStatusChanged",
-                "data": true
-            }),
-        );
+        rt.record_chat_event(300, &json!({ "kind": "TypingStatusChanged", "data": true }));
+        rt.record_chat_event(300, &json!({ "kind": "Error", "data": "Something went wrong" }));
 
         let agent = rt.get_agent(info.agent_id).unwrap();
-        assert_eq!(agent.status, AgentStatus::Failed);
         assert!(agent.last_error.is_some());
+        // Error doesn't change is_running — TypingStatusChanged does
+        assert!(agent.is_running);
+    }
+
+    #[test]
+    fn subprocess_exit_stops_agent() {
+        let mut rt = AgentRuntime::new();
+        let info = rt.register_agent(400, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+
+        rt.record_chat_event(400, &json!({ "kind": "TypingStatusChanged", "data": true }));
+        rt.record_chat_event(400, &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }));
+
+        let agent = rt.get_agent(info.agent_id).unwrap();
+        assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
     }
 
     #[test]
-    fn normal_transitions_still_work() {
+    fn subprocess_exit_error_sets_last_error() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(
-            400,
-            vec!["/tmp".into()],
-            "tycode".into(),
-            None,
-            "test".into(),
-        );
-        assert_eq!(
-            rt.get_agent(info.agent_id).unwrap().status,
-            AgentStatus::Queued
-        );
+        let info = rt.register_agent(500, vec!["/tmp".into()], "tycode".into(), None, "test".into());
 
-        rt.mark_agent_running(info.agent_id, Some("Running...".into()));
-        assert_eq!(
-            rt.get_agent(info.agent_id).unwrap().status,
-            AgentStatus::Running
-        );
+        rt.record_chat_event(500, &json!({ "kind": "TypingStatusChanged", "data": true }));
+        rt.record_chat_event(500, &json!({ "kind": "SubprocessExit", "data": { "exit_code": 1 } }));
 
-        // ToolRequest with ask_user_question -> WaitingInput
-        rt.record_chat_event(
-            400,
-            &json!({
-                "kind": "ToolRequest",
-                "data": { "tool_name": "ask_user_question" }
-            }),
-        );
-        assert_eq!(
-            rt.get_agent(info.agent_id).unwrap().status,
-            AgentStatus::WaitingInput
-        );
-
-        // Back to Running via StreamStart
-        rt.record_chat_event(
-            400,
-            &json!({
-                "kind": "StreamStart",
-                "data": {}
-            }),
-        );
-        assert_eq!(
-            rt.get_agent(info.agent_id).unwrap().status,
-            AgentStatus::Running
-        );
-    }
-
-    #[test]
-    fn stream_end_with_tool_calls_keeps_agent_running() {
-        let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(
-            450,
-            vec!["/tmp".into()],
-            "claude".into(),
-            None,
-            "tool-loop".into(),
-        );
-
-        rt.record_chat_event(
-            450,
-            &json!({
-                "kind": "StreamStart",
-                "data": {}
-            }),
-        );
-        rt.record_chat_event(
-            450,
-            &json!({
-                "kind": "StreamEnd",
-                "data": {
-                    "message": {
-                        "content": "Using tools...",
-                        "tool_calls": [{ "id": "toolu_1", "name": "Task", "arguments": {} }]
-                    }
-                }
-            }),
-        );
-
-        let after_loop = rt.get_agent(info.agent_id).unwrap();
-        assert_eq!(after_loop.status, AgentStatus::Running);
-        assert!(after_loop.ended_at_ms.is_none());
-
-        rt.record_chat_event(
-            450,
-            &json!({
-                "kind": "StreamEnd",
-                "data": {
-                    "message": {
-                        "content": "Final answer",
-                        "tool_calls": []
-                    }
-                }
-            }),
-        );
-        let completed = rt.get_agent(info.agent_id).unwrap();
-        assert_eq!(completed.status, AgentStatus::Completed);
-        assert!(completed.ended_at_ms.is_some());
+        let agent = rt.get_agent(info.agent_id).unwrap();
+        assert!(!agent.is_running);
+        assert!(agent.last_error.is_some());
     }
 
     #[test]
     fn collect_result_falls_back_to_summary_when_no_last_message() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(
-            500,
-            vec!["/tmp".into()],
-            "tycode".into(),
-            None,
-            "test".into(),
-        );
+        let info = rt.register_agent(600, vec!["/tmp".into()], "tycode".into(), None, "test".into());
 
-        // Complete via SubprocessExit(0) which sets no last_message
-        rt.record_chat_event(
-            500,
-            &json!({
-                "kind": "SubprocessExit",
-                "data": { "exit_code": 0 }
-            }),
-        );
+        rt.record_chat_event(600, &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }));
 
         let result = rt.collect_result(info.agent_id).unwrap();
-        assert_eq!(result.agent.status, AgentStatus::Completed);
-        // Falls back to summary since last_message is None
         assert_eq!(result.final_message.as_deref(), Some("Completed"));
+    }
+
+    #[test]
+    fn mark_conversation_closed_stops_agent() {
+        let mut rt = AgentRuntime::new();
+        let info = rt.register_agent(700, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        rt.mark_agent_running(info.agent_id, Some("Running...".into()));
+
+        let changed = rt.mark_conversation_closed(700, Some("Terminated".to_string()));
+        assert!(changed);
+
+        let agent = rt.get_agent(info.agent_id).unwrap();
+        assert!(!agent.is_running);
+        assert!(agent.ended_at_ms.is_some());
     }
 }

@@ -99,7 +99,7 @@ struct SendAgentMessageToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct AwaitAgentsToolInput {
-    /// Agent IDs to watch. If omitted, watches all non-terminal agents.
+    /// Agent IDs to watch. If omitted, watches all running agents.
     agent_ids: Option<Vec<u64>>,
     /// Idle timeout in milliseconds. Resets on agent activity. Defaults to 60s.
     timeout_ms: Option<u64>,
@@ -171,7 +171,7 @@ impl TydeAgentMcpServer {
     }
 
     #[tool(
-        description = "Spawn a Tyde agent and block until it finishes or needs input. Returns the agent's final message, status, and any error. This is the simplest way to run an agent — one call does everything."
+        description = "Spawn a Tyde agent and block until it finishes. Returns the agent's final message and any error. This is the simplest way to run an agent — one call does everything."
     )]
     async fn tyde_run_agent(
         &self,
@@ -198,7 +198,7 @@ impl TydeAgentMcpServer {
     }
 
     #[tool(
-        description = "Block until one or more agents become idle (completed, failed, needs_input, or cancelled). Returns the idle agents with their messages and a list of still-running agent IDs. If agent_ids is omitted, watches all non-terminal agents. Use this after spawning multiple agents with tyde_spawn_agent to wait for any of them to finish — like epoll."
+        description = "Block until one or more agents stop running. Returns the stopped agents with their messages and a list of still-running agent IDs. If agent_ids is omitted, watches all running agents. Use this after spawning multiple agents with tyde_spawn_agent to wait for any of them to finish — like epoll."
     )]
     async fn tyde_await_agent(
         &self,
@@ -232,7 +232,7 @@ impl TydeAgentMcpServer {
     }
 
     #[tool(
-        description = "Cancel a running Tyde agent. Interrupts it and shuts down its subprocess. Returns the agent's final status."
+        description = "Cancel a running Tyde agent. Interrupts it and shuts down its subprocess. Returns the agent's final message."
     )]
     async fn tyde_cancel_agent(
         &self,
@@ -249,7 +249,7 @@ impl TydeAgentMcpServer {
     }
 
     #[tool(
-        description = "List all Tyde agents with their current status, last message, and metadata."
+        description = "List all Tyde agents with their running state, last message, and metadata."
     )]
     async fn tyde_list_agents(&self) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
