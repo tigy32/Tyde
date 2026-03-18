@@ -4,6 +4,7 @@ import type {
   AdminEventPayload,
   ChatEventPayload,
   ConversationRegisteredPayload,
+  CreateWorkbenchRequestPayload,
   McpHttpServerSettings,
   RuntimeAgent,
 } from "./bridge";
@@ -18,7 +19,9 @@ import {
   listAgents,
   onAdminEvent,
   onChatEvent,
+  onCreateWorkbenchRequest,
   openWorkspaceDialog,
+  submitCreateWorkbenchResponse,
   terminateAgent,
 } from "./bridge";
 import { CommandPalette } from "./command_palette";
@@ -90,6 +93,9 @@ export class AppController {
     );
     await onAdminEvent((payload) => this.routeAdminEvent(payload));
     await registerDebugUiBridge();
+    await onCreateWorkbenchRequest((payload) => {
+      void this.handleCreateWorkbenchRequest(payload);
+    });
     document
       .getElementById("open-workspace-btn")!
       .addEventListener("click", () => this.openWorkspace());
@@ -887,6 +893,34 @@ export class AppController {
       "git-worktree",
     );
     this.switchToWorkspace(project.id);
+  }
+
+  private async handleCreateWorkbenchRequest(
+    payload: CreateWorkbenchRequestPayload,
+  ): Promise<void> {
+    const parent = this.projectState.projects.find(
+      (p) => p.workspacePath === payload.parent_workspace_path,
+    );
+    if (!parent) {
+      await submitCreateWorkbenchResponse(
+        payload.request_id,
+        false,
+        undefined,
+        `No project found for workspace path: ${payload.parent_workspace_path}`,
+      );
+      return;
+    }
+    const project = this.projectState.addWorkbench(
+      parent.id,
+      payload.worktree_path,
+      payload.branch,
+      "git-worktree",
+    );
+    await submitCreateWorkbenchResponse(
+      payload.request_id,
+      true,
+      project.workspacePath,
+    );
   }
 
   private async removeWorkbench(projectId: string): Promise<void> {

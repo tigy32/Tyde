@@ -338,6 +338,10 @@ pub(crate) struct AppState {
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
+    create_workbench_pending:
+        SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>>>,
+    create_workbench_request_seq: AtomicU64,
+    default_backend: SyncMutex<String>,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
     dev_instance: SyncMutex<Option<dev_instance::DevInstance>>,
@@ -357,6 +361,12 @@ struct AppSettings {
     driver_mcp_http_enabled: bool,
     #[serde(default = "default_driver_mcp_http_autoload")]
     driver_mcp_http_autoload: bool,
+    #[serde(default = "default_backend")]
+    default_backend: String,
+}
+
+fn default_backend() -> String {
+    "tycode".to_string()
 }
 
 fn default_mcp_http_enabled() -> bool {
@@ -377,6 +387,7 @@ impl Default for AppSettings {
             mcp_http_enabled: default_mcp_http_enabled(),
             driver_mcp_http_enabled: default_driver_mcp_http_enabled(),
             driver_mcp_http_autoload: default_driver_mcp_http_autoload(),
+            default_backend: default_backend(),
         }
     }
 }
@@ -498,6 +509,14 @@ struct DebugUiRequestPayload {
     request_id: String,
     action: String,
     params: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateWorkbenchRequestPayload {
+    request_id: String,
+    parent_workspace_path: String,
+    branch: String,
+    worktree_path: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -714,9 +733,6 @@ fn load_app_settings() -> AppSettings {
     };
 
     // Allow env vars to override settings (used by dev instances spawned from the host).
-    if let Ok(val) = std::env::var("TYDE_MCP_HTTP_ENABLED") {
-        settings.mcp_http_enabled = val == "true" || val == "1";
-    }
     if let Ok(val) = std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED") {
         settings.driver_mcp_http_enabled = val == "true" || val == "1";
     }
@@ -745,6 +761,7 @@ fn app_settings_from_state(state: &AppState) -> AppSettings {
         mcp_http_enabled: *state.mcp_http_enabled.lock(),
         driver_mcp_http_enabled: *state.driver_mcp_http_enabled.lock(),
         driver_mcp_http_autoload: *state.driver_mcp_http_autoload.lock(),
+        default_backend: state.default_backend.lock().clone(),
     }
 }
 
@@ -1023,6 +1040,59 @@ pub(crate) async fn debug_ui_action_internal(
     }
 }
 
+pub(crate) async fn create_workbench_internal(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    parent_workspace_path: String,
+    branch: String,
+) -> Result<String, String> {
+    let worktree_path = format!("{parent_workspace_path}--{branch}");
+
+    git_service::git_worktree_add(&parent_workspace_path, &worktree_path, &branch).await?;
+
+    let request_id = format!(
+        "cwb-{}",
+        state
+            .create_workbench_request_seq
+            .fetch_add(1, Ordering::Relaxed)
+    );
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    {
+        let mut pending = state.create_workbench_pending.lock();
+        pending.insert(request_id.clone(), tx);
+    }
+
+    let payload = CreateWorkbenchRequestPayload {
+        request_id: request_id.clone(),
+        parent_workspace_path,
+        branch,
+        worktree_path,
+    };
+
+    if let Err(err) = app.emit("tyde-create-workbench-request", &payload) {
+        state
+            .create_workbench_pending
+            .lock()
+            .remove(&request_id);
+        return Err(format!(
+            "Failed to emit create workbench request: {err:?}"
+        ));
+    }
+
+    match tokio::time::timeout(Duration::from_millis(30_000), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Create workbench response channel closed".to_string()),
+        Err(_) => {
+            state
+                .create_workbench_pending
+                .lock()
+                .remove(&request_id);
+            Err("Create workbench request timed out".to_string())
+        }
+    }
+}
+
 fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id
@@ -1030,14 +1100,16 @@ fn is_valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn configured_backend_kind() -> BackendKind {
-    BackendKind::Tycode
-}
-
-fn resolve_requested_backend_kind(backend_kind: Option<String>) -> Result<BackendKind, String> {
+fn resolve_requested_backend_kind(
+    state: &AppState,
+    backend_kind: Option<String>,
+) -> Result<BackendKind, String> {
     match backend_kind {
         Some(raw) if !raw.trim().is_empty() => raw.parse::<BackendKind>(),
-        _ => Ok(configured_backend_kind()),
+        _ => {
+            let stored = state.default_backend.lock();
+            Ok(stored.parse::<BackendKind>().unwrap_or(BackendKind::Tycode))
+        }
     }
 }
 
@@ -1271,7 +1343,7 @@ async fn create_conversation(
     ephemeral: Option<bool>,
     conversation_mode: Option<String>,
 ) -> Result<u64, String> {
-    let backend_kind = resolve_requested_backend_kind(backend_kind)?;
+    let backend_kind = resolve_requested_backend_kind(&state, backend_kind)?;
     let ephemeral = ephemeral.unwrap_or(false);
     let include_agent_control = matches!(
         conversation_mode
@@ -1561,7 +1633,7 @@ pub(crate) async fn spawn_agent_internal(
         }
     }
 
-    let backend_kind = resolve_requested_backend_kind(backend_kind)?;
+    let backend_kind = resolve_requested_backend_kind(state, backend_kind)?;
     {
         let disabled = state.disabled_backends.lock();
         if disabled.contains(backend_kind.as_str()) {
@@ -2374,6 +2446,19 @@ fn set_driver_mcp_http_server_autoload_enabled(
 }
 
 #[tauri::command]
+fn set_default_backend(
+    state: tauri::State<'_, AppState>,
+    backend: String,
+) -> Result<(), String> {
+    // Validate that the backend kind is known.
+    backend
+        .parse::<BackendKind>()
+        .map_err(|e| format!("Invalid backend kind: {e}"))?;
+    *state.default_backend.lock() = backend;
+    save_app_settings(&app_settings_from_state(&state))
+}
+
+#[tauri::command]
 fn submit_debug_ui_response(
     state: tauri::State<'_, AppState>,
     request_id: String,
@@ -2403,6 +2488,29 @@ fn submit_debug_ui_response(
         }),
     );
 
+    if let Some(tx) = sender {
+        let _ = tx.send(response);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn submit_create_workbench_response(
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+    ok: bool,
+    workspace_path: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    let sender = {
+        let mut pending = state.create_workbench_pending.lock();
+        pending.remove(&request_id)
+    };
+    let response = if ok {
+        Ok(workspace_path.unwrap_or_default())
+    } else {
+        Err(error.unwrap_or_else(|| "Create workbench failed".to_string()))
+    };
     if let Some(tx) = sender {
         let _ = tx.send(response);
     }
@@ -2606,7 +2714,7 @@ async fn create_admin_subprocess(
     workspace_roots: Vec<String>,
     backend_kind: Option<String>,
 ) -> Result<u64, String> {
-    let backend_kind = resolve_requested_backend_kind(backend_kind)?;
+    let backend_kind = resolve_requested_backend_kind(&state, backend_kind)?;
     let path = resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
     let (session, rx) = BackendSession::spawn_admin(backend_kind, &path, &workspace_roots).await?;
 
@@ -3156,9 +3264,12 @@ pub fn run() {
             mcp_http_enabled: SyncMutex::new(app_settings.mcp_http_enabled),
             driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
             driver_mcp_http_autoload: SyncMutex::new(app_settings.driver_mcp_http_autoload),
+            default_backend: SyncMutex::new(app_settings.default_backend),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
+            create_workbench_pending: SyncMutex::new(HashMap::new()),
+            create_workbench_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),
@@ -3225,7 +3336,9 @@ pub fn run() {
             get_driver_mcp_http_server_settings,
             set_driver_mcp_http_server_enabled,
             set_driver_mcp_http_server_autoload_enabled,
+            set_default_backend,
             submit_debug_ui_response,
+            submit_create_workbench_response,
             get_settings,
             list_models,
             list_sessions,
@@ -3348,9 +3461,12 @@ mod tests {
             mcp_http_enabled: SyncMutex::new(true),
             driver_mcp_http_enabled: SyncMutex::new(false),
             driver_mcp_http_autoload: SyncMutex::new(false),
+            default_backend: SyncMutex::new("tycode".to_string()),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
+            create_workbench_pending: SyncMutex::new(HashMap::new()),
+            create_workbench_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),

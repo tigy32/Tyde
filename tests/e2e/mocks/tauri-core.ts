@@ -623,6 +623,12 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
     case 'submit_debug_ui_response':
       return null;
 
+    case 'submit_create_workbench_response':
+      return null;
+
+    case 'set_default_backend':
+      return null;
+
     case 'create_terminal': {
       const workspacePath = typeof args?.workspacePath === 'string' ? args.workspacePath : '';
       const id = nextTerminalId++;

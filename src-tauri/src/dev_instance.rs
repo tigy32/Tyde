@@ -211,8 +211,8 @@ pub(crate) async fn start_dev_instance(
     }
 
     // Find available ports by binding to :0 and reading the assigned ports.
-    // We need two: one for the debug MCP server, one for Vite (to avoid
-    // colliding with the host's Vite on 5173).
+    // We need three: debug MCP, agent control MCP, and Vite (to avoid
+    // colliding with the host's ports).
     let find_free_port = || -> Result<u16, String> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .map_err(|e| format!("Failed to find available port: {e}"))?;
@@ -223,6 +223,7 @@ pub(crate) async fn start_dev_instance(
         Ok(port)
     };
     let debug_mcp_port = find_free_port()?;
+    let agent_mcp_port = find_free_port()?;
     let vite_port = find_free_port()?;
 
     let debug_mcp_url = format!("http://127.0.0.1:{debug_mcp_port}/mcp");
@@ -237,8 +238,9 @@ pub(crate) async fn start_dev_instance(
     // - TYDE_VITE_PORT: Vite dev server port (read by vite.config.ts)
     // - TYDE_DEBUG_MCP_HTTP_BIND_ADDR: debug MCP server bind address
     // - TYDE_DEBUG_MCP_HTTP_ENABLED: enable debug MCP in the child
-    // - TYDE_MCP_HTTP_ENABLED=false: disable agent control MCP (recursion prevention)
-    // - TYDE_DRIVER_MCP_HTTP_ENABLED=false: disable driver MCP (recursion prevention)
+    // - TYDE_AGENT_MCP_HTTP_BIND_ADDR: agent control MCP on ephemeral port
+    //   (avoids collision with the host)
+    // - TYDE_DRIVER_MCP_HTTP_ENABLED=false: disable driver MCP (not needed in dev)
     let mut cmd = tokio::process::Command::new("npx");
     cmd.args(["tauri", "dev", "--config", &tauri_config_override])
         .current_dir(&project_dir)
@@ -248,7 +250,10 @@ pub(crate) async fn start_dev_instance(
             format!("127.0.0.1:{debug_mcp_port}"),
         )
         .env("TYDE_DEBUG_MCP_HTTP_ENABLED", "true")
-        .env("TYDE_MCP_HTTP_ENABLED", "false")
+        .env(
+            "TYDE_AGENT_MCP_HTTP_BIND_ADDR",
+            format!("127.0.0.1:{agent_mcp_port}"),
+        )
         .env("TYDE_DRIVER_MCP_HTTP_ENABLED", "false");
     if let Some(ref ws) = workspace_path {
         cmd.env("TYDE_OPEN_WORKSPACE", ws);
