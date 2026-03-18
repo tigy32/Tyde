@@ -526,6 +526,36 @@ export function addRecentWorkspace(path: string): void {
   }
 }
 
+export interface BackendUsageWindow {
+  id: string;
+  label: string;
+  used_percent: number | null;
+  reset_at_text: string | null;
+  reset_at_unix: number | null;
+  window_minutes: number | null;
+}
+
+export interface BackendUsageResult {
+  backend_kind: BackendKind;
+  source: string;
+  captured_at_ms: number;
+  plan: string | null;
+  status: string | null;
+  windows: BackendUsageWindow[];
+  details: string[];
+}
+
+export function queryBackendUsage(
+  backendKind: BackendKind,
+): Promise<BackendUsageResult> {
+  return invoke<BackendUsageResult>("query_backend_usage", {
+    backendKind,
+  }).catch((err) => {
+    console.error("bridge: queryBackendUsage failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
 export async function openWorkspaceDialog(): Promise<string | null> {
   try {
     const selected = await open({

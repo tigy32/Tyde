@@ -7,12 +7,15 @@ import {
   type BackendDependencyStatus,
   type BackendDepResult,
   type BackendKind,
+  type BackendUsageResult,
+  type BackendUsageWindow,
   checkBackendDependencies as checkBackendDependenciesBridge,
   type DriverMcpHttpServerSettings,
   getDriverMcpHttpServerSettings as getDriverMcpHttpServerSettingsBridge,
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
   installBackendDependency as installBackendDependencyBridge,
   type McpHttpServerSettings,
+  queryBackendUsage as queryBackendUsageBridge,
   setDisabledBackends as setDisabledBackendsBridge,
   setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
   setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
@@ -173,6 +176,8 @@ export function setDefaultSpawnProfile(profileName: string | null): void {
 
 const ENABLED_BACKENDS_STORAGE_KEY = "tyde-enabled-backends";
 const ALL_BACKENDS: BackendKind[] = ["tycode", "codex", "claude", "kiro"];
+type UsageAwareBackendKind = Exclude<BackendKind, "tycode" | "claude">;
+const USAGE_AWARE_BACKENDS: UsageAwareBackendKind[] = ["codex", "kiro"];
 
 let cachedDependencyStatus: Record<BackendKind, BackendDepResult> | null = null;
 
@@ -474,6 +479,11 @@ export class SettingsPanel {
   > | null = null;
   private installingBackends: Set<BackendKind> = new Set();
   private backendInstallError: Map<BackendKind, string> = new Map();
+  private backendUsage: Partial<
+    Record<UsageAwareBackendKind, BackendUsageResult>
+  > = {};
+  private backendUsageLoading: Set<UsageAwareBackendKind> = new Set();
+  private backendUsageError: Map<UsageAwareBackendKind, string> = new Map();
   private _adminId: number | null = null;
 
   get adminId(): number | null {
@@ -1137,6 +1147,261 @@ export class SettingsPanel {
       this.setActiveSegment(outputControl, getToolOutputMode());
   }
 
+  private refreshBackendUsage(force = false): void {
+    for (const kind of USAGE_AWARE_BACKENDS) {
+      this.refreshSingleBackendUsage(kind, force);
+    }
+  }
+
+  private refreshSingleBackendUsage(
+    kind: UsageAwareBackendKind,
+    force = false,
+  ): void {
+    if (!this.backendDependencyStatus) return;
+    if (this.isUsageBackendMissing(kind)) {
+      delete this.backendUsage[kind];
+      this.backendUsageError.delete(kind);
+      this.backendUsageLoading.delete(kind);
+      return;
+    }
+
+    if (this.backendUsageLoading.has(kind)) return;
+    if (!force && this.backendUsage[kind]) return;
+
+    this.backendUsageLoading.add(kind);
+    this.backendUsageError.delete(kind);
+    if (this.activeTab === "backends") {
+      this.rerenderPanelContent("backends", () => this.buildBackendsContent());
+    }
+
+    queryBackendUsageBridge(kind)
+      .then((usage) => {
+        this.backendUsage[kind] = usage;
+        this.backendUsageError.delete(kind);
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        delete this.backendUsage[kind];
+        this.backendUsageError.set(kind, message);
+        console.error(`Failed to query usage for backend "${kind}":`, err);
+      })
+      .finally(() => {
+        this.backendUsageLoading.delete(kind);
+        if (this.activeTab === "backends") {
+          this.rerenderPanelContent("backends", () =>
+            this.buildBackendsContent(),
+          );
+        }
+      });
+  }
+
+  private isUsageBackendMissing(kind: UsageAwareBackendKind): boolean {
+    const dep = this.backendDependencyStatus?.[kind];
+    return dep !== undefined && !dep.available;
+  }
+
+  private buildBackendUsageSection(kind: BackendKind): HTMLElement | null {
+    if (kind === "tycode") return null;
+    if (kind === "claude") return this.buildClaudeUsageNoticeSection();
+    const usageKind = kind as UsageAwareBackendKind;
+    if (this.isUsageBackendMissing(usageKind)) return null;
+
+    const section = el("div", { class: "settings-backend-usage" });
+    const header = el("div", { class: "settings-backend-usage-header" });
+    header.appendChild(
+      el("span", { class: "settings-backend-usage-title" }, "Usage"),
+    );
+    section.appendChild(header);
+
+    const usage = this.backendUsage[usageKind];
+    if (usage?.plan || usage?.status) {
+      const parts: string[] = [];
+      if (usage.plan) parts.push(`Plan: ${usage.plan}`);
+      if (usage.status) parts.push(`Status: ${usage.status}`);
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-usage-meta" },
+          parts.join(" | "),
+        ),
+      );
+    }
+
+    const windows = usage?.windows ?? [];
+    if (windows.length > 0) {
+      for (const window of windows) {
+        section.appendChild(this.buildBackendUsageWindow(window));
+      }
+    } else if (this.backendUsageLoading.has(usageKind)) {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-usage-meta" },
+          "Loading usage limits...",
+        ),
+      );
+    } else if (usage) {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-usage-meta" },
+          "No usage limits reported.",
+        ),
+      );
+    } else {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-usage-meta" },
+          "Click Refresh usage to load usage limits.",
+        ),
+      );
+    }
+
+    if (usage?.details?.length) {
+      for (const detail of usage.details) {
+        section.appendChild(
+          el(
+            "p",
+            { class: "settings-description settings-usage-meta" },
+            detail,
+          ),
+        );
+      }
+    }
+
+    if (this.backendUsageLoading.has(usageKind) && usage) {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-usage-meta" },
+          "Refreshing usage...",
+        ),
+      );
+    }
+
+    const error = this.backendUsageError.get(usageKind);
+    if (error) {
+      section.appendChild(
+        el("p", { class: "settings-description settings-usage-error" }, error),
+      );
+    }
+
+    return section;
+  }
+
+  private buildClaudeUsageNoticeSection(): HTMLElement {
+    const section = el("div", { class: "settings-backend-usage" });
+    const header = el("div", { class: "settings-backend-usage-header" });
+    header.appendChild(
+      el("span", { class: "settings-backend-usage-title" }, "Usage"),
+    );
+    section.appendChild(header);
+
+    const usageLink = el(
+      "a",
+      {
+        class: "settings-usage-link",
+        href: "https://claude.ai/settings/usage",
+        target: "_blank",
+        rel: "noopener noreferrer",
+      },
+      "View Claude usage",
+    );
+    section.appendChild(usageLink);
+
+    const issueText = el("p", {
+      class: "settings-description settings-usage-meta settings-usage-note",
+    });
+    issueText.append(
+      "Claude Code does not programmatically expose usage limits yet. ",
+    );
+    const issueLink = el(
+      "a",
+      {
+        class: "settings-usage-link",
+        href: "https://github.com/anthropics/claude-code/issues/13585",
+        target: "_blank",
+        rel: "noopener noreferrer",
+      },
+      "Tracking issue",
+    );
+    issueText.appendChild(issueLink);
+    section.appendChild(issueText);
+
+    return section;
+  }
+
+  private buildBackendUsageWindow(window: BackendUsageWindow): HTMLElement {
+    const row = el("div", { class: "settings-usage-row" });
+    const header = el("div", { class: "settings-usage-row-header" });
+    header.appendChild(
+      el("span", { class: "settings-usage-label" }, window.label || "Usage"),
+    );
+    header.appendChild(
+      el(
+        "span",
+        { class: "settings-usage-value" },
+        this.formatUsagePercent(window.used_percent),
+      ),
+    );
+    row.appendChild(header);
+
+    const bar = el("div", { class: "settings-usage-bar" });
+    const fill = el("div", { class: "settings-usage-bar-fill" });
+    const width = this.clampUsagePercent(window.used_percent);
+    fill.style.width = `${width}%`;
+    bar.appendChild(fill);
+    row.appendChild(bar);
+
+    const resetText = this.formatUsageReset(window);
+    if (resetText) {
+      row.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-usage-meta" },
+          `Resets: ${resetText}`,
+        ),
+      );
+    }
+    return row;
+  }
+
+  private formatUsagePercent(percent: number | null): string {
+    if (percent === null || !Number.isFinite(percent)) return "n/a";
+    const rounded = Math.round(percent * 10) / 10;
+    if (Math.abs(rounded - Math.round(rounded)) < 0.05) {
+      return `${Math.round(rounded)}%`;
+    }
+    return `${rounded.toFixed(1)}%`;
+  }
+
+  private clampUsagePercent(percent: number | null): number {
+    if (percent === null || !Number.isFinite(percent)) return 0;
+    return Math.max(0, Math.min(100, percent));
+  }
+
+  private formatUsageReset(window: BackendUsageWindow): string | null {
+    const text = window.reset_at_text?.trim();
+    if (text) return text;
+
+    if (
+      window.reset_at_unix !== null &&
+      Number.isFinite(window.reset_at_unix)
+    ) {
+      const timestampMs =
+        window.reset_at_unix > 1_000_000_000_000
+          ? window.reset_at_unix
+          : window.reset_at_unix * 1000;
+      const date = new Date(timestampMs);
+      if (!Number.isNaN(date.getTime())) {
+        return date.toLocaleString();
+      }
+    }
+
+    return null;
+  }
+
   // ========== BACKENDS TAB ==========
 
   private buildBackendsPanel(): HTMLElement {
@@ -1154,6 +1419,30 @@ export class SettingsPanel {
   private buildBackendsContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
     frag.appendChild(this.buildDefaultBackendSection());
+    const toolbar = el("div", { class: "settings-backend-toolbar" });
+    toolbar.appendChild(
+      el(
+        "p",
+        {
+          class: "settings-description settings-backend-toolbar-note",
+        },
+        "Usage is shown for Codex and Kiro.",
+      ),
+    );
+    const refreshAllBtn = el(
+      "button",
+      {
+        class: "settings-usage-refresh settings-usage-refresh-all",
+        type: "button",
+      },
+      this.backendUsageLoading.size > 0 ? "Refreshing..." : "Refresh usage",
+    ) as HTMLButtonElement;
+    refreshAllBtn.disabled = this.backendUsageLoading.size > 0;
+    refreshAllBtn.addEventListener("click", () =>
+      this.refreshBackendUsage(true),
+    );
+    toolbar.appendChild(refreshAllBtn);
+    frag.appendChild(toolbar);
     const enabledPrefs = getEnabledBackendPreferences();
 
     const backends: { kind: BackendKind; label: string; binary: string }[] = [
@@ -1162,26 +1451,73 @@ export class SettingsPanel {
       { kind: "claude", label: "Claude Code", binary: "claude" },
       { kind: "kiro", label: "Kiro", binary: "kiro-cli" },
     ];
+    const backendDescriptions: Record<BackendKind, string> = {
+      tycode: "Built-in Tyde backend.",
+      codex: "OpenAI Codex CLI backend.",
+      claude: "Anthropic Claude Code CLI backend.",
+      kiro: "Kiro CLI backend.",
+    };
+
+    const list = el("div", { class: "settings-backend-list" });
 
     for (const { kind, label, binary } of backends) {
       const dep = this.backendDependencyStatus?.[kind];
       const depMissing = dep !== undefined && !dep.available;
 
-      const section = el("div", { class: "settings-section" });
-      const field = el("div", { class: "settings-field" });
-      const row = el("div", { class: "settings-toggle-row" });
-      const labelCol = el("div", { class: "settings-toggle-label-col" });
+      const card = el("div", { class: "settings-backend-card" });
+      const row = el("div", {
+        class: "settings-toggle-row settings-backend-card-header",
+      });
+      const labelCol = el("div", {
+        class: "settings-toggle-label-col settings-backend-card-label-col",
+      });
 
       labelCol.appendChild(
         el(
           "label",
-          { class: "settings-label", "data-testid": "settings-label" },
+          {
+            class: "settings-label settings-backend-name",
+            "data-testid": "settings-label",
+          },
           label,
         ),
       );
+      labelCol.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-backend-subtitle" },
+          backendDescriptions[kind],
+        ),
+      );
+      row.appendChild(labelCol);
+
+      const toggle = el("label", { class: "settings-toggle" });
+      const input = el("input", {
+        type: "checkbox",
+        "data-testid": `settings-backend-${kind}-enabled`,
+      }) as HTMLInputElement;
+      input.checked = enabledPrefs.includes(kind) && !depMissing;
+      input.disabled = depMissing;
+      input.addEventListener("change", () => {
+        const current = getEnabledBackendPreferences();
+        if (input.checked) {
+          if (!current.includes(kind)) current.push(kind);
+        } else {
+          const idx = current.indexOf(kind);
+          if (idx !== -1) current.splice(idx, 1);
+        }
+        setEnabledBackendPreferences(current);
+        syncDisabledBackendsToRust();
+        this.syncProfileDropdown();
+        this.onBackendsChanged?.();
+      });
+      toggle.appendChild(input);
+      toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
+      row.appendChild(toggle);
+      card.appendChild(row);
 
       if (depMissing) {
-        labelCol.appendChild(
+        card.appendChild(
           el(
             "p",
             { class: "settings-description settings-backend-warning" },
@@ -1217,10 +1553,10 @@ export class SettingsPanel {
               );
             });
         });
-        labelCol.appendChild(installBtn);
+        card.appendChild(installBtn);
 
         if (installError) {
-          labelCol.appendChild(
+          card.appendChild(
             el(
               "p",
               { class: "settings-description settings-backend-warning" },
@@ -1228,47 +1564,16 @@ export class SettingsPanel {
             ),
           );
         }
-      } else {
-        labelCol.appendChild(
-          el(
-            "p",
-            { class: "settings-description" },
-            `Enable or disable the ${label} backend.`,
-          ),
-        );
       }
 
-      row.appendChild(labelCol);
-
-      const toggle = el("label", { class: "settings-toggle" });
-      const input = el("input", {
-        type: "checkbox",
-        "data-testid": `settings-backend-${kind}-enabled`,
-      }) as HTMLInputElement;
-      input.checked = enabledPrefs.includes(kind) && !depMissing;
-      input.disabled = depMissing;
-      input.addEventListener("change", () => {
-        const current = getEnabledBackendPreferences();
-        if (input.checked) {
-          if (!current.includes(kind)) current.push(kind);
-        } else {
-          const idx = current.indexOf(kind);
-          if (idx !== -1) current.splice(idx, 1);
-        }
-        setEnabledBackendPreferences(current);
-        syncDisabledBackendsToRust();
-        this.syncProfileDropdown();
-        this.onBackendsChanged?.();
-      });
-      toggle.appendChild(input);
-      toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
-      row.appendChild(toggle);
-
-      field.appendChild(row);
-      section.appendChild(field);
-      frag.appendChild(section);
+      const usageSection = this.buildBackendUsageSection(kind);
+      if (usageSection) {
+        card.appendChild(usageSection);
+      }
+      list.appendChild(card);
     }
 
+    frag.appendChild(list);
     return frag;
   }
 

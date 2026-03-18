@@ -172,6 +172,29 @@ impl CodexSession {
     }
 }
 
+pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, String> {
+    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[])?;
+
+    rpc.request(
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "tyde",
+                "title": Value::Null,
+                "version": "0.1"
+            },
+            "capabilities": {
+                "experimentalApi": true
+            }
+        }),
+    )
+    .await?;
+
+    let limits = rpc.request("account/rateLimits/read", Value::Null).await;
+    rpc.shutdown().await;
+    limits
+}
+
 #[derive(Clone)]
 struct PendingRequest {
     request_id: Value,

@@ -83,6 +83,7 @@ impl ClaudeCommandHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct ClaudeSession {
     inner: Arc<ClaudeInner>,
 }
@@ -1565,7 +1566,8 @@ fn track_pending_subagent_prompt_event(
             let Some(block) = event.get("content_block") else {
                 return;
             };
-            let Some((tool_use_id, _name, description, _agent_type)) = extract_spawn_info(block) else {
+            let Some((tool_use_id, _name, description, _agent_type)) = extract_spawn_info(block)
+            else {
                 return;
             };
             pending_prompts.insert(
