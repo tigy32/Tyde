@@ -66,7 +66,8 @@ struct PendingSubAgentPrompt {
 }
 
 const CLAUDE_AGENT_NAME: &str = "claude";
-const CLAUDE_ESTIMATED_CONTEXT_WINDOW: u64 = 1_000_000;
+const CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
+const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
 const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CLAUDE_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
@@ -565,6 +566,7 @@ impl ClaudeInner {
                     let known_context_window = summary.result_context_window;
                     if let Some(phase) = take_phase_emission(&mut summary) {
                         let text = phase.text;
+                        let selected_model = phase.model.clone().or(model_hint.clone());
                         let tool_calls = phase
                             .tool_calls
                             .iter()
@@ -582,13 +584,14 @@ impl ClaudeInner {
                             phase.tool_io_bytes,
                             phase.reasoning_bytes,
                             known_context_window,
+                            selected_model.as_deref(),
                         );
                         if !text.is_empty() {
                             self.add_conversation_bytes(text.len() as u64).await;
                         }
                         self.emit_stream_end(
                             text,
-                            phase.model.or(model_hint),
+                            selected_model,
                             phase.usage,
                             phase.reasoning,
                             tool_calls,
@@ -609,6 +612,7 @@ impl ClaudeInner {
                     let known_context_window = summary.result_context_window;
                     if let Some(phase) = take_phase_emission(&mut summary) {
                         let partial = phase.text;
+                        let selected_model = phase.model.clone();
                         let tool_calls = phase
                             .tool_calls
                             .iter()
@@ -626,13 +630,14 @@ impl ClaudeInner {
                             phase.tool_io_bytes,
                             phase.reasoning_bytes,
                             known_context_window,
+                            selected_model.as_deref(),
                         );
                         if !partial.is_empty() {
                             self.add_conversation_bytes(partial.len() as u64).await;
                         }
                         self.emit_stream_end(
                             partial,
-                            phase.model,
+                            selected_model,
                             phase.usage,
                             phase.reasoning,
                             tool_calls,
@@ -1859,17 +1864,12 @@ fn consume_claude_stream_value(
             // Extract contextWindow from result.modelUsage[model].contextWindow.
             // This is the only place Claude Code reports the actual context window.
             if let Some(model_usage) = value.get("modelUsage").and_then(Value::as_object) {
-                for (_model, data) in model_usage {
-                    if let Some(cw) = data
-                        .get("contextWindow")
-                        .or_else(|| data.get("context_window"))
-                        .and_then(Value::as_u64)
-                        .filter(|w| *w > 0)
-                    {
-                        summary.result_context_window = Some(cw);
-                        break;
-                    }
-                }
+                let preferred_model = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .or(summary.model.as_deref());
+                summary.result_context_window =
+                    extract_context_window_from_model_usage(model_usage, preferred_model);
             }
 
             let is_error = value
@@ -3173,7 +3173,10 @@ fn claude_task_update_from_todo_write(arguments: &Value) -> Option<Value> {
     let todos = arguments.get("todos")?.as_array()?;
     let mut tasks = Vec::with_capacity(todos.len());
     for (i, todo) in todos.iter().enumerate() {
-        let status = todo.get("status").and_then(Value::as_str).unwrap_or("pending");
+        let status = todo
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
         let description = if status == "in_progress" {
             todo.get("activeForm")
                 .and_then(Value::as_str)
@@ -4257,12 +4260,98 @@ fn claude_known_models() -> Vec<Value> {
         .collect()
 }
 
+fn normalize_model_key_for_context_lookup(model: &str) -> String {
+    strip_context_window_suffix(model.trim()).to_ascii_lowercase()
+}
+
+fn strip_context_window_suffix(model: &str) -> &str {
+    model.strip_suffix("[1m]").unwrap_or(model)
+}
+
+fn claude_model_family_hint(model: &str) -> Option<&'static str> {
+    let normalized = normalize_model_key_for_context_lookup(model);
+    if normalized.contains("opus") {
+        return Some("opus");
+    }
+    if normalized.contains("sonnet") {
+        return Some("sonnet");
+    }
+    if normalized.contains("haiku") {
+        return Some("haiku");
+    }
+    None
+}
+
+fn extract_context_window_from_model_usage_entry(entry: &Value) -> Option<u64> {
+    entry
+        .get("contextWindow")
+        .or_else(|| entry.get("context_window"))
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)
+}
+
+fn extract_context_window_from_model_usage(
+    model_usage: &serde_json::Map<String, Value>,
+    preferred_model: Option<&str>,
+) -> Option<u64> {
+    let with_window = model_usage
+        .iter()
+        .filter_map(|(model, entry)| {
+            extract_context_window_from_model_usage_entry(entry).map(|window| (model, window))
+        })
+        .collect::<Vec<_>>();
+
+    if with_window.is_empty() {
+        return None;
+    }
+
+    if let Some(model) = preferred_model {
+        let preferred = normalize_model_key_for_context_lookup(model);
+        if let Some((_, window)) = with_window
+            .iter()
+            .copied()
+            .find(|(model_key, _)| normalize_model_key_for_context_lookup(model_key) == preferred)
+        {
+            return Some(window);
+        }
+
+        if let Some(family) = claude_model_family_hint(model) {
+            if let Some((_, window)) = with_window.iter().copied().find(|(model_key, _)| {
+                normalize_model_key_for_context_lookup(model_key).contains(family)
+            }) {
+                return Some(window);
+            }
+        }
+    }
+
+    if with_window.len() == 1 {
+        return Some(with_window[0].1);
+    }
+
+    with_window.first().map(|(_, window)| *window)
+}
+
+fn claude_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
+    let Some(model) = model_hint else {
+        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
+    };
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.ends_with("[1m]") {
+        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M;
+    }
+    if normalized.contains("haiku") {
+        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
+    }
+    CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT
+}
+
 fn estimate_context_breakdown(
     token_usage: Option<&Value>,
     conversation_history_bytes: u64,
     tool_io_bytes: u64,
     reasoning_bytes: u64,
     known_context_window: Option<u64>,
+    model_hint: Option<&str>,
 ) -> Value {
     let base_input_tokens = token_usage
         .and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64))
@@ -4290,7 +4379,7 @@ fn estimate_context_breakdown(
                 .and_then(|usage| usage.get("context_window").and_then(Value::as_u64))
                 .filter(|window| *window > 0)
         })
-        .unwrap_or(CLAUDE_ESTIMATED_CONTEXT_WINDOW);
+        .unwrap_or_else(|| claude_estimated_context_window_for_model(model_hint));
     let reasoning_from_tokens = token_usage
         .and_then(|usage| usage.get("reasoning_tokens").and_then(Value::as_u64))
         .unwrap_or(0)
@@ -5830,7 +5919,7 @@ mod tests {
         });
         // With known_context_window = 200_000, context_window should be 200_000
         // even though input_tokens (10+18000+2000 = 20_010) < 200_000.
-        let bd = estimate_context_breakdown(Some(&usage), 100, 50, 0, Some(200_000));
+        let bd = estimate_context_breakdown(Some(&usage), 100, 50, 0, Some(200_000), None);
         assert_eq!(
             bd.get("context_window").and_then(Value::as_u64),
             Some(200_000)
@@ -5854,7 +5943,7 @@ mod tests {
         // Total prompt = 50K + 400K + 150K = 600K (bogus — would only happen
         // with the old cumulative-vs-per-call bug, but test the fallback anyway).
         // With known_context_window = 200_000, context_window stays at 200_000.
-        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, Some(200_000));
+        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, Some(200_000), None);
         assert_eq!(
             bd.get("context_window").and_then(Value::as_u64),
             Some(200_000)
@@ -5871,11 +5960,11 @@ mod tests {
             "cache_creation_input_tokens": 0,
             "reasoning_tokens": 0
         });
-        // No known_context_window → should fall back to CLAUDE_ESTIMATED_CONTEXT_WINDOW.
-        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None);
+        // No known_context_window → should fall back to the conservative default.
+        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None, None);
         assert_eq!(
             bd.get("context_window").and_then(Value::as_u64),
-            Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW)
+            Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT)
         );
     }
 
@@ -5956,6 +6045,53 @@ mod tests {
     }
 
     #[test]
+    fn result_event_prefers_model_usage_entry_for_current_model() {
+        let mut summary = ClaudeStdoutSummary::default();
+        summary.model = Some("claude-haiku-4-5-20251001".to_string());
+
+        let result_event = json!({
+            "type": "result",
+            "result": "Done",
+            "model": "claude-haiku-4-5-20251001",
+            "modelUsage": {
+                "claude-sonnet-4-6": { "contextWindow": 1_000_000 },
+                "claude-haiku-4-5-20251001": { "contextWindow": 200_000 }
+            }
+        });
+        let (inner, _rx) = make_test_inner();
+        let mut segment = SegmentState::default();
+        let base_id = "test-msg".to_string();
+        let mut current_id = base_id.clone();
+        consume_claude_stream_value(
+            &result_event,
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        assert_eq!(summary.result_context_window, Some(200_000));
+    }
+
+    #[test]
+    fn estimate_context_breakdown_supports_explicit_1m_model_suffix_fallback() {
+        let usage = json!({
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "total_tokens": 30,
+            "cached_prompt_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0
+        });
+        let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None, Some("sonnet[1m]"));
+        assert_eq!(
+            bd.get("context_window").and_then(Value::as_u64),
+            Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M)
+        );
+    }
+
+    #[test]
     fn phase_usage_returns_raw_usage() {
         // phase_usage_for_emission returns summary.usage as-is (no
         // differential math) so the token badge and context breakdown
@@ -5975,9 +6111,18 @@ mod tests {
         }));
 
         let phase1 = phase_usage_for_emission(&mut summary).expect("should return usage");
-        assert_eq!(phase1.get("input_tokens").and_then(Value::as_u64), Some(150_000));
-        assert_eq!(phase1.get("output_tokens").and_then(Value::as_u64), Some(500));
-        assert_eq!(phase1.get("cached_prompt_tokens").and_then(Value::as_u64), Some(120_000));
+        assert_eq!(
+            phase1.get("input_tokens").and_then(Value::as_u64),
+            Some(150_000)
+        );
+        assert_eq!(
+            phase1.get("output_tokens").and_then(Value::as_u64),
+            Some(500)
+        );
+        assert_eq!(
+            phase1.get("cached_prompt_tokens").and_then(Value::as_u64),
+            Some(120_000)
+        );
     }
 
     #[test]
@@ -5991,22 +6136,46 @@ mod tests {
         });
         let event = claude_task_update_from_todo_write(&arguments)
             .expect("should produce a TaskUpdate event");
-        assert_eq!(event.get("kind").and_then(Value::as_str), Some("TaskUpdate"));
+        assert_eq!(
+            event.get("kind").and_then(Value::as_str),
+            Some("TaskUpdate")
+        );
         let data = event.get("data").expect("should have data");
-        let tasks = data.get("tasks").and_then(Value::as_array).expect("should have tasks");
+        let tasks = data
+            .get("tasks")
+            .and_then(Value::as_array)
+            .expect("should have tasks");
         assert_eq!(tasks.len(), 3);
 
         // Completed task uses `content` (imperative form).
-        assert_eq!(tasks[0].get("description").and_then(Value::as_str), Some("Fix the bug"));
-        assert_eq!(tasks[0].get("status").and_then(Value::as_str), Some("completed"));
+        assert_eq!(
+            tasks[0].get("description").and_then(Value::as_str),
+            Some("Fix the bug")
+        );
+        assert_eq!(
+            tasks[0].get("status").and_then(Value::as_str),
+            Some("completed")
+        );
 
         // In-progress task uses `activeForm` (present-tense).
-        assert_eq!(tasks[1].get("description").and_then(Value::as_str), Some("Running tests"));
-        assert_eq!(tasks[1].get("status").and_then(Value::as_str), Some("in_progress"));
+        assert_eq!(
+            tasks[1].get("description").and_then(Value::as_str),
+            Some("Running tests")
+        );
+        assert_eq!(
+            tasks[1].get("status").and_then(Value::as_str),
+            Some("in_progress")
+        );
 
         // Pending task uses `content`.
-        assert_eq!(tasks[2].get("description").and_then(Value::as_str), Some("Deploy"));
-        assert_eq!(tasks[2].get("status").and_then(Value::as_str), Some("pending"));
+        assert_eq!(
+            tasks[2].get("description").and_then(Value::as_str),
+            Some("Deploy")
+        );
+        assert_eq!(
+            tasks[2].get("status").and_then(Value::as_str),
+            Some("pending")
+        );
     }
 
     #[test]

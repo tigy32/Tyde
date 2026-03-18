@@ -230,9 +230,8 @@ pub(crate) async fn start_dev_instance(
 
     // Override tauri.conf.json devUrl to point at the Vite port we chose,
     // using Tauri CLI's --config JSON merge patch.
-    let tauri_config_override = format!(
-        r#"{{"build":{{"devUrl":"http://localhost:{vite_port}"}}}}"#
-    );
+    let tauri_config_override =
+        format!(r#"{{"build":{{"devUrl":"http://localhost:{vite_port}"}}}}"#);
 
     // Spawn `npx tauri dev` with env vars that configure the child instance:
     // - TYDE_VITE_PORT: Vite dev server port (read by vite.config.ts)
@@ -258,8 +257,7 @@ pub(crate) async fn start_dev_instance(
     if let Some(ref ws) = workspace_path {
         cmd.env("TYDE_OPEN_WORKSPACE", ws);
     }
-    cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 

@@ -37,9 +37,7 @@ use tokio::fs as tokio_fs;
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::admin::AdminManager;
-use crate::agent_runtime::{
-    AgentEventBatch, AgentInfo, AgentRuntime, CollectedAgentResult,
-};
+use crate::agent_runtime::{AgentEventBatch, AgentInfo, AgentRuntime, CollectedAgentResult};
 use crate::backend::{
     BackendKind, BackendSession, SessionCommand, StartupMcpServer, StartupMcpTransport,
 };
@@ -1071,23 +1069,15 @@ pub(crate) async fn create_workbench_internal(
     };
 
     if let Err(err) = app.emit("tyde-create-workbench-request", &payload) {
-        state
-            .create_workbench_pending
-            .lock()
-            .remove(&request_id);
-        return Err(format!(
-            "Failed to emit create workbench request: {err:?}"
-        ));
+        state.create_workbench_pending.lock().remove(&request_id);
+        return Err(format!("Failed to emit create workbench request: {err:?}"));
     }
 
     match tokio::time::timeout(Duration::from_millis(30_000), rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("Create workbench response channel closed".to_string()),
         Err(_) => {
-            state
-                .create_workbench_pending
-                .lock()
-                .remove(&request_id);
+            state.create_workbench_pending.lock().remove(&request_id);
             Err("Create workbench request timed out".to_string())
         }
     }
@@ -2047,8 +2037,7 @@ pub(crate) async fn run_query_screenshot_agent(
             }
         }
     }
-    let png_base64 =
-        png_base64.ok_or("Could not extract PNG data from screenshot response")?;
+    let png_base64 = png_base64.ok_or("Could not extract PNG data from screenshot response")?;
 
     // 3. Build the image attachment.
     let image_size = png_base64.len() as u64;
@@ -2061,8 +2050,8 @@ pub(crate) async fn run_query_screenshot_agent(
 
     // 4. Spawn an ephemeral agent with the screenshot attached.
     let prompt = format!("{QUERY_SCREENSHOT_PREAMBLE}{question}");
-    let project_dir = dev_instance::dev_instance_project_dir(state)
-        .ok_or("No dev instance running")?;
+    let project_dir =
+        dev_instance::dev_instance_project_dir(state).ok_or("No dev instance running")?;
 
     let request = SpawnAgentRequest {
         workspace_roots: vec![project_dir],
@@ -2087,17 +2076,9 @@ pub(crate) async fn run_query_screenshot_agent(
     .await;
 
     // Collect result and terminate regardless of wait outcome.
-    let result = collect_agent_result_internal(
-        state,
-        AgentIdRequest { agent_id },
-    )
-    .await;
+    let result = collect_agent_result_internal(state, AgentIdRequest { agent_id }).await;
 
-    let _ = terminate_agent_internal(
-        state,
-        AgentIdRequest { agent_id },
-    )
-    .await;
+    let _ = terminate_agent_internal(state, AgentIdRequest { agent_id }).await;
 
     // If the wait itself failed (timeout), return that error.
     wait_result?;
@@ -2446,10 +2427,7 @@ fn set_driver_mcp_http_server_autoload_enabled(
 }
 
 #[tauri::command]
-fn set_default_backend(
-    state: tauri::State<'_, AppState>,
-    backend: String,
-) -> Result<(), String> {
+fn set_default_backend(state: tauri::State<'_, AppState>, backend: String) -> Result<(), String> {
     // Validate that the backend kind is known.
     backend
         .parse::<BackendKind>()

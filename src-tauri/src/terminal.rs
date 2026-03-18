@@ -253,10 +253,7 @@ fn emit_terminal_output(app: &tauri::AppHandle, terminal_id: u64, bytes: &[u8]) 
             "data": data.clone(),
         }),
     );
-    let payload = TerminalOutputPayload {
-        terminal_id,
-        data,
-    };
+    let payload = TerminalOutputPayload { terminal_id, data };
     let _ = app.emit("terminal-output", payload);
 }
 
@@ -350,13 +347,11 @@ fn ansi_sequence_complete(seq: &[u8]) -> bool {
         b']' => {
             // OSC sequence: ESC ] ... (terminated by BEL or ESC \)
             // Check for BEL (0x07) or ST (ESC \) anywhere in the sequence.
-            seq.contains(&0x07)
-                || seq.windows(2).any(|w| w == [0x1b, b'\\'])
+            seq.contains(&0x07) || seq.windows(2).any(|w| w == [0x1b, b'\\'])
         }
         b'P' | b'X' | b'^' | b'_' => {
             // DCS, SOS, PM, APC — string sequences terminated by ST.
-            seq.contains(&0x07)
-                || seq.windows(2).any(|w| w == [0x1b, b'\\'])
+            seq.contains(&0x07) || seq.windows(2).any(|w| w == [0x1b, b'\\'])
         }
         0x40..=0x7E => {
             // Two-byte escape (ESC + final). Complete at length 2.

@@ -93,7 +93,10 @@ async fn query_kiro_usage() -> Result<Value, String> {
         let snippet = if clean_capture.trim().is_empty() {
             "empty output".to_string()
         } else {
-            truncate_chars(&clean_capture.trim().replace('\n', " | "), USAGE_ERROR_SNIPPET_MAX_CHARS)
+            truncate_chars(
+                &clean_capture.trim().replace('\n', " | "),
+                USAGE_ERROR_SNIPPET_MAX_CHARS,
+            )
         };
         return if output.status.success() {
             Err(format!("Unable to parse Kiro usage output: {snippet}"))
@@ -194,9 +197,7 @@ fn parse_kiro_usage_capture(clean_capture: &str) -> ParsedKiroUsage {
 
     for line in &lines {
         let lower = line.to_ascii_lowercase();
-        if parsed.plan.is_none()
-            && lower.starts_with("plan")
-            && !lower.contains("covered in plan")
+        if parsed.plan.is_none() && lower.starts_with("plan") && !lower.contains("covered in plan")
         {
             if let Some(value) = extract_suffix_after_colon(line) {
                 if !value.is_empty() {
@@ -402,7 +403,6 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     #[test]
     fn codex_window_label_formats_common_windows() {
