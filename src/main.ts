@@ -62,6 +62,10 @@ async function restoreWindowState(): Promise<void> {
   }
 }
 
+// Prevent the browser from navigating to files dropped outside of handled drop zones.
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => e.preventDefault());
+
 document.addEventListener("DOMContentLoaded", async () => {
   await restoreWindowState();
   const app = new AppController();
