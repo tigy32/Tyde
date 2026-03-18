@@ -56,6 +56,7 @@ const SAFE_ROOTED_LINK_PREFIXES = ["#", "/", "./", "../"];
 const ALLOWED_RENDER_TAGS = new Set([
   "a",
   "blockquote",
+  "button",
   "br",
   "code",
   "del",
