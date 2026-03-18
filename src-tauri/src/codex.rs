@@ -17,7 +17,7 @@ use crate::subprocess::ImageAttachment;
 const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_AGENT_NAME: &str = "codex";
-const CODEX_ESTIMATED_CONTEXT_WINDOW: u64 = 256_000;
+const CODEX_ESTIMATED_CONTEXT_WINDOW: u64 = 200_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";

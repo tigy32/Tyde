@@ -66,7 +66,7 @@ struct PendingSubAgentPrompt {
 }
 
 const CLAUDE_AGENT_NAME: &str = "claude";
-const CLAUDE_ESTIMATED_CONTEXT_WINDOW: u64 = 200_000;
+const CLAUDE_ESTIMATED_CONTEXT_WINDOW: u64 = 1_000_000;
 const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CLAUDE_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
