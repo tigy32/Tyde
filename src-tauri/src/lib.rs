@@ -529,7 +529,7 @@ pub(crate) struct SpawnAgentRequest {
     pub(crate) prompt: String,
     pub(crate) backend_kind: Option<String>,
     pub(crate) parent_agent_id: Option<u64>,
-    pub(crate) name: Option<String>,
+    pub(crate) name: String,
     pub(crate) ephemeral: Option<bool>,
     /// Images to attach to the initial message sent to the agent.
     #[serde(skip)]
@@ -1643,18 +1643,10 @@ pub(crate) async fn spawn_agent_internal(
     )
     .await?;
 
-    let display_name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| {
-            let trimmed = prompt.trim();
-            let truncated: String = trimmed.chars().take(60).collect();
-            if truncated.len() < trimmed.len() {
-                format!("{truncated}…")
-            } else {
-                truncated
-            }
-        });
+    let display_name = name.trim().to_string();
+    if display_name.is_empty() {
+        return Err("spawn_agent requires a non-empty name".to_string());
+    }
 
     let conversation_id = {
         let mut mgr = state.manager.lock().await;
@@ -2069,7 +2061,7 @@ pub(crate) async fn run_query_screenshot_agent(
         prompt,
         backend_kind: None,
         parent_agent_id: None,
-        name: Some("__internal_query_screenshot__".to_string()),
+        name: "__internal_query_screenshot__".to_string(),
         ephemeral: Some(true),
         images: Some(vec![image]),
     };
@@ -2245,7 +2237,7 @@ async fn spawn_agent(
     prompt: String,
     backend_kind: Option<String>,
     parent_agent_id: Option<u64>,
-    name: Option<String>,
+    name: String,
     ephemeral: Option<bool>,
 ) -> Result<SpawnAgentResponse, String> {
     spawn_agent_internal(

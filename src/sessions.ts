@@ -50,7 +50,6 @@ export class SessionsPanel {
   }
 
   update(sessions: SessionMetadata[]): void {
-    this.aliases = this.loadAliases();
     this.sessions = sessions
       .map((s) => this.normalizeSession(s))
       .filter((s): s is NormalizedSession => s !== null);
@@ -123,6 +122,7 @@ export class SessionsPanel {
   }
 
   private render(): void {
+    this.aliases = this.loadAliases();
     this.container.innerHTML = "";
 
     const toolbar = document.createElement("div");
