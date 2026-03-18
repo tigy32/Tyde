@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::{
-    await_agents_internal, cancel_agent_internal, list_agents_internal, run_agent_internal,
-    send_agent_message_internal, spawn_agent_internal, AgentIdRequest, AppState,
-    AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
+    await_agents_internal, cancel_agent_internal, create_workbench_internal,
+    list_agents_internal, run_agent_internal, send_agent_message_internal,
+    spawn_agent_internal, AgentIdRequest, AppState, AwaitAgentsRequest,
+    SendAgentMessageRequest, SpawnAgentRequest,
 };
 
 const MCP_HTTP_BIND_ENV: &str = "TYDE_AGENT_MCP_HTTP_BIND_ADDR";
@@ -109,6 +110,14 @@ struct AwaitAgentsToolInput {
 struct AgentIdToolInput {
     /// The agent to cancel.
     agent_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct CreateWorkbenchToolInput {
+    /// The parent workspace path (the git repo root).
+    parent_workspace_path: String,
+    /// The branch name for the new worktree (e.g. "feature-login").
+    branch: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +266,27 @@ impl TydeAgentMcpServer {
         let app_state = self.app.state::<AppState>();
         match list_agents_internal(app_state.inner()).await {
             Ok(value) => ok_json(value),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Create a git worktree workbench from a parent workspace. Runs `git worktree add -b <branch> <path>` and registers the new workspace in the Tyde project list. Returns the new workspace path, which can be passed directly to tyde_spawn_agent's workspace_roots."
+    )]
+    async fn tyde_create_workbench(
+        &self,
+        Parameters(input): Parameters<CreateWorkbenchToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        match create_workbench_internal(
+            &self.app,
+            app_state.inner(),
+            input.parent_workspace_path,
+            input.branch,
+        )
+        .await
+        {
+            Ok(workspace_path) => ok_json(serde_json::json!({ "workspace_path": workspace_path })),
             Err(err) => Ok(err_text(err)),
         }
     }

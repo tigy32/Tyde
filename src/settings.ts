@@ -16,6 +16,7 @@ import {
   installBackendDependency as installBackendDependencyBridge,
   type McpHttpServerSettings,
   queryBackendUsage as queryBackendUsageBridge,
+  setDefaultBackend as setDefaultBackendBridge,
   setDisabledBackends as setDisabledBackendsBridge,
   setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
   setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
@@ -135,14 +136,15 @@ export function getDefaultBackend(): BackendKind {
 }
 
 export function setDefaultBackend(backend: string | null | undefined): void {
+  const normalized = normalizeBackendKind(backend);
   try {
-    localStorage.setItem(
-      DEFAULT_BACKEND_STORAGE_KEY,
-      normalizeBackendKind(backend),
-    );
+    localStorage.setItem(DEFAULT_BACKEND_STORAGE_KEY, normalized);
   } catch (err) {
     console.error("Failed to save default backend to localStorage:", err);
   }
+  setDefaultBackendBridge(normalized).catch((err) => {
+    console.error("Failed to sync default backend to Rust:", err);
+  });
 }
 
 export function getDefaultSpawnProfile(): string | null {
@@ -241,6 +243,9 @@ export async function initializeBackendDependencies(): Promise<void> {
     const status = await checkBackendDependenciesBridge();
     setCachedDependencyStatus(status);
     syncDisabledBackendsToRust();
+    setDefaultBackendBridge(getDefaultBackend()).catch((err) => {
+      console.error("Failed to sync default backend to Rust:", err);
+    });
   } catch (err) {
     console.error("Failed to initialize backend dependencies:", err);
   }
@@ -560,9 +565,7 @@ export class SettingsPanel {
       })
       .finally(() => {
         this.mcpHttpStatusLoading = false;
-        if (this.activeTab === "tyde") {
-          this.rerenderPanelContent("tyde", () => this.buildTydeContent());
-        }
+        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
       });
   }
 
@@ -580,9 +583,7 @@ export class SettingsPanel {
       })
       .finally(() => {
         this.driverMcpHttpStatusLoading = false;
-        if (this.activeTab === "tyde") {
-          this.rerenderPanelContent("tyde", () => this.buildTydeContent());
-        }
+        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
       });
   }
 

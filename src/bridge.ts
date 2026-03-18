@@ -355,6 +355,10 @@ export function setDriverMcpHttpServerAutoloadEnabled(enabled: boolean) {
   return execute("set_driver_mcp_http_server_autoload_enabled", { enabled });
 }
 
+export function setDefaultBackend(backend: string) {
+  return execute("set_default_backend", { backend });
+}
+
 // --- Backend management ---
 
 export function checkBackendDependencies() {
@@ -396,6 +400,40 @@ export function submitDebugUiResponse(
   error?: string,
 ) {
   return execute("submit_debug_ui_response", { requestId, ok, result, error });
+}
+
+// --- Create workbench bridge ---
+
+export interface CreateWorkbenchRequestPayload {
+  request_id: string;
+  parent_workspace_path: string;
+  branch: string;
+  worktree_path: string;
+}
+
+export function onCreateWorkbenchRequest(
+  callback: (payload: CreateWorkbenchRequestPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<CreateWorkbenchRequestPayload>(
+    "tyde-create-workbench-request",
+    (event) => {
+      callback(event.payload);
+    },
+  );
+}
+
+export function submitCreateWorkbenchResponse(
+  requestId: string,
+  ok: boolean,
+  workspacePath?: string,
+  error?: string,
+) {
+  return execute("submit_create_workbench_response", {
+    requestId,
+    ok,
+    workspacePath,
+    error,
+  });
 }
 
 // --- Event listeners (Tauri-specific) ---
