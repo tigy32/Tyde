@@ -382,6 +382,7 @@ fn build_local_command(workspace_path: &str) -> CommandBuilder {
     if !cfg!(target_os = "windows") {
         cmd.arg("-l");
     }
+    cmd.env("TERM", "xterm-256color");
     cmd.cwd(workspace_path);
     cmd
 }
@@ -395,5 +396,6 @@ fn build_remote_command(host: &str, path: &str) -> CommandBuilder {
         shell_quote_arg(path)
     );
     cmd.arg(remote_cmd);
+    cmd.env("TERM", "xterm-256color");
     cmd
 }

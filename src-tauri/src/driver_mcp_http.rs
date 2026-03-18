@@ -19,10 +19,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-use crate::{
-    debug_mcp_http::extract_valid_png_data,
-    dev_instance, AppState,
-};
+use crate::{dev_instance, run_query_screenshot_agent, AppState};
 
 const DRIVER_MCP_HTTP_BIND_ENV: &str = "TYDE_DRIVER_MCP_HTTP_BIND_ADDR";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:47773";
@@ -59,6 +56,10 @@ impl TydeDriverMcpServer {
 struct DevInstanceStartToolInput {
     /// Path to the Tyde project root directory to build and run.
     project_dir: String,
+    /// Optional workspace directory to open automatically on startup.
+    /// Bypasses the native file dialog so MCP clients can control the
+    /// full lifecycle without manual intervention.
+    workspace_path: Option<String>,
 }
 
 /// Empty input — no parameters needed.
@@ -103,14 +104,6 @@ struct ListTestIdsToolInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct CaptureScreenshotToolInput {
-    selector: Option<String>,
-    index: Option<usize>,
-    max_dimension: Option<u32>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct TypeToolInput {
     selector: String,
     text: String,
@@ -148,6 +141,15 @@ struct WaitForToolInput {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct QueryScreenshotToolInput {
+    /// A visual question about the UI, e.g. "Is the sidebar collapsed or expanded?",
+    /// "What color is the error banner?", "Does the layout look correct?"
+    question: String,
+    /// Max wait time in milliseconds for the inspection agent (default 300000).
+    timeout_ms: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -178,7 +180,7 @@ async fn proxy_tool(
 }
 
 // ---------------------------------------------------------------------------
-// MCP Tools — 13 tools: 2 dev instance lifecycle + 11 proxied debug tools
+// MCP Tools — 13 tools: 2 dev instance lifecycle + 10 proxied debug tools + 1 query_screenshot
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -193,7 +195,7 @@ impl TydeDriverMcpServer {
         Parameters(input): Parameters<DevInstanceStartToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match dev_instance::start_dev_instance(app_state.inner(), input.project_dir).await {
+        match dev_instance::start_dev_instance(app_state.inner(), input.project_dir, input.workspace_path).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
         }
@@ -277,58 +279,6 @@ impl TydeDriverMcpServer {
         proxy_tool(&self.app, "tyde_debug_list_testids", args).await
     }
 
-    #[tool(description = "Capture a PNG screenshot of the dev instance (optionally by selector).")]
-    async fn tyde_debug_capture_screenshot(
-        &self,
-        Parameters(input): Parameters<CaptureScreenshotToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "selector": input.selector,
-            "index": input.index,
-            "max_dimension": input.max_dimension,
-            "timeout_ms": input.timeout_ms,
-        });
-
-        let app_state = self.app.state::<AppState>();
-        let value = match dev_instance::proxy_debug_tool_call(
-            app_state.inner(),
-            "tyde_debug_capture_screenshot",
-            args,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(err) => return Ok(err_text(err)),
-        };
-
-        // The proxy returns the raw CallToolResult JSON. Extract the screenshot
-        // content so we can return a proper Content::image to the client.
-        // The dev instance's debug MCP returns content[1] as the JSON metadata.
-        let content_arr = value.get("content").and_then(|c| c.as_array());
-        if let Some(items) = content_arr {
-            // Look for the JSON metadata item that has `data` and `mime_type` fields.
-            for item in items {
-                if let Some(json_text) = item.get("text").and_then(|t| t.as_str()) {
-                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(json_text) {
-                        if let Ok(data) = extract_valid_png_data(&meta) {
-                            let out = vec![
-                                Content::image(data.to_string(), "image/png".to_string()),
-                                Content::json(meta)?,
-                            ];
-                            return Ok(CallToolResult::success(out));
-                        }
-                    }
-                }
-            }
-        }
-
-        // If we couldn't extract the image, return the raw proxy result.
-        match serde_json::from_value::<CallToolResult>(value.clone()) {
-            Ok(result) => Ok(result),
-            Err(_) => ok_json(value),
-        }
-    }
-
     #[tool(description = "Click a UI element in the dev instance by CSS selector.")]
     async fn tyde_debug_click(
         &self,
@@ -402,6 +352,29 @@ impl TydeDriverMcpServer {
             "timeout_ms": input.timeout_ms,
         });
         proxy_tool(&self.app, "tyde_debug_wait_for", args).await
+    }
+
+    // -- High-level screenshot query -------------------------------------------
+
+    #[tool(
+        description = "Ask a visual question about the dev instance UI by taking a screenshot and having an agent describe what it sees. Use this for visual/styling validation — layout, colors, spacing, visual state. For DOM-level questions (text content, element presence, test IDs, attributes), prefer the targeted debug tools instead: tyde_debug_get_text, tyde_debug_query_elements, tyde_debug_list_testids."
+    )]
+    async fn tyde_debug_query_screenshot(
+        &self,
+        Parameters(input): Parameters<QueryScreenshotToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        match run_query_screenshot_agent(
+            &self.app,
+            app_state.inner(),
+            input.question,
+            input.timeout_ms,
+        )
+        .await
+        {
+            Ok(answer) => Ok(CallToolResult::success(vec![Content::text(answer)])),
+            Err(err) => Ok(err_text(err)),
+        }
     }
 }
 

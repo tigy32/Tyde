@@ -139,6 +139,15 @@ struct WaitForToolInput {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct EvaluateToolInput {
+    /// JavaScript expression to evaluate in the webview. The body of an async
+    /// function — use `return` to produce a value. Has access to the full DOM
+    /// and any globals the app exposes.
+    expression: String,
+    timeout_ms: Option<u64>,
+}
+
 fn ok_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::json(value)?]))
 }
@@ -378,6 +387,22 @@ impl TydeDebugMcpServer {
             "timeout_ms": input.timeout_ms,
         });
         match call_ui_action(&self.app, "wait_for", params, input.timeout_ms).await {
+            Ok(value) => ok_json(value),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Evaluate a JavaScript expression in the Tyde webview and return the result. The expression is the body of an async function — use `return` to produce a value. Has access to the full DOM and any globals the app exposes (e.g. window.__TYDE_BRIDGE__)."
+    )]
+    async fn tyde_debug_evaluate(
+        &self,
+        Parameters(input): Parameters<EvaluateToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = serde_json::json!({
+            "expression": input.expression,
+        });
+        match call_ui_action(&self.app, "evaluate", params, input.timeout_ms).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
         }
