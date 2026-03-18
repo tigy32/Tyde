@@ -174,14 +174,7 @@ impl AgentRuntime {
     }
 
     pub fn mark_agent_running(&mut self, agent_id: u64, summary: Option<String>) -> bool {
-        self.update_agent(
-            agent_id,
-            Some(true),
-            summary,
-            None,
-            "agent_running",
-            None,
-        )
+        self.update_agent(agent_id, Some(true), summary, None, "agent_running", None)
     }
 
     pub fn mark_conversation_failed(&mut self, conversation_id: u64, message: String) -> bool {
@@ -233,9 +226,17 @@ impl AgentRuntime {
                 self.update_agent(
                     agent_id,
                     Some(typing),
-                    Some(if typing { "Running...".to_string() } else { "Completed".to_string() }),
+                    Some(if typing {
+                        "Running...".to_string()
+                    } else {
+                        "Completed".to_string()
+                    }),
                     None,
-                    if typing { "typing_started" } else { "typing_stopped" },
+                    if typing {
+                        "typing_started"
+                    } else {
+                        "typing_stopped"
+                    },
                     None,
                 )
             }
@@ -341,16 +342,14 @@ impl AgentRuntime {
                     )
                 }
             }
-            "StreamStart" => {
-                self.update_agent(
-                    agent_id,
-                    None,
-                    Some("Running...".to_string()),
-                    None,
-                    "stream_start",
-                    None,
-                )
-            }
+            "StreamStart" => self.update_agent(
+                agent_id,
+                None,
+                Some("Running...".to_string()),
+                None,
+                "stream_start",
+                None,
+            ),
             _ => false,
         }
     }
@@ -475,13 +474,7 @@ impl AgentRuntime {
         };
 
         let (conversation_id, running, message) = event_payload;
-        self.push_event(
-            agent_id,
-            conversation_id,
-            event_kind,
-            running,
-            message,
-        );
+        self.push_event(agent_id, conversation_id, event_kind, running, message);
 
         changed
     }
@@ -564,7 +557,10 @@ mod tests {
             100,
             &json!({ "kind": "StreamEnd", "data": { "message": { "content": "Done with the task" } } }),
         );
-        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": false }));
+        rt.record_chat_event(
+            100,
+            &json!({ "kind": "TypingStatusChanged", "data": false }),
+        );
 
         assert!(!rt.get_agent(agent_id).unwrap().is_running);
         (rt, agent_id)
@@ -573,13 +569,22 @@ mod tests {
     #[test]
     fn typing_status_controls_is_running() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(100, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            100,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
         assert!(!rt.get_agent(info.agent_id).unwrap().is_running);
 
         rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
         assert!(rt.get_agent(info.agent_id).unwrap().is_running);
 
-        rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": false }));
+        rt.record_chat_event(
+            100,
+            &json!({ "kind": "TypingStatusChanged", "data": false }),
+        );
         let agent = rt.get_agent(info.agent_id).unwrap();
         assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
@@ -588,7 +593,13 @@ mod tests {
     #[test]
     fn stream_end_updates_summary_and_message_not_is_running() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(100, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            100,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
 
         rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
         rt.record_chat_event(
@@ -619,7 +630,13 @@ mod tests {
     #[test]
     fn collect_result_errors_for_running_agent() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(200, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            200,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
         rt.mark_agent_running(info.agent_id, Some("Running...".into()));
 
         let result = rt.collect_result(info.agent_id);
@@ -638,10 +655,19 @@ mod tests {
     #[test]
     fn error_event_sets_last_error() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(300, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            300,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
 
         rt.record_chat_event(300, &json!({ "kind": "TypingStatusChanged", "data": true }));
-        rt.record_chat_event(300, &json!({ "kind": "Error", "data": "Something went wrong" }));
+        rt.record_chat_event(
+            300,
+            &json!({ "kind": "Error", "data": "Something went wrong" }),
+        );
 
         let agent = rt.get_agent(info.agent_id).unwrap();
         assert!(agent.last_error.is_some());
@@ -652,10 +678,19 @@ mod tests {
     #[test]
     fn subprocess_exit_stops_agent() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(400, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            400,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
 
         rt.record_chat_event(400, &json!({ "kind": "TypingStatusChanged", "data": true }));
-        rt.record_chat_event(400, &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }));
+        rt.record_chat_event(
+            400,
+            &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }),
+        );
 
         let agent = rt.get_agent(info.agent_id).unwrap();
         assert!(!agent.is_running);
@@ -665,10 +700,19 @@ mod tests {
     #[test]
     fn subprocess_exit_error_sets_last_error() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(500, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            500,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
 
         rt.record_chat_event(500, &json!({ "kind": "TypingStatusChanged", "data": true }));
-        rt.record_chat_event(500, &json!({ "kind": "SubprocessExit", "data": { "exit_code": 1 } }));
+        rt.record_chat_event(
+            500,
+            &json!({ "kind": "SubprocessExit", "data": { "exit_code": 1 } }),
+        );
 
         let agent = rt.get_agent(info.agent_id).unwrap();
         assert!(!agent.is_running);
@@ -678,9 +722,18 @@ mod tests {
     #[test]
     fn collect_result_falls_back_to_summary_when_no_last_message() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(600, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            600,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
 
-        rt.record_chat_event(600, &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }));
+        rt.record_chat_event(
+            600,
+            &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }),
+        );
 
         let result = rt.collect_result(info.agent_id).unwrap();
         assert_eq!(result.final_message.as_deref(), Some("Completed"));
@@ -689,7 +742,13 @@ mod tests {
     #[test]
     fn mark_conversation_closed_stops_agent() {
         let mut rt = AgentRuntime::new();
-        let info = rt.register_agent(700, vec!["/tmp".into()], "tycode".into(), None, "test".into());
+        let info = rt.register_agent(
+            700,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "test".into(),
+        );
         rt.mark_agent_running(info.agent_id, Some("Running...".into()));
 
         let changed = rt.mark_conversation_closed(700, Some("Terminated".to_string()));

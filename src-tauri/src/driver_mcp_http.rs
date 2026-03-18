@@ -195,7 +195,13 @@ impl TydeDriverMcpServer {
         Parameters(input): Parameters<DevInstanceStartToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match dev_instance::start_dev_instance(app_state.inner(), input.project_dir, input.workspace_path).await {
+        match dev_instance::start_dev_instance(
+            app_state.inner(),
+            input.project_dir,
+            input.workspace_path,
+        )
+        .await
+        {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
         }

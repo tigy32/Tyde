@@ -1009,7 +1009,11 @@ impl AcpRpc {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                format!("cd {} && {}", crate::remote::shell_quote_arg(cwd), remote_exec)
+                format!(
+                    "cd {} && {}",
+                    crate::remote::shell_quote_arg(cwd),
+                    remote_exec
+                )
             } else {
                 remote_exec
             };
@@ -1040,8 +1044,7 @@ impl AcpRpc {
             {
                 cmd.current_dir(path);
             }
-            cmd
-                .spawn()
+            cmd.spawn()
                 .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?
         };
 

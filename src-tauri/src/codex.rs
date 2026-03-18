@@ -17,7 +17,8 @@ use crate::subprocess::ImageAttachment;
 const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_AGENT_NAME: &str = "codex";
-const CODEX_ESTIMATED_CONTEXT_WINDOW: u64 = 200_000;
+const CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
+const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX: u64 = 400_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
@@ -897,8 +898,10 @@ impl CodexInner {
                 self.handle_plan_update(params);
             }
             "thread/tokenUsage/updated" => {
-                if let Some((turn_id, token_usage)) = extract_turn_token_usage(params) {
-                    let mut state = self.state.lock().await;
+                let mut state = self.state.lock().await;
+                if let Some((turn_id, token_usage)) =
+                    extract_turn_token_usage(params, state.model.as_deref())
+                {
                     state.token_usage_by_turn.insert(turn_id, token_usage);
                 }
             }
@@ -955,7 +958,10 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("turn")
                     .to_string();
-                emit_event_to(event_tx, json!({ "kind": "TypingStatusChanged", "data": true }));
+                emit_event_to(
+                    event_tx,
+                    json!({ "kind": "TypingStatusChanged", "data": true }),
+                );
                 emit_event_to(
                     event_tx,
                     json!({
@@ -1043,13 +1049,20 @@ impl CodexInner {
                     .unwrap_or("Codex error")
                     .to_string();
                 emit_event_to(event_tx, json!({ "kind": "Error", "data": message }));
-                emit_event_to(event_tx, json!({ "kind": "TypingStatusChanged", "data": false }));
+                emit_event_to(
+                    event_tx,
+                    json!({ "kind": "TypingStatusChanged", "data": false }),
+                );
             }
             _ => {}
         }
     }
 
-    fn handle_subagent_item_started(&self, params: &Value, event_tx: &mpsc::UnboundedSender<Value>) {
+    fn handle_subagent_item_started(
+        &self,
+        params: &Value,
+        event_tx: &mpsc::UnboundedSender<Value>,
+    ) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -1304,7 +1317,11 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_turn_completed(&self, params: &Value, event_tx: &mpsc::UnboundedSender<Value>) {
+    fn handle_subagent_turn_completed(
+        &self,
+        params: &Value,
+        event_tx: &mpsc::UnboundedSender<Value>,
+    ) {
         let turn_status = params
             .get("turn")
             .and_then(|v| v.get("status"))
@@ -1312,7 +1329,10 @@ impl CodexInner {
             .unwrap_or("completed")
             .to_string();
 
-        emit_event_to(event_tx, json!({ "kind": "TypingStatusChanged", "data": false }));
+        emit_event_to(
+            event_tx,
+            json!({ "kind": "TypingStatusChanged", "data": false }),
+        );
         if turn_status == "interrupted" {
             emit_event_to(
                 event_tx,
@@ -1828,7 +1848,7 @@ impl CodexInner {
                     reasoning
                 };
                 let context_breakdown =
-                    estimate_context_breakdown(token_usage.as_ref(), &turn_context);
+                    estimate_context_breakdown(token_usage.as_ref(), &turn_context, Some(&model));
                 self.emit_event(json!({
                     "kind": "StreamEnd",
                     "data": {
@@ -2375,7 +2395,11 @@ impl CodexInner {
             .and_then(Value::as_str)
             .unwrap_or("completed")
             .to_string();
-        let turn_usage = extract_turn_token_usage(params);
+        let model_hint = {
+            let state = self.state.lock().await;
+            state.model.clone()
+        };
+        let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
 
         {
             let mut state = self.state.lock().await;
@@ -2604,9 +2628,7 @@ fn find_subagent_event_tx_for_thread(
     let mut unresolved = state
         .subagent_streams
         .values()
-        .filter(|stream| {
-            stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none()
-        })
+        .filter(|stream| stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none())
         .map(|stream| stream.handle.event_tx.clone());
     let first = unresolved.next()?;
     if unresolved.next().is_some() {
@@ -3735,13 +3757,20 @@ fn extract_turn_token_usage_value(params: &Value) -> Option<&Value> {
         .or_else(|| params.get("turn").and_then(|turn| turn.get("usage")))
 }
 
-fn extract_turn_token_usage(params: &Value) -> Option<(String, Value)> {
+fn extract_turn_token_usage(params: &Value, model_hint: Option<&str>) -> Option<(String, Value)> {
     let turn_id = extract_turn_id(params)?;
     let usage = extract_turn_token_usage_value(params)?;
-    Some((turn_id, normalize_token_usage(usage)))
+    Some((
+        turn_id,
+        normalize_token_usage_with_envelope(usage, Some(params), model_hint),
+    ))
 }
 
-fn normalize_token_usage(raw: &Value) -> Value {
+fn normalize_token_usage_with_envelope(
+    raw: &Value,
+    envelope: Option<&Value>,
+    model_hint: Option<&str>,
+) -> Value {
     let source = raw
         .get("last")
         .filter(|value| value.is_object())
@@ -3788,10 +3817,11 @@ fn normalize_token_usage(raw: &Value) -> Value {
     // total_tokens = input_tokens + output_tokens (no double-counting).
     let total_tokens =
         usage_u64(source, &["totalTokens", "total_tokens"]).unwrap_or(input_tokens + output_tokens);
-    let context_window = context_window_from_token_usage(raw, source)
+    let context_window = context_window_from_token_usage(raw, source, envelope)
         .filter(|window| *window > 0)
         .unwrap_or_else(|| {
-            std::cmp::max(CODEX_ESTIMATED_CONTEXT_WINDOW, prompt_tokens_total.max(1))
+            let model_estimate = codex_estimated_context_window_for_model(model_hint);
+            std::cmp::max(model_estimate, prompt_tokens_total.max(1))
         });
 
     json!({
@@ -3805,7 +3835,11 @@ fn normalize_token_usage(raw: &Value) -> Value {
     })
 }
 
-fn context_window_from_token_usage(raw: &Value, last: &Value) -> Option<u64> {
+fn context_window_from_token_usage(
+    raw: &Value,
+    last: &Value,
+    envelope: Option<&Value>,
+) -> Option<u64> {
     const WINDOW_KEYS: &[&str] = &[
         "contextWindow",
         "context_window",
@@ -3817,24 +3851,64 @@ fn context_window_from_token_usage(raw: &Value, last: &Value) -> Option<u64> {
         "max_prompt_tokens",
     ];
 
-    for key in WINDOW_KEYS {
-        if let Some(value) = raw.get(*key).and_then(Value::as_u64) {
-            return Some(value);
-        }
+    find_context_window_in_value(raw, WINDOW_KEYS, 2)
+        .or_else(|| find_context_window_in_value(last, WINDOW_KEYS, 2))
+        .or_else(|| envelope.and_then(|value| find_context_window_in_value(value, WINDOW_KEYS, 4)))
+}
+
+fn find_context_window_in_value(value: &Value, keys: &[&str], depth: usize) -> Option<u64> {
+    if depth == 0 {
+        return None;
     }
 
-    for key in WINDOW_KEYS {
-        if let Some(value) = last.get(*key).and_then(Value::as_u64) {
-            return Some(value);
+    if let Some(obj) = value.as_object() {
+        for key in keys {
+            if let Some(window) = obj.get(*key).and_then(Value::as_u64).filter(|w| *w > 0) {
+                return Some(window);
+            }
+        }
+        for nested in obj.values() {
+            if let Some(window) = find_context_window_in_value(nested, keys, depth - 1) {
+                return Some(window);
+            }
+        }
+        return None;
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(window) = find_context_window_in_value(item, keys, depth - 1) {
+                return Some(window);
+            }
         }
     }
 
     None
 }
 
+fn codex_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
+    let Some(model) = model_hint else {
+        return CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
+    };
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized == "codex-mini-latest" {
+        return CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
+    }
+    if normalized == "gpt-5-codex"
+        || normalized == "gpt-5.1-codex"
+        || normalized == "gpt-5.2-codex"
+        || normalized == "gpt-5.3-codex"
+        || normalized == "gpt-5.4-codex"
+    {
+        return CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX;
+    }
+    CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
+}
+
 fn estimate_context_breakdown(
     token_usage: Option<&Value>,
     turn_context: &TurnContextEstimate,
+    model_hint: Option<&str>,
 ) -> Value {
     let base_input_tokens = token_usage
         .and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64))
@@ -3856,7 +3930,10 @@ fn estimate_context_breakdown(
     let context_window = token_usage
         .and_then(|usage| usage.get("context_window").and_then(Value::as_u64))
         .filter(|window| *window > 0)
-        .unwrap_or_else(|| std::cmp::max(CODEX_ESTIMATED_CONTEXT_WINDOW, input_tokens.max(1)));
+        .unwrap_or_else(|| {
+            let model_estimate = codex_estimated_context_window_for_model(model_hint);
+            std::cmp::max(model_estimate, input_tokens.max(1))
+        });
 
     let reasoning_from_tokens = token_usage
         .and_then(|usage| usage.get("reasoning_tokens").and_then(Value::as_u64))
@@ -4581,7 +4658,8 @@ mod tests {
             name: String,
             description: String,
             agent_type: String,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>> {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>
+        {
             Box::pin(async move {
                 let agent_id = self.next_agent_id.fetch_add(1, Ordering::Relaxed);
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
@@ -4647,7 +4725,9 @@ mod tests {
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
-        live_test_log(&format!("preflight: codex --version available={codex_available}"));
+        live_test_log(&format!(
+            "preflight: codex --version available={codex_available}"
+        ));
         if !codex_available {
             eprintln!("Skipping live Codex test (`codex` CLI is not available).");
             return;
@@ -5364,7 +5444,8 @@ If you skip spawn_agent or wait_agent, this test fails."#;
 
     #[test]
     fn normalize_token_usage_accepts_flat_snake_case_payloads() {
-        let normalized = normalize_token_usage(&json!({
+        let normalized = normalize_token_usage_with_envelope(
+            &json!({
             "input_tokens": 120,
             "output_tokens": 80,
             "total_tokens": 200,
@@ -5372,7 +5453,10 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             "cache_creation_input_tokens": 5,
             "reasoning_tokens": 7,
             "context_window": 200000
-        }));
+            }),
+            None,
+            None,
+        );
 
         assert_eq!(normalized["input_tokens"], json!(120));
         assert_eq!(normalized["output_tokens"], json!(80));
@@ -5396,11 +5480,54 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             }
         });
 
-        let (turn_id, usage) = extract_turn_token_usage(&payload).expect("turn usage");
+        let (turn_id, usage) = extract_turn_token_usage(&payload, None).expect("turn usage");
         assert_eq!(turn_id, "turn_123");
         assert_eq!(usage["input_tokens"], json!(90));
         assert_eq!(usage["output_tokens"], json!(30));
         assert_eq!(usage["total_tokens"], json!(120));
+    }
+
+    #[test]
+    fn extract_turn_token_usage_reads_context_window_from_event_wrapper() {
+        let payload = json!({
+            "turn": {
+                "id": "turn_123",
+                "usage": {
+                    "input_tokens": 90,
+                    "output_tokens": 30,
+                    "total_tokens": 120
+                }
+            },
+            "modelUsage": {
+                "gpt-5.3-codex": {
+                    "contextWindow": 400_000
+                }
+            }
+        });
+
+        let (_, usage) =
+            extract_turn_token_usage(&payload, Some("gpt-5.3-codex")).expect("turn usage");
+        assert_eq!(usage["context_window"], json!(400_000));
+    }
+
+    #[test]
+    fn estimate_context_breakdown_uses_model_aware_context_fallback() {
+        let usage = json!({
+            "input_tokens": 90,
+            "output_tokens": 30,
+            "total_tokens": 120,
+            "cached_prompt_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "context_window": Value::Null
+        });
+        let turn_context = TurnContextEstimate::default();
+        let breakdown =
+            estimate_context_breakdown(Some(&usage), &turn_context, Some("gpt-5.3-codex"));
+        assert_eq!(
+            breakdown.get("context_window").and_then(Value::as_u64),
+            Some(CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX)
+        );
     }
 
     #[test]
@@ -5603,6 +5730,9 @@ If you skip spawn_agent or wait_agent, this test fails."#;
     #[test]
     fn codex_workspace_write_sandbox_policy_is_workspace_write() {
         let policy = codex_workspace_write_sandbox_policy();
-        assert_eq!(policy.get("type").and_then(Value::as_str), Some("workspaceWrite"));
+        assert_eq!(
+            policy.get("type").and_then(Value::as_str),
+            Some("workspaceWrite")
+        );
     }
 }

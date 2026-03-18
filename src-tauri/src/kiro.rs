@@ -7,12 +7,12 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::backend::{SessionCommand, StartupMcpServer};
 use crate::acp::{
     acp_mcp_servers_json, extract_message_id, extract_text_from_update, extract_tool_call_id,
     map_plan_status, normalize_update_type, parse_tool_call_completion, parse_tool_call_request,
     AcpBridge, AcpInbound, AcpSpawnSpec,
 };
+use crate::backend::{SessionCommand, StartupMcpServer};
 use crate::subprocess::ImageAttachment;
 
 const KIRO_AGENT_NAME: &str = "kiro";
@@ -67,8 +67,13 @@ impl KiroSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let roots =
-            resolve_kiro_session_roots(workspace_roots, ssh_host.as_deref(), admin_session, ephemeral).await?;
+        let roots = resolve_kiro_session_roots(
+            workspace_roots,
+            ssh_host.as_deref(),
+            admin_session,
+            ephemeral,
+        )
+        .await?;
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &["acp"])
             .with_local_cwd(roots.session_cwd.clone());
         if ssh_host.is_some() {
@@ -453,8 +458,7 @@ impl KiroInner {
         let mut seen = HashSet::new();
         for root in listing_roots {
             if ssh_host.is_some() {
-                let session_ids =
-                    list_kiro_session_ids_via_cli(&root, ssh_host.as_deref()).await?;
+                let session_ids = list_kiro_session_ids_via_cli(&root, ssh_host.as_deref()).await?;
                 for session in
                     build_remote_kiro_session_metadata(&root, excluded.as_deref(), session_ids)
                 {
@@ -958,8 +962,7 @@ impl KiroInner {
             let canonical_id =
                 build_canonical_tool_call_id(&mut state, &stream_message_id, &raw_tool_call_id);
             let duplicate_request = state.active_tool_contexts.contains_key(&canonical_id);
-            let tool_type =
-                map_tool_request_type(params, &request.args, &workspace_root).await;
+            let tool_type = map_tool_request_type(params, &request.args, &workspace_root).await;
 
             let context = state
                 .active_tool_contexts
@@ -988,9 +991,10 @@ impl KiroInner {
             state
                 .tool_call_aliases
                 .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
-            state
-                .tool_call_aliases
-                .insert(tool_alias_message_key(&stream_message_id, &raw_tool_call_id), canonical_id.clone());
+            state.tool_call_aliases.insert(
+                tool_alias_message_key(&stream_message_id, &raw_tool_call_id),
+                canonical_id.clone(),
+            );
 
             if !duplicate_request {
                 if state.active_message_id.is_none() {
@@ -1050,8 +1054,8 @@ impl KiroInner {
     }
 
     async fn handle_tool_call_update(&self, params: &Value) {
-        let raw_tool_call_id = extract_kiro_tool_call_id(params)
-            .map(|raw| normalize_tool_call_id_fragment(&raw));
+        let raw_tool_call_id =
+            extract_kiro_tool_call_id(params).map(|raw| normalize_tool_call_id_fragment(&raw));
         let message_id = extract_kiro_message_id(params);
 
         let (resolved_tool_call_id, fallback_name) = {
@@ -1104,7 +1108,8 @@ impl KiroInner {
                         .get("after")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if file_path.is_empty() || !has_visible_text(before) || has_visible_text(after) {
+                    if file_path.is_empty() || !has_visible_text(before) || has_visible_text(after)
+                    {
                         None
                     } else {
                         let resolved = resolve_tool_file_path(file_path, &state.workspace_root);
@@ -1401,7 +1406,8 @@ impl KiroInner {
     }
 
     async fn flush_tool_events_after_stream_end(&self, tool_calls: &[Value]) {
-        let mut completions_to_emit: Vec<(String, String, Value, bool, Option<String>)> = Vec::new();
+        let mut completions_to_emit: Vec<(String, String, Value, bool, Option<String>)> =
+            Vec::new();
         let mut requests_to_emit: Vec<(String, String, Value)> = Vec::new();
 
         {
@@ -1731,7 +1737,9 @@ async fn resolve_kiro_session_roots(
         })?;
         dir.to_string_lossy().to_string()
     } else if ephemeral {
-        let dir = PathBuf::from(&scope_root).join(".tyde").join("kiro-ephemeral");
+        let dir = PathBuf::from(&scope_root)
+            .join(".tyde")
+            .join("kiro-ephemeral");
         tokio::fs::create_dir_all(&dir).await.map_err(|err| {
             format!(
                 "Failed to create Kiro ephemeral directory '{}': {err}",
@@ -2075,10 +2083,7 @@ async fn list_local_kiro_session_metadata(
 /// Maps Kiro ACP tool_call params to Tyde's internal tool type representation.
 /// Uses the ACP `kind` field directly: "execute" → RunCommand, "edit" → ModifyFile, "read" → ReadFiles.
 async fn map_tool_request_type(params: &Value, args: &Value, workspace_root: &str) -> Value {
-    let acp_kind = params
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let acp_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
 
     match acp_kind {
         "execute" => {
@@ -2116,7 +2121,10 @@ async fn map_tool_request_type(params: &Value, args: &Value, workspace_root: &st
                 .to_string();
 
             let resolved_file_path = resolve_tool_file_path(&file_path, workspace_root);
-            if before.is_empty() && !resolved_file_path.is_empty() && Path::new(&resolved_file_path).exists() {
+            if before.is_empty()
+                && !resolved_file_path.is_empty()
+                && Path::new(&resolved_file_path).exists()
+            {
                 if let Ok(contents) = tokio::fs::read_to_string(&resolved_file_path).await {
                     before = contents;
                 }
@@ -2293,7 +2301,6 @@ fn estimate_line_diff_counts(before: &str, after: &str) -> (u64, u64) {
     }
 }
 
-
 fn extract_first_string(value: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
         let Some(raw) = value.get(*key) else {
@@ -2336,7 +2343,8 @@ fn extract_first_string_recursive(
                         return Some(found);
                     }
                 }
-                if let Some(found) = extract_first_string_recursive(child, keys, depth + 1, max_depth)
+                if let Some(found) =
+                    extract_first_string_recursive(child, keys, depth + 1, max_depth)
                 {
                     return Some(found);
                 }
@@ -2352,7 +2360,8 @@ fn extract_first_string_recursive(
                         return Some(found);
                     }
                 }
-                if let Some(found) = extract_first_string_recursive(child, keys, depth + 1, max_depth)
+                if let Some(found) =
+                    extract_first_string_recursive(child, keys, depth + 1, max_depth)
                 {
                     return Some(found);
                 }

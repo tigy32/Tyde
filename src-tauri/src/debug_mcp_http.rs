@@ -508,7 +508,6 @@ pub(crate) fn start_debug_mcp_http_server(app: &tauri::AppHandle) -> Result<(), 
     Ok(())
 }
 
-
 fn clear_running_server_if_url(url: &str) {
     let mut guard = RUNNING_DEBUG_MCP_HTTP_SERVER.lock();
     let should_clear = guard.as_ref().map(|running| running.url.as_str()) == Some(url);

@@ -291,11 +291,7 @@ pub async fn git_current_branch(working_dir: &str) -> Result<String, String> {
     }
 }
 
-pub async fn git_worktree_add(
-    working_dir: &str,
-    path: &str,
-    branch: &str,
-) -> Result<(), String> {
+pub async fn git_worktree_add(working_dir: &str, path: &str, branch: &str) -> Result<(), String> {
     run_git(working_dir, &["worktree", "add", "-b", branch, path]).await?;
     Ok(())
 }

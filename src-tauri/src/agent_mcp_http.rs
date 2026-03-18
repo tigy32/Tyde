@@ -23,10 +23,9 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::{
-    await_agents_internal, cancel_agent_internal, create_workbench_internal,
-    list_agents_internal, run_agent_internal, send_agent_message_internal,
-    spawn_agent_internal, AgentIdRequest, AppState, AwaitAgentsRequest,
-    SendAgentMessageRequest, SpawnAgentRequest,
+    await_agents_internal, cancel_agent_internal, create_workbench_internal, list_agents_internal,
+    run_agent_internal, send_agent_message_internal, spawn_agent_internal, AgentIdRequest,
+    AppState, AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
 };
 
 const MCP_HTTP_BIND_ENV: &str = "TYDE_AGENT_MCP_HTTP_BIND_ADDR";
@@ -290,7 +289,6 @@ impl TydeAgentMcpServer {
             Err(err) => Ok(err_text(err)),
         }
     }
-
 }
 
 #[tool_handler]
