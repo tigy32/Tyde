@@ -89,6 +89,10 @@ function isConversationMissingError(err: unknown): boolean {
   );
 }
 
+function isGenericAgentName(name: string): boolean {
+  return /^(Agent \d+|Conversation|Bridge|Sub-agent)$/i.test(name);
+}
+
 export class WorkspaceView {
   readonly projectId: string;
   readonly workspacePath: string;
@@ -829,6 +833,18 @@ export class WorkspaceView {
     );
     this.conversationBackendKindMap.set(agent.conversation_id, backendKind);
     this.registerConversation(this.runtimeAgentToPanelInfo(agent));
+
+    if (
+      agent.parent_agent_id != null &&
+      agent.name &&
+      !this.pendingSessionAliases.has(agent.conversation_id) &&
+      !this.conversationSessionMap.has(agent.conversation_id)
+    ) {
+      const name = agent.name.trim();
+      if (name && !isGenericAgentName(name)) {
+        this.pendingSessionAliases.set(agent.conversation_id, name);
+      }
+    }
   }
 
   syncRuntimeAgents(agents: RuntimeAgent[]): void {
