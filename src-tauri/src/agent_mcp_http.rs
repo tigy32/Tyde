@@ -70,7 +70,7 @@ struct SpawnAgentToolInput {
     /// Parent agent ID if this is a sub-agent.
     parent_agent_id: Option<u64>,
     /// Human-readable name for the agent.
-    name: Option<String>,
+    name: String,
     /// Whether this is an ephemeral (non-persisted) session.
     ephemeral: Option<bool>,
 }
@@ -86,7 +86,7 @@ struct RunAgentToolInput {
     /// Parent agent ID if this is a sub-agent.
     parent_agent_id: Option<u64>,
     /// Human-readable name for the agent.
-    name: Option<String>,
+    name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
