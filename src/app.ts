@@ -520,10 +520,12 @@ export class AppController {
       }
       if (action === "terminate") {
         await terminateAgent(agentId);
+        this.closeRuntimeAgentTab(agent);
         await this.refreshRuntimeAgents();
         return;
       }
 
+      this.closeRuntimeAgentTab(agent);
       this.hiddenRuntimeAgentIds.add(agentId);
       this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
     } catch (err) {
@@ -536,6 +538,19 @@ export class AppController {
       this.notifications.error(
         `Failed to ${actionLabel} agent: ${String(err)}`,
       );
+    }
+  }
+
+  private closeRuntimeAgentTab(agent: RuntimeAgent | AgentInfo): void {
+    const conversationId =
+      "conversation_id" in agent ? agent.conversation_id : agent.conversationId;
+    for (const view of this.workspaceViews.values()) {
+      const tabManager = view.getTabManager();
+      const tab = tabManager.getTabByConversationId(conversationId);
+      if (tab) {
+        tabManager.closeTab(tab.id);
+        return;
+      }
     }
   }
 
