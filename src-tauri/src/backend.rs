@@ -392,8 +392,10 @@ impl BackendSession {
     }
 
     pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        if let Self::Claude(session) = self {
-            session.set_subagent_emitter(emitter).await;
+        match self {
+            Self::Claude(session) => session.set_subagent_emitter(emitter).await,
+            Self::Codex(session) => session.set_subagent_emitter(emitter).await,
+            _ => {}
         }
     }
 
