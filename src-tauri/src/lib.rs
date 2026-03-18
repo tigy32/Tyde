@@ -1,3 +1,4 @@
+mod acp;
 mod admin;
 mod agent_mcp_http;
 mod agent_runtime;
@@ -12,10 +13,10 @@ mod file_service;
 mod file_watch;
 mod git_service;
 mod kiro;
-mod acp;
 mod remote;
 mod subprocess;
 mod terminal;
+mod usage;
 
 use parking_lot::Mutex as SyncMutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -135,7 +136,11 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                     parent_agent_id,
                     display_name,
                 );
-                info.agent_type = if agent_type.is_empty() { None } else { Some(agent_type) };
+                info.agent_type = if agent_type.is_empty() {
+                    None
+                } else {
+                    Some(agent_type)
+                };
                 runtime.update_agent_type(info.agent_id, info.agent_type.clone());
                 runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
                 info
@@ -1119,6 +1124,11 @@ fn check_backend_dependencies() -> BackendDependencyStatus {
 }
 
 #[tauri::command]
+async fn query_backend_usage(backend_kind: String) -> Result<Value, String> {
+    usage::query_backend_usage(&backend_kind).await
+}
+
+#[tauri::command]
 fn set_disabled_backends(
     state: tauri::State<'_, AppState>,
     backends: Vec<String>,
@@ -1156,9 +1166,7 @@ fn detect_local_target() -> Result<String, String> {
 async fn install_tycode_subprocess() -> Result<(), String> {
     let target = detect_local_target()?;
     let archive = format!("{SUBPROCESS_CRATE_NAME}-{target}.tar.xz");
-    let url = format!(
-        "{SUBPROCESS_GIT_REPO}/releases/download/v{SUBPROCESS_VERSION}/{archive}"
-    );
+    let url = format!("{SUBPROCESS_GIT_REPO}/releases/download/v{SUBPROCESS_VERSION}/{archive}");
 
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -1215,7 +1223,10 @@ async fn install_claude_code() -> Result<(), String> {
 
 async fn install_kiro() -> Result<(), String> {
     let output = tokio::process::Command::new("sh")
-        .args(["-c", "curl -fsSL https://cli.kiro.dev/install | bash -s -- --force"])
+        .args([
+            "-c",
+            "curl -fsSL https://cli.kiro.dev/install | bash -s -- --force",
+        ])
         .output()
         .await
         .map_err(|e| format!("Failed to run install script: {e}"))?;
@@ -2511,10 +2522,7 @@ async fn update_settings(
             &app,
             &state,
             conversation_id,
-            SessionCommand::UpdateSettings {
-                settings,
-                persist,
-            },
+            SessionCommand::UpdateSettings { settings, persist },
         )
         .await;
     }
@@ -2533,13 +2541,8 @@ async fn update_settings(
     settings_rx.borrow_and_update();
 
     // 2. Ask the subprocess for its current settings.
-    execute_conversation_command(
-        &app,
-        &state,
-        conversation_id,
-        SessionCommand::GetSettings,
-    )
-    .await?;
+    execute_conversation_command(&app, &state, conversation_id, SessionCommand::GetSettings)
+        .await?;
 
     // 3. Wait for the Settings event to come back through forward_events.
     settings_rx
@@ -2782,11 +2785,7 @@ async fn git_diff_base_content(
 }
 
 #[tauri::command]
-async fn git_worktree_add(
-    working_dir: String,
-    path: String,
-    branch: String,
-) -> Result<(), String> {
+async fn git_worktree_add(working_dir: String, path: String, branch: String) -> Result<(), String> {
     git_service::git_worktree_add(&working_dir, &path, &branch).await
 }
 
@@ -3042,7 +3041,10 @@ async fn submit_feedback(feedback: String) -> Result<(), String> {
         .map_err(|e| format!("Failed to send feedback: {e}"))?;
 
     if !res.status().is_success() {
-        return Err(format!("Feedback submission failed with status {}", res.status()));
+        return Err(format!(
+            "Feedback submission failed with status {}",
+            res.status()
+        ));
     }
     Ok(())
 }
@@ -3184,6 +3186,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_initial_workspace,
             check_backend_dependencies,
+            query_backend_usage,
             set_disabled_backends,
             install_backend_dependency,
             create_conversation,
