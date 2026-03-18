@@ -11,6 +11,7 @@ import {
   addRecentWorkspace,
   cancelConversation,
   closeConversation,
+  getInitialWorkspace,
   gitWorktreeAdd,
   gitWorktreeRemove,
   interruptAgent,
@@ -50,7 +51,7 @@ import { WorkspaceView } from "./workspace_view";
 
 const HOME_BRIDGE_VIEW_ID = "__home_bridge__";
 const HOME_BRIDGE_LABEL = "Bridge";
-const INTERNAL_TITLE_AGENT_PREFIX = "__internal_title__";
+const INTERNAL_AGENT_PREFIX = "__internal_";
 
 export class AppController {
   private notifications!: NotificationManager;
@@ -490,7 +491,7 @@ export class AppController {
     if (this.hiddenRuntimeAgentIds.has(agent.agent_id)) return false;
 
     const name = agent.name.trim();
-    if (name.startsWith(INTERNAL_TITLE_AGENT_PREFIX)) return false;
+    if (name.startsWith(INTERNAL_AGENT_PREFIX)) return false;
 
     // Backward compatibility for older title helpers created before the internal prefix.
     if (/^title\s+\d+$/i.test(name)) return false;
@@ -1301,6 +1302,12 @@ export class AppController {
   }
 
   private async bootstrapStartup(): Promise<void> {
+    const initialWorkspace = await getInitialWorkspace();
+    if (initialWorkspace) {
+      await this.openWorkspacePath(initialWorkspace);
+      return;
+    }
+
     const startupProject = this.projectState.getActiveProject();
 
     if (!startupProject) {

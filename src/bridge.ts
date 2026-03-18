@@ -540,3 +540,7 @@ export async function openWorkspaceDialog(): Promise<string | null> {
     throw new Error(friendlyError(String(err)));
   }
 }
+
+export async function getInitialWorkspace(): Promise<string | null> {
+  return invoke<string | null>("get_initial_workspace");
+}

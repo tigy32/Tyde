@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { domToCanvas } from "modern-screenshot";
 import { submitDebugUiResponse } from "./bridge";
@@ -532,6 +533,31 @@ async function handleWaitFor(
   );
 }
 
+async function handleEvaluate(
+  params: Record<string, unknown>,
+): Promise<unknown> {
+  const expression = asString(params.expression);
+  if (!expression || expression.trim().length === 0) {
+    throw new Error("evaluate requires a non-empty expression");
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
+  const AsyncFunction = (async () => {}).constructor as new (
+    ...args: string[]
+  ) => (...args: unknown[]) => Promise<unknown>;
+  const fn = new AsyncFunction("invoke", expression);
+  const result = await fn(invoke);
+
+  // Clamp serialised output so we don't blow up the MCP response.
+  const json = JSON.stringify(result, null, 2) ?? "undefined";
+  const MAX_LEN = 100_000;
+  return {
+    value: json.length <= MAX_LEN ? result : undefined,
+    display:
+      json.length > MAX_LEN ? `${json.slice(0, MAX_LEN)}…(truncated)` : json,
+  };
+}
+
 async function handleCaptureScreenshot(
   params: Record<string, unknown>,
 ): Promise<unknown> {
@@ -647,6 +673,8 @@ async function executeAction(
       return handleWaitFor(params);
     case "capture_screenshot":
       return handleCaptureScreenshot(params);
+    case "evaluate":
+      return handleEvaluate(params);
     default:
       throw new Error(`Unsupported debug UI action '${action}'`);
   }

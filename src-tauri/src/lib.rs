@@ -495,6 +495,9 @@ pub(crate) struct SpawnAgentRequest {
     pub(crate) parent_agent_id: Option<u64>,
     pub(crate) name: Option<String>,
     pub(crate) ephemeral: Option<bool>,
+    /// Images to attach to the initial message sent to the agent.
+    #[serde(skip)]
+    pub(crate) images: Option<Vec<ImageAttachment>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1008,18 +1011,14 @@ fn is_valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn configured_backend_kind() -> Result<BackendKind, String> {
-    let backend_raw = std::env::var("TYDE_BACKEND_KIND").or_else(|_| std::env::var("TYDE_BACKEND"));
-    match backend_raw {
-        Ok(raw) => raw.parse::<BackendKind>(),
-        Err(_) => Ok(BackendKind::Tycode),
-    }
+fn configured_backend_kind() -> BackendKind {
+    BackendKind::Tycode
 }
 
 fn resolve_requested_backend_kind(backend_kind: Option<String>) -> Result<BackendKind, String> {
     match backend_kind {
         Some(raw) if !raw.trim().is_empty() => raw.parse::<BackendKind>(),
-        _ => configured_backend_kind(),
+        _ => Ok(configured_backend_kind()),
     }
 }
 
@@ -1081,6 +1080,11 @@ struct BackendDependencyStatus {
     codex: BackendDepResult,
     claude: BackendDepResult,
     kiro: BackendDepResult,
+}
+
+#[tauri::command]
+fn get_initial_workspace() -> Option<String> {
+    std::env::var("TYDE_OPEN_WORKSPACE").ok()
 }
 
 #[tauri::command]
@@ -1510,6 +1514,7 @@ pub(crate) async fn spawn_agent_internal(
         parent_agent_id,
         name,
         ephemeral,
+        images,
     } = request;
 
     if workspace_roots.iter().all(|root| root.trim().is_empty()) {
@@ -1619,7 +1624,7 @@ pub(crate) async fn spawn_agent_internal(
         conversation_id,
         SessionCommand::SendMessage {
             message: prompt,
-            images: None,
+            images,
         },
     )
     .await?;
@@ -1893,6 +1898,115 @@ pub(crate) async fn run_agent_internal(
     Ok(agent_result_from_info(&info))
 }
 
+const QUERY_SCREENSHOT_PREAMBLE: &str = "\
+You are a visual inspector for a Tyde dev instance. A screenshot of the current UI \
+is attached to this message.
+
+Your job is to answer a visual question about the UI based on the screenshot. \
+Provide a concise, factual answer.
+
+Guidelines:
+- Be concise — your entire response will be returned as a text summary to another agent
+- Focus on answering the specific question asked
+- Describe what you see: layout, colors, spacing, visual state of elements
+- Only answer based on what is visually apparent in the screenshot
+
+Question: ";
+
+/// Take a screenshot of the dev instance, then spawn an ephemeral agent with the
+/// image attached to answer a visual question about the UI.
+pub(crate) async fn run_query_screenshot_agent(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    question: String,
+    timeout_ms: Option<u64>,
+) -> Result<String, String> {
+    // 1. Take a screenshot via the debug MCP proxy.
+    let screenshot_result = dev_instance::proxy_debug_tool_call(
+        state,
+        "tyde_debug_capture_screenshot",
+        serde_json::json!({}),
+    )
+    .await?;
+
+    // 2. Extract the base64 PNG data from the proxy response.
+    let content_arr = screenshot_result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or("Screenshot response missing content array")?;
+
+    let mut png_base64: Option<String> = None;
+    for item in content_arr {
+        if let Some(json_text) = item.get("text").and_then(|t| t.as_str()) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(json_text) {
+                if let Ok(data) = crate::debug_mcp_http::extract_valid_png_data(&meta) {
+                    png_base64 = Some(data.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let png_base64 =
+        png_base64.ok_or("Could not extract PNG data from screenshot response")?;
+
+    // 3. Build the image attachment.
+    let image_size = png_base64.len() as u64;
+    let image = ImageAttachment {
+        data: png_base64,
+        media_type: "image/png".to_string(),
+        name: "screenshot.png".to_string(),
+        size: image_size,
+    };
+
+    // 4. Spawn an ephemeral agent with the screenshot attached.
+    let prompt = format!("{QUERY_SCREENSHOT_PREAMBLE}{question}");
+    let project_dir = dev_instance::dev_instance_project_dir(state)
+        .ok_or("No dev instance running")?;
+
+    let request = SpawnAgentRequest {
+        workspace_roots: vec![project_dir],
+        prompt,
+        backend_kind: None,
+        parent_agent_id: None,
+        name: Some("__internal_query_screenshot__".to_string()),
+        ephemeral: Some(true),
+        images: Some(vec![image]),
+    };
+
+    let spawn_resp = spawn_agent_internal(app, state, request).await?;
+    let agent_id = spawn_resp.agent_id;
+
+    let wait_result = wait_for_agent_internal(
+        state,
+        WaitForAgentRequest {
+            agent_id,
+            timeout_ms: Some(timeout_ms.unwrap_or(300_000)),
+        },
+    )
+    .await;
+
+    // Collect result and terminate regardless of wait outcome.
+    let result = collect_agent_result_internal(
+        state,
+        AgentIdRequest { agent_id },
+    )
+    .await;
+
+    let _ = terminate_agent_internal(
+        state,
+        AgentIdRequest { agent_id },
+    )
+    .await;
+
+    // If the wait itself failed (timeout), return that error.
+    wait_result?;
+
+    let collected = result?;
+    collected
+        .final_message
+        .ok_or_else(|| "Query screenshot agent finished without producing a response".to_string())
+}
+
 /// epoll-style wait: block until any of the watched agents becomes idle.
 /// Returns the idle agents and the list of still-running ones.
 pub(crate) async fn await_agents_internal(
@@ -2051,6 +2165,7 @@ async fn spawn_agent(
             parent_agent_id,
             name,
             ephemeral,
+            images: None,
         },
     )
     .await
@@ -3067,6 +3182,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_initial_workspace,
             check_backend_dependencies,
             set_disabled_backends,
             install_backend_dependency,
