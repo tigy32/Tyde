@@ -50,6 +50,7 @@ export class SessionsPanel {
   }
 
   update(sessions: SessionMetadata[]): void {
+    this.aliases = this.loadAliases();
     this.sessions = sessions
       .map((s) => this.normalizeSession(s))
       .filter((s): s is NormalizedSession => s !== null);

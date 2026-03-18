@@ -835,7 +835,6 @@ export class WorkspaceView {
     this.registerConversation(this.runtimeAgentToPanelInfo(agent));
 
     if (
-      agent.parent_agent_id != null &&
       agent.name &&
       !this.pendingSessionAliases.has(agent.conversation_id) &&
       !this.conversationSessionMap.has(agent.conversation_id)

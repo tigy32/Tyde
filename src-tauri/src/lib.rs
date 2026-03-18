@@ -1643,7 +1643,18 @@ pub(crate) async fn spawn_agent_internal(
     )
     .await?;
 
-    let display_name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let display_name = name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| {
+            let trimmed = prompt.trim();
+            let truncated: String = trimmed.chars().take(60).collect();
+            if truncated.len() < trimmed.len() {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
+        });
 
     let conversation_id = {
         let mut mgr = state.manager.lock().await;
@@ -1657,7 +1668,7 @@ pub(crate) async fn spawn_agent_internal(
             workspace_roots.clone(),
             backend_kind.as_str().to_string(),
             parent_agent_id,
-            display_name.unwrap_or_else(|| format!("Agent {conversation_id}")),
+            display_name,
         )
     };
     state.agent_runtime_notify.notify_waiters();
