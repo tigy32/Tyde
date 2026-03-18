@@ -772,7 +772,11 @@ export function toolResultElement(
         root.appendChild(
           createToolResultSection(
             "Documentation",
-            createPreBlock(documentation || "No documentation returned"),
+            buildCommandOutputBlock(
+              documentation || "No documentation returned",
+              "tool-result-stdout",
+              fullHeight,
+            ),
             fullHeight,
           ),
         );
@@ -814,7 +818,11 @@ export function toolResultElement(
           root.appendChild(
             createToolResultSection(
               "Details",
-              createPreBlock(result.detailed_message),
+              buildCommandOutputBlock(
+                result.detailed_message,
+                "tool-result-stderr",
+                fullHeight,
+              ),
               true,
             ),
           );
@@ -839,11 +847,16 @@ export function toolResultElement(
           );
           return;
         }
+        const fullHeight = mode === "verbose";
         root.appendChild(
           createToolResultSection(
             "Result JSON",
-            createPreBlock(jsonPretty),
-            mode === "verbose",
+            buildCommandOutputBlock(
+              jsonPretty,
+              "tool-result-stdout",
+              fullHeight,
+            ),
+            fullHeight,
           ),
         );
       };
