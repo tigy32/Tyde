@@ -131,6 +131,7 @@ fn spawn_request_from(input: SpawnAgentToolInput) -> SpawnAgentRequest {
         parent_agent_id: input.parent_agent_id,
         name: input.name,
         ephemeral: input.ephemeral,
+        images: None,
     }
 }
 
@@ -187,6 +188,7 @@ impl TydeAgentMcpServer {
             parent_agent_id: explicit_parent,
             name: input.name,
             ephemeral: Some(false),
+            images: None,
         };
         if request.parent_agent_id.is_none() {
             request.parent_agent_id = caller_agent_id_from_parts(&parts);

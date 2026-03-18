@@ -15,7 +15,6 @@ pub(crate) struct DevInstance {
     /// Shared proxy state (cheap to clone for use across await points).
     proxy: Arc<McpProxy>,
     /// Project directory the dev instance was launched from.
-    #[allow(dead_code)]
     pub(crate) project_dir: String,
 }
 
@@ -190,6 +189,7 @@ impl McpProxy {
 pub(crate) async fn start_dev_instance(
     state: &AppState,
     project_dir: String,
+    workspace_path: Option<String>,
 ) -> Result<DevInstanceStartResult, String> {
     {
         let guard = state.dev_instance.lock();
@@ -249,7 +249,11 @@ pub(crate) async fn start_dev_instance(
         )
         .env("TYDE_DEBUG_MCP_HTTP_ENABLED", "true")
         .env("TYDE_MCP_HTTP_ENABLED", "false")
-        .env("TYDE_DRIVER_MCP_HTTP_ENABLED", "false")
+        .env("TYDE_DRIVER_MCP_HTTP_ENABLED", "false");
+    if let Some(ref ws) = workspace_path {
+        cmd.env("TYDE_OPEN_WORKSPACE", ws);
+    }
+    cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -368,6 +372,12 @@ pub(crate) async fn stop_dev_instance(state: &AppState) -> Result<DevInstanceSto
     );
 
     Ok(DevInstanceStopResult { status: "stopped" })
+}
+
+/// Return the project directory of the running dev instance, if any.
+pub(crate) fn dev_instance_project_dir(state: &AppState) -> Option<String> {
+    let guard = state.dev_instance.lock();
+    guard.as_ref().map(|i| i.project_dir.clone())
 }
 
 /// Kill the child and its entire process tree.
