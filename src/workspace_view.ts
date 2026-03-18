@@ -168,6 +168,7 @@ export class WorkspaceView {
 
     this.root = document.createElement("div");
     this.root.className = "workspace-view";
+    this.root.style.display = "none";
     this.root.dataset.testid = "workspace-view";
     this.root.dataset.viewMode = this.mode;
 
