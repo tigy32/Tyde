@@ -1,3 +1,4 @@
+import { confirm } from "@tauri-apps/plugin-dialog";
 import type { GitFileStatus } from "@tyde/protocol";
 import { applyPatch } from "diff";
 import {
@@ -428,12 +429,10 @@ export class GitPanel {
   }
 
   private async discardFile(path: string): Promise<void> {
-    if (
-      !window.confirm(
-        `Discard all changes to "${path}"? This cannot be undone.`,
-      )
-    )
-      return;
+    const confirmed = await confirm(
+      `Discard all changes to "${path}"? This cannot be undone.`,
+    );
+    if (!confirmed) return;
     try {
       await gitDiscard(this.workingDir, [path]);
       await this.refresh();
