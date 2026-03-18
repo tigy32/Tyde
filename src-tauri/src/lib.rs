@@ -55,13 +55,14 @@ use crate::remote::{
 use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
 
-/// Implements SubAgentEmitter for Claude Code sessions. Registers sub-agents
-/// in the Tyde AgentRuntime and creates per-sub-agent event forwarding.
+/// Implements SubAgentEmitter for backend sessions that expose provider-native
+/// sub-agent lifecycle events. Registers sub-agents in the Tyde AgentRuntime
+/// and creates per-sub-agent event forwarding.
 ///
 /// For non-bridge conversations, `parent_agent_id` starts as `None`. The first
 /// time a sub-agent is spawned, the parent conversation is lazily registered in
 /// the AgentRuntime so that the parent-child hierarchy is visible in the UI.
-struct ClaudeSubAgentEmitter {
+struct BackendSubAgentEmitter {
     app: tauri::AppHandle,
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
@@ -71,9 +72,11 @@ struct ClaudeSubAgentEmitter {
     lazy_parent_agent_id: Mutex<Option<u64>>,
     parent_conversation_id: u64,
     workspace_roots: Vec<String>,
+    backend_kind: String,
+    assistant_sender_name: String,
 }
 
-impl ClaudeSubAgentEmitter {
+impl BackendSubAgentEmitter {
     /// Resolve the parent agent_id. If no explicit parent was set (non-bridge
     /// conversations), lazily register the parent conversation in the runtime.
     async fn resolve_parent_agent_id(&self) -> Option<u64> {
@@ -90,7 +93,7 @@ impl ClaudeSubAgentEmitter {
         let info = runtime.register_agent(
             self.parent_conversation_id,
             self.workspace_roots.clone(),
-            "claude".to_string(),
+            self.backend_kind.clone(),
             None,
             "Conversation".to_string(),
         );
@@ -101,7 +104,7 @@ impl ClaudeSubAgentEmitter {
     }
 }
 
-impl SubAgentEmitter for ClaudeSubAgentEmitter {
+impl SubAgentEmitter for BackendSubAgentEmitter {
     fn on_subagent_spawned(
         &self,
         tool_use_id: String,
@@ -132,7 +135,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                 let mut info = runtime.register_agent(
                     conversation_id,
                     self.workspace_roots.clone(),
-                    "claude".to_string(),
+                    self.backend_kind.clone(),
                     parent_agent_id,
                     display_name,
                 );
@@ -148,7 +151,8 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
             self.agent_runtime_notify.notify_waiters();
 
             tracing::info!(
-                "Claude sub-agent spawned: agent_id={}, conversation_id={}, parent={:?}, tool_use_id={}",
+                "{} sub-agent spawned: agent_id={}, conversation_id={}, parent={:?}, tool_use_id={}",
+                self.backend_kind,
                 agent_info.agent_id,
                 conversation_id,
                 parent_agent_id,
@@ -164,7 +168,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                 "data": {
                     "agent_id": agent_info.agent_id,
                     "workspace_roots": self.workspace_roots,
-                    "backend_kind": "claude",
+                    "backend_kind": &self.backend_kind,
                     "name": &agent_info.name,
                     "agent_type": &agent_info.agent_type,
                     "parent_agent_id": parent_agent_id,
@@ -259,7 +263,7 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
                             serde_json::json!({
                                 "message": {
                                     "timestamp": crate::claude::unix_now_ms(),
-                                    "sender": { "Assistant": { "agent": "Claude" } },
+                                    "sender": { "Assistant": { "agent": &self.assistant_sender_name } },
                                     "content": summary,
                                     "tool_calls": [],
                                     "images": [],
@@ -301,12 +305,22 @@ impl SubAgentEmitter for ClaudeSubAgentEmitter {
             }
 
             tracing::info!(
-                "Claude sub-agent completed: agent_id={}, tool_use_id={}, success={}",
+                "{} sub-agent completed: agent_id={}, tool_use_id={}, success={}",
+                self.backend_kind,
                 agent_id,
                 tool_use_id,
                 success,
             );
         })
+    }
+}
+
+fn backend_assistant_sender_name(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Codex => "Codex",
+        BackendKind::Claude => "Claude",
+        BackendKind::Kiro => "Kiro",
     }
 }
 
@@ -1316,7 +1330,7 @@ async fn create_conversation(
         let mgr = state.manager.lock().await;
         let session = mgr.get(id).ok_or("Conversation not found")?;
         session
-            .set_subagent_emitter(Arc::new(ClaudeSubAgentEmitter {
+            .set_subagent_emitter(Arc::new(BackendSubAgentEmitter {
                 app: app.clone(),
                 agent_runtime: state.agent_runtime.clone(),
                 agent_runtime_notify: state.agent_runtime_notify.clone(),
@@ -1324,6 +1338,8 @@ async fn create_conversation(
                 lazy_parent_agent_id: Mutex::new(None),
                 parent_conversation_id: id,
                 workspace_roots: workspace_roots.clone(),
+                backend_kind: backend_kind.as_str().to_string(),
+                assistant_sender_name: backend_assistant_sender_name(backend_kind).to_string(),
             }))
             .await;
     }
@@ -1590,7 +1606,7 @@ pub(crate) async fn spawn_agent_internal(
         let mgr = state.manager.lock().await;
         let session = mgr.get(conversation_id).ok_or("Conversation not found")?;
         session
-            .set_subagent_emitter(Arc::new(ClaudeSubAgentEmitter {
+            .set_subagent_emitter(Arc::new(BackendSubAgentEmitter {
                 app: app.clone(),
                 agent_runtime: state.agent_runtime.clone(),
                 agent_runtime_notify: state.agent_runtime_notify.clone(),
@@ -1598,6 +1614,8 @@ pub(crate) async fn spawn_agent_internal(
                 lazy_parent_agent_id: Mutex::new(None),
                 parent_conversation_id: conversation_id,
                 workspace_roots: workspace_roots.clone(),
+                backend_kind: backend_kind.as_str().to_string(),
+                assistant_sender_name: backend_assistant_sender_name(backend_kind).to_string(),
             }))
             .await;
     }

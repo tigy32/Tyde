@@ -11,6 +11,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::claude::{SubAgentEmitter, SubAgentHandle};
 use crate::subprocess::ImageAttachment;
 
 const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -20,6 +21,7 @@ const CODEX_ESTIMATED_CONTEXT_WINDOW: u64 = 256_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
+const CODEX_FORCED_THREAD_SANDBOX: &str = "workspace-write";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 
@@ -104,7 +106,7 @@ impl CodexSession {
                 "thread/start",
                 json!({
                     "cwd": cwd,
-                    "sandbox": "workspace-write",
+                    "sandbox": CODEX_FORCED_THREAD_SANDBOX,
                     "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
                     "ephemeral": ephemeral,
                     "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
@@ -143,6 +145,8 @@ impl CodexSession {
                 pending_request: None,
                 pending_user_input_bytes: 0,
                 conversation_bytes_total: 0,
+                subagent_emitter: None,
+                subagent_streams: HashMap::new(),
             }),
         });
 
@@ -165,6 +169,11 @@ impl CodexSession {
 
     pub async fn session_id(&self) -> Option<String> {
         Some(self.inner.state.lock().await.thread_id.clone())
+    }
+
+    pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        let mut state = self.inner.state.lock().await;
+        state.subagent_emitter = Some(emitter);
     }
 
     pub async fn shutdown(self) {
@@ -226,6 +235,30 @@ struct TurnContextEstimate {
     reasoning_bytes: u64,
 }
 
+struct CodexSubAgentStream {
+    handle: SubAgentHandle,
+    description: String,
+    receiver_thread_id: Option<String>,
+    tool_name: String,
+    external_agent_id: Option<String>,
+}
+
+struct CodexSubAgentSpawnInfo {
+    item_id: String,
+    name: String,
+    description: String,
+    agent_type: String,
+    receiver_thread_id: Option<String>,
+    tool_name: String,
+}
+
+#[derive(Clone)]
+struct CodexWaitAgentCompletion {
+    external_agent_id: String,
+    success: bool,
+    final_response: Option<String>,
+}
+
 struct CodexState {
     thread_id: String,
     model: Option<String>,
@@ -239,6 +272,8 @@ struct CodexState {
     pending_request: Option<PendingRequest>,
     pending_user_input_bytes: u64,
     conversation_bytes_total: u64,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    subagent_streams: HashMap<String, CodexSubAgentStream>,
 }
 
 struct CodexInner {
@@ -302,6 +337,9 @@ impl CodexInner {
                 let approval_policy = approval_policy_override
                     .unwrap_or_else(|| CODEX_FORCED_APPROVAL_POLICY.to_string());
                 params["approvalPolicy"] = Value::String(approval_policy);
+                // Force writable sandbox on each turn so resumed/continued threads
+                // cannot fall back to a read-only default.
+                params["sandboxPolicy"] = codex_workspace_write_sandbox_policy();
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
                     self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
@@ -464,6 +502,12 @@ impl CodexInner {
             .and_then(Value::as_array)
             .cloned()
             .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
+
+        self.complete_all_codex_subagents(
+            false,
+            Some("Sub-agent run cancelled because the session was resumed.".to_string()),
+        )
+        .await;
 
         {
             let mut state = self.state.lock().await;
@@ -735,6 +779,11 @@ impl CodexInner {
                 }));
             }
             CodexInbound::Closed { exit_code } => {
+                self.complete_all_codex_subagents(
+                    false,
+                    Some("Codex backend exited before sub-agent completion.".to_string()),
+                )
+                .await;
                 self.emit_event(json!({
                     "kind": "SubprocessExit",
                     "data": { "exit_code": exit_code }
@@ -754,6 +803,13 @@ impl CodexInner {
     }
 
     async fn handle_notification(&self, method: &str, params: &Value) {
+        if self
+            .handle_subagent_notification_if_needed(method, params)
+            .await
+        {
+            return;
+        }
+
         match method {
             "turn/started" => {
                 let turn_id = params
@@ -862,6 +918,423 @@ impl CodexInner {
         }
     }
 
+    async fn handle_subagent_notification_if_needed(&self, method: &str, params: &Value) -> bool {
+        let Some(thread_id) = extract_notification_thread_id(params) else {
+            return false;
+        };
+
+        let (event_tx, model) = {
+            let state = self.state.lock().await;
+            if thread_id == state.thread_id {
+                return false;
+            }
+            let Some(event_tx) = find_subagent_event_tx_for_thread(&state, &thread_id) else {
+                return false;
+            };
+            let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+            (event_tx, model)
+        };
+
+        self.handle_subagent_notification(method, params, &event_tx, &model)
+            .await;
+        true
+    }
+
+    async fn handle_subagent_notification(
+        &self,
+        method: &str,
+        params: &Value,
+        event_tx: &mpsc::UnboundedSender<Value>,
+        model: &str,
+    ) {
+        match method {
+            "turn/started" => {
+                let turn_id = params
+                    .get("turn")
+                    .and_then(|v| v.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn")
+                    .to_string();
+                emit_event_to(event_tx, json!({ "kind": "TypingStatusChanged", "data": true }));
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "StreamStart",
+                        "data": {
+                            "message_id": turn_id,
+                            "agent": CODEX_AGENT_NAME,
+                            "model": model
+                        }
+                    }),
+                );
+            }
+            "item/agentMessage/delta" => {
+                let delta = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if delta.is_empty() {
+                    return;
+                }
+                let message_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                    .to_string();
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "StreamDelta",
+                        "data": {
+                            "message_id": message_id,
+                            "text": delta
+                        }
+                    }),
+                );
+            }
+            reasoning_method if is_reasoning_notification_method(reasoning_method) => {
+                let Some(delta) = extract_codex_reasoning_delta_text(params) else {
+                    return;
+                };
+                let message_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                    .to_string();
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "StreamReasoningDelta",
+                        "data": {
+                            "message_id": message_id,
+                            "text": delta
+                        }
+                    }),
+                );
+            }
+            "item/started" => {
+                self.handle_subagent_item_started(params, event_tx);
+            }
+            "item/completed" => {
+                self.handle_subagent_item_completed(params, event_tx, model);
+            }
+            "turn/plan/updated" => {
+                emit_event_to(
+                    event_tx,
+                    codex_plan_update_event_from_params(params).unwrap_or_else(|| {
+                        json!({
+                            "kind": "TaskUpdate",
+                            "data": {
+                                "title": "Plan",
+                                "tasks": []
+                            }
+                        })
+                    }),
+                );
+            }
+            "turn/completed" => {
+                self.handle_subagent_turn_completed(params, event_tx);
+            }
+            "error" => {
+                let message = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex error")
+                    .to_string();
+                emit_event_to(event_tx, json!({ "kind": "Error", "data": message }));
+                emit_event_to(event_tx, json!({ "kind": "TypingStatusChanged", "data": false }));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_subagent_item_started(&self, params: &Value, event_tx: &mpsc::UnboundedSender<Value>) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("tool-call")
+            .to_string();
+
+        match item_type {
+            "commandExecution" => {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let cwd = item
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "ToolRequest",
+                        "data": {
+                            "tool_call_id": item_id,
+                            "tool_name": "run_command",
+                            "tool_type": {
+                                "kind": "RunCommand",
+                                "command": command,
+                                "working_directory": cwd
+                            }
+                        }
+                    }),
+                );
+            }
+            "fileChange" => {
+                let file_changes = parse_codex_file_changes(item);
+                if file_changes.is_empty() {
+                    return;
+                }
+                let total = file_changes.len();
+                for (idx, change) in file_changes.iter().enumerate() {
+                    let call_id = codex_file_change_call_id(&item_id, idx, total);
+                    emit_modify_file_request_to(
+                        event_tx,
+                        &call_id,
+                        &change.path,
+                        &change.before,
+                        &change.after,
+                    );
+                }
+            }
+            "collabToolCall" | "collabAgentToolCall" | "mcpToolCall" | "dynamicToolCall" => {
+                let tool_name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or(item_type)
+                    .to_string();
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "ToolRequest",
+                        "data": {
+                            "tool_call_id": item_id,
+                            "tool_name": tool_name,
+                            "tool_type": {
+                                "kind": "Other",
+                                "args": item
+                            }
+                        }
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_subagent_item_completed(
+        &self,
+        params: &Value,
+        event_tx: &mpsc::UnboundedSender<Value>,
+        model: &str,
+    ) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("item")
+            .to_string();
+
+        match item_type {
+            "agentMessage" => {
+                let text = extract_codex_item_text(item);
+                let reasoning = extract_codex_item_reasoning(item);
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "StreamEnd",
+                        "data": {
+                            "message": {
+                                "timestamp": unix_now_ms(),
+                                "sender": { "Assistant": { "agent": CODEX_AGENT_NAME } },
+                                "content": text,
+                                "reasoning": reasoning.map(|summary| json!({ "text": summary })).unwrap_or(Value::Null),
+                                "tool_calls": [],
+                                "model_info": { "model": model },
+                                "images": []
+                            }
+                        }
+                    }),
+                );
+            }
+            "reasoning" => {
+                let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
+                    return;
+                };
+                let trimmed = reasoning_text.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                emit_event_to(
+                    event_tx,
+                    json!({
+                        "kind": "StreamReasoningDelta",
+                        "data": {
+                            "message_id": item_id,
+                            "text": trimmed
+                        }
+                    }),
+                );
+            }
+            "commandExecution" => {
+                let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
+                let output = item
+                    .get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let success = exit_code == 0;
+                emit_tool_execution_completed_to(
+                    event_tx,
+                    &item_id,
+                    "run_command",
+                    success,
+                    json!({
+                        "kind": "RunCommand",
+                        "exit_code": exit_code,
+                        "stdout": output,
+                        "stderr": ""
+                    }),
+                    if success {
+                        None
+                    } else {
+                        Some(format!("Command failed with exit code {exit_code}"))
+                    },
+                );
+            }
+            "fileChange" => {
+                let success = item.get("status").and_then(Value::as_str) == Some("completed");
+                let file_changes = parse_codex_file_changes(item);
+                if file_changes.is_empty() {
+                    emit_tool_execution_completed_to(
+                        event_tx,
+                        &item_id,
+                        "file_change",
+                        success,
+                        json!({
+                            "kind": "Other",
+                            "result": item
+                        }),
+                        if success {
+                            None
+                        } else {
+                            Some("File changes were not applied".to_string())
+                        },
+                    );
+                    return;
+                }
+                let total = file_changes.len();
+                for (idx, change) in file_changes.iter().enumerate() {
+                    let call_id = codex_file_change_call_id(&item_id, idx, total);
+                    emit_tool_execution_completed_to(
+                        event_tx,
+                        &call_id,
+                        "modify_file",
+                        success,
+                        json!({
+                            "kind": "ModifyFile",
+                            "lines_added": change.lines_added,
+                            "lines_removed": change.lines_removed
+                        }),
+                        if success {
+                            None
+                        } else {
+                            Some("File changes were not applied".to_string())
+                        },
+                    );
+                }
+            }
+            "mcpToolCall" | "dynamicToolCall" => {
+                let tool_name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or(item_type);
+                let success = item.get("status").and_then(Value::as_str) == Some("completed")
+                    || item.get("success").and_then(Value::as_bool) == Some(true);
+                emit_tool_execution_completed_to(
+                    event_tx,
+                    &item_id,
+                    tool_name,
+                    success,
+                    json!({
+                        "kind": "Other",
+                        "result": item
+                    }),
+                    if success {
+                        None
+                    } else {
+                        Some(format!("{tool_name} failed"))
+                    },
+                );
+            }
+            "collabToolCall" | "collabAgentToolCall" => {
+                let tool_name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("collab_tool");
+                let success = codex_item_success(item);
+                emit_tool_execution_completed_to(
+                    event_tx,
+                    &item_id,
+                    tool_name,
+                    success,
+                    json!({
+                        "kind": "Other",
+                        "result": item
+                    }),
+                    if success {
+                        None
+                    } else {
+                        Some(format!("{tool_name} failed"))
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_subagent_turn_completed(&self, params: &Value, event_tx: &mpsc::UnboundedSender<Value>) {
+        let turn_status = params
+            .get("turn")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_string();
+
+        emit_event_to(event_tx, json!({ "kind": "TypingStatusChanged", "data": false }));
+        if turn_status == "interrupted" {
+            emit_event_to(
+                event_tx,
+                json!({
+                    "kind": "OperationCancelled",
+                    "data": { "message": "Operation cancelled" }
+                }),
+            );
+            return;
+        }
+        if turn_status == "failed" {
+            let message = params
+                .get("turn")
+                .and_then(|v| v.get("error"))
+                .and_then(|v| v.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Codex turn failed")
+                .to_string();
+            emit_event_to(event_tx, json!({ "kind": "Error", "data": message }));
+        }
+    }
+
     async fn handle_legacy_codex_event(&self, method: &str, params: &Value) {
         let Some(delta) = extract_reasoning_delta_from_legacy_codex_event(method, params) else {
             return;
@@ -891,6 +1364,8 @@ impl CodexInner {
         };
 
         if terminal {
+            self.complete_all_codex_subagents(false, Some(message.clone()))
+                .await;
             self.emit_event(json!({ "kind": "Error", "data": message }));
             self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
             return;
@@ -1260,6 +1735,25 @@ impl CodexInner {
                     );
                 }
             }
+            "collabToolCall" | "collabAgentToolCall" => {
+                let tool_name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("collab_tool")
+                    .to_string();
+                self.emit_event(json!({
+                    "kind": "ToolRequest",
+                    "data": {
+                        "tool_call_id": item_id,
+                        "tool_name": tool_name,
+                        "tool_type": {
+                            "kind": "Other",
+                            "args": item
+                        }
+                    }
+                }));
+                self.spawn_codex_subagent_if_needed(item).await;
+            }
             "mcpToolCall" | "dynamicToolCall" => {
                 let tool_name = item
                     .get("tool")
@@ -1277,6 +1771,7 @@ impl CodexInner {
                         }
                     }
                 }));
+                self.spawn_codex_subagent_if_needed(item).await;
             }
             _ => {}
         }
@@ -1367,6 +1862,10 @@ impl CodexInner {
             }
             "userMessage" => {
                 // User messages are emitted synchronously when sent to keep ordering stable.
+                // Codex may also inject subagent notifications as synthetic user messages.
+                let text = extract_codex_item_text(item);
+                self.complete_codex_subagent_from_notification_if_needed(&text)
+                    .await;
             }
             "reasoning" => {
                 let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
@@ -1566,8 +2065,268 @@ impl CodexInner {
                         Some(format!("{tool_name} failed"))
                     },
                 );
+                if codex_item_looks_like_spawn_tool(item) {
+                    self.spawn_codex_subagent_if_needed(item).await;
+                    self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
+                        .await;
+                    if !success {
+                        self.complete_codex_subagent_if_needed(&item_id, item, false)
+                            .await;
+                    }
+                } else {
+                    self.complete_codex_subagent_if_needed(&item_id, item, success)
+                        .await;
+                }
+                self.complete_codex_subagents_from_wait_if_needed(item)
+                    .await;
+            }
+            "collabToolCall" | "collabAgentToolCall" => {
+                self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
+                    .await;
+                let tool_name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("collab_tool");
+                let success = codex_item_success(item);
+                self.emit_tool_execution_completed(
+                    &item_id,
+                    tool_name,
+                    success,
+                    json!({
+                        "kind": "Other",
+                        "result": item
+                    }),
+                    if success {
+                        None
+                    } else {
+                        Some(format!("{tool_name} failed"))
+                    },
+                );
+                if codex_item_looks_like_spawn_tool(item) {
+                    self.spawn_codex_subagent_if_needed(item).await;
+                    self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
+                        .await;
+                    if !success {
+                        self.complete_codex_subagent_if_needed(&item_id, item, false)
+                            .await;
+                    }
+                } else {
+                    self.complete_codex_subagent_if_needed(&item_id, item, success)
+                        .await;
+                }
+                self.complete_codex_subagents_from_wait_if_needed(item)
+                    .await;
             }
             _ => {}
+        }
+    }
+
+    async fn spawn_codex_subagent_if_needed(&self, item: &Value) {
+        let Some(spawn) = parse_codex_subagent_spawn(item) else {
+            return;
+        };
+
+        let emitter = {
+            let state = self.state.lock().await;
+            if state.subagent_streams.contains_key(&spawn.item_id) {
+                return;
+            }
+            state.subagent_emitter.clone()
+        };
+        let Some(emitter) = emitter else {
+            return;
+        };
+
+        let handle = emitter
+            .on_subagent_spawned(
+                spawn.item_id.clone(),
+                spawn.name,
+                spawn.description.clone(),
+                spawn.agent_type,
+            )
+            .await;
+
+        let mut state = self.state.lock().await;
+        tracing::info!(
+            "Codex sub-agent spawn detected: item_id={}, tool={}",
+            spawn.item_id,
+            spawn.tool_name
+        );
+        state
+            .subagent_streams
+            .entry(spawn.item_id)
+            .or_insert(CodexSubAgentStream {
+                handle,
+                description: spawn.description,
+                receiver_thread_id: spawn.receiver_thread_id,
+                tool_name: spawn.tool_name,
+                external_agent_id: None,
+            });
+    }
+
+    async fn complete_codex_subagent_if_needed(&self, item_id: &str, item: &Value, success: bool) {
+        let (emitter, stream) = {
+            let mut state = self.state.lock().await;
+            (
+                state.subagent_emitter.clone(),
+                state.subagent_streams.remove(item_id),
+            )
+        };
+
+        let Some(stream) = stream else {
+            return;
+        };
+        let Some(emitter) = emitter else {
+            return;
+        };
+
+        let final_response = extract_codex_subagent_final_response(item).or_else(|| {
+            if success {
+                None
+            } else {
+                Some(codex_subagent_failure_message(&stream))
+            }
+        });
+
+        emitter
+            .on_subagent_completed(item_id, stream.handle.agent_id, success, final_response)
+            .await;
+    }
+
+    async fn record_codex_subagent_spawn_result_if_needed(&self, item_id: &str, item: &Value) {
+        let Some(external_agent_id) = extract_codex_spawned_agent_id(item) else {
+            return;
+        };
+
+        let mut state = self.state.lock().await;
+        if let Some(stream) = state.subagent_streams.get_mut(item_id) {
+            stream.external_agent_id = Some(external_agent_id);
+            tracing::info!(
+                "Codex sub-agent mapped: item_id={} -> external_agent_id={}",
+                item_id,
+                stream.external_agent_id.as_deref().unwrap_or("")
+            );
+        }
+    }
+
+    async fn complete_codex_subagents_from_wait_if_needed(&self, item: &Value) {
+        let completions = extract_codex_wait_agent_completions(item);
+        if completions.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "Codex wait-agent completion payload parsed: {} entrie(s)",
+            completions.len()
+        );
+        for completion in completions {
+            self.complete_codex_subagent_by_external_id(
+                &completion.external_agent_id,
+                completion.success,
+                completion.final_response.clone(),
+            )
+            .await;
+        }
+    }
+
+    async fn complete_codex_subagent_from_notification_if_needed(&self, text: &str) {
+        let Some(completion) = extract_codex_subagent_notification_completion(text) else {
+            return;
+        };
+        tracing::info!(
+            "Codex subagent notification parsed for external_agent_id={}",
+            completion.external_agent_id
+        );
+        self.complete_codex_subagent_by_external_id(
+            &completion.external_agent_id,
+            completion.success,
+            completion.final_response,
+        )
+        .await;
+    }
+
+    async fn complete_codex_subagent_by_external_id(
+        &self,
+        external_agent_id: &str,
+        success: bool,
+        final_response: Option<String>,
+    ) {
+        let (emitter, stream_item_id, stream) = {
+            let mut state = self.state.lock().await;
+            let emitter = state.subagent_emitter.clone();
+
+            let direct_match = state.subagent_streams.iter().find_map(|(item_id, stream)| {
+                (stream.external_agent_id.as_deref() == Some(external_agent_id))
+                    .then(|| item_id.clone())
+            });
+
+            let fallback_single_unknown = if direct_match.is_none() {
+                let mut unknown = state
+                    .subagent_streams
+                    .iter()
+                    .filter(|(_, stream)| stream.external_agent_id.is_none())
+                    .map(|(item_id, _)| item_id.clone());
+                let first = unknown.next();
+                if first.is_some() && unknown.next().is_none() {
+                    first
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let item_id = direct_match.or(fallback_single_unknown);
+            let stream = item_id
+                .as_ref()
+                .and_then(|id| state.subagent_streams.remove(id));
+            (emitter, item_id, stream)
+        };
+
+        let Some(emitter) = emitter else {
+            return;
+        };
+        let Some(item_id) = stream_item_id else {
+            return;
+        };
+        let Some(stream) = stream else {
+            return;
+        };
+
+        let final_response = final_response.or_else(|| {
+            if success {
+                None
+            } else {
+                Some(codex_subagent_failure_message(&stream))
+            }
+        });
+
+        emitter
+            .on_subagent_completed(&item_id, stream.handle.agent_id, success, final_response)
+            .await;
+    }
+
+    async fn complete_all_codex_subagents(&self, success: bool, message: Option<String>) {
+        let (emitter, streams) = {
+            let mut state = self.state.lock().await;
+            let streams = state.subagent_streams.drain().collect::<Vec<_>>();
+            (state.subagent_emitter.clone(), streams)
+        };
+
+        let Some(emitter) = emitter else {
+            return;
+        };
+
+        for (item_id, stream) in streams {
+            let final_response = message.clone().or_else(|| {
+                if success {
+                    None
+                } else {
+                    Some(codex_subagent_failure_message(&stream))
+                }
+            });
+            emitter
+                .on_subagent_completed(&item_id, stream.handle.agent_id, success, final_response)
+                .await;
         }
     }
 
@@ -1646,6 +2405,8 @@ impl CodexInner {
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
 
         if turn_status == "interrupted" {
+            self.complete_all_codex_subagents(false, Some("Operation cancelled".to_string()))
+                .await;
             self.emit_event(json!({
                 "kind": "OperationCancelled",
                 "data": { "message": "Operation cancelled" }
@@ -1661,6 +2422,8 @@ impl CodexInner {
                 .and_then(Value::as_str)
                 .unwrap_or("Codex turn failed")
                 .to_string();
+            self.complete_all_codex_subagents(false, Some(message.clone()))
+                .await;
             self.emit_event(json!({ "kind": "Error", "data": message }));
         }
     }
@@ -1738,6 +2501,154 @@ impl CodexInner {
     }
 }
 
+fn emit_event_to(event_tx: &mpsc::UnboundedSender<Value>, event: Value) {
+    if let Err(e) = event_tx.send(event) {
+        tracing::trace!("sub-agent event send failed: {e}");
+    }
+}
+
+fn emit_tool_execution_completed_to(
+    event_tx: &mpsc::UnboundedSender<Value>,
+    tool_call_id: &str,
+    tool_name: &str,
+    success: bool,
+    tool_result: Value,
+    error: Option<String>,
+) {
+    emit_event_to(
+        event_tx,
+        json!({
+            "kind": "ToolExecutionCompleted",
+            "data": {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_result": tool_result,
+                "success": success,
+                "error": error
+            }
+        }),
+    );
+}
+
+fn emit_modify_file_request_to(
+    event_tx: &mpsc::UnboundedSender<Value>,
+    tool_call_id: &str,
+    file_path: &str,
+    before: &str,
+    after: &str,
+) {
+    emit_event_to(
+        event_tx,
+        json!({
+            "kind": "ToolRequest",
+            "data": {
+                "tool_call_id": tool_call_id,
+                "tool_name": "modify_file",
+                "tool_type": {
+                    "kind": "ModifyFile",
+                    "file_path": file_path,
+                    "before": before,
+                    "after": after
+                }
+            }
+        }),
+    );
+}
+
+fn extract_notification_thread_id(params: &Value) -> Option<String> {
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("thread_id").and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("threadId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("thread_id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| params.get("senderThreadId").and_then(Value::as_str))
+        .map(|id| id.to_string())
+}
+
+fn find_subagent_event_tx_for_thread(
+    state: &CodexState,
+    thread_id: &str,
+) -> Option<mpsc::UnboundedSender<Value>> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return None;
+    }
+
+    if let Some(stream) = state.subagent_streams.values().find(|stream| {
+        stream.receiver_thread_id.as_deref() == Some(thread_id)
+            || stream.external_agent_id.as_deref() == Some(thread_id)
+    }) {
+        return Some(stream.handle.event_tx.clone());
+    }
+
+    // Early in a spawn, Codex may start emitting sub-agent notifications before
+    // the receiver thread id is recorded. If exactly one sub-agent stream is
+    // unresolved, route to that stream.
+    let mut unresolved = state
+        .subagent_streams
+        .values()
+        .filter(|stream| {
+            stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none()
+        })
+        .map(|stream| stream.handle.event_tx.clone());
+    let first = unresolved.next()?;
+    if unresolved.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+fn codex_plan_update_event_from_params(params: &Value) -> Option<Value> {
+    let title = params
+        .get("explanation")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Plan")
+        .to_string();
+    let plan = params.get("plan").and_then(Value::as_array)?;
+    let tasks = plan
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| {
+            let status = step
+                .get("status")
+                .and_then(Value::as_str)
+                .map(map_plan_status)
+                .unwrap_or("pending");
+            json!({
+                "id": idx as u64 + 1,
+                "description": step.get("step").and_then(Value::as_str).unwrap_or("step"),
+                "status": status
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(json!({
+        "kind": "TaskUpdate",
+        "data": {
+            "title": title,
+            "tasks": tasks
+        }
+    }))
+}
+
 fn codex_thread_to_session_metadata(thread: &Value) -> Option<Value> {
     let session_id = thread.get("id").and_then(Value::as_str)?;
     let preview = thread
@@ -1801,6 +2712,493 @@ fn codex_thread_to_session_metadata(thread: &Value) -> Option<Value> {
         "message_count": message_count,
         "backend_kind": "codex"
     }))
+}
+
+fn codex_item_success(item: &Value) -> bool {
+    if let Some(success) = item.get("success").and_then(Value::as_bool) {
+        return success;
+    }
+
+    let normalized_status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("agentStatus").and_then(Value::as_str))
+        .map(|status| status.trim().to_ascii_lowercase());
+
+    match normalized_status.as_deref() {
+        Some("completed" | "complete" | "succeeded" | "success" | "ok" | "done") => true,
+        Some("failed" | "error" | "cancelled" | "canceled" | "interrupted" | "denied") => false,
+        _ => true,
+    }
+}
+
+fn parse_codex_subagent_spawn(item: &Value) -> Option<CodexSubAgentSpawnInfo> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if !matches!(
+        item_type,
+        "collabToolCall" | "collabAgentToolCall" | "dynamicToolCall" | "mcpToolCall"
+    ) {
+        return None;
+    }
+
+    let tool_name = codex_item_tool_name(item).unwrap_or_else(|| "collab_tool".to_string());
+    let looks_like_spawn = if matches!(item_type, "collabToolCall" | "collabAgentToolCall") {
+        codex_collab_item_looks_like_spawn(item) || codex_tool_name_is_spawn(&tool_name)
+    } else {
+        codex_tool_name_is_spawn(&tool_name)
+    };
+    if !looks_like_spawn {
+        return None;
+    }
+
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("callId").and_then(Value::as_str))
+        .or_else(|| item.get("toolCallId").and_then(Value::as_str))?
+        .to_string();
+    let description = codex_find_string(
+        item,
+        &["prompt", "task", "instruction", "message", "description"],
+        5,
+    )
+    .unwrap_or_default();
+    let agent_type = codex_find_string(
+        item,
+        &[
+            "receiverAgentType",
+            "agentType",
+            "subagentType",
+            "subagent_type",
+            "agent_type",
+        ],
+        5,
+    )
+    .unwrap_or_default();
+
+    let name = codex_find_string(
+        item,
+        &[
+            "description",
+            "receiverAgentName",
+            "receiverName",
+            "name",
+            "subagent_type",
+            "agent_type",
+        ],
+        5,
+    )
+    .unwrap_or_else(|| {
+        if !agent_type.is_empty() {
+            agent_type.clone()
+        } else if codex_tool_name_is_spawn(&tool_name) {
+            "Sub-agent".to_string()
+        } else {
+            tool_name.clone()
+        }
+    });
+
+    let receiver_thread_id = codex_find_string(
+        item,
+        &["newThreadId", "receiverThreadId", "receiverThreadIds"],
+        5,
+    );
+
+    Some(CodexSubAgentSpawnInfo {
+        item_id,
+        name,
+        description,
+        agent_type,
+        receiver_thread_id,
+        tool_name,
+    })
+}
+
+fn codex_item_looks_like_spawn_tool(item: &Value) -> bool {
+    codex_item_tool_name(item)
+        .map(|name| codex_tool_name_is_spawn(&name))
+        .unwrap_or(false)
+}
+
+fn codex_item_looks_like_wait_tool(item: &Value) -> bool {
+    codex_item_tool_name(item)
+        .map(|name| codex_tool_name_is_wait(&name))
+        .unwrap_or(false)
+}
+
+fn codex_item_tool_name(item: &Value) -> Option<String> {
+    codex_find_string(item, &["tool", "name"], 3)
+}
+
+fn codex_normalize_tool_name(tool_name: &str) -> String {
+    tool_name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>()
+}
+
+fn codex_tool_name_is_spawn(tool_name: &str) -> bool {
+    let normalized = codex_normalize_tool_name(tool_name);
+    normalized == "spawnagent"
+        || normalized == "spawnsubagent"
+        || normalized == "delegate"
+        || normalized.ends_with("spawnagent")
+        || normalized.ends_with("spawnsubagent")
+        || normalized.contains("delegate")
+}
+
+fn codex_tool_name_is_wait(tool_name: &str) -> bool {
+    let normalized = codex_normalize_tool_name(tool_name);
+    normalized == "wait"
+        || normalized == "waitagent"
+        || normalized == "awaitagent"
+        || normalized.ends_with("waitagent")
+        || normalized.ends_with("awaitagent")
+}
+
+fn codex_collab_item_looks_like_spawn(item: &Value) -> bool {
+    if codex_find_string(item, &["newThreadId"], 3).is_some() {
+        return true;
+    }
+
+    let tool = codex_find_string(item, &["tool"], 3).unwrap_or_default();
+    let normalized_tool = codex_normalize_tool_name(&tool);
+    if codex_tool_name_is_spawn(&tool)
+        || normalized_tool.contains("delegate")
+        || normalized_tool.contains("subagent")
+    {
+        return true;
+    }
+
+    let source_kind = codex_find_string(item, &["sourceKind", "source_kind"], 3)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    source_kind.contains("spawn")
+}
+
+fn extract_codex_spawned_agent_id(item: &Value) -> Option<String> {
+    let mut found: Option<String> = None;
+    codex_visit_value_and_embedded_json(item, 6, &mut |candidate| {
+        if found.is_some() {
+            return;
+        }
+        found = codex_find_string(
+            candidate,
+            &[
+                "spawnedAgentId",
+                "spawned_agent_id",
+                "agentId",
+                "agent_id",
+                "newThreadId",
+                "receiverThreadId",
+                "receiverThreadIds",
+            ],
+            3,
+        );
+    });
+    found
+}
+
+fn extract_codex_wait_agent_completions(item: &Value) -> Vec<CodexWaitAgentCompletion> {
+    if !codex_item_looks_like_wait_tool(item) {
+        return Vec::new();
+    }
+
+    let mut by_id: HashMap<String, CodexWaitAgentCompletion> = HashMap::new();
+    codex_visit_value_and_embedded_json(item, 6, &mut |candidate| {
+        if let Some(status_map) = candidate.get("status").and_then(Value::as_object) {
+            for (external_agent_id, status_entry) in status_map {
+                if let Some(completion) =
+                    codex_parse_wait_agent_status_entry(external_agent_id, status_entry)
+                {
+                    by_id.insert(completion.external_agent_id.clone(), completion);
+                }
+            }
+        }
+
+        if let Some(states) = candidate.get("agentsStates").and_then(Value::as_object) {
+            for (external_agent_id, state_entry) in states {
+                if let Some(completion) =
+                    codex_parse_collab_agent_state_entry(external_agent_id, state_entry)
+                {
+                    by_id.insert(completion.external_agent_id.clone(), completion);
+                }
+            }
+        }
+    });
+
+    by_id.into_values().collect()
+}
+
+fn codex_parse_collab_agent_state_entry(
+    external_agent_id: &str,
+    state_entry: &Value,
+) -> Option<CodexWaitAgentCompletion> {
+    let external_agent_id = external_agent_id.trim();
+    if external_agent_id.is_empty() {
+        return None;
+    }
+
+    let status = state_entry
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let final_response = state_entry
+        .get("message")
+        .and_then(codex_status_text_from_entry)
+        .or_else(|| codex_status_text_from_entry(state_entry));
+
+    match status.as_str() {
+        "completed" => Some(CodexWaitAgentCompletion {
+            external_agent_id: external_agent_id.to_string(),
+            success: true,
+            final_response,
+        }),
+        "errored" | "error" | "failed" | "interrupted" | "shutdown" | "notfound" => {
+            Some(CodexWaitAgentCompletion {
+                external_agent_id: external_agent_id.to_string(),
+                success: false,
+                final_response,
+            })
+        }
+        "running" | "pendinginit" => None,
+        _ => None,
+    }
+}
+
+fn codex_parse_wait_agent_status_entry(
+    external_agent_id: &str,
+    status_entry: &Value,
+) -> Option<CodexWaitAgentCompletion> {
+    let external_agent_id = external_agent_id.trim();
+    if external_agent_id.is_empty() {
+        return None;
+    }
+
+    let (success, final_response) = match status_entry {
+        Value::Object(map) => {
+            if let Some(value) = map.get("completed") {
+                (true, codex_status_text_from_entry(value))
+            } else if let Some(value) = map.get("failed").or_else(|| map.get("error")) {
+                (false, codex_status_text_from_entry(value))
+            } else if let Some(value) = map
+                .get("cancelled")
+                .or_else(|| map.get("canceled"))
+                .or_else(|| map.get("interrupted"))
+            {
+                (false, codex_status_text_from_entry(value))
+            } else if let Some(success) = map.get("success").and_then(Value::as_bool) {
+                let text = map
+                    .get("message")
+                    .or_else(|| map.get("result"))
+                    .or_else(|| map.get("summary"))
+                    .and_then(codex_status_text_from_entry);
+                (success, text)
+            } else if let Some(status) = map.get("status").and_then(Value::as_str) {
+                let normalized = status.trim().to_ascii_lowercase();
+                let success = matches!(
+                    normalized.as_str(),
+                    "completed" | "complete" | "succeeded" | "success" | "ok" | "done"
+                );
+                let text = map
+                    .get("message")
+                    .or_else(|| map.get("result"))
+                    .or_else(|| map.get("summary"))
+                    .and_then(codex_status_text_from_entry);
+                (success, text)
+            } else {
+                (true, codex_status_text_from_entry(status_entry))
+            }
+        }
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => {
+            (true, codex_status_text_from_entry(status_entry))
+        }
+        _ => (true, None),
+    };
+
+    Some(CodexWaitAgentCompletion {
+        external_agent_id: external_agent_id.to_string(),
+        success,
+        final_response,
+    })
+}
+
+fn codex_status_text_from_entry(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(num) = value.as_i64() {
+        return Some(num.to_string());
+    }
+    if let Some(num) = value.as_u64() {
+        return Some(num.to_string());
+    }
+    if let Some(num) = value.as_f64() {
+        return Some(num.to_string());
+    }
+    if let Some(flag) = value.as_bool() {
+        return Some(flag.to_string());
+    }
+    codex_find_string(
+        value,
+        &[
+            "message",
+            "result",
+            "summary",
+            "text",
+            "content",
+            "output",
+            "completed",
+            "failed",
+            "error",
+        ],
+        3,
+    )
+}
+
+fn extract_codex_subagent_notification_completion(text: &str) -> Option<CodexWaitAgentCompletion> {
+    let payload = codex_extract_tagged_payload_json(text, "subagent_notification")?;
+    let external_agent_id = codex_find_string(&payload, &["agent_id", "agentId"], 3)?;
+    let status_entry = payload.get("status").cloned().unwrap_or(Value::Null);
+    if let Some(parsed) = codex_parse_wait_agent_status_entry(&external_agent_id, &status_entry) {
+        return Some(parsed);
+    }
+    Some(CodexWaitAgentCompletion {
+        external_agent_id,
+        success: true,
+        final_response: codex_status_text_from_entry(&status_entry),
+    })
+}
+
+fn codex_extract_tagged_payload_json(text: &str, tag: &str) -> Option<Value> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)?;
+    let end = text.find(&close)?;
+    if end <= start + open.len() {
+        return None;
+    }
+    let payload = text[start + open.len()..end].trim();
+    serde_json::from_str(payload).ok()
+}
+
+fn codex_visit_value_and_embedded_json<F>(value: &Value, depth: usize, visitor: &mut F)
+where
+    F: FnMut(&Value),
+{
+    if depth == 0 {
+        return;
+    }
+
+    visitor(value);
+
+    match value {
+        Value::Object(map) => {
+            for child in map.values() {
+                codex_visit_value_and_embedded_json(child, depth - 1, visitor);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                codex_visit_value_and_embedded_json(item, depth - 1, visitor);
+            }
+        }
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty()
+                && (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && trimmed.len() <= 2_000_000
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    codex_visit_value_and_embedded_json(&parsed, depth - 1, visitor);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn codex_subagent_failure_message(stream: &CodexSubAgentStream) -> String {
+    if let Some(thread_id) = stream.receiver_thread_id.as_ref() {
+        format!("{} failed (thread {}).", stream.tool_name, thread_id)
+    } else if !stream.description.trim().is_empty() {
+        format!("{} failed: {}", stream.tool_name, stream.description)
+    } else {
+        format!("{} failed", stream.tool_name)
+    }
+}
+
+fn extract_codex_subagent_final_response(item: &Value) -> Option<String> {
+    let text = codex_find_string(
+        item,
+        &[
+            "finalResponse",
+            "final_response",
+            "response",
+            "resultText",
+            "output",
+            "summary",
+            "text",
+            "message",
+        ],
+        5,
+    )?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn codex_find_string(value: &Value, keys: &[&str], depth: usize) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(candidate) = map.get(*key) {
+                    if let Some(found) = candidate.as_str() {
+                        let trimmed = found.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                    if let Some(items) = candidate.as_array() {
+                        for item in items {
+                            if let Some(found) = item.as_str() {
+                                let trimmed = found.trim();
+                                if !trimmed.is_empty() {
+                                    return Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(found) = codex_find_string(child, keys, depth - 1) {
+                    return Some(found);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(found) = codex_find_string(item, keys, depth - 1) {
+                    return Some(found);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 fn extract_codex_item_text(item: &Value) -> String {
@@ -2580,6 +3978,10 @@ fn parse_review_decision(message: &str) -> &'static str {
     }
 }
 
+fn codex_workspace_write_sandbox_policy() -> Value {
+    json!({ "type": "workspaceWrite" })
+}
+
 fn normalize_reasoning_effort(raw: &str) -> Option<String> {
     let normalized = raw.trim().to_ascii_lowercase();
     let value = match normalized.as_str() {
@@ -2974,6 +4376,101 @@ impl CodexRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn live_test_verbose() -> bool {
+        std::env::var("TYDE_LIVE_CODEX_TEST_VERBOSE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    }
+
+    fn live_test_log(msg: &str) {
+        eprintln!("[live-codex-test] {msg}");
+    }
+
+    fn summarize_live_event(event: &Value) -> String {
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        match kind {
+            "ToolRequest" => {
+                let tool_name = event
+                    .get("data")
+                    .and_then(|d| d.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let call_id = event
+                    .get("data")
+                    .and_then(|d| d.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                format!("kind=ToolRequest tool={tool_name} call_id={call_id}")
+            }
+            "ToolExecutionCompleted" => {
+                let tool_name = event
+                    .get("data")
+                    .and_then(|d| d.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let success = event
+                    .get("data")
+                    .and_then(|d| d.get("success"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let call_id = event
+                    .get("data")
+                    .and_then(|d| d.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                format!(
+                    "kind=ToolExecutionCompleted tool={tool_name} success={success} call_id={call_id}"
+                )
+            }
+            "Error" => {
+                let data = event.get("data").cloned().unwrap_or(Value::Null);
+                format!("kind=Error data={data}")
+            }
+            "StreamStart" => {
+                let model = event
+                    .get("data")
+                    .and_then(|d| d.get("model"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                format!("kind=StreamStart model={model}")
+            }
+            "StreamEnd" => {
+                let content = event
+                    .get("data")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let preview = if content.len() > 80 {
+                    format!("{}...", &content[..80])
+                } else {
+                    content.to_string()
+                };
+                format!("kind=StreamEnd preview={preview:?}")
+            }
+            "MessageAdded" => {
+                let sender = event
+                    .get("data")
+                    .and_then(|d| d.get("sender"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                format!("kind=MessageAdded sender={sender}")
+            }
+            "TypingStatusChanged" => {
+                let typing = event.get("data").and_then(Value::as_bool).unwrap_or(false);
+                format!("kind=TypingStatusChanged typing={typing}")
+            }
+            other => format!("kind={other}"),
+        }
+    }
 
     fn test_codex_state() -> CodexState {
         CodexState {
@@ -2994,7 +4491,588 @@ mod tests {
             pending_request: None,
             pending_user_input_bytes: 0,
             conversation_bytes_total: 0,
+            subagent_emitter: None,
+            subagent_streams: HashMap::new(),
         }
+    }
+
+    fn test_codex_inner() -> (Arc<CodexInner>, mpsc::UnboundedReceiver<Value>) {
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let stdin = child.stdin.take().expect("capture test child stdin");
+        let rpc = CodexRpc {
+            stdin: Arc::new(Mutex::new(stdin)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            child: Arc::new(Mutex::new(Some(child))),
+        };
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(CodexInner {
+            rpc,
+            event_tx,
+            state: Mutex::new(test_codex_state()),
+        });
+        (inner, event_rx)
+    }
+
+    fn drain_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    #[derive(Debug)]
+    struct RecordedSpawn {
+        tool_use_id: String,
+        name: String,
+        description: String,
+        agent_type: String,
+        agent_id: u64,
+    }
+
+    #[derive(Debug)]
+    struct RecordedCompletion {
+        tool_use_id: String,
+        agent_id: u64,
+        success: bool,
+        final_response: Option<String>,
+    }
+
+    struct RecordingSubAgentEmitter {
+        next_agent_id: AtomicU64,
+        spawns: tokio::sync::Mutex<Vec<RecordedSpawn>>,
+        completions: tokio::sync::Mutex<Vec<RecordedCompletion>>,
+        events_by_agent_id: Arc<tokio::sync::Mutex<HashMap<u64, Vec<Value>>>>,
+    }
+
+    impl RecordingSubAgentEmitter {
+        fn new() -> Self {
+            Self {
+                next_agent_id: AtomicU64::new(1),
+                spawns: tokio::sync::Mutex::new(Vec::new()),
+                completions: tokio::sync::Mutex::new(Vec::new()),
+                events_by_agent_id: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            }
+        }
+
+        async fn spawn_count(&self) -> usize {
+            self.spawns.lock().await.len()
+        }
+
+        async fn completion_count(&self) -> usize {
+            self.completions.lock().await.len()
+        }
+
+        async fn events_by_agent(&self) -> HashMap<u64, Vec<Value>> {
+            self.events_by_agent_id.lock().await.clone()
+        }
+    }
+
+    impl SubAgentEmitter for RecordingSubAgentEmitter {
+        fn on_subagent_spawned(
+            &self,
+            tool_use_id: String,
+            name: String,
+            description: String,
+            agent_type: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>> {
+            Box::pin(async move {
+                let agent_id = self.next_agent_id.fetch_add(1, Ordering::Relaxed);
+                let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+                let events_by_agent_id = Arc::clone(&self.events_by_agent_id);
+                tokio::spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        let mut guard = events_by_agent_id.lock().await;
+                        guard.entry(agent_id).or_default().push(event);
+                    }
+                });
+                live_test_log(&format!(
+                    "spawn callback: tool_use_id={tool_use_id} agent_id={agent_id} name={name:?} agent_type={agent_type:?} description={description:?}"
+                ));
+                self.spawns.lock().await.push(RecordedSpawn {
+                    tool_use_id,
+                    name,
+                    description,
+                    agent_type,
+                    agent_id,
+                });
+                SubAgentHandle {
+                    agent_id,
+                    conversation_id: 10_000 + agent_id,
+                    event_tx,
+                }
+            })
+        }
+
+        fn on_subagent_completed(
+            &self,
+            tool_use_id: &str,
+            agent_id: u64,
+            success: bool,
+            final_response: Option<String>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let tool_use_id = tool_use_id.to_string();
+            Box::pin(async move {
+                live_test_log(&format!(
+                    "completion callback: tool_use_id={tool_use_id} agent_id={agent_id} success={success} final_response={final_response:?}"
+                ));
+                self.completions.lock().await.push(RecordedCompletion {
+                    tool_use_id,
+                    agent_id,
+                    success,
+                    final_response,
+                });
+            })
+        }
+    }
+
+    #[test]
+    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    fn live_codex_spawn_agent_round_trip_emits_subagent_callbacks() {
+        live_test_log("starting live codex sub-agent test");
+        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+            return;
+        }
+        live_test_log("preflight: TYDE_LIVE_CODEX_TEST=1 set");
+
+        let codex_available = std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        live_test_log(&format!("preflight: codex --version available={codex_available}"));
+        if !codex_available {
+            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
+            return;
+        }
+
+        if let Ok(out) = std::process::Command::new("codex")
+            .args(["login", "status"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            let logged_in = out.status.success() && combined.contains("logged in");
+            let explicitly_not_logged_in = combined.contains("not logged in");
+            if live_test_verbose() {
+                live_test_log(&format!(
+                    "preflight: codex login status exit={} stdout={:?} stderr={:?}",
+                    out.status, stdout, stderr
+                ));
+            } else {
+                live_test_log(&format!(
+                    "preflight: codex login status exit={} logged_in={} explicitly_not_logged_in={}",
+                    out.status, logged_in, explicitly_not_logged_in
+                ));
+            }
+            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
+                eprintln!(
+                    "Skipping live Codex test (`codex login status` indicates no active login)."
+                );
+                return;
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let workspace = std::env::temp_dir().join(format!("tyde-codex-live-subagent-{suffix}"));
+            std::fs::create_dir_all(&workspace).expect("create temp workspace");
+            std::fs::write(workspace.join("hello.txt"), "hello from live test\n")
+                .expect("seed workspace file");
+            live_test_log(&format!("workspace prepared: {}", workspace.display()));
+
+            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
+            live_test_log("spawning CodexSession");
+            let (session, mut event_rx) = CodexSession::spawn(&workspace_roots, None, &[])
+                .await
+                .expect("spawn codex session");
+            live_test_log("CodexSession spawned");
+            let emitter = Arc::new(RecordingSubAgentEmitter::new());
+            session
+                .set_subagent_emitter(emitter.clone() as Arc<dyn SubAgentEmitter>)
+                .await;
+            live_test_log("sub-agent emitter attached");
+
+            let prompt = r#"Test harness: you MUST call spawn_agent exactly once and then wait_agent.
+1) spawn_agent: use agent_type "worker", message "Read hello.txt and reply exactly: LIVE_SUBAGENT_OK".
+2) wait_agent: wait for that spawned agent id.
+3) Return a one-line summary.
+If you skip spawn_agent or wait_agent, this test fails."#;
+            live_test_log(&format!("sending prompt: {prompt}"));
+
+            session
+                .command_handle()
+                .execute(SessionCommand::SendMessage {
+                    message: prompt.to_string(),
+                    images: None,
+                })
+                .await
+                .expect("send message");
+            live_test_log("prompt sent; waiting for completion callback");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+            let idle_grace = Duration::from_secs(8);
+            let mut poll_ticks: u64 = 0;
+            let mut tool_request_count: u64 = 0;
+            let mut tool_execution_completed_count: u64 = 0;
+            let mut stream_end_count: u64 = 0;
+            let mut last_stream_end_preview: Option<String> = None;
+            let mut seen_typing_true = false;
+            let mut last_typing_status: Option<bool> = None;
+            let mut idle_edge_at: Option<tokio::time::Instant> = None;
+            let mut event_stream_closed = false;
+            while tokio::time::Instant::now() < deadline {
+                poll_ticks = poll_ticks.saturating_add(1);
+                if emitter.completion_count().await > 0 {
+                    live_test_log("completion callback observed; exiting wait loop");
+                    break;
+                }
+                if let Some(idle_at) = idle_edge_at {
+                    if tokio::time::Instant::now().duration_since(idle_at) >= idle_grace {
+                        live_test_log(&format!(
+                            "idle edge grace elapsed ({:?}) with no completion callback; exiting wait loop",
+                            idle_grace
+                        ));
+                        break;
+                    }
+                }
+
+                match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
+                    Ok(Some(event)) => {
+                        if live_test_verbose() {
+                            live_test_log(&format!("event(raw): {event}"));
+                        } else {
+                            live_test_log(&format!("event: {}", summarize_live_event(&event)));
+                        }
+                        if event.get("kind").and_then(Value::as_str) == Some("Error") {
+                            let spawn_count_now = emitter.spawn_count().await;
+                            let completion_count_now = emitter.completion_count().await;
+                            live_test_log(&format!(
+                                "error event encountered; spawn_count={spawn_count_now} completion_count={completion_count_now}"
+                            ));
+                            panic!("Codex emitted error during live subagent test: {event}");
+                        }
+                        match event.get("kind").and_then(Value::as_str) {
+                            Some("ToolRequest") => {
+                                tool_request_count = tool_request_count.saturating_add(1);
+                            }
+                            Some("ToolExecutionCompleted") => {
+                                tool_execution_completed_count =
+                                    tool_execution_completed_count.saturating_add(1);
+                            }
+                            Some("StreamEnd") => {
+                                stream_end_count = stream_end_count.saturating_add(1);
+                                let content = event
+                                    .get("data")
+                                    .and_then(|d| d.get("message"))
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                if !content.is_empty() {
+                                    let preview = if content.len() > 120 {
+                                        format!("{}...", &content[..120])
+                                    } else {
+                                        content.to_string()
+                                    };
+                                    last_stream_end_preview = Some(preview);
+                                }
+                            }
+                            Some("TypingStatusChanged") => {
+                                let typing =
+                                    event.get("data").and_then(Value::as_bool).unwrap_or(false);
+                                if typing {
+                                    seen_typing_true = true;
+                                    idle_edge_at = None;
+                                }
+                                if matches!(last_typing_status, Some(true)) && !typing {
+                                    idle_edge_at = Some(tokio::time::Instant::now());
+                                    live_test_log(
+                                        "detected TypingStatusChanged true->false (model idle edge)",
+                                    );
+                                }
+                                last_typing_status = Some(typing);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None) => {
+                        event_stream_closed = true;
+                        live_test_log("event stream closed before completion");
+                        break;
+                    }
+                    Err(_) => {
+                        if poll_ticks % 10 == 0 {
+                            live_test_log(&format!(
+                                "still waiting... elapsed={}s",
+                                poll_ticks.saturating_mul(2)
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let spawn_count = emitter.spawn_count().await;
+            let completion_count = emitter.completion_count().await;
+            let wait_diagnostics = format!(
+                "seen_typing_true={} last_typing_status={:?} idle_edge_observed={} tool_requests={} tool_execution_completed_events={} stream_ends={} last_stream_end_preview={:?} event_stream_closed={} poll_ticks={}",
+                seen_typing_true,
+                last_typing_status,
+                idle_edge_at.is_some(),
+                tool_request_count,
+                tool_execution_completed_count,
+                stream_end_count,
+                last_stream_end_preview,
+                event_stream_closed,
+                poll_ticks
+            );
+            live_test_log(&format!(
+                "post-run counts: spawn_count={spawn_count} completion_count={completion_count}"
+            ));
+            live_test_log(&format!("wait diagnostics: {wait_diagnostics}"));
+            assert!(
+                spawn_count > 0,
+                "Expected at least one sub-agent spawn callback from live Codex run. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                completion_count > 0,
+                "Expected at least one sub-agent completion callback from live Codex run. diagnostics={wait_diagnostics}"
+            );
+            let spawns = emitter.spawns.lock().await;
+            let completions = emitter.completions.lock().await;
+            for spawn in spawns.iter() {
+                live_test_log(&format!(
+                    "recorded spawn: tool_use_id={} agent_id={} name={:?} agent_type={:?} description={:?}",
+                    spawn.tool_use_id,
+                    spawn.agent_id,
+                    spawn.name,
+                    spawn.agent_type,
+                    spawn.description
+                ));
+            }
+            for completion in completions.iter() {
+                live_test_log(&format!(
+                    "recorded completion: tool_use_id={} agent_id={} success={} final_response={:?}",
+                    completion.tool_use_id,
+                    completion.agent_id,
+                    completion.success,
+                    completion.final_response
+                ));
+            }
+            assert!(
+                spawns.iter().any(|s| !s.tool_use_id.is_empty()),
+                "spawn callback should include a tool_use_id. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                spawns.iter().any(|s| s.agent_id > 0),
+                "spawn callback should include a non-zero agent_id. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                spawns.iter().any(|s| !s.name.trim().is_empty()),
+                "spawn callback should include a display name. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                spawns
+                    .iter()
+                    .any(|s| !s.description.is_empty() || !s.agent_type.is_empty()),
+                "spawn callback should include description or agent type metadata. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                completions.iter().any(|c| !c.tool_use_id.is_empty() && c.agent_id > 0),
+                "completion callback should include tool_use_id and agent_id. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                completions.iter().any(|c| c.success || c.final_response.is_some()),
+                "completion callback should provide success or a final response. diagnostics={wait_diagnostics}"
+            );
+            let events_by_agent = emitter.events_by_agent().await;
+            for (agent_id, events) in &events_by_agent {
+                live_test_log(&format!(
+                    "sub-agent event stream: agent_id={} events={}",
+                    agent_id,
+                    events.len()
+                ));
+            }
+            assert!(
+                events_by_agent.values().any(|events| {
+                    events
+                        .iter()
+                        .any(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                }),
+                "sub-agent event stream should include a StreamEnd. diagnostics={wait_diagnostics}"
+            );
+            assert!(
+                events_by_agent.values().any(|events| {
+                    events
+                        .iter()
+                        .any(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                }),
+                "sub-agent event stream should include at least one ToolRequest. diagnostics={wait_diagnostics}"
+            );
+            drop(spawns);
+            drop(completions);
+            live_test_log("shutting down session");
+            session.shutdown().await;
+
+            let _ = std::fs::remove_dir_all(&workspace);
+            live_test_log("workspace removed; final assertions");
+
+            live_test_log("live codex sub-agent test completed successfully");
+        });
+    }
+
+    #[test]
+    fn subagent_thread_notifications_route_to_subagent_channel_not_parent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+
+            {
+                let mut state = inner.state.lock().await;
+                state.thread_id = "thread-parent".to_string();
+                state.subagent_streams.insert(
+                    "spawn-1".to_string(),
+                    CodexSubAgentStream {
+                        handle: SubAgentHandle {
+                            agent_id: 1,
+                            conversation_id: 10_001,
+                            event_tx: subagent_tx,
+                        },
+                        description: "Test sub-agent".to_string(),
+                        receiver_thread_id: Some("thread-sub-1".to_string()),
+                        tool_name: "spawnAgent".to_string(),
+                        external_agent_id: Some("thread-sub-1".to_string()),
+                    },
+                );
+            }
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "turn": { "id": "turn-sub-1" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "cmd-sub-1",
+                            "command": "cat hello.txt",
+                            "cwd": "/tmp"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "cmd-sub-1",
+                            "exitCode": 0,
+                            "aggregatedOutput": "LIVE_SUBAGENT_OK"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-1",
+                            "text": "LIVE_SUBAGENT_OK"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-sub-1",
+                        "turn": {
+                            "id": "turn-sub-1",
+                            "status": "completed"
+                        }
+                    }),
+                )
+                .await;
+
+            let parent_events = drain_events(&mut parent_rx);
+            assert!(
+                parent_events.is_empty(),
+                "sub-agent thread notifications should not emit into parent conversation: {parent_events:?}"
+            );
+
+            let subagent_events = drain_events(&mut subagent_rx);
+            assert!(
+                subagent_events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolRequest")
+                        && event
+                            .get("data")
+                            .and_then(|d| d.get("tool_name"))
+                            .and_then(Value::as_str)
+                            == Some("run_command")
+                }),
+                "expected sub-agent ToolRequest(run_command), got events={subagent_events:?}"
+            );
+            assert!(
+                subagent_events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted")
+                        && event
+                            .get("data")
+                            .and_then(|d| d.get("tool_name"))
+                            .and_then(Value::as_str)
+                            == Some("run_command")
+                }),
+                "expected sub-agent ToolExecutionCompleted(run_command), got events={subagent_events:?}"
+            );
+            assert!(
+                subagent_events.iter().any(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                        && event
+                            .get("data")
+                            .and_then(|d| d.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(Value::as_str)
+                            == Some("LIVE_SUBAGENT_OK")
+                }),
+                "expected sub-agent StreamEnd with final message, got events={subagent_events:?}"
+            );
+
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]
@@ -3323,5 +5401,208 @@ mod tests {
         assert_eq!(usage["input_tokens"], json!(90));
         assert_eq!(usage["output_tokens"], json!(30));
         assert_eq!(usage["total_tokens"], json!(120));
+    }
+
+    #[test]
+    fn parse_codex_subagent_spawn_reads_collab_shape() {
+        let item = json!({
+            "type": "collabToolCall",
+            "id": "collab-1",
+            "tool": "spawn_agent",
+            "newThreadId": "thread_sub_1",
+            "prompt": "Review src/auth.ts for race conditions",
+            "receiverAgentType": "reviewer",
+            "description": "Auth Reviewer"
+        });
+
+        let parsed = parse_codex_subagent_spawn(&item).expect("spawn item");
+        assert_eq!(parsed.item_id, "collab-1");
+        assert_eq!(parsed.tool_name, "spawn_agent");
+        assert_eq!(parsed.name, "Auth Reviewer");
+        assert_eq!(parsed.description, "Review src/auth.ts for race conditions");
+        assert_eq!(parsed.agent_type, "reviewer");
+        assert_eq!(parsed.receiver_thread_id.as_deref(), Some("thread_sub_1"));
+    }
+
+    #[test]
+    fn parse_codex_subagent_spawn_reads_collab_agent_shape() {
+        let item = json!({
+            "type": "collabAgentToolCall",
+            "id": "collab-agent-1",
+            "tool": "spawnAgent",
+            "receiverThreadIds": ["thread_sub_42"],
+            "prompt": "Read hello.txt and reply exactly: LIVE_SUBAGENT_OK",
+            "model": "gpt-5.3-codex"
+        });
+
+        let parsed = parse_codex_subagent_spawn(&item).expect("collab agent spawn");
+        assert_eq!(parsed.item_id, "collab-agent-1");
+        assert_eq!(parsed.tool_name, "spawnAgent");
+        assert_eq!(
+            parsed.description,
+            "Read hello.txt and reply exactly: LIVE_SUBAGENT_OK"
+        );
+        assert_eq!(parsed.receiver_thread_id.as_deref(), Some("thread_sub_42"));
+    }
+
+    #[test]
+    fn parse_codex_subagent_spawn_ignores_non_spawn_collab_calls() {
+        let item = json!({
+            "type": "collabToolCall",
+            "id": "collab-2",
+            "tool": "wait_agent",
+            "receiverThreadId": "thread_sub_1"
+        });
+        assert!(parse_codex_subagent_spawn(&item).is_none());
+    }
+
+    #[test]
+    fn parse_codex_subagent_spawn_reads_dynamic_spawn_call() {
+        let item = json!({
+            "type": "dynamicToolCall",
+            "id": "dyn-1",
+            "tool": "spawn_agent",
+            "arguments": {
+                "agent_type": "worker",
+                "message": "Read hello.py and add a greeting"
+            }
+        });
+
+        let parsed = parse_codex_subagent_spawn(&item).expect("dynamic spawn");
+        assert_eq!(parsed.item_id, "dyn-1");
+        assert_eq!(parsed.tool_name, "spawn_agent");
+        assert_eq!(parsed.agent_type, "worker");
+        assert_eq!(parsed.description, "Read hello.py and add a greeting");
+    }
+
+    #[test]
+    fn extract_codex_spawned_agent_id_reads_stringified_result_payload() {
+        let item = json!({
+            "type": "dynamicToolCall",
+            "tool": "spawn_agent",
+            "output": "{\"agent_id\":\"agent_123\"}"
+        });
+        assert_eq!(
+            extract_codex_spawned_agent_id(&item),
+            Some("agent_123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_codex_wait_agent_completions_reads_status_map() {
+        let item = json!({
+            "type": "dynamicToolCall",
+            "tool": "wait_agent",
+            "output": "{\"status\":{\"agent_123\":{\"completed\":\"done\"},\"agent_456\":{\"failed\":\"boom\"}},\"timed_out\":false}"
+        });
+
+        let completions = extract_codex_wait_agent_completions(&item);
+        let by_id = completions
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.external_agent_id,
+                    (entry.success, entry.final_response),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            by_id.get("agent_123"),
+            Some(&(true, Some("done".to_string())))
+        );
+        assert_eq!(
+            by_id.get("agent_456"),
+            Some(&(false, Some("boom".to_string())))
+        );
+    }
+
+    #[test]
+    fn extract_codex_wait_agent_completions_reads_collab_agent_states() {
+        let item = json!({
+            "type": "collabAgentToolCall",
+            "id": "collab-wait-1",
+            "tool": "wait",
+            "agentsStates": {
+                "thread_sub_ok": { "status": "completed", "message": "LIVE_SUBAGENT_OK" },
+                "thread_sub_err": { "status": "errored", "message": "boom" },
+                "thread_sub_running": { "status": "running", "message": "still running" }
+            }
+        });
+
+        let completions = extract_codex_wait_agent_completions(&item);
+        let by_id = completions
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.external_agent_id,
+                    (entry.success, entry.final_response),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            by_id.get("thread_sub_ok"),
+            Some(&(true, Some("LIVE_SUBAGENT_OK".to_string())))
+        );
+        assert_eq!(
+            by_id.get("thread_sub_err"),
+            Some(&(false, Some("boom".to_string())))
+        );
+        assert!(
+            !by_id.contains_key("thread_sub_running"),
+            "running state should not be treated as a completed wait result"
+        );
+    }
+
+    #[test]
+    fn codex_tool_name_matchers_handle_camel_case_collab_tools() {
+        assert!(codex_tool_name_is_spawn("spawnAgent"));
+        assert!(codex_tool_name_is_wait("wait"));
+    }
+
+    #[test]
+    fn extract_codex_subagent_notification_completion_reads_wrapped_payload() {
+        let text = r#"<subagent_notification>
+{"agent_id":"agent_123","status":{"completed":"worker finished"}}
+</subagent_notification>"#;
+
+        let completion =
+            extract_codex_subagent_notification_completion(text).expect("subagent notification");
+        assert_eq!(completion.external_agent_id, "agent_123");
+        assert!(completion.success);
+        assert_eq!(
+            completion.final_response,
+            Some("worker finished".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_item_success_uses_status_and_success_flag() {
+        assert!(codex_item_success(&json!({ "status": "completed" })));
+        assert!(!codex_item_success(&json!({ "status": "failed" })));
+        assert!(!codex_item_success(
+            &json!({ "success": false, "status": "completed" })
+        ));
+    }
+
+    #[test]
+    fn extract_codex_subagent_final_response_prefers_text_fields() {
+        let item = json!({
+            "type": "collabToolCall",
+            "result": {
+                "summary": "Finished static analysis; no critical issues."
+            }
+        });
+        assert_eq!(
+            extract_codex_subagent_final_response(&item),
+            Some("Finished static analysis; no critical issues.".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_workspace_write_sandbox_policy_is_workspace_write() {
+        let policy = codex_workspace_write_sandbox_policy();
+        assert_eq!(policy.get("type").and_then(Value::as_str), Some("workspaceWrite"));
     }
 }

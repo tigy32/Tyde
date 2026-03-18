@@ -150,6 +150,10 @@ const SPAWN_TOOL_NAMES = new Set([
   "Agent",
   "tyde_spawn_agent",
   "tyde_run_agent",
+  "spawn_agent",
+  "spawnAgent",
+  "spawn_subagent",
+  "delegate",
 ]);
 
 export function isSpawnTool(toolName: string): boolean {
