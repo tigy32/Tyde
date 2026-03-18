@@ -2263,6 +2263,8 @@ export class WorkspaceView {
         await cancelConversation(conversationId);
         return;
       }
+      const tab = this.tabManager.getTabByConversationId(conversationId);
+      if (tab) this.tabManager.closeTab(tab.id);
       this.closeConversationPermanently(conversationId);
     } catch (err) {
       const actionLabel = action === "interrupt" ? "interrupt" : "remove";
