@@ -340,6 +340,21 @@ export class EventRouter {
           "progress",
         );
         break;
+      case "TypingStatusChanged":
+        // Do NOT unregister here — the backend can emit TypingStatusChanged(false)
+        // before ToolRequest(ask_user_question) in approval flows (see codex.rs).
+        // Unregistering prematurely would drop the ToolRequest and any later events.
+        // Only SubprocessExit and Error are truly terminal.
+        if (event.data !== true) {
+          diffPanel.updateFeedbackProgress(
+            convId,
+            "Agent finished",
+            "complete",
+          );
+          const filePath = this.feedbackAgentFiles.get(convId);
+          if (filePath && this.onRefreshFile) this.onRefreshFile(filePath);
+        }
+        break;
       case "SubprocessExit":
         diffPanel.updateFeedbackProgress(convId, "Agent finished", "complete");
         this.unregisterFeedbackAgent(convId);

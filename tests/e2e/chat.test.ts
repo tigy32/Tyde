@@ -5,6 +5,7 @@ const WORKSPACE_CONV_ID = 10000;
 afterEach(async () => {
   await browser.execute(() => {
     delete (window as any).__mockFinalTypingDelayMs;
+    delete (window as any).__mockReadFileContentByPath;
   });
 });
 
@@ -1800,6 +1801,13 @@ describe('Agents panel parity', () => {
   it('retains feedback-agent conversation history when opened after background execution', async () => {
     await openWorkspace();
 
+    // Set up mock to return updated content when the file is re-read after feedback.
+    await browser.execute(() => {
+      (window as any).__mockReadFileContentByPath = {
+        '/mock/workspace/README.md': '# Updated heading\n',
+      };
+    });
+
     const feedbackId = await spawnFeedbackAgent(
       '/mock/workspace/README.md',
       '# Old content',
@@ -1839,6 +1847,58 @@ describe('Agents panel parity', () => {
     const msgCount = await assistantMessages.length;
     const latestText = await assistantMessages[msgCount - 1].getText();
     expect(latestText).toContain('Mock response to: Apply the following feedback to file: /mock/workspace/README.md');
+
+    // --- Regression: feedback agents complete via TypingStatusChanged ---
+    // The mock backend emits TypingStatusChanged(false) but never SubprocessExit.
+    // The feedback agent must still be marked completed (not running) in
+    // the agents panel. Before the fix, the feedback handler only listened
+    // for SubprocessExit, leaving the inline spinner stuck in progress.
+    await openAgentsWidget();
+    expect((await $$(sel.agentCardRunning)).length).toBe(0);
+    const cardIsCompleted = await browser.execute((cardSel: string) => {
+      const cards = Array.from(document.querySelectorAll(cardSel)) as HTMLElement[];
+      const visible = cards.find((el) => el.offsetParent !== null);
+      return visible?.classList.contains('agent-card-completed') ?? false;
+    }, sel.agentCard);
+    expect(cardIsCompleted).toBe(true);
+
+    // Switch back to the file tab so the diff panel is visible for assertions.
+    await browser.execute(() => {
+      const fileTab = document.querySelector('[data-testid="conv-tab"].conv-tab-file') as HTMLElement | null;
+      fileTab?.click();
+    });
+
+    // --- Bug A: feedback box in diff panel shows "complete" (not stuck on spinner) ---
+    // The inline feedback box should transition from a spinner to a checkmark icon
+    // when the feedback agent finishes via TypingStatusChanged(false).
+    await browser.waitUntil(
+      async () => browser.execute(() => document.querySelector('.feedback-complete-icon') !== null),
+      { timeout: 5000, timeoutMsg: 'Expected feedback box to show completion icon' },
+    );
+    const feedbackBoxStatus = await browser.execute(() => {
+      const completeIcon = document.querySelector('.feedback-complete-icon');
+      const spinner = document.querySelector('.feedback-spinner');
+      return {
+        hasCompleteIcon: completeIcon !== null,
+        hasSpinner: spinner !== null,
+        completeIconText: completeIcon?.textContent ?? null,
+      };
+    });
+    expect(feedbackBoxStatus.hasCompleteIcon).toBe(true);
+    expect(feedbackBoxStatus.hasSpinner).toBe(false);
+    expect(feedbackBoxStatus.completeIconText).toBe('✓');
+
+    // --- Bug B: open file tab content refreshed after feedback agent modifies it ---
+    // The file was opened with '# Old content' but the mock read_file_content now
+    // returns '# Updated heading\n'. The refresh triggered on TypingStatusChanged(false)
+    // should have updated the tab content.
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const lines = document.querySelectorAll('.diff-panel-file-line');
+        return Array.from(lines).some((el) => (el.textContent ?? '').includes('Updated heading'));
+      }),
+      { timeout: 5000, timeoutMsg: 'Expected file tab content to be refreshed with updated content' },
+    );
   });
 
   it('shows runtime agents in both the project and home agents views and supports interrupt/remove controls', async () => {
