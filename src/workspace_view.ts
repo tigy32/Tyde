@@ -1950,13 +1950,65 @@ export class WorkspaceView {
       feedback: string,
     ) => {
       if (!this.diffPanel.onFeedbackSubmit) return null;
-      return this.diffPanel.onFeedbackSubmit(
-        filePath,
-        0,
-        0,
-        lineContent,
-        feedback,
+
+      // Open a file tab so the diff panel has visible content and the
+      // refreshFileContent path can be exercised by the test.
+      this.openFileViewerTab(lineContent, filePath);
+
+      // Create a feedback box in the diff panel so the test can assert
+      // on its visible status (spinner → checkmark transition).
+      this.diffPanel.showFeedbackInput(0, 0, filePath, [lineContent]);
+      const key = `${filePath}:0-0`;
+      const box = (this.diffPanel as any).feedbackBoxes.get(key) as
+        | {
+            status: string;
+            summary: string;
+            conversationId: number | null;
+            element: HTMLElement;
+          }
+        | undefined;
+      if (box) {
+        box.status = "progress";
+        box.summary = "Starting...";
+        (this.diffPanel as any).renderFeedbackProgress(box, feedback);
+      }
+
+      // Replicate the onFeedbackSubmit logic but set box.conversationId
+      // before sendMessage so that synchronous mock events can find the box.
+      const backendKind = this.resolveConversationBackend();
+      const id = await createConversation(
+        this.resolveWorkspaceRootsForBackend(backendKind),
+        backendKind,
+        true,
       );
+      this.chatPanel.setConversationBackendKind(id, backendKind);
+      const fileName = filePath.split("/").pop() || filePath;
+      this.registerConversation({
+        conversationId: id,
+        name: `Feedback: ${fileName}:1-1`,
+        summary: "Applying feedback...",
+        isTyping: true,
+        createdAt: Date.now(),
+        projectId: this.projectId,
+      });
+      this.eventRouter.registerFeedbackAgent(id, filePath);
+      if (box) box.conversationId = id;
+
+      const message = [
+        `Apply the following feedback to file: ${filePath}`,
+        "Lines 1-1:",
+        "```",
+        lineContent,
+        "```",
+        "",
+        "Feedback:",
+        feedback,
+        "",
+        "Apply these changes autonomously without asking questions.",
+      ].join("\n");
+      await sendMessage(id, message);
+
+      return id;
     };
   }
 
