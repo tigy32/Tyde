@@ -1003,6 +1003,170 @@ describe('Chat tab lifecycle', () => {
       (window as any).__mockIncludeToolCalls = false;
     });
 
+    // --- AskUserQuestion renders as question card, not a stuck "Running..." card ---
+    const askToolCallId = 'test-ask-user-1';
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamDelta', { text: 'Let me ask you a question.' });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamEnd', {
+      message: makeAssistantMessage('Let me ask you a question.', [
+        { id: askToolCallId, name: 'AskUserQuestion', arguments: {
+          questions: [{
+            question: 'Which language do you prefer?',
+            header: 'Language',
+            options: [
+              { label: 'Rust', description: 'Systems programming' },
+              { label: 'Python', description: 'Scripting language' },
+            ],
+            multiSelect: false,
+          }],
+        }},
+      ]),
+    });
+
+    // AskUserQuestion should NOT create a pending tool card
+    await browser.pause(100);
+    const askPendingCount = await browser.execute((toolStatusSel: string) => {
+      const statuses = document.querySelectorAll(toolStatusSel);
+      return Array.from(statuses).filter(el => el.textContent?.trim() === 'Pending').length;
+    }, sel.toolStatusText);
+    expect(askPendingCount).toBe(0);
+
+    // Emit ToolRequest — should render custom question card
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolRequest', {
+      tool_call_id: askToolCallId,
+      tool_name: 'AskUserQuestion',
+      tool_type: {
+        kind: 'Other',
+        args: {
+          tool: 'AskUserQuestion',
+          arguments: {
+            questions: [{
+              question: 'Which language do you prefer?',
+              header: 'Language',
+              options: [
+                { label: 'Rust', description: 'Systems programming' },
+                { label: 'Python', description: 'Scripting language' },
+              ],
+              multiSelect: false,
+            }],
+          },
+        },
+      },
+    });
+
+    // Question text and options should be visible
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        return document.body.textContent?.includes('Which language do you prefer?') ?? false;
+      }),
+      { timeout: 3000, timeoutMsg: 'AskUserQuestion text should be visible' },
+    );
+    const askOptions = await browser.execute(() => {
+      const items = document.querySelectorAll('.ask-question-options li');
+      return Array.from(items).map(li => li.textContent?.trim() ?? '');
+    });
+    expect(askOptions.length).toBe(2);
+    expect(askOptions[0]).toContain('Rust');
+    expect(askOptions[1]).toContain('Python');
+
+    // Card status should say "Waiting for response", not "Running..."
+    const askStatus = await browser.execute(() => {
+      const cards = document.querySelectorAll('[data-testid="tool-card"]');
+      const lastCard = cards[cards.length - 1];
+      const status = lastCard?.querySelector('.tool-status-text');
+      return status?.textContent?.trim() ?? '';
+    });
+    expect(askStatus).toBe('Waiting for response');
+
+    // Emit ToolExecutionCompleted — card should NOT flip to "Done"
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolExecutionCompleted', {
+      tool_call_id: askToolCallId,
+      tool_name: 'AskUserQuestion',
+      tool_result: { kind: 'Other', result: null },
+      success: true,
+    });
+    await browser.pause(100);
+    const askStatusAfter = await browser.execute(() => {
+      const cards = document.querySelectorAll('[data-testid="tool-card"]');
+      const lastCard = cards[cards.length - 1];
+      const status = lastCard?.querySelector('.tool-status-text');
+      return status?.textContent?.trim() ?? '';
+    });
+    expect(askStatusAfter).toBe('Waiting for response');
+
+    // --- ExitPlanMode renders plan content from tool result ---
+    const planToolCallId = 'test-exit-plan-1';
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamDelta', { text: 'Here is my plan.' });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamEnd', {
+      message: makeAssistantMessage('Here is my plan.', [
+        { id: planToolCallId, name: 'ExitPlanMode', arguments: {} },
+      ]),
+    });
+
+    // ExitPlanMode should NOT create a pending tool card
+    await browser.pause(100);
+    const planPendingCount = await browser.execute((toolStatusSel: string) => {
+      const statuses = document.querySelectorAll(toolStatusSel);
+      return Array.from(statuses).filter(el => el.textContent?.trim() === 'Pending').length;
+    }, sel.toolStatusText);
+    expect(planPendingCount).toBe(0);
+
+    // Emit ToolRequest — initially renders as plan-mode-indicator
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolRequest', {
+      tool_call_id: planToolCallId,
+      tool_name: 'ExitPlanMode',
+      tool_type: { kind: 'Other', args: { tool: 'ExitPlanMode', arguments: {} } },
+    });
+
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const indicator = document.querySelector('.plan-mode-indicator');
+        return indicator?.textContent?.includes('Plan ready') ?? false;
+      }),
+      { timeout: 3000, timeoutMsg: 'ExitPlanMode should render as "Plan ready" indicator' },
+    );
+
+    // Emit ToolExecutionCompleted with plan_content — indicator upgrades to plan card
+    const planMarkdown = '## Step 1\n\nDo the first thing.\n\n## Step 2\n\nDo the second thing.';
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolExecutionCompleted', {
+      tool_call_id: planToolCallId,
+      tool_name: 'ExitPlanMode',
+      tool_result: { kind: 'Other', result: { plan_content: planMarkdown } },
+      success: true,
+    });
+
+    // Plan content should be rendered as markdown
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const planContent = document.querySelector('.plan-content');
+        return planContent?.textContent?.includes('Step 1') ?? false;
+      }),
+      { timeout: 3000, timeoutMsg: 'ExitPlanMode should render plan content as markdown' },
+    );
+
+    // Plan card should show "Plan" as name and "Ready for review" as status
+    const planCardInfo = await browser.execute(() => {
+      const contentEl = document.querySelector('.plan-content');
+      const card = contentEl?.closest('.tool-card');
+      const name = card?.querySelector('.tool-name')?.textContent?.trim();
+      const status = card?.querySelector('.tool-status-text')?.textContent?.trim();
+      return { name, status };
+    });
+    expect(planCardInfo.name).toBe('Plan');
+    expect(planCardInfo.status).toBe('Ready for review');
+
+    // No stuck statuses
+    const planHasStuckStatus = await browser.execute(() => {
+      const contentEl = document.querySelector('.plan-content');
+      const container = contentEl?.closest('.embedded-tool-calls');
+      if (!container) return false;
+      const statusTexts = Array.from(container.querySelectorAll('.tool-status-text'))
+        .map(el => el.textContent?.trim());
+      return statusTexts.includes('Running...') || statusTexts.includes('Pending');
+    });
+    expect(planHasStuckStatus).toBe(false);
+
     // --- Sessions panel loads data ---
     await openSessionsWidget();
     await browser.waitUntil(

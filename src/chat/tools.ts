@@ -160,6 +160,16 @@ export function isSpawnTool(toolName: string): boolean {
   return SPAWN_TOOL_NAMES.has(toolName);
 }
 
+const USER_INPUT_TOOL_NAMES = new Set([
+  "AskUserQuestion",
+  "ExitPlanMode",
+  "EnterPlanMode",
+]);
+
+export function isUserInputTool(toolName: string): boolean {
+  return USER_INPUT_TOOL_NAMES.has(toolName);
+}
+
 function extractSpawnDetail(
   _toolName: string,
   toolType: ToolRequestType,
@@ -187,6 +197,43 @@ function extractSpawnDetail(
 
   if (label && detail) return `${label}: ${detail}`;
   return label || detail;
+}
+
+interface UserQuestionOption {
+  label: string;
+  description: string;
+}
+
+interface UserQuestion {
+  question: string;
+  options: UserQuestionOption[];
+}
+
+function extractUserQuestions(toolType: ToolRequestType): UserQuestion[] {
+  if (toolType.kind !== "Other") return [];
+  const args = toolType.args as Record<string, unknown> | null;
+  if (!args || typeof args !== "object") return [];
+  // The tool arguments arrive nested: args = { tool: "AskUserQuestion", arguments: { questions: [...] } }
+  const inner = args.arguments as Record<string, unknown> | undefined;
+  const raw = inner?.questions;
+  if (!Array.isArray(raw)) return [];
+  const result: UserQuestion[] = [];
+  for (const q of raw) {
+    if (!q || typeof q !== "object" || typeof q.question !== "string") continue;
+    const options: UserQuestionOption[] = [];
+    if (Array.isArray(q.options)) {
+      for (const o of q.options) {
+        if (o && typeof o === "object" && typeof o.label === "string") {
+          options.push({
+            label: o.label,
+            description: typeof o.description === "string" ? o.description : "",
+          });
+        }
+      }
+    }
+    result.push({ question: q.question, options });
+  }
+  return result;
 }
 
 export function countLines(text: string): number {
@@ -961,6 +1008,9 @@ export function createPendingToolCards(
   for (const toolCall of toolCalls) {
     state.toolHostByCall.set(toolCall.id, appendTarget);
     if (state.toolCards.has(toolCall.id)) continue;
+    // User-input tools get custom rendering in handleToolRequest —
+    // skip the generic pending card so the custom path runs.
+    if (isUserInputTool(toolCall.name)) continue;
 
     const isSpawn = isSpawnTool(toolCall.name);
 
@@ -1043,6 +1093,87 @@ export function handleToolRequest(
     }
   }
 
+  // ExitPlanMode / EnterPlanMode: plan text is already in the assistant
+  // message — just show a subtle indicator instead of a tool card.
+  if (toolName === "ExitPlanMode" || toolName === "EnterPlanMode") {
+    const indicator = document.createElement("div");
+    indicator.className = "plan-mode-indicator";
+    indicator.textContent =
+      toolName === "ExitPlanMode"
+        ? "Plan ready for review"
+        : "Entering plan mode";
+    toolCallsContainer.appendChild(indicator);
+    state.toolCards.set(toolCallId, indicator);
+    scrollToBottom();
+    return;
+  }
+
+  // AskUserQuestion: render as a question card with options.
+  if (toolName === "AskUserQuestion") {
+    const card = document.createElement("div");
+    card.className = "tool-card tool-call-item";
+    card.dataset.testid = "tool-card";
+    card.setAttribute("role", "region");
+    card.setAttribute("aria-label", "Question");
+
+    const header = document.createElement("div");
+    header.className = "tool-card-header";
+
+    const iconEl = document.createElement("span");
+    iconEl.className = "tool-status-icon";
+    iconEl.textContent = "❓";
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "tool-name";
+    nameEl.textContent = "Question";
+
+    const statusEl = document.createElement("span");
+    statusEl.className = "tool-status-text";
+    statusEl.textContent = "Waiting for response";
+
+    header.appendChild(iconEl);
+    header.appendChild(nameEl);
+    header.appendChild(statusEl);
+    card.appendChild(header);
+
+    const detailsEl = document.createElement("div");
+    detailsEl.className = "tool-details";
+
+    const questions = extractUserQuestions(toolType);
+    if (questions.length > 0) {
+      for (const q of questions) {
+        const questionDiv = document.createElement("div");
+        questionDiv.className = "ask-question-text";
+        questionDiv.innerHTML = renderContent(q.question);
+        detailsEl.appendChild(questionDiv);
+
+        if (q.options.length > 0) {
+          const list = document.createElement("ul");
+          list.className = "ask-question-options";
+          for (const opt of q.options) {
+            const li = document.createElement("li");
+            const labelB = document.createElement("strong");
+            labelB.textContent = opt.label;
+            li.appendChild(labelB);
+            if (opt.description) {
+              li.appendChild(document.createTextNode(` — ${opt.description}`));
+            }
+            list.appendChild(li);
+          }
+          detailsEl.appendChild(list);
+        }
+      }
+    }
+
+    card.appendChild(detailsEl);
+    setCardExpandedState(card, true);
+    toolCallsContainer.appendChild(card);
+    state.toolCards.set(toolCallId, card);
+    state.toolHostByCall.set(toolCallId, appendTarget);
+    scrollToBottom();
+    return;
+  }
+
   const isSpawn = isSpawnTool(toolName);
 
   const card = document.createElement("div");
@@ -1116,6 +1247,79 @@ export function handleToolCompleted(
 ): boolean {
   const card = state.toolCards.get(toolCallId);
   if (!card) return false;
+
+  // User-input tools (AskUserQuestion, EnterPlanMode) complete with a
+  // synthetic success — don't overwrite the card UI.
+  if (toolName === "AskUserQuestion" || toolName === "EnterPlanMode") {
+    return true;
+  }
+
+  // ExitPlanMode: if the backend found plan file content, render it.
+  if (toolName === "ExitPlanMode") {
+    const planContent =
+      toolResult.kind === "Other" &&
+      toolResult.result &&
+      typeof toolResult.result === "object" &&
+      "plan_content" in toolResult.result &&
+      typeof (toolResult.result as Record<string, unknown>).plan_content ===
+        "string"
+        ? ((toolResult.result as Record<string, unknown>)
+            .plan_content as string)
+        : null;
+    if (!planContent) return true;
+
+    // Replace the simple indicator with a full plan card.
+    const parent = card.parentElement;
+    if (!parent) return true;
+
+    const planCard = document.createElement("div");
+    planCard.className = "tool-card tool-call-item";
+    planCard.dataset.testid = "tool-card";
+    planCard.setAttribute("role", "region");
+    planCard.setAttribute("aria-label", "Plan");
+
+    const header = document.createElement("div");
+    header.className = "tool-card-header";
+
+    const iconEl = document.createElement("span");
+    iconEl.className = "tool-status-icon";
+    iconEl.textContent = "\u{1F4CB}";
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "tool-name";
+    nameEl.textContent = "Plan";
+
+    const statusEl = document.createElement("span");
+    statusEl.className = "tool-status-text";
+    statusEl.textContent = "Ready for review";
+
+    const chevron = document.createElement("span");
+    chevron.className = "tool-chevron";
+    chevron.textContent = "\u25BC";
+
+    header.appendChild(iconEl);
+    header.appendChild(nameEl);
+    header.appendChild(statusEl);
+    header.appendChild(chevron);
+    planCard.appendChild(header);
+
+    const detailsEl = document.createElement("div");
+    detailsEl.className = "tool-details";
+
+    const contentDiv = document.createElement("div");
+    contentDiv.className = "message-content plan-content";
+    contentDiv.innerHTML = renderContent(planContent);
+    detailsEl.appendChild(contentDiv);
+
+    planCard.appendChild(detailsEl);
+    header.addEventListener("click", createToggleHandler(detailsEl, chevron));
+    setCardExpandedState(planCard, true);
+
+    parent.replaceChild(planCard, card);
+    state.toolCards.set(toolCallId, planCard);
+    scrollToBottom();
+    return true;
+  }
 
   const header = card.querySelector(".tool-card-header") as HTMLElement | null;
   const statusEl = card.querySelector(".tool-status-text");

@@ -1191,6 +1191,34 @@ body {
   font-size: 0.9em;
 }
 
+.plan-mode-indicator {
+  font-size: 0.85em;
+  color: var(--text-secondary);
+  padding: 4px 0;
+  font-style: italic;
+}
+
+.plan-content {
+  font-family: var(--font-sans);
+  font-size: calc(var(--base-font-size) * 0.93);
+  line-height: 1.6;
+  padding: 4px 6px;
+}
+
+.ask-question-options {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 0 0;
+}
+
+.ask-question-options li {
+  padding: 4px 8px;
+  margin: 2px 0;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
 .view-diff-btn {
   display: inline-flex;
   align-items: center;
