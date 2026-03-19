@@ -74,70 +74,11 @@ struct DebugEventsToolInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct QueryElementsToolInput {
-    selector: String,
-    include_text: Option<bool>,
-    include_html: Option<bool>,
-    max_nodes: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct SelectorIndexToolInput {
-    selector: String,
-    index: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct GetTextToolInput {
-    selector: String,
-    index: Option<usize>,
-    max_length: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct ListTestIdsToolInput {
-    pattern: Option<String>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct TypeToolInput {
-    selector: String,
-    text: String,
-    index: Option<usize>,
-    append: Option<bool>,
-    submit: Option<bool>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct KeyPressToolInput {
-    key: String,
-    code: Option<String>,
-    ctrl: Option<bool>,
-    alt: Option<bool>,
-    shift: Option<bool>,
-    meta: Option<bool>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct ScrollToolInput {
-    selector: Option<String>,
-    index: Option<usize>,
-    dx: Option<f64>,
-    dy: Option<f64>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-struct WaitForToolInput {
-    selector: String,
-    index: Option<usize>,
-    state: Option<String>,
+struct EvaluateToolInput {
+    /// JavaScript expression to evaluate in the webview. The body of an async
+    /// function — use `return` to produce a value. Has access to the full DOM
+    /// and any globals the app exposes.
+    expression: String,
     timeout_ms: Option<u64>,
 }
 
@@ -180,7 +121,7 @@ async fn proxy_tool(
 }
 
 // ---------------------------------------------------------------------------
-// MCP Tools — 13 tools: 2 dev instance lifecycle + 10 proxied debug tools + 1 query_screenshot
+// MCP Tools — 6 tools: 2 dev instance lifecycle + 3 proxied debug tools + 1 query_screenshot
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -244,126 +185,24 @@ impl TydeDriverMcpServer {
         proxy_tool(&self.app, "tyde_debug_events_since", args).await
     }
 
-    #[tool(description = "Query DOM elements in the dev instance by CSS selector.")]
-    async fn tyde_debug_query_elements(
+    #[tool(
+        description = "Evaluate a JavaScript expression in the Tyde webview and return the result. The expression is the body of an async function — use `return` to produce a value. Has access to the full DOM and any globals the app exposes (e.g. window.__TYDE_BRIDGE__). Use this for all DOM interaction: querying elements, reading text, clicking, typing, dispatching events, scrolling, waiting for conditions, etc."
+    )]
+    async fn tyde_debug_evaluate(
         &self,
-        Parameters(input): Parameters<QueryElementsToolInput>,
+        Parameters(input): Parameters<EvaluateToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let args = serde_json::json!({
-            "selector": input.selector,
-            "include_text": input.include_text,
-            "include_html": input.include_html,
-            "max_nodes": input.max_nodes,
+            "expression": input.expression,
             "timeout_ms": input.timeout_ms,
         });
-        proxy_tool(&self.app, "tyde_debug_query_elements", args).await
-    }
-
-    #[tool(description = "Get text from a UI element in the dev instance.")]
-    async fn tyde_debug_get_text(
-        &self,
-        Parameters(input): Parameters<GetTextToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "selector": input.selector,
-            "index": input.index,
-            "max_length": input.max_length,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_get_text", args).await
-    }
-
-    #[tool(description = "List active data-testid values in the dev instance.")]
-    async fn tyde_debug_list_testids(
-        &self,
-        Parameters(input): Parameters<ListTestIdsToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "pattern": input.pattern,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_list_testids", args).await
-    }
-
-    #[tool(description = "Click a UI element in the dev instance by CSS selector.")]
-    async fn tyde_debug_click(
-        &self,
-        Parameters(input): Parameters<SelectorIndexToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "selector": input.selector,
-            "index": input.index,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_click", args).await
-    }
-
-    #[tool(description = "Type text into a UI element in the dev instance.")]
-    async fn tyde_debug_type(
-        &self,
-        Parameters(input): Parameters<TypeToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "selector": input.selector,
-            "text": input.text,
-            "index": input.index,
-            "append": input.append,
-            "submit": input.submit,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_type", args).await
-    }
-
-    #[tool(description = "Dispatch a keyboard event in the dev instance.")]
-    async fn tyde_debug_keypress(
-        &self,
-        Parameters(input): Parameters<KeyPressToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "key": input.key,
-            "code": input.code,
-            "ctrl": input.ctrl,
-            "alt": input.alt,
-            "shift": input.shift,
-            "meta": input.meta,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_keypress", args).await
-    }
-
-    #[tool(description = "Scroll a UI element (or window) in the dev instance.")]
-    async fn tyde_debug_scroll(
-        &self,
-        Parameters(input): Parameters<ScrollToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "selector": input.selector,
-            "index": input.index,
-            "dx": input.dx,
-            "dy": input.dy,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_scroll", args).await
-    }
-
-    #[tool(description = "Wait for a selector condition in the dev instance.")]
-    async fn tyde_debug_wait_for(
-        &self,
-        Parameters(input): Parameters<WaitForToolInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let args = serde_json::json!({
-            "selector": input.selector,
-            "index": input.index,
-            "state": input.state,
-            "timeout_ms": input.timeout_ms,
-        });
-        proxy_tool(&self.app, "tyde_debug_wait_for", args).await
+        proxy_tool(&self.app, "tyde_debug_evaluate", args).await
     }
 
     // -- High-level screenshot query -------------------------------------------
 
     #[tool(
-        description = "Ask a visual question about the dev instance UI by taking a screenshot and having an agent describe what it sees. Use this for visual/styling validation — layout, colors, spacing, visual state. For DOM-level questions (text content, element presence, test IDs, attributes), prefer the targeted debug tools instead: tyde_debug_get_text, tyde_debug_query_elements, tyde_debug_list_testids."
+        description = "Ask a visual question about the dev instance UI by taking a screenshot and having an agent describe what it sees. Use this for visual/styling validation — layout, colors, spacing, visual state. For DOM-level questions (text content, element presence, attributes), prefer tyde_debug_evaluate instead."
     )]
     async fn tyde_debug_query_screenshot(
         &self,
