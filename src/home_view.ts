@@ -532,7 +532,7 @@ export class HomeView {
 
     const subtitle = document.createElement("p");
     subtitle.className = "home-subtitle";
-    subtitle.textContent = "AI-Oriented IDE";
+    subtitle.textContent = "Coding Agent Studio";
 
     header.appendChild(logo);
     header.appendChild(title);
