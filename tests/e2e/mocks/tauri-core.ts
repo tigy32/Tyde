@@ -928,6 +928,56 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
+    case 'list_workflows': {
+      const workflows = (window as any).__mockWorkflows as Array<{
+        id: string;
+        name: string;
+        description: string;
+        trigger: string;
+        steps: Array<{ name: string; actions: Array<Record<string, unknown>> }>;
+        scope: string;
+      }> | undefined;
+      return workflows ?? [];
+    }
+
+    case 'save_workflow': {
+      const json = typeof args?.workflowJson === 'string' ? args.workflowJson : '{}';
+      const parsed = JSON.parse(json);
+      const scope = typeof args?.scope === 'string' ? args.scope : 'global';
+      const workflows = ((window as any).__mockWorkflows ?? []) as Array<Record<string, unknown>>;
+      const existing = workflows.findIndex((w) => w.id === parsed.id);
+      if (existing >= 0) {
+        workflows[existing] = { ...parsed, scope };
+      } else {
+        workflows.push({ ...parsed, scope });
+      }
+      (window as any).__mockWorkflows = workflows;
+      return null;
+    }
+
+    case 'delete_workflow': {
+      const id = typeof args?.id === 'string' ? args.id : '';
+      const workflows = ((window as any).__mockWorkflows ?? []) as Array<Record<string, unknown>>;
+      (window as any).__mockWorkflows = workflows.filter((w) => w.id !== id);
+      return null;
+    }
+
+    case 'run_shell_command': {
+      const command = typeof args?.command === 'string' ? args.command : '';
+      const mockShellHandler = (window as any).__mockShellCommandHandler as
+        | ((cmd: string) => { stdout: string; stderr: string; exit_code: number | null; success: boolean })
+        | undefined;
+      if (mockShellHandler) {
+        return mockShellHandler(command);
+      }
+      return {
+        stdout: `mock output for: ${command}\n`,
+        stderr: '',
+        exit_code: 0,
+        success: true,
+      };
+    }
+
     default:
       return null;
   }

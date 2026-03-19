@@ -17,6 +17,7 @@ mod remote;
 mod subprocess;
 mod terminal;
 mod usage;
+mod workflow_io;
 
 use parking_lot::Mutex as SyncMutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -3228,6 +3229,39 @@ fn resolve_shell_path() {
     std::env::set_var("PATH", &resolved);
 }
 
+// --- Workflow commands ---
+
+#[tauri::command]
+async fn list_workflows(workspace_path: Option<String>) -> Result<Vec<workflow_io::WorkflowEntry>, String> {
+    workflow_io::list_workflows(workspace_path).await
+}
+
+#[tauri::command]
+async fn save_workflow(
+    workflow_json: String,
+    scope: String,
+    workspace_path: Option<String>,
+) -> Result<(), String> {
+    workflow_io::save_workflow(&workflow_json, &scope, workspace_path).await
+}
+
+#[tauri::command]
+async fn delete_workflow(
+    id: String,
+    scope: String,
+    workspace_path: Option<String>,
+) -> Result<(), String> {
+    workflow_io::delete_workflow(&id, &scope, workspace_path).await
+}
+
+#[tauri::command]
+async fn run_shell_command(
+    command: String,
+    cwd: String,
+) -> Result<workflow_io::ShellCommandResult, String> {
+    workflow_io::run_shell_command(&command, &cwd).await
+}
+
 #[cfg(target_os = "linux")]
 fn detect_system_dark_mode() -> bool {
     let output = Command::new("dbus-send")
@@ -3398,6 +3432,10 @@ pub fn run() {
             resize_terminal,
             close_terminal,
             submit_feedback,
+            list_workflows,
+            save_workflow,
+            delete_workflow,
+            run_shell_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

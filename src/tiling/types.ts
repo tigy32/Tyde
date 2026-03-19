@@ -8,7 +8,8 @@ export type PanelType =
   | "settings"
   | "sessions"
   | "agents"
-  | "terminal";
+  | "terminal"
+  | "workflows";
 
 export interface PanelTab {
   id: string;
