@@ -338,6 +338,7 @@ pub(crate) struct AppState {
     mcp_http_enabled: SyncMutex<bool>,
     driver_mcp_http_enabled: SyncMutex<bool>,
     driver_mcp_http_autoload: SyncMutex<bool>,
+    driver_mcp_http_env_override: bool,
     debug_event_log: SyncMutex<DebugEventLog>,
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
@@ -706,7 +707,8 @@ fn resolve_tyde_app_settings_path() -> Result<PathBuf, String> {
     Err("Could not determine home directory for app settings".to_string())
 }
 
-fn load_app_settings() -> AppSettings {
+/// Read settings from disk without applying any env var overrides.
+fn load_app_settings_from_disk() -> AppSettings {
     let path = match resolve_tyde_app_settings_path() {
         Ok(path) => path,
         Err(err) => {
@@ -725,7 +727,7 @@ fn load_app_settings() -> AppSettings {
         }
     };
 
-    let mut settings = match serde_json::from_str::<AppSettings>(&raw) {
+    match serde_json::from_str::<AppSettings>(&raw) {
         Ok(settings) => settings,
         Err(err) => {
             tracing::error!(
@@ -734,7 +736,11 @@ fn load_app_settings() -> AppSettings {
             );
             AppSettings::default()
         }
-    };
+    }
+}
+
+fn load_app_settings() -> AppSettings {
+    let mut settings = load_app_settings_from_disk();
 
     // Allow env vars to override settings (used by dev instances spawned from the host).
     if let Ok(val) = std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED") {
@@ -761,10 +767,18 @@ fn save_app_settings(settings: &AppSettings) -> Result<(), String> {
 }
 
 fn app_settings_from_state(state: &AppState) -> AppSettings {
+    // When driver settings were overridden by env var (dev instances), read the
+    // driver fields from the on-disk file so we never clobber the host's saved values.
+    let (driver_enabled, driver_autoload) = if state.driver_mcp_http_env_override {
+        let on_disk = load_app_settings_from_disk();
+        (on_disk.driver_mcp_http_enabled, on_disk.driver_mcp_http_autoload)
+    } else {
+        (*state.driver_mcp_http_enabled.lock(), *state.driver_mcp_http_autoload.lock())
+    };
     AppSettings {
         mcp_http_enabled: *state.mcp_http_enabled.lock(),
-        driver_mcp_http_enabled: *state.driver_mcp_http_enabled.lock(),
-        driver_mcp_http_autoload: *state.driver_mcp_http_autoload.lock(),
+        driver_mcp_http_enabled: driver_enabled,
+        driver_mcp_http_autoload: driver_autoload,
         default_backend: state.default_backend.lock().clone(),
     }
 }
@@ -3243,6 +3257,8 @@ pub fn run() {
     if detect_system_dark_mode() {
         std::env::set_var("GTK_THEME", "Adwaita:dark");
     }
+    let driver_mcp_http_env_override =
+        std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED").is_ok();
     let mut app_settings = load_app_settings();
     if !app_settings.driver_mcp_http_enabled {
         app_settings.driver_mcp_http_autoload = false;
@@ -3262,6 +3278,7 @@ pub fn run() {
             mcp_http_enabled: SyncMutex::new(app_settings.mcp_http_enabled),
             driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
             driver_mcp_http_autoload: SyncMutex::new(app_settings.driver_mcp_http_autoload),
+            driver_mcp_http_env_override,
             default_backend: SyncMutex::new(app_settings.default_backend),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
@@ -3469,6 +3486,7 @@ mod tests {
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),
+            driver_mcp_http_env_override: false,
         }
     }
 
