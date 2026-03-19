@@ -290,12 +290,18 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                 }
             }
             if let Some(conv_id) = conversation_id {
+                let typing_event = serde_json::json!({
+                    "kind": "TypingStatusChanged",
+                    "data": false,
+                });
+                {
+                    let mut runtime = self.agent_runtime.lock().await;
+                    runtime.record_chat_event(conv_id, &typing_event);
+                }
+                self.agent_runtime_notify.notify_waiters();
                 let typing_payload = ChatEventPayload {
                     conversation_id: conv_id,
-                    event: serde_json::json!({
-                        "kind": "TypingStatusChanged",
-                        "data": false,
-                    }),
+                    event: typing_event,
                 };
                 if let Err(e) = self.app.emit("chat-event", &typing_payload) {
                     tracing::warn!("Failed to emit sub-agent typing stop event: {e:?}");
