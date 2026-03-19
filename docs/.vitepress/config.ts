@@ -31,6 +31,7 @@ export default defineConfig({
         items: [
           { text: 'Agent Control', link: '/features/agent-control' },
           { text: 'Workbenches', link: '/features/workbenches' },
+          { text: 'Workflows', link: '/features/workflows' },
         ],
       },
     ],

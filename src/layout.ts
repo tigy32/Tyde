@@ -7,7 +7,8 @@ export type PersistentWidgetId =
   | "files"
   | "sessions"
   | "agents"
-  | "terminal";
+  | "terminal"
+  | "workflows";
 type WidgetId = PersistentWidgetId;
 type DropTarget = DockZone;
 type CenterView = "chat" | "editor" | "home";
@@ -40,6 +41,7 @@ const WIDGET_TITLES: Record<WidgetId, string> = {
   sessions: "History",
   agents: "Agents",
   terminal: "Terminal",
+  workflows: "Workflows",
 };
 
 const WIDGET_TO_PANEL: Record<WidgetId, PanelType> = {
@@ -48,6 +50,7 @@ const WIDGET_TO_PANEL: Record<WidgetId, PanelType> = {
   sessions: "sessions",
   agents: "agents",
   terminal: "terminal",
+  workflows: "workflows",
 };
 
 const ALL_WIDGETS: PersistentWidgetId[] = [
@@ -56,6 +59,7 @@ const ALL_WIDGETS: PersistentWidgetId[] = [
   "sessions",
   "agents",
   "terminal",
+  "workflows",
 ];
 
 function defaultState(): WorkbenchState {
@@ -66,10 +70,11 @@ function defaultState(): WorkbenchState {
       sessions: "right",
       agents: "right",
       terminal: "bottom",
+      workflows: "right",
     },
     widgetOrder: {
       left: ["files", "git"],
-      right: ["agents", "sessions"],
+      right: ["agents", "sessions", "workflows"],
       bottom: ["terminal"],
     },
     activeWidget: {
@@ -98,7 +103,8 @@ function isWidgetId(value: unknown): value is WidgetId {
     value === "files" ||
     value === "sessions" ||
     value === "agents" ||
-    value === "terminal"
+    value === "terminal" ||
+    value === "workflows"
   );
 }
 
@@ -395,6 +401,7 @@ export class Layout {
     this.widgetPanels.set("sessions", panelFactory(WIDGET_TO_PANEL.sessions));
     this.widgetPanels.set("agents", panelFactory(WIDGET_TO_PANEL.agents));
     this.widgetPanels.set("terminal", panelFactory(WIDGET_TO_PANEL.terminal));
+    this.widgetPanels.set("workflows", panelFactory(WIDGET_TO_PANEL.workflows));
 
     const persisted = this.loadPersistedState();
     this.state = persisted ?? defaultState();

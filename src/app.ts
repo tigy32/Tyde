@@ -72,6 +72,7 @@ export class AppController {
   private hiddenRuntimeAgentIds = new Set<number>();
   private runtimeAgentSyncTimer: number | null = null;
   private runtimeAgentSyncInFlight: Promise<void> | null = null;
+  private registeredWorkflowCommandIds: string[] = [];
 
   private workspaceViews = new Map<string, WorkspaceView>();
   private activeWorkspaceId: string | null = null;
@@ -332,6 +333,9 @@ export class AppController {
     };
     view.onRuntimeAgentAction = (agent, action) => {
       void this.handleRuntimeAgentAction(agent, action);
+    };
+    view.onWorkflowsChanged = () => {
+      this.registerWorkflowCommands(view);
     };
     this.projectState.setProjectConversationIds(
       projectId,
@@ -596,6 +600,7 @@ export class AppController {
     document.querySelector(".app-title")!.textContent =
       `Tyde — ${project.name}`;
 
+    this.registerWorkflowCommands(view);
     this.homeView.hide();
     this.homeBridgeView.hide();
     this.settingsTabViewEl.classList.add("hidden");
@@ -1217,6 +1222,40 @@ export class AppController {
       label: "Send Feedback",
       execute: () => showFeedbackDialog(),
     });
+  }
+
+  private registerWorkflowCommands(view: WorkspaceView): void {
+    for (const id of this.registeredWorkflowCommandIds) {
+      this.commandPalette.unregisterCommand(id);
+    }
+    this.registeredWorkflowCommandIds = [];
+
+    const store = view.getWorkflowStore();
+    for (const workflow of store.getAll()) {
+      const commandId = `workflow:${workflow.id}`;
+      this.commandPalette.registerCommand({
+        id: commandId,
+        label: `Run Workflow: ${workflow.name}`,
+        execute: () => {
+          view.getWorkflowsPanel().runWorkflow(workflow);
+          view.getLayout().showWidget("workflows");
+        },
+      });
+      this.registeredWorkflowCommandIds.push(commandId);
+    }
+
+    const builderId = "workflow:new";
+    this.commandPalette.registerCommand({
+      id: builderId,
+      label: "New Workflow",
+      execute: () => {
+        const activeView = this.getActiveView();
+        if (activeView) {
+          (activeView as WorkspaceView).getWorkflowsPanel().onNewWorkflow?.();
+        }
+      },
+    });
+    this.registeredWorkflowCommandIds.push(builderId);
   }
 
   private registerKeyboardShortcuts(): void {

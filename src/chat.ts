@@ -121,6 +121,7 @@ export class ChatPanel {
     | null = null;
   onOpenFileLink: ((filePath: string, oneBasedLine?: number) => void) | null =
     null;
+  onSlashCommand: ((command: string) => boolean) | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -314,6 +315,15 @@ export class ChatPanel {
       const text = textarea.value.trim();
       if ((!text && view.pendingImages.length === 0) || view.disconnected)
         return;
+
+      if (text.startsWith("/") && this.onSlashCommand) {
+        const handled = this.onSlashCommand(text);
+        if (handled) {
+          textarea.value = "";
+          textarea.style.height = "auto";
+          return;
+        }
+      }
 
       const aiIsTyping = !view.typingIndicator.classList.contains("hidden");
 

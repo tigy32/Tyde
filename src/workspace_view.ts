@@ -51,6 +51,10 @@ import type { TabState } from "./tabs";
 import { TabManager } from "./tabs";
 import { TerminalService } from "./terminal";
 import type { PanelType } from "./tiling/types";
+import { WorkflowBuilder } from "./workflows/builder";
+import { WorkflowEngine } from "./workflows/engine";
+import { WorkflowsPanel } from "./workflows/panel";
+import { WorkflowStore } from "./workflows/store";
 
 interface WorkspaceViewConfig {
   projectId: string;
@@ -114,6 +118,10 @@ export class WorkspaceView {
   private sessionsPanel: SessionsPanel;
   private agentsPanel: AgentsPanel;
   private terminalService: TerminalService;
+  private workflowStore: WorkflowStore;
+  private workflowEngine: WorkflowEngine;
+  private workflowsPanel: WorkflowsPanel;
+  private workflowBuilder: WorkflowBuilder;
   private eventRouter: EventRouter;
   private notifications: NotificationManager;
   private conversationIds: Set<number> = new Set();
@@ -154,6 +162,7 @@ export class WorkspaceView {
     | ((agent: AgentInfo, action: AgentCardAction) => void)
     | null = null;
   onRuntimeAgentClick: ((agent: AgentInfo) => void) | null = null;
+  onWorkflowsChanged: (() => void) | null = null;
 
   constructor(config: WorkspaceViewConfig) {
     this.projectId = config.projectId;
@@ -387,6 +396,13 @@ export class WorkspaceView {
     terminalContainer.innerHTML =
       "<span>Click + in the bottom dock to open a terminal.</span>";
 
+    const workflowsContainer = document.createElement("div");
+    workflowsContainer.style.display = "flex";
+    workflowsContainer.style.flexDirection = "column";
+    workflowsContainer.style.minHeight = "0";
+    workflowsContainer.style.height = "100%";
+    workflowsContainer.style.overflow = "auto";
+
     const panelElements = new Map<PanelType, HTMLElement>();
     panelElements.set("chat", chatContainer);
     panelElements.set("git", gitPanelEl);
@@ -395,6 +411,7 @@ export class WorkspaceView {
     panelElements.set("sessions", sessionsContainer);
     panelElements.set("agents", agentsContainer);
     panelElements.set("terminal", terminalContainer);
+    panelElements.set("workflows", workflowsContainer);
 
     const panelFactory = (panelType: PanelType): HTMLElement => {
       return panelElements.get(panelType) ?? document.createElement("div");
@@ -428,6 +445,35 @@ export class WorkspaceView {
       }
       void this.handleConversationAgentAction(agent, action);
     };
+    this.workflowStore = new WorkflowStore(config.workspacePath);
+    this.workflowEngine = new WorkflowEngine(
+      config.workspacePath,
+      config.workspacePath ? [config.workspacePath] : [],
+      this.workflowStore,
+    );
+    this.workflowsPanel = new WorkflowsPanel(
+      workflowsContainer,
+      this.workflowStore,
+      this.workflowEngine,
+    );
+    this.workflowBuilder = new WorkflowBuilder(this.workflowStore);
+    this.workflowBuilder.onClose = () => {
+      this.workflowStore.load().then(() => {
+        this.workflowsPanel.render();
+        this.onWorkflowsChanged?.();
+      });
+    };
+    this.workflowsPanel.onNewWorkflow = () => this.workflowBuilder.show();
+    this.workflowsPanel.onEditWorkflow = (w) => this.workflowBuilder.show(w);
+    this.workflowsPanel.onManageWorkflows = () =>
+      this.workflowBuilder.showManager();
+    this.workflowsPanel.onOpenAgentConversation = (conversationId, name) =>
+      this.focusConversation(conversationId, name);
+    this.workflowStore.onChange = () => {
+      this.workflowsPanel.render();
+      this.onWorkflowsChanged?.();
+    };
+
     this.terminalService = new TerminalService(config.workspacePath);
 
     this.layout.onCreateTerminal = (zone) => {
@@ -539,6 +585,13 @@ export class WorkspaceView {
     this.chatPanel.onUserMessageSent = (conversationId, text) => {
       this.handleUserMessageForAutoTitle(conversationId, text);
     };
+    this.chatPanel.onSlashCommand = (command) => {
+      const workflow = this.workflowStore.getByTrigger(command);
+      if (!workflow) return false;
+      this.workflowsPanel.runWorkflow(workflow);
+      this.layout.showWidget("workflows");
+      return true;
+    };
 
     this.eventRouter = new EventRouter({
       chatPanel: this.chatPanel,
@@ -567,6 +620,9 @@ export class WorkspaceView {
       this.gitPanel.startPeriodicRefresh();
       this.chatPanel.showWelcome();
     }
+    this.workflowStore.load().catch((err) => {
+      console.error("Failed to load workflows:", err);
+    });
   }
 
   show(): void {
@@ -708,6 +764,15 @@ export class WorkspaceView {
   }
   getAgentsPanel(): AgentsPanel {
     return this.agentsPanel;
+  }
+  getWorkflowStore(): WorkflowStore {
+    return this.workflowStore;
+  }
+  getWorkflowEngine(): WorkflowEngine {
+    return this.workflowEngine;
+  }
+  getWorkflowsPanel(): WorkflowsPanel {
+    return this.workflowsPanel;
   }
   ownsConversation(conversationId: number): boolean {
     return this.conversationIds.has(conversationId);

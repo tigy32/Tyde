@@ -36,9 +36,11 @@ export type {
   RemoteConnectionProgress,
   RuntimeAgent,
   RuntimeAgentEventBatch,
+  ShellCommandResult,
   SpawnAgentResponse,
   TerminalExitPayload,
   TerminalOutputPayload,
+  WorkflowEntry,
 } from "@tyde/protocol";
 
 function friendlyError(raw: string): string {
@@ -615,4 +617,30 @@ export async function openWorkspaceDialog(): Promise<string | null> {
 
 export async function getInitialWorkspace(): Promise<string | null> {
   return invoke<string | null>("get_initial_workspace");
+}
+
+// --- Workflow operations ---
+
+export function listWorkflows(workspacePath?: string) {
+  return execute("list_workflows", { workspacePath });
+}
+
+export function saveWorkflow(
+  workflowJson: string,
+  scope: string,
+  workspacePath?: string,
+) {
+  return execute("save_workflow", { workflowJson, scope, workspacePath });
+}
+
+export function deleteWorkflow(
+  id: string,
+  scope: string,
+  workspacePath?: string,
+) {
+  return execute("delete_workflow", { id, scope, workspacePath });
+}
+
+export function runShellCommand(command: string, cwd: string) {
+  return execute("run_shell_command", { command, cwd });
 }
