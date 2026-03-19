@@ -107,4 +107,4 @@ capped at 10x the idle timeout to prevent infinite waits. Default idle timeout i
 
 Point your MCP-capable client (Codex/Claude Code) to the exported URL.
 
-For Tyde UI/log debugging tools, see `docs/debug-mcp.md`.
+For Tyde UI/log debugging tools, see `dev-docs/debug-mcp.md`.

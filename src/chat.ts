@@ -1404,7 +1404,7 @@ export class ChatPanel {
     welcome.innerHTML = `
       <div class="welcome-logo"><img src="/tycode-tiger.png" alt="Tycode tiger" class="welcome-logo-img" /></div>
       <h1 class="welcome-title">Tyde</h1>
-      <p class="welcome-subtitle">AI-Powered Development Environment</p>
+      <p class="welcome-subtitle">Coding Agent Studio</p>
       <div class="welcome-actions">
         <button id="welcome-new-chat" data-testid="welcome-new-chat" class="welcome-btn">New Chat Tab</button>
       </div>

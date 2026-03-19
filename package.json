@@ -10,7 +10,10 @@
     "test:e2e": "wdio run wdio.conf.ts",
     "lint": "biome check src/",
     "lint:fix": "biome check --fix src/",
-    "check": "biome check src/ && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && cargo check --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings"
+    "check": "biome check src/ && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && cargo check --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
   },
   "dependencies": {
     "@tanstack/virtual-core": "^3.13.21",
@@ -36,6 +39,7 @@
     "ts-node": "^10",
     "typescript": "~5.6",
     "vite": "^6",
+    "vitepress": "^1.6.4",
     "webdriverio": "^9"
   }
 }
