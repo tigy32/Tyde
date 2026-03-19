@@ -28,6 +28,7 @@ impl SubprocessBridge {
         subprocess_path: &str,
         workspace_roots: &[String],
         mcp_servers_json: Option<&str>,
+        ephemeral: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let remote_roots = parse_remote_workspace_roots(workspace_roots)?;
 
@@ -45,7 +46,7 @@ impl SubprocessBridge {
             };
 
             let remote_cmd =
-                build_remote_ssh_command(&remote_binary, &roots_json, mcp_servers_json);
+                build_remote_ssh_command(&remote_binary, &roots_json, mcp_servers_json, ephemeral);
             Command::new("ssh")
                 .arg("-T")
                 .arg(host)
@@ -60,6 +61,9 @@ impl SubprocessBridge {
             cmd.arg("--workspace-roots").arg(&roots_json);
             if let Some(mcp_servers_json) = mcp_servers_json {
                 cmd.arg("--mcp-servers").arg(mcp_servers_json);
+            }
+            if ephemeral {
+                cmd.arg("--ephemeral");
             }
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -180,6 +184,7 @@ fn build_remote_ssh_command(
     binary: &str,
     roots_json: &str,
     mcp_servers_json: Option<&str>,
+    ephemeral: bool,
 ) -> String {
     use crate::remote::shell_quote_arg;
     // Prepend common binary directories to PATH. Sourcing profile files is
@@ -194,6 +199,9 @@ fn build_remote_ssh_command(
         cmd.push_str(" --mcp-servers ");
         cmd.push_str(&shell_quote_arg(mcp_servers_json));
     }
+    if ephemeral {
+        cmd.push_str(" --ephemeral");
+    }
     cmd
 }
 
@@ -204,7 +212,7 @@ mod tests {
     #[test]
     fn ssh_args_survive_shell_interpretation() {
         let roots_json = r#"["/home/user/project","/tmp/other"]"#;
-        let remote_cmd = build_remote_ssh_command("echo", roots_json, None);
+        let remote_cmd = build_remote_ssh_command("echo", roots_json, None, false);
 
         let sh_result = std::process::Command::new("sh")
             .arg("-c")
@@ -244,7 +252,7 @@ mod tests {
 
     #[test]
     fn remote_cmd_prepends_common_path_dirs() {
-        let cmd = build_remote_ssh_command("/usr/bin/tycode-subprocess", "[]", None);
+        let cmd = build_remote_ssh_command("/usr/bin/tycode-subprocess", "[]", None, false);
         assert!(
             cmd.contains(".cargo/bin"),
             "command missing .cargo/bin in PATH: {cmd}"
@@ -262,7 +270,7 @@ mod tests {
     #[test]
     fn remote_cmd_path_prepend_doesnt_block_execution() {
         let roots_json = r#"["/home/user/project"]"#;
-        let remote_cmd = build_remote_ssh_command("echo", roots_json, None);
+        let remote_cmd = build_remote_ssh_command("echo", roots_json, None, false);
 
         for shell in ["sh", "zsh"] {
             let result = std::process::Command::new(shell)
@@ -288,9 +296,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_cmd_includes_ephemeral_flag_when_set() {
+        let roots_json = r#"["/home/user/project"]"#;
+
+        let without = build_remote_ssh_command("tycode-subprocess", roots_json, None, false);
+        assert!(
+            !without.contains("--ephemeral"),
+            "non-ephemeral command should not contain --ephemeral: {without}"
+        );
+
+        let with = build_remote_ssh_command("tycode-subprocess", roots_json, None, true);
+        assert!(
+            with.contains("--ephemeral"),
+            "ephemeral command should contain --ephemeral: {with}"
+        );
+    }
+
+    #[test]
     fn ssh_args_handle_embedded_single_quotes() {
         let roots_json = r#"["/home/user/it's a path"]"#;
-        let remote_cmd = build_remote_ssh_command("echo", roots_json, None);
+        let remote_cmd = build_remote_ssh_command("echo", roots_json, None, false);
 
         let result = std::process::Command::new("sh")
             .arg("-c")

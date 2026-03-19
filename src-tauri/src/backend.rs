@@ -268,12 +268,12 @@ impl BackendSession {
         startup_mcp_servers: &[StartupMcpServer],
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         match kind {
-            // Tycode subprocess currently has no "no-session-persistence" mode.
             BackendKind::Tycode => {
                 let (bridge, rx) = SubprocessBridge::spawn(
                     executable_path,
                     workspace_roots,
                     tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
+                    ephemeral,
                 )?;
                 Ok((Self::Tycode(bridge), rx))
             }
@@ -329,7 +329,8 @@ impl BackendSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         match kind {
             BackendKind::Tycode => {
-                let (bridge, rx) = SubprocessBridge::spawn(executable_path, workspace_roots, None)?;
+                let (bridge, rx) =
+                    SubprocessBridge::spawn(executable_path, workspace_roots, None, true)?;
                 Ok((Self::Tycode(bridge), rx))
             }
             BackendKind::Codex => {
