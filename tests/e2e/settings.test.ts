@@ -202,6 +202,49 @@ describe('Settings panel', () => {
     }, sel.settingsTabPanel);
     expect(debugMcpAutoloadAfterToggle).toBe(true);
 
+    // --- Regression: driver toggle state survives saving from another tab ---
+    // The bug: env-overridden driver settings were clobbered when any other
+    // setting triggered save_app_settings. Verify that switching to "general",
+    // changing a setting there, and coming back preserves the driver toggle.
+    await browser.execute((navItemSel: string) => {
+      const btn = document.querySelector(navItemSel + '[data-tab="general"]') as HTMLButtonElement | null;
+      btn?.click();
+    }, sel.settingsNavItem);
+    await browser.pause(300);
+
+    // Change a general setting (default backend dropdown) to trigger a save
+    await browser.execute(() => {
+      const select = document.querySelector('[data-testid="default-backend-select"]') as HTMLSelectElement | null;
+      if (select && select.options.length > 1) {
+        select.value = select.options[1].value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+    await browser.pause(200);
+
+    // Navigate back to tyde tab
+    await browser.execute((navItemSel: string) => {
+      const btn = document.querySelector(navItemSel + '[data-tab="tyde"]') as HTMLButtonElement | null;
+      btn?.click();
+    }, sel.settingsNavItem);
+    await browser.pause(300);
+
+    // Driver toggle must still be enabled (was toggled on at line ~166 above)
+    const driverAfterOtherSave = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
+      return input?.checked ?? false;
+    }, sel.settingsTabPanel);
+    expect(driverAfterOtherSave).toBe(true);
+
+    // Autoload toggle must still be enabled
+    const autoloadAfterOtherSave = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
+      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
+      return input?.checked ?? false;
+    }, sel.settingsTabPanel);
+    expect(autoloadAfterOtherSave).toBe(true);
+
     // --- Backends tab ---
     await browser.execute((navItemSel: string) => {
       const btn = document.querySelector(navItemSel + '[data-tab="backends"]') as HTMLButtonElement | null;
