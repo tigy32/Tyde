@@ -1003,6 +1003,108 @@ describe('Chat tab lifecycle', () => {
       (window as any).__mockIncludeToolCalls = false;
     });
 
+    // --- Regression: tool output updates survive DOM disconnect/reconnect ---
+    // The old bindToolOutputRenderer used isConnected to permanently remove
+    // callbacks when an element was detached. This broke docked views that
+    // get detached and reattached. Verify that toggling tool output mode
+    // still updates a tool result after a disconnect/reconnect cycle.
+    const disconnectToolId = 'test-disconnect-tool';
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamDelta', { text: 'Running a command for disconnect test.' });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamEnd', {
+      message: makeAssistantMessage('Running a command for disconnect test.', [
+        { id: disconnectToolId, name: 'RunCommand', arguments: { command: 'echo hello' } },
+      ]),
+    });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolRequest', {
+      tool_call_id: disconnectToolId,
+      tool_name: 'RunCommand',
+      tool_type: { kind: 'RunCommand', command: 'echo hello', working_directory: '/mock' },
+    });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolExecutionCompleted', {
+      tool_call_id: disconnectToolId,
+      tool_name: 'RunCommand',
+      tool_result: { kind: 'RunCommand', exit_code: 0, stdout: 'hello\n', stderr: '' },
+      success: true,
+    });
+
+    // Wait for the tool result to render with stdout content visible (compact mode is the default)
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const results = document.querySelectorAll('.tool-result-command');
+        const last = results[results.length - 1];
+        return last?.querySelector('.tool-result-stdout') !== null;
+      }),
+      { timeout: 5000, timeoutMsg: 'Expected RunCommand tool result to show stdout in compact mode' },
+    );
+
+    // Disconnect the tool result element from the DOM — simulates what happens
+    // when a conversation view is docked (detached from the DOM tree).
+    await browser.execute(() => {
+      const results = document.querySelectorAll('.tool-result-command');
+      const target = results[results.length - 1] as HTMLElement;
+      // Stash the parent and position so we can reconnect later.
+      (window as any).__disconnectTarget = target;
+      (window as any).__disconnectParent = target.parentElement!;
+      (window as any).__disconnectNextSibling = target.nextSibling;
+      target.parentElement!.removeChild(target);
+    });
+
+    // While the element is disconnected, toggle the output mode to summary.
+    // The old isConnected guard would have removed the callback during this
+    // broadcast, permanently breaking updates for the element.
+    await browser.execute(() => {
+      const btn = document.querySelector('[data-testid="tool-output-toggle-global"]') as HTMLButtonElement | null;
+      if (!btn) throw new Error('Missing tool output toggle button');
+      // compact → verbose
+      btn.click();
+      // verbose → summary
+      btn.click();
+    });
+
+    // Reconnect the element — simulates undocking the conversation view.
+    await browser.execute(() => {
+      const target = (window as any).__disconnectTarget as HTMLElement;
+      const parent = (window as any).__disconnectParent as HTMLElement;
+      const nextSibling = (window as any).__disconnectNextSibling;
+      if (nextSibling) {
+        parent.insertBefore(target, nextSibling);
+      } else {
+        parent.appendChild(target);
+      }
+      delete (window as any).__disconnectTarget;
+      delete (window as any).__disconnectParent;
+      delete (window as any).__disconnectNextSibling;
+    });
+
+    // The reconnected element should already reflect summary mode (no stdout).
+    // If the callback was dropped while disconnected, the element would still
+    // show the stale compact rendering with stdout visible.
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const results = document.querySelectorAll('.tool-result-command');
+        const last = results[results.length - 1] as HTMLElement;
+        return last?.querySelector('.tool-result-stdout') === null;
+      }),
+      { timeout: 3000, timeoutMsg: 'Tool result should reflect summary mode after disconnect/broadcast/reconnect' },
+    );
+
+    // Toggle back to compact so subsequent tests start in the expected mode
+    await browser.execute(() => {
+      const btn = document.querySelector('[data-testid="tool-output-toggle-global"]') as HTMLButtonElement | null;
+      btn?.click(); // summary → compact
+    });
+
+    // Verify the tool result re-renders with stdout visible in compact mode
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const results = document.querySelectorAll('.tool-result-command');
+        const last = results[results.length - 1] as HTMLElement;
+        return last?.querySelector('.tool-result-stdout') !== null;
+      }),
+      { timeout: 3000, timeoutMsg: 'Tool result should re-render stdout after switching back to compact' },
+    );
+
     // --- AskUserQuestion renders as question card, not a stuck "Running..." card ---
     const askToolCallId = 'test-ask-user-1';
     await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });

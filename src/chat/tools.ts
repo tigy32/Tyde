@@ -110,6 +110,8 @@ export interface ToolState {
   diffData: Map<string, { filePath: string; before: string; after: string }>;
   toolDiffByCall: Map<string, string>;
   toolHostByCall: Map<string, HTMLElement>;
+  /** Unsubscribe functions for tool output callbacks owned by this state. */
+  outputUnsubscribers: Array<() => void>;
 }
 
 export function createToolState(): ToolState {
@@ -118,10 +120,13 @@ export function createToolState(): ToolState {
     diffData: new Map(),
     toolDiffByCall: new Map(),
     toolHostByCall: new Map(),
+    outputUnsubscribers: [],
   };
 }
 
 export function resetToolState(state: ToolState): void {
+  for (const unsub of state.outputUnsubscribers) unsub();
+  state.outputUnsubscribers.length = 0;
   state.toolCards.clear();
   state.diffData.clear();
   state.toolDiffByCall.clear();
@@ -410,20 +415,19 @@ function countSummaryLines(text: string): number {
 }
 
 function bindToolOutputRenderer(
-  root: HTMLElement,
+  state: ToolState,
   render: (mode: ToolOutputMode) => void,
 ): void {
-  let firstRender = true;
+  // Always render — even on disconnected elements — so that when a
+  // view is re-attached to the DOM it already reflects the current mode.
   const update = (mode: ToolOutputMode) => {
-    if (!firstRender && !root.isConnected) {
-      toolOutputUpdateCallbacks.delete(update);
-      return;
-    }
-    firstRender = false;
     render(mode);
   };
-  update(currentToolOutputMode);
+  render(currentToolOutputMode);
   toolOutputUpdateCallbacks.add(update);
+  state.outputUnsubscribers.push(() =>
+    toolOutputUpdateCallbacks.delete(update),
+  );
 }
 
 function shouldExpandToolDetailsOnRequest(mode: ToolOutputMode): boolean {
@@ -679,7 +683,7 @@ export function toolResultElement(
         );
         root.appendChild(diffContainer);
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
     case "RunCommand": {
@@ -722,7 +726,7 @@ export function toolResultElement(
           );
         }
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
     case "ReadFiles": {
@@ -756,7 +760,7 @@ export function toolResultElement(
           );
         }
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
     case "SearchTypes": {
@@ -794,7 +798,7 @@ export function toolResultElement(
           root.appendChild(createMetaLine(`+${hiddenCount} more`));
         }
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
     case "GetTypeDocs": {
@@ -828,7 +832,7 @@ export function toolResultElement(
           ),
         );
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
     case "Error": {
@@ -875,12 +879,12 @@ export function toolResultElement(
           );
         }
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
     case "Other": {
       if (isSpawnTool(toolName) && typeof result.result === "string") {
-        return renderSpawnToolResult(result.result);
+        return renderSpawnToolResult(state, result.result);
       }
       const root = document.createElement("div");
       root.className = "tool-result tool-result-docs";
@@ -907,13 +911,13 @@ export function toolResultElement(
           ),
         );
       };
-      bindToolOutputRenderer(root, updateResult);
+      bindToolOutputRenderer(state, updateResult);
       return root;
     }
   }
 }
 
-function renderSpawnToolResult(text: string): HTMLElement {
+function renderSpawnToolResult(state: ToolState, text: string): HTMLElement {
   const root = document.createElement("div");
   root.className = "tool-result tool-result-spawn";
   const rendered = renderContent(text);
@@ -929,7 +933,7 @@ function renderSpawnToolResult(text: string): HTMLElement {
     root.appendChild(content);
     hideTruncationIfNotNeeded(content);
   };
-  bindToolOutputRenderer(root, updateResult);
+  bindToolOutputRenderer(state, updateResult);
   return root;
 }
 
