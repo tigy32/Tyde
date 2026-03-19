@@ -641,7 +641,10 @@ export class ChatPanel {
           event.data.tool_name,
           event.data.tool_type,
         );
-        if (event.data.tool_name === "ask_user_question") {
+        if (
+          event.data.tool_name === "ask_user_question" ||
+          event.data.tool_name === "AskUserQuestion"
+        ) {
           this.notificationManager?.notifyUserInputNeeded(
             "AI is waiting for your response",
           );

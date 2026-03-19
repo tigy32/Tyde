@@ -3163,6 +3163,13 @@ fn claude_is_todo_write_tool_name(tool_name: &str) -> bool {
     normalize_tool_name(tool_name) == "todowrite"
 }
 
+fn claude_is_user_input_tool_name(tool_name: &str) -> bool {
+    matches!(
+        normalize_tool_name(tool_name).as_str(),
+        "askuserquestion" | "exitplanmode" | "enterplanmode"
+    )
+}
+
 /// Convert a TodoWrite tool call's arguments into a TaskUpdate event value.
 ///
 /// Claude Code's TodoWrite sends `{ "todos": [{ "content": "...", "status": "...", "activeForm": "..." }, ...] }`.
@@ -4058,6 +4065,45 @@ fn extract_tool_result_events_from_message(
             .unwrap_or(false);
 
         if is_error {
+            // AskUserQuestion, ExitPlanMode, and EnterPlanMode return is_error in
+            // --print mode because they need interactive input. This is expected —
+            // treat them as successful end-of-turn signals.
+            if claude_is_user_input_tool_name(&tool_name) {
+                let tool_result =
+                    if normalize_tool_name(&tool_name) == "exitplanmode" {
+                        // Find plan file content from a preceding Write tool in this turn.
+                        let plan_content = tool_call_by_id.values()
+                            .filter(|tc| normalize_tool_name(&tc.name) == "write")
+                            .find_map(|tc| {
+                                let path = claude_argument_file_path(&tc.arguments)?;
+                                if !path.contains(".claude/plans/") {
+                                    return None;
+                                }
+                                claude_argument_string(
+                                    &tc.arguments,
+                                    &["content", "text", "new_content"],
+                                )
+                            });
+                        match plan_content {
+                            Some(content) => json!({
+                                "kind": "Other",
+                                "result": { "plan_content": content }
+                            }),
+                            None => json!({ "kind": "Other", "result": null }),
+                        }
+                    } else {
+                        json!({ "kind": "Other", "result": null })
+                    };
+                events.push(ClaudeReplayToolExecution {
+                    tool_call_id,
+                    tool_name,
+                    success: true,
+                    tool_result,
+                    error: None,
+                });
+                continue;
+            }
+
             if is_run_command {
                 let command_result =
                     claude_run_command_result_from_tool_block(block, &result_text, 1, true);
@@ -6265,5 +6311,242 @@ mod tests {
             Some("Say \"hello world\" and nothing else.")
         );
         assert!(pending_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_tool_emits_request_and_success_completion() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-1".to_string();
+        let mut current_id = base_id.clone();
+
+        // Outer code emits initial StreamStart before read_claude_stdout runs.
+        inner.emit_stream_start(&base_id, None);
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(event_kind(&ev), Some("StreamStart"));
+
+        // 1) assistant message with AskUserQuestion tool_use
+        consume_claude_stream_value(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4-6",
+                    "id": "msg_ask",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_ask",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [{
+                                "question": "Which language?",
+                                "header": "Language",
+                                "options": [
+                                    { "label": "Rust", "description": "Systems lang" },
+                                    { "label": "Python", "description": "Scripting lang" }
+                                ],
+                                "multiSelect": false
+                            }]
+                        }
+                    }],
+                    "usage": { "input_tokens": 100, "output_tokens": 50 }
+                },
+                "session_id": "test-session"
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        // At this point the tool_call is registered but no StreamEnd/ToolRequest emitted yet
+        // (close_current_phase hasn't been called yet).
+        assert!(
+            summary.tool_name_by_id.contains_key("toolu_ask"),
+            "tool call should be registered: {:?}",
+            summary.tool_name_by_id
+        );
+
+        // 2) user message with tool_result (is_error: true) — this triggers
+        //    close_current_phase (StreamEnd + ToolRequest) then ToolExecutionCompleted.
+        consume_claude_stream_value(
+            &json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "content": "Answer questions?",
+                        "is_error": true,
+                        "tool_use_id": "toolu_ask"
+                    }]
+                },
+                "session_id": "test-session"
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        // Drain all emitted events
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|ev| ev.get("kind").and_then(Value::as_str))
+            .collect();
+
+        // Expect: StreamEnd, ToolRequest, ToolExecutionCompleted
+        assert!(
+            kinds.contains(&"StreamEnd"),
+            "expected StreamEnd in events, got: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"ToolRequest"),
+            "expected ToolRequest in events, got: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"ToolExecutionCompleted"),
+            "expected ToolExecutionCompleted in events, got: {kinds:?}"
+        );
+
+        // ToolExecutionCompleted should be success (overridden from is_error)
+        let completion = events
+            .iter()
+            .find(|ev| event_kind(ev) == Some("ToolExecutionCompleted"))
+            .expect("ToolExecutionCompleted should be present");
+        assert_eq!(
+            completion.pointer("/data/success").and_then(Value::as_bool),
+            Some(true),
+            "user-input tool should be overridden to success"
+        );
+        assert_eq!(
+            completion
+                .pointer("/data/tool_name")
+                .and_then(Value::as_str),
+            Some("AskUserQuestion")
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_includes_plan_content_from_preceding_write() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-1".to_string();
+        let mut current_id = base_id.clone();
+
+        inner.emit_stream_start(&base_id, None);
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(event_kind(&ev), Some("StreamStart"));
+
+        let plan_content = "# Plan\n\n## Step 1\nDo the first thing.";
+
+        // 1) assistant message with Write tool_use (plan file) + ExitPlanMode tool_use
+        consume_claude_stream_value(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4-6",
+                    "id": "msg_plan",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_write",
+                            "name": "Write",
+                            "input": {
+                                "file_path": "/Users/test/.claude/plans/test-plan.md",
+                                "content": plan_content
+                            }
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_exit",
+                            "name": "ExitPlanMode",
+                            "input": {}
+                        }
+                    ],
+                    "usage": { "input_tokens": 100, "output_tokens": 50 }
+                },
+                "session_id": "test-session"
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        // 2) user message with tool_results for both tools
+        consume_claude_stream_value(
+            &json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": "",
+                            "is_error": false,
+                            "tool_use_id": "toolu_write"
+                        },
+                        {
+                            "type": "tool_result",
+                            "content": "Exit plan mode?",
+                            "is_error": true,
+                            "tool_use_id": "toolu_exit"
+                        }
+                    ]
+                },
+                "session_id": "test-session"
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        // Drain all emitted events
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        // Find the ExitPlanMode ToolExecutionCompleted
+        let completion = events
+            .iter()
+            .find(|ev| {
+                event_kind(ev) == Some("ToolExecutionCompleted")
+                    && ev
+                        .pointer("/data/tool_name")
+                        .and_then(Value::as_str)
+                        == Some("ExitPlanMode")
+            })
+            .expect("ExitPlanMode ToolExecutionCompleted should be present");
+
+        assert_eq!(
+            completion.pointer("/data/success").and_then(Value::as_bool),
+            Some(true),
+        );
+
+        // The result should contain the plan content from the Write tool
+        assert_eq!(
+            completion
+                .pointer("/data/tool_result/result/plan_content")
+                .and_then(Value::as_str),
+            Some(plan_content),
+            "ExitPlanMode result should include plan_content from preceding Write"
+        );
     }
 }

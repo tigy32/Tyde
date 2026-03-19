@@ -272,19 +272,25 @@ export class EventRouter {
           });
         }
         break;
-      case "ToolRequest":
-        if (event.data.tool_name === "ask_user_question") {
+      case "ToolRequest": {
+        const isQuestion =
+          event.data.tool_name === "ask_user_question" ||
+          event.data.tool_name === "AskUserQuestion";
+        const isPlanDone = event.data.tool_name === "ExitPlanMode";
+        if (isQuestion) {
           this.waitingForUserInput.add(conversationId);
         }
         if (agent) {
           agentsPanel.updateAgent(conversationId, {
-            summary:
-              event.data.tool_name === "ask_user_question"
-                ? "Waiting for your input"
+            summary: isQuestion
+              ? "Waiting for your input"
+              : isPlanDone
+                ? "Plan ready"
                 : `Using ${event.data.tool_name}...`,
           });
         }
         break;
+      }
       case "OperationCancelled":
       case "RetryAttempt":
       case "SubprocessStderr":
