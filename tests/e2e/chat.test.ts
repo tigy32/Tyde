@@ -2190,6 +2190,55 @@ describe('Chat tab auto title', () => {
     const finalTitle = await (await $(sel.convTabTitle)).getText();
     expect(finalTitle).toBe('Manual Name');
   });
+
+  it('renames the tab via title agent after the first user message is sent', async () => {
+    await openWorkspace();
+
+    const newChatBtn = await $(sel.welcomeNewChat);
+    await newChatBtn.waitForExist({ timeout: 5000 });
+    await browser.execute((el: HTMLElement) => el.click(), newChatBtn);
+
+    const input = await $(sel.messageInput);
+    await input.waitForDisplayed({ timeout: 5000 });
+
+    // Tab starts with a default "Chat N" title
+    await browser.waitUntil(
+      async () => {
+        const title = await $(sel.convTabActive + ' ' + sel.convTabTitle);
+        return (await title.getText()).startsWith('Chat');
+      },
+      { timeout: 5000, timeoutMsg: 'Expected initial default chat tab title' },
+    );
+
+    // Sending the first message triggers auto-title generation via a spawned title agent
+    await sendPromptAndWaitForAssistant('Fix the login page redirect bug');
+
+    // The title agent completes asynchronously and renames the tab
+    await browser.waitUntil(
+      async () => {
+        const title = await $(sel.convTabActive + ' ' + sel.convTabTitle);
+        const text = await title.getText();
+        return !text.startsWith('Chat');
+      },
+      { timeout: 10000, timeoutMsg: 'Expected tab title to change from default after title agent completes' },
+    );
+
+    const autoTitle = await (await $(sel.convTabActive + ' ' + sel.convTabTitle)).getText();
+    expect(autoTitle.length).toBeGreaterThan(0);
+
+    // Verify the agents panel card also received the auto-generated title
+    await openAgentsWidget();
+    await browser.waitUntil(
+      async () => {
+        return browser.execute((titleSel: string, expected: string) => {
+          return Array.from(document.querySelectorAll(titleSel))
+            .filter((el) => (el as HTMLElement).offsetParent !== null)
+            .some((el) => el.textContent?.trim() === expected);
+        }, sel.agentCardTitle, autoTitle);
+      },
+      { timeout: 5000, timeoutMsg: 'Expected agents panel card title to match the auto-generated tab title' },
+    );
+  });
 });
 
 describe('Chat file links', () => {

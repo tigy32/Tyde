@@ -494,6 +494,16 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
+    case 'rename_agent': {
+      const agentId = Number(args?.agentId);
+      const name = typeof args?.name === 'string' ? args.name.trim() : '';
+      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
+      const agent = runtimeAgents.get(agentId);
+      if (!agent) throw new Error(`Agent ${agentId} not found`);
+      if (name) agent.name = name;
+      return null;
+    }
+
     case 'get_agent': {
       const agentId = Number(args?.agentId);
       if (!Number.isFinite(agentId)) return null;
