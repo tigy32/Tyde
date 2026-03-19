@@ -927,5 +927,11 @@ export function transformCallback(_callback: Function, _once?: boolean): number 
   return 0;
 }
 
+// Expose a helper so E2E tests can inject/update mock runtime agents directly.
+// This lets tests exercise the list_agents → syncRuntimeAgents polling path.
+(window as any).__mockSetRuntimeAgent = (agent: MockRuntimeAgent) => {
+  runtimeAgents.set(agent.agent_id, agent);
+};
+
 // Expose invoke on window so E2E tests can call it via browser.execute()
 (window as any).__TAURI_INTERNALS__ = { invoke };

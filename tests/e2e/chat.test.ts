@@ -1935,6 +1935,125 @@ describe('Agents panel parity', () => {
     );
   });
 
+  it('marks a bridge sub-agent as completed when TypingStatusChanged false is received', async () => {
+    await openWorkspace();
+
+    const newChatBtn = await $(sel.welcomeNewChat);
+    await newChatBtn.waitForExist({ timeout: 5000 });
+    await browser.execute((el: HTMLElement) => el.click(), newChatBtn);
+    const input = await $(sel.messageInput);
+    await input.waitForDisplayed({ timeout: 5000 });
+
+    await openAgentsWidget();
+
+    // Register a sub-agent with a real agent_id so it participates in the
+    // list_agents → syncRuntimeAgents polling path (the actual bug path).
+    const subAgentConvId = WORKSPACE_CONV_ID + 500;
+    const subAgentId = 42;
+    await emitChatEvent(subAgentConvId, 'ConversationRegistered', {
+      agent_id: subAgentId,
+      workspace_roots: ['/mock/workspace'],
+      backend_kind: 'tycode',
+      name: 'Sub-agent Worker',
+      agent_type: null,
+      parent_agent_id: 1,
+    });
+
+    // Also register the agent in the mock runtime so list_agents returns it
+    // with is_running: true (simulating a live runtime-tracked sub-agent).
+    const now = Date.now();
+    await browser.execute((agent: any) => {
+      (window as any).__mockSetRuntimeAgent(agent);
+    }, {
+      agent_id: subAgentId,
+      conversation_id: subAgentConvId,
+      workspace_roots: ['/mock/workspace'],
+      backend_kind: 'tycode',
+      parent_agent_id: 1,
+      keep_alive_without_tab: false,
+      name: 'Sub-agent Worker',
+      is_running: true,
+      summary: '',
+      created_at_ms: now,
+      updated_at_ms: now,
+      ended_at_ms: null,
+      last_error: null,
+      last_message: null,
+    });
+
+    await emitChatEvent(subAgentConvId, 'TypingStatusChanged', true);
+
+    // Sub-agent card should appear as running
+    await browser.waitUntil(
+      async () => browser.execute((titleSel: string) => {
+        return Array.from(document.querySelectorAll(titleSel))
+          .filter((el) => (el as HTMLElement).offsetParent !== null)
+          .map((el) => el.textContent?.trim() ?? '')
+          .includes('Sub-agent Worker');
+      }, sel.agentCardTitle),
+      { timeout: 5000, timeoutMsg: 'Expected sub-agent card to appear in agents panel' },
+    );
+    await browser.waitUntil(
+      async () => (await (await $$(sel.agentCardRunning)).length) >= 1,
+      { timeout: 5000, timeoutMsg: 'Expected sub-agent card to show running state' },
+    );
+
+    // Sub-agent completes: TypingStatusChanged false
+    await emitChatEvent(subAgentConvId, 'TypingStatusChanged', false);
+
+    // Simulate the Rust fix: record_chat_event sets is_running to false in the
+    // runtime, so the next list_agents poll returns the agent as stopped.
+    await browser.execute((agentId: number, convId: number) => {
+      (window as any).__mockSetRuntimeAgent({
+        agent_id: agentId,
+        conversation_id: convId,
+        workspace_roots: ['/mock/workspace'],
+        backend_kind: 'tycode',
+        parent_agent_id: 1,
+        keep_alive_without_tab: false,
+        name: 'Sub-agent Worker',
+        is_running: false,
+        summary: 'Completed',
+        created_at_ms: Date.now(),
+        updated_at_ms: Date.now(),
+        ended_at_ms: Date.now(),
+        last_error: null,
+        last_message: null,
+      });
+    }, subAgentId, subAgentConvId);
+
+    // Wait for at least one syncRuntimeAgents poll cycle (runs every 500ms)
+    // to verify the poll doesn't revert the completed state.
+    await browser.pause(800);
+
+    // The sub-agent card should still show completed state (no running class,
+    // shows remove button instead of interrupt/terminate).
+    await browser.waitUntil(
+      async () => browser.execute((cardSel: string, titleSel: string) => {
+        const cards = Array.from(document.querySelectorAll(cardSel)) as HTMLElement[];
+        return !cards.some((card) => {
+          if (!card.offsetParent) return false;
+          const title = card.querySelector(titleSel);
+          return title?.textContent?.trim() === 'Sub-agent Worker'
+            && card.classList.contains('agent-card-running');
+        });
+      }, sel.agentCard, sel.agentCardTitle),
+      { timeout: 5000, timeoutMsg: 'Expected sub-agent card to stay completed after syncRuntimeAgents poll' },
+    );
+    await browser.waitUntil(
+      async () => browser.execute((cardSel: string, removeSel: string, titleSel: string) => {
+        const cards = Array.from(document.querySelectorAll(cardSel)) as HTMLElement[];
+        return cards.some((card) => {
+          if (!card.offsetParent) return false;
+          const title = card.querySelector(titleSel);
+          if (!title || title.textContent?.trim() !== 'Sub-agent Worker') return false;
+          return Boolean(card.querySelector(removeSel));
+        });
+      }, sel.agentCard, sel.agentCardRemove, sel.agentCardTitle),
+      { timeout: 5000, timeoutMsg: 'Expected Remove button on completed sub-agent card after poll' },
+    );
+  });
+
   it('reopens hidden agent chats from the agents widget without duplicating tabs or losing live updates', async () => {
     await openWorkspace();
 
