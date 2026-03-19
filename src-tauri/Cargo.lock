@@ -5851,8 +5851,8 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tycode-core"
-version = "0.5.5"
-source = "git+https://github.com/tigy32/Tycode?tag=v0.5.5#56a48f4ec2d5d5ace6e999787b6e669c5c74e09a"
+version = "0.5.6"
+source = "git+https://github.com/tigy32/Tycode?tag=v0.5.6#97c7bd228d5c350277798854771cfde59d38a670"
 dependencies = [
  "anyhow",
  "async-channel",
