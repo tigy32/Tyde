@@ -180,6 +180,10 @@ export function getAgent(agentId: number) {
   return execute("get_agent", { agentId });
 }
 
+export function renameAgent(agentId: number, name: string) {
+  return execute("rename_agent", { agentId, name });
+}
+
 export function listAgents() {
   return execute("list_agents", {} as Record<string, never>);
 }

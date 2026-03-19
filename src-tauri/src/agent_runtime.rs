@@ -167,6 +167,18 @@ impl AgentRuntime {
         info
     }
 
+    pub fn rename_agent(&mut self, agent_id: u64, name: String) -> bool {
+        let Some(info) = self.agents.get_mut(&agent_id) else {
+            return false;
+        };
+        if info.name == name {
+            return false;
+        }
+        info.name = name;
+        info.updated_at_ms = now_ms();
+        true
+    }
+
     pub fn update_agent_type(&mut self, agent_id: u64, agent_type: Option<String>) {
         if let Some(info) = self.agents.get_mut(&agent_id) {
             info.agent_type = agent_type;

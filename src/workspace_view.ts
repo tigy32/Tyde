@@ -20,6 +20,7 @@ import {
   getSessionId,
   onFileChanged,
   readFileContent,
+  renameAgent,
   resumeSession,
   sendMessage,
   spawnAgent,
@@ -1089,6 +1090,11 @@ export class WorkspaceView {
         this.pendingSessionAliases.set(conversationId, normalizedTitle);
       }
       this.agentsPanel.updateAgent(conversationId, { name: normalizedTitle });
+      const agentInfo =
+        this.agentsPanel.getAgentByConversationId(conversationId);
+      if (agentInfo?.agentId != null) {
+        void renameAgent(agentInfo.agentId, normalizedTitle);
+      }
     } catch (err) {
       console.warn(
         `Auto-title generation failed for conversation ${conversationId}:`,
@@ -2303,6 +2309,8 @@ export class WorkspaceView {
     );
     if (existing?.name && (name === "Bridge" || name === "Conversation")) {
       name = existing.name;
+      // Push the correct name back to the runtime so listAgents() returns it.
+      void renameAgent(agent.agent_id, name);
     }
     const isTyping =
       agent.is_running &&

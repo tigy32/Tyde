@@ -2300,6 +2300,17 @@ async fn get_agent(
 }
 
 #[tauri::command]
+async fn rename_agent(
+    state: tauri::State<'_, AppState>,
+    agent_id: u64,
+    name: String,
+) -> Result<(), String> {
+    let mut runtime = state.agent_runtime.lock().await;
+    runtime.rename_agent(agent_id, name);
+    Ok(())
+}
+
+#[tauri::command]
 async fn list_agents(state: tauri::State<'_, AppState>) -> Result<Vec<AgentInfo>, String> {
     list_agents_internal(state.inner()).await
 }
@@ -3314,6 +3325,7 @@ pub fn run() {
             interrupt_agent,
             terminate_agent,
             get_agent,
+            rename_agent,
             list_agents,
             wait_for_agent,
             agent_events_since,
