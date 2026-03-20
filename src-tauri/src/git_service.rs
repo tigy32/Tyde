@@ -3,6 +3,41 @@ use tokio::process::Command;
 
 use crate::remote::{parse_remote_path, run_ssh_command};
 
+pub async fn discover_git_repos(workspace_dir: &str) -> Result<Vec<String>, String> {
+    // Check if the workspace dir itself is a git repo
+    let check = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(workspace_dir)
+        .output()
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    if check.status.success() {
+        return Ok(vec![workspace_dir.to_string()]);
+    }
+
+    // Scan immediate children for .git directories
+    let mut repos = Vec::new();
+    let mut entries = tokio::fs::read_dir(workspace_dir)
+        .await
+        .map_err(|e| format!("Failed to read directory: {e}"))?;
+
+    while let Some(entry) = entries.next_entry().await.map_err(|e| format!("{e}"))? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join(".git").exists() {
+            if let Some(s) = path.to_str() {
+                repos.push(s.to_string());
+            }
+        }
+    }
+
+    repos.sort();
+    Ok(repos)
+}
+
 #[derive(Serialize, Clone)]
 pub struct GitFileStatus {
     pub path: String,

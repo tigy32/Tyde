@@ -2165,6 +2165,39 @@ body {
   color: var(--color-error);
 }
 
+.git-repo-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+.git-repo-selector-label {
+  font-size: calc(var(--base-font-size) * 0.9286);
+  color: var(--text-secondary);
+}
+
+.git-repo-select {
+  background: var(--bg-secondary);
+  color: var(--text-bright);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: calc(var(--base-font-size) * 0.9286);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.git-repo-select:focus {
+  outline: 1px solid var(--accent-primary);
+}
+
+.git-repo-select-inline {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* === File Explorer === */
 .explorer-empty,
 .explorer-error {

@@ -248,6 +248,15 @@ export function adminDeleteSession(adminId: number, sessionId: string) {
 
 // --- Git operations ---
 
+export function discoverGitRepos(workspaceDir: string): Promise<string[]> {
+  return invoke<string[]>("discover_git_repos", { workspaceDir }).catch(
+    (err) => {
+      console.error("bridge: discoverGitRepos failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
 export function gitCurrentBranch(workingDir: string) {
   return execute("git_current_branch", { workingDir });
 }

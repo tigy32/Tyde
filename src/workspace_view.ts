@@ -615,7 +615,9 @@ export class WorkspaceView {
     if (this.mode === "bridge") {
       this.showEmptyState();
     } else {
-      this.gitPanel.setWorkingDir(config.workspacePath);
+      this.gitPanel.discoverRepos(config.workspacePath).catch((err) => {
+        console.error("Failed to discover git repos:", err);
+      });
       this.fileExplorer.setRootPath(config.workspacePath);
       this.gitPanel.startPeriodicRefresh();
       this.chatPanel.showWelcome();
