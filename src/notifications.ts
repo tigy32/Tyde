@@ -218,7 +218,10 @@ export class NotificationManager {
     clearBtn.textContent = "Clear All";
     clearBtn.addEventListener("click", () => {
       this.clearHistory();
-      this.renderHistoryList(panel);
+      this.historyPanelEl!.remove();
+      this.historyPanelEl = null;
+      const bell = document.querySelector(".notification-bell-btn");
+      if (bell) bell.setAttribute("aria-expanded", "false");
     });
 
     header.appendChild(title);
