@@ -83,6 +83,12 @@ export const sel = {
   homeTabAgents: '[data-testid="home-tab-agents"]',
   homeAgentsSection: '[data-testid="home-agents-section"]',
   homeAgentCard: '[data-testid="home-agent-card"]',
+  homeSettingsBtn: '[data-testid="home-settings-btn"]',
+  homeKeyboardHints: '[data-testid="home-keyboard-hints"]',
+  homeWizard: '[data-testid="home-wizard"]',
+  wizardNext: '[data-testid="wizard-next"]',
+  wizardFinish: '[data-testid="wizard-finish"]',
+  homeEmptyProjects: '[data-testid="home-empty-projects"]',
 
   // Git
   gitClean: '[data-testid="git-clean"]',
@@ -139,6 +145,7 @@ export async function resetAppState(storageEntries: Record<string, string> = {})
     window.localStorage.clear();
     const defaults: Record<string, string> = {
       'mock-mcp-http-enabled': 'true',
+      'tyde-onboarding-complete': 'true',
     };
     const merged = { ...defaults, ...entries };
     for (const [key, value] of Object.entries(merged)) {

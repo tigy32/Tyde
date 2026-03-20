@@ -250,6 +250,7 @@ export class AppController {
     this.homeView.onAgentClick = (agent) => {
       this.openRuntimeAgentInWorkspace(agent);
     };
+    this.homeView.onOpenSettings = () => this.openSettings();
     this.homeView.setBridgeChatAvailability(
       this.bridgeControlEnabled,
       this.bridgeChatDisabledReason(),
@@ -1043,8 +1044,12 @@ export class AppController {
       "Open Remote Workspace";
   }
 
-  private openSettings(): void {
+  private openSettings(tab?: string): void {
     if (!this.settingsTabViewEl.classList.contains("hidden")) {
+      if (tab) {
+        this.settingsPanel.openToTab(tab);
+        return;
+      }
       this.closeSettings();
       return;
     }
@@ -1052,6 +1057,9 @@ export class AppController {
     const view = this.getActiveView();
     if (view) {
       this.settingsPanel.adminId = view.getAdminId();
+    }
+    if (tab) {
+      this.settingsPanel.openToTab(tab);
     }
     this.settingsTabViewEl.classList.remove("hidden");
     this.escapeStack.push("settings", () => this.closeSettings());

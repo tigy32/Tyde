@@ -8121,11 +8121,13 @@ body {
 }
 
 .home-header {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
   gap: 4px;
+  width: 100%;
 }
 
 .home-logo {
@@ -8428,6 +8430,157 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* === Home: Settings gear button === */
+.home-settings-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background: transparent;
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: calc(var(--base-font-size) * 1.2);
+  padding: 6px 10px;
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+
+.home-settings-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* === Home: Keyboard shortcut hints === */
+.home-keyboard-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  justify-content: center;
+}
+
+.home-keyboard-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-tertiary);
+  font-size: calc(var(--base-font-size) * 0.857);
+}
+
+.home-kbd {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-primary);
+  background: var(--bg-tertiary);
+  font-family: inherit;
+  font-size: calc(var(--base-font-size) * 0.786);
+  color: var(--text-secondary);
+}
+
+.home-keyboard-hint-label {
+  color: var(--text-tertiary);
+}
+
+/* === Home: Empty projects state === */
+.home-empty-projects {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--text-tertiary);
+}
+
+.home-empty-projects-label {
+  font-size: calc(var(--base-font-size) * 1.14);
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.home-empty-projects-hint {
+  font-size: calc(var(--base-font-size) * 0.857);
+}
+
+/* === Home: Setup Wizard === */
+.home-wizard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 24px;
+  width: 100%;
+  max-width: 480px;
+}
+
+.home-wizard-text {
+  color: var(--text-secondary);
+  font-size: var(--base-font-size);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.home-wizard-step-title {
+  font-size: calc(var(--base-font-size) * 1.5);
+  font-weight: 600;
+  color: var(--text-bright, var(--text-primary));
+  margin: 0;
+}
+
+.home-wizard-backend-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+}
+
+.home-wizard-backend-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border-primary) 82%, transparent);
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+}
+
+.home-wizard-backend-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.home-wizard-backend-label-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.home-wizard-backend-name {
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.home-wizard-backend-desc {
+  font-size: calc(var(--base-font-size) * 0.857);
+  color: var(--text-tertiary);
+}
+
+.home-wizard-backend-warning {
+  color: var(--color-warning, #ff9800);
+  font-size: calc(var(--base-font-size) * 0.857);
+  margin: 0;
+}
+
+.home-wizard-btn-row {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
 }
 
 /* === Docked Conversation (per-tab docking) === */
