@@ -37,7 +37,7 @@ export class ProjectStateManager {
     this.restore();
   }
 
-  addProject(workspacePath: string): Project {
+  createProject(workspacePath: string): Project {
     const name =
       workspacePath.split("/").pop() ||
       workspacePath.split("\\").pop() ||
@@ -54,7 +54,21 @@ export class ProjectStateManager {
     };
     this.projects.push(project);
     this.onChange?.();
+    return project;
+  }
+
+  commitProject(_project: Project): void {
     this.persist();
+  }
+
+  abandonProject(projectId: string): void {
+    this.projects = this.projects.filter((p) => p.id !== projectId);
+    this.onChange?.();
+  }
+
+  addProject(workspacePath: string): Project {
+    const project = this.createProject(workspacePath);
+    this.commitProject(project);
     return project;
   }
 

@@ -780,23 +780,51 @@ export class AppController {
     let project = this.projectState.projects.find(
       (p) => p.workspacePath === dir,
     );
-    if (!project) {
-      project = this.projectState.addProject(dir);
+
+    if (remote && !project) {
+      // For new remote workspaces, create an unpersisted project so we can
+      // build the view and attempt connection. Only persist after success.
+      project = this.projectState.createProject(dir);
       project.name = displayName;
-    }
 
-    const view = this.getOrCreateWorkspaceView(
-      project.id,
-      project.workspacePath,
-      project.name,
-    );
-    this.switchToWorkspace(project.id);
+      const view = this.getOrCreateWorkspaceView(
+        project.id,
+        project.workspacePath,
+        project.name,
+      );
+      this.switchToWorkspace(project.id);
 
-    if (remote) {
+      let connected = false;
       try {
         await view.createNewConversationTab();
-      } catch (err) {
-        console.error("Remote connection failed:", err);
+        connected = true;
+      } finally {
+        if (!connected) {
+          view.destroy();
+          view.root.remove();
+          this.workspaceViews.delete(project.id);
+          this.projectState.abandonProject(project.id);
+          this.switchToHome();
+        }
+      }
+
+      // Connection succeeded — persist
+      this.projectState.commitProject(project);
+    } else {
+      if (!project) {
+        project = this.projectState.addProject(dir);
+        project.name = displayName;
+      }
+
+      const view = this.getOrCreateWorkspaceView(
+        project.id,
+        project.workspacePath,
+        project.name,
+      );
+      this.switchToWorkspace(project.id);
+
+      if (remote) {
+        await view.createNewConversationTab();
       }
     }
 
