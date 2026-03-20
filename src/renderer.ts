@@ -389,30 +389,6 @@ export function wrapWithTruncation(
   return `<div class="truncatable collapsed"><div class="truncatable-content">${html}</div><div class="truncatable-fade"></div><button class="truncatable-toggle" onclick="const container = this.closest('.truncatable'); if (container.classList.contains('collapsed')) { container.classList.remove('collapsed'); this.textContent = 'Show less'; } else { container.classList.add('collapsed'); this.textContent = 'Show more'; }">Show more</button></div>`;
 }
 
-/**
- * After setting innerHTML with wrapWithTruncation output, call this on the
- * parent element to hide the "Show more" button when content doesn't actually
- * overflow the collapsed max-height. Defers to requestAnimationFrame so the
- * element can be in the DOM and laid out before measuring.
- */
-export function hideTruncationIfNotNeeded(parent: Element): void {
-  requestAnimationFrame(() => {
-    for (const el of parent.querySelectorAll<HTMLElement>(
-      ".truncatable.collapsed",
-    )) {
-      const content = el.querySelector<HTMLElement>(".truncatable-content");
-      if (!content) continue;
-      if (content.scrollHeight <= 200) {
-        el.classList.remove("collapsed");
-        el.querySelector<HTMLElement>(".truncatable-fade")!.style.display =
-          "none";
-        el.querySelector<HTMLElement>(".truncatable-toggle")!.style.display =
-          "none";
-      }
-    }
-  });
-}
-
 export function renderCommandOutput(
   stdout: string,
   stderr: string,

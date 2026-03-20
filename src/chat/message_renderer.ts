@@ -1,9 +1,5 @@
 import type { ChatMessage, MessageSender, TokenUsage } from "@tyde/protocol";
-import {
-  hideTruncationIfNotNeeded,
-  renderContent,
-  wrapWithTruncation,
-} from "../renderer";
+import { renderContent, wrapWithTruncation } from "../renderer";
 import { normalizeReasoningText } from "./reasoning";
 
 export function formatCompact(n: number): string {
@@ -307,7 +303,6 @@ export function createMessageElement(
       renderContent(message.content),
       message.content.length,
     );
-    hideTruncationIfNotNeeded(contentEl);
   }
   el.appendChild(contentEl);
 

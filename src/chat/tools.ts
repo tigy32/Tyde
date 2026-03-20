@@ -4,12 +4,7 @@ import type {
   ToolUseData,
 } from "@tyde/protocol";
 import { createTwoFilesPatch } from "diff";
-import {
-  escapeHtml,
-  hideTruncationIfNotNeeded,
-  renderContent,
-  wrapWithTruncation,
-} from "../renderer";
+import { escapeHtml, renderContent, wrapWithTruncation } from "../renderer";
 
 export type ToolOutputMode = "summary" | "compact" | "verbose";
 // Legacy alias for existing imports in older code paths.
@@ -271,7 +266,6 @@ export function buildCommandOutputBlock(
   } else {
     const pre = createPreBlock(output);
     wrapper.innerHTML = wrapWithTruncation(pre.outerHTML, output.length, 0);
-    hideTruncationIfNotNeeded(wrapper);
   }
   return wrapper;
 }
@@ -347,7 +341,6 @@ function renderInlineDiff(
       diffLines.length,
       0,
     );
-    hideTruncationIfNotNeeded(wrapper);
     return wrapper;
   }
 
@@ -931,7 +924,6 @@ function renderSpawnToolResult(state: ToolState, text: string): HTMLElement {
         ? rendered
         : wrapWithTruncation(rendered, text.length, 0);
     root.appendChild(content);
-    hideTruncationIfNotNeeded(content);
   };
   bindToolOutputRenderer(state, updateResult);
   return root;
