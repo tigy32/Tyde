@@ -23,9 +23,10 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::{
-    await_agents_internal, cancel_agent_internal, create_workbench_internal, list_agents_internal,
-    run_agent_internal, send_agent_message_internal, spawn_agent_internal, AgentIdRequest,
-    AppState, AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
+    await_agents_internal, cancel_agent_internal, create_workbench_internal,
+    delete_workbench_internal, list_agents_internal, run_agent_internal,
+    send_agent_message_internal, spawn_agent_internal, AgentIdRequest, AppState,
+    AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
 };
 
 const MCP_HTTP_BIND_ENV: &str = "TYDE_AGENT_MCP_HTTP_BIND_ADDR";
@@ -119,6 +120,12 @@ struct CreateWorkbenchToolInput {
     branch: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct DeleteWorkbenchToolInput {
+    /// The workspace path of the workbench to delete.
+    workspace_path: String,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -153,7 +160,7 @@ fn caller_agent_id_from_parts(parts: &http::request::Parts) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Tools (6 tools — agent orchestration)
+// MCP Tools (7 tools — agent orchestration + workbench management)
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -286,6 +293,20 @@ impl TydeAgentMcpServer {
         .await
         {
             Ok(workspace_path) => ok_json(serde_json::json!({ "workspace_path": workspace_path })),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Delete a git worktree workbench. Closes all conversations, removes the workspace view, runs `git worktree remove`, and unregisters the workspace from the Tyde project list."
+    )]
+    async fn tyde_delete_workbench(
+        &self,
+        Parameters(input): Parameters<DeleteWorkbenchToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        match delete_workbench_internal(&self.app, app_state.inner(), input.workspace_path).await {
+            Ok(()) => ok_json(serde_json::json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }
     }
