@@ -7870,13 +7870,11 @@ body {
 
 .dock-zone-left {
   min-width: 220px;
-  max-width: 500px;
   border-right: 1px solid var(--border-primary);
 }
 
 .dock-zone-right {
   min-width: 220px;
-  max-width: 500px;
   border-left: 1px solid var(--border-primary);
 }
 

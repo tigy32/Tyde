@@ -1241,16 +1241,10 @@ export class Layout {
   ): void {
     if (target === "left") {
       const delta = e.clientX - this.resizeStartPos;
-      this.state.leftWidth = Math.min(
-        500,
-        Math.max(220, this.resizeStartSize + delta),
-      );
+      this.state.leftWidth = Math.max(220, this.resizeStartSize + delta);
     } else if (target === "right") {
       const delta = this.resizeStartPos - e.clientX;
-      this.state.rightWidth = Math.min(
-        500,
-        Math.max(220, this.resizeStartSize + delta),
-      );
+      this.state.rightWidth = Math.max(220, this.resizeStartSize + delta);
     } else {
       const delta = this.resizeStartPos - e.clientY;
       this.state.bottomHeight = Math.min(
