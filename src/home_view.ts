@@ -1,7 +1,20 @@
 import type { AgentCardAction } from "./agents";
-import type { BackendKind, RuntimeAgent } from "./bridge";
+import type { BackendDepResult, BackendKind, RuntimeAgent } from "./bridge";
+import {
+  checkBackendDependencies as checkBackendDependenciesBridge,
+  installBackendDependency as installBackendDependencyBridge,
+} from "./bridge";
+import { formatShortcut } from "./keyboard";
 import type { Project, ProjectStateManager } from "./project_state";
-import { getEnabledBackends } from "./settings";
+import {
+  getCachedDependencyStatus,
+  getEnabledBackendPreferences,
+  getEnabledBackends,
+  isOnboardingComplete,
+  markOnboardingComplete,
+  setEnabledBackendPreferences,
+  syncDisabledBackendsToRust,
+} from "./settings";
 
 const STATUS_COLORS: Record<string, string> = {
   active: "#4CAF50",
@@ -28,6 +41,12 @@ export class HomeView {
   private homeHideSubAgents = false;
   private homeHideOtherWorkspaces = false;
   private homeSearchQuery = "";
+  private wizardStep: 0 | 1 | 2 = 0;
+  private wizardDependencyStatus: Record<BackendKind, BackendDepResult> | null =
+    null;
+  private wizardInstallingBackends: Set<BackendKind> = new Set();
+  private wizardInstallError: Map<BackendKind, string> = new Map();
+  onOpenSettings: (() => void) | null = null;
   onOpenWorkspace: (() => void) | null = null;
   onOpenRemoteWorkspace: (() => void) | null = null;
   onNewBridgeChat: ((backendOverride?: BackendKind) => void) | null = null;
@@ -76,13 +95,22 @@ export class HomeView {
     wrapper.className = "home-view";
     wrapper.dataset.testid = "home-view";
 
+    if (!isOnboardingComplete()) {
+      wrapper.appendChild(this.buildWizard());
+      this.container.appendChild(wrapper);
+      return;
+    }
+
     wrapper.appendChild(this.buildHeader());
     wrapper.appendChild(this.buildActions());
+    wrapper.appendChild(this.buildKeyboardHints());
     wrapper.appendChild(this.buildTabBar());
 
     if (this.activeTab === "projects") {
       if (this.projectState.projects.length > 0) {
         wrapper.appendChild(this.buildProjectGrid());
+      } else {
+        wrapper.appendChild(this.buildEmptyProjectsState());
       }
     } else {
       wrapper.appendChild(this.buildAgentsSection());
@@ -534,9 +562,18 @@ export class HomeView {
     subtitle.className = "home-subtitle";
     subtitle.textContent = "Coding Agent Studio";
 
+    const settingsBtn = document.createElement("button");
+    settingsBtn.className = "home-settings-btn";
+    settingsBtn.dataset.testid = "home-settings-btn";
+    settingsBtn.textContent = "\u2699";
+    settingsBtn.title = `Settings (${formatShortcut("Ctrl+,")})`;
+    settingsBtn.setAttribute("aria-label", "Open settings");
+    settingsBtn.addEventListener("click", () => this.onOpenSettings?.());
+
     header.appendChild(logo);
     header.appendChild(title);
     header.appendChild(subtitle);
+    header.appendChild(settingsBtn);
     return header;
   }
 
@@ -772,5 +809,331 @@ export class HomeView {
     card.appendChild(meta);
 
     return card;
+  }
+
+  // --- Setup Wizard ---
+
+  private buildWizard(): HTMLElement {
+    const wizard = document.createElement("div");
+    wizard.className = "home-wizard";
+    wizard.dataset.testid = "home-wizard";
+
+    if (this.wizardStep === 0) {
+      this.buildWizardWelcome(wizard);
+    } else if (this.wizardStep === 1) {
+      this.buildWizardBackends(wizard);
+    } else {
+      this.buildWizardDone(wizard);
+    }
+
+    return wizard;
+  }
+
+  private buildWizardWelcome(wizard: HTMLElement): void {
+    const logo = document.createElement("div");
+    logo.className = "home-logo";
+    const img = document.createElement("img");
+    img.src = "tycode-tiger.png";
+    img.alt = "Tyde";
+    img.className = "home-logo-img";
+    logo.appendChild(img);
+    wizard.appendChild(logo);
+
+    const title = document.createElement("h1");
+    title.className = "home-title";
+    title.textContent = "Welcome to Tyde";
+    wizard.appendChild(title);
+
+    const desc = document.createElement("p");
+    desc.className = "home-wizard-text";
+    desc.textContent =
+      "Tyde is a coding agent studio that connects to multiple AI backends. " +
+      "Let\u2019s set up your first backend so you can start working.";
+    wizard.appendChild(desc);
+
+    const nextBtn = document.createElement("button");
+    nextBtn.className = "home-action-btn home-action-primary";
+    nextBtn.dataset.testid = "wizard-next";
+    nextBtn.textContent = "Set Up Backends";
+    nextBtn.addEventListener("click", () => {
+      this.wizardStep = 1;
+      this.wizardDependencyStatus = getCachedDependencyStatus();
+      this.render();
+    });
+    wizard.appendChild(nextBtn);
+  }
+
+  private buildWizardBackends(wizard: HTMLElement): void {
+    const title = document.createElement("h2");
+    title.className = "home-wizard-step-title";
+    title.textContent = "Configure Backends";
+    wizard.appendChild(title);
+
+    const desc = document.createElement("p");
+    desc.className = "home-wizard-text";
+    desc.textContent =
+      "Enable the coding backends you have installed. " +
+      "At least one backend is required.";
+    wizard.appendChild(desc);
+
+    const backends: {
+      kind: BackendKind;
+      label: string;
+      binary: string;
+      description: string;
+    }[] = [
+      {
+        kind: "tycode",
+        label: "Tycode",
+        binary: "tycode-subprocess",
+        description: "Built-in Tyde backend.",
+      },
+      {
+        kind: "codex",
+        label: "Codex",
+        binary: "codex",
+        description: "OpenAI Codex CLI backend.",
+      },
+      {
+        kind: "claude",
+        label: "Claude Code",
+        binary: "claude",
+        description: "Anthropic Claude Code CLI backend.",
+      },
+      {
+        kind: "kiro",
+        label: "Kiro",
+        binary: "kiro-cli",
+        description: "Kiro CLI backend.",
+      },
+    ];
+
+    const list = document.createElement("div");
+    list.className = "home-wizard-backend-list";
+
+    const enabledPrefs = getEnabledBackendPreferences();
+
+    for (const { kind, label, binary, description } of backends) {
+      const dep = this.wizardDependencyStatus?.[kind];
+      const depMissing = dep !== undefined && !dep.available;
+
+      const card = document.createElement("div");
+      card.className = "home-wizard-backend-card";
+      card.dataset.testid = `wizard-backend-${kind}`;
+
+      const row = document.createElement("div");
+      row.className = "home-wizard-backend-row";
+
+      const labelCol = document.createElement("div");
+      labelCol.className = "home-wizard-backend-label-col";
+
+      const nameEl = document.createElement("span");
+      nameEl.className = "home-wizard-backend-name";
+      nameEl.textContent = label;
+      labelCol.appendChild(nameEl);
+
+      const descEl = document.createElement("span");
+      descEl.className = "home-wizard-backend-desc";
+      descEl.textContent = description;
+      labelCol.appendChild(descEl);
+
+      row.appendChild(labelCol);
+
+      const toggle = document.createElement("label");
+      toggle.className = "settings-toggle";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = enabledPrefs.includes(kind) && !depMissing;
+      input.disabled = depMissing;
+      input.addEventListener("change", () => {
+        const current = getEnabledBackendPreferences();
+        if (input.checked) {
+          if (!current.includes(kind)) current.push(kind);
+        } else {
+          const idx = current.indexOf(kind);
+          if (idx !== -1) current.splice(idx, 1);
+        }
+        setEnabledBackendPreferences(current);
+        syncDisabledBackendsToRust();
+      });
+      toggle.appendChild(input);
+      const slider = document.createElement("span");
+      slider.className = "settings-toggle-slider";
+      toggle.appendChild(slider);
+      row.appendChild(toggle);
+
+      card.appendChild(row);
+
+      if (depMissing) {
+        const warning = document.createElement("p");
+        warning.className = "home-wizard-backend-warning";
+        warning.textContent = `"${binary}" was not found in PATH.`;
+        card.appendChild(warning);
+
+        const installing = this.wizardInstallingBackends.has(kind);
+        const installError = this.wizardInstallError.get(kind);
+
+        const installBtn = document.createElement("button");
+        installBtn.className = "settings-install-btn";
+        installBtn.dataset.testid = `wizard-install-${kind}`;
+        installBtn.textContent = installing ? "Installing\u2026" : "Install";
+        installBtn.disabled = installing;
+        installBtn.addEventListener("click", () => {
+          this.wizardInstallingBackends.add(kind);
+          this.wizardInstallError.delete(kind);
+          this.render();
+          installBackendDependencyBridge(kind)
+            .then(() => {
+              this.wizardInstallingBackends.delete(kind);
+              return checkBackendDependenciesBridge();
+            })
+            .then((status) => {
+              this.wizardDependencyStatus = {
+                tycode: status.tycode,
+                codex: status.codex,
+                claude: status.claude,
+                kiro: status.kiro,
+              };
+              this.render();
+            })
+            .catch((err) => {
+              this.wizardInstallingBackends.delete(kind);
+              this.wizardInstallError.set(kind, String(err));
+              this.render();
+            });
+        });
+        card.appendChild(installBtn);
+
+        if (installError) {
+          const errorEl = document.createElement("p");
+          errorEl.className = "home-wizard-backend-warning";
+          errorEl.textContent = installError;
+          card.appendChild(errorEl);
+        }
+      }
+
+      list.appendChild(card);
+    }
+
+    wizard.appendChild(list);
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "home-wizard-btn-row";
+
+    const backBtn = document.createElement("button");
+    backBtn.className = "home-action-btn home-action-secondary";
+    backBtn.textContent = "Back";
+    backBtn.addEventListener("click", () => {
+      this.wizardStep = 0;
+      this.render();
+    });
+
+    const nextBtn = document.createElement("button");
+    nextBtn.className = "home-action-btn home-action-primary";
+    nextBtn.dataset.testid = "wizard-next";
+    nextBtn.textContent = "Continue";
+    nextBtn.addEventListener("click", () => {
+      this.wizardStep = 2;
+      this.render();
+    });
+
+    btnRow.appendChild(backBtn);
+    btnRow.appendChild(nextBtn);
+    wizard.appendChild(btnRow);
+  }
+
+  private buildWizardDone(wizard: HTMLElement): void {
+    const title = document.createElement("h2");
+    title.className = "home-wizard-step-title";
+    title.textContent = "You\u2019re All Set";
+    wizard.appendChild(title);
+
+    const enabledBackends = getEnabledBackends();
+    const text = document.createElement("p");
+    text.className = "home-wizard-text";
+    text.textContent =
+      enabledBackends.length > 0
+        ? `${enabledBackends.length} backend${enabledBackends.length === 1 ? "" : "s"} enabled. You can change this anytime in Settings.`
+        : "No backends are enabled yet. You can enable them in Settings later.";
+    wizard.appendChild(text);
+
+    wizard.appendChild(this.buildKeyboardHints());
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "home-wizard-btn-row";
+
+    const backBtn = document.createElement("button");
+    backBtn.className = "home-action-btn home-action-secondary";
+    backBtn.textContent = "Back";
+    backBtn.addEventListener("click", () => {
+      this.wizardStep = 1;
+      this.render();
+    });
+
+    const getStartedBtn = document.createElement("button");
+    getStartedBtn.className = "home-action-btn home-action-primary";
+    getStartedBtn.dataset.testid = "wizard-finish";
+    getStartedBtn.textContent = "Get Started";
+    getStartedBtn.addEventListener("click", () => {
+      markOnboardingComplete();
+      this.render();
+    });
+
+    btnRow.appendChild(backBtn);
+    btnRow.appendChild(getStartedBtn);
+    wizard.appendChild(btnRow);
+  }
+
+  // --- Keyboard hints & empty state ---
+
+  private buildKeyboardHints(): HTMLElement {
+    const section = document.createElement("div");
+    section.className = "home-keyboard-hints";
+    section.dataset.testid = "home-keyboard-hints";
+
+    const hints: [string, string][] = [
+      [formatShortcut("Ctrl+K"), "Command Palette"],
+      [formatShortcut("Ctrl+,"), "Settings"],
+      [formatShortcut("Ctrl+/"), "Keyboard Shortcuts"],
+      [formatShortcut("Ctrl+N"), "New Conversation"],
+    ];
+
+    for (const [shortcut, label] of hints) {
+      const hint = document.createElement("div");
+      hint.className = "home-keyboard-hint";
+
+      const kbd = document.createElement("kbd");
+      kbd.className = "home-kbd";
+      kbd.textContent = shortcut;
+
+      const descSpan = document.createElement("span");
+      descSpan.className = "home-keyboard-hint-label";
+      descSpan.textContent = label;
+
+      hint.appendChild(kbd);
+      hint.appendChild(descSpan);
+      section.appendChild(hint);
+    }
+
+    return section;
+  }
+
+  private buildEmptyProjectsState(): HTMLElement {
+    const empty = document.createElement("div");
+    empty.className = "home-empty-projects";
+    empty.dataset.testid = "home-empty-projects";
+
+    const label = document.createElement("div");
+    label.className = "home-empty-projects-label";
+    label.textContent = "No open projects";
+
+    const hint = document.createElement("div");
+    hint.className = "home-empty-projects-hint";
+    hint.textContent =
+      "Open a workspace to get started, or start a Bridge chat above.";
+
+    empty.appendChild(label);
+    empty.appendChild(hint);
+    return empty;
   }
 }

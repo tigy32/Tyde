@@ -32,6 +32,7 @@ import {
 
 const APPEARANCE_STORAGE_KEY = "tyde-appearance";
 const ACTIVE_SETTINGS_TAB_KEY = "tyde-settings-active-tab";
+const ONBOARDING_COMPLETE_KEY = "tyde-onboarding-complete";
 const DEFAULT_SPAWN_PROFILE_STORAGE_KEY = "tyde-default-spawn-profile";
 const DEFAULT_BACKEND_STORAGE_KEY = "tyde-default-backend";
 
@@ -231,7 +232,7 @@ export function getEnabledBackends(): BackendKind[] {
   return ALL_BACKENDS.filter(isBackendEnabled);
 }
 
-function syncDisabledBackendsToRust(): void {
+export function syncDisabledBackendsToRust(): void {
   const disabled = ALL_BACKENDS.filter((b) => !isBackendEnabled(b));
   setDisabledBackendsBridge(disabled).catch((err) => {
     console.error("Failed to sync disabled backends to Rust:", err);
@@ -249,6 +250,16 @@ export async function initializeBackendDependencies(): Promise<void> {
   } catch (err) {
     console.error("Failed to initialize backend dependencies:", err);
   }
+}
+
+// --- Onboarding ---
+
+export function isOnboardingComplete(): boolean {
+  return localStorage.getItem(ONBOARDING_COMPLETE_KEY) !== null;
+}
+
+export function markOnboardingComplete(): void {
+  localStorage.setItem(ONBOARDING_COMPLETE_KEY, "true");
 }
 
 // --- Schema resolution helpers (ported from VSCode settings.js) ---
@@ -910,6 +921,10 @@ export class SettingsPanel {
     this.syncTabVisibility();
   }
 
+  openToTab(tab: SettingsTabId): void {
+    this.switchTab(tab);
+  }
+
   private syncTabVisibility(): void {
     this.syncNavGroupsForActiveTab();
 
@@ -1171,6 +1186,7 @@ export class SettingsPanel {
     this.backendUsageError.delete(kind);
     if (this.activeTab === "backends") {
       this.rerenderPanelContent("backends", () => this.buildBackendsContent());
+      this.syncProfileDropdown();
     }
 
     queryBackendUsageBridge(kind)
@@ -1190,6 +1206,7 @@ export class SettingsPanel {
           this.rerenderPanelContent("backends", () =>
             this.buildBackendsContent(),
           );
+          this.syncProfileDropdown();
         }
       });
   }
@@ -1539,6 +1556,7 @@ export class SettingsPanel {
           this.rerenderPanelContent("backends", () =>
             this.buildBackendsContent(),
           );
+          this.syncProfileDropdown();
           installBackendDependencyBridge(kind)
             .then(() => {
               this.installingBackends.delete(kind);
@@ -1550,6 +1568,7 @@ export class SettingsPanel {
               this.rerenderPanelContent("backends", () =>
                 this.buildBackendsContent(),
               );
+              this.syncProfileDropdown();
             });
         });
         card.appendChild(installBtn);

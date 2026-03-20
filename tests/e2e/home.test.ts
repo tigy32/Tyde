@@ -317,6 +317,88 @@ describe('Home screen and app launch', () => {
     );
   });
 
+  it('shows setup wizard on first launch and completes to normal home view', async () => {
+    await resetAppState();
+    // Remove onboarding-complete to simulate first launch
+    await browser.execute(() => localStorage.removeItem('tyde-onboarding-complete'));
+    await browser.url('/');
+
+    const wizard = await $(sel.homeWizard);
+    await wizard.waitForExist({ timeout: 5000 });
+    expect(await wizard.isDisplayed()).toBe(true);
+
+    const wizardText = await wizard.getText();
+    expect(wizardText).toContain('Welcome to Tyde');
+
+    // Click "Set Up Backends"
+    const nextBtn = await $(sel.wizardNext);
+    await nextBtn.click();
+
+    // Backends step
+    await browser.waitUntil(
+      async () => {
+        const text = await (await $(sel.homeWizard)).getText();
+        return text.includes('Configure Backends');
+      },
+      { timeout: 5000, timeoutMsg: 'Expected backends step' },
+    );
+
+    // Click Continue
+    const continueBtn = await $(sel.wizardNext);
+    await continueBtn.click();
+
+    // Done step with keyboard hints
+    await browser.waitUntil(
+      async () => {
+        const text = await (await $(sel.homeWizard)).getText();
+        return text.includes("All Set");
+      },
+      { timeout: 5000, timeoutMsg: 'Expected done step' },
+    );
+
+    const hints = await $(sel.homeKeyboardHints);
+    expect(await hints.isDisplayed()).toBe(true);
+
+    // Click "Get Started" — wizard disappears, normal home view shows
+    const finishBtn = await $(sel.wizardFinish);
+    await finishBtn.click();
+
+    await browser.waitUntil(
+      async () => !(await (await $(sel.homeWizard)).isExisting()),
+      { timeout: 5000, timeoutMsg: 'Expected wizard to disappear after finishing' },
+    );
+
+    // Normal home view elements visible
+    const bridgeBtn = await $(sel.homeNewBridgeChat);
+    expect(await bridgeBtn.isDisplayed()).toBe(true);
+  });
+
+  it('has a settings gear button on the home screen that opens settings', async () => {
+    await resetAppState();
+
+    const settingsBtn = await $(sel.homeSettingsBtn);
+    await settingsBtn.waitForDisplayed({ timeout: 5000 });
+    await settingsBtn.click();
+
+    const settingsView = await $(sel.settingsTabView);
+    await browser.waitUntil(
+      async () => {
+        const cls = await settingsView.getAttribute('class');
+        return cls !== null && !cls.includes('hidden');
+      },
+      { timeout: 5000, timeoutMsg: 'Settings overlay did not open from home gear button' },
+    );
+  });
+
+  it('shows empty projects state when no projects are open', async () => {
+    await resetAppState();
+
+    const emptyState = await $(sel.homeEmptyProjects);
+    await emptyState.waitForDisplayed({ timeout: 5000 });
+    const text = await emptyState.getText();
+    expect(text).toContain('No open projects');
+  });
+
   it('hides internal title helper agents from home agent surfaces', async () => {
     await openWorkspace();
 
