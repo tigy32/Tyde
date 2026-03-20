@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ pub struct ImageAttachment {
 pub struct SubprocessBridge {
     stdin: Arc<Mutex<ChildStdin>>,
     child: Arc<Mutex<Option<Child>>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl SubprocessBridge {
@@ -81,6 +83,8 @@ impl SubprocessBridge {
         let tx = event_tx.clone();
         let child_for_reader = Arc::new(Mutex::new(Some(child)));
         let child_ref = child_for_reader.clone();
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let shutting_down_reader = Arc::clone(&shutting_down);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -90,9 +94,13 @@ impl SubprocessBridge {
                 };
                 let _ = tx.send(value);
             }
-            let exit_code = match child_ref.lock().await.as_mut() {
-                Some(c) => c.try_wait().ok().flatten().and_then(|s| s.code()),
-                None => None,
+            let exit_code = if shutting_down_reader.load(Ordering::Acquire) {
+                Some(0)
+            } else {
+                match child_ref.lock().await.as_mut() {
+                    Some(c) => c.try_wait().ok().flatten().and_then(|s| s.code()),
+                    None => None,
+                }
             };
             let exit_event =
                 serde_json::json!({"kind": "SubprocessExit", "data": {"exit_code": exit_code}});
@@ -113,6 +121,7 @@ impl SubprocessBridge {
             Self {
                 stdin: Arc::new(Mutex::new(stdin)),
                 child: child_for_reader.clone(),
+                shutting_down,
             },
             event_rx,
         ))
@@ -145,6 +154,7 @@ impl SubprocessBridge {
     }
 
     pub async fn shutdown(self) {
+        self.shutting_down.store(true, Ordering::Release);
         if self.is_alive().await {
             let _ = self
                 .send_line(&serde_json::json!({"command": "quit"}).to_string())
