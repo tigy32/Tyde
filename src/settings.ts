@@ -598,11 +598,9 @@ export class SettingsPanel {
         };
         setCachedDependencyStatus(status);
         syncDisabledBackendsToRust();
-        if (this.activeTab === "backends") {
-          this.rerenderPanelContent("backends", () =>
-            this.buildBackendsContent(),
-          );
-        }
+        this.rerenderPanelContent("backends", () =>
+          this.buildBackendsContent(),
+        );
         this.syncProfileDropdown();
         this.onBackendsChanged?.();
       })
