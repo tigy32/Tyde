@@ -428,10 +428,6 @@ export class ChatPanel {
         textarea.selectionEnd = textarea.value.length;
         return;
       }
-      if (e.key === "Escape") {
-        if (view.typingIndicator.classList.contains("hidden")) return;
-        cancelConversation(conversationId);
-      }
     });
 
     textarea.addEventListener("input", () => {
