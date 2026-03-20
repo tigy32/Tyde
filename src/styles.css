@@ -3714,6 +3714,22 @@ body {
   }
 }
 
+/* Chat history loading overlay */
+.chat-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-primary);
+  z-index: 5;
+}
+
+.chat-loading-overlay .loading-spinner {
+  width: 24px;
+  height: 24px;
+}
+
 /* Loading overlay for panels */
 .panel-loading {
   display: flex;

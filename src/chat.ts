@@ -78,6 +78,7 @@ interface ConversationView {
   programmaticScroll: boolean;
   retryCard: HTMLElement | null;
   retryCountdownTimer: number | null;
+  loadingOverlay: HTMLElement;
 }
 
 interface ParsedLinkedFileTarget {
@@ -234,8 +235,16 @@ export class ChatPanel {
       this.conversationBackendKinds.get(conversationId) ?? "tycode";
     const sessionSettings = createSessionSettings(conversationId, backendKind);
 
+    const loadingOverlay = document.createElement("div");
+    loadingOverlay.className = "chat-loading-overlay hidden";
+    loadingOverlay.dataset.testid = "chat-loading-overlay";
+    const loadingSpinner = document.createElement("div");
+    loadingSpinner.className = "loading-spinner";
+    loadingOverlay.appendChild(loadingSpinner);
+
     wrapper.appendChild(taskBarEl);
     wrapper.appendChild(container);
+    wrapper.appendChild(loadingOverlay);
     wrapper.appendChild(typingIndicator);
     wrapper.appendChild(queueIndicator);
     wrapper.appendChild(inputArea);
@@ -266,6 +275,7 @@ export class ChatPanel {
       programmaticScroll: false,
       retryCard: null,
       retryCountdownTimer: null,
+      loadingOverlay,
     };
 
     this.wireViewEvents(view, conversationId, cancelBtn, fileInput, attachBtn);
@@ -1565,6 +1575,16 @@ export class ChatPanel {
     if (!view) return;
     view.disconnected = false;
     this.updateViewSendButton(view);
+  }
+
+  setHistoryLoading(conversationId: number, loading: boolean): void {
+    const view = this.views.get(conversationId);
+    if (!view) return;
+    if (loading) {
+      view.loadingOverlay.classList.remove("hidden");
+    } else {
+      view.loadingOverlay.classList.add("hidden");
+    }
   }
 
   focusInput(): void {

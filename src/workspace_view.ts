@@ -1842,13 +1842,16 @@ export class WorkspaceView {
         cid = await this.createNewConversationTab(savedAlias, backendKind, {
           bootstrap: false,
         });
+        this.chatPanel.setHistoryLoading(cid, true);
         await resumeSession(cid, sessionId);
+        this.chatPanel.setHistoryLoading(cid, false);
         this.conversationSessionMap.set(cid, { sessionId, backendKind });
         this.sessionsPanel.setActiveSession(sessionId, backendKind);
         this.sessionsPanel.setResuming(null);
         this.gitPanel.requestRefresh();
       } catch (err) {
         if (cid !== null) {
+          this.chatPanel.setHistoryLoading(cid, false);
           this.disposeFailedResumeConversation(cid);
         }
         this.sessionsPanel.setResuming(null);
