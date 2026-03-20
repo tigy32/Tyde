@@ -283,10 +283,8 @@ impl TydeAgentMcpServer {
         &self,
         Parameters(input): Parameters<CreateWorkbenchToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let app_state = self.app.state::<AppState>();
         match create_workbench_internal(
             &self.app,
-            app_state.inner(),
             input.parent_workspace_path,
             input.branch,
         )
@@ -304,8 +302,7 @@ impl TydeAgentMcpServer {
         &self,
         Parameters(input): Parameters<DeleteWorkbenchToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let app_state = self.app.state::<AppState>();
-        match delete_workbench_internal(&self.app, app_state.inner(), input.workspace_path).await {
+        match delete_workbench_internal(&self.app, input.workspace_path).await {
             Ok(()) => ok_json(serde_json::json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }

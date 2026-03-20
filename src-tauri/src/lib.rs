@@ -319,12 +319,6 @@ pub(crate) struct AppState {
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
-    create_workbench_pending:
-        SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>>>,
-    create_workbench_request_seq: AtomicU64,
-    delete_workbench_pending:
-        SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
-    delete_workbench_request_seq: AtomicU64,
     default_backend: SyncMutex<String>,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
@@ -496,16 +490,14 @@ struct DebugUiRequestPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CreateWorkbenchRequestPayload {
-    request_id: String,
+struct CreateWorkbenchEventPayload {
     parent_workspace_path: String,
     branch: String,
     worktree_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct DeleteWorkbenchRequestPayload {
-    request_id: String,
+struct DeleteWorkbenchEventPayload {
     workspace_path: String,
 }
 
@@ -1051,85 +1043,33 @@ pub(crate) async fn debug_ui_action_internal(
 
 pub(crate) async fn create_workbench_internal(
     app: &tauri::AppHandle,
-    state: &AppState,
     parent_workspace_path: String,
     branch: String,
 ) -> Result<String, String> {
     let worktree_path = format!("{parent_workspace_path}--{branch}");
-
     git_service::git_worktree_add(&parent_workspace_path, &worktree_path, &branch).await?;
-
-    let request_id = format!(
-        "cwb-{}",
-        state
-            .create_workbench_request_seq
-            .fetch_add(1, Ordering::Relaxed)
-    );
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
-    {
-        let mut pending = state.create_workbench_pending.lock();
-        pending.insert(request_id.clone(), tx);
-    }
-
-    let payload = CreateWorkbenchRequestPayload {
-        request_id: request_id.clone(),
-        parent_workspace_path,
-        branch,
-        worktree_path,
-    };
-
-    if let Err(err) = app.emit("tyde-create-workbench-request", &payload) {
-        state.create_workbench_pending.lock().remove(&request_id);
-        return Err(format!("Failed to emit create workbench request: {err:?}"));
-    }
-
-    match tokio::time::timeout(Duration::from_millis(30_000), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("Create workbench response channel closed".to_string()),
-        Err(_) => {
-            state.create_workbench_pending.lock().remove(&request_id);
-            Err("Create workbench request timed out".to_string())
-        }
-    }
+    app.emit(
+        "tyde-create-workbench",
+        &CreateWorkbenchEventPayload {
+            parent_workspace_path,
+            branch,
+            worktree_path: worktree_path.clone(),
+        },
+    )
+    .map_err(|err| format!("Failed to emit create workbench event: {err:?}"))?;
+    Ok(worktree_path)
 }
 
 pub(crate) async fn delete_workbench_internal(
     app: &tauri::AppHandle,
-    state: &AppState,
     workspace_path: String,
 ) -> Result<(), String> {
-    let request_id = format!(
-        "dwb-{}",
-        state
-            .delete_workbench_request_seq
-            .fetch_add(1, Ordering::Relaxed)
-    );
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-    {
-        let mut pending = state.delete_workbench_pending.lock();
-        pending.insert(request_id.clone(), tx);
-    }
-
-    let payload = DeleteWorkbenchRequestPayload {
-        request_id: request_id.clone(),
-        workspace_path,
-    };
-
-    if let Err(err) = app.emit("tyde-delete-workbench-request", &payload) {
-        state.delete_workbench_pending.lock().remove(&request_id);
-        return Err(format!("Failed to emit delete workbench request: {err:?}"));
-    }
-
-    match tokio::time::timeout(Duration::from_millis(30_000), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("Delete workbench response channel closed".to_string()),
-        Err(_) => {
-            state.delete_workbench_pending.lock().remove(&request_id);
-            Err("Delete workbench request timed out".to_string())
-        }
-    }
+    app.emit(
+        "tyde-delete-workbench",
+        &DeleteWorkbenchEventPayload { workspace_path },
+    )
+    .map_err(|err| format!("Failed to emit delete workbench event: {err:?}"))?;
+    Ok(())
 }
 
 fn is_valid_session_id(session_id: &str) -> bool {
@@ -2542,51 +2482,6 @@ fn submit_debug_ui_response(
 }
 
 #[tauri::command]
-fn submit_create_workbench_response(
-    state: tauri::State<'_, AppState>,
-    request_id: String,
-    ok: bool,
-    workspace_path: Option<String>,
-    error: Option<String>,
-) -> Result<(), String> {
-    let sender = {
-        let mut pending = state.create_workbench_pending.lock();
-        pending.remove(&request_id)
-    };
-    let response = if ok {
-        Ok(workspace_path.unwrap_or_default())
-    } else {
-        Err(error.unwrap_or_else(|| "Create workbench failed".to_string()))
-    };
-    if let Some(tx) = sender {
-        let _ = tx.send(response);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn submit_delete_workbench_response(
-    state: tauri::State<'_, AppState>,
-    request_id: String,
-    ok: bool,
-    error: Option<String>,
-) -> Result<(), String> {
-    let sender = {
-        let mut pending = state.delete_workbench_pending.lock();
-        pending.remove(&request_id)
-    };
-    let response = if ok {
-        Ok(())
-    } else {
-        Err(error.unwrap_or_else(|| "Delete workbench failed".to_string()))
-    };
-    if let Some(tx) = sender {
-        let _ = tx.send(response);
-    }
-    Ok(())
-}
-
-#[tauri::command]
 async fn get_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -3382,10 +3277,6 @@ pub fn run() {
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
-            create_workbench_pending: SyncMutex::new(HashMap::new()),
-            create_workbench_request_seq: AtomicU64::new(1),
-            delete_workbench_pending: SyncMutex::new(HashMap::new()),
-            delete_workbench_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),
@@ -3455,8 +3346,6 @@ pub fn run() {
             set_driver_mcp_http_server_autoload_enabled,
             set_default_backend,
             submit_debug_ui_response,
-            submit_create_workbench_response,
-            submit_delete_workbench_response,
             get_settings,
             list_models,
             list_sessions,
@@ -3588,10 +3477,6 @@ mod tests {
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
-            create_workbench_pending: SyncMutex::new(HashMap::new()),
-            create_workbench_request_seq: AtomicU64::new(1),
-            delete_workbench_pending: SyncMutex::new(HashMap::new()),
-            delete_workbench_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),
