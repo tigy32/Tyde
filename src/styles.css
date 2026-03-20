@@ -6302,6 +6302,31 @@ body {
   color: var(--text-primary);
 }
 
+.notification-history-dismiss {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: calc(var(--base-font-size) * 1.1429);
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+  border-radius: 3px;
+  opacity: 0;
+  transition:
+    opacity 0.1s,
+    color 0.1s;
+}
+
+.notification-history-item:hover .notification-history-dismiss {
+  opacity: 1;
+}
+
+.notification-history-dismiss:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
 /* === Full-Screen Chat Mode === */
 .fullscreen-chat-exit {
   position: fixed;

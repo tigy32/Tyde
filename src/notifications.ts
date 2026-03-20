@@ -301,7 +301,24 @@ export class NotificationManager {
     body.appendChild(time);
     row.appendChild(icon);
     row.appendChild(body);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "notification-history-dismiss";
+    closeBtn.textContent = "\u00d7";
+    closeBtn.setAttribute("aria-label", "Dismiss notification");
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.removeFromHistory(item);
+    });
+    row.appendChild(closeBtn);
+
     return row;
+  }
+
+  private removeFromHistory(item: NotificationItem): void {
+    const idx = this.history.indexOf(item);
+    if (idx !== -1) this.history.splice(idx, 1);
+    if (this.historyPanelEl) this.renderHistoryList(this.historyPanelEl);
   }
 
   private ensureContainer(): HTMLElement {
