@@ -108,6 +108,9 @@ export class AppController {
     document
       .getElementById("feedback-btn")!
       .addEventListener("click", () => showFeedbackDialog());
+    document
+      .getElementById("header-settings-btn")!
+      .addEventListener("click", () => this.openSettings());
 
     await initializeBackendDependencies();
     this.refreshAllBackendMenus();
@@ -272,7 +275,6 @@ export class AppController {
     this.homeView.onAgentClick = (agent) => {
       this.openRuntimeAgentInWorkspace(agent);
     };
-    this.homeView.onOpenSettings = () => this.openSettings();
     this.homeView.setBridgeChatAvailability(
       this.bridgeControlEnabled,
       this.bridgeChatDisabledReason(),

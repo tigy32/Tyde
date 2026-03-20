@@ -8468,28 +8468,6 @@ body {
   white-space: nowrap;
 }
 
-/* === Home: Settings gear button === */
-.home-settings-btn {
-  position: absolute;
-  top: 0;
-  right: 0;
-  background: transparent;
-  border: 1px solid var(--border-primary);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: calc(var(--base-font-size) * 1.2);
-  padding: 6px 10px;
-  cursor: pointer;
-  transition:
-    color 0.15s,
-    background 0.15s;
-}
-
-.home-settings-btn:hover {
-  color: var(--text-primary);
-  background: var(--bg-tertiary);
-}
-
 /* === Home: Keyboard shortcut hints === */
 .home-keyboard-hints {
   display: flex;

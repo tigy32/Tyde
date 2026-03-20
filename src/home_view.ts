@@ -46,7 +46,6 @@ export class HomeView {
     null;
   private wizardInstallingBackends: Set<BackendKind> = new Set();
   private wizardInstallError: Map<BackendKind, string> = new Map();
-  onOpenSettings: (() => void) | null = null;
   onOpenWorkspace: (() => void) | null = null;
   onOpenRemoteWorkspace: (() => void) | null = null;
   onNewBridgeChat: ((backendOverride?: BackendKind) => void) | null = null;
@@ -562,18 +561,9 @@ export class HomeView {
     subtitle.className = "home-subtitle";
     subtitle.textContent = "Coding Agent Studio";
 
-    const settingsBtn = document.createElement("button");
-    settingsBtn.className = "home-settings-btn";
-    settingsBtn.dataset.testid = "home-settings-btn";
-    settingsBtn.textContent = "\u2699";
-    settingsBtn.title = `Settings (${formatShortcut("Ctrl+,")})`;
-    settingsBtn.setAttribute("aria-label", "Open settings");
-    settingsBtn.addEventListener("click", () => this.onOpenSettings?.());
-
     header.appendChild(logo);
     header.appendChild(title);
     header.appendChild(subtitle);
-    header.appendChild(settingsBtn);
     return header;
   }
 
