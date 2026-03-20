@@ -901,8 +901,11 @@ export class ChatPanel {
     // Backend controls typing status — do NOT call setViewTypingVisible here
     if (!result) {
       this.renderFullMessage(view, message);
-    } else if (result.durationMs > 30_000) {
-      this.notificationManager?.notifyTaskComplete("Response complete");
+    } else {
+      this.expandLastAssistantMessage(view.container);
+      if (result.durationMs > 30_000) {
+        this.notificationManager?.notifyTaskComplete("Response complete");
+      }
     }
 
     if (message.tool_calls.length > 0 && view.streamState.lastRenderedBubble) {
@@ -965,6 +968,31 @@ export class ChatPanel {
 
   // --- Message rendering ---
 
+  private expandLastAssistantMessage(container: HTMLElement): void {
+    const msgs = container.querySelectorAll(".message.assistant-message");
+    if (msgs.length === 0) return;
+    const last = msgs[msgs.length - 1];
+    const lastTruncatable = last.querySelector(
+      ".message-content > .truncatable.collapsed",
+    );
+    if (lastTruncatable) {
+      lastTruncatable.classList.remove("collapsed");
+      const btn = lastTruncatable.querySelector(".truncatable-toggle");
+      if (btn) btn.textContent = "Show less";
+    }
+    if (msgs.length >= 2) {
+      const prev = msgs[msgs.length - 2];
+      const prevTruncatable = prev.querySelector(
+        ".message-content > .truncatable:not(.collapsed)",
+      );
+      if (prevTruncatable) {
+        prevTruncatable.classList.add("collapsed");
+        const btn = prevTruncatable.querySelector(".truncatable-toggle");
+        if (btn) btn.textContent = "Show more";
+      }
+    }
+  }
+
   private renderFullMessage(
     view: ConversationView,
     message: ChatMessage,
@@ -978,6 +1006,7 @@ export class ChatPanel {
     );
     view.container.appendChild(el);
     view.streamState.lastRenderedBubble = el;
+    this.expandLastAssistantMessage(view.container);
     if (message.context_breakdown) {
       view.taskPanel.setContextUsage(message.context_breakdown);
     }
