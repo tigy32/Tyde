@@ -373,10 +373,10 @@ describe('Home screen and app launch', () => {
     expect(await bridgeBtn.isDisplayed()).toBe(true);
   });
 
-  it('has a settings gear button on the home screen that opens settings', async () => {
+  it('has a settings gear button in the header that opens settings', async () => {
     await resetAppState();
 
-    const settingsBtn = await $(sel.homeSettingsBtn);
+    const settingsBtn = await $(sel.headerSettingsBtn);
     await settingsBtn.waitForDisplayed({ timeout: 5000 });
     await settingsBtn.click();
 
@@ -386,7 +386,7 @@ describe('Home screen and app launch', () => {
         const cls = await settingsView.getAttribute('class');
         return cls !== null && !cls.includes('hidden');
       },
-      { timeout: 5000, timeoutMsg: 'Settings overlay did not open from home gear button' },
+      { timeout: 5000, timeoutMsg: 'Settings overlay did not open from header gear button' },
     );
   });
 
