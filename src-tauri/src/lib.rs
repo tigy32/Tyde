@@ -322,6 +322,9 @@ pub(crate) struct AppState {
     create_workbench_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>>>,
     create_workbench_request_seq: AtomicU64,
+    delete_workbench_pending:
+        SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>,
+    delete_workbench_request_seq: AtomicU64,
     default_backend: SyncMutex<String>,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
@@ -498,6 +501,12 @@ struct CreateWorkbenchRequestPayload {
     parent_workspace_path: String,
     branch: String,
     worktree_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeleteWorkbenchRequestPayload {
+    request_id: String,
+    workspace_path: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1081,6 +1090,44 @@ pub(crate) async fn create_workbench_internal(
         Err(_) => {
             state.create_workbench_pending.lock().remove(&request_id);
             Err("Create workbench request timed out".to_string())
+        }
+    }
+}
+
+pub(crate) async fn delete_workbench_internal(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    workspace_path: String,
+) -> Result<(), String> {
+    let request_id = format!(
+        "dwb-{}",
+        state
+            .delete_workbench_request_seq
+            .fetch_add(1, Ordering::Relaxed)
+    );
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    {
+        let mut pending = state.delete_workbench_pending.lock();
+        pending.insert(request_id.clone(), tx);
+    }
+
+    let payload = DeleteWorkbenchRequestPayload {
+        request_id: request_id.clone(),
+        workspace_path,
+    };
+
+    if let Err(err) = app.emit("tyde-delete-workbench-request", &payload) {
+        state.delete_workbench_pending.lock().remove(&request_id);
+        return Err(format!("Failed to emit delete workbench request: {err:?}"));
+    }
+
+    match tokio::time::timeout(Duration::from_millis(30_000), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Delete workbench response channel closed".to_string()),
+        Err(_) => {
+            state.delete_workbench_pending.lock().remove(&request_id);
+            Err("Delete workbench request timed out".to_string())
         }
     }
 }
@@ -2518,6 +2565,28 @@ fn submit_create_workbench_response(
 }
 
 #[tauri::command]
+fn submit_delete_workbench_response(
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+    ok: bool,
+    error: Option<String>,
+) -> Result<(), String> {
+    let sender = {
+        let mut pending = state.delete_workbench_pending.lock();
+        pending.remove(&request_id)
+    };
+    let response = if ok {
+        Ok(())
+    } else {
+        Err(error.unwrap_or_else(|| "Delete workbench failed".to_string()))
+    };
+    if let Some(tx) = sender {
+        let _ = tx.send(response);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -3315,6 +3384,8 @@ pub fn run() {
             debug_ui_request_seq: AtomicU64::new(1),
             create_workbench_pending: SyncMutex::new(HashMap::new()),
             create_workbench_request_seq: AtomicU64::new(1),
+            delete_workbench_pending: SyncMutex::new(HashMap::new()),
+            delete_workbench_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),
@@ -3385,6 +3456,7 @@ pub fn run() {
             set_default_backend,
             submit_debug_ui_response,
             submit_create_workbench_response,
+            submit_delete_workbench_response,
             get_settings,
             list_models,
             list_sessions,
@@ -3518,6 +3590,8 @@ mod tests {
             debug_ui_request_seq: AtomicU64::new(1),
             create_workbench_pending: SyncMutex::new(HashMap::new()),
             create_workbench_request_seq: AtomicU64::new(1),
+            delete_workbench_pending: SyncMutex::new(HashMap::new()),
+            delete_workbench_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instance: SyncMutex::new(None),

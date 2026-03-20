@@ -451,6 +451,36 @@ export function submitCreateWorkbenchResponse(
   });
 }
 
+// --- Delete workbench bridge ---
+
+export interface DeleteWorkbenchRequestPayload {
+  request_id: string;
+  workspace_path: string;
+}
+
+export function onDeleteWorkbenchRequest(
+  callback: (payload: DeleteWorkbenchRequestPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<DeleteWorkbenchRequestPayload>(
+    "tyde-delete-workbench-request",
+    (event) => {
+      callback(event.payload);
+    },
+  );
+}
+
+export function submitDeleteWorkbenchResponse(
+  requestId: string,
+  ok: boolean,
+  error?: string,
+) {
+  return invoke("submit_delete_workbench_response", {
+    requestId,
+    ok,
+    error,
+  });
+}
+
 // --- Event listeners (Tauri-specific) ---
 
 export function onChatEvent(

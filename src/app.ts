@@ -5,6 +5,7 @@ import type {
   ChatEventPayload,
   ConversationRegisteredPayload,
   CreateWorkbenchRequestPayload,
+  DeleteWorkbenchRequestPayload,
   McpHttpServerSettings,
   RuntimeAgent,
 } from "./bridge";
@@ -21,8 +22,10 @@ import {
   onAdminEvent,
   onChatEvent,
   onCreateWorkbenchRequest,
+  onDeleteWorkbenchRequest,
   openWorkspaceDialog,
   submitCreateWorkbenchResponse,
+  submitDeleteWorkbenchResponse,
   terminateAgent,
 } from "./bridge";
 import { CommandPalette } from "./command_palette";
@@ -98,6 +101,9 @@ export class AppController {
     await registerDebugUiBridge();
     await onCreateWorkbenchRequest((payload) => {
       void this.handleCreateWorkbenchRequest(payload);
+    });
+    await onDeleteWorkbenchRequest((payload) => {
+      void this.handleDeleteWorkbenchRequest(payload);
     });
     document
       .getElementById("open-workspace-btn")!
@@ -994,6 +1000,40 @@ export class AppController {
       true,
       project.workspacePath,
     );
+  }
+
+  private async handleDeleteWorkbenchRequest(
+    payload: DeleteWorkbenchRequestPayload,
+  ): Promise<void> {
+    const project = this.projectState.projects.find(
+      (p) => p.workspacePath === payload.workspace_path,
+    );
+    if (!project) {
+      await submitDeleteWorkbenchResponse(
+        payload.request_id,
+        false,
+        `No project found for workspace path: ${payload.workspace_path}`,
+      );
+      return;
+    }
+    if (!project.parentProjectId) {
+      await submitDeleteWorkbenchResponse(
+        payload.request_id,
+        false,
+        `Project is not a workbench: ${payload.workspace_path}`,
+      );
+      return;
+    }
+    try {
+      await this.removeWorkbench(project.id);
+      await submitDeleteWorkbenchResponse(payload.request_id, true);
+    } catch (err) {
+      await submitDeleteWorkbenchResponse(
+        payload.request_id,
+        false,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 
   private async removeWorkbench(projectId: string): Promise<void> {
