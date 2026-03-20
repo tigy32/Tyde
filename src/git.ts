@@ -2,6 +2,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import type { GitFileStatus } from "@tyde/protocol";
 import { applyPatch } from "diff";
 import {
+  discoverGitRepos,
   gitCommit,
   gitCurrentBranch,
   gitDiff,
@@ -16,6 +17,8 @@ import { escapeHtml } from "./renderer";
 export class GitPanel {
   private container: HTMLElement;
   private workingDir = "";
+  private workspaceRoot = "";
+  private discoveredRepos: string[] = [];
   private currentBranch = "";
   private stagedFiles: GitFileStatus[] = [];
   private changedFiles: GitFileStatus[] = [];
@@ -38,6 +41,22 @@ export class GitPanel {
   setWorkingDir(dir: string): void {
     this.workingDir = dir;
     this.refresh();
+  }
+
+  async discoverRepos(workspacePath: string): Promise<void> {
+    this.workspaceRoot = workspacePath;
+    const repos = await discoverGitRepos(workspacePath);
+    this.discoveredRepos = repos;
+    if (repos.length === 1) {
+      this.setWorkingDir(repos[0]);
+    } else if (repos.length > 1) {
+      // Multiple repos: don't auto-pick, render selector and wait for user
+      this.workingDir = "";
+      this.renderRepoSelector();
+    } else {
+      // Zero repos: show "not a git repository" by pointing at workspace root
+      this.setWorkingDir(workspacePath);
+    }
   }
 
   requestRefresh(): void {
@@ -67,6 +86,10 @@ export class GitPanel {
     this.lastRefreshTime = Date.now();
 
     if (!this.workingDir) {
+      if (this.discoveredRepos.length > 1) {
+        // Repo selector is visible — don't clobber it
+        return;
+      }
       this.container.innerHTML =
         '<div class="git-empty">No workspace selected</div>';
       return;
@@ -145,10 +168,76 @@ export class GitPanel {
     this.container.appendChild(this.renderCommitArea());
   }
 
+  private renderRepoSelector(): void {
+    this.container.innerHTML = "";
+    const wrapper = document.createElement("div");
+    wrapper.className = "git-repo-selector";
+
+    const label = document.createElement("label");
+    label.textContent = "Select repository:";
+    label.className = "git-repo-selector-label";
+
+    const select = document.createElement("select");
+    select.className = "git-repo-select";
+    select.setAttribute("data-testid", "git-repo-select");
+
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Choose a repository...";
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    select.appendChild(placeholder);
+
+    for (const repo of this.discoveredRepos) {
+      const option = document.createElement("option");
+      option.value = repo;
+      option.textContent = this.repoRelativePath(repo);
+      select.appendChild(option);
+    }
+
+    select.addEventListener("change", () => {
+      this.setWorkingDir(select.value);
+    });
+
+    wrapper.appendChild(label);
+    wrapper.appendChild(select);
+    this.container.appendChild(wrapper);
+  }
+
+  private repoRelativePath(repoPath: string): string {
+    if (this.workspaceRoot && repoPath.startsWith(this.workspaceRoot)) {
+      const rel = repoPath.slice(this.workspaceRoot.length).replace(/^\//, "");
+      if (rel) return rel;
+    }
+    return repoPath;
+  }
+
   private renderBranchDisplay(): HTMLElement {
     const div = document.createElement("div");
     div.className = "git-branch-display";
-    div.innerHTML = `<span class="git-branch-icon">⎇</span><span class="git-branch-name">${escapeHtml(this.currentBranch)}</span>`;
+
+    if (this.discoveredRepos.length > 1) {
+      const select = document.createElement("select");
+      select.className = "git-repo-select git-repo-select-inline";
+      select.setAttribute("data-testid", "git-repo-select");
+      for (const repo of this.discoveredRepos) {
+        const option = document.createElement("option");
+        option.value = repo;
+        option.textContent = this.repoRelativePath(repo);
+        option.selected = repo === this.workingDir;
+        select.appendChild(option);
+      }
+      select.addEventListener("change", () => {
+        this.setWorkingDir(select.value);
+      });
+      div.appendChild(select);
+    }
+
+    const branchSpan = document.createElement("span");
+    branchSpan.className = "git-branch-icon-wrap";
+    branchSpan.innerHTML = `<span class="git-branch-icon">⎇</span><span class="git-branch-name">${escapeHtml(this.currentBranch)}</span>`;
+    div.appendChild(branchSpan);
+
     return div;
   }
 

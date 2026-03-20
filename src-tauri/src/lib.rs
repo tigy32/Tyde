@@ -2866,6 +2866,14 @@ async fn export_session_json(session_id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn discover_git_repos(workspace_dir: String) -> Result<Vec<String>, String> {
+    if parse_remote_path(&workspace_dir).is_some() {
+        return Ok(vec![workspace_dir]);
+    }
+    git_service::discover_git_repos(&workspace_dir).await
+}
+
+#[tauri::command]
 async fn git_current_branch(working_dir: String) -> Result<String, String> {
     git_service::git_current_branch(&working_dir).await
 }
@@ -3394,6 +3402,7 @@ pub fn run() {
             admin_switch_profile,
             admin_get_module_schemas,
             admin_delete_session,
+            discover_git_repos,
             git_current_branch,
             git_status,
             git_stage,
