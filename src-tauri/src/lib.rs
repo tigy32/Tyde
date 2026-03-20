@@ -217,6 +217,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
         agent_id: u64,
         success: bool,
         final_response: Option<String>,
+        event_tx: mpsc::UnboundedSender<Value>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let tool_use_id = tool_use_id.to_string();
         Box::pin(async move {
@@ -226,9 +227,8 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                 .filter(|text| !text.is_empty())
                 .map(|text| text.to_string());
 
-            let (conversation_id, maybe_event) = {
-                let mut runtime = self.agent_runtime.lock().await;
-                let conv_id = runtime.conversation_id_for_agent(agent_id);
+            let should_emit = {
+                let runtime = self.agent_runtime.lock().await;
                 let current_info = runtime.get_agent(agent_id);
                 let already_stopped = current_info
                     .as_ref()
@@ -244,70 +244,45 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                     (Some(_), None) => true,
                     _ => false,
                 };
-                let should_emit_terminal_event = !already_stopped || final_response_differs;
-
-                if !should_emit_terminal_event || conv_id.is_none() {
-                    (conv_id, None)
-                } else {
-                    let summary = final_response.clone().unwrap_or_else(|| {
-                        if success {
-                            "Completed".to_string()
-                        } else {
-                            "Failed".to_string()
-                        }
-                    });
-                    let event = serde_json::json!({
-                        "kind": if success { "StreamEnd" } else { "Error" },
-                        "data": if success {
-                            serde_json::json!({
-                                "message": {
-                                    "timestamp": crate::claude::unix_now_ms(),
-                                    "sender": { "Assistant": { "agent": &self.assistant_sender_name } },
-                                    "content": summary,
-                                    "tool_calls": [],
-                                    "images": [],
-                                }
-                            })
-                        } else {
-                            serde_json::json!(summary)
-                        }
-                    });
-                    if let Some(cid) = conv_id {
-                        runtime.record_chat_event(cid, &event);
-                    }
-                    (conv_id, Some(event))
-                }
+                !already_stopped || final_response_differs
             };
-            self.agent_runtime_notify.notify_waiters();
 
-            // Emit to the frontend so the EventRouter updates typing/status.
-            if let (Some(conv_id), Some(event)) = (conversation_id, maybe_event) {
-                let payload = ChatEventPayload {
-                    conversation_id: conv_id,
-                    event,
-                };
-                if let Err(e) = self.app.emit("chat-event", &payload) {
-                    tracing::warn!("Failed to emit sub-agent completion event: {e:?}");
-                }
-            }
-            if let Some(conv_id) = conversation_id {
-                let typing_event = serde_json::json!({
-                    "kind": "TypingStatusChanged",
-                    "data": false,
+            // Route terminal events through the sub-agent's event channel so
+            // forward_events processes them in order — after any earlier queued
+            // events like TypingStatusChanged(true).  This prevents the race
+            // where forward_events processes a stale TypingStatusChanged(true)
+            // after we've already recorded TypingStatusChanged(false).
+            if should_emit {
+                let summary = final_response.clone().unwrap_or_else(|| {
+                    if success {
+                        "Completed".to_string()
+                    } else {
+                        "Failed".to_string()
+                    }
                 });
-                {
-                    let mut runtime = self.agent_runtime.lock().await;
-                    runtime.record_chat_event(conv_id, &typing_event);
-                }
-                self.agent_runtime_notify.notify_waiters();
-                let typing_payload = ChatEventPayload {
-                    conversation_id: conv_id,
-                    event: typing_event,
-                };
-                if let Err(e) = self.app.emit("chat-event", &typing_payload) {
-                    tracing::warn!("Failed to emit sub-agent typing stop event: {e:?}");
-                }
+                let terminal_event = serde_json::json!({
+                    "kind": if success { "StreamEnd" } else { "Error" },
+                    "data": if success {
+                        serde_json::json!({
+                            "message": {
+                                "timestamp": crate::claude::unix_now_ms(),
+                                "sender": { "Assistant": { "agent": &self.assistant_sender_name } },
+                                "content": summary,
+                                "tool_calls": [],
+                                "images": [],
+                            }
+                        })
+                    } else {
+                        serde_json::json!(summary)
+                    }
+                });
+                let _ = event_tx.send(terminal_event);
             }
+
+            let _ = event_tx.send(serde_json::json!({
+                "kind": "TypingStatusChanged",
+                "data": false,
+            }));
 
             tracing::info!(
                 "{} sub-agent completed: agent_id={}, tool_use_id={}, success={}",
@@ -772,9 +747,15 @@ fn app_settings_from_state(state: &AppState) -> AppSettings {
     // driver fields from the on-disk file so we never clobber the host's saved values.
     let (driver_enabled, driver_autoload) = if state.driver_mcp_http_env_override {
         let on_disk = load_app_settings_from_disk();
-        (on_disk.driver_mcp_http_enabled, on_disk.driver_mcp_http_autoload)
+        (
+            on_disk.driver_mcp_http_enabled,
+            on_disk.driver_mcp_http_autoload,
+        )
     } else {
-        (*state.driver_mcp_http_enabled.lock(), *state.driver_mcp_http_autoload.lock())
+        (
+            *state.driver_mcp_http_enabled.lock(),
+            *state.driver_mcp_http_autoload.lock(),
+        )
     };
     AppSettings {
         mcp_http_enabled: *state.mcp_http_enabled.lock(),
@@ -3232,7 +3213,9 @@ fn resolve_shell_path() {
 // --- Workflow commands ---
 
 #[tauri::command]
-async fn list_workflows(workspace_path: Option<String>) -> Result<Vec<workflow_io::WorkflowEntry>, String> {
+async fn list_workflows(
+    workspace_path: Option<String>,
+) -> Result<Vec<workflow_io::WorkflowEntry>, String> {
     workflow_io::list_workflows(workspace_path).await
 }
 
@@ -3291,8 +3274,7 @@ pub fn run() {
     if detect_system_dark_mode() {
         std::env::set_var("GTK_THEME", "Adwaita:dark");
     }
-    let driver_mcp_http_env_override =
-        std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED").is_ok();
+    let driver_mcp_http_env_override = std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED").is_ok();
     let mut app_settings = load_app_settings();
     if !app_settings.driver_mcp_http_enabled {
         app_settings.driver_mcp_http_autoload = false;

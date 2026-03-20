@@ -2209,7 +2209,13 @@ impl CodexInner {
         });
 
         emitter
-            .on_subagent_completed(item_id, stream.handle.agent_id, success, final_response)
+            .on_subagent_completed(
+                item_id,
+                stream.handle.agent_id,
+                success,
+                final_response,
+                stream.handle.event_tx.clone(),
+            )
             .await;
     }
 
@@ -2321,7 +2327,13 @@ impl CodexInner {
         });
 
         emitter
-            .on_subagent_completed(&item_id, stream.handle.agent_id, success, final_response)
+            .on_subagent_completed(
+                &item_id,
+                stream.handle.agent_id,
+                success,
+                final_response,
+                stream.handle.event_tx.clone(),
+            )
             .await;
     }
 
@@ -2345,7 +2357,13 @@ impl CodexInner {
                 }
             });
             emitter
-                .on_subagent_completed(&item_id, stream.handle.agent_id, success, final_response)
+                .on_subagent_completed(
+                    &item_id,
+                    stream.handle.agent_id,
+                    success,
+                    final_response,
+                    stream.handle.event_tx.clone(),
+                )
                 .await;
         }
     }
@@ -4694,6 +4712,7 @@ mod tests {
             agent_id: u64,
             success: bool,
             final_response: Option<String>,
+            _event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             let tool_use_id = tool_use_id.to_string();
             Box::pin(async move {

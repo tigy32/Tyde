@@ -61,7 +61,9 @@ fn resolve_global_workflows_dir() -> Result<PathBuf, String> {
 }
 
 fn resolve_project_workflows_dir(workspace_path: &str) -> PathBuf {
-    PathBuf::from(workspace_path).join(".tyde").join("workflows")
+    PathBuf::from(workspace_path)
+        .join(".tyde")
+        .join("workflows")
 }
 
 async fn read_workflows_from_dir(dir: &PathBuf, scope: &str) -> Vec<WorkflowEntry> {
@@ -88,17 +90,11 @@ async fn read_workflows_from_dir(dir: &PathBuf, scope: &str) -> Vec<WorkflowEntr
                         });
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            "Failed to parse workflow {}: {err}",
-                            path.display()
-                        );
+                        tracing::warn!("Failed to parse workflow {}: {err}", path.display());
                     }
                 },
                 Err(err) => {
-                    tracing::warn!(
-                        "Failed to read workflow file {}: {err}",
-                        path.display()
-                    );
+                    tracing::warn!("Failed to read workflow file {}: {err}", path.display());
                 }
             }
         }
@@ -137,8 +133,9 @@ pub async fn save_workflow(
     let dir = match scope {
         "global" => resolve_global_workflows_dir()?,
         "project" => {
-            let wp = workspace_path
-                .ok_or_else(|| "workspace_path is required for project-scoped workflows".to_string())?;
+            let wp = workspace_path.ok_or_else(|| {
+                "workspace_path is required for project-scoped workflows".to_string()
+            })?;
             resolve_project_workflows_dir(&wp)
         }
         other => return Err(format!("Invalid scope: {other}")),
@@ -173,8 +170,9 @@ pub async fn delete_workflow(
     let dir = match scope {
         "global" => resolve_global_workflows_dir()?,
         "project" => {
-            let wp = workspace_path
-                .ok_or_else(|| "workspace_path is required for project-scoped workflows".to_string())?;
+            let wp = workspace_path.ok_or_else(|| {
+                "workspace_path is required for project-scoped workflows".to_string()
+            })?;
             resolve_project_workflows_dir(&wp)
         }
         other => return Err(format!("Invalid scope: {other}")),
@@ -257,7 +255,11 @@ mod tests {
             .unwrap();
 
         // Verify file exists
-        let wf_path = tmp.path().join(".tyde").join("workflows").join("test-wf.json");
+        let wf_path = tmp
+            .path()
+            .join(".tyde")
+            .join("workflows")
+            .join("test-wf.json");
         assert!(wf_path.exists());
 
         // List and verify
@@ -288,7 +290,11 @@ mod tests {
             .await
             .unwrap();
 
-        let wf_path = tmp.path().join(".tyde").join("workflows").join("del-test.json");
+        let wf_path = tmp
+            .path()
+            .join(".tyde")
+            .join("workflows")
+            .join("del-test.json");
         assert!(wf_path.exists());
 
         delete_workflow("del-test", "project", Some(project_path.clone()))

@@ -39,12 +39,15 @@ pub trait SubAgentEmitter: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>;
 
     /// Called when a sub-agent completes (tool_result received for the spawn tool).
+    /// `event_tx` is the sub-agent's event channel so completion events are routed
+    /// through `forward_events` in the correct order (after any queued events).
     fn on_subagent_completed(
         &self,
         tool_use_id: &str,
         agent_id: u64,
         success: bool,
         final_response: Option<String>,
+        event_tx: mpsc::UnboundedSender<Value>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
@@ -1725,12 +1728,14 @@ async fn detect_subagent_completions(
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let event_tx = stream.handle.event_tx.clone();
             emitter
                 .on_subagent_completed(
                     tool_use_id,
                     stream.handle.agent_id,
                     !is_error,
                     final_response,
+                    event_tx,
                 )
                 .await;
         }
@@ -4069,31 +4074,31 @@ fn extract_tool_result_events_from_message(
             // --print mode because they need interactive input. This is expected —
             // treat them as successful end-of-turn signals.
             if claude_is_user_input_tool_name(&tool_name) {
-                let tool_result =
-                    if normalize_tool_name(&tool_name) == "exitplanmode" {
-                        // Find plan file content from a preceding Write tool in this turn.
-                        let plan_content = tool_call_by_id.values()
-                            .filter(|tc| normalize_tool_name(&tc.name) == "write")
-                            .find_map(|tc| {
-                                let path = claude_argument_file_path(&tc.arguments)?;
-                                if !path.contains(".claude/plans/") {
-                                    return None;
-                                }
-                                claude_argument_string(
-                                    &tc.arguments,
-                                    &["content", "text", "new_content"],
-                                )
-                            });
-                        match plan_content {
-                            Some(content) => json!({
-                                "kind": "Other",
-                                "result": { "plan_content": content }
-                            }),
-                            None => json!({ "kind": "Other", "result": null }),
-                        }
-                    } else {
-                        json!({ "kind": "Other", "result": null })
-                    };
+                let tool_result = if normalize_tool_name(&tool_name) == "exitplanmode" {
+                    // Find plan file content from a preceding Write tool in this turn.
+                    let plan_content = tool_call_by_id
+                        .values()
+                        .filter(|tc| normalize_tool_name(&tc.name) == "write")
+                        .find_map(|tc| {
+                            let path = claude_argument_file_path(&tc.arguments)?;
+                            if !path.contains(".claude/plans/") {
+                                return None;
+                            }
+                            claude_argument_string(
+                                &tc.arguments,
+                                &["content", "text", "new_content"],
+                            )
+                        });
+                    match plan_content {
+                        Some(content) => json!({
+                            "kind": "Other",
+                            "result": { "plan_content": content }
+                        }),
+                        None => json!({ "kind": "Other", "result": null }),
+                    }
+                } else {
+                    json!({ "kind": "Other", "result": null })
+                };
                 events.push(ClaudeReplayToolExecution {
                     tool_call_id,
                     tool_name,
@@ -6528,10 +6533,7 @@ mod tests {
             .iter()
             .find(|ev| {
                 event_kind(ev) == Some("ToolExecutionCompleted")
-                    && ev
-                        .pointer("/data/tool_name")
-                        .and_then(Value::as_str)
-                        == Some("ExitPlanMode")
+                    && ev.pointer("/data/tool_name").and_then(Value::as_str) == Some("ExitPlanMode")
             })
             .expect("ExitPlanMode ToolExecutionCompleted should be present");
 
