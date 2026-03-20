@@ -2253,6 +2253,7 @@ export class WorkspaceView {
           // Debounced explorer refresh for any change under the workspace
           if (payload.path.startsWith(this.workspacePath)) {
             this.scheduleExplorerRefresh();
+            this.gitPanel.requestRefresh();
           }
         });
       }

@@ -2139,6 +2139,9 @@ body {
   border-radius: 6px;
   margin-bottom: 12px;
 }
+.git-refresh-btn {
+  margin-left: auto;
+}
 
 .git-branch-icon {
   color: var(--accent-primary);

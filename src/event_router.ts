@@ -169,7 +169,7 @@ export class EventRouter {
         }
         break;
       case "ToolExecutionCompleted":
-        if (isActiveTab) gitPanel.requestRefresh();
+        gitPanel.requestRefresh();
         if (agent) {
           const failureSummary = summarizeText(
             event.data.error ??

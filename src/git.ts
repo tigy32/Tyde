@@ -238,6 +238,13 @@ export class GitPanel {
     branchSpan.innerHTML = `<span class="git-branch-icon">⎇</span><span class="git-branch-name">${escapeHtml(this.currentBranch)}</span>`;
     div.appendChild(branchSpan);
 
+    const refreshBtn = document.createElement("button");
+    refreshBtn.className = "git-action-btn git-refresh-btn";
+    refreshBtn.title = "Refresh";
+    refreshBtn.textContent = "↻";
+    refreshBtn.addEventListener("click", () => this.requestRefresh());
+    div.appendChild(refreshBtn);
+
     return div;
   }
 
