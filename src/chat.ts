@@ -104,6 +104,7 @@ export class ChatPanel {
   private typingByConversation = new Map<number, boolean>();
   private activeConversationId: number | null = null;
   private inputHistory = new InputHistory();
+  private spawnLoadingOverlay: HTMLElement | null = null;
 
   notificationManager: NotificationManager | null = null;
   private relativeTimeTicker: number | null = null;
@@ -509,6 +510,7 @@ export class ChatPanel {
   }
 
   switchToConversation(conversationId: number): void {
+    this.hideSpawnLoading();
     const switchStart = perfNow();
     let hidePrevMs = 0;
     let getViewMs = 0;
@@ -808,6 +810,42 @@ export class ChatPanel {
     this.switchToConversation(id);
     const view = this.views.get(id);
     view?.textarea.focus();
+  }
+
+  showSpawnLoading(): void {
+    this.hideSpawnLoading();
+    if (this.activeConversationId !== null) {
+      const prevView = this.views.get(this.activeConversationId);
+      if (prevView && !this.detachedViews.has(this.activeConversationId)) {
+        prevView.wrapper.style.display = "none";
+      }
+    }
+    this.activeConversationId = null;
+    this.welcomeEl.style.display = "none";
+    this.container.classList.remove("chat-panel-welcome");
+
+    const overlay = document.createElement("div");
+    overlay.className = "chat-spawn-loading";
+    overlay.innerHTML =
+      '<div class="loading-spinner"></div><span>Starting agent\u2026</span>';
+    this.container.appendChild(overlay);
+    this.spawnLoadingOverlay = overlay;
+  }
+
+  hideSpawnLoading(): void {
+    if (this.spawnLoadingOverlay) {
+      this.spawnLoadingOverlay.remove();
+      this.spawnLoadingOverlay = null;
+    }
+  }
+
+  showSpawnError(message: string): void {
+    this.hideSpawnLoading();
+    const overlay = document.createElement("div");
+    overlay.className = "chat-spawn-loading chat-spawn-error";
+    overlay.textContent = message;
+    this.container.appendChild(overlay);
+    this.spawnLoadingOverlay = overlay;
   }
 
   // --- Chat clearing ---
@@ -1415,6 +1453,7 @@ export class ChatPanel {
   // --- Lifecycle ---
 
   clear(): void {
+    this.hideSpawnLoading();
     if (this.activeConversationId !== null) {
       const view = this.views.get(this.activeConversationId);
       if (view) view.wrapper.style.display = "none";

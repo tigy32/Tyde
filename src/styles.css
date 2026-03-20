@@ -3725,6 +3725,21 @@ body {
   font-size: calc(var(--base-font-size) * 0.9286);
 }
 
+/* Chat spawn loading overlay */
+.chat-spawn-loading {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: calc(var(--base-font-size) * 0.9286);
+}
+
+.chat-spawn-error {
+  color: var(--color-error);
+}
+
 /* Empty state styling */
 .panel-empty-state {
   display: flex;
