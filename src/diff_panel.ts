@@ -1351,10 +1351,38 @@ export class DiffPanel {
         matches.length;
     }
 
-    this.pendingFindFocus = true;
-    this.pendingFindSelectAll = false;
-    this.pendingScrollToSearchMatch = true;
-    this.render();
+    const lineIndex = matches[this.fileSearchActiveIndex];
+    if (lineIndex === undefined) return;
+
+    // Update counter text in-place
+    const countEl = this.container.querySelector<HTMLElement>(
+      ".diff-panel-find-count",
+    );
+    if (countEl) {
+      countEl.textContent = `${this.fileSearchActiveIndex + 1}/${matches.length}`;
+    }
+
+    // Swap active class in-place for non-virtualized views.
+    // For virtualized views, scrollToFileLine triggers a forced viewport
+    // re-render which applies the class via createFileLineElement.
+    if (!this.virtualizedFileView) {
+      const oldActive = this.container.querySelector(
+        ".diff-panel-search-hit-active",
+      );
+      if (oldActive) oldActive.classList.remove("diff-panel-search-hit-active");
+      const newActive = this.container.querySelector(
+        `[data-search-match-index="${this.fileSearchActiveIndex}"]`,
+      );
+      if (newActive) newActive.classList.add("diff-panel-search-hit-active");
+    }
+
+    this.scrollToFileLine(lineIndex, "smooth");
+
+    // Re-focus the search input
+    const input = this.container.querySelector<HTMLInputElement>(
+      ".diff-panel-find-input",
+    );
+    if (input) input.focus();
   }
 
   private closeFileSearch(): void {
