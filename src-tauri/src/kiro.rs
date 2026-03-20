@@ -149,6 +149,7 @@ impl KiroSession {
                 active_stream_tool_calls: Vec::new(),
                 active_tool_contexts: HashMap::new(),
                 tool_call_aliases: HashMap::new(),
+                cancelled: false,
                 replaying_history: false,
                 replay_assistant_message_id: None,
                 replay_assistant_text: String::new(),
@@ -196,6 +197,7 @@ struct KiroState {
     active_stream_tool_calls: Vec<Value>,
     active_tool_contexts: HashMap<String, KiroToolContext>,
     tool_call_aliases: HashMap<String, String>,
+    cancelled: bool,
     replaying_history: bool,
     replay_assistant_message_id: Option<String>,
     replay_assistant_text: String,
@@ -267,9 +269,21 @@ impl KiroInner {
                     params["modeId"] = Value::String(mode_id);
                 }
 
+                self.state.lock().await.cancelled = false;
+
                 let response = match self.bridge.request("session/prompt", params).await {
                     Ok(value) => value,
                     Err(err) => {
+                        // CancelConversation sets `cancelled = true` before sending
+                        // session/cancel. If the prompt error is just the stale
+                        // rejection of a cancelled request, swallow it — the cancel
+                        // handler already emitted OperationCancelled + TypingStatusChanged.
+                        let mut state = self.state.lock().await;
+                        if state.cancelled {
+                            state.cancelled = false;
+                            return Ok(());
+                        }
+                        drop(state);
                         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
                         return Err(err);
                     }
@@ -324,7 +338,10 @@ impl KiroInner {
                 Ok(())
             }
             SessionCommand::CancelConversation => {
-                let session_id = self.state.lock().await.session_id.clone();
+                let mut state = self.state.lock().await;
+                state.cancelled = true;
+                let session_id = state.session_id.clone();
+                drop(state);
                 self.bridge
                     .notify("session/cancel", json!({ "sessionId": session_id }))
                     .await?;
