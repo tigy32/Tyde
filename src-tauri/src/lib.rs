@@ -1923,6 +1923,10 @@ pub(crate) async fn wait_for_agent_internal(
     let mut last_updated_at_ms: Option<u64> = None;
 
     loop {
+        // Create the Notified future BEFORE checking state to avoid missing
+        // a notification that fires between the state check and the await.
+        let notified = state.agent_runtime_notify.notified();
+
         let current = {
             let runtime = state.agent_runtime.lock().await;
             runtime
@@ -1939,7 +1943,6 @@ pub(crate) async fn wait_for_agent_internal(
             last_updated_at_ms = Some(current.updated_at_ms);
         }
 
-        let notified = state.agent_runtime_notify.notified();
         let now = tokio::time::Instant::now();
         let effective_deadline = idle_deadline.min(wall_deadline);
         if now >= effective_deadline {
@@ -2111,6 +2114,10 @@ pub(crate) async fn await_agents_internal(
     let mut last_updated_at_ms: Option<u64> = None;
 
     loop {
+        // Create the Notified future BEFORE checking state to avoid missing
+        // a notification that fires between the state check and the await.
+        let notified = state.agent_runtime_notify.notified();
+
         let (ready, still_running, newest_updated_at) = {
             let runtime = state.agent_runtime.lock().await;
             let watch_ids: Vec<u64> = match &request.agent_ids {
@@ -2170,7 +2177,6 @@ pub(crate) async fn await_agents_internal(
             last_updated_at_ms = Some(newest_updated_at);
         }
 
-        let notified = state.agent_runtime_notify.notified();
         let now = tokio::time::Instant::now();
         let effective_deadline = idle_deadline.min(wall_deadline);
         if now >= effective_deadline {
