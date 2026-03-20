@@ -1287,20 +1287,48 @@ export class WorkspaceView {
   ): Promise<number> {
     this.ensureConversationCreationAllowed();
     const backendKind = this.resolveConversationBackend(backendOverride);
-    await this.ensureAdminSubprocess(backendKind);
-    const conversationRoots = this.resolveWorkspaceRootsForBackend(backendKind);
-    const id = await createConversation(
-      conversationRoots,
-      backendKind,
-      undefined,
-      this.resolveConversationMode(),
-    );
+
+    // Show tab with loading state BEFORE blocking subprocess spawn
+    const tabTitle = this.resolveTitleForNewConversation(tabLabel);
+    const tab = this.tabManager.createChatTab(null, tabTitle);
+    this.tabManager.switchTo(tab.id);
+    this.layout.setHomeMode(false);
+    this.layout.switchTab("chat");
+    this.chatPanel.showSpawnLoading();
+
+    let id: number;
+    try {
+      await this.ensureAdminSubprocess(backendKind);
+      const conversationRoots =
+        this.resolveWorkspaceRootsForBackend(backendKind);
+      id = await createConversation(
+        conversationRoots,
+        backendKind,
+        undefined,
+        this.resolveConversationMode(),
+      );
+    } catch (err) {
+      this.tabManager.closeTab(tab.id);
+      this.chatPanel.showSpawnError(
+        `Failed to start agent: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      throw err;
+    }
+
+    // If the user closed the tab while we were awaiting, clean up and bail out.
+    const tabStillExists = this.tabManager
+      .getTabs()
+      .some((t) => t.id === tab.id);
+    if (!tabStillExists) {
+      closeConversation(id).catch(() => {});
+      return id;
+    }
+
+    // Bind the real conversation ID to the tab and view
+    tab.conversationId = id;
+    this.tabManager.persist();
     this.chatPanel.setConversationBackendKind(id, backendKind);
     this.conversationBackendKindMap.set(id, backendKind);
-    const tab = this.tabManager.createChatTab(
-      id,
-      this.resolveTitleForNewConversation(tabLabel),
-    );
     this.registerConversation({
       conversationId: id,
       name: tab.title,
@@ -1309,9 +1337,6 @@ export class WorkspaceView {
       createdAt: Date.now(),
       projectId: this.projectId,
     });
-    this.tabManager.switchTo(tab.id);
-    this.layout.setHomeMode(false);
-    this.layout.switchTab("chat");
     this.chatPanel.switchToConversation(id);
     await this.applyDefaultSpawnProfile(id, backendKind);
     if (this.mode === "bridge") {
