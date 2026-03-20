@@ -2142,6 +2142,7 @@ async fn map_tool_request_type(params: &Value, args: &Value, workspace_root: &st
                 .to_string();
             let after = args
                 .get("newStr")
+                .or_else(|| args.get("file_text"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
