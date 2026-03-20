@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -132,6 +133,7 @@ impl KiroSession {
         let inner = Arc::new(KiroInner {
             bridge,
             event_tx,
+            shutting_down: AtomicBool::new(false),
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
@@ -219,6 +221,7 @@ struct KiroInner {
     bridge: AcpBridge,
     event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<KiroState>,
+    shutting_down: AtomicBool,
 }
 
 impl KiroInner {
@@ -580,6 +583,7 @@ impl KiroInner {
     }
 
     async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         self.bridge.shutdown().await;
     }
 
@@ -589,9 +593,14 @@ impl KiroInner {
                 self.emit_event(json!({ "kind": "SubprocessStderr", "data": line }));
             }
             AcpInbound::Closed { exit_code } => {
+                let code = if self.shutting_down.load(Ordering::Acquire) {
+                    Some(0)
+                } else {
+                    exit_code
+                };
                 self.emit_event(json!({
                     "kind": "SubprocessExit",
-                    "data": { "exit_code": exit_code }
+                    "data": { "exit_code": code }
                 }));
             }
             AcpInbound::Notification { method, params } => {
