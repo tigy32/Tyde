@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -10,8 +9,6 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
-
-const ACP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
 const ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
 
@@ -1186,13 +1183,9 @@ impl AcpRpc {
             return Err(err);
         }
 
-        match tokio::time::timeout(ACP_REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("ACP response channel closed".to_string()),
-            Err(_) => {
-                let _ = self.pending.lock().await.remove(&id);
-                Err(format!("ACP request timed out for method '{method}'"))
-            }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err("ACP response channel closed".to_string()),
         }
     }
 
