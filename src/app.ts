@@ -15,6 +15,7 @@ import {
   getInitialWorkspace,
   gitWorktreeAdd,
   gitWorktreeRemove,
+  installBackendDependency as installBackendDependencyBridge,
   interruptAgent,
   listAgents,
   onAdminEvent,
@@ -42,6 +43,7 @@ import { ProjectSidebar } from "./projects";
 import {
   adjustFontSize,
   initializeBackendDependencies,
+  needsTycodeUpgrade,
   SettingsPanel,
 } from "./settings";
 import { promptForText } from "./text_prompt";
@@ -109,6 +111,26 @@ export class AppController {
 
     await initializeBackendDependencies();
     this.refreshAllBackendMenus();
+
+    // If the user previously enabled tycode but the binary is missing after an
+    // app update, kick off a background install and notify. Don't block startup.
+    if (needsTycodeUpgrade()) {
+      this.notifications.info(
+        "Tycode update required — installing new version in the background.",
+      );
+      installBackendDependencyBridge("tycode")
+        .then(() => {
+          this.settingsPanel.refreshBackendDependencies();
+          this.refreshAllBackendMenus();
+          this.notifications.success("Tycode updated successfully.");
+        })
+        .catch((err) => {
+          console.error("[tycode] Background install failed:", err);
+          this.notifications.error(
+            `Tycode update failed: ${String(err)}. You can retry from Settings → Backends.`,
+          );
+        });
+    }
 
     await this.bootstrapStartup();
     this.startRuntimeAgentSync();

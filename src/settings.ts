@@ -252,6 +252,21 @@ export async function initializeBackendDependencies(): Promise<void> {
   }
 }
 
+/**
+ * Returns true if tycode was previously enabled by the user but the binary
+ * is no longer available (version bump after app update).
+ */
+export function needsTycodeUpgrade(): boolean {
+  // Only trigger for users who explicitly set backend preferences before.
+  // When the key is absent, this is a first-time user — don't auto-install.
+  if (localStorage.getItem(ENABLED_BACKENDS_STORAGE_KEY) === null) return false;
+  const prefs = getEnabledBackendPreferences();
+  const status = getCachedDependencyStatus();
+  return (
+    prefs.includes("tycode") && status !== null && !status.tycode.available
+  );
+}
+
 // --- Onboarding ---
 
 export function isOnboardingComplete(): boolean {
