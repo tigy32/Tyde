@@ -417,68 +417,38 @@ export function submitDebugUiResponse(
   return execute("submit_debug_ui_response", { requestId, ok, result, error });
 }
 
-// --- Create workbench bridge ---
+// --- Workbench events ---
 
-export interface CreateWorkbenchRequestPayload {
-  request_id: string;
+export interface CreateWorkbenchEventPayload {
   parent_workspace_path: string;
   branch: string;
   worktree_path: string;
 }
 
-export function onCreateWorkbenchRequest(
-  callback: (payload: CreateWorkbenchRequestPayload) => void,
+export function onCreateWorkbench(
+  callback: (payload: CreateWorkbenchEventPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<CreateWorkbenchRequestPayload>(
-    "tyde-create-workbench-request",
+  return listen<CreateWorkbenchEventPayload>(
+    "tyde-create-workbench",
     (event) => {
       callback(event.payload);
     },
   );
 }
 
-export function submitCreateWorkbenchResponse(
-  requestId: string,
-  ok: boolean,
-  workspacePath?: string,
-  error?: string,
-) {
-  return execute("submit_create_workbench_response", {
-    requestId,
-    ok,
-    workspacePath,
-    error,
-  });
-}
-
-// --- Delete workbench bridge ---
-
-export interface DeleteWorkbenchRequestPayload {
-  request_id: string;
+export interface DeleteWorkbenchEventPayload {
   workspace_path: string;
 }
 
-export function onDeleteWorkbenchRequest(
-  callback: (payload: DeleteWorkbenchRequestPayload) => void,
+export function onDeleteWorkbench(
+  callback: (payload: DeleteWorkbenchEventPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<DeleteWorkbenchRequestPayload>(
-    "tyde-delete-workbench-request",
+  return listen<DeleteWorkbenchEventPayload>(
+    "tyde-delete-workbench",
     (event) => {
       callback(event.payload);
     },
   );
-}
-
-export function submitDeleteWorkbenchResponse(
-  requestId: string,
-  ok: boolean,
-  error?: string,
-) {
-  return invoke("submit_delete_workbench_response", {
-    requestId,
-    ok,
-    error,
-  });
 }
 
 // --- Event listeners (Tauri-specific) ---

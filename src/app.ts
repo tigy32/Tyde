@@ -4,8 +4,8 @@ import type {
   AdminEventPayload,
   ChatEventPayload,
   ConversationRegisteredPayload,
-  CreateWorkbenchRequestPayload,
-  DeleteWorkbenchRequestPayload,
+  CreateWorkbenchEventPayload,
+  DeleteWorkbenchEventPayload,
   McpHttpServerSettings,
   RuntimeAgent,
 } from "./bridge";
@@ -21,11 +21,9 @@ import {
   listAgents,
   onAdminEvent,
   onChatEvent,
-  onCreateWorkbenchRequest,
-  onDeleteWorkbenchRequest,
+  onCreateWorkbench,
+  onDeleteWorkbench,
   openWorkspaceDialog,
-  submitCreateWorkbenchResponse,
-  submitDeleteWorkbenchResponse,
   terminateAgent,
 } from "./bridge";
 import { CommandPalette } from "./command_palette";
@@ -99,11 +97,11 @@ export class AppController {
     );
     await onAdminEvent((payload) => this.routeAdminEvent(payload));
     await registerDebugUiBridge();
-    await onCreateWorkbenchRequest((payload) => {
-      void this.handleCreateWorkbenchRequest(payload);
+    await onCreateWorkbench((payload) => {
+      this.handleCreateWorkbench(payload);
     });
-    await onDeleteWorkbenchRequest((payload) => {
-      void this.handleDeleteWorkbenchRequest(payload);
+    await onDeleteWorkbench((payload) => {
+      void this.handleDeleteWorkbench(payload);
     });
     document
       .getElementById("open-workspace-btn")!
@@ -974,66 +972,32 @@ export class AppController {
     this.switchToWorkspace(project.id);
   }
 
-  private async handleCreateWorkbenchRequest(
-    payload: CreateWorkbenchRequestPayload,
-  ): Promise<void> {
+  private handleCreateWorkbench(payload: CreateWorkbenchEventPayload): void {
     const parent = this.projectState.projects.find(
       (p) => p.workspacePath === payload.parent_workspace_path,
     );
     if (!parent) {
-      await submitCreateWorkbenchResponse(
-        payload.request_id,
-        false,
-        undefined,
+      this.notifications.error(
         `No project found for workspace path: ${payload.parent_workspace_path}`,
       );
       return;
     }
-    const project = this.projectState.addWorkbench(
+    this.projectState.addWorkbench(
       parent.id,
       payload.worktree_path,
       payload.branch,
       "git-worktree",
     );
-    await submitCreateWorkbenchResponse(
-      payload.request_id,
-      true,
-      project.workspacePath,
-    );
   }
 
-  private async handleDeleteWorkbenchRequest(
-    payload: DeleteWorkbenchRequestPayload,
+  private async handleDeleteWorkbench(
+    payload: DeleteWorkbenchEventPayload,
   ): Promise<void> {
     const project = this.projectState.projects.find(
       (p) => p.workspacePath === payload.workspace_path,
     );
-    if (!project) {
-      await submitDeleteWorkbenchResponse(
-        payload.request_id,
-        false,
-        `No project found for workspace path: ${payload.workspace_path}`,
-      );
-      return;
-    }
-    if (!project.parentProjectId) {
-      await submitDeleteWorkbenchResponse(
-        payload.request_id,
-        false,
-        `Project is not a workbench: ${payload.workspace_path}`,
-      );
-      return;
-    }
-    try {
-      await this.removeWorkbench(project.id);
-      await submitDeleteWorkbenchResponse(payload.request_id, true);
-    } catch (err) {
-      await submitDeleteWorkbenchResponse(
-        payload.request_id,
-        false,
-        err instanceof Error ? err.message : String(err),
-      );
-    }
+    if (!project || !project.parentProjectId) return;
+    await this.removeWorkbench(project.id);
   }
 
   private async removeWorkbench(projectId: string): Promise<void> {
