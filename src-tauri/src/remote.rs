@@ -123,7 +123,7 @@ pub fn ssh_control_args() -> Result<Vec<String>, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Cannot create SSH control socket dir: {e}"))?;
 
-    let socket_path = dir.join("ctrl-%r@%h:%p");
+    let socket_path = dir.join("%C");
 
     Ok(vec![
         "-o".to_string(),
