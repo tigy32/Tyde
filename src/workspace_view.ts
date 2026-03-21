@@ -18,6 +18,7 @@ import {
   createConversation,
   exportSessionJson,
   getSessionId,
+  normalizeBackendKind,
   onFileChanged,
   readFileContent,
   renameAgent,
@@ -619,7 +620,6 @@ export class WorkspaceView {
         console.error("Failed to discover git repos:", err);
       });
       this.fileExplorer.setRootPath(config.workspacePath);
-      this.gitPanel.startPeriodicRefresh();
       this.chatPanel.showWelcome();
     }
     this.workflowStore.load().catch((err) => {
@@ -650,7 +650,6 @@ export class WorkspaceView {
   destroy(): void {
     if (this.mode !== "bridge") {
       this.stopFileWatching();
-      this.gitPanel.stopPeriodicRefresh();
     }
     this.terminalService.destroy();
     for (const cleanup of this.uiCleanupFns) {
@@ -892,9 +891,7 @@ export class WorkspaceView {
   }
 
   syncRuntimeAgent(agent: RuntimeAgent): void {
-    const backendKind = this.normalizeRuntimeAgentBackendKind(
-      agent.backend_kind,
-    );
+    const backendKind = normalizeBackendKind(agent.backend_kind);
     this.chatPanel.setConversationBackendKind(
       agent.conversation_id,
       backendKind,
@@ -932,7 +929,31 @@ export class WorkspaceView {
     const nextConversationIds = new Set<number>();
     for (const agent of agents) {
       nextConversationIds.add(agent.conversation_id);
-      this.agentsPanel.upsertAgent(this.runtimeAgentToPanelInfo(agent));
+      // Preview cards are not owned by this view's EventRouter, so always
+      // use the backend summary directly instead of runtimeAgentToPanelInfo
+      // which preserves stale EventRouter state.
+      let name = agent.name.trim() || `Agent ${agent.agent_id}`;
+      const existing = this.agentsPanel.getAgentByConversationId(
+        agent.conversation_id,
+      );
+      if (existing?.name && (name === "Bridge" || name === "Conversation")) {
+        name = existing.name;
+        void renameAgent(agent.agent_id, name);
+      }
+      this.agentsPanel.upsertAgent({
+        agentId: agent.agent_id,
+        conversationId: agent.conversation_id,
+        name,
+        agentType: agent.agent_type,
+        createdAt: agent.created_at_ms,
+        projectId: this.projectId,
+        parentAgentId: agent.parent_agent_id,
+        summary: agent.is_running
+          ? agent.summary.trim() || "Running..."
+          : (agent.last_error ?? (agent.summary.trim() || "Completed")),
+        isTyping: agent.is_running,
+        hasError: agent.last_error != null,
+      });
     }
 
     for (const existing of this.agentsPanel.getAgents()) {
@@ -2443,40 +2464,66 @@ export class WorkspaceView {
     }
   }
 
-  private normalizeRuntimeAgentBackendKind(raw: string): BackendKind {
-    if (raw === "codex" || raw === "claude" || raw === "kiro") return raw;
-    return "tycode";
-  }
-
   private runtimeAgentToPanelInfo(agent: RuntimeAgent): AgentInfo {
-    // Preserve the existing panel name if the runtime name is a generic default.
-    // This avoids overwriting user-set conversation titles with "Bridge" etc.
     let name = agent.name.trim() || `Agent ${agent.agent_id}`;
     const existing = this.agentsPanel.getAgentByConversationId(
       agent.conversation_id,
     );
     if (existing?.name && (name === "Bridge" || name === "Conversation")) {
       name = existing.name;
-      // Push the correct name back to the runtime so listAgents() returns it.
       void renameAgent(agent.agent_id, name);
     }
-    const isTyping =
-      agent.is_running &&
-      (this.chatPanel.getConversationTypingState(agent.conversation_id) ??
-        existing?.isTyping ??
-        true);
-    return {
+
+    const base = {
       agentId: agent.agent_id,
       conversationId: agent.conversation_id,
       name,
       agentType: agent.agent_type,
-      summary:
-        agent.summary.trim() || (agent.is_running ? "Running..." : "Completed"),
-      isTyping,
-      hasError: agent.last_error != null,
       createdAt: agent.created_at_ms,
       projectId: this.projectId,
       parentAgentId: agent.parent_agent_id,
+    };
+
+    // First appearance — set initial state from the backend snapshot.
+    // EventRouter will take over once chat events start arriving.
+    if (!existing) {
+      return {
+        ...base,
+        summary: agent.is_running ? "Running..." : "Completed",
+        isTyping: agent.is_running,
+        hasError: agent.last_error != null,
+      };
+    }
+
+    // Existing agent — preserve isTyping/summary/hasError that EventRouter
+    // maintains. Only override on lifecycle transitions where the backend
+    // state disagrees with the card state.
+    if (agent.is_running && !existing.isTyping) {
+      // Start transition: backend says running but card shows idle.
+      return {
+        ...base,
+        summary: agent.summary.trim() || "Running...",
+        isTyping: true,
+        hasError: false,
+      };
+    }
+
+    if (!agent.is_running && existing.isTyping) {
+      // Stop transition: backend says stopped but card shows running.
+      // Handles terminate/cancel from MCP where no TypingStatusChanged=false follows.
+      return {
+        ...base,
+        summary: agent.last_error ?? (agent.summary.trim() || "Completed"),
+        isTyping: false,
+        hasError: agent.last_error != null,
+      };
+    }
+
+    return {
+      ...base,
+      summary: existing.summary,
+      isTyping: existing.isTyping,
+      hasError: existing.hasError,
     };
   }
 

@@ -96,10 +96,16 @@ impl BackendSubAgentEmitter {
             None,
             "Conversation".to_string(),
         );
-        runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
         let id = info.agent_id;
         *lazy = Some(id);
         Some(id)
+    }
+
+    async fn emit_agent_changed(&self, agent_id: u64) {
+        let info = { self.agent_runtime.lock().await.get_agent(agent_id) };
+        if let Some(info) = info {
+            let _ = self.app.emit("agent-changed", &info);
+        }
     }
 }
 
@@ -144,10 +150,10 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                     Some(agent_type)
                 };
                 runtime.update_agent_type(info.agent_id, info.agent_type.clone());
-                runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
                 info
             };
             self.agent_runtime_notify.notify_waiters();
+            self.emit_agent_changed(agent_info.agent_id).await;
 
             tracing::info!(
                 "{} sub-agent spawned: agent_id={}, conversation_id={}, parent={:?}, tool_use_id={}",
@@ -1372,9 +1378,9 @@ async fn create_conversation(
             None,
             "Bridge".to_string(),
         );
-        runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()));
         drop(runtime);
         state.agent_runtime_notify.notify_waiters();
+        emit_agent_changed(&app, &state, info.agent_id).await;
     }
 
     {
@@ -1457,6 +1463,10 @@ async fn forward_events(
         };
         if changed {
             agent_runtime_notify.notify_waiters();
+            let info = { agent_runtime.lock().await.get_agent_by_conversation(conversation_id) };
+            if let Some(info) = info {
+                let _ = app.emit("agent-changed", &info);
+            }
         }
 
         let payload = ChatEventPayload {
@@ -1488,6 +1498,30 @@ fn emit_subprocess_exit(app: &tauri::AppHandle, conversation_id: u64) {
     }
 }
 
+async fn emit_agent_changed(app: &tauri::AppHandle, state: &AppState, agent_id: u64) {
+    let info = { state.agent_runtime.lock().await.get_agent(agent_id) };
+    if let Some(info) = info {
+        let _ = app.emit("agent-changed", &info);
+    }
+}
+
+async fn emit_agent_changed_for_conversation(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    conversation_id: u64,
+) {
+    let info = {
+        state
+            .agent_runtime
+            .lock()
+            .await
+            .get_agent_by_conversation(conversation_id)
+    };
+    if let Some(info) = info {
+        let _ = app.emit("agent-changed", &info);
+    }
+}
+
 async fn execute_conversation_command(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -1516,6 +1550,7 @@ async fn execute_conversation_command(
             };
             if changed {
                 state.agent_runtime_notify.notify_waiters();
+                emit_agent_changed_for_conversation(app, state, conversation_id).await;
             }
             emit_subprocess_exit(app, conversation_id);
             Err(err)
@@ -1557,6 +1592,7 @@ async fn cancel_conversation(
 
 #[tauri::command]
 async fn close_conversation(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     conversation_id: u64,
 ) -> Result<(), String> {
@@ -1576,6 +1612,7 @@ async fn close_conversation(
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
+        emit_agent_changed_for_conversation(&app, &state, conversation_id).await;
     }
     Ok(())
 }
@@ -1653,6 +1690,7 @@ pub(crate) async fn spawn_agent_internal(
         )
     };
     state.agent_runtime_notify.notify_waiters();
+    emit_agent_changed(app, state, info.agent_id).await;
 
     // Set up the sub-agent emitter AFTER registration so we know this agent's id.
     // Sub-agents spawned by this agent will have parent_agent_id = info.agent_id.
@@ -1712,14 +1750,6 @@ pub(crate) async fn spawn_agent_internal(
     )
     .await?;
 
-    let changed = {
-        let mut runtime = state.agent_runtime.lock().await;
-        runtime.mark_agent_running(info.agent_id, Some("Running...".to_string()))
-    };
-    if changed {
-        state.agent_runtime_notify.notify_waiters();
-    }
-
     Ok(SpawnAgentResponse {
         agent_id: info.agent_id,
         conversation_id,
@@ -1753,14 +1783,6 @@ pub(crate) async fn send_agent_message_internal(
         },
     )
     .await?;
-
-    let changed = {
-        let mut runtime = state.agent_runtime.lock().await;
-        runtime.mark_agent_running(agent_id, Some("Running...".to_string()))
-    };
-    if changed {
-        state.agent_runtime_notify.notify_waiters();
-    }
 
     Ok(())
 }
@@ -1808,6 +1830,7 @@ pub(crate) async fn interrupt_agent_internal(
         };
         if changed {
             state.agent_runtime_notify.notify_waiters();
+            emit_agent_changed(app, state, agent_id).await;
         }
         return Ok(());
     }
@@ -1826,12 +1849,14 @@ pub(crate) async fn interrupt_agent_internal(
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
+        emit_agent_changed(app, state, agent_id).await;
     }
 
     Ok(())
 }
 
 pub(crate) async fn terminate_agent_internal(
+    app: &tauri::AppHandle,
     state: &AppState,
     request: AgentIdRequest,
 ) -> Result<(), String> {
@@ -1855,6 +1880,7 @@ pub(crate) async fn terminate_agent_internal(
     };
     for child_id in child_ids {
         let _ = Box::pin(terminate_agent_internal(
+            app,
             state,
             AgentIdRequest { agent_id: child_id },
         ))
@@ -1875,6 +1901,7 @@ pub(crate) async fn terminate_agent_internal(
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
+        emit_agent_changed(app, state, agent_id).await;
     }
 
     Ok(())
@@ -2073,7 +2100,7 @@ pub(crate) async fn run_query_screenshot_agent(
     // Collect result and terminate regardless of wait outcome.
     let result = collect_agent_result_internal(state, AgentIdRequest { agent_id }).await;
 
-    let _ = terminate_agent_internal(state, AgentIdRequest { agent_id }).await;
+    let _ = terminate_agent_internal(app, state, AgentIdRequest { agent_id }).await;
 
     // If the wait itself failed (timeout), return that error.
     wait_result?;
@@ -2215,6 +2242,7 @@ pub(crate) async fn cancel_agent_internal(
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
+        emit_agent_changed(app, state, agent_id).await;
     }
 
     let runtime = state.agent_runtime.lock().await;
@@ -2276,8 +2304,12 @@ async fn interrupt_agent(
 }
 
 #[tauri::command]
-async fn terminate_agent(state: tauri::State<'_, AppState>, agent_id: u64) -> Result<(), String> {
-    terminate_agent_internal(state.inner(), AgentIdRequest { agent_id }).await
+async fn terminate_agent(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    agent_id: u64,
+) -> Result<(), String> {
+    terminate_agent_internal(&app, state.inner(), AgentIdRequest { agent_id }).await
 }
 
 #[tauri::command]
@@ -3497,7 +3529,6 @@ mod tests {
                 None,
                 "test".into(),
             );
-            assert!(runtime.mark_agent_running(info.agent_id, Some("Running...".into())));
             info.agent_id
         };
 

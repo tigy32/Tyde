@@ -4,6 +4,7 @@ import {
   checkBackendDependencies as checkBackendDependenciesBridge,
   installBackendDependency as installBackendDependencyBridge,
 } from "./bridge";
+import { formatRelativeTime } from "./chat/message_renderer";
 import { formatShortcut } from "./keyboard";
 import type { Project, ProjectStateManager } from "./project_state";
 import {
@@ -395,7 +396,7 @@ export class HomeView {
 
     const time = document.createElement("div");
     time.className = "agent-card-time";
-    time.textContent = this.formatRelativeTime(agent.created_at_ms);
+    time.textContent = formatRelativeTime(agent.created_at_ms);
 
     const footer = document.createElement("div");
     footer.className = "agent-card-footer";
@@ -428,15 +429,6 @@ export class HomeView {
     if (agent.is_running) return "running";
     if (agent.last_error != null) return "error";
     return "completed";
-  }
-
-  private formatRelativeTime(epochMs: number): string {
-    const deltaMs = Date.now() - epochMs;
-    if (deltaMs < 60_000) return "just now";
-    const minutes = Math.floor(deltaMs / 60_000);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ago`;
   }
 
   private loadAgents(): void {

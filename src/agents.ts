@@ -1,3 +1,5 @@
+import { formatRelativeTime } from "./chat/message_renderer";
+
 export type AgentCardAction = "interrupt" | "terminate" | "remove";
 
 export interface AgentInfo {
@@ -316,7 +318,7 @@ export class AgentsPanel {
 
     const time = document.createElement("div");
     time.className = "agent-card-time";
-    time.textContent = this.formatRelativeTime(agent.createdAt);
+    time.textContent = formatRelativeTime(agent.createdAt);
 
     footer.appendChild(time);
 
@@ -400,17 +402,6 @@ export class AgentsPanel {
     return agent.agentId != null
       ? "Remove this agent card"
       : "Close and remove this conversation";
-  }
-
-  private formatRelativeTime(epochMs: number): string {
-    const deltaMs = Date.now() - epochMs;
-    if (deltaMs < 60_000) return "just now";
-
-    const minutes = Math.floor(deltaMs / 60_000);
-    if (minutes < 60) return `${minutes}m ago`;
-
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ago`;
   }
 
   private notifyChanged(): void {

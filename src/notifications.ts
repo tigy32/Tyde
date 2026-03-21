@@ -1,3 +1,5 @@
+import { formatRelativeTime } from "./chat/message_renderer";
+
 export type NotificationType = "info" | "warning" | "error" | "success";
 
 export interface NotificationAction {
@@ -42,7 +44,7 @@ export class NotificationManager {
   private container: HTMLElement | null = null;
   private historyPanelEl: HTMLElement | null = null;
   private idCounter = 0;
-  private badgeIntervalId: ReturnType<typeof setInterval> | null = null;
+  private updateBadge: (() => void) | null = null;
 
   private visible: NotificationItem[] = [];
   private queue: NotificationItem[] = [];
@@ -95,6 +97,7 @@ export class NotificationManager {
 
     this.addToHistory(item);
     this.unreadCount++;
+    this.updateBadge?.();
 
     if (!this.enabled) return id;
 
@@ -150,10 +153,12 @@ export class NotificationManager {
   clearHistory(): void {
     this.history = [];
     this.unreadCount = 0;
+    this.updateBadge?.();
   }
 
   markAllRead(): void {
     this.unreadCount = 0;
+    this.updateBadge?.();
   }
 
   createBellButton(): HTMLElement {
@@ -186,8 +191,7 @@ export class NotificationManager {
       }
     };
 
-    if (this.badgeIntervalId !== null) clearInterval(this.badgeIntervalId);
-    this.badgeIntervalId = setInterval(updateBadge, 1000);
+    this.updateBadge = updateBadge;
     updateBadge();
 
     btn.addEventListener("click", () => {
@@ -281,7 +285,7 @@ export class NotificationManager {
 
     const time = document.createElement("span");
     time.className = "notification-history-time";
-    time.textContent = this.relativeTime(item.timestamp);
+    time.textContent = formatRelativeTime(item.timestamp.getTime());
 
     body.appendChild(msg);
 
@@ -455,18 +459,6 @@ export class NotificationManager {
     if (this.history.length > MAX_HISTORY) {
       this.history.pop();
     }
-  }
-
-  private relativeTime(date: Date): string {
-    const diffMs = Date.now() - date.getTime();
-    const diffSec = Math.floor(diffMs / 1000);
-    const diffMin = Math.floor(diffSec / 60);
-    const diffHr = Math.floor(diffMin / 60);
-
-    if (diffSec < 60) return "just now";
-    if (diffMin < 60) return `${diffMin}m ago`;
-    if (diffHr < 24) return `${diffHr}h ago`;
-    return `${Math.floor(diffHr / 24)}d ago`;
   }
 
   private systemNotify(title: string, body: string): void {

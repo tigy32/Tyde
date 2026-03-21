@@ -20,6 +20,7 @@ import {
   interruptAgent,
   listAgents,
   onAdminEvent,
+  onAgentChanged,
   onChatEvent,
   onCreateWorkbench,
   onDeleteWorkbench,
@@ -73,8 +74,6 @@ export class AppController {
   private runtimeAgents = new Map<number, RuntimeAgent>();
   private runtimeAgentsByProjectId = new Map<string, RuntimeAgent[]>();
   private hiddenRuntimeAgentIds = new Set<number>();
-  private runtimeAgentSyncTimer: number | null = null;
-  private runtimeAgentSyncInFlight: Promise<void> | null = null;
   private registeredWorkflowCommandIds: string[] = [];
 
   private workspaceViews = new Map<string, WorkspaceView>();
@@ -139,8 +138,19 @@ export class AppController {
         });
     }
 
+    await onAgentChanged((agent) => {
+      this.runtimeAgents.set(agent.agent_id, agent);
+      this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
+    });
+
+    // Seed agent map with current state at startup
+    const initialAgents = await listAgents();
+    this.runtimeAgents = new Map(
+      initialAgents.map((agent) => [agent.agent_id, agent]),
+    );
+    this.applyRuntimeAgents(initialAgents);
+
     await this.bootstrapStartup();
-    this.startRuntimeAgentSync();
   }
 
   showError(msg: string): void {
@@ -270,8 +280,9 @@ export class AppController {
     this.homeView.resolveProjectAgentCounts = (projectId) =>
       this.getProjectAgentCounts(projectId);
     this.homeView.resolveAllAgents = async () => {
-      const agents = await listAgents();
-      return agents.filter((agent) => this.shouldDisplayRuntimeAgent(agent));
+      return Array.from(this.runtimeAgents.values()).filter((agent) =>
+        this.shouldDisplayRuntimeAgent(agent),
+      );
     };
     this.homeView.onAgentAction = (agent, action) => {
       void this.handleRuntimeAgentAction(agent, action);
@@ -411,36 +422,6 @@ export class AppController {
     return { total, active };
   }
 
-  private startRuntimeAgentSync(): void {
-    if (this.runtimeAgentSyncTimer !== null) return;
-    void this.refreshRuntimeAgents();
-    this.runtimeAgentSyncTimer = window.setInterval(() => {
-      void this.refreshRuntimeAgents();
-    }, 500);
-  }
-
-  private refreshRuntimeAgents(): Promise<void> {
-    if (this.runtimeAgentSyncInFlight) {
-      return this.runtimeAgentSyncInFlight;
-    }
-
-    this.runtimeAgentSyncInFlight = (async () => {
-      try {
-        const agents = await listAgents();
-        this.runtimeAgents = new Map(
-          agents.map((agent) => [agent.agent_id, agent]),
-        );
-        this.applyRuntimeAgents(agents);
-      } catch (err) {
-        console.warn("Failed to refresh runtime agents:", err);
-      } finally {
-        this.runtimeAgentSyncInFlight = null;
-      }
-    })();
-
-    return this.runtimeAgentSyncInFlight;
-  }
-
   private applyRuntimeAgents(agents: RuntimeAgent[]): void {
     const visibleAgents = agents.filter((agent) =>
       this.shouldDisplayRuntimeAgent(agent),
@@ -493,37 +474,7 @@ export class AppController {
       if (project) return project;
     }
 
-    let bestMatch: { id: string; workspacePath: string } | null = null;
-    let bestLength = -1;
-    for (const project of this.projectState.projects) {
-      if (!this.runtimeAgentMatchesProject(agent, project.workspacePath))
-        continue;
-      if (project.workspacePath.length <= bestLength) continue;
-      bestMatch = project;
-      bestLength = project.workspacePath.length;
-    }
-    return bestMatch;
-  }
-
-  private runtimeAgentMatchesProject(
-    agent: RuntimeAgent,
-    workspacePath: string,
-  ): boolean {
-    const normalizedWorkspace = this.normalizeWorkspacePath(workspacePath);
-    if (!normalizedWorkspace) return false;
-    return agent.workspace_roots.some((root) => {
-      const normalizedRoot = this.normalizeWorkspacePath(root);
-      if (!normalizedRoot) return false;
-      return (
-        normalizedRoot === normalizedWorkspace ||
-        normalizedRoot.startsWith(`${normalizedWorkspace}/`) ||
-        normalizedWorkspace.startsWith(`${normalizedRoot}/`)
-      );
-    });
-  }
-
-  private normalizeWorkspacePath(path: string): string {
-    return path.replace(/\\/g, "/").replace(/\/+$/, "");
+    return this.resolveProjectForWorkspaceRoots(agent.workspace_roots);
   }
 
   private shouldDisplayRuntimeAgent(agent: RuntimeAgent): boolean {
@@ -548,13 +499,11 @@ export class AppController {
     try {
       if (action === "interrupt") {
         await interruptAgent(agentId);
-        await this.refreshRuntimeAgents();
         return;
       }
       if (action === "terminate") {
         await terminateAgent(agentId);
         this.closeRuntimeAgentTab(agent);
-        await this.refreshRuntimeAgents();
         return;
       }
 
@@ -713,6 +662,10 @@ export class AppController {
       bestLength = project.workspacePath.length;
     }
     return bestMatch;
+  }
+
+  private normalizeWorkspacePath(path: string): string {
+    return path.replace(/\\/g, "/").replace(/\/+$/, "");
   }
 
   private routeChatEvent(payload: ChatEventPayload): void {

@@ -784,9 +784,18 @@ export class ChatPanel {
         return;
       }
 
-      if (target.tagName === "A") {
-        const href = target.getAttribute("href");
+      const anchor = target.closest("a");
+      if (anchor instanceof HTMLAnchorElement) {
+        const href = anchor.getAttribute("href");
         if (!href) return;
+
+        const linkedFile = this.parseLinkedFileTarget(href);
+        if (linkedFile && this.onOpenFileLink) {
+          e.preventDefault();
+          this.onOpenFileLink(linkedFile.path, linkedFile.line);
+          return;
+        }
+
         e.preventDefault();
         const tauriShell = (window as any).__TAURI__?.shell;
         if (tauriShell?.open) {
@@ -1598,10 +1607,6 @@ export class ChatPanel {
     const view = this.views.get(this.activeConversationId);
     if (!view) return false;
     return !view.typingIndicator.classList.contains("hidden");
-  }
-
-  getConversationTypingState(conversationId: number): boolean | undefined {
-    return this.typingByConversation.get(conversationId);
   }
 
   isStreaming(): boolean {

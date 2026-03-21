@@ -1,3 +1,4 @@
+import { formatRelativeTime } from "../chat/message_renderer";
 import { escapeHtml } from "../renderer";
 import type { WorkflowEngine } from "./engine";
 import type { WorkflowStore } from "./store";
@@ -253,7 +254,7 @@ export class WorkflowsPanel {
 
     const time = document.createElement("div");
     time.className = "workflow-run-card-time";
-    const relative = this.formatRelativeTime(run.startedAt);
+    const relative = formatRelativeTime(run.startedAt);
     const elapsed = this.formatElapsed(run);
     time.textContent = `${relative} \u00B7 ${elapsed}`;
     footer.appendChild(time);
@@ -464,15 +465,6 @@ export class WorkflowsPanel {
     }
     const count = run.steps.length;
     return `${count} step${count === 1 ? "" : "s"} completed`;
-  }
-
-  private formatRelativeTime(epochMs: number): string {
-    const deltaMs = Date.now() - epochMs;
-    if (deltaMs < 60_000) return "just now";
-    const minutes = Math.floor(deltaMs / 60_000);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ago`;
   }
 
   private formatElapsed(run: WorkflowRunState): string {

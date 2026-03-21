@@ -26,7 +26,6 @@ export class GitPanel {
   private collapsedSections = new Set<string>();
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRefreshTime = 0;
-  private pollInterval: ReturnType<typeof setInterval> | null = null;
   private commitPrefix = "";
 
   onShowDiff:
@@ -70,18 +69,6 @@ export class GitPanel {
     this.refresh();
   }
 
-  startPeriodicRefresh(): void {
-    this.stopPeriodicRefresh();
-    this.pollInterval = setInterval(() => this.requestRefresh(), 30000);
-  }
-
-  stopPeriodicRefresh(): void {
-    if (this.pollInterval) {
-      clearInterval(this.pollInterval);
-      this.pollInterval = null;
-    }
-  }
-
   async refresh(): Promise<void> {
     this.lastRefreshTime = Date.now();
 
@@ -117,7 +104,6 @@ export class GitPanel {
       if (errMsg.includes("not a git repository")) {
         this.container.innerHTML =
           '<div class="git-empty" data-testid="git-empty">Not a git repository</div>';
-        this.stopPeriodicRefresh();
         return;
       }
       this.container.innerHTML = `<div class="git-error" data-testid="git-error">Git error: ${escapeHtml(errMsg)}</div>`;

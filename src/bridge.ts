@@ -16,6 +16,7 @@ import {
   ProtocolParseError,
   parseChatEvent,
   type RemoteConnectionProgress,
+  type RuntimeAgent,
   type TerminalExitPayload,
   type TerminalOutputPayload,
 } from "@tyde/protocol";
@@ -42,6 +43,16 @@ export type {
   TerminalOutputPayload,
   WorkflowEntry,
 } from "@tyde/protocol";
+
+export function normalizeBackendKind(
+  value: string | null | undefined,
+): BackendKind {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "codex") return "codex";
+  if (normalized === "claude" || normalized === "claude_code") return "claude";
+  if (normalized === "kiro") return "kiro";
+  return "tycode";
+}
 
 function friendlyError(raw: string): string {
   const msg = String(raw);
@@ -449,6 +460,16 @@ export function onDeleteWorkbench(
       callback(event.payload);
     },
   );
+}
+
+// --- Agent change events ---
+
+export function onAgentChanged(
+  callback: (agent: RuntimeAgent) => void,
+): Promise<UnlistenFn> {
+  return listen<RuntimeAgent>("agent-changed", (event) => {
+    callback(event.payload);
+  });
 }
 
 // --- Event listeners (Tauri-specific) ---
