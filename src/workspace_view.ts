@@ -146,7 +146,8 @@ export class WorkspaceView {
   private pendingSessionAliases = new Map<number, string>();
   private titleGenerationRequested = new Set<number>();
   private sessionsRefreshRequestedForConversation = new Set<number>();
-  private tabsRestored = false;
+  private _readyPromise: Promise<void> | null = null;
+  private _constructorWork: Promise<unknown>[] = [];
   private uiCleanupFns: Array<() => void> = [];
   private newConversationEnabled = true;
   private newConversationDisabledReason = "New conversations are unavailable.";
@@ -425,7 +426,7 @@ export class WorkspaceView {
     this.homeViewContainer.classList.add("workspace-home-view");
 
     this.chatPanel = new ChatPanel(chatTabViewEl);
-    this.tabManager = new TabManager(tabBarEl, config.projectId);
+    this.tabManager = new TabManager(tabBarEl);
     this.tabManager.setShowNewTabButton(false);
     this.gitPanel = new GitPanel(gitPanelEl);
     this.fileExplorer = new FileExplorer(filesPanelEl);
@@ -616,30 +617,41 @@ export class WorkspaceView {
     if (this.mode === "bridge") {
       this.showEmptyState();
     } else {
-      this.gitPanel.discoverRepos(config.workspacePath).catch((err) => {
-        console.error("Failed to discover git repos:", err);
-      });
-      this.fileExplorer.setRootPath(config.workspacePath);
+      this._constructorWork.push(
+        this.gitPanel.discoverRepos(config.workspacePath).catch((err) => {
+          console.error("Failed to discover git repos:", err);
+        }),
+      );
+      this._constructorWork.push(
+        this.fileExplorer.setRootPath(config.workspacePath),
+      );
       this.chatPanel.showWelcome();
     }
-    this.workflowStore.load().catch((err) => {
-      console.error("Failed to load workflows:", err);
-    });
+    this._constructorWork.push(
+      this.workflowStore.load().catch((err) => {
+        console.error("Failed to load workflows:", err);
+      }),
+    );
   }
 
   show(): void {
     this.root.style.display = "";
+    const work: Promise<unknown>[] = [];
     if (this.mode !== "bridge") {
-      void this.startFileWatching();
-      void this.refreshOpenFileTabs();
+      work.push(this.startFileWatching());
+      work.push(this.refreshOpenFileTabs());
     }
-    void this.requestSessionsList(false);
-    if (!this.tabsRestored) {
-      this.tabsRestored = true;
-      void this.restorePersistedTabs();
-    } else if (this.mode === "bridge" && !this.tabManager.hasTabs()) {
+    work.push(this.requestSessionsList(false));
+    if (this.mode === "bridge" && !this.tabManager.hasTabs()) {
       this.layout.setHomeMode(true);
     }
+    this._readyPromise = Promise.all([...this._constructorWork, ...work]).then(
+      () => {},
+    );
+  }
+
+  whenReady(): Promise<void> {
+    return this._readyPromise ?? Promise.resolve();
   }
   hide(): void {
     if (this.mode !== "bridge") {
@@ -678,54 +690,6 @@ export class WorkspaceView {
     this.conversationIds.clear();
     this.agentsPanel.clear();
     this.emitConversationIdsChanged();
-  }
-
-  private async restorePersistedTabs(): Promise<void> {
-    const persisted = this.tabManager.getPersistedState();
-    if (!persisted || persisted.tabs.length === 0) return;
-
-    const restorable = persisted.tabs.filter(
-      (entry) => entry.sessionId && entry.backendKind,
-    );
-    if (restorable.length === 0) return;
-
-    const tabIds: string[] = [];
-
-    for (const entry of restorable) {
-      const backendKind = entry.backendKind as BackendKind;
-      let cid: number | null = null;
-      try {
-        cid = await this.createNewConversationTab(entry.title, backendKind, {
-          bootstrap: false,
-        });
-        await resumeSession(cid, entry.sessionId!);
-        this.conversationSessionMap.set(cid, {
-          sessionId: entry.sessionId!,
-          backendKind,
-        });
-        const tab = this.tabManager.getTabByConversationId(cid);
-        if (tab) tabIds.push(tab.id);
-      } catch (err) {
-        console.warn(`Failed to restore session ${entry.sessionId}:`, err);
-        if (cid !== null) {
-          this.disposeFailedResumeConversation(cid);
-        }
-      }
-    }
-
-    // Switch to the tab that was previously active, if it was restored
-    if (persisted.activeTabId && tabIds.length > 0) {
-      // The original tab IDs won't match since we created new tabs.
-      // Restore the tab at the same index as the previously active one.
-      const restorableIdx = restorable.findIndex(
-        (e) => e.id === persisted.activeTabId,
-      );
-      if (restorableIdx >= 0 && restorableIdx < tabIds.length) {
-        this.tabManager.switchTo(tabIds[restorableIdx]);
-      }
-    } else if (tabIds.length > 0) {
-      this.tabManager.switchTo(tabIds[0]);
-    }
   }
 
   getActiveConversationId(): number | null {
@@ -1044,7 +1008,6 @@ export class WorkspaceView {
               );
               this.pendingSessionAliases.delete(payload.conversation_id);
             }
-            this.tabManager.persist();
           }
         })
         .catch((err) => {
@@ -1347,7 +1310,6 @@ export class WorkspaceView {
 
     // Bind the real conversation ID to the tab and view
     tab.conversationId = id;
-    this.tabManager.persist();
     this.chatPanel.setConversationBackendKind(id, backendKind);
     this.conversationBackendKindMap.set(id, backendKind);
     this.registerConversation({
@@ -1827,13 +1789,6 @@ export class WorkspaceView {
       );
     };
 
-    this.tabManager.onGetTabSessionInfo = (tab) => {
-      if (tab.kind !== "chat" || tab.conversationId === null) return null;
-      const session = this.conversationSessionMap.get(tab.conversationId);
-      if (!session) return null;
-      return { sessionId: session.sessionId, backendKind: session.backendKind };
-    };
-
     this.tabManager.onNewTab = () => {
       this.startNewConversation();
     };
@@ -2299,8 +2254,13 @@ export class WorkspaceView {
             void this.refreshFileContentPath(payload.path);
           }
 
-          // Debounced explorer refresh for any change under the workspace
-          if (payload.path.startsWith(this.workspacePath)) {
+          // Debounced explorer + git refresh for any change under the workspace,
+          // but ignore .git internals to avoid a feedback loop (our own git
+          // status calls write to .git/index.lock etc., re-triggering the watcher).
+          if (
+            payload.path.startsWith(this.workspacePath) &&
+            !payload.path.includes("/.git/")
+          ) {
             this.scheduleExplorerRefresh();
             this.gitPanel.requestRefresh();
           }

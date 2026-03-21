@@ -39,7 +39,7 @@ export class GitPanel {
 
   setWorkingDir(dir: string): void {
     this.workingDir = dir;
-    this.refresh();
+    this.refresh(true);
   }
 
   async discoverRepos(workspacePath: string): Promise<void> {
@@ -69,7 +69,7 @@ export class GitPanel {
     this.refresh();
   }
 
-  async refresh(): Promise<void> {
+  async refresh(showLoading = false): Promise<void> {
     this.lastRefreshTime = Date.now();
 
     if (!this.workingDir) {
@@ -82,8 +82,10 @@ export class GitPanel {
       return;
     }
 
-    this.container.innerHTML =
-      '<div class="panel-loading"><span class="loading-spinner"></span>Loading git status...</div>';
+    if (showLoading) {
+      this.container.innerHTML =
+        '<div class="panel-loading"><span class="loading-spinner"></span>Loading git status...</div>';
+    }
 
     try {
       const [files, branch] = await Promise.all([
@@ -228,7 +230,7 @@ export class GitPanel {
     refreshBtn.className = "git-action-btn git-refresh-btn";
     refreshBtn.title = "Refresh";
     refreshBtn.textContent = "↻";
-    refreshBtn.addEventListener("click", () => this.requestRefresh());
+    refreshBtn.addEventListener("click", () => this.refresh(true));
     div.appendChild(refreshBtn);
 
     return div;
