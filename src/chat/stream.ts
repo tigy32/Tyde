@@ -94,7 +94,7 @@ function mergeStreamingDelta(existing: string, incoming: string): string {
 
 export function handleStreamStart(
   state: StreamState,
-  chatContainer: HTMLElement,
+  appendBubble: (bubble: HTMLElement) => void,
   agent: string,
   modelInfo: unknown,
   resolveModelLabel: (info: unknown) => string | null,
@@ -126,7 +126,7 @@ export function handleStreamStart(
   contentEl.innerHTML = renderStreamingBody("");
   bubble.appendChild(contentEl);
 
-  chatContainer.appendChild(bubble);
+  appendBubble(bubble);
   state.currentBubble = bubble;
   state.currentContentEl = contentEl;
   state.currentReasoningEl = null;

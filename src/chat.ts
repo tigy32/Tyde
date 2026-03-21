@@ -1,3 +1,9 @@
+import {
+  elementScroll,
+  observeElementOffset,
+  observeElementRect,
+  Virtualizer,
+} from "@tanstack/virtual-core";
 import type {
   ChatEvent,
   ChatMessage,
@@ -24,9 +30,9 @@ import {
 } from "./chat/input";
 import { InputHistory } from "./chat/input_handler";
 import {
-  addSystemMessage,
   copyToClipboard,
   createMessageElement,
+  createSystemMessageElement,
   refreshRelativeTimes,
   resolveModelLabel,
   setRelativeTimeElement,
@@ -54,9 +60,21 @@ interface QueuedMessage {
   images?: ImageAttachment[];
 }
 
+type StoredMessage =
+  | { kind: "chat"; message: ChatMessage; element: HTMLElement | null }
+  | {
+      kind: "system";
+      text: string;
+      style: "system" | "warning" | "error";
+      element: HTMLElement | null;
+    }
+  | { kind: "streaming"; element: HTMLElement }
+  | { kind: "retry"; element: HTMLElement };
+
 interface ConversationView {
   wrapper: HTMLElement;
   container: HTMLDivElement;
+  chatWrapper: HTMLElement;
   inputArea: HTMLElement;
   textarea: HTMLTextAreaElement;
   sendBtn: HTMLButtonElement;
@@ -79,11 +97,136 @@ interface ConversationView {
   retryCard: HTMLElement | null;
   retryCountdownTimer: number | null;
   loadingOverlay: HTMLElement;
+  messages: StoredMessage[];
+  virtualizer: Virtualizer<HTMLElement, HTMLElement>;
+  teardownVirtualizer: (() => void) | null;
+  renderingMessages: boolean;
+  renderDirty: boolean;
 }
 
 interface ParsedLinkedFileTarget {
   path: string;
   line?: number;
+}
+
+function createMessageElementForStored(stored: StoredMessage): HTMLElement {
+  switch (stored.kind) {
+    case "chat":
+      return createMessageElement(
+        stored.message,
+        resolveModelLabel,
+        copyToClipboard,
+        openLightbox,
+        setRelativeTimeElement,
+      );
+    case "system":
+      return createSystemMessageElement(stored.text, stored.style);
+    case "streaming":
+      return stored.element;
+    case "retry":
+      return stored.element;
+  }
+}
+
+function getOrCreateElement(stored: StoredMessage): HTMLElement {
+  if (stored.kind === "streaming" || stored.kind === "retry") {
+    return stored.element;
+  }
+  if (stored.element) return stored.element;
+  const el = createMessageElementForStored(stored);
+  stored.element = el;
+  return el;
+}
+
+function updateVirtualizerCount(view: ConversationView): void {
+  view.virtualizer.setOptions({
+    ...view.virtualizer.options,
+    count: view.messages.length,
+  });
+  renderVisibleMessages(view);
+}
+
+function renderVisibleMessages(view: ConversationView): void {
+  if (view.renderingMessages) {
+    view.renderDirty = true;
+    return;
+  }
+  view.renderingMessages = true;
+  view.renderDirty = false;
+
+  const { virtualizer, chatWrapper, messages } = view;
+  virtualizer._willUpdate();
+
+  chatWrapper.style.height = `${virtualizer.getTotalSize()}px`;
+
+  if (messages.length === 0) {
+    for (const child of Array.from(chatWrapper.children)) {
+      child.remove();
+    }
+    view.renderingMessages = false;
+    return;
+  }
+
+  const virtualItems = virtualizer.getVirtualItems();
+
+  // Build set of indices that should be visible
+  const visibleIndices = new Set<number>();
+  for (const item of virtualItems) {
+    visibleIndices.add(item.index);
+  }
+
+  // Build map of currently mounted elements by index
+  const mountedElements = new Map<number, HTMLElement>();
+  for (const child of Array.from(chatWrapper.children)) {
+    const el = child as HTMLElement;
+    const idx = el.dataset.index;
+    if (idx === undefined || !visibleIndices.has(Number(idx))) {
+      el.remove();
+    } else {
+      mountedElements.set(Number(idx), el);
+    }
+  }
+
+  // Collect newly mounted elements for measurement after positioning
+  const toMeasure: HTMLElement[] = [];
+
+  // Add new elements and update positions
+  for (const item of virtualItems) {
+    let el = mountedElements.get(item.index);
+    if (!el) {
+      el = getOrCreateElement(messages[item.index]);
+      el.dataset.index = String(item.index);
+      el.style.position = "absolute";
+      el.style.top = "0";
+      el.style.left = "0";
+      el.style.right = "0";
+      chatWrapper.appendChild(el);
+      toMeasure.push(el);
+    }
+    el.style.transform = `translateY(${item.start}px)`;
+  }
+
+  // Measure newly mounted elements — may trigger onChange via ResizeObserver
+  for (const el of toMeasure) {
+    virtualizer.measureElement(el);
+  }
+
+  // Update all positions after measurement (sizes may have changed)
+  virtualizer._willUpdate();
+  for (const item of virtualizer.getVirtualItems()) {
+    const el = chatWrapper.querySelector(
+      `[data-index="${item.index}"]`,
+    ) as HTMLElement | null;
+    if (el) el.style.transform = `translateY(${item.start}px)`;
+  }
+  chatWrapper.style.height = `${virtualizer.getTotalSize()}px`;
+
+  view.renderingMessages = false;
+
+  // If onChange fired during this render, do one more pass
+  if (view.renderDirty) {
+    renderVisibleMessages(view);
+  }
 }
 
 const ANSI_OSC_RE = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g;
@@ -162,9 +305,12 @@ export class ChatPanel {
     container.setAttribute("role", "log");
     container.setAttribute("aria-live", "polite");
 
+    const chatWrapper = document.createElement("div");
+    chatWrapper.className = "chat-message-wrapper";
+    container.appendChild(chatWrapper);
+
     const taskBarEl = document.createElement("div");
     const taskPanel = new TaskPanel(taskBarEl);
-    container.appendChild(taskBarEl);
 
     const typingIndicator = document.createElement("div");
     typingIndicator.className = "typing-indicator hidden";
@@ -251,9 +397,25 @@ export class ChatPanel {
     wrapper.appendChild(sessionSettings.element);
     wrapper.appendChild(scrollToBottomBtn);
 
+    const messages: StoredMessage[] = [];
+
+    const virtualizer = new Virtualizer<HTMLElement, HTMLElement>({
+      count: 0,
+      getScrollElement: () => container,
+      estimateSize: () => 120,
+      overscan: 5,
+      gap: 6,
+      paddingEnd: 8,
+      scrollToFn: elementScroll,
+      observeElementRect,
+      observeElementOffset,
+      onChange: () => renderVisibleMessages(view),
+    });
+
     const view: ConversationView = {
       wrapper,
       container,
+      chatWrapper,
       inputArea,
       textarea,
       sendBtn,
@@ -276,7 +438,15 @@ export class ChatPanel {
       retryCard: null,
       retryCountdownTimer: null,
       loadingOverlay,
+      messages,
+      virtualizer,
+      teardownVirtualizer: null,
+      renderingMessages: false,
+      renderDirty: false,
     };
+
+    view.teardownVirtualizer = virtualizer._didMount();
+    virtualizer._willUpdate();
 
     this.wireViewEvents(view, conversationId, cancelBtn, fileInput, attachBtn);
     this.container.appendChild(wrapper);
@@ -376,18 +546,15 @@ export class ChatPanel {
           msg.includes("not found")
         ) {
           view.disconnected = true;
-          addSystemMessage(
-            view.container,
+          this.appendSystemMessage(
+            view,
             "Backend process unavailable. Open a new tab to continue.",
             "error",
-            () => this.scrollToBottom(view),
           );
           updateSend();
           return;
         }
-        addSystemMessage(view.container, msg, "error", () =>
-          this.scrollToBottom(view),
-        );
+        this.appendSystemMessage(view, msg, "error");
       }
     };
 
@@ -590,6 +757,10 @@ export class ChatPanel {
     this.typingByConversation.delete(conversationId);
     const view = this.views.get(conversationId);
     if (!view) return;
+    if (view.teardownVirtualizer) {
+      view.teardownVirtualizer();
+      view.teardownVirtualizer = null;
+    }
     view.wrapper.remove();
     this.views.delete(conversationId);
     if (this.activeConversationId === conversationId) {
@@ -633,9 +804,7 @@ export class ChatPanel {
         if (view.streamState.currentBubble) {
           this.handleStreamInterruption(view, event.data);
         } else {
-          addSystemMessage(view.container, event.data, "error", () =>
-            this.scrollToBottom(view),
-          );
+          this.appendSystemMessage(view, event.data, "error");
         }
         this.notificationManager?.notifyError(event.data);
         break;
@@ -644,12 +813,7 @@ export class ChatPanel {
         if (!line) break;
         const clipped =
           line.length > 300 ? `${line.slice(0, 300)}\u2026` : line;
-        addSystemMessage(
-          view.container,
-          `Backend stderr: ${clipped}`,
-          "warning",
-          () => this.scrollToBottom(view),
-        );
+        this.appendSystemMessage(view, `Backend stderr: ${clipped}`, "warning");
         break;
       }
       case "ToolRequest":
@@ -684,9 +848,7 @@ export class ChatPanel {
         this.clearConversation(view);
         break;
       case "OperationCancelled":
-        addSystemMessage(view.container, event.data.message, "system", () =>
-          this.scrollToBottom(view),
-        );
+        this.appendSystemMessage(view, event.data.message, "system");
         break;
       case "RetryAttempt":
         this.showRetryCard(
@@ -706,11 +868,10 @@ export class ChatPanel {
         if (view.streamState.currentBubble) {
           this.handleStreamInterruption(view, "Backend process exited");
         }
-        addSystemMessage(
-          view.container,
+        this.appendSystemMessage(
+          view,
           "Backend process exited. Open a new tab to continue.",
           "error",
-          () => this.scrollToBottom(view),
         );
         this.updateViewSendButton(view);
         break;
@@ -885,7 +1046,9 @@ export class ChatPanel {
       view.retryCountdownTimer = null;
     }
     view.retryCard = null;
-    view.container.innerHTML = "";
+    view.messages = [];
+    updateVirtualizerCount(view);
+    view.chatWrapper.replaceChildren();
     stream.resetStreamState(view.streamState);
     resetToolState(view.toolState);
     view.queuedMessages = [];
@@ -894,6 +1057,16 @@ export class ChatPanel {
     view.userScrolledUp = false;
     view.taskPanel.clearState();
     this.updateViewScrollButton(view);
+  }
+
+  private appendSystemMessage(
+    view: ConversationView,
+    text: string,
+    style: "system" | "warning" | "error",
+  ): void {
+    view.messages.push({ kind: "system", text, style, element: null });
+    updateVirtualizerCount(view);
+    this.scrollToBottom(view);
   }
 
   // --- Stream handlers ---
@@ -905,13 +1078,14 @@ export class ChatPanel {
   ): void {
     if (view.retryCard) {
       this.removeRetryCard(view);
-      addSystemMessage(view.container, "Reconnected", "system", () =>
-        this.scrollToBottom(view),
-      );
+      this.appendSystemMessage(view, "Reconnected", "system");
     }
     stream.handleStreamStart(
       view.streamState,
-      view.container,
+      (bubble) => {
+        view.messages.push({ kind: "streaming", element: bubble });
+        updateVirtualizerCount(view);
+      },
       agent,
       modelInfo,
       resolveModelLabel,
@@ -959,7 +1133,25 @@ export class ChatPanel {
     if (!result) {
       this.renderFullMessage(view, message);
     } else {
-      this.expandLastAssistantMessage(view.container);
+      // Replace the streaming entry with a finalized chat entry
+      const streamIdx = view.messages.findIndex((m) => m.kind === "streaming");
+      if (streamIdx !== -1) {
+        const rendered = view.streamState.lastRenderedBubble;
+        if (rendered) {
+          rendered.dataset.index = String(streamIdx);
+          rendered.style.position = "absolute";
+          rendered.style.top = "0";
+          rendered.style.left = "0";
+          rendered.style.right = "0";
+          view.virtualizer.measureElement(rendered);
+        }
+        view.messages[streamIdx] = {
+          kind: "chat",
+          message,
+          element: rendered,
+        };
+      }
+      this.expandLastAssistantMessage(view.chatWrapper);
       if (result.durationMs > 30_000) {
         this.notificationManager?.notifyTaskComplete("Response complete");
       }
@@ -989,7 +1181,7 @@ export class ChatPanel {
       toolName,
       toolType,
       view.streamState.currentBubble ?? view.streamState.lastRenderedBubble,
-      view.container,
+      view.chatWrapper,
       () => this.scrollToBottom(view),
     );
   }
@@ -1018,9 +1210,7 @@ export class ChatPanel {
       ? `Tool "${toolName}" ${label}: ${errorDetail}`
       : `Tool "${toolName}" ${label}`;
     const style = success ? ("system" as const) : ("error" as const);
-    addSystemMessage(view.container, msg, style, () =>
-      this.scrollToBottom(view),
-    );
+    this.appendSystemMessage(view, msg, style);
   }
 
   // --- Message rendering ---
@@ -1061,9 +1251,11 @@ export class ChatPanel {
       openLightbox,
       setRelativeTimeElement,
     );
-    view.container.appendChild(el);
+    const stored: StoredMessage = { kind: "chat", message, element: el };
+    view.messages.push(stored);
+    updateVirtualizerCount(view);
     view.streamState.lastRenderedBubble = el;
-    this.expandLastAssistantMessage(view.container);
+    this.expandLastAssistantMessage(view.chatWrapper);
     if (message.context_breakdown) {
       view.taskPanel.setContextUsage(message.context_breakdown);
     }
@@ -1140,8 +1332,9 @@ export class ChatPanel {
     actions.appendChild(cancelBtn);
     card.appendChild(actions);
 
-    view.container.appendChild(card);
     view.retryCard = card;
+    view.messages.push({ kind: "retry", element: card });
+    updateVirtualizerCount(view);
     this.scrollToBottom(view);
 
     const startTime = Date.now();
@@ -1170,7 +1363,11 @@ export class ChatPanel {
       target.retryCountdownTimer = null;
     }
     if (target.retryCard) {
-      target.retryCard.remove();
+      const idx = target.messages.findIndex((m) => m.kind === "retry");
+      if (idx !== -1) {
+        target.messages.splice(idx, 1);
+        updateVirtualizerCount(target);
+      }
       target.retryCard = null;
     }
   }
@@ -1243,18 +1440,15 @@ export class ChatPanel {
           msg.includes("not found")
         ) {
           view.disconnected = true;
-          addSystemMessage(
-            view.container,
+          this.appendSystemMessage(
+            view,
             "Backend process unavailable. Open a new tab to continue.",
             "error",
-            () => this.scrollToBottom(view),
           );
           this.updateViewSendButton(view);
           return;
         }
-        addSystemMessage(view.container, msg, "error", () =>
-          this.scrollToBottom(view),
-        );
+        this.appendSystemMessage(view, msg, "error");
       });
   }
 

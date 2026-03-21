@@ -433,9 +433,10 @@ body {
   min-width: 0;
   overflow-y: auto;
   padding: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+}
+
+.chat-message-wrapper {
+  position: relative;
 }
 
 .chat-panel > .chat-container {
@@ -471,7 +472,7 @@ body {
 }
 
 .user-message {
-  align-self: flex-end;
+  margin-left: auto;
   max-width: 85%;
   background: var(--user-msg-bg);
   color: var(--text-white);
@@ -479,14 +480,14 @@ body {
 }
 
 .assistant-message {
-  align-self: stretch;
-  width: 100%;
   background: var(--assistant-msg-bg);
   color: var(--text-primary);
 }
 
 .system-message {
-  align-self: center;
+  margin-left: auto;
+  margin-right: auto;
+  width: fit-content;
   background: var(--bg-primary);
   color: var(--text-secondary);
   font-style: italic;
@@ -5816,9 +5817,7 @@ body {
 .sessions-list {
   flex: 1;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  padding: 0 8px;
 }
 
 .session-card {
