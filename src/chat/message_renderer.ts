@@ -361,17 +361,26 @@ function resolveDisplayedReasoning(
   return { text: reasoningText, tokens: displayTokens };
 }
 
+export function createSystemMessageElement(
+  text: string,
+  style: "system" | "warning" | "error",
+): HTMLElement {
+  const el = document.createElement("div");
+  el.className = `message ${style}-message`;
+  el.dataset.testid = style === "error" ? "error-message" : "system-message";
+  el.setAttribute("role", "article");
+  el.textContent = text;
+  return el;
+}
+
+/** @deprecated Use createSystemMessageElement + virtualizer store instead */
 export function addSystemMessage(
   chatContainer: HTMLElement,
   text: string,
   style: "system" | "warning" | "error",
   scrollToBottom: () => void,
 ): void {
-  const el = document.createElement("div");
-  el.className = `message ${style}-message`;
-  el.dataset.testid = style === "error" ? "error-message" : "system-message";
-  el.setAttribute("role", "article");
-  el.textContent = text;
+  const el = createSystemMessageElement(text, style);
   chatContainer.appendChild(el);
   scrollToBottom();
 }

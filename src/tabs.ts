@@ -14,21 +14,6 @@ export interface TabState {
   fileView: FileTabView | null;
 }
 
-export interface PersistedTabEntry {
-  id: string;
-  kind: "chat";
-  title: string;
-  conversationId: number | null;
-  sessionId?: string;
-  backendKind?: string;
-}
-
-export interface PersistedTabState {
-  tabs: PersistedTabEntry[];
-  activeTabId: string | null;
-  tabCounter: number;
-}
-
 export interface RuntimeTabState {
   tabs: TabState[];
   activeTabId: string | null;
@@ -56,11 +41,9 @@ export class TabManager {
   private pointerMoveHandler: ((e: PointerEvent) => void) | null = null;
   private pointerUpHandler: ((e: PointerEvent) => void) | null = null;
   private newTabIds = new Set<string>();
-  private storageKeyPrefix: string;
   private externalDragActive = false;
   private autoManagedChatTabIds = new Set<string>();
   private userRenamedChatTabIds = new Set<string>();
-  private pendingPersistedState: PersistedTabState | null = null;
 
   onBeforeTabSwitch: (() => void) | null = null;
   onTabSwitch: ((tab: TabState) => void) | null = null;
@@ -73,16 +56,10 @@ export class TabManager {
   onExternalDragEnd:
     | ((tab: TabState, clientX: number, clientY: number) => void)
     | null = null;
-  onGetTabSessionInfo:
-    | ((tab: TabState) => { sessionId: string; backendKind: string } | null)
-    | null = null;
-
-  constructor(tabBarEl: HTMLElement, storageKeyPrefix: string = "") {
+  constructor(tabBarEl: HTMLElement) {
     this.tabBarEl = tabBarEl;
-    this.storageKeyPrefix = storageKeyPrefix;
     this.tabBarEl.setAttribute("role", "tablist");
     this.setupContextMenuDismiss();
-    this.loadPersistedState();
     this.render();
   }
 
@@ -106,7 +83,7 @@ export class TabManager {
     }
     this.tabs.push(tab);
     this.render();
-    this.persist();
+
     return tab;
   }
 
@@ -176,7 +153,6 @@ export class TabManager {
     }
 
     this.render();
-    this.persist();
   }
 
   removeTab(tabId: string): void {
@@ -199,7 +175,6 @@ export class TabManager {
     }
 
     this.render();
-    this.persist();
   }
 
   closeOthers(tabId: string): void {
@@ -215,7 +190,6 @@ export class TabManager {
       this.onTabClose?.(tab);
     }
     this.render();
-    this.persist();
 
     if (!wasAlreadyActive) {
       this.onTabSwitch?.(keep);
@@ -232,7 +206,6 @@ export class TabManager {
       this.onTabClose?.(tab);
     }
     this.render();
-    this.persist();
   }
 
   getActiveTab(): TabState | null {
@@ -318,7 +291,7 @@ export class TabManager {
       }
     }
     this.render();
-    this.persist();
+
     if (source === "user") {
       this.onTabRenamed?.(tab);
     }
@@ -394,85 +367,6 @@ export class TabManager {
     this.emitActiveTab();
   }
 
-  exportPersistedState(): PersistedTabState {
-    return {
-      tabs: this.tabs
-        .filter(
-          (tab): tab is TabState & { kind: "chat" } => tab.kind === "chat",
-        )
-        .map((tab) => {
-          const sessionInfo = this.onGetTabSessionInfo?.(tab) ?? null;
-          const entry: PersistedTabEntry = {
-            id: tab.id,
-            kind: "chat",
-            title: tab.title,
-            conversationId: tab.conversationId,
-          };
-          if (sessionInfo) {
-            entry.sessionId = sessionInfo.sessionId;
-            entry.backendKind = sessionInfo.backendKind;
-          }
-          return entry;
-        }),
-      activeTabId:
-        this.getActiveTab()?.kind === "chat" ? this.activeTabId : null,
-      tabCounter: this.tabCounter,
-    };
-  }
-
-  importPersistedState(state: PersistedTabState | null): void {
-    if (!state) {
-      this.tabs = [];
-      this.activeTabId = null;
-      this.autoManagedChatTabIds.clear();
-      this.userRenamedChatTabIds.clear();
-      this.render();
-      return;
-    }
-
-    this.tabCounter = state.tabCounter;
-    this.tabs = state.tabs.map((entry) => ({
-      id: entry.id,
-      kind: "chat" as const,
-      conversationId: entry.conversationId ?? null,
-      title: entry.title || "Chat",
-      hasUnread: false,
-      isStreaming: false,
-      filePath: null,
-      fileView: null,
-    }));
-
-    if (
-      state.activeTabId &&
-      this.tabs.some((tab) => tab.id === state.activeTabId)
-    ) {
-      this.activeTabId = state.activeTabId;
-    } else {
-      this.activeTabId = this.tabs[0]?.id ?? null;
-    }
-
-    this.rebuildChatTitleTracking();
-    this.render();
-    this.persist();
-    this.emitActiveTab();
-  }
-
-  persist(): void {
-    try {
-      const state = this.exportPersistedState();
-      localStorage.setItem(
-        `${this.storageKeyPrefix}-tabs`,
-        JSON.stringify(state),
-      );
-    } catch (err) {
-      console.error("Failed to persist tab state to localStorage:", err);
-    }
-  }
-
-  getPersistedState(): PersistedTabState | null {
-    return this.pendingPersistedState;
-  }
-
   private emitActiveTab(): void {
     const active = this.getActiveTab();
     if (!active) return;
@@ -519,26 +413,6 @@ export class TabManager {
   private clearChatTitleTracking(tabId: string): void {
     this.autoManagedChatTabIds.delete(tabId);
     this.userRenamedChatTabIds.delete(tabId);
-  }
-
-  private loadPersistedState(): void {
-    try {
-      const raw = localStorage.getItem(`${this.storageKeyPrefix}-tabs`);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (
-        typeof parsed !== "object" ||
-        parsed === null ||
-        !Array.isArray(parsed.tabs)
-      )
-        return;
-      this.pendingPersistedState = parsed as PersistedTabState;
-    } catch (err) {
-      console.error(
-        "Failed to load persisted tab state from localStorage:",
-        err,
-      );
-    }
   }
 
   private render(): void {
@@ -695,7 +569,6 @@ export class TabManager {
     }
 
     this.render();
-    this.persist();
   }
 
   private moveTabToEnd(sourceId: string): void {
@@ -704,7 +577,6 @@ export class TabManager {
     const [moved] = this.tabs.splice(sourceIdx, 1);
     this.tabs.push(moved);
     this.render();
-    this.persist();
   }
 
   private clearDragIndicators(): void {

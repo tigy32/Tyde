@@ -1,3 +1,9 @@
+import {
+  elementScroll,
+  observeElementOffset,
+  observeElementRect,
+  Virtualizer,
+} from "@tanstack/virtual-core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import type { SessionMetadata } from "@tyde/protocol";
 import { type BackendKind, normalizeBackendKind } from "./bridge";
@@ -15,6 +21,7 @@ interface NormalizedSession {
 }
 
 const SESSION_ALIAS_STORAGE_KEY = "tyde-session-aliases";
+const ROW_HEIGHT = 68;
 
 export class SessionsPanel {
   private container: HTMLElement;
@@ -28,6 +35,10 @@ export class SessionsPanel {
   private aliases: Record<string, string> = {};
   private newSessionEnabled = true;
   private newSessionDisabledReason = "New sessions are unavailable.";
+
+  private wrapperEl: HTMLElement | null = null;
+  private virtualizer: Virtualizer<HTMLElement, HTMLElement> | null = null;
+  private teardownVirtualizer: (() => void) | null = null;
 
   onResumeSession:
     | ((sessionId: string, backendKind: BackendKind) => void)
@@ -86,7 +97,7 @@ export class SessionsPanel {
     this.activeSessionKey = sessionId
       ? this.sessionKey(sessionId, backendKind)
       : null;
-    this.render();
+    this.renderVisibleCards();
   }
 
   setResuming(
@@ -96,7 +107,7 @@ export class SessionsPanel {
     this.resumingSessionKey = sessionId
       ? this.sessionKey(sessionId, backendKind)
       : null;
-    this.render();
+    this.renderVisibleCards();
   }
 
   private applyFilter(): void {
@@ -121,8 +132,17 @@ export class SessionsPanel {
     });
   }
 
+  private destroyVirtualizer(): void {
+    if (this.teardownVirtualizer) {
+      this.teardownVirtualizer();
+      this.teardownVirtualizer = null;
+    }
+    this.virtualizer = null;
+    this.wrapperEl = null;
+  }
+
   private render(): void {
-    this.aliases = this.loadAliases();
+    this.destroyVirtualizer();
     this.container.innerHTML = "";
 
     const toolbar = document.createElement("div");
@@ -190,7 +210,7 @@ export class SessionsPanel {
     searchInput.addEventListener("input", () => {
       this.searchQuery = searchInput.value;
       this.applyFilter();
-      this.renderList(list);
+      this.updateVirtualList();
     });
     searchWrap.appendChild(searchInput);
     this.container.appendChild(searchWrap);
@@ -200,24 +220,97 @@ export class SessionsPanel {
     list.dataset.testid = "sessions-list";
     list.setAttribute("role", "list");
     list.setAttribute("aria-busy", "false");
-    this.renderList(list);
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "sessions-list-wrapper";
+    list.appendChild(wrapper);
+
+    this.wrapperEl = wrapper;
     this.container.appendChild(list);
+
+    const virtualizer = new Virtualizer<HTMLElement, HTMLElement>({
+      count: this.filteredSessions.length,
+      getScrollElement: () => list,
+      estimateSize: () => ROW_HEIGHT,
+      overscan: 5,
+      gap: 6,
+      scrollToFn: elementScroll,
+      observeElementRect,
+      observeElementOffset,
+      onChange: () => this.renderVisibleCards(),
+    });
+
+    this.virtualizer = virtualizer;
+    this.teardownVirtualizer = virtualizer._didMount();
+    virtualizer._willUpdate();
+    this.renderVisibleCards();
   }
 
-  private renderList(list: HTMLElement): void {
-    list.innerHTML = "";
+  private updateVirtualList(): void {
+    if (!this.virtualizer) return;
+    this.virtualizer.setOptions({
+      ...this.virtualizer.options,
+      count: this.filteredSessions.length,
+    });
+    this.virtualizer._willUpdate();
+    this.renderVisibleCards();
+  }
 
-    if (this.filteredSessions.length === 0 && this.searchQuery) {
-      const noMatch = document.createElement("div");
-      noMatch.className = "sessions-no-match";
-      noMatch.textContent = "No sessions match your search";
-      list.appendChild(noMatch);
+  private renderVisibleCards(): void {
+    const wrapper = this.wrapperEl;
+    const virtualizer = this.virtualizer;
+    if (!wrapper || !virtualizer) return;
+
+    virtualizer._willUpdate();
+    const count = this.filteredSessions.length;
+
+    if (count === 0) {
+      if (this.searchQuery) {
+        const noMatch = document.createElement("div");
+        noMatch.className = "sessions-no-match";
+        noMatch.textContent = "No sessions match your search";
+        wrapper.replaceChildren(noMatch);
+      } else {
+        wrapper.replaceChildren();
+      }
       return;
     }
 
-    for (const session of this.filteredSessions) {
-      list.appendChild(this.createSessionCard(session));
+    const virtualItems = virtualizer.getVirtualItems();
+    if (virtualItems.length === 0) {
+      const spacer = this.createSpacer(virtualizer.getTotalSize());
+      wrapper.replaceChildren(spacer);
+      return;
     }
+
+    const frag = document.createDocumentFragment();
+    const totalSize = virtualizer.getTotalSize();
+    const first = virtualItems[0];
+    const last = virtualItems[virtualItems.length - 1];
+
+    const topSpacerSize = Math.max(0, first.start);
+    if (topSpacerSize > 0) {
+      frag.appendChild(this.createSpacer(topSpacerSize));
+    }
+
+    for (const item of virtualItems) {
+      const card = this.createSessionCard(this.filteredSessions[item.index]);
+      frag.appendChild(card);
+    }
+
+    const bottomSpacerSize = Math.max(0, totalSize - last.end);
+    if (bottomSpacerSize > 0) {
+      frag.appendChild(this.createSpacer(bottomSpacerSize));
+    }
+
+    wrapper.replaceChildren(frag);
+  }
+
+  private createSpacer(heightPx: number): HTMLElement {
+    const spacer = document.createElement("div");
+    spacer.style.height = `${heightPx}px`;
+    spacer.setAttribute("aria-hidden", "true");
+    return spacer;
   }
 
   private createSessionCard(session: NormalizedSession): HTMLElement {
@@ -233,7 +326,7 @@ export class SessionsPanel {
     card.addEventListener("click", () => {
       if (isResuming) return;
       this.resumingSessionKey = session.key;
-      this.render();
+      this.renderVisibleCards();
       this.onResumeSession?.(session.id, session.backendKind);
     });
 
@@ -458,7 +551,7 @@ export class SessionsPanel {
       this.aliases[session.key] = trimmed;
     }
     this.saveAliases();
-    this.render();
+    this.renderVisibleCards();
   }
 
   setSessionAlias(
@@ -474,7 +567,7 @@ export class SessionsPanel {
       this.aliases[key] = trimmed;
     }
     this.saveAliases();
-    this.render();
+    this.renderVisibleCards();
   }
 
   getSessionAlias(

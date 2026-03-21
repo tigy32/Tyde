@@ -148,6 +148,7 @@ function updateRuntimeAgent(
   agent.last_error = options?.lastError ?? agent.last_error;
   agent.ended_at_ms = isRunning ? null : Date.now();
   pushRuntimeEvent(agent, kind, summary);
+  emit('agent-changed', { ...agent, workspace_roots: [...agent.workspace_roots] });
 }
 
 function sortedRuntimeAgents(): MockRuntimeAgent[] {
@@ -734,6 +735,14 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
+    case 'discover_git_repos': {
+      const workspaceDir = typeof args?.workspaceDir === 'string' ? args.workspaceDir : '';
+      if ((window as any).__mockGitNotRepo) {
+        return [];
+      }
+      return workspaceDir ? [workspaceDir] : [];
+    }
+
     case 'git_current_branch':
       if ((window as any).__mockGitNotRepo) {
         throw new Error('git rev-parse --abbrev-ref HEAD: fatal: not a git repository (or any of the parent directories): .git');
@@ -985,9 +994,9 @@ export function transformCallback(_callback: Function, _once?: boolean): number 
 }
 
 // Expose a helper so E2E tests can inject/update mock runtime agents directly.
-// This lets tests exercise the list_agents → syncRuntimeAgents polling path.
 (window as any).__mockSetRuntimeAgent = (agent: MockRuntimeAgent) => {
   runtimeAgents.set(agent.agent_id, agent);
+  emit('agent-changed', { ...agent, workspace_roots: [...agent.workspace_roots] });
 };
 
 // Expose invoke on window so E2E tests can call it via browser.execute()
