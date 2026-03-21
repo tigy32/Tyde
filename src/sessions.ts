@@ -1,6 +1,6 @@
 import { confirm } from "@tauri-apps/plugin-dialog";
 import type { SessionMetadata } from "@tyde/protocol";
-import type { BackendKind } from "./bridge";
+import { type BackendKind, normalizeBackendKind } from "./bridge";
 import { escapeHtml } from "./renderer";
 import { promptForText } from "./text_prompt";
 
@@ -375,7 +375,7 @@ export class SessionsPanel {
   private normalizeSession(raw: SessionMetadata): NormalizedSession | null {
     const sessionId = this.asString(raw.session_id) ?? this.asString(raw.id);
     if (!sessionId) return null;
-    const backendKind = this.normalizeBackendKind(raw.backend_kind);
+    const backendKind = normalizeBackendKind(raw.backend_kind);
 
     const preview =
       this.asString(raw.last_message_preview) ??
@@ -419,16 +419,6 @@ export class SessionsPanel {
 
   private sessionKey(sessionId: string, backendKind: BackendKind): string {
     return `${backendKind}:${sessionId}`;
-  }
-
-  private normalizeBackendKind(value: unknown): BackendKind {
-    if (typeof value !== "string") return "tycode";
-    const normalized = value.trim().toLowerCase();
-    if (normalized === "codex") return "codex";
-    if (normalized === "claude" || normalized === "claude_code")
-      return "claude";
-    if (normalized === "kiro") return "kiro";
-    return "tycode";
   }
 
   private abbreviatePath(path: string): string {

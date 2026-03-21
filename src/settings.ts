@@ -15,6 +15,7 @@ import {
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
   installBackendDependency as installBackendDependencyBridge,
   type McpHttpServerSettings,
+  normalizeBackendKind,
   queryBackendUsage as queryBackendUsageBridge,
   setDefaultBackend as setDefaultBackendBridge,
   setDisabledBackends as setDisabledBackendsBridge,
@@ -115,14 +116,6 @@ function normalizeProfileName(value: string | null): string | null {
   if (value === null) return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
-}
-
-function normalizeBackendKind(value: string | null | undefined): BackendKind {
-  const normalized = (value ?? "").trim().toLowerCase();
-  if (normalized === "codex") return "codex";
-  if (normalized === "claude" || normalized === "claude_code") return "claude";
-  if (normalized === "kiro") return "kiro";
-  return "tycode";
 }
 
 export function getDefaultBackend(): BackendKind {

@@ -84,6 +84,11 @@ impl AgentRuntime {
         self.agents.get(&agent_id).cloned()
     }
 
+    pub fn get_agent_by_conversation(&self, conversation_id: u64) -> Option<AgentInfo> {
+        let agent_id = self.conversation_to_agent.get(&conversation_id).copied()?;
+        self.agents.get(&agent_id).cloned()
+    }
+
     pub fn list_agents(&self) -> Vec<AgentInfo> {
         let mut out = self.agents.values().cloned().collect::<Vec<_>>();
         out.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
@@ -147,8 +152,8 @@ impl AgentRuntime {
             parent_agent_id,
             name,
             agent_type: None,
-            is_running: false,
-            summary: "Queued".to_string(),
+            is_running: true,
+            summary: "Running...".to_string(),
             created_at_ms: now,
             updated_at_ms: now,
             ended_at_ms: None,
@@ -161,8 +166,8 @@ impl AgentRuntime {
             agent_id,
             conversation_id,
             "agent_spawned",
-            false,
-            Some("Queued".to_string()),
+            true,
+            Some("Running...".to_string()),
         );
         info
     }
@@ -235,14 +240,18 @@ impl AgentRuntime {
         match kind {
             "TypingStatusChanged" => {
                 let typing = event.get("data").and_then(Value::as_bool).unwrap_or(false);
+                // When typing starts, keep the existing summary (e.g. "Using Read...")
+                // so the home view preserves richer context between tool calls.
+                // Only set "Completed" on typing=false.
+                let summary = if typing {
+                    None
+                } else {
+                    Some("Completed".to_string())
+                };
                 self.update_agent(
                     agent_id,
                     Some(typing),
-                    Some(if typing {
-                        "Running...".to_string()
-                    } else {
-                        "Completed".to_string()
-                    }),
+                    summary,
                     None,
                     if typing {
                         "typing_started"
@@ -357,7 +366,7 @@ impl AgentRuntime {
             "StreamStart" => self.update_agent(
                 agent_id,
                 None,
-                Some("Running...".to_string()),
+                None, // keep existing summary — ToolRequest/StreamEnd provide richer context
                 None,
                 "stream_start",
                 None,
@@ -588,7 +597,7 @@ mod tests {
             None,
             "test".into(),
         );
-        assert!(!rt.get_agent(info.agent_id).unwrap().is_running);
+        assert!(rt.get_agent(info.agent_id).unwrap().is_running);
 
         rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
         assert!(rt.get_agent(info.agent_id).unwrap().is_running);
@@ -649,8 +658,6 @@ mod tests {
             None,
             "test".into(),
         );
-        rt.mark_agent_running(info.agent_id, Some("Running...".into()));
-
         let result = rt.collect_result(info.agent_id);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("still running"));
@@ -761,8 +768,6 @@ mod tests {
             None,
             "test".into(),
         );
-        rt.mark_agent_running(info.agent_id, Some("Running...".into()));
-
         let changed = rt.mark_conversation_closed(700, Some("Terminated".to_string()));
         assert!(changed);
 

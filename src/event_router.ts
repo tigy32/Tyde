@@ -48,7 +48,6 @@ export class EventRouter {
   private sessionsLoadTimeout: number | null = null;
   private feedbackAgentFiles: Map<number, string> = new Map();
   private waitingForUserInput: Set<number> = new Set();
-  private typingByConversation: Map<number, boolean> = new Map();
   onRefreshFile: ((filePath: string) => void) | null = null;
 
   constructor(deps: EventRouterDeps) {
@@ -108,13 +107,11 @@ export class EventRouter {
 
     switch (event.kind) {
       case "StreamStart":
-        this.typingByConversation.set(conversationId, true);
         this.waitingForUserInput.delete(conversationId);
         if (tab) tabManager.setStreaming(tab.id, true);
         if (agent) {
           agentsPanel.updateAgent(conversationId, {
             isTyping: true,
-            summary: "Running...",
           });
         }
         break;
@@ -141,14 +138,10 @@ export class EventRouter {
       case "TimingUpdate":
         break;
       case "TypingStatusChanged":
-        // TypingStatusChanged=false is authoritative for "agent is no longer running".
-        // Treat any non-true payload as false to avoid truthy/non-boolean glitches.
-        this.typingByConversation.set(conversationId, event.data === true);
         if (agent) {
           if (event.data === true) {
             agentsPanel.updateAgent(conversationId, {
               isTyping: true,
-              summary: "Running...",
             });
           } else {
             const waiting = this.waitingForUserInput.has(conversationId);
@@ -198,7 +191,6 @@ export class EventRouter {
       case "SubprocessExit":
         if (tab) tabManager.setStreaming(tab.id, false);
         this.waitingForUserInput.delete(conversationId);
-        this.typingByConversation.set(conversationId, false);
         if (event.data.exit_code !== 0) {
           notifications.error("AI backend disconnected");
         }
@@ -226,7 +218,6 @@ export class EventRouter {
 
         notifications.error(event.data);
         this.waitingForUserInput.delete(conversationId);
-        this.typingByConversation.set(conversationId, false);
         if (agent) {
           agentsPanel.updateAgent(conversationId, {
             isTyping: false,
@@ -265,7 +256,6 @@ export class EventRouter {
         break;
       case "ConversationCleared":
         this.waitingForUserInput.delete(conversationId);
-        this.typingByConversation.set(conversationId, false);
         if (agent) {
           agentsPanel.updateAgent(conversationId, {
             isTyping: false,
