@@ -38,10 +38,10 @@ export class FileExplorer {
     this.abortController.abort();
   }
 
-  setRootPath(path: string): void {
+  setRootPath(path: string): Promise<void> {
     this.rootPath = path;
     this.expandedDirs.clear();
-    this.refresh();
+    return this.refresh();
   }
 
   async refresh(silent = false): Promise<void> {

@@ -151,6 +151,12 @@ export class AppController {
     this.applyRuntimeAgents(initialAgents);
 
     await this.bootstrapStartup();
+
+    const splash = document.getElementById("splash");
+    if (splash) {
+      splash.classList.add("fade-out");
+      splash.addEventListener("transitionend", () => splash.remove());
+    }
   }
 
   showError(msg: string): void {
@@ -1125,7 +1131,7 @@ export class AppController {
       id: "refresh-git",
       label: "Refresh Git Status",
       shortcut: formatShortcut("Ctrl+Shift+R"),
-      execute: () => this.getActiveView()?.getGitPanel().refresh(),
+      execute: () => this.getActiveView()?.getGitPanel().refresh(true),
     });
     cp.registerCommand({
       id: "toggle-fullscreen-chat",
@@ -1310,7 +1316,7 @@ export class AppController {
       this.getActiveView()?.getLayout().toggleFullScreenChat(),
     );
     kb.register("Ctrl+Shift+R", () =>
-      this.getActiveView()?.getGitPanel().refresh(),
+      this.getActiveView()?.getGitPanel().refresh(true),
     );
     kb.register("Ctrl+1", () => {
       void this.getActiveView()?.focusChatTabOrCreate();
@@ -1410,6 +1416,10 @@ export class AppController {
     const initialWorkspace = await getInitialWorkspace();
     if (initialWorkspace) {
       await this.openWorkspacePath(initialWorkspace);
+      const view = this.activeWorkspaceId
+        ? this.workspaceViews.get(this.activeWorkspaceId)
+        : null;
+      if (view) await view.whenReady();
       return;
     }
 
@@ -1433,5 +1443,7 @@ export class AppController {
     } catch (err) {
       console.error("Failed to spawn admin subprocess:", err);
     }
+
+    await view.whenReady();
   }
 }
