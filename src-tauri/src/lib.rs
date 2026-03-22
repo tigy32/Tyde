@@ -14,6 +14,7 @@ mod file_watch;
 mod git_service;
 mod kiro;
 mod remote;
+mod session_store;
 mod steering;
 mod subprocess;
 mod terminal;
@@ -53,6 +54,7 @@ use crate::remote::{
     validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
 use crate::subprocess::ImageAttachment;
+use crate::session_store::SessionStore;
 use crate::terminal::TerminalManager;
 
 /// Implements SubAgentEmitter for backend sessions that expose provider-native
@@ -74,6 +76,8 @@ struct BackendSubAgentEmitter {
     workspace_roots: Vec<String>,
     backend_kind: String,
     assistant_sender_name: String,
+    session_store: Arc<SyncMutex<SessionStore>>,
+    conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
 }
 
 impl BackendSubAgentEmitter {
@@ -189,6 +193,8 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                 notify,
                 registration,
                 settings_tx,
+                self.session_store.clone(),
+                self.conversation_to_session.clone(),
             ));
 
             // Queue a synthetic user message with the parent task text when available.
@@ -318,6 +324,8 @@ pub(crate) struct AppState {
     file_watch: SyncMutex<Option<FileWatchManager>>,
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
+    session_store: Arc<SyncMutex<SessionStore>>,
+    conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
     mcp_http_enabled: SyncMutex<bool>,
     driver_mcp_http_enabled: SyncMutex<bool>,
     driver_mcp_http_autoload: SyncMutex<bool>,
@@ -509,6 +517,12 @@ struct DeleteWorkbenchEventPayload {
 }
 
 #[derive(Serialize, Clone)]
+struct CreateConversationResponse {
+    conversation_id: u64,
+    session_id: String,
+}
+
+#[derive(Serialize, Clone)]
 pub(crate) struct SpawnAgentResponse {
     pub(crate) agent_id: u64,
     pub(crate) conversation_id: u64,
@@ -570,6 +584,12 @@ pub(crate) struct AgentResult {
 pub(crate) struct AwaitAgentsResponse {
     pub(crate) ready: Vec<AgentResult>,
     pub(crate) still_running: Vec<u64>,
+}
+
+fn is_generic_agent_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "conversation" || lower == "bridge" || lower == "sub-agent"
+        || lower.starts_with("agent ")
 }
 
 fn is_executable(path: &std::path::Path) -> bool {
@@ -1328,7 +1348,7 @@ async fn create_conversation(
     backend_kind: Option<String>,
     ephemeral: Option<bool>,
     conversation_mode: Option<String>,
-) -> Result<u64, String> {
+) -> Result<CreateConversationResponse, String> {
     let backend_kind = resolve_requested_backend_kind(&state, backend_kind)?;
     let ephemeral = ephemeral.unwrap_or(false);
     let include_agent_control = matches!(
@@ -1400,6 +1420,8 @@ async fn create_conversation(
                 workspace_roots: workspace_roots.clone(),
                 backend_kind: backend_kind.as_str().to_string(),
                 assistant_sender_name: backend_assistant_sender_name(backend_kind).to_string(),
+                session_store: state.session_store.clone(),
+                conversation_to_session: state.conversation_to_session.clone(),
             }))
             .await;
     }
@@ -1421,6 +1443,29 @@ async fn create_conversation(
         watchers.insert(id, settings_tx.clone());
     }
 
+    // Create session store record
+    let workspace_root = workspace_roots.first().map(|s| s.as_str());
+    let session_record = {
+        let mut store = state.session_store.lock();
+        store.create(backend_kind.as_str(), workspace_root)?
+    };
+    let tyde_session_id = session_record.id.clone();
+    {
+        let mut map = state.conversation_to_session.lock();
+        map.insert(id, tyde_session_id.clone());
+    }
+
+    // Try to get backend_session_id immediately (works for Codex/Kiro)
+    {
+        let mgr = state.manager.lock().await;
+        if let Some(session) = mgr.get(id) {
+            if let Some(backend_sid) = session.session_id().await {
+                let mut store = state.session_store.lock();
+                store.set_backend_session_id(&tyde_session_id, &backend_sid)?;
+            }
+        }
+    }
+
     tokio::spawn(forward_events(
         app.clone(),
         id,
@@ -1429,8 +1474,13 @@ async fn create_conversation(
         state.agent_runtime_notify.clone(),
         registration,
         settings_tx,
+        state.session_store.clone(),
+        state.conversation_to_session.clone(),
     ));
-    Ok(id)
+    Ok(CreateConversationResponse {
+        conversation_id: id,
+        session_id: tyde_session_id,
+    })
 }
 
 async fn forward_events(
@@ -1441,6 +1491,8 @@ async fn forward_events(
     agent_runtime_notify: Arc<Notify>,
     registration: Value,
     settings_tx: watch::Sender<Value>,
+    session_store: Arc<SyncMutex<SessionStore>>,
+    conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
 ) {
     let reg_payload = ChatEventPayload {
         conversation_id,
@@ -1457,6 +1509,72 @@ async fn forward_events(
         if event.get("kind").and_then(|k| k.as_str()) == Some("Settings") {
             if let Some(data) = event.get("data") {
                 let _ = settings_tx.send(data.clone());
+            }
+        }
+
+        // Session store updates based on event kind
+        let event_kind = event.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        let tyde_session_id = conversation_to_session.lock().get(&conversation_id).cloned();
+        if let Some(ref sid) = tyde_session_id {
+            // Try to fill backend_session_id on every event if still missing (fix #5)
+            let needs_backend_id = {
+                let store = session_store.lock();
+                store.get(sid).map(|r| r.backend_session_id.is_none()).unwrap_or(false)
+            };
+            if needs_backend_id {
+                let backend_session_id = {
+                    let state: tauri::State<'_, AppState> = app.state();
+                    let mgr = state.manager.lock().await;
+                    if let Some(session) = mgr.get(conversation_id) {
+                        session.session_id().await
+                    } else {
+                        None
+                    }
+                };
+                if let Some(backend_sid) = backend_session_id {
+                    if let Err(err) = session_store.lock().set_backend_session_id(sid, &backend_sid) {
+                        tracing::error!("Failed to set backend_session_id: {err}");
+                    }
+                }
+            }
+
+            match event_kind {
+                "MessageAdded" => {
+                    // Only count user messages to avoid double-counting (fix #8).
+                    // MessageAdded fires for both user and assistant messages.
+                    // StreamEnd fires once per assistant turn, so we count that separately.
+                    let is_user = event
+                        .get("data")
+                        .and_then(|d| d.get("sender"))
+                        .and_then(|s| s.as_str())
+                        == Some("User");
+                    if is_user {
+                        if let Err(err) = session_store.lock().increment_message_count(sid) {
+                            tracing::error!("Failed to increment message count: {err}");
+                        }
+                    }
+                }
+                "StreamEnd" => {
+                    // Count assistant turn
+                    if let Err(err) = session_store.lock().increment_message_count(sid) {
+                        tracing::error!("Failed to increment message count: {err}");
+                    }
+                }
+                "TaskUpdate" => {
+                    if let Some(title) = event
+                        .get("data")
+                        .and_then(|d| d.get("title"))
+                        .and_then(|t| t.as_str())
+                    {
+                        let trimmed = title.trim();
+                        if !trimmed.is_empty() {
+                            if let Err(err) = session_store.lock().set_alias(sid, trimmed) {
+                                tracing::error!("Failed to set session alias: {err}");
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1560,6 +1678,8 @@ async fn execute_conversation_command(
                 state.agent_runtime_notify.notify_waiters();
                 emit_agent_changed_for_conversation(app, state, conversation_id).await;
             }
+            // Clean up conversation_to_session map (store record persists)
+            state.conversation_to_session.lock().remove(&conversation_id);
             emit_subprocess_exit(app, conversation_id);
             Err(err)
         }
@@ -1622,6 +1742,8 @@ async fn close_conversation(
         state.agent_runtime_notify.notify_waiters();
         emit_agent_changed_for_conversation(&app, &state, conversation_id).await;
     }
+    // Clean up runtime map (store record persists)
+    state.conversation_to_session.lock().remove(&conversation_id);
     Ok(())
 }
 
@@ -1696,11 +1818,36 @@ pub(crate) async fn spawn_agent_internal(
             workspace_roots.clone(),
             backend_kind.as_str().to_string(),
             parent_agent_id,
-            display_name,
+            display_name.clone(),
         )
     };
     state.agent_runtime_notify.notify_waiters();
     emit_agent_changed(app, state, info.agent_id).await;
+
+    // Create session store record for this agent
+    let tyde_session_id = {
+        let workspace_root = workspace_roots.first().map(|s| s.as_str());
+        let record = state.session_store.lock().create(backend_kind.as_str(), workspace_root)?;
+        record.id
+    };
+    // Set parent_id if this agent has a parent
+    if let Some(parent_runtime_agent_id) = parent_agent_id {
+        let parent_cid = {
+            let runtime = state.agent_runtime.lock().await;
+            runtime.conversation_id_for_agent(parent_runtime_agent_id)
+        };
+        if let Some(parent_cid) = parent_cid {
+            let parent_tyde_id = state.conversation_to_session.lock().get(&parent_cid).cloned();
+            if let Some(parent_tyde_id) = parent_tyde_id {
+                state.session_store.lock().set_parent(&tyde_session_id, &parent_tyde_id)?;
+            }
+        }
+    }
+    // Set alias from display name if non-generic
+    if !display_name.is_empty() && !is_generic_agent_name(&display_name) {
+        state.session_store.lock().set_alias(&tyde_session_id, &display_name)?;
+    }
+    state.conversation_to_session.lock().insert(conversation_id, tyde_session_id);
 
     // Set up the sub-agent emitter AFTER registration so we know this agent's id.
     // Sub-agents spawned by this agent will have parent_agent_id = info.agent_id.
@@ -1718,6 +1865,8 @@ pub(crate) async fn spawn_agent_internal(
                 workspace_roots: workspace_roots.clone(),
                 backend_kind: backend_kind.as_str().to_string(),
                 assistant_sender_name: backend_assistant_sender_name(backend_kind).to_string(),
+                session_store: state.session_store.clone(),
+                conversation_to_session: state.conversation_to_session.clone(),
             }))
             .await;
     }
@@ -1747,6 +1896,8 @@ pub(crate) async fn spawn_agent_internal(
         state.agent_runtime_notify.clone(),
         registration,
         settings_tx,
+        state.session_store.clone(),
+        state.conversation_to_session.clone(),
     ));
 
     execute_conversation_command(
@@ -1913,6 +2064,9 @@ pub(crate) async fn terminate_agent_internal(
         state.agent_runtime_notify.notify_waiters();
         emit_agent_changed(app, state, agent_id).await;
     }
+
+    // Clean up conversation_to_session map (store record persists)
+    state.conversation_to_session.lock().remove(&conversation_id);
 
     Ok(())
 }
@@ -2242,6 +2396,9 @@ pub(crate) async fn cancel_agent_internal(
         emit_agent_changed(app, state, agent_id).await;
     }
 
+    // Clean up conversation_to_session map (store record persists)
+    state.conversation_to_session.lock().remove(&conversation_id);
+
     let runtime = state.agent_runtime.lock().await;
     let info = runtime
         .get_agent(agent_id)
@@ -2323,8 +2480,21 @@ async fn rename_agent(
     agent_id: u64,
     name: String,
 ) -> Result<(), String> {
-    let mut runtime = state.agent_runtime.lock().await;
-    runtime.rename_agent(agent_id, name);
+    let conversation_id = {
+        let runtime = state.agent_runtime.lock().await;
+        runtime.conversation_id_for_agent(agent_id)
+    };
+    {
+        let mut runtime = state.agent_runtime.lock().await;
+        runtime.rename_agent(agent_id, name.clone());
+    }
+    // Update session store alias
+    if let Some(cid) = conversation_id {
+        let tyde_session_id = state.conversation_to_session.lock().get(&cid).cloned();
+        if let Some(sid) = tyde_session_id {
+            state.session_store.lock().set_alias(&sid, &name)?;
+        }
+    }
     Ok(())
 }
 
@@ -2539,9 +2709,43 @@ async fn resume_session(
         &app,
         &state,
         conversation_id,
-        SessionCommand::ResumeSession { session_id },
+        SessionCommand::ResumeSession {
+            session_id: session_id.clone(),
+        },
     )
-    .await
+    .await?;
+
+    // Deduplicate session store records: create_conversation eagerly created a
+    // new record, but resume reuses an existing backend session. Find the
+    // original record and point conversation_to_session at it, then delete the
+    // duplicate.
+    let backend_kind = {
+        let mgr = state.manager.lock().await;
+        mgr.backend_kind(conversation_id)
+            .map(|k| k.as_str().to_string())
+    };
+    if let Some(bk) = backend_kind {
+        let duplicate_tyde_id = state.conversation_to_session.lock().get(&conversation_id).cloned();
+        let mut store = state.session_store.lock();
+        if let Some(existing) = store.get_by_backend_session(&bk, &session_id) {
+            let existing_id = existing.id.clone();
+            // Only deduplicate if the conversation is currently mapped to a different record
+            if duplicate_tyde_id.as_deref() != Some(&existing_id) {
+                // Point the conversation at the original record
+                state.conversation_to_session.lock().insert(conversation_id, existing_id);
+                // Delete the duplicate record created by create_conversation
+                if let Some(dup_id) = duplicate_tyde_id {
+                    store.delete(&dup_id)?;
+                }
+            }
+        } else if let Some(ref dup_id) = duplicate_tyde_id {
+            // No existing record found — this is a first-time resume. Set the
+            // backend_session_id on the record that create_conversation made.
+            store.set_backend_session_id(dup_id, &session_id)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -2551,13 +2755,29 @@ async fn delete_session(
     conversation_id: u64,
     session_id: String,
 ) -> Result<(), String> {
+    let backend_kind = {
+        let mgr = state.manager.lock().await;
+        mgr.backend_kind(conversation_id)
+            .map(|k| k.as_str().to_string())
+    };
     execute_conversation_command(
         &app,
         &state,
         conversation_id,
-        SessionCommand::DeleteSession { session_id },
+        SessionCommand::DeleteSession {
+            session_id: session_id.clone(),
+        },
     )
-    .await
+    .await?;
+    // Clean up session store: find the record by backend_session_id and delete it
+    if let Some(ref bk) = backend_kind {
+        let mut store = state.session_store.lock();
+        if let Some(record) = store.get_by_backend_session(bk, &session_id) {
+            let tyde_id = record.id.clone();
+            store.delete(&tyde_id)?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2843,12 +3063,45 @@ async fn admin_delete_session(
     admin_id: u64,
     session_id: String,
 ) -> Result<(), String> {
+    let backend_kind = {
+        let admin = state.admin.lock().await;
+        admin.get(admin_id).map(|s| s.kind().as_str().to_string())
+    };
     execute_admin_command(
         &state,
         admin_id,
-        SessionCommand::DeleteSession { session_id },
+        SessionCommand::DeleteSession {
+            session_id: session_id.clone(),
+        },
     )
-    .await
+    .await?;
+    // Clean up session store
+    if let Some(ref bk) = backend_kind {
+        let mut store = state.session_store.lock();
+        if let Some(record) = store.get_by_backend_session(bk, &session_id) {
+            let tyde_id = record.id.clone();
+            store.delete(&tyde_id)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_session_records(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<session_store::SessionRecord>, String> {
+    let store = state.session_store.lock();
+    Ok(store.list())
+}
+
+#[tauri::command]
+fn rename_session(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let mut store = state.session_store.lock();
+    store.set_user_alias(&id, &name)
 }
 
 #[tauri::command]
@@ -3117,6 +3370,8 @@ async fn restart_subprocess(
         state.agent_runtime_notify.clone(),
         registration,
         settings_tx,
+        state.session_store.clone(),
+        state.conversation_to_session.clone(),
     ));
     Ok(())
 }
@@ -3150,6 +3405,9 @@ async fn shutdown_all_subprocesses(state: tauri::State<'_, AppState>) -> Result<
     for session in conversations.into_iter().chain(admins) {
         session.shutdown().await;
     }
+
+    // Clean up all conversation_to_session mappings (store records persist)
+    state.conversation_to_session.lock().clear();
 
     {
         let mut mgr = state.terminals.lock().await;
@@ -3300,6 +3558,13 @@ pub fn run() {
             file_watch: SyncMutex::new(None),
             agent_runtime: Arc::new(Mutex::new(AgentRuntime::new())),
             agent_runtime_notify: Arc::new(Notify::new()),
+            session_store: Arc::new(SyncMutex::new({
+                let path = resolve_tyde_app_settings_path()
+                    .map(|p| p.parent().unwrap().join("session-store.json"))
+                    .unwrap_or_else(|_| PathBuf::from("session-store.json"));
+                SessionStore::load(path).expect("failed to load session store")
+            })),
+            conversation_to_session: Arc::new(SyncMutex::new(HashMap::new())),
             mcp_http_enabled: SyncMutex::new(app_settings.mcp_http_enabled),
             driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
             driver_mcp_http_autoload: SyncMutex::new(app_settings.driver_mcp_http_autoload),
@@ -3383,6 +3648,8 @@ pub fn run() {
             resume_session,
             delete_session,
             get_session_id,
+            list_session_records,
+            rename_session,
             list_profiles,
             switch_profile,
             get_module_schemas,
@@ -3494,6 +3761,10 @@ mod tests {
     use serde_json::json;
 
     fn test_app_state() -> AppState {
+        let tmp_path = std::env::temp_dir().join(format!(
+            "tyde-test-session-store-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         AppState {
             manager: Mutex::new(ConversationManager::new()),
             admin: Mutex::new(AdminManager::new()),
@@ -3501,6 +3772,10 @@ mod tests {
             file_watch: SyncMutex::new(None),
             agent_runtime: Arc::new(Mutex::new(AgentRuntime::new())),
             agent_runtime_notify: Arc::new(Notify::new()),
+            session_store: Arc::new(SyncMutex::new(
+                SessionStore::load(tmp_path).expect("failed to create test session store"),
+            )),
+            conversation_to_session: Arc::new(SyncMutex::new(HashMap::new())),
             mcp_http_enabled: SyncMutex::new(true),
             driver_mcp_http_enabled: SyncMutex::new(false),
             driver_mcp_http_autoload: SyncMutex::new(false),

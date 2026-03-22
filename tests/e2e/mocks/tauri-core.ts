@@ -93,6 +93,23 @@ function defaultMockSessionsByBackend(): Record<string, MockSessionState[]> {
 
 let mockSessionsByBackend: Record<string, MockSessionState[]> = defaultMockSessionsByBackend();
 
+interface MockSessionRecord {
+  id: string;
+  backend_session_id: string | null;
+  backend_kind: string;
+  alias: string | null;
+  user_alias: string | null;
+  parent_id: string | null;
+  workspace_root: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  message_count: number;
+}
+
+let nextMockRecordId = 1;
+const mockSessionRecords = new Map<string, MockSessionRecord>();
+const conversationToRecordId = new Map<number, string>();
+
 let nextTerminalId = 70_000;
 const terminalWorkspaceById = new Map<number, string>();
 let mockMcpHttpServerEnabled = true;
@@ -365,6 +382,23 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         }
       }
 
+      const now = Date.now();
+      const recordId = `mock-record-${nextMockRecordId++}`;
+      const record: MockSessionRecord = {
+        id: recordId,
+        backend_session_id: null,
+        backend_kind: backendKind,
+        alias: null,
+        user_alias: null,
+        parent_id: null,
+        workspace_root: workspaceRoots[0] ?? null,
+        created_at_ms: now,
+        updated_at_ms: now,
+        message_count: 0,
+      };
+      mockSessionRecords.set(recordId, record);
+      conversationToRecordId.set(id, recordId);
+
       await emitChatEvent(id, {
         kind: 'ConversationRegistered',
         data: {
@@ -376,7 +410,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         },
       });
 
-      return id;
+      return { conversation_id: id, session_id: recordId };
     }
 
     case 'send_message': {
@@ -709,6 +743,20 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
     case 'list_sessions':
       return [];
 
+    case 'list_session_records':
+      return Array.from(mockSessionRecords.values()).map((r) => ({ ...r }));
+
+    case 'rename_session': {
+      const recordId = typeof args?.id === 'string' ? args.id : '';
+      const newName = typeof args?.name === 'string' ? args.name : '';
+      const rec = mockSessionRecords.get(recordId);
+      if (rec) {
+        rec.user_alias = newName || null;
+        rec.updated_at_ms = Date.now();
+      }
+      return null;
+    }
+
     case 'list_directory': {
       const path = typeof args?.path === 'string' ? args.path : '';
       if (!path) return [];
@@ -769,11 +817,35 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       const conv = conversations.get(cid);
       if (!conv) return null;
       // Return a deterministic session_id based on backend kind + conversation id
-      return `${conv.backendKind}-session-${cid}`;
+      const backendSessionId = `${conv.backendKind}-session-${cid}`;
+      // Mirror real backend: set backend_session_id on the corresponding record
+      const linkedRecordId = conversationToRecordId.get(cid);
+      if (linkedRecordId) {
+        const rec = mockSessionRecords.get(linkedRecordId);
+        if (rec && !rec.backend_session_id) {
+          rec.backend_session_id = backendSessionId;
+          rec.updated_at_ms = Date.now();
+        }
+      }
+      return backendSessionId;
+    }
+
+    case 'resume_session': {
+      const resumeCid = Number(args?.conversationId);
+      const resumeSessionId = typeof args?.sessionId === 'string' ? args.sessionId : '';
+      // Mirror real backend: set backend_session_id on the record created by create_conversation
+      const resumeRecordId = conversationToRecordId.get(resumeCid);
+      if (resumeRecordId && resumeSessionId) {
+        const rec = mockSessionRecords.get(resumeRecordId);
+        if (rec && !rec.backend_session_id) {
+          rec.backend_session_id = resumeSessionId;
+          rec.updated_at_ms = Date.now();
+        }
+      }
+      return null;
     }
 
     case 'cancel_conversation':
-    case 'resume_session':
     case 'delete_session':
     case 'export_session_json':
     case 'get_module_schemas': {
