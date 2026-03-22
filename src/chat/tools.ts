@@ -4,7 +4,12 @@ import type {
   ToolUseData,
 } from "@tyde/protocol";
 import { createTwoFilesPatch } from "diff";
-import { escapeHtml, renderContent, wrapWithTruncation } from "../renderer";
+import {
+  collapseTruncatablesIfShort,
+  escapeHtml,
+  renderContent,
+  wrapWithTruncation,
+} from "../renderer";
 
 export type ToolOutputMode = "summary" | "compact" | "verbose";
 // Legacy alias for existing imports in older code paths.
@@ -410,11 +415,13 @@ function countSummaryLines(text: string): number {
 function bindToolOutputRenderer(
   state: ToolState,
   render: (mode: ToolOutputMode) => void,
+  root: HTMLElement,
 ): void {
   // Always render — even on disconnected elements — so that when a
   // view is re-attached to the DOM it already reflects the current mode.
   const update = (mode: ToolOutputMode) => {
     render(mode);
+    requestAnimationFrame(() => collapseTruncatablesIfShort(root));
   };
   render(currentToolOutputMode);
   toolOutputUpdateCallbacks.add(update);
@@ -676,7 +683,7 @@ export function toolResultElement(
         );
         root.appendChild(diffContainer);
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
     case "RunCommand": {
@@ -719,7 +726,7 @@ export function toolResultElement(
           );
         }
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
     case "ReadFiles": {
@@ -753,7 +760,7 @@ export function toolResultElement(
           );
         }
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
     case "SearchTypes": {
@@ -791,7 +798,7 @@ export function toolResultElement(
           root.appendChild(createMetaLine(`+${hiddenCount} more`));
         }
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
     case "GetTypeDocs": {
@@ -825,7 +832,7 @@ export function toolResultElement(
           ),
         );
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
     case "Error": {
@@ -872,7 +879,7 @@ export function toolResultElement(
           );
         }
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
     case "Other": {
@@ -904,7 +911,7 @@ export function toolResultElement(
           ),
         );
       };
-      bindToolOutputRenderer(state, updateResult);
+      bindToolOutputRenderer(state, updateResult, root);
       return root;
     }
   }
@@ -925,7 +932,7 @@ function renderSpawnToolResult(state: ToolState, text: string): HTMLElement {
         : wrapWithTruncation(rendered, text.length, 0);
     root.appendChild(content);
   };
-  bindToolOutputRenderer(state, updateResult);
+  bindToolOutputRenderer(state, updateResult, root);
   return root;
 }
 
@@ -1348,6 +1355,7 @@ export function handleToolCompleted(
   const resultEl = toolResultElement(state, toolCallId, toolResult, toolName);
   if (details && resultEl) {
     details.appendChild(resultEl);
+    requestAnimationFrame(() => collapseTruncatablesIfShort(resultEl));
   }
 
   if (details) {
