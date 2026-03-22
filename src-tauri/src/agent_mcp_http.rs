@@ -100,8 +100,8 @@ struct SendAgentMessageToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct AwaitAgentsToolInput {
-    /// Agent IDs to watch. If omitted, watches all running agents.
-    agent_ids: Option<Vec<u64>>,
+    /// Agent IDs to watch.
+    agent_ids: Vec<u64>,
     /// Idle timeout in milliseconds. Resets on agent activity. Defaults to 60s.
     timeout_ms: Option<u64>,
 }
@@ -215,7 +215,7 @@ impl TydeAgentMcpServer {
     }
 
     #[tool(
-        description = "Block until one or more agents stop running. Returns the stopped agents with their messages and a list of still-running agent IDs. If agent_ids is omitted, watches all running agents. Use this after spawning multiple agents with tyde_spawn_agent to wait for any of them to finish — like epoll."
+        description = "Block until one or more agents stop running. Returns the stopped agents with their messages and a list of still-running agent IDs. Use this after spawning multiple agents with tyde_spawn_agent to wait for any of them to finish — like epoll."
     )]
     async fn tyde_await_agent(
         &self,
@@ -283,12 +283,7 @@ impl TydeAgentMcpServer {
         &self,
         Parameters(input): Parameters<CreateWorkbenchToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        match create_workbench_internal(
-            &self.app,
-            input.parent_workspace_path,
-            input.branch,
-        )
-        .await
+        match create_workbench_internal(&self.app, input.parent_workspace_path, input.branch).await
         {
             Ok(workspace_path) => ok_json(serde_json::json!({ "workspace_path": workspace_path })),
             Err(err) => Ok(err_text(err)),
