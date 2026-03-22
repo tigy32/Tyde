@@ -41,24 +41,27 @@ impl KiroSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, false, false, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, false, false, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, false, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, true, false, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     pub async fn spawn_admin(
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, true, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, true, true, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     async fn spawn_with_mode(
@@ -67,6 +70,7 @@ impl KiroSession {
         admin_session: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let roots = resolve_kiro_session_roots(
             workspace_roots,
@@ -103,27 +107,53 @@ impl KiroSession {
             )
             .await?;
 
-        let session_started = bridge
-            .request(
-                "session/new",
-                json!({
-                    "cwd": roots.session_cwd,
-                    "mcpServers": acp_mcp_servers_json(startup_mcp_servers)
-                }),
-            )
-            .await?;
+        let has_kiro_steering = if let Some(content) = steering_content {
+            if !content.trim().is_empty() {
+                crate::steering::write_kiro_steering(&roots.scope_root, content).await?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
-        let session_id = session_started
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                session_started
-                    .get("session")
-                    .and_then(|v| v.get("sessionId"))
-                    .and_then(Value::as_str)
-            })
-            .ok_or("Kiro session/new response missing sessionId")?
-            .to_string();
+        let session_result: Result<(String, Value), String> = async {
+            let session_started = bridge
+                .request(
+                    "session/new",
+                    json!({
+                        "cwd": roots.session_cwd,
+                        "mcpServers": acp_mcp_servers_json(startup_mcp_servers)
+                    }),
+                )
+                .await?;
+
+            let session_id = session_started
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    session_started
+                        .get("session")
+                        .and_then(|v| v.get("sessionId"))
+                        .and_then(Value::as_str)
+                })
+                .ok_or("Kiro session/new response missing sessionId")?
+                .to_string();
+
+            Ok((session_id, session_started))
+        }
+        .await;
+
+        let (session_id, session_started) = match session_result {
+            Ok(v) => v,
+            Err(e) => {
+                if has_kiro_steering {
+                    crate::steering::cleanup_kiro_steering(&roots.scope_root).await;
+                }
+                return Err(e);
+            }
+        };
 
         let initial_model = extract_current_model(&session_started);
         let initial_mode = extract_current_mode(&session_started);
@@ -134,6 +164,7 @@ impl KiroSession {
             bridge,
             event_tx,
             shutting_down: AtomicBool::new(false),
+            has_kiro_steering,
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
@@ -224,6 +255,7 @@ struct KiroInner {
     event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
+    has_kiro_steering: bool,
 }
 
 impl KiroInner {
@@ -601,6 +633,10 @@ impl KiroInner {
 
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        if self.has_kiro_steering {
+            let workspace_root = self.state.lock().await.workspace_root.clone();
+            crate::steering::cleanup_kiro_steering(&workspace_root).await;
+        }
         self.bridge.shutdown().await;
     }
 

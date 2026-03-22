@@ -46,24 +46,27 @@ impl CodexSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     pub async fn spawn_admin(
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     async fn spawn_with_mode(
@@ -71,8 +74,15 @@ impl CodexSession {
         ephemeral: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let (rpc, inbound_rx) = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers)?;
+        let steering_tempfile = match steering_content {
+            Some(content) if !content.trim().is_empty() => {
+                Some(crate::steering::write_codex_steering_tempfile(content)?)
+            }
+            _ => None,
+        };
+        let (rpc, inbound_rx) = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers, steering_tempfile.as_deref())?;
 
         rpc.request(
             "initialize",
@@ -149,6 +159,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 subagent_streams: HashMap::new(),
             }),
+            steering_tempfile,
         });
 
         let forward_inner = Arc::clone(&inner);
@@ -179,11 +190,16 @@ impl CodexSession {
 
     pub async fn shutdown(self) {
         self.inner.rpc.shutdown().await;
+        if let Some(path) = &self.inner.steering_tempfile {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!("Failed to remove steering temp file {}: {e}", path.display());
+            }
+        }
     }
 }
 
 pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, String> {
-    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[])?;
+    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[], None)?;
 
     rpc.request(
         "initialize",
@@ -281,6 +297,7 @@ struct CodexInner {
     rpc: CodexRpc,
     event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<CodexState>,
+    steering_tempfile: Option<std::path::PathBuf>,
 }
 
 impl CodexInner {
@@ -4259,8 +4276,15 @@ impl CodexRpc {
     fn spawn(
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_tempfile: Option<&std::path::Path>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
-        let config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
+        let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
+        if let Some(path) = steering_tempfile {
+            config_overrides.push(format!(
+                "model_instructions_file={}",
+                toml_quoted(&path.display().to_string())
+            ));
+        }
         let mut child = if let Some(host) = ssh_host {
             use crate::remote::shell_quote_command;
 

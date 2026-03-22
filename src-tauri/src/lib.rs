@@ -14,6 +14,7 @@ mod file_watch;
 mod git_service;
 mod kiro;
 mod remote;
+mod steering;
 mod subprocess;
 mod terminal;
 mod usage;
@@ -1352,12 +1353,14 @@ async fn create_conversation(
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers =
         startup_mcp_servers_for_agent(state.inner(), include_agent_control, reserved_agent_id)?;
+    let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
         &workspace_roots,
         ephemeral,
         &startup_mcp_servers,
+        steering.as_deref(),
     )
     .await?;
 
@@ -1665,12 +1668,14 @@ pub(crate) async fn spawn_agent_internal(
     let resolved_path =
         resolve_backend_executable_path(app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state, false)?;
+    let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
         &workspace_roots,
         ephemeral,
         &startup_mcp_servers,
+        steering.as_deref(),
     )
     .await?;
 
@@ -3071,12 +3076,14 @@ async fn restart_subprocess(
     let resolved_path =
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state.inner(), false)?;
+    let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
         &workspace_roots,
         false,
         &startup_mcp_servers,
+        steering.as_deref(),
     )
     .await?;
 
