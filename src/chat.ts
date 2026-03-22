@@ -1145,6 +1145,9 @@ export class ChatPanel {
           rendered.style.right = "0";
           view.virtualizer.measureElement(rendered);
         }
+        // Reposition all items — measureElement updated the size cache but
+        // positions (translateY) are still stale from the pre-swap layout.
+        renderVisibleMessages(view);
         view.messages[streamIdx] = {
           kind: "chat",
           message,
