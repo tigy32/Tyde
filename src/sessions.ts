@@ -5,19 +5,26 @@ import {
   Virtualizer,
 } from "@tanstack/virtual-core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import type { SessionMetadata } from "@tyde/protocol";
-import { type BackendKind, normalizeBackendKind } from "./bridge";
+import type { SessionMetadata, SessionRecord } from "@tyde/protocol";
+import {
+  type BackendKind,
+  listSessionRecords,
+  normalizeBackendKind,
+  renameSession,
+} from "./bridge";
 import { escapeHtml } from "./renderer";
 import { promptForText } from "./text_prompt";
 
 interface NormalizedSession {
   key: string;
   id: string;
+  tydeSessionId: string | null;
   backendKind: BackendKind;
   preview: string;
   createdAtMs: number;
   messageCount: number | null;
   workspaceRoot?: string;
+  parentId: string | null;
 }
 
 const SESSION_ALIAS_STORAGE_KEY = "tyde-session-aliases";
@@ -32,7 +39,8 @@ export class SessionsPanel {
   private resumingSessionKey: string | null = null;
   private state: "loading" | "loaded" | "error" = "loaded";
   private errorMessage = "";
-  private aliases: Record<string, string> = {};
+  private records = new Map<string, SessionRecord>();
+  private showAgentSessions = false;
   private newSessionEnabled = true;
   private newSessionDisabledReason = "New sessions are unavailable.";
 
@@ -56,8 +64,20 @@ export class SessionsPanel {
     this.container = container;
     this.container.className = "sessions-panel";
     this.container.dataset.testid = "sessions-panel";
-    this.aliases = this.loadAliases();
+    void this.migrateLocalStorageAliases();
     this.render();
+  }
+
+  async refreshRecords(): Promise<void> {
+    try {
+      const records = await listSessionRecords();
+      this.records.clear();
+      for (const r of records) {
+        this.records.set(r.id, r);
+      }
+    } catch (err) {
+      console.error("Failed to fetch session records:", err);
+    }
   }
 
   update(sessions: SessionMetadata[]): void {
@@ -110,21 +130,49 @@ export class SessionsPanel {
     this.renderVisibleCards();
   }
 
+  getResolvedAlias(tydeSessionId: string): string | undefined {
+    const record = this.records.get(tydeSessionId);
+    if (!record) return undefined;
+    const alias = record.user_alias ?? record.alias;
+    return alias && alias.trim().length > 0 ? alias.trim() : undefined;
+  }
+
+  getResolvedAliasForBackendSession(
+    backendSessionId: string,
+    backendKind: BackendKind,
+  ): string | undefined {
+    for (const record of this.records.values()) {
+      if (
+        record.backend_session_id === backendSessionId &&
+        normalizeBackendKind(record.backend_kind) === backendKind
+      ) {
+        const alias = record.user_alias ?? record.alias;
+        return alias && alias.trim().length > 0 ? alias.trim() : undefined;
+      }
+    }
+    return undefined;
+  }
+
   private applyFilter(): void {
+    let base = this.sessions;
+    // Filter out agent sessions unless toggle is on
+    if (!this.showAgentSessions) {
+      base = base.filter((s) => s.parentId === null);
+    }
     const q = this.searchQuery.toLowerCase();
     if (!q) {
-      this.filteredSessions = this.sessions;
+      this.filteredSessions = base;
       return;
     }
-    this.filteredSessions = this.sessions.filter((s) => {
+    this.filteredSessions = base.filter((s) => {
+      const title = this.resolveSessionTitle(s).toLowerCase();
       const preview = s.preview.toLowerCase();
-      const alias = (this.aliases[s.key] ?? "").toLowerCase();
       const workspace = (s.workspaceRoot ?? "").toLowerCase();
       const date = this.formatDate(s.createdAtMs).toLowerCase();
       const backend = s.backendKind.toLowerCase();
       return (
+        title.includes(q) ||
         preview.includes(q) ||
-        alias.includes(q) ||
         workspace.includes(q) ||
         date.includes(q) ||
         backend.includes(q)
@@ -163,11 +211,28 @@ export class SessionsPanel {
     const refreshBtn = document.createElement("button");
     refreshBtn.className = "sessions-action-btn sessions-refresh-btn";
     refreshBtn.dataset.testid = "sessions-refresh";
-    refreshBtn.textContent = "↻";
+    refreshBtn.textContent = "\u21BB";
     refreshBtn.title = "Refresh sessions";
     refreshBtn.addEventListener("click", () => this.onRefresh?.());
 
+    const agentToggle = document.createElement("button");
+    agentToggle.className = `sessions-action-btn sessions-agent-toggle${this.showAgentSessions ? " active" : ""}`;
+    agentToggle.title = this.showAgentSessions
+      ? "Hide agent sessions"
+      : "Show agent sessions";
+    agentToggle.textContent = "\u2699\uFE0E";
+    agentToggle.addEventListener("click", () => {
+      this.showAgentSessions = !this.showAgentSessions;
+      agentToggle.classList.toggle("active", this.showAgentSessions);
+      agentToggle.title = this.showAgentSessions
+        ? "Hide agent sessions"
+        : "Show agent sessions";
+      this.applyFilter();
+      this.updateVirtualList();
+    });
+
     toolbar.appendChild(newBtn);
+    toolbar.appendChild(agentToggle);
     toolbar.appendChild(refreshBtn);
     this.container.appendChild(toolbar);
 
@@ -185,7 +250,7 @@ export class SessionsPanel {
     if (this.state === "error") {
       const error = document.createElement("div");
       error.className = "sessions-error-state";
-      error.innerHTML = `<span class="sessions-error-icon">⚠</span><span>${escapeHtml(this.errorMessage)}</span>`;
+      error.innerHTML = `<span class="sessions-error-icon">\u26A0</span><span>${escapeHtml(this.errorMessage)}</span>`;
       this.container.appendChild(error);
       return;
     }
@@ -194,7 +259,7 @@ export class SessionsPanel {
       const empty = document.createElement("div");
       empty.className = "sessions-empty";
       empty.innerHTML =
-        '<span class="sessions-empty-icon">💬</span><span>No saved sessions yet</span><span class="sessions-empty-hint">Start a conversation to create a session</span>';
+        '<span class="sessions-empty-icon">\uD83D\uDCAC</span><span>No saved sessions yet</span><span class="sessions-empty-hint">Start a conversation to create a session</span>';
       this.container.appendChild(empty);
       return;
     }
@@ -345,7 +410,7 @@ export class SessionsPanel {
     renameBtn.type = "button";
     renameBtn.className = "session-card-action-btn";
     renameBtn.title = "Rename session";
-    renameBtn.textContent = "✎";
+    renameBtn.textContent = "\u270E";
     renameBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       void this.renameSessionAlias(session);
@@ -356,7 +421,7 @@ export class SessionsPanel {
     deleteBtn.type = "button";
     deleteBtn.className = "session-card-action-btn session-card-action-delete";
     deleteBtn.title = "Delete session";
-    deleteBtn.textContent = "🗑\uFE0E";
+    deleteBtn.textContent = "\uD83D\uDDD1\uFE0E";
     deleteBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const confirmed = await confirm(
@@ -388,7 +453,7 @@ export class SessionsPanel {
 
     const dot0 = document.createElement("span");
     dot0.className = "session-card-separator";
-    dot0.textContent = "·";
+    dot0.textContent = "\u00B7";
     meta.appendChild(dot0);
 
     const date = document.createElement("span");
@@ -399,7 +464,7 @@ export class SessionsPanel {
     if (session.workspaceRoot) {
       const dot = document.createElement("span");
       dot.className = "session-card-separator";
-      dot.textContent = "·";
+      dot.textContent = "\u00B7";
       meta.appendChild(dot);
 
       const workspace = document.createElement("span");
@@ -412,7 +477,7 @@ export class SessionsPanel {
     if (session.messageCount !== null) {
       const dot2 = document.createElement("span");
       dot2.className = "session-card-separator";
-      dot2.textContent = "·";
+      dot2.textContent = "\u00B7";
       meta.appendChild(dot2);
 
       const count = document.createElement("span");
@@ -423,7 +488,7 @@ export class SessionsPanel {
 
     const dot3 = document.createElement("span");
     dot3.className = "session-card-separator";
-    dot3.textContent = "·";
+    dot3.textContent = "\u00B7";
     meta.appendChild(dot3);
 
     const idLabel = document.createElement("span");
@@ -483,19 +548,43 @@ export class SessionsPanel {
     const createdAtMs =
       createdValue > 1_000_000_000_000 ? createdValue : createdValue * 1000;
 
-    const messageCountRaw = this.asNumber(raw.message_count);
+    // Match with store record by backend_session_id + backend_kind
+    let matchedRecord: SessionRecord | undefined;
+    for (const record of this.records.values()) {
+      if (
+        record.backend_session_id === sessionId &&
+        normalizeBackendKind(record.backend_kind) === backendKind
+      ) {
+        matchedRecord = record;
+        break;
+      }
+    }
+
+    // Use store message_count if available, otherwise fall back to backend
+    const messageCountRaw = matchedRecord
+      ? matchedRecord.message_count
+      : this.asNumber(raw.message_count);
+
+    // Use store created_at if available
+    const finalCreatedAtMs = matchedRecord
+      ? matchedRecord.created_at_ms
+      : createdAtMs;
 
     return {
       key: this.sessionKey(sessionId, backendKind),
       id: sessionId,
+      tydeSessionId: matchedRecord?.id ?? null,
       backendKind,
       preview,
-      createdAtMs,
+      createdAtMs: finalCreatedAtMs,
       messageCount:
         messageCountRaw === null
           ? null
           : Math.max(0, Math.floor(messageCountRaw)),
-      workspaceRoot: this.asString(raw.workspace_root),
+      workspaceRoot:
+        matchedRecord?.workspace_root ??
+        this.asString(raw.workspace_root),
+      parentId: matchedRecord?.parent_id ?? null,
     };
   }
 
@@ -518,93 +607,86 @@ export class SessionsPanel {
     const sep = path.includes("/") ? "/" : "\\";
     const parts = path.split(sep).filter(Boolean);
     if (parts.length <= 2) return path;
-    return `…${sep}${parts.slice(-2).join(sep)}`;
+    return `\u2026${sep}${parts.slice(-2).join(sep)}`;
   }
 
   private truncate(text: string, max: number): string {
     const firstLine = text.split("\n")[0];
     if (firstLine.length <= max) return firstLine;
-    return `${firstLine.slice(0, max - 1)}…`;
+    return `${firstLine.slice(0, max - 1)}\u2026`;
   }
 
   private resolveSessionTitle(session: NormalizedSession): string {
-    const alias = this.aliases[session.key];
-    if (alias && alias.trim().length > 0) {
-      return this.truncate(alias.trim(), 80);
+    if (session.tydeSessionId) {
+      const record = this.records.get(session.tydeSessionId);
+      if (record) {
+        const userAlias = record.user_alias?.trim();
+        if (userAlias && userAlias.length > 0) {
+          return this.truncate(userAlias, 80);
+        }
+        const alias = record.alias?.trim();
+        if (alias && alias.length > 0) {
+          return this.truncate(alias, 80);
+        }
+      }
     }
     return this.truncate(session.preview, 80);
   }
 
   private async renameSessionAlias(session: NormalizedSession): Promise<void> {
-    const current = this.aliases[session.key] ?? "";
+    const currentTitle = this.resolveSessionTitle(session);
     const next = await promptForText({
       title: "Session Title",
-      defaultValue: current || this.truncate(session.preview, 80),
+      defaultValue: currentTitle,
       placeholder: "Session title",
       confirmLabel: "Save",
     });
     if (next === null) return;
     const trimmed = next.trim();
-    if (!trimmed) {
-      delete this.aliases[session.key];
-    } else {
-      this.aliases[session.key] = trimmed;
+    if (session.tydeSessionId) {
+      await renameSession(session.tydeSessionId, trimmed);
+      await this.refreshRecords();
     }
-    this.saveAliases();
     this.renderVisibleCards();
   }
 
-  setSessionAlias(
-    sessionId: string,
-    backendKind: BackendKind,
-    title: string,
-  ): void {
-    const key = this.sessionKey(sessionId, backendKind);
-    const trimmed = title.trim();
-    if (!trimmed) {
-      delete this.aliases[key];
-    } else {
-      this.aliases[key] = trimmed;
+  private async migrateLocalStorageAliases(): Promise<void> {
+    const raw = localStorage.getItem(SESSION_ALIAS_STORAGE_KEY);
+    if (!raw) {
+      await this.refreshRecords();
+      return;
     }
-    this.saveAliases();
-    this.renderVisibleCards();
-  }
-
-  getSessionAlias(
-    sessionId: string,
-    backendKind: BackendKind,
-  ): string | undefined {
-    const key = this.sessionKey(sessionId, backendKind);
-    const alias = this.aliases[key];
-    return alias && alias.trim().length > 0 ? alias.trim() : undefined;
-  }
-
-  private loadAliases(): Record<string, string> {
-    try {
-      const raw = localStorage.getItem(SESSION_ALIAS_STORAGE_KEY);
-      if (!raw) return {};
-      const parsed = JSON.parse(raw);
-      if (
-        typeof parsed !== "object" ||
-        parsed === null ||
-        Array.isArray(parsed)
-      )
-        return {};
-      return parsed as Record<string, string>;
-    } catch (err) {
-      console.error("Failed to load session aliases from localStorage:", err);
-      return {};
+    const parsed = JSON.parse(raw);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      await this.refreshRecords();
+      return;
     }
-  }
-
-  private saveAliases(): void {
-    try {
-      localStorage.setItem(
-        SESSION_ALIAS_STORAGE_KEY,
-        JSON.stringify(this.aliases),
-      );
-    } catch (err) {
-      console.error("Failed to save session aliases to localStorage:", err);
+    const aliases = parsed as Record<string, string>;
+    await this.refreshRecords();
+    const promises: Promise<void>[] = [];
+    for (const [key, alias] of Object.entries(aliases)) {
+      if (!alias || !alias.trim()) continue;
+      // key format is "backendKind:sessionId"
+      const colonIdx = key.indexOf(":");
+      if (colonIdx === -1) continue;
+      const bk = key.slice(0, colonIdx);
+      const sid = key.slice(colonIdx + 1);
+      // Find matching record
+      for (const record of this.records.values()) {
+        if (
+          record.backend_session_id === sid &&
+          normalizeBackendKind(record.backend_kind) === normalizeBackendKind(bk)
+        ) {
+          promises.push(renameSession(record.id, alias.trim()));
+          break;
+        }
+      }
     }
+    await Promise.all(promises);
+    localStorage.removeItem(SESSION_ALIAS_STORAGE_KEY);
   }
 }

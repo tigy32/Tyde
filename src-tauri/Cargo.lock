@@ -5917,6 +5917,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tycode-core",
+ "uuid",
 ]
 
 [[package]]

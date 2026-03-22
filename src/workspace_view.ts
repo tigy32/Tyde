@@ -22,6 +22,7 @@ import {
   onFileChanged,
   readFileContent,
   renameAgent,
+  renameSession,
   resumeSession,
   sendMessage,
   spawnAgent,
@@ -143,7 +144,7 @@ export class WorkspaceView {
     { sessionId: string; backendKind: BackendKind }
   >();
   private conversationBackendKindMap = new Map<number, BackendKind>();
-  private pendingSessionAliases = new Map<number, string>();
+  private conversationTydeSessionMap = new Map<number, string>();
   private titleGenerationRequested = new Set<number>();
   private sessionsRefreshRequestedForConversation = new Set<number>();
   private _readyPromise: Promise<void> | null = null;
@@ -678,7 +679,7 @@ export class WorkspaceView {
     this.adminBackendById.clear();
     this.sessionsByBackend.clear();
     this.rejectAllSessionsListWaiters("Workspace view disposed");
-    this.pendingSessionAliases.clear();
+    this.conversationTydeSessionMap.clear();
     this.titleGenerationRequested.clear();
     this.sessionsRefreshRequestedForConversation.clear();
     for (const conversationId of this.conversationIds) {
@@ -862,17 +863,6 @@ export class WorkspaceView {
     );
     this.conversationBackendKindMap.set(agent.conversation_id, backendKind);
     this.registerConversation(this.runtimeAgentToPanelInfo(agent));
-
-    if (
-      agent.name &&
-      !this.pendingSessionAliases.has(agent.conversation_id) &&
-      !this.conversationSessionMap.has(agent.conversation_id)
-    ) {
-      const name = agent.name.trim();
-      if (name && !isGenericAgentName(name)) {
-        this.pendingSessionAliases.set(agent.conversation_id, name);
-      }
-    }
   }
 
   syncRuntimeAgents(agents: RuntimeAgent[]): void {
@@ -997,17 +987,6 @@ export class WorkspaceView {
               sessionId,
               backendKind,
             });
-            const pendingAlias = this.pendingSessionAliases.get(
-              payload.conversation_id,
-            );
-            if (pendingAlias) {
-              this.sessionsPanel.setSessionAlias(
-                sessionId,
-                backendKind,
-                pendingAlias,
-              );
-              this.pendingSessionAliases.delete(payload.conversation_id);
-            }
           }
         })
         .catch((err) => {
@@ -1037,7 +1016,9 @@ export class WorkspaceView {
           backend_kind: session.backend_kind ?? backendKind,
         }));
         this.sessionsByBackend.set(backendKind, sessions);
-        this.sessionsPanel.update(this.mergeSessions());
+        void this.sessionsPanel.refreshRecords().then(() => {
+          this.sessionsPanel.update(this.mergeSessions());
+        });
       } catch (err) {
         this.sessionsPanel.showError("Failed to render sessions list.");
         this.notifications.error(`Sessions rendering failed: ${String(err)}`);
@@ -1115,31 +1096,7 @@ export class WorkspaceView {
       );
       if (!renamed) return;
 
-      let session = this.conversationSessionMap.get(conversationId);
-      if (!session) {
-        // The conversationSessionMap is populated from the StreamEnd handler, but
-        // for Claude the Rust-side session_id may not be set until after the CLI
-        // process exits — which can race with StreamEnd delivery.  By the time the
-        // title agent finishes (seconds later) the id is almost always available,
-        // so fetch it directly before falling back to pendingSessionAliases.
-        const backendKind = this.conversationBackendKindMap.get(conversationId);
-        if (backendKind) {
-          const sessionId = await getSessionId(conversationId);
-          if (sessionId) {
-            session = { sessionId, backendKind };
-            this.conversationSessionMap.set(conversationId, session);
-          }
-        }
-      }
-      if (session) {
-        this.sessionsPanel.setSessionAlias(
-          session.sessionId,
-          session.backendKind,
-          normalizedTitle,
-        );
-      } else {
-        this.pendingSessionAliases.set(conversationId, normalizedTitle);
-      }
+      // Alias is written by Rust via renameAgent → store.set_alias
       this.agentsPanel.updateAgent(conversationId, { name: normalizedTitle });
       const agentInfo =
         this.agentsPanel.getAgentByConversationId(conversationId);
@@ -1281,16 +1238,19 @@ export class WorkspaceView {
     this.chatPanel.showSpawnLoading();
 
     let id: number;
+    let tydeSessionId: string | undefined;
     try {
       await this.ensureAdminSubprocess(backendKind);
       const conversationRoots =
         this.resolveWorkspaceRootsForBackend(backendKind);
-      id = await createConversation(
+      const result = await createConversation(
         conversationRoots,
         backendKind,
         undefined,
         this.resolveConversationMode(),
       );
+      id = result.conversation_id;
+      tydeSessionId = result.session_id;
     } catch (err) {
       this.tabManager.closeTab(tab.id);
       this.chatPanel.showSpawnError(
@@ -1310,6 +1270,9 @@ export class WorkspaceView {
 
     // Bind the real conversation ID to the tab and view
     tab.conversationId = id;
+    if (tydeSessionId) {
+      this.conversationTydeSessionMap.set(id, tydeSessionId);
+    }
     this.chatPanel.setConversationBackendKind(id, backendKind);
     this.conversationBackendKindMap.set(id, backendKind);
     this.registerConversation({
@@ -1322,9 +1285,6 @@ export class WorkspaceView {
     });
     this.chatPanel.switchToConversation(id);
     await this.applyDefaultSpawnProfile(id, backendKind);
-    if (this.mode === "bridge") {
-      this.pendingSessionAliases.set(id, tab.title);
-    }
     if (this.mode === "bridge" && options?.bootstrap !== false) {
       await sendMessage(id, this.buildBridgeBootstrapPrompt());
     }
@@ -1776,17 +1736,17 @@ export class WorkspaceView {
     this.tabManager.onTabRenamed = (tab: TabState) => {
       if (tab.kind !== "chat" || tab.conversationId === null) return;
       this.agentsPanel.updateAgent(tab.conversationId, { name: tab.title });
-      const session = this.conversationSessionMap.get(tab.conversationId);
-      if (!session) {
-        this.pendingSessionAliases.set(tab.conversationId, tab.title);
-        return;
-      }
-      this.pendingSessionAliases.delete(tab.conversationId);
-      this.sessionsPanel.setSessionAlias(
-        session.sessionId,
-        session.backendKind,
-        tab.title,
+      // User rename: write to session store via renameSession
+      const tydeSessionId = this.conversationTydeSessionMap.get(
+        tab.conversationId,
       );
+      if (tydeSessionId) {
+        void renameSession(tydeSessionId, tab.title).then(() =>
+          this.sessionsPanel.refreshRecords().then(() =>
+            this.sessionsPanel.update(this.mergeSessions()),
+          ),
+        );
+      }
     };
 
     this.tabManager.onNewTab = () => {
@@ -1811,10 +1771,11 @@ export class WorkspaceView {
         }
 
         // Always resume into a fresh tab; use saved alias as tab label if available.
-        const savedAlias = this.sessionsPanel.getSessionAlias(
-          sessionId,
-          backendKind,
-        );
+        const savedAlias =
+          this.sessionsPanel.getResolvedAliasForBackendSession(
+            sessionId,
+            backendKind,
+          );
         cid = await this.createNewConversationTab(savedAlias, backendKind, {
           bootstrap: false,
         });
@@ -1887,8 +1848,7 @@ export class WorkspaceView {
               break;
             }
           }
-          // Clean up the persisted alias only after confirmed deletion.
-          this.sessionsPanel.setSessionAlias(sessionId, backendKind, "");
+          // Store record is cleaned up by Rust in admin_delete_session
           this.notifications.success("Session deleted");
           return;
         } catch (err) {
@@ -2047,11 +2007,13 @@ export class WorkspaceView {
       // Replicate the onFeedbackSubmit logic but set box.conversationId
       // before sendMessage so that synchronous mock events can find the box.
       const backendKind = this.resolveConversationBackend();
-      const id = await createConversation(
+      const result = await createConversation(
         this.resolveWorkspaceRootsForBackend(backendKind),
         backendKind,
         true,
       );
+      const id = result.conversation_id;
+      this.conversationTydeSessionMap.set(id, result.session_id);
       this.chatPanel.setConversationBackendKind(id, backendKind);
       const fileName = filePath.split("/").pop() || filePath;
       this.registerConversation({
@@ -2118,11 +2080,13 @@ export class WorkspaceView {
       feedback,
     ) => {
       const backendKind = this.resolveConversationBackend();
-      const id = await createConversation(
+      const result = await createConversation(
         this.resolveWorkspaceRootsForBackend(backendKind),
         backendKind,
         true,
       );
+      const id = result.conversation_id;
+      this.conversationTydeSessionMap.set(id, result.session_id);
       this.chatPanel.setConversationBackendKind(id, backendKind);
 
       const fileName = filePath.split("/").pop() || filePath;
@@ -2526,7 +2490,7 @@ export class WorkspaceView {
     this.conversationIds.delete(conversationId);
     this.agentsPanel.removeAgent(conversationId);
     this.eventRouter.unregisterFeedbackAgent(conversationId);
-    this.pendingSessionAliases.delete(conversationId);
+    this.conversationTydeSessionMap.delete(conversationId);
     this.titleGenerationRequested.delete(conversationId);
     this.sessionsRefreshRequestedForConversation.delete(conversationId);
     this.emitConversationIdsChanged();

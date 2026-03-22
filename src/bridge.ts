@@ -31,12 +31,14 @@ export type {
   ConversationMode,
   ConversationRegisteredData,
   ConversationRegisteredPayload,
+  CreateConversationResponse,
   DriverMcpHttpServerSettings,
   FileChangedPayload,
   McpHttpServerSettings,
   RemoteConnectionProgress,
   RuntimeAgent,
   RuntimeAgentEventBatch,
+  SessionRecord,
   ShellCommandResult,
   SpawnAgentResponse,
   TerminalExitPayload,
@@ -121,6 +123,14 @@ export function deleteSession(conversationId: number, sessionId: string) {
 
 export function exportSessionJson(sessionId: string) {
   return execute("export_session_json", { sessionId });
+}
+
+export function listSessionRecords() {
+  return execute("list_session_records", {} as Record<string, never>);
+}
+
+export function renameSession(id: string, name: string) {
+  return execute("rename_session", { id, name });
 }
 
 // --- Settings & models ---
