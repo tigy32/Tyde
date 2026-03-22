@@ -61,15 +61,23 @@ interface QueuedMessage {
 }
 
 type StoredMessage =
-  | { kind: "chat"; message: ChatMessage; element: HTMLElement | null }
+  | {
+      kind: "chat";
+      key: number;
+      message: ChatMessage;
+      element: HTMLElement | null;
+    }
   | {
       kind: "system";
+      key: number;
       text: string;
       style: "system" | "warning" | "error";
       element: HTMLElement | null;
     }
-  | { kind: "streaming"; element: HTMLElement }
-  | { kind: "retry"; element: HTMLElement };
+  | { kind: "streaming"; key: number; element: HTMLElement }
+  | { kind: "retry"; key: number; element: HTMLElement };
+
+let nextMessageKey = 1;
 
 interface ConversationView {
   wrapper: HTMLElement;
@@ -177,18 +185,21 @@ function renderVisibleMessages(view: ConversationView): void {
 
   // Build map of currently mounted elements by index
   const mountedElements = new Map<number, HTMLElement>();
+  let removedAny = false;
   for (const child of Array.from(chatWrapper.children)) {
     const el = child as HTMLElement;
     const idx = el.dataset.index;
     if (idx === undefined || !visibleIndices.has(Number(idx))) {
       el.remove();
+      removedAny = true;
     } else {
       mountedElements.set(Number(idx), el);
     }
   }
-
-  // Collect newly mounted elements for measurement after positioning
-  const toMeasure: HTMLElement[] = [];
+  // Clean up ResizeObserver entries for removed (disconnected) elements.
+  if (removedAny) {
+    virtualizer.measureElement(null as unknown as HTMLElement);
+  }
 
   // Add new elements and update positions
   for (const item of virtualItems) {
@@ -201,13 +212,11 @@ function renderVisibleMessages(view: ConversationView): void {
       el.style.left = "0";
       el.style.right = "0";
       chatWrapper.appendChild(el);
-      toMeasure.push(el);
     }
     el.style.transform = `translateY(${item.start}px)`;
-  }
-
-  // Measure newly mounted elements — may trigger onChange via ResizeObserver
-  for (const el of toMeasure) {
+    // Measure all visible elements — not just newly mounted ones.
+    // Retained elements may have been mutated while offscreen (e.g. tool
+    // card content updates) and their cached heights could be stale.
     virtualizer.measureElement(el);
   }
 
@@ -403,6 +412,7 @@ export class ChatPanel {
       count: 0,
       getScrollElement: () => container,
       estimateSize: () => 120,
+      getItemKey: (index) => view.messages[index].key,
       overscan: 5,
       gap: 6,
       paddingEnd: 8,
@@ -1048,6 +1058,7 @@ export class ChatPanel {
     view.retryCard = null;
     view.messages = [];
     updateVirtualizerCount(view);
+    view.virtualizer.measure();
     view.chatWrapper.replaceChildren();
     stream.resetStreamState(view.streamState);
     resetToolState(view.toolState);
@@ -1064,7 +1075,13 @@ export class ChatPanel {
     text: string,
     style: "system" | "warning" | "error",
   ): void {
-    view.messages.push({ kind: "system", text, style, element: null });
+    view.messages.push({
+      kind: "system",
+      key: nextMessageKey++,
+      text,
+      style,
+      element: null,
+    });
     updateVirtualizerCount(view);
     this.scrollToBottom(view);
   }
@@ -1083,7 +1100,11 @@ export class ChatPanel {
     stream.handleStreamStart(
       view.streamState,
       (bubble) => {
-        view.messages.push({ kind: "streaming", element: bubble });
+        view.messages.push({
+          kind: "streaming",
+          key: nextMessageKey++,
+          element: bubble,
+        });
         updateVirtualizerCount(view);
       },
       agent,
@@ -1136,13 +1157,10 @@ export class ChatPanel {
       // Replace the streaming entry with a finalized chat entry
       const streamIdx = view.messages.findIndex((m) => m.kind === "streaming");
       if (streamIdx !== -1) {
+        const streamKey = view.messages[streamIdx].key;
         const rendered = view.streamState.lastRenderedBubble;
         if (rendered) {
           rendered.dataset.index = String(streamIdx);
-          rendered.style.position = "absolute";
-          rendered.style.top = "0";
-          rendered.style.left = "0";
-          rendered.style.right = "0";
           view.virtualizer.measureElement(rendered);
         }
         // Reposition all items — measureElement updated the size cache but
@@ -1150,11 +1168,12 @@ export class ChatPanel {
         renderVisibleMessages(view);
         view.messages[streamIdx] = {
           kind: "chat",
+          key: streamKey,
           message,
           element: rendered,
         };
       }
-      this.expandLastAssistantMessage(view.chatWrapper);
+      this.expandLastAssistantMessage(view);
       if (result.durationMs > 30_000) {
         this.notificationManager?.notifyTaskComplete("Response complete");
       }
@@ -1218,10 +1237,12 @@ export class ChatPanel {
 
   // --- Message rendering ---
 
-  private expandLastAssistantMessage(container: HTMLElement): void {
-    const msgs = container.querySelectorAll(".message.assistant-message");
+  private expandLastAssistantMessage(view: ConversationView): void {
+    const { chatWrapper, virtualizer } = view;
+    const msgs = chatWrapper.querySelectorAll(".message.assistant-message");
     if (msgs.length === 0) return;
-    const last = msgs[msgs.length - 1];
+    const last = msgs[msgs.length - 1] as HTMLElement;
+    let changed = false;
     const lastTruncatable = last.querySelector(
       ".message-content > .truncatable.collapsed",
     );
@@ -1229,9 +1250,11 @@ export class ChatPanel {
       lastTruncatable.classList.remove("collapsed");
       const btn = lastTruncatable.querySelector(".truncatable-toggle");
       if (btn) btn.textContent = "Show less";
+      changed = true;
     }
+    let prev: HTMLElement | null = null;
     if (msgs.length >= 2) {
-      const prev = msgs[msgs.length - 2];
+      prev = msgs[msgs.length - 2] as HTMLElement;
       const prevTruncatable = prev.querySelector(
         ".message-content > .truncatable:not(.collapsed)",
       );
@@ -1239,7 +1262,13 @@ export class ChatPanel {
         prevTruncatable.classList.add("collapsed");
         const btn = prevTruncatable.querySelector(".truncatable-toggle");
         if (btn) btn.textContent = "Show more";
+        changed = true;
       }
+    }
+    if (changed) {
+      if (last.dataset.index !== undefined) virtualizer.measureElement(last);
+      if (prev?.dataset.index !== undefined) virtualizer.measureElement(prev);
+      renderVisibleMessages(view);
     }
   }
 
@@ -1254,11 +1283,16 @@ export class ChatPanel {
       openLightbox,
       setRelativeTimeElement,
     );
-    const stored: StoredMessage = { kind: "chat", message, element: el };
+    const stored: StoredMessage = {
+      kind: "chat",
+      key: nextMessageKey++,
+      message,
+      element: el,
+    };
     view.messages.push(stored);
     updateVirtualizerCount(view);
     view.streamState.lastRenderedBubble = el;
-    this.expandLastAssistantMessage(view.chatWrapper);
+    this.expandLastAssistantMessage(view);
     if (message.context_breakdown) {
       view.taskPanel.setContextUsage(message.context_breakdown);
     }
@@ -1336,7 +1370,11 @@ export class ChatPanel {
     card.appendChild(actions);
 
     view.retryCard = card;
-    view.messages.push({ kind: "retry", element: card });
+    view.messages.push({
+      kind: "retry",
+      key: nextMessageKey++,
+      element: card,
+    });
     updateVirtualizerCount(view);
     this.scrollToBottom(view);
 
@@ -1369,7 +1407,14 @@ export class ChatPanel {
       const idx = target.messages.findIndex((m) => m.kind === "retry");
       if (idx !== -1) {
         target.messages.splice(idx, 1);
+        // Mid-list removal shifts indices. Clear data-index on all mounted
+        // elements so renderVisibleMessages treats them as stale and
+        // re-mounts with correct indices.
+        for (const child of Array.from(target.chatWrapper.children)) {
+          delete (child as HTMLElement).dataset.index;
+        }
         updateVirtualizerCount(target);
+        target.virtualizer.measure();
       }
       target.retryCard = null;
     }
