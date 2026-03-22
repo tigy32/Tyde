@@ -77,8 +77,34 @@ cmd_release() {
 
     local dmg="$dmg_dir/${app_name}.dmg"
     log "Creating DMG from signed app"
-    hdiutil create -volname "$app_name" -srcfolder "$app_bundle" \
-        -ov -format UDZO "$dmg"
+
+    if ! command -v create-dmg &>/dev/null; then
+        error "create-dmg not found. Install with: brew install create-dmg"
+    fi
+
+    # create-dmg needs a staging folder containing the .app
+    local staging_dir
+    staging_dir=$(mktemp -d)
+    cp -R "$app_bundle" "$staging_dir/"
+
+    # create-dmg returns exit code 2 when it can't set icon positions (common in CI)
+    # but the DMG is still valid, so we allow it
+    create-dmg \
+        --volname "$app_name" \
+        --window-pos 200 120 \
+        --window-size 660 400 \
+        --icon-size 80 \
+        --icon "$app_name.app" 180 220 \
+        --app-drop-link 480 220 \
+        --no-internet-enable \
+        "$dmg" \
+        "$staging_dir" || local dmg_exit=$?
+
+    rm -rf "$staging_dir"
+
+    if [[ "${dmg_exit:-0}" -ne 0 && "${dmg_exit:-0}" -ne 2 ]]; then
+        error "create-dmg failed with exit code $dmg_exit"
+    fi
 
     sign_and_notarize "$dmg"
 

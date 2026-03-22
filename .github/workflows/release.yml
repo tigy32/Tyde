@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            rust-target: aarch64-apple-darwin
+          - platform: macos-latest
+            rust-target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf
+
+      - name: Install macOS tools
+        if: startsWith(matrix.platform, 'macos')
+        run: brew install create-dmg
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # ---- macOS code signing setup ----
+      - name: Import Apple certificate
+        if: startsWith(matrix.platform, 'macos') && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+      - name: Write Apple API key
+        if: startsWith(matrix.platform, 'macos') && env.APPLE_API_KEY_CONTENT != ''
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          echo "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+
+      # ---- Windows code signing setup ----
+      - name: Import Windows certificate
+        if: matrix.platform == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          New-Item -ItemType directory -Path certificate
+          Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/tempCert.txt certificate/certificate.pfx
+          Remove-Item -path certificate -include tempCert.txt
+          Import-PfxCertificate -FilePath certificate/certificate.pfx `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password (ConvertTo-SecureString `
+              -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText)
+
+      # ---- Build ----
+      - name: Build with Tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
+        with:
+          tagName: ${{ github.event.inputs.version || github.ref_name }}
+          releaseName: Tyde ${{ github.event.inputs.version || github.ref_name }}
+          releaseBody: ''
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.rust-target }}
+          tauriScript: npx tauri
+
+      # ---- macOS: Rebuild DMG with drag-to-Applications ----
+      - name: Rebuild macOS DMG
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          BUNDLE_DIR="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          APP_BUNDLE=$(find "$BUNDLE_DIR/macos" -name '*.app' -maxdepth 1 | head -1)
+          APP_NAME=$(basename "$APP_BUNDLE" .app)
+          DMG_DIR="$BUNDLE_DIR/dmg"
+
+          rm -f "$DMG_DIR"/*.dmg
+
+          STAGING=$(mktemp -d)
+          cp -R "$APP_BUNDLE" "$STAGING/"
+
+          # Exit code 2 = icon positioning failed (headless CI), DMG is still valid
+          create-dmg \
+            --volname "$APP_NAME" \
+            --window-pos 200 120 \
+            --window-size 660 400 \
+            --icon-size 80 \
+            --icon "$APP_NAME.app" 180 220 \
+            --app-drop-link 480 220 \
+            --no-internet-enable \
+            "$DMG_DIR/${APP_NAME}_${{ matrix.rust-target }}.dmg" \
+            "$STAGING" || DMG_EXIT=$?
+
+          rm -rf "$STAGING"
+
+          if [[ "${DMG_EXIT:-0}" -ne 0 && "${DMG_EXIT:-0}" -ne 2 ]]; then
+            echo "create-dmg failed with exit code $DMG_EXIT"
+            exit 1
+          fi
+
+      - name: Sign and notarize DMG
+        if: startsWith(matrix.platform, 'macos') && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          BUNDLE_DIR="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          DMG=$(find "$BUNDLE_DIR/dmg" -name '*.dmg' | head -1)
+
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
+
+          xcrun notarytool submit "$DMG" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key-id "$APPLE_API_KEY" \
+            --key "$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8" \
+            --wait
+
+          xcrun stapler staple "$DMG"
+
+      - name: Upload macOS DMG to release
+        if: startsWith(matrix.platform, 'macos') && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          BUNDLE_DIR="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          DMG=$(find "$BUNDLE_DIR/dmg" -name '*.dmg' | head -1)
+          gh release upload ${{ github.event.inputs.version || github.ref_name }} "$DMG" --clobber
+
+      # ---- Linux: SHA256 checksums ----
+      - name: Generate Linux checksums
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          BUNDLE_DIR="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          for f in "$BUNDLE_DIR"/appimage/*.AppImage "$BUNDLE_DIR"/deb/*.deb; do
+            [ -f "$f" ] && sha256sum "$f" > "${f}.sha256"
+          done
+
+      # ---- Cleanup ----
+      - name: Cleanup macOS keychain
+        if: startsWith(matrix.platform, 'macos') && env.APPLE_CERTIFICATE != '' && always()
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
