@@ -551,7 +551,7 @@ pub(crate) struct AgentEventsSinceRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AwaitAgentsRequest {
-    pub(crate) agent_ids: Option<Vec<u64>>,
+    pub(crate) agent_ids: Vec<u64>,
     pub(crate) timeout_ms: Option<u64>,
 }
 
@@ -1463,7 +1463,12 @@ async fn forward_events(
         };
         if changed {
             agent_runtime_notify.notify_waiters();
-            let info = { agent_runtime.lock().await.get_agent_by_conversation(conversation_id) };
+            let info = {
+                agent_runtime
+                    .lock()
+                    .await
+                    .get_agent_by_conversation(conversation_id)
+            };
             if let Some(info) = info {
                 let _ = app.emit("agent-changed", &info);
             }
@@ -2134,26 +2139,13 @@ pub(crate) async fn await_agents_internal(
 
         let (ready, still_running, newest_updated_at) = {
             let runtime = state.agent_runtime.lock().await;
-            let watch_ids: Vec<u64> = match &request.agent_ids {
-                Some(ids) => {
-                    // Validate all requested IDs exist.
-                    for &id in ids {
-                        if !runtime.has_agent(id) {
-                            return Err(format!("Agent {id} not found"));
-                        }
-                    }
-                    ids.clone()
+            // Validate all requested IDs exist.
+            for &id in &request.agent_ids {
+                if !runtime.has_agent(id) {
+                    return Err(format!("Agent {id} not found"));
                 }
-                None => {
-                    // Watch all running agents.
-                    runtime
-                        .list_agents()
-                        .iter()
-                        .filter(|a| a.is_running)
-                        .map(|a| a.agent_id)
-                        .collect()
-                }
-            };
+            }
+            let watch_ids = request.agent_ids.clone();
 
             if watch_ids.is_empty() {
                 return Err("No agents to watch".to_string());
