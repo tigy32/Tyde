@@ -389,6 +389,22 @@ export function wrapWithTruncation(
   return `<div class="truncatable collapsed"><div class="truncatable-content">${html}</div><div class="truncatable-fade"></div><button class="truncatable-toggle" onclick="const container = this.closest('.truncatable'); if (container.classList.contains('collapsed')) { container.classList.remove('collapsed'); this.textContent = 'Show less'; } else { container.classList.add('collapsed'); this.textContent = 'Show more'; }">Show more</button></div>`;
 }
 
+/** Remove truncation wrapper from elements whose content doesn't overflow. */
+export function collapseTruncatablesIfShort(root: HTMLElement): void {
+  if (!root.isConnected) return;
+  for (const el of root.querySelectorAll<HTMLElement>(
+    ".truncatable.collapsed",
+  )) {
+    const content = el.querySelector<HTMLElement>(".truncatable-content");
+    if (!content) continue;
+    if (content.scrollHeight <= content.clientHeight) {
+      el.classList.remove("collapsed");
+      el.querySelector<HTMLElement>(".truncatable-fade")?.remove();
+      el.querySelector<HTMLElement>(".truncatable-toggle")?.remove();
+    }
+  }
+}
+
 export function renderCommandOutput(
   stdout: string,
   stderr: string,
