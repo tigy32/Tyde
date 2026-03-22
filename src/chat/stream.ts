@@ -208,6 +208,14 @@ export function handleStreamEnd(
       "[stream] StreamEnd rendered element has no children — bubble content may vanish",
     );
   }
+  // Apply absolute positioning BEFORE replaceWith so the element enters the
+  // DOM with the correct layout mode. Without this, measureElement can fire
+  // (via ResizeObserver) while the element still has natural flow layout,
+  // producing wildly wrong cached heights.
+  rendered.style.position = "absolute";
+  rendered.style.top = "0";
+  rendered.style.left = "0";
+  rendered.style.right = "0";
   state.currentBubble.replaceWith(rendered);
 
   if (embeddedToolCalls) {
