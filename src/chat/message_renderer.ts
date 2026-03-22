@@ -1,9 +1,5 @@
 import type { ChatMessage, MessageSender, TokenUsage } from "@tyde/protocol";
-import {
-  collapseTruncatablesIfShort,
-  renderContent,
-  wrapWithTruncation,
-} from "../renderer";
+import { renderContent, wrapWithTruncation } from "../renderer";
 import { normalizeReasoningText } from "./reasoning";
 
 export function formatCompact(n: number): string {
@@ -309,7 +305,6 @@ export function createMessageElement(
     );
   }
   el.appendChild(contentEl);
-  requestAnimationFrame(() => collapseTruncatablesIfShort(contentEl));
 
   if (message.images && message.images.length > 0) {
     const imagesRow = document.createElement("div");

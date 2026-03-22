@@ -97,16 +97,18 @@ impl ClaudeSession {
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers).await
+        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers, steering_content).await
     }
 
     async fn spawn_with_mode(
@@ -114,6 +116,7 @@ impl ClaudeSession {
         no_session_persistence: bool,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
@@ -140,6 +143,7 @@ impl ClaudeSession {
                 effort: Some("high".to_string()),
                 permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                 startup_mcp_config_json: build_claude_mcp_config_json(startup_mcp_servers),
+                steering_content: steering_content.map(|s| s.to_string()),
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -185,6 +189,7 @@ struct ClaudeState {
     effort: Option<String>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
+    steering_content: Option<String>,
     last_cumulative_usage: Option<Value>,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
@@ -390,6 +395,7 @@ struct RunTurnParams<'a> {
     effort: Option<String>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
+    steering_content: Option<String>,
 }
 
 impl ClaudeInner {
@@ -484,6 +490,7 @@ impl ClaudeInner {
             effort,
             permission_mode,
             startup_mcp_config_json,
+            steering_content,
             conversation_history_bytes,
             cancel_rx,
         ) = {
@@ -516,6 +523,7 @@ impl ClaudeInner {
                 state.effort.clone(),
                 state.permission_mode.clone(),
                 state.startup_mcp_config_json.clone(),
+                state.steering_content.clone(),
                 state.conversation_bytes_total,
                 cancel_rx,
             )
@@ -540,6 +548,7 @@ impl ClaudeInner {
                         effort,
                         permission_mode,
                         startup_mcp_config_json,
+                        steering_content,
                     },
                     cancel_rx,
                 )
@@ -686,6 +695,7 @@ impl ClaudeInner {
             effort,
             permission_mode,
             startup_mcp_config_json,
+            steering_content,
         } = params;
         let effective_permission_mode = permission_mode
             .as_deref()
@@ -726,6 +736,13 @@ impl ClaudeInner {
             if !mcp_config_json.trim().is_empty() {
                 cli_args.push("--mcp-config".to_string());
                 cli_args.push(mcp_config_json);
+            }
+        }
+
+        if let Some(steering) = steering_content {
+            if !steering.trim().is_empty() {
+                cli_args.push("--append-system-prompt".to_string());
+                cli_args.push(steering);
             }
         }
 
@@ -5318,6 +5335,7 @@ mod tests {
                     effort: Some(effort.to_string()),
                     permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                     startup_mcp_config_json: None,
+                    steering_content: None,
                 },
                 cancel_rx,
             )
