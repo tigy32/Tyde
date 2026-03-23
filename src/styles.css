@@ -5776,6 +5776,16 @@ body {
   color: var(--text-bright);
 }
 
+.sessions-agent-toggle.active {
+  background: color-mix(in srgb, var(--accent-primary) 18%, var(--bg-primary));
+  border-color: color-mix(
+    in srgb,
+    var(--accent-primary) 55%,
+    var(--border-primary)
+  );
+  color: var(--text-primary);
+}
+
 .sessions-new-btn {
   flex: 1;
 }

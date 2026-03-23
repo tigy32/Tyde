@@ -32,7 +32,7 @@ export class WorkflowBuilder {
     this.overlay.addEventListener("keydown", (e) => {
       if (e.key === "Escape") this.hide();
     });
-    document.body.appendChild(this.overlay);
+    document.getElementById("app")!.appendChild(this.overlay);
   }
 
   showManager(): void {

@@ -7,6 +7,40 @@ import { createTwoFilesPatch } from "diff";
 import { escapeHtml, renderContent, wrapWithTruncation } from "../renderer";
 
 export type ToolOutputMode = "summary" | "compact" | "verbose";
+
+/**
+ * After a truncatable element is attached and laid out, check whether its
+ * content actually overflows the collapsed max-height.  If it doesn't,
+ * hide the "Show more" toggle and fade — there's nothing more to show.
+ *
+ * Uses a one-shot ResizeObserver so the check runs after layout even if
+ * the element is still detached when this function is called.
+ */
+function hideTruncationIfNotOverflowing(container: HTMLElement): void {
+  const truncatable = container.querySelector(
+    ".truncatable.collapsed",
+  ) as HTMLElement | null;
+  if (!truncatable) return;
+
+  const content = truncatable.querySelector(
+    ".truncatable-content",
+  ) as HTMLElement | null;
+  if (!content) return;
+
+  const observer = new ResizeObserver(() => {
+    observer.disconnect();
+    // Content has max-height:200px + padding-bottom:20px when collapsed.
+    // If scrollHeight fits within that, the content isn't actually truncated.
+    if (content.scrollHeight <= content.clientHeight) {
+      truncatable.classList.remove("collapsed");
+      const toggle = truncatable.querySelector(
+        ".truncatable-toggle",
+      ) as HTMLElement | null;
+      if (toggle) toggle.style.display = "none";
+    }
+  });
+  observer.observe(content);
+}
 // Legacy alias for existing imports in older code paths.
 export type DiffDisplayMode = ToolOutputMode;
 const TOOL_OUTPUT_MODE_KEY = "tyde-tool-output-mode";
@@ -266,6 +300,7 @@ export function buildCommandOutputBlock(
   } else {
     const pre = createPreBlock(output);
     wrapper.innerHTML = wrapWithTruncation(pre.outerHTML, output.length, 0);
+    hideTruncationIfNotOverflowing(wrapper);
   }
   return wrapper;
 }
@@ -341,6 +376,7 @@ function renderInlineDiff(
       diffLines.length,
       0,
     );
+    hideTruncationIfNotOverflowing(wrapper);
     return wrapper;
   }
 
@@ -924,6 +960,7 @@ function renderSpawnToolResult(state: ToolState, text: string): HTMLElement {
         ? rendered
         : wrapWithTruncation(rendered, text.length, 0);
     root.appendChild(content);
+    if (mode !== "verbose") hideTruncationIfNotOverflowing(content);
   };
   bindToolOutputRenderer(state, updateResult);
   return root;
