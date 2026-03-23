@@ -96,10 +96,6 @@ function isConversationMissingError(err: unknown): boolean {
   );
 }
 
-function isGenericAgentName(name: string): boolean {
-  return /^(Agent \d+|Conversation|Bridge|Sub-agent)$/i.test(name);
-}
-
 export class WorkspaceView {
   readonly projectId: string;
   readonly workspacePath: string;
@@ -1742,9 +1738,9 @@ export class WorkspaceView {
       );
       if (tydeSessionId) {
         void renameSession(tydeSessionId, tab.title).then(() =>
-          this.sessionsPanel.refreshRecords().then(() =>
-            this.sessionsPanel.update(this.mergeSessions()),
-          ),
+          this.sessionsPanel
+            .refreshRecords()
+            .then(() => this.sessionsPanel.update(this.mergeSessions())),
         );
       }
     };
@@ -1771,11 +1767,10 @@ export class WorkspaceView {
         }
 
         // Always resume into a fresh tab; use saved alias as tab label if available.
-        const savedAlias =
-          this.sessionsPanel.getResolvedAliasForBackendSession(
-            sessionId,
-            backendKind,
-          );
+        const savedAlias = this.sessionsPanel.getResolvedAliasForBackendSession(
+          sessionId,
+          backendKind,
+        );
         cid = await this.createNewConversationTab(savedAlias, backendKind, {
           bootstrap: false,
         });

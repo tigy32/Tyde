@@ -71,6 +71,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const app = new AppController();
 
   window.onerror = (message, source, lineno, colno, error) => {
+    if (typeof message === "string" && message.includes("ResizeObserver loop"))
+      return true;
     console.error("Unhandled error:", {
       message,
       source,
@@ -84,8 +86,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
 
   window.addEventListener("unhandledrejection", (event) => {
-    console.error("Unhandled promise rejection:", event.reason);
     const msg = event.reason?.message || String(event.reason);
+    if (msg.includes("ResizeObserver loop")) return;
+    console.error("Unhandled promise rejection:", event.reason);
     app.showError(`Unexpected error: ${msg.slice(0, 200)}`);
   });
 

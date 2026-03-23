@@ -633,8 +633,10 @@ describe('Chat scroll behavior', () => {
       tabs[0]?.click();
     }, sel.convTab);
 
-    await browser.pause(200);
-    expect((await getScrollState()).atBottom).toBe(true);
+    await browser.waitUntil(
+      async () => (await getScrollState()).atBottom,
+      { timeout: 3000, timeoutMsg: 'Should be at bottom after switching back to tab with new message' },
+    );
     expect(await scrollBtn.getAttribute('class')).toContain('hidden');
   });
 });

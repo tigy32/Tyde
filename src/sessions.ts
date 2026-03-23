@@ -218,15 +218,15 @@ export class SessionsPanel {
     const agentToggle = document.createElement("button");
     agentToggle.className = `sessions-action-btn sessions-agent-toggle${this.showAgentSessions ? " active" : ""}`;
     agentToggle.title = this.showAgentSessions
-      ? "Hide agent sessions"
-      : "Show agent sessions";
-    agentToggle.textContent = "\u2699\uFE0E";
+      ? "Hide sub-agent sessions"
+      : "Show sub-agent sessions";
+    agentToggle.textContent = "\u229F";
     agentToggle.addEventListener("click", () => {
       this.showAgentSessions = !this.showAgentSessions;
       agentToggle.classList.toggle("active", this.showAgentSessions);
       agentToggle.title = this.showAgentSessions
-        ? "Hide agent sessions"
-        : "Show agent sessions";
+        ? "Hide sub-agent sessions"
+        : "Show sub-agent sessions";
       this.applyFilter();
       this.updateVirtualList();
     });
@@ -582,8 +582,7 @@ export class SessionsPanel {
           ? null
           : Math.max(0, Math.floor(messageCountRaw)),
       workspaceRoot:
-        matchedRecord?.workspace_root ??
-        this.asString(raw.workspace_root),
+        matchedRecord?.workspace_root ?? this.asString(raw.workspace_root),
       parentId: matchedRecord?.parent_id ?? null,
     };
   }

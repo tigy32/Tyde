@@ -102,6 +102,10 @@ interface ConversationView {
   teardownVirtualizer: (() => void) | null;
   renderingMessages: boolean;
   renderDirty: boolean;
+  childResizeObserver: ResizeObserver;
+  /** Running average of measured element heights for better estimateSize. */
+  measuredSizeSum: number;
+  measuredSizeCount: number;
 }
 
 interface ParsedLinkedFileTarget {
@@ -187,10 +191,12 @@ function renderVisibleMessages(view: ConversationView): void {
     }
   }
 
-  // Collect newly mounted elements for measurement after positioning
-  const toMeasure: HTMLElement[] = [];
+  // Flush disconnected nodes from the virtualizer's internal observer cache
+  // so that re-mounted or replaced elements get a fresh ResizeObserver call.
+  virtualizer.measureElement(null as unknown as HTMLElement);
 
   // Add new elements and update positions
+  const toMeasure: HTMLElement[] = [];
   for (const item of virtualItems) {
     let el = mountedElements.get(item.index);
     if (!el) {
@@ -206,14 +212,22 @@ function renderVisibleMessages(view: ConversationView): void {
     el.style.transform = `translateY(${item.start}px)`;
   }
 
-  // Measure newly mounted elements — may trigger onChange via ResizeObserver
+  // Register newly mounted elements with the virtualizer (sets up TanStack's
+  // internal ResizeObserver + performs sync measurement).  Also feed the
+  // initial measurement into the running average for estimateSize.
   for (const el of toMeasure) {
     virtualizer.measureElement(el);
+    const h = el.offsetHeight;
+    if (h > 0) {
+      view.measuredSizeSum += h;
+      view.measuredSizeCount += 1;
+    }
   }
 
-  // Update all positions after measurement (sizes may have changed)
+  // Re-read positions after measurement (sizes may have changed)
   virtualizer._willUpdate();
-  for (const item of virtualizer.getVirtualItems()) {
+  const updatedItems = virtualizer.getVirtualItems();
+  for (const item of updatedItems) {
     const el = chatWrapper.querySelector(
       `[data-index="${item.index}"]`,
     ) as HTMLElement | null;
@@ -402,7 +416,13 @@ export class ChatPanel {
     const virtualizer = new Virtualizer<HTMLElement, HTMLElement>({
       count: 0,
       getScrollElement: () => container,
-      estimateSize: () => 120,
+      // Dynamic estimateSize: uses running average of measured heights instead
+      // of a fixed 120px.  This dramatically reduces layout thrash for items
+      // that haven't been measured yet (e.g. when scrolling fast).
+      estimateSize: () =>
+        view.measuredSizeCount > 0
+          ? Math.round(view.measuredSizeSum / view.measuredSizeCount)
+          : 120,
       overscan: 5,
       gap: 6,
       paddingEnd: 8,
@@ -411,6 +431,47 @@ export class ChatPanel {
       observeElementOffset,
       onChange: () => renderVisibleMessages(view),
     });
+
+    // A ResizeObserver watching all mounted message elements in chatWrapper.
+    // When any child resizes (streaming growth, tool card append, image load,
+    // replaceWith swap, etc.), we re-measure it with the virtualizer and
+    // re-render positions.
+    const childResizeObserver = new ResizeObserver((entries) => {
+      let anyChanged = false;
+      for (const entry of entries) {
+        const el = entry.target as HTMLElement;
+        if (el.dataset.index === undefined) continue;
+        // Re-register with virtualizer so it picks up the new size
+        virtualizer.measureElement(el);
+        anyChanged = true;
+      }
+      if (anyChanged) {
+        renderVisibleMessages(view);
+        if (!view.userScrolledUp) {
+          this.scrollToBottom(view);
+        }
+      }
+    });
+
+    // MutationObserver to auto-observe/unobserve children as they are
+    // added/removed from chatWrapper.  We observe ALL HTMLElement children
+    // (not just those with data-index) because replaceWith() may add an
+    // element before data-index is set on it.
+    const childMutationObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node instanceof HTMLElement) {
+            childResizeObserver.observe(node);
+          }
+        }
+        for (const node of mutation.removedNodes) {
+          if (node instanceof HTMLElement) {
+            childResizeObserver.unobserve(node);
+          }
+        }
+      }
+    });
+    childMutationObserver.observe(chatWrapper, { childList: true });
 
     const view: ConversationView = {
       wrapper,
@@ -443,6 +504,9 @@ export class ChatPanel {
       teardownVirtualizer: null,
       renderingMessages: false,
       renderDirty: false,
+      childResizeObserver,
+      measuredSizeSum: 0,
+      measuredSizeCount: 0,
     };
 
     view.teardownVirtualizer = virtualizer._didMount();
@@ -757,6 +821,7 @@ export class ChatPanel {
     this.typingByConversation.delete(conversationId);
     const view = this.views.get(conversationId);
     if (!view) return;
+    view.childResizeObserver.disconnect();
     if (view.teardownVirtualizer) {
       view.teardownVirtualizer();
       view.teardownVirtualizer = null;
@@ -1133,26 +1198,33 @@ export class ChatPanel {
     if (!result) {
       this.renderFullMessage(view, message);
     } else {
-      // Replace the streaming entry with a finalized chat entry
+      // Replace the streaming entry with a finalized chat entry.
+      // stream.handleStreamEnd already did replaceWith() — the new rendered
+      // element is in the DOM but the virtualizer doesn't know about it yet.
       const streamIdx = view.messages.findIndex((m) => m.kind === "streaming");
       if (streamIdx !== -1) {
         const rendered = view.streamState.lastRenderedBubble;
+        // Update messages array FIRST so renderVisibleMessages sees the
+        // correct element for this index.
+        view.messages[streamIdx] = {
+          kind: "chat",
+          message,
+          element: rendered,
+        };
         if (rendered) {
           rendered.dataset.index = String(streamIdx);
           rendered.style.position = "absolute";
           rendered.style.top = "0";
           rendered.style.left = "0";
           rendered.style.right = "0";
+          // Explicitly register the replacement element with the virtualizer.
+          // This performs a sync measurement AND sets up TanStack's internal
+          // ResizeObserver, since the old streaming bubble's observer is now
+          // watching a disconnected node.
           view.virtualizer.measureElement(rendered);
         }
-        // Reposition all items — measureElement updated the size cache but
-        // positions (translateY) are still stale from the pre-swap layout.
+        // Reposition all items with the updated size cache.
         renderVisibleMessages(view);
-        view.messages[streamIdx] = {
-          kind: "chat",
-          message,
-          element: rendered,
-        };
       }
       this.expandLastAssistantMessage(view.chatWrapper);
       if (result.durationMs > 30_000) {
