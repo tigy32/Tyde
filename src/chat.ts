@@ -1196,16 +1196,23 @@ export class ChatPanel {
     );
     // Backend controls typing status — do NOT call setViewTypingVisible here
     if (!result) {
+      // Clean up any orphaned streaming bubble before rendering the full message
+      const orphanIdx = view.messages.findIndex((m) => m.kind === "streaming");
+      if (orphanIdx !== -1) {
+        view.messages[orphanIdx].element?.remove();
+        view.messages.splice(orphanIdx, 1);
+        updateVirtualizerCount(view);
+      }
       this.renderFullMessage(view, message);
     } else {
-      // Replace the streaming entry with a finalized chat entry.
-      // stream.handleStreamEnd already did replaceWith() — the new rendered
-      // element is in the DOM but the virtualizer doesn't know about it yet.
       const streamIdx = view.messages.findIndex((m) => m.kind === "streaming");
       if (streamIdx !== -1) {
+        const oldBubble = view.messages[streamIdx].element;
         const rendered = view.streamState.lastRenderedBubble;
-        // Update messages array FIRST so renderVisibleMessages sees the
-        // correct element for this index.
+
+        // Remove old streaming bubble so the virtualizer can mount rendered.
+        oldBubble?.remove();
+
         view.messages[streamIdx] = {
           kind: "chat",
           message,
@@ -1217,19 +1224,15 @@ export class ChatPanel {
           rendered.style.top = "0";
           rendered.style.left = "0";
           rendered.style.right = "0";
-          // Explicitly register the replacement element with the virtualizer.
-          // This performs a sync measurement AND sets up TanStack's internal
-          // ResizeObserver, since the old streaming bubble's observer is now
-          // watching a disconnected node.
           view.virtualizer.measureElement(rendered);
         }
-        // Reposition all items with the updated size cache.
         renderVisibleMessages(view);
       }
       this.expandLastAssistantMessage(view.chatWrapper);
       if (result.durationMs > 30_000) {
         this.notificationManager?.notifyTaskComplete("Response complete");
       }
+      this.scrollToBottom(view);
     }
 
     if (message.tool_calls.length > 0 && view.streamState.lastRenderedBubble) {
