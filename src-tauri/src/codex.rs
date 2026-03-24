@@ -82,7 +82,7 @@ impl CodexSession {
             }
             _ => None,
         };
-        let (rpc, inbound_rx) = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers, steering_tempfile.as_deref())?;
+        let (rpc, inbound_rx) = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers, steering_tempfile.as_deref()).await?;
 
         rpc.request(
             "initialize",
@@ -199,7 +199,7 @@ impl CodexSession {
 }
 
 pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, String> {
-    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[], None)?;
+    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[], None).await?;
 
     rpc.request(
         "initialize",
@@ -4273,7 +4273,7 @@ struct CodexRpc {
 }
 
 impl CodexRpc {
-    fn spawn(
+    async fn spawn(
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
@@ -4286,10 +4286,7 @@ impl CodexRpc {
             ));
         }
         let mut child = if let Some(host) = ssh_host {
-            use crate::remote::shell_quote_command;
-
             let mut remote_args = vec![
-                "codex".to_string(),
                 "app-server".to_string(),
                 "--listen".to_string(),
                 "stdio://".to_string(),
@@ -4298,22 +4295,7 @@ impl CodexRpc {
                 remote_args.push("-c".to_string());
                 remote_args.push(override_key_value.clone());
             }
-            let remote_cmd = format!(
-                "PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" {}",
-                shell_quote_command(&remote_args),
-            );
-            let mut cmd = Command::new("ssh");
-            for arg in crate::remote::ssh_control_args()? {
-                cmd.arg(arg);
-            }
-            cmd.arg("-T")
-                .arg(host)
-                .arg(remote_cmd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn Codex app-server over SSH: {e}"))?
+            crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
             let mut cmd = Command::new("codex");
             cmd.arg("app-server").arg("--listen").arg("stdio://");

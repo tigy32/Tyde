@@ -78,6 +78,7 @@ impl AcpSpawnSpec {
         }
         self
     }
+
 }
 
 pub struct AcpBridge {
@@ -87,11 +88,11 @@ pub struct AcpBridge {
 }
 
 impl AcpBridge {
-    pub fn spawn(
+    pub async fn spawn(
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
-        let (rpc, inbound_rx) = AcpRpc::spawn(spec, ssh_host)?;
+        let (rpc, inbound_rx) = AcpRpc::spawn(spec, ssh_host).await?;
         Ok((
             Self {
                 rpc,
@@ -989,44 +990,19 @@ struct AcpRpc {
 }
 
 impl AcpRpc {
-    fn spawn(
+    async fn spawn(
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
         let mut child = if let Some(host) = ssh_host {
-            use crate::remote::shell_quote_command;
-
-            let remote_exec = format!(
-                "PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" {}",
-                shell_quote_command(&spec.remote_args),
-            );
-            let remote_cmd = if let Some(cwd) = spec
-                .remote_cwd
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                format!(
-                    "cd {} && {}",
-                    crate::remote::shell_quote_arg(cwd),
-                    remote_exec
-                )
-            } else {
-                remote_exec
-            };
-
-            let mut cmd = Command::new("ssh");
-            for arg in crate::remote::ssh_control_args()? {
-                cmd.arg(arg);
-            }
-            cmd.arg("-T")
-                .arg(host)
-                .arg(remote_cmd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?
+            crate::remote::spawn_remote_process(
+                host,
+                &spec.remote_args[0],
+                &spec.remote_args[1..].to_vec(),
+                spec.remote_cwd.as_deref(),
+            )
+            .await
+            .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?
         } else {
             let mut cmd = Command::new(&spec.local_program);
             cmd.args(&spec.local_args)
@@ -1229,6 +1205,18 @@ impl AcpRpc {
     }
 
     async fn shutdown(&self) {
+        // Close stdin to propagate EOF through SSH to the remote process.
+        // SIGKILL on the local SSH slave doesn't give it time to send
+        // "channel close" through the ControlMaster, so the remote
+        // process never learns its client disconnected and becomes an
+        // orphan (PPID=1). Closing stdin first lets the SSH slave
+        // cleanly tear down the channel.
+        {
+            let mut stdin = self.stdin.lock().await;
+            let _ = stdin.shutdown().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
         if let Some(child) = self.child.lock().await.as_mut() {
             let _ = child.start_kill();
         }

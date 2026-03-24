@@ -756,34 +756,23 @@ impl ClaudeInner {
             }
         }
 
-        let mut command = if let Some(host) = ssh_host {
-            use crate::remote::{shell_quote_arg, shell_quote_command, ssh_control_args};
-            let quoted_args = shell_quote_command(&cli_args);
-            let remote_cmd = format!(
-                "cd {} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" claude {}",
-                shell_quote_arg(workspace_root),
-                quoted_args,
-            );
-            let mut cmd = Command::new("ssh");
-            let control_args = match ssh_control_args() {
-                Ok(args) => args,
+        let mut child = if let Some(host) = ssh_host {
+            match crate::remote::spawn_remote_process(
+                host,
+                "claude",
+                &cli_args,
+                Some(workspace_root),
+            )
+            .await
+            {
+                Ok(child) => child,
                 Err(err) => {
                     return TurnOutcome::Failed {
                         summary: ClaudeStdoutSummary::default(),
-                        error: format!("Failed to get SSH control args: {err}"),
+                        error: format!("Failed to start Claude CLI over SSH: {err}"),
                     };
                 }
-            };
-            for arg in control_args {
-                cmd.arg(arg);
             }
-            cmd.arg("-T")
-                .arg(host)
-                .arg(remote_cmd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            cmd
         } else {
             let mut cmd = Command::new("claude");
             for arg in &cli_args {
@@ -793,16 +782,14 @@ impl ClaudeInner {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            cmd
-        };
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                return TurnOutcome::Failed {
-                    summary: ClaudeStdoutSummary::default(),
-                    error: format!("Failed to start Claude CLI: {err}"),
-                };
+            match cmd.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    return TurnOutcome::Failed {
+                        summary: ClaudeStdoutSummary::default(),
+                        error: format!("Failed to start Claude CLI: {err}"),
+                    };
+                }
             }
         };
 

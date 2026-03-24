@@ -275,7 +275,7 @@ impl BackendSession {
                     workspace_roots,
                     tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
                     ephemeral,
-                )?;
+                ).await?;
                 Ok((Self::Tycode(bridge), rx))
             }
             BackendKind::Codex => {
@@ -331,7 +331,7 @@ impl BackendSession {
         match kind {
             BackendKind::Tycode => {
                 let (bridge, rx) =
-                    SubprocessBridge::spawn(executable_path, workspace_roots, None, true)?;
+                    SubprocessBridge::spawn(executable_path, workspace_roots, None, true).await?;
                 Ok((Self::Tycode(bridge), rx))
             }
             BackendKind::Codex => {
