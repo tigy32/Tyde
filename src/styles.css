@@ -1,5 +1,7 @@
 /* === Theme Variables === */
 :root {
+  color-scheme: dark;
+
   /* 3-Surface Dark Theme */
   --surface-base: #121212;
   --surface-1: #1a1a1a;
@@ -101,6 +103,8 @@
 }
 
 [data-theme="light"] {
+  color-scheme: light;
+
   --surface-base: #f7f7f7;
   --surface-1: #ffffff;
   --surface-2: #f3f3f3;
