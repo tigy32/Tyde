@@ -132,7 +132,31 @@ pub fn ssh_control_args() -> Result<Vec<String>, String> {
         format!("ControlPath={}", socket_path.display()),
         "-o".to_string(),
         "ControlPersist=600".to_string(),
+        // Without keepalives the master can't detect a dead TCP connection
+        // to the remote. It sits for hours refusing new sessions, forcing
+        // every SSH call to fall back to a direct connection.
+        "-o".to_string(),
+        "ServerAliveInterval=60".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
     ])
+}
+
+pub async fn resolve_remote_shell_path(host: &str) -> Result<String, String> {
+    let output = run_ssh_raw(host, "$SHELL -li -c 'echo TYDE_PATH_MARKER=$PATH'").await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to resolve remote shell PATH: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Login shells print banners before and cleanup commands (e.g. `clear`)
+    // after our echo. Use a unique prefix to reliably extract the PATH.
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("TYDE_PATH_MARKER="))
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "Remote shell PATH resolution returned empty".to_string())
 }
 
 /// Runs a raw command string over SSH, allowing shell variable expansion.
@@ -407,7 +431,14 @@ pub async fn validate_remote_cli(
         "in_progress",
         &format!("Checking for {cli_name} CLI on remote host..."),
     );
-    let check_cmd = format!("command -v {}", shell_quote_arg(cli_name));
+    // Bare SSH sessions use a minimal PATH that excludes ~/.local/bin,
+    // ~/.toolbox/bin, etc. Resolve the user's login shell PATH first.
+    let remote_path = resolve_remote_shell_path(host).await.map_err(|err| {
+        let msg = format!("Failed to resolve remote PATH: {err}");
+        emit_progress("checking_environment", "failed", &msg);
+        msg
+    })?;
+    let check_cmd = format!("PATH={} command -v {}", shell_quote_arg(&remote_path), shell_quote_arg(cli_name));
     let check_output = run_ssh_raw(host, &check_cmd).await?;
     if !check_output.status.success() {
         let msg = format!("{cli_name} CLI not found on remote host '{host}'");
@@ -436,6 +467,41 @@ pub async fn run_ssh_command(host: &str, args: &[String]) -> Result<std::process
         .output()
         .await
         .map_err(|e| format!("Failed to run ssh command: {e}"))
+}
+
+/// Spawns a long-lived process on a remote host via SSH with the user's
+/// full login shell PATH. Backends describe WHAT to run — this handles HOW.
+pub async fn spawn_remote_process(
+    host: &str,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+) -> Result<tokio::process::Child, String> {
+    let remote_path = resolve_remote_shell_path(host).await?;
+    let cwd_prefix = match cwd {
+        Some(dir) if !dir.trim().is_empty() => format!("cd {} && ", shell_quote_arg(dir)),
+        _ => String::new(),
+    };
+    let mut cmd_parts = vec![program.to_string()];
+    cmd_parts.extend(args.iter().cloned());
+    let remote_exec = format!(
+        "{}PATH={} {}",
+        cwd_prefix,
+        shell_quote_arg(&remote_path),
+        shell_quote_command(&cmd_parts),
+    );
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_control_args()? {
+        cmd.arg(arg);
+    }
+    cmd.arg("-T")
+        .arg(host)
+        .arg(&remote_exec)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.spawn()
+        .map_err(|err| format!("Failed to spawn remote process '{program}' on '{host}': {err}"))
 }
 
 #[cfg(test)]

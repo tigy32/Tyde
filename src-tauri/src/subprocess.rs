@@ -26,7 +26,7 @@ pub struct SubprocessBridge {
 }
 
 impl SubprocessBridge {
-    pub fn spawn(
+    pub async fn spawn(
         subprocess_path: &str,
         workspace_roots: &[String],
         mcp_servers_json: Option<&str>,
@@ -47,17 +47,15 @@ impl SubprocessBridge {
                 subprocess_path.to_string()
             };
 
-            let remote_cmd =
-                build_remote_ssh_command(&remote_binary, &roots_json, mcp_servers_json, ephemeral);
-            Command::new("ssh")
-                .arg("-T")
-                .arg(host)
-                .arg(remote_cmd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn remote subprocess over ssh: {e:?}"))?
+            let mut remote_args = vec!["--workspace-roots".to_string(), roots_json.clone()];
+            if let Some(mcp) = mcp_servers_json {
+                remote_args.push("--mcp-servers".to_string());
+                remote_args.push(mcp.to_string());
+            }
+            if ephemeral {
+                remote_args.push("--ephemeral".to_string());
+            }
+            crate::remote::spawn_remote_process(&host, &remote_binary, &remote_args, None).await?
         } else {
             let mut cmd = Command::new(subprocess_path);
             cmd.arg("--workspace-roots").arg(&roots_json);
@@ -190,155 +188,6 @@ impl Drop for SubprocessBridge {
     }
 }
 
-fn build_remote_ssh_command(
-    binary: &str,
-    roots_json: &str,
-    mcp_servers_json: Option<&str>,
-    ephemeral: bool,
-) -> String {
-    use crate::remote::shell_quote_arg;
-    // Prepend common binary directories to PATH. Sourcing profile files is
-    // unsafe — they can contain `exec` statements that replace the shell
-    // process, preventing our command from ever running.
-    let mut cmd = format!(
-        "PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" {} --workspace-roots {}",
-        binary,
-        shell_quote_arg(roots_json)
-    );
-    if let Some(mcp_servers_json) = mcp_servers_json {
-        cmd.push_str(" --mcp-servers ");
-        cmd.push_str(&shell_quote_arg(mcp_servers_json));
-    }
-    if ephemeral {
-        cmd.push_str(" --ephemeral");
-    }
-    cmd
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn ssh_args_survive_shell_interpretation() {
-        let roots_json = r#"["/home/user/project","/tmp/other"]"#;
-        let remote_cmd = build_remote_ssh_command("echo", roots_json, None, false);
 
-        let sh_result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&remote_cmd)
-            .output()
-            .expect("failed to spawn sh");
-
-        let sh_stdout = String::from_utf8_lossy(&sh_result.stdout);
-        let sh_stderr = String::from_utf8_lossy(&sh_result.stderr);
-        assert!(
-            sh_result.status.success(),
-            "sh failed with stderr: {sh_stderr}"
-        );
-        assert!(
-            sh_stdout.contains(roots_json),
-            "sh output didn't preserve JSON: got {sh_stdout}"
-        );
-
-        // Run through zsh if available (the shell that triggered the original bug)
-        if let Ok(zsh_result) = std::process::Command::new("zsh")
-            .arg("-c")
-            .arg(&remote_cmd)
-            .output()
-        {
-            let zsh_stdout = String::from_utf8_lossy(&zsh_result.stdout);
-            let zsh_stderr = String::from_utf8_lossy(&zsh_result.stderr);
-            assert!(
-                zsh_result.status.success(),
-                "zsh failed with stderr: {zsh_stderr}"
-            );
-            assert!(
-                zsh_stdout.contains(roots_json),
-                "zsh output didn't preserve JSON: got {zsh_stdout}"
-            );
-        }
-    }
-
-    #[test]
-    fn remote_cmd_prepends_common_path_dirs() {
-        let cmd = build_remote_ssh_command("/usr/bin/tycode-subprocess", "[]", None, false);
-        assert!(
-            cmd.contains(".cargo/bin"),
-            "command missing .cargo/bin in PATH: {cmd}"
-        );
-        assert!(
-            cmd.contains(".local/bin"),
-            "command missing .local/bin in PATH: {cmd}"
-        );
-        assert!(
-            cmd.contains("/usr/local/bin"),
-            "command missing /usr/local/bin in PATH: {cmd}"
-        );
-    }
-
-    #[test]
-    fn remote_cmd_path_prepend_doesnt_block_execution() {
-        let roots_json = r#"["/home/user/project"]"#;
-        let remote_cmd = build_remote_ssh_command("echo", roots_json, None, false);
-
-        for shell in ["sh", "zsh"] {
-            let result = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(&remote_cmd)
-                .output();
-
-            let Ok(output) = result else {
-                continue;
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success(),
-                "{shell}: PATH prepend blocked execution. stderr: {stderr}"
-            );
-            assert!(
-                stdout.contains(roots_json),
-                "{shell}: command didn't produce expected output. stdout: {stdout}"
-            );
-        }
-    }
-
-    #[test]
-    fn remote_cmd_includes_ephemeral_flag_when_set() {
-        let roots_json = r#"["/home/user/project"]"#;
-
-        let without = build_remote_ssh_command("tycode-subprocess", roots_json, None, false);
-        assert!(
-            !without.contains("--ephemeral"),
-            "non-ephemeral command should not contain --ephemeral: {without}"
-        );
-
-        let with = build_remote_ssh_command("tycode-subprocess", roots_json, None, true);
-        assert!(
-            with.contains("--ephemeral"),
-            "ephemeral command should contain --ephemeral: {with}"
-        );
-    }
-
-    #[test]
-    fn ssh_args_handle_embedded_single_quotes() {
-        let roots_json = r#"["/home/user/it's a path"]"#;
-        let remote_cmd = build_remote_ssh_command("echo", roots_json, None, false);
-
-        let result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&remote_cmd)
-            .output()
-            .expect("failed to spawn sh");
-
-        let stdout = String::from_utf8_lossy(&result.stdout);
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(result.status.success(), "sh failed with stderr: {stderr}");
-        assert!(
-            stdout.contains(roots_json),
-            "sh output didn't preserve JSON with quotes: got {stdout}"
-        );
-    }
-}

@@ -208,7 +208,6 @@ export function handleStreamEnd(
       "[stream] StreamEnd rendered element has no children — bubble content may vanish",
     );
   }
-  state.currentBubble.replaceWith(rendered);
 
   if (embeddedToolCalls) {
     const metaBar = rendered.querySelector(".message-footer");
@@ -228,7 +227,6 @@ export function handleStreamEnd(
   state.streamingText = "";
   state.streamingReasoning = "";
   state.streamModelLabel = null;
-  scrollToBottom();
 
   return { durationMs };
 }

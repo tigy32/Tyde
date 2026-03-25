@@ -1,11 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::acp::{
@@ -17,7 +16,6 @@ use crate::backend::{SessionCommand, StartupMcpServer};
 use crate::subprocess::ImageAttachment;
 
 const KIRO_AGENT_NAME: &str = "kiro";
-const KIRO_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
 const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 
@@ -81,10 +79,11 @@ impl KiroSession {
         .await?;
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &["acp"])
             .with_local_cwd(roots.session_cwd.clone());
+        spawn_spec.local_program = resolve_kiro_chat_binary();
         if ssh_host.is_some() {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
-        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, ssh_host.as_deref())?;
+        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, ssh_host.as_deref()).await?;
 
         bridge
             .request(
@@ -165,11 +164,10 @@ impl KiroSession {
             event_tx,
             shutting_down: AtomicBool::new(false),
             has_kiro_steering,
+            ssh_host,
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
-                workspace_roots: workspace_roots.to_vec(),
-                ssh_host,
                 admin_session,
                 startup_mcp_servers: startup_mcp_servers.to_vec(),
                 model: initial_model,
@@ -216,8 +214,6 @@ impl KiroSession {
 struct KiroState {
     session_id: String,
     workspace_root: String,
-    workspace_roots: Vec<String>,
-    ssh_host: Option<String>,
     admin_session: bool,
     startup_mcp_servers: Vec<StartupMcpServer>,
     model: Option<String>,
@@ -256,6 +252,7 @@ struct KiroInner {
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
     has_kiro_steering: bool,
+    ssh_host: Option<String>,
 }
 
 impl KiroInner {
@@ -485,66 +482,53 @@ impl KiroInner {
     }
 
     async fn list_sessions(&self) -> Result<(), String> {
-        let (workspace_roots, workspace_root, ssh_host, excluded_session_id) = {
+        let excluded_session_id = {
             let state = self.state.lock().await;
-            (
-                state.workspace_roots.clone(),
-                state.workspace_root.clone(),
-                state.ssh_host.clone(),
-                if state.admin_session {
-                    Some(state.session_id.clone())
-                } else {
-                    None
-                },
-            )
+            if state.admin_session {
+                Some(state.session_id.clone())
+            } else {
+                None
+            }
         };
-        let excluded = excluded_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let listing_roots =
-            resolve_listing_roots(&workspace_roots, &workspace_root, ssh_host.as_deref())?;
+
+        let raw_sessions = match &self.ssh_host {
+            Some(host) => load_remote_kiro_sessions(host).await?,
+            None => load_local_kiro_sessions().await?,
+        };
 
         let mut sessions = Vec::new();
-        let mut seen = HashSet::new();
-        for root in listing_roots {
-            if ssh_host.is_some() {
-                let session_ids = list_kiro_session_ids_via_cli(&root, ssh_host.as_deref()).await?;
-                for session in
-                    build_remote_kiro_session_metadata(&root, excluded.as_deref(), session_ids)
-                {
-                    let Some(session_id) = session.get("session_id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    if seen.insert(session_id.to_string()) {
-                        sessions.push(session);
-                    }
-                }
+        for (session_id, metadata) in &raw_sessions {
+            if excluded_session_id.as_deref() == Some(session_id.as_str()) {
                 continue;
             }
-
-            let root_sessions =
-                list_local_kiro_session_metadata(&root, excluded.as_deref()).await?;
-            for session in root_sessions {
-                let Some(session_id) = session.get("session_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                if seen.insert(session_id.to_string()) {
-                    sessions.push(session);
-                }
+            let cwd = metadata
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if cwd.contains(KIRO_ADMIN_SESSION_SUBDIR)
+                || cwd.contains(KIRO_EPHEMERAL_SESSION_SUBDIR)
+            {
+                continue;
             }
+            let title = extract_session_title(metadata);
+            let last_modified = extract_session_timestamp(metadata);
+
+            sessions.push(json!({
+                "id": session_id,
+                "session_id": session_id,
+                "title": title,
+                "created_at": last_modified,
+                "last_modified": last_modified,
+                "last_message_preview": "",
+                "workspace_root": cwd,
+                "message_count": Value::Null,
+                "backend_kind": "kiro",
+            }));
         }
 
         sessions.sort_by(|a, b| {
-            let a_ts = a
-                .get("last_modified")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            let b_ts = b
-                .get("last_modified")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
+            let a_ts = a.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
+            let b_ts = b.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
             b_ts.cmp(&a_ts)
         });
 
@@ -559,16 +543,10 @@ impl KiroInner {
         let normalized = normalize_optional_string(&Value::String(session_id))
             .ok_or("Invalid session id".to_string())?;
 
-        let sessions_dir = resolve_local_kiro_sessions_dir()?;
-        for ext in &["json", "jsonl", "lock"] {
-            let path = sessions_dir.join(format!("{normalized}.{ext}"));
-            if path.exists() {
-                tokio::fs::remove_file(&path)
-                    .await
-                    .map_err(|err| format!("Failed to delete {}: {err}", path.display()))?;
-            }
+        match &self.ssh_host {
+            Some(host) => delete_remote_kiro_session(host, &normalized).await,
+            None => delete_local_kiro_session(&normalized).await,
         }
-        Ok(())
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
@@ -586,6 +564,14 @@ impl KiroInner {
         self.clear_active_stream().await;
         self.emit_event(json!({ "kind": "ConversationCleared" }));
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+
+        // kiro-cli-chat doesn't check PID liveness when reading .lock files,
+        // so stale locks from dead processes block session/load. Remove the
+        // lock file before attempting to load.
+        let _ = match &self.ssh_host {
+            Some(host) => clear_remote_kiro_session_lock(host, &session_id).await,
+            None => clear_local_kiro_session_lock(&session_id).await,
+        };
 
         let response = match self
             .bridge
@@ -633,6 +619,21 @@ impl KiroInner {
 
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+
+        // The SSH ControlMaster keeps the TCP connection alive after the
+        // local slave is killed, so the remote kiro-cli-chat never gets
+        // EOF and stays running. Kill the remote process explicitly
+        // using the PID from its session lock file.
+        if let Some(host) = &self.ssh_host {
+            let session_id = self.state.lock().await.session_id.clone();
+            let cmd = format!(
+                "PID=$(grep -oE '[0-9]+' ~/.kiro/sessions/cli/{0}.lock 2>/dev/null | head -1); \
+                 [ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null; true",
+                crate::remote::shell_quote_arg(&session_id)
+            );
+            let _ = crate::remote::run_ssh_raw(host, &cmd).await;
+        }
+
         if self.has_kiro_steering {
             let workspace_root = self.state.lock().await.workspace_root.clone();
             crate::steering::cleanup_kiro_steering(&workspace_root).await;
@@ -1576,183 +1577,6 @@ fn resolve_local_kiro_sessions_dir() -> Result<std::path::PathBuf, String> {
         .join("cli"))
 }
 
-fn resolve_listing_roots(
-    workspace_roots: &[String],
-    fallback_root: &str,
-    ssh_host: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let mut roots = if ssh_host.is_some() {
-        crate::remote::parse_remote_workspace_roots(workspace_roots)?
-            .map(|(_, paths)| paths)
-            .unwrap_or_default()
-    } else {
-        workspace_roots
-            .iter()
-            .filter(|root| !root.trim().is_empty() && !root.starts_with("ssh://"))
-            .map(|root| root.trim().to_string())
-            .collect::<Vec<_>>()
-    };
-
-    if roots.is_empty() {
-        let fallback = fallback_root.trim();
-        if !fallback.is_empty() {
-            roots.push(fallback.to_string());
-        }
-    }
-
-    Ok(roots)
-}
-
-async fn list_kiro_session_ids_via_cli(
-    workspace_root: &str,
-    ssh_host: Option<&str>,
-) -> Result<Vec<String>, String> {
-    let output = if let Some(host) = ssh_host {
-        let remote_cmd = format!(
-            "cd {} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" {}",
-            crate::remote::shell_quote_arg(workspace_root),
-            crate::remote::shell_quote_command(&[
-                "kiro-cli".to_string(),
-                "chat".to_string(),
-                "--list-sessions".to_string(),
-            ]),
-        );
-        let mut cmd = Command::new("ssh");
-        for arg in crate::remote::ssh_control_args()? {
-            cmd.arg(arg);
-        }
-        cmd.arg("-T").arg(host).arg(remote_cmd);
-        tokio::time::timeout(KIRO_LIST_TIMEOUT, cmd.output())
-            .await
-            .map_err(|_| "Timed out waiting for Kiro list-sessions command".to_string())?
-            .map_err(|err| format!("Failed to run Kiro list-sessions over SSH: {err}"))?
-    } else {
-        let mut cmd = Command::new("kiro-cli");
-        cmd.arg("chat")
-            .arg("--list-sessions")
-            .current_dir(workspace_root);
-        tokio::time::timeout(KIRO_LIST_TIMEOUT, cmd.output())
-            .await
-            .map_err(|_| "Timed out waiting for Kiro list-sessions command".to_string())?
-            .map_err(|err| format!("Failed to run Kiro list-sessions command: {err}"))?
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Failed to list Kiro sessions: {stderr}"));
-    }
-
-    let mut combined = String::new();
-    combined.push_str(&String::from_utf8_lossy(&output.stdout));
-    if !combined.is_empty() {
-        combined.push('\n');
-    }
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    let sanitized = strip_ansi(&combined);
-    let ids = extract_uuid_tokens(&sanitized);
-    if ids.is_empty()
-        && !sanitized
-            .to_ascii_lowercase()
-            .contains("no saved chat sessions")
-    {
-        let snippet = sanitized.trim().replace('\n', " | ");
-        return Err(format!(
-            "Unable to parse Kiro list-sessions output for '{workspace_root}': {snippet}"
-        ));
-    }
-    Ok(ids)
-}
-
-fn build_remote_kiro_session_metadata(
-    workspace_root: &str,
-    excluded_session_id: Option<&str>,
-    session_ids: Vec<String>,
-) -> Vec<Value> {
-    let mut sessions = Vec::new();
-    for session_id in session_ids {
-        if excluded_session_id == Some(session_id.as_str()) {
-            continue;
-        }
-        sessions.push(json!({
-            "id": session_id,
-            "session_id": session_id,
-            "title": "Kiro Session",
-            "created_at": 0,
-            "last_modified": 0,
-            "last_message_preview": "",
-            "workspace_root": workspace_root,
-            "message_count": Value::Null,
-            "backend_kind": "kiro",
-        }));
-    }
-    sessions
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if matches!(chars.peek(), Some('[')) {
-                let _ = chars.next();
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-                continue;
-            }
-            continue;
-        }
-        output.push(ch);
-    }
-    output
-}
-
-fn extract_uuid_tokens(input: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut token = String::new();
-
-    let flush = |token: &mut String, out: &mut Vec<String>, seen: &mut HashSet<String>| {
-        if !token.is_empty() && is_uuid_like(token) && seen.insert(token.clone()) {
-            out.push(token.clone());
-        }
-        token.clear();
-    };
-
-    for ch in input.chars() {
-        if ch.is_ascii_hexdigit() || ch == '-' {
-            token.push(ch);
-        } else {
-            flush(&mut token, &mut out, &mut seen);
-        }
-    }
-    flush(&mut token, &mut out, &mut seen);
-    out
-}
-
-fn is_uuid_like(value: &str) -> bool {
-    if value.len() != 36 {
-        return false;
-    }
-    for (idx, ch) in value.chars().enumerate() {
-        match idx {
-            8 | 13 | 18 | 23 => {
-                if ch != '-' {
-                    return false;
-                }
-            }
-            _ => {
-                if !ch.is_ascii_hexdigit() {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
 struct KiroSessionRoots {
     session_cwd: String,
     scope_root: String,
@@ -1846,18 +1670,7 @@ fn join_posix_path(base: &str, suffix: &str) -> String {
     }
 }
 
-fn normalize_path_for_compare(path: &str) -> String {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
 
-    let mut normalized = trimmed.replace('\\', "/");
-    while normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    normalized
-}
 
 fn strip_ansi_and_controls(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
@@ -1965,181 +1778,6 @@ fn is_stream_artifact_char(ch: char) -> bool {
         ch,
         '\u{2500}'..='\u{259F}' | '\u{25A0}' | '\u{25AA}' | '\u{25AB}' | '\u{FFFD}' | '|'
     )
-}
-
-fn system_time_to_unix_ms(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_millis() as u64)
-}
-
-fn extract_last_assistant_preview(session: &Value) -> String {
-    let turns = session
-        .get("session_state")
-        .and_then(|state| state.get("conversation_metadata"))
-        .and_then(|metadata| metadata.get("user_turn_metadatas"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    for turn in turns.iter().rev() {
-        let content = turn
-            .get("result")
-            .and_then(|result| result.get("Ok"))
-            .and_then(|ok| ok.get("content"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        let mut text_chunks = Vec::new();
-        for item in content {
-            let text = item
-                .get("data")
-                .and_then(|data| data.get("data"))
-                .or_else(|| item.get("text"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            if let Some(chunk) = text {
-                text_chunks.push(chunk.to_string());
-            }
-        }
-
-        if !text_chunks.is_empty() {
-            return text_chunks.join("\n");
-        }
-    }
-
-    String::new()
-}
-
-async fn list_local_kiro_session_metadata(
-    workspace_root: &str,
-    excluded_session_id: Option<&str>,
-) -> Result<Vec<Value>, String> {
-    let sessions_dir = resolve_local_kiro_sessions_dir()?;
-    let mut sessions = Vec::new();
-    let normalized_workspace = normalize_path_for_compare(workspace_root);
-
-    let mut dir = match tokio::fs::read_dir(&sessions_dir).await {
-        Ok(entries) => entries,
-        Err(err) => {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return Ok(Vec::new());
-            }
-            return Err(format!(
-                "Failed to read Kiro sessions directory '{}': {err}",
-                sessions_dir.display()
-            ));
-        }
-    };
-
-    while let Some(entry) = dir
-        .next_entry()
-        .await
-        .map_err(|err| format!("Failed to enumerate Kiro sessions: {err}"))?
-    {
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if !file_name.ends_with(".json") || file_name.ends_with("-rollup.json") {
-            continue;
-        }
-
-        let session_id = file_name.trim_end_matches(".json").trim().to_string();
-        if session_id.is_empty() {
-            continue;
-        }
-        if excluded_session_id == Some(session_id.as_str()) {
-            continue;
-        }
-
-        let metadata = match entry.metadata().await {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let created_at = metadata
-            .created()
-            .or_else(|_| metadata.modified())
-            .ok()
-            .and_then(system_time_to_unix_ms)
-            .unwrap_or_else(unix_now_ms);
-        let last_modified = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_unix_ms)
-            .unwrap_or(created_at);
-
-        let contents = match tokio::fs::read_to_string(entry.path()).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let session_json = match serde_json::from_str::<Value>(&contents) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        let session_cwd = session_json
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_string();
-
-        // Skip admin/agent sessions (cwd ends with .tyde/kiro-admin)
-        if session_cwd.contains(KIRO_ADMIN_SESSION_SUBDIR) {
-            continue;
-        }
-
-        // Skip ephemeral sessions (title generation, etc.)
-        if session_cwd.contains(KIRO_EPHEMERAL_SESSION_SUBDIR) {
-            continue;
-        }
-
-        // Filter by workspace root
-        if !normalized_workspace.is_empty()
-            && normalize_path_for_compare(&session_cwd) != normalized_workspace
-        {
-            continue;
-        }
-
-        let message_count = session_json
-            .get("session_state")
-            .and_then(|state| state.get("conversation_metadata"))
-            .and_then(|metadata| metadata.get("user_turn_metadatas"))
-            .and_then(Value::as_array)
-            .map(|turns| turns.len() as u64);
-
-        if message_count.unwrap_or(0) == 0 {
-            continue;
-        }
-
-        let preview = extract_last_assistant_preview(&session_json);
-
-        sessions.push(json!({
-            "id": session_id,
-            "session_id": session_id,
-            "title": "Kiro Session",
-            "created_at": created_at,
-            "last_modified": last_modified,
-            "last_message_preview": preview,
-            "workspace_root": session_cwd,
-            "message_count": message_count,
-            "backend_kind": "kiro",
-        }));
-    }
-
-    sessions.sort_by(|a, b| {
-        let a_ts = a
-            .get("last_modified")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let b_ts = b
-            .get("last_modified")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        b_ts.cmp(&a_ts)
-    });
-
-    Ok(sessions)
 }
 
 /// Maps Kiro ACP tool_call params to Tyde's internal tool type representation.
@@ -2758,6 +2396,49 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
         .map(|raw| raw.to_string())
 }
 
+fn find_in_path(binary: &str) -> Option<String> {
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
+    let output = std::process::Command::new(which_cmd)
+        .arg(binary)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// Toolbox-style wrappers often symlink only the primary binary (kiro-cli)
+/// without creating links for companion binaries (kiro-cli-chat). Resolve
+/// the real install directory by following symlinks, then look for the
+/// companion as a sibling.
+fn resolve_sibling_binary(known_binary: &str, sibling_name: &str) -> Option<String> {
+    let known_path = find_in_path(known_binary)?;
+    let real_path = std::fs::canonicalize(&known_path).ok()?;
+    let dir = real_path.parent()?;
+    let sibling = dir.join(sibling_name);
+    if sibling.exists() {
+        Some(sibling.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_kiro_chat_binary() -> String {
+    if let Some(path) = find_in_path("kiro-cli-chat") {
+        return path;
+    }
+    if let Some(path) = resolve_sibling_binary("kiro-cli", "kiro-cli-chat") {
+        return path;
+    }
+    "kiro-cli-chat".to_string()
+}
+
 fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
     workspace_roots
         .iter()
@@ -2766,11 +2447,250 @@ fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
         .ok_or("Kiro backend requires at least one local workspace root".to_string())
 }
 
+fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
+    let utc = s.trim().strip_suffix('Z').unwrap_or(s.trim());
+    let (date, time) = utc.split_once('T')?;
+    let mut dp = date.splitn(3, '-');
+    let y: u64 = dp.next()?.parse().ok()?;
+    let m: u64 = dp.next()?.parse().ok()?;
+    let d: u64 = dp.next()?.parse().ok()?;
+    let (hms, _frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut tp = hms.splitn(3, ':');
+    let h: u64 = tp.next()?.parse().ok()?;
+    let min: u64 = tp.next()?.parse().ok()?;
+    let sec: u64 = tp.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let month_days: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut days: u64 = 0;
+    for yr in 1970..y {
+        days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) { 366 } else { 365 };
+    }
+    for mo in 1..m {
+        days += month_days.get((mo - 1) as usize).copied().unwrap_or(30);
+        if mo == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            days += 1;
+        }
+    }
+    days += d.saturating_sub(1);
+    Some((days * 86400 + h * 3600 + min * 60 + sec) * 1000)
+}
+
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis() as u64
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("cmd")
+        .args(["/C", &format!("tasklist /FI \"PID eq {pid}\" /NH | findstr {pid}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
+    let sessions_dir = resolve_local_kiro_sessions_dir()?;
+    let lock_path = sessions_dir.join(format!("{session_id}.lock"));
+    if !lock_path.exists() {
+        return Ok(());
+    }
+    let content = match tokio::fs::read_to_string(&lock_path).await {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    if let Ok(pid) = content.trim().parse::<u32>() {
+        if is_pid_alive(pid) {
+            return Ok(());
+        }
+    }
+    tokio::fs::remove_file(&lock_path)
+        .await
+        .map_err(|err| format!("Failed to remove stale lock {}: {err}", lock_path.display()))?;
+    Ok(())
+}
+
+async fn clear_remote_kiro_session_lock(host: &str, session_id: &str) -> Result<(), String> {
+    let cmd = format!(
+        "LOCKFILE=~/.kiro/sessions/cli/{0}.lock; \
+         if [ -f \"$LOCKFILE\" ]; then \
+           PID=$(grep -oE '[0-9]+' \"$LOCKFILE\" | head -1); \
+           if [ -n \"$PID\" ] && ! kill -0 \"$PID\" 2>/dev/null; then \
+             rm -f \"$LOCKFILE\"; \
+           fi; \
+         fi",
+        crate::remote::shell_quote_arg(session_id)
+    );
+    let output = crate::remote::run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to clear remote session lock: {stderr}"));
+    }
+    Ok(())
+}
+
+async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
+    let sessions_dir = resolve_local_kiro_sessions_dir()?;
+    for ext in &["json", "jsonl", "lock"] {
+        let path = sessions_dir.join(format!("{session_id}.{ext}"));
+        if path.exists() {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|err| format!("Failed to delete {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn delete_remote_kiro_session(host: &str, session_id: &str) -> Result<(), String> {
+    let cmd = format!(
+        "rm -f ~/.kiro/sessions/cli/{0}.json ~/.kiro/sessions/cli/{0}.jsonl ~/.kiro/sessions/cli/{0}.lock",
+        crate::remote::shell_quote_arg(session_id)
+    );
+    let output = crate::remote::run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to delete remote kiro session: {stderr}"));
+    }
+    Ok(())
+}
+
+async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
+    let dir = resolve_local_kiro_sessions_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    let mut entries = tokio::fs::read_dir(&dir)
+        .await
+        .map_err(|e| format!("Failed to read kiro sessions directory: {e:?}"))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("Failed to read directory entry: {e:?}"))?
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let session_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => continue,
+        };
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("Skipping unreadable kiro session file {}: {e:?}", path.display());
+                continue;
+            }
+        };
+        let metadata: Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("Skipping unparseable kiro session file {}: {e:?}", path.display());
+                continue;
+            }
+        };
+        result.push((session_id, metadata));
+    }
+    Ok(result)
+}
+
+async fn load_remote_kiro_sessions(host: &str) -> Result<Vec<(String, Value)>, String> {
+    let cmd = concat!(
+        "for f in ~/.kiro/sessions/cli/*.json; do ",
+        "[ -f \"$f\" ] && ",
+        "printf 'TYDE_SID:%s\n' \"$(basename \"$f\" .json)\" && ",
+        "cat \"$f\" && ",
+        "printf '\nTYDE_SEND\n'; ",
+        "done"
+    );
+    let output = crate::remote::run_ssh_raw(host, cmd).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to list remote kiro sessions: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_remote_session_dump(&stdout)
+}
+
+fn parse_remote_session_dump(dump: &str) -> Result<Vec<(String, Value)>, String> {
+    let mut result = Vec::new();
+    let mut current_id: Option<String> = None;
+    let mut current_content = String::new();
+
+    for line in dump.lines() {
+        if let Some(id) = line.strip_prefix("TYDE_SID:") {
+            if let Some(prev_id) = current_id.take() {
+                if let Ok(metadata) = serde_json::from_str::<Value>(&current_content) {
+                    result.push((prev_id, metadata));
+                }
+            }
+            current_id = Some(id.trim().to_string());
+            current_content.clear();
+        } else if line == "TYDE_SEND" {
+            if let Some(id) = current_id.take() {
+                if let Ok(metadata) = serde_json::from_str::<Value>(&current_content) {
+                    result.push((id, metadata));
+                }
+            }
+            current_content.clear();
+        } else if current_id.is_some() {
+            if !current_content.is_empty() {
+                current_content.push('\n');
+            }
+            current_content.push_str(line);
+        }
+    }
+    if let Some(id) = current_id {
+        if let Ok(metadata) = serde_json::from_str::<Value>(&current_content) {
+            result.push((id, metadata));
+        }
+    }
+    Ok(result)
+}
+
+fn extract_session_title(metadata: &Value) -> String {
+    metadata
+        .get("title")
+        .or_else(|| {
+            metadata
+                .get("conversation_metadata")
+                .and_then(|cm| cm.get("title"))
+        })
+        .or_else(|| metadata.get("name"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("Kiro Session")
+        .to_string()
+}
+
+fn extract_session_timestamp(metadata: &Value) -> u64 {
+    let ts_field = metadata
+        .get("updatedAt")
+        .or_else(|| metadata.get("updated_at"))
+        .or_else(|| metadata.get("createdAt"))
+        .or_else(|| metadata.get("created_at"));
+    if let Some(s) = ts_field.and_then(Value::as_str) {
+        if let Some(ms) = parse_iso8601_to_unix_ms(s) {
+            return ms;
+        }
+    }
+    ts_field.and_then(Value::as_u64).unwrap_or(0)
 }
 
 #[cfg(test)]
