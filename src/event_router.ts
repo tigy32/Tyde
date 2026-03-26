@@ -179,6 +179,9 @@ export class EventRouter {
           });
         }
         break;
+      case "SessionStarted":
+        void sessionsPanel.refreshRecords();
+        break;
       case "SessionsList":
         this.clearSessionsLoadingTimeout();
         try {

@@ -17,7 +17,6 @@ import {
   createAdminSubprocess,
   createConversation,
   exportSessionJson,
-  getSessionId,
   normalizeBackendKind,
   onFileChanged,
   readFileContent,
@@ -964,33 +963,20 @@ export class WorkspaceView {
       );
     }
 
-    // After first assistant response, fetch and cache the session_id for this conversation.
     if (
-      payload.event.kind === "StreamEnd" &&
-      !this.conversationSessionMap.has(payload.conversation_id) &&
+      payload.event.kind === "SessionStarted" &&
       this.conversationBackendKindMap.has(payload.conversation_id)
     ) {
-      const backendKind = this.conversationBackendKindMap.get(
-        payload.conversation_id,
-      )!;
-      getSessionId(payload.conversation_id)
-        .then((sessionId) => {
-          if (
-            sessionId &&
-            !this.conversationSessionMap.has(payload.conversation_id)
-          ) {
-            this.conversationSessionMap.set(payload.conversation_id, {
-              sessionId,
-              backendKind,
-            });
-          }
-        })
-        .catch((err) => {
-          console.warn(
-            `Failed to fetch session_id for conversation ${payload.conversation_id}:`,
-            err,
-          );
+      const sessionId = payload.event.data.session_id;
+      if (sessionId) {
+        const backendKind = this.conversationBackendKindMap.get(
+          payload.conversation_id,
+        )!;
+        this.conversationSessionMap.set(payload.conversation_id, {
+          sessionId,
+          backendKind,
         });
+      }
     }
   }
 

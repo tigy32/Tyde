@@ -165,10 +165,6 @@ impl ClaudeSession {
         }
     }
 
-    pub async fn session_id(&self) -> Option<String> {
-        self.inner.state.lock().await.session_id.clone()
-    }
-
     pub async fn shutdown(self) {
         self.inner.shutdown().await;
     }
@@ -562,7 +558,11 @@ impl ClaudeInner {
                     let mut summary = summary;
                     if !ephemeral {
                         if let Some(session_id) = summary.session_id.clone() {
-                            self.set_session_id(turn_id, session_id).await;
+                            self.set_session_id(turn_id, session_id.clone()).await;
+                            self.emit_event(json!({
+                                "kind": "SessionStarted",
+                                "data": { "session_id": session_id }
+                            }));
                         }
                     }
 
@@ -1027,6 +1027,10 @@ impl ClaudeInner {
             (state.workspace_root.clone(), state.ssh_host.clone())
         };
 
+        self.emit_event(json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": &normalized }
+        }));
         self.emit_event(json!({ "kind": "ConversationCleared" }));
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
 
@@ -4626,6 +4630,7 @@ mod tests {
                 effort: None,
                 permission_mode: None,
                 startup_mcp_config_json: None,
+                steering_content: None,
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,

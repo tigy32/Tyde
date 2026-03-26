@@ -384,15 +384,6 @@ impl BackendSession {
         }
     }
 
-    pub async fn session_id(&self) -> Option<String> {
-        match self {
-            Self::Tycode(_) => None,
-            Self::Codex(session) => session.session_id().await,
-            Self::Claude(session) => session.session_id().await,
-            Self::Kiro(session) => session.session_id().await,
-        }
-    }
-
     pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
         match self {
             Self::Claude(session) => session.set_subagent_emitter(emitter).await,

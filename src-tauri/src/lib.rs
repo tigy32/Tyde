@@ -1455,17 +1455,6 @@ async fn create_conversation(
         map.insert(id, tyde_session_id.clone());
     }
 
-    // Try to get backend_session_id immediately (works for Codex/Kiro)
-    {
-        let mgr = state.manager.lock().await;
-        if let Some(session) = mgr.get(id) {
-            if let Some(backend_sid) = session.session_id().await {
-                let mut store = state.session_store.lock();
-                store.set_backend_session_id(&tyde_session_id, &backend_sid)?;
-            }
-        }
-    }
-
     tokio::spawn(forward_events(
         app.clone(),
         id,
@@ -1516,28 +1505,6 @@ async fn forward_events(
         let event_kind = event.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         let tyde_session_id = conversation_to_session.lock().get(&conversation_id).cloned();
         if let Some(ref sid) = tyde_session_id {
-            // Try to fill backend_session_id on every event if still missing (fix #5)
-            let needs_backend_id = {
-                let store = session_store.lock();
-                store.get(sid).map(|r| r.backend_session_id.is_none()).unwrap_or(false)
-            };
-            if needs_backend_id {
-                let backend_session_id = {
-                    let state: tauri::State<'_, AppState> = app.state();
-                    let mgr = state.manager.lock().await;
-                    if let Some(session) = mgr.get(conversation_id) {
-                        session.session_id().await
-                    } else {
-                        None
-                    }
-                };
-                if let Some(backend_sid) = backend_session_id {
-                    if let Err(err) = session_store.lock().set_backend_session_id(sid, &backend_sid) {
-                        tracing::error!("Failed to set backend_session_id: {err}");
-                    }
-                }
-            }
-
             match event_kind {
                 "MessageAdded" => {
                     // Only count user messages to avoid double-counting (fix #8).
@@ -1571,6 +1538,17 @@ async fn forward_events(
                             if let Err(err) = session_store.lock().set_alias(sid, trimmed) {
                                 tracing::error!("Failed to set session alias: {err}");
                             }
+                        }
+                    }
+                }
+                "SessionStarted" => {
+                    if let Some(session_id) = event
+                        .get("data")
+                        .and_then(|d| d.get("session_id"))
+                        .and_then(|s| s.as_str())
+                    {
+                        if let Err(err) = session_store.lock().set_backend_session_id(sid, session_id) {
+                            tracing::error!("Failed to set backend_session_id from SessionStarted: {err}");
                         }
                     }
                 }
@@ -2785,9 +2763,13 @@ async fn get_session_id(
     state: tauri::State<'_, AppState>,
     conversation_id: u64,
 ) -> Result<Option<String>, String> {
-    let mgr = state.manager.lock().await;
-    let session = mgr.get(conversation_id).ok_or("Conversation not found")?;
-    Ok(session.session_id().await)
+    let tyde_session_id = state.conversation_to_session.lock()
+        .get(&conversation_id).cloned();
+    let Some(sid) = tyde_session_id else {
+        return Ok(None);
+    };
+    let store = state.session_store.lock();
+    Ok(store.get(&sid).and_then(|r| r.backend_session_id.clone()))
 }
 
 #[tauri::command]
