@@ -3510,6 +3510,14 @@ async fn submit_feedback(feedback: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn raise_fd_limit() {
+    let hard = rlimit::getrlimit(rlimit::Resource::NOFILE)
+        .map(|(_, hard)| hard)
+        .unwrap_or(10240);
+    let _ = rlimit::setrlimit(rlimit::Resource::NOFILE, hard, hard);
+}
+
 /// Resolves the user's login shell PATH and sets it process-wide.
 /// macOS GUI apps launched from Dock/Finder inherit launchd's minimal PATH
 /// (/usr/bin:/bin:/usr/sbin:/sbin), missing Homebrew, Cargo, nvm, etc.
@@ -3610,6 +3618,9 @@ fn detect_system_dark_mode() -> bool {
 }
 
 pub fn run() {
+    #[cfg(unix)]
+    raise_fd_limit();
+
     resolve_shell_path();
     #[cfg(target_os = "linux")]
     if detect_system_dark_mode() {
