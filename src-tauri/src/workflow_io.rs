@@ -345,7 +345,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_reads_existing_global_workflow() {
-        // We created ~/.tyde/workflows/test-echo.json earlier
+        let global_dir = resolve_global_workflows_dir().unwrap();
+        sync_fs::create_dir_all(&global_dir).ok();
+
+        let wf_json = r#"{
+            "id": "test-echo",
+            "name": "Test Echo",
+            "description": "Echo test workflow",
+            "trigger": "/test-echo",
+            "steps": [
+                { "name": "Greet", "actions": [{ "type": "run_command", "command": "echo hello" }] },
+                { "name": "Done", "actions": [{ "type": "run_command", "command": "echo done" }] }
+            ]
+        }"#;
+        sync_fs::write(global_dir.join("test-echo.json"), wf_json).unwrap();
+
         let entries = list_workflows(None).await.unwrap();
         let echo: Vec<_> = entries.iter().filter(|e| e.id == "test-echo").collect();
         assert_eq!(echo.len(), 1);
@@ -353,5 +367,7 @@ mod tests {
         assert_eq!(echo[0].trigger, "/test-echo");
         assert_eq!(echo[0].scope, "global");
         assert_eq!(echo[0].steps.len(), 2);
+
+        sync_fs::remove_file(global_dir.join("test-echo.json")).ok();
     }
 }
