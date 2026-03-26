@@ -1151,7 +1151,11 @@ export class ChatPanel {
     if (view.streamState.currentBubble !== null) {
       console.warn(
         "[STREAM PROTOCOL VIOLATION] StreamStart received while previous stream is still open. Forcing close of orphaned stream. This is a bug in the backend — a StreamEnd event was never sent for the previous stream.",
-        { currentBubble: view.streamState.currentBubble, newAgent: agent, newModelInfo: modelInfo },
+        {
+          currentBubble: view.streamState.currentBubble,
+          newAgent: agent,
+          newModelInfo: modelInfo,
+        },
       );
       const orphanedBubble = view.streamState.currentBubble;
       const orphanedText = stream.stripStreamingCursorArtifacts(

@@ -99,7 +99,14 @@ impl ClaudeSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            false,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_ephemeral(
@@ -108,7 +115,14 @@ impl ClaudeSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            true,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     async fn spawn_with_mode(
@@ -5293,6 +5307,7 @@ mod tests {
                     effort: Some("high".to_string()),
                     permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                     startup_mcp_config_json: None,
+                    steering_content: None,
                     last_cumulative_usage: None,
                     conversation_bytes_total: 0,
                     active_turn: None,

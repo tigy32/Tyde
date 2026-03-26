@@ -14,9 +14,7 @@ pub async fn read_steering(workspace_root: &str) -> Result<Option<String>, Strin
     }
 
     // Per-workspace steering: {workspace_root}/.tycode/steering/*.md
-    let workspace_dir = Path::new(workspace_root)
-        .join(".tycode")
-        .join("steering");
+    let workspace_dir = Path::new(workspace_root).join(".tycode").join("steering");
     collect_md_files(&workspace_dir, &mut parts).await?;
 
     if parts.is_empty() {
@@ -98,9 +96,9 @@ async fn collect_md_files(dir: &Path, parts: &mut Vec<String>) -> Result<(), Str
     }
     paths.sort();
     for path in paths {
-        let content = fs::read_to_string(&path).await.map_err(|e| {
-            format!("Failed to read steering file {}: {e}", path.display())
-        })?;
+        let content = fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("Failed to read steering file {}: {e}", path.display()))?;
         let trimmed = content.trim();
         if !trimmed.is_empty() {
             parts.push(trimmed.to_string());

@@ -66,7 +66,9 @@ export function forceCloseOrphanedStream(state: StreamState): void {
     state.currentBubble.classList.remove("streaming");
     state.currentBubble.querySelector(".streaming-cursor")?.remove();
     // Finalize reasoning section if it was mid-stream
-    const reasoningSection = state.currentBubble.querySelector(".reasoning-streaming");
+    const reasoningSection = state.currentBubble.querySelector(
+      ".reasoning-streaming",
+    );
     if (reasoningSection) {
       reasoningSection.classList.remove("reasoning-streaming");
     }

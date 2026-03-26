@@ -64,7 +64,10 @@ impl SessionStore {
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!("Session store not found at {}, starting empty", path.display());
+                tracing::info!(
+                    "Session store not found at {}, starting empty",
+                    path.display()
+                );
                 HashMap::new()
             }
             Err(err) => {
@@ -87,8 +90,12 @@ impl SessionStore {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("Failed to create session store directory: {err}"))?;
         }
-        std::fs::write(&self.path, json)
-            .map_err(|err| format!("Failed to write session store to {}: {err}", self.path.display()))
+        std::fs::write(&self.path, json).map_err(|err| {
+            format!(
+                "Failed to write session store to {}: {err}",
+                self.path.display()
+            )
+        })
     }
 
     pub fn get(&self, id: &str) -> Option<&SessionRecord> {
@@ -130,7 +137,11 @@ impl SessionStore {
         Ok(record)
     }
 
-    pub fn set_backend_session_id(&mut self, id: &str, backend_session_id: &str) -> Result<(), String> {
+    pub fn set_backend_session_id(
+        &mut self,
+        id: &str,
+        backend_session_id: &str,
+    ) -> Result<(), String> {
         if let Some(record) = self.records.get_mut(id) {
             record.backend_session_id = Some(backend_session_id.to_string());
             record.updated_at_ms = now_ms();

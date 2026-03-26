@@ -53,8 +53,8 @@ use crate::remote::{
     connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots,
     validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
-use crate::subprocess::ImageAttachment;
 use crate::session_store::SessionStore;
+use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
 
 /// Implements SubAgentEmitter for backend sessions that expose provider-native
@@ -168,6 +168,49 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                 parent_agent_id,
                 tool_use_id,
             );
+
+            // Create session store record for this sub-agent
+            {
+                let workspace_root = self.workspace_roots.first().map(|s| s.as_str());
+                match self
+                    .session_store
+                    .lock()
+                    .create(&self.backend_kind, workspace_root)
+                {
+                    Ok(record) => {
+                        let sub_sid = record.id;
+                        let parent_tyde_id = self
+                            .conversation_to_session
+                            .lock()
+                            .get(&self.parent_conversation_id)
+                            .cloned();
+                        if let Some(ref parent_id) = parent_tyde_id {
+                            if let Err(err) =
+                                self.session_store.lock().set_parent(&sub_sid, parent_id)
+                            {
+                                tracing::error!("Failed to set sub-agent parent_id: {err}");
+                            }
+                        }
+                        if !agent_info.name.is_empty() && !is_generic_agent_name(&agent_info.name) {
+                            if let Err(err) = self
+                                .session_store
+                                .lock()
+                                .set_alias(&sub_sid, &agent_info.name)
+                            {
+                                tracing::error!("Failed to set sub-agent alias: {err}");
+                            }
+                        }
+                        self.conversation_to_session
+                            .lock()
+                            .insert(conversation_id, sub_sid);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to create session store record for sub-agent: {err}"
+                        );
+                    }
+                }
+            }
 
             // Forward sub-agent events to the frontend
             let app = self.app.clone();
@@ -588,7 +631,9 @@ pub(crate) struct AwaitAgentsResponse {
 
 fn is_generic_agent_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == "conversation" || lower == "bridge" || lower == "sub-agent"
+    lower == "conversation"
+        || lower == "bridge"
+        || lower == "sub-agent"
         || lower.starts_with("agent ")
 }
 
@@ -1153,13 +1198,15 @@ async fn resolve_backend_executable_path(
             }
         }
         BackendKind::Kiro => {
-            let remote_roots = parse_remote_workspace_roots(workspace_roots)?;
-            match &remote_roots {
-                Some((host, _)) => {
-                    validate_remote_cli(app, host, "kiro-cli").await?;
+            // parse_remote_workspace_roots errors on mixed local+SSH roots.
+            // For admin sessions with mixed bridge projects, fall through to
+            // local so list_sessions can query both local and SSH roots.
+            match parse_remote_workspace_roots(workspace_roots) {
+                Ok(Some((host, _))) => {
+                    validate_remote_cli(app, &host, "kiro-cli-chat").await?;
                     Ok(host.clone())
                 }
-                None => Ok(String::new()),
+                _ => Ok(String::new()),
             }
         }
     }
@@ -1503,7 +1550,10 @@ async fn forward_events(
 
         // Session store updates based on event kind
         let event_kind = event.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        let tyde_session_id = conversation_to_session.lock().get(&conversation_id).cloned();
+        let tyde_session_id = conversation_to_session
+            .lock()
+            .get(&conversation_id)
+            .cloned();
         if let Some(ref sid) = tyde_session_id {
             match event_kind {
                 "MessageAdded" => {
@@ -1547,8 +1597,12 @@ async fn forward_events(
                         .and_then(|d| d.get("session_id"))
                         .and_then(|s| s.as_str())
                     {
-                        if let Err(err) = session_store.lock().set_backend_session_id(sid, session_id) {
-                            tracing::error!("Failed to set backend_session_id from SessionStarted: {err}");
+                        if let Err(err) =
+                            session_store.lock().set_backend_session_id(sid, session_id)
+                        {
+                            tracing::error!(
+                                "Failed to set backend_session_id from SessionStarted: {err}"
+                            );
                         }
                     }
                 }
@@ -1657,7 +1711,10 @@ async fn execute_conversation_command(
                 emit_agent_changed_for_conversation(app, state, conversation_id).await;
             }
             // Clean up conversation_to_session map (store record persists)
-            state.conversation_to_session.lock().remove(&conversation_id);
+            state
+                .conversation_to_session
+                .lock()
+                .remove(&conversation_id);
             emit_subprocess_exit(app, conversation_id);
             Err(err)
         }
@@ -1721,7 +1778,10 @@ async fn close_conversation(
         emit_agent_changed_for_conversation(&app, &state, conversation_id).await;
     }
     // Clean up runtime map (store record persists)
-    state.conversation_to_session.lock().remove(&conversation_id);
+    state
+        .conversation_to_session
+        .lock()
+        .remove(&conversation_id);
     Ok(())
 }
 
@@ -1805,7 +1865,10 @@ pub(crate) async fn spawn_agent_internal(
     // Create session store record for this agent
     let tyde_session_id = {
         let workspace_root = workspace_roots.first().map(|s| s.as_str());
-        let record = state.session_store.lock().create(backend_kind.as_str(), workspace_root)?;
+        let record = state
+            .session_store
+            .lock()
+            .create(backend_kind.as_str(), workspace_root)?;
         record.id
     };
     // Set parent_id if this agent has a parent
@@ -1815,17 +1878,30 @@ pub(crate) async fn spawn_agent_internal(
             runtime.conversation_id_for_agent(parent_runtime_agent_id)
         };
         if let Some(parent_cid) = parent_cid {
-            let parent_tyde_id = state.conversation_to_session.lock().get(&parent_cid).cloned();
+            let parent_tyde_id = state
+                .conversation_to_session
+                .lock()
+                .get(&parent_cid)
+                .cloned();
             if let Some(parent_tyde_id) = parent_tyde_id {
-                state.session_store.lock().set_parent(&tyde_session_id, &parent_tyde_id)?;
+                state
+                    .session_store
+                    .lock()
+                    .set_parent(&tyde_session_id, &parent_tyde_id)?;
             }
         }
     }
     // Set alias from display name if non-generic
     if !display_name.is_empty() && !is_generic_agent_name(&display_name) {
-        state.session_store.lock().set_alias(&tyde_session_id, &display_name)?;
+        state
+            .session_store
+            .lock()
+            .set_alias(&tyde_session_id, &display_name)?;
     }
-    state.conversation_to_session.lock().insert(conversation_id, tyde_session_id);
+    state
+        .conversation_to_session
+        .lock()
+        .insert(conversation_id, tyde_session_id);
 
     // Set up the sub-agent emitter AFTER registration so we know this agent's id.
     // Sub-agents spawned by this agent will have parent_agent_id = info.agent_id.
@@ -2044,7 +2120,10 @@ pub(crate) async fn terminate_agent_internal(
     }
 
     // Clean up conversation_to_session map (store record persists)
-    state.conversation_to_session.lock().remove(&conversation_id);
+    state
+        .conversation_to_session
+        .lock()
+        .remove(&conversation_id);
 
     Ok(())
 }
@@ -2375,7 +2454,10 @@ pub(crate) async fn cancel_agent_internal(
     }
 
     // Clean up conversation_to_session map (store record persists)
-    state.conversation_to_session.lock().remove(&conversation_id);
+    state
+        .conversation_to_session
+        .lock()
+        .remove(&conversation_id);
 
     let runtime = state.agent_runtime.lock().await;
     let info = runtime
@@ -2703,14 +2785,21 @@ async fn resume_session(
             .map(|k| k.as_str().to_string())
     };
     if let Some(bk) = backend_kind {
-        let duplicate_tyde_id = state.conversation_to_session.lock().get(&conversation_id).cloned();
+        let duplicate_tyde_id = state
+            .conversation_to_session
+            .lock()
+            .get(&conversation_id)
+            .cloned();
         let mut store = state.session_store.lock();
         if let Some(existing) = store.get_by_backend_session(&bk, &session_id) {
             let existing_id = existing.id.clone();
             // Only deduplicate if the conversation is currently mapped to a different record
             if duplicate_tyde_id.as_deref() != Some(&existing_id) {
                 // Point the conversation at the original record
-                state.conversation_to_session.lock().insert(conversation_id, existing_id);
+                state
+                    .conversation_to_session
+                    .lock()
+                    .insert(conversation_id, existing_id);
                 // Delete the duplicate record created by create_conversation
                 if let Some(dup_id) = duplicate_tyde_id {
                     store.delete(&dup_id)?;
@@ -2763,8 +2852,11 @@ async fn get_session_id(
     state: tauri::State<'_, AppState>,
     conversation_id: u64,
 ) -> Result<Option<String>, String> {
-    let tyde_session_id = state.conversation_to_session.lock()
-        .get(&conversation_id).cloned();
+    let tyde_session_id = state
+        .conversation_to_session
+        .lock()
+        .get(&conversation_id)
+        .cloned();
     let Some(sid) = tyde_session_id else {
         return Ok(None);
     };

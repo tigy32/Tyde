@@ -285,10 +285,21 @@ impl BackendSession {
                     Some(executable_path.to_string())
                 };
                 let (session, rx) = if ephemeral {
-                    CodexSession::spawn_ephemeral(workspace_roots, ssh_host, startup_mcp_servers, steering_content)
-                        .await?
+                    CodexSession::spawn_ephemeral(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
                 } else {
-                    CodexSession::spawn(workspace_roots, ssh_host, startup_mcp_servers, steering_content).await?
+                    CodexSession::spawn(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
                 };
                 Ok((Self::Codex(session), rx))
             }
@@ -299,10 +310,21 @@ impl BackendSession {
                     Some(executable_path.to_string())
                 };
                 let (session, rx) = if ephemeral {
-                    ClaudeSession::spawn_ephemeral(workspace_roots, ssh_host, startup_mcp_servers, steering_content)
-                        .await?
+                    ClaudeSession::spawn_ephemeral(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
                 } else {
-                    ClaudeSession::spawn(workspace_roots, ssh_host, startup_mcp_servers, steering_content).await?
+                    ClaudeSession::spawn(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
                 };
                 Ok((Self::Claude(session), rx))
             }
@@ -313,10 +335,21 @@ impl BackendSession {
                     Some(executable_path.to_string())
                 };
                 let (session, rx) = if ephemeral {
-                    KiroSession::spawn_ephemeral(workspace_roots, ssh_host, startup_mcp_servers, steering_content)
-                        .await?
+                    KiroSession::spawn_ephemeral(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
                 } else {
-                    KiroSession::spawn(workspace_roots, ssh_host, startup_mcp_servers, steering_content).await?
+                    KiroSession::spawn(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
                 };
                 Ok((Self::Kiro(session), rx))
             }
@@ -350,7 +383,8 @@ impl BackendSession {
                 } else {
                     Some(executable_path.to_string())
                 };
-                let (session, rx) = ClaudeSession::spawn(workspace_roots, ssh_host, &[], None).await?;
+                let (session, rx) =
+                    ClaudeSession::spawn(workspace_roots, ssh_host, &[], None).await?;
                 Ok((Self::Claude(session), rx))
             }
             BackendKind::Kiro => {
