@@ -49,6 +49,44 @@ export function resetStreamState(state: StreamState): void {
   state.streamModelLabel = null;
 }
 
+// Force-close an orphaned stream that was never terminated by StreamEnd.
+// This is a defensive measure — the backend MUST send StreamEnd on all exit
+// paths, but if it doesn't, we prevent the UI from getting stuck.
+export function forceCloseOrphanedStream(state: StreamState): void {
+  if (state.rafId !== null) {
+    cancelAnimationFrame(state.rafId);
+    state.rafId = null;
+  }
+  if (state.deltaBuffer) {
+    state.streamingText += state.deltaBuffer;
+    state.deltaBuffer = "";
+  }
+
+  if (state.currentBubble) {
+    state.currentBubble.classList.remove("streaming");
+    state.currentBubble.querySelector(".streaming-cursor")?.remove();
+    // Finalize reasoning section if it was mid-stream
+    const reasoningSection = state.currentBubble.querySelector(".reasoning-streaming");
+    if (reasoningSection) {
+      reasoningSection.classList.remove("reasoning-streaming");
+    }
+  }
+
+  if (state.currentContentEl) {
+    const cleanedText = stripStreamingCursorArtifacts(state.streamingText);
+    state.currentContentEl.innerHTML = cleanedText
+      ? renderContent(cleanedText)
+      : "";
+  }
+
+  state.currentBubble = null;
+  state.currentContentEl = null;
+  state.currentReasoningEl = null;
+  state.streamingText = "";
+  state.streamingReasoning = "";
+  state.streamModelLabel = null;
+}
+
 export function stripStreamingCursorArtifacts(text: string): string {
   return text.replace(STREAMING_CURSOR_ARTIFACT_RE, "");
 }

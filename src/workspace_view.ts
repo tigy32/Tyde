@@ -637,7 +637,7 @@ export class WorkspaceView {
       work.push(this.startFileWatching());
       work.push(this.refreshOpenFileTabs());
     }
-    work.push(this.requestSessionsList(false));
+    void this.requestSessionsList(false);
     if (this.mode === "bridge" && !this.tabManager.hasTabs()) {
       this.layout.setHomeMode(true);
     }
@@ -1156,7 +1156,7 @@ export class WorkspaceView {
       .filter(
         (workspacePath) =>
           workspacePath.trim().length > 0 &&
-          !workspacePath.startsWith("ssh://"),
+          (backendKind === "kiro" || !workspacePath.startsWith("ssh://")),
       );
   }
 

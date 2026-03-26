@@ -526,6 +526,40 @@ impl KiroInner {
             }));
         }
 
+        // When admin runs locally but workspace_roots contains SSH paths,
+        // also query those remote hosts for kiro sessions.
+        if ssh_host.is_none() {
+            let mut ssh_by_host: HashMap<String, Vec<String>> = HashMap::new();
+            for root in &workspace_roots {
+                if let Some(remote) = crate::remote::parse_remote_path(root) {
+                    ssh_by_host.entry(remote.host).or_default().push(remote.path);
+                }
+            }
+            for (host, paths) in &ssh_by_host {
+                for path in paths {
+                    match list_kiro_session_ids_via_cli(path, Some(host)).await {
+                        Ok(session_ids) => {
+                            for session in
+                                build_remote_kiro_session_metadata(path, excluded.as_deref(), session_ids)
+                            {
+                                let Some(session_id) =
+                                    session.get("session_id").and_then(Value::as_str)
+                                else {
+                                    continue;
+                                };
+                                if seen.insert(session_id.to_string()) {
+                                    sessions.push(session);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("Failed to list Kiro sessions on {host}: {err}");
+                        }
+                    }
+                }
+            }
+        }
+
         sessions.sort_by(|a, b| {
             let a_ts = a.get("last_modified").and_then(Value::as_u64).unwrap_or(0);
             let b_ts = b.get("last_modified").and_then(Value::as_u64).unwrap_or(0);

@@ -1145,6 +1145,37 @@ export class ChatPanel {
       this.removeRetryCard(view);
       this.appendSystemMessage(view, "Reconnected", "system");
     }
+
+    // Orphan cleanup lives here (not in stream.handleStreamStart) because
+    // transitioning the messages array entry requires view-level access.
+    if (view.streamState.currentBubble !== null) {
+      console.warn(
+        "[STREAM PROTOCOL VIOLATION] StreamStart received while previous stream is still open. Forcing close of orphaned stream. This is a bug in the backend — a StreamEnd event was never sent for the previous stream.",
+        { currentBubble: view.streamState.currentBubble, newAgent: agent, newModelInfo: modelInfo },
+      );
+      const orphanedBubble = view.streamState.currentBubble;
+      const orphanedText = stream.stripStreamingCursorArtifacts(
+        view.streamState.streamingText + view.streamState.deltaBuffer,
+      );
+      stream.forceCloseOrphanedStream(view.streamState);
+      const streamIdx = view.messages.findIndex((m) => m.kind === "streaming");
+      if (streamIdx !== -1) {
+        view.messages[streamIdx] = {
+          kind: "chat",
+          message: {
+            timestamp: Date.now(),
+            sender: { Assistant: { agent } },
+            content: orphanedText,
+            tool_calls: [],
+          },
+          element: orphanedBubble,
+        };
+        orphanedBubble.dataset.index = String(streamIdx);
+        view.virtualizer.measureElement(orphanedBubble);
+        renderVisibleMessages(view);
+      }
+    }
+
     stream.handleStreamStart(
       view.streamState,
       (bubble) => {
