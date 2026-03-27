@@ -275,7 +275,8 @@ impl BackendSession {
                     workspace_roots,
                     tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
                     ephemeral,
-                ).await?;
+                )
+                .await?;
                 Ok((Self::Tycode(bridge), rx))
             }
             BackendKind::Codex => {

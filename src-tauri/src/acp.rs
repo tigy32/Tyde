@@ -78,7 +78,6 @@ impl AcpSpawnSpec {
         }
         self
     }
-
 }
 
 pub struct AcpBridge {
@@ -998,7 +997,7 @@ impl AcpRpc {
             crate::remote::spawn_remote_process(
                 host,
                 &spec.remote_args[0],
-                &spec.remote_args[1..].to_vec(),
+                &spec.remote_args[1..],
                 spec.remote_cwd.as_deref(),
             )
             .await

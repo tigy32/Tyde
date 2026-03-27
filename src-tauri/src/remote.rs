@@ -438,7 +438,11 @@ pub async fn validate_remote_cli(
         emit_progress("checking_environment", "failed", &msg);
         msg
     })?;
-    let check_cmd = format!("PATH={} command -v {}", shell_quote_arg(&remote_path), shell_quote_arg(cli_name));
+    let check_cmd = format!(
+        "PATH={} command -v {}",
+        shell_quote_arg(&remote_path),
+        shell_quote_arg(cli_name)
+    );
     let check_output = run_ssh_raw(host, &check_cmd).await?;
     if !check_output.status.success() {
         let msg = format!("{cli_name} CLI not found on remote host '{host}'");

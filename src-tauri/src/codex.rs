@@ -48,7 +48,14 @@ impl CodexSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, false, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            false,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_ephemeral(
@@ -57,7 +64,14 @@ impl CodexSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            true,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_admin(
@@ -66,7 +80,14 @@ impl CodexSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            true,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     async fn spawn_with_mode(
@@ -82,7 +103,12 @@ impl CodexSession {
             }
             _ => None,
         };
-        let (rpc, inbound_rx) = CodexRpc::spawn(ssh_host.as_deref(), startup_mcp_servers, steering_tempfile.as_deref()).await?;
+        let (rpc, inbound_rx) = CodexRpc::spawn(
+            ssh_host.as_deref(),
+            startup_mcp_servers,
+            steering_tempfile.as_deref(),
+        )
+        .await?;
 
         rpc.request(
             "initialize",
@@ -179,10 +205,6 @@ impl CodexSession {
         }
     }
 
-    pub async fn session_id(&self) -> Option<String> {
-        Some(self.inner.state.lock().await.thread_id.clone())
-    }
-
     pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
         let mut state = self.inner.state.lock().await;
         state.subagent_emitter = Some(emitter);
@@ -192,7 +214,10 @@ impl CodexSession {
         self.inner.rpc.shutdown().await;
         if let Some(path) = &self.inner.steering_tempfile {
             if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!("Failed to remove steering temp file {}: {e}", path.display());
+                tracing::warn!(
+                    "Failed to remove steering temp file {}: {e}",
+                    path.display()
+                );
             }
         }
     }
@@ -4616,6 +4641,7 @@ mod tests {
             rpc,
             event_tx,
             state: Mutex::new(test_codex_state()),
+            steering_tempfile: None,
         });
         (inner, event_rx)
     }
@@ -4804,7 +4830,7 @@ mod tests {
 
             let workspace_roots = vec![workspace.to_string_lossy().to_string()];
             live_test_log("spawning CodexSession");
-            let (session, mut event_rx) = CodexSession::spawn(&workspace_roots, None, &[])
+            let (session, mut event_rx) = CodexSession::spawn(&workspace_roots, None, &[], None)
                 .await
                 .expect("spawn codex session");
             live_test_log("CodexSession spawned");

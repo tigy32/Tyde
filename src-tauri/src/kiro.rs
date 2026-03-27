@@ -41,7 +41,15 @@ impl KiroSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, false, false, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            false,
+            false,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_ephemeral(
@@ -50,7 +58,15 @@ impl KiroSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, false, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            true,
+            false,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_admin(
@@ -59,7 +75,15 @@ impl KiroSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, true, true, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            true,
+            true,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     async fn spawn_with_mode(
@@ -200,10 +224,6 @@ impl KiroSession {
         KiroCommandHandle {
             inner: Arc::clone(&self.inner),
         }
-    }
-
-    pub async fn session_id(&self) -> Option<String> {
-        Some(self.inner.state.lock().await.session_id.clone())
     }
 
     pub async fn shutdown(self) {
@@ -524,40 +544,6 @@ impl KiroInner {
                 "message_count": Value::Null,
                 "backend_kind": "kiro",
             }));
-        }
-
-        // When admin runs locally but workspace_roots contains SSH paths,
-        // also query those remote hosts for kiro sessions.
-        if ssh_host.is_none() {
-            let mut ssh_by_host: HashMap<String, Vec<String>> = HashMap::new();
-            for root in &workspace_roots {
-                if let Some(remote) = crate::remote::parse_remote_path(root) {
-                    ssh_by_host.entry(remote.host).or_default().push(remote.path);
-                }
-            }
-            for (host, paths) in &ssh_by_host {
-                for path in paths {
-                    match list_kiro_session_ids_via_cli(path, Some(host)).await {
-                        Ok(session_ids) => {
-                            for session in
-                                build_remote_kiro_session_metadata(path, excluded.as_deref(), session_ids)
-                            {
-                                let Some(session_id) =
-                                    session.get("session_id").and_then(Value::as_str)
-                                else {
-                                    continue;
-                                };
-                                if seen.insert(session_id.to_string()) {
-                                    sessions.push(session);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!("Failed to list Kiro sessions on {host}: {err}");
-                        }
-                    }
-                }
-            }
         }
 
         sessions.sort_by(|a, b| {
@@ -1704,8 +1690,6 @@ fn join_posix_path(base: &str, suffix: &str) -> String {
     }
 }
 
-
-
 fn strip_ansi_and_controls(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -2444,7 +2428,11 @@ fn find_in_path(binary: &str) -> Option<String> {
         .next()?
         .trim()
         .to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Toolbox-style wrappers often symlink only the primary binary (kiro-cli)
@@ -2496,11 +2484,15 @@ fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
     let month_days: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut days: u64 = 0;
     for yr in 1970..y {
-        days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) { 366 } else { 365 };
+        days += if yr.is_multiple_of(4) && (!yr.is_multiple_of(100) || yr.is_multiple_of(400)) {
+            366
+        } else {
+            365
+        };
     }
     for mo in 1..m {
         days += month_days.get((mo - 1) as usize).copied().unwrap_or(30);
-        if mo == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+        if mo == 2 && y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
             days += 1;
         }
     }
@@ -2529,7 +2521,10 @@ fn is_pid_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
     std::process::Command::new("cmd")
-        .args(["/C", &format!("tasklist /FI \"PID eq {pid}\" /NH | findstr {pid}")])
+        .args([
+            "/C",
+            &format!("tasklist /FI \"PID eq {pid}\" /NH | findstr {pid}"),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -2628,14 +2623,20 @@ async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!("Skipping unreadable kiro session file {}: {e:?}", path.display());
+                tracing::debug!(
+                    "Skipping unreadable kiro session file {}: {e:?}",
+                    path.display()
+                );
                 continue;
             }
         };
         let metadata: Value = match serde_json::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!("Skipping unparseable kiro session file {}: {e:?}", path.display());
+                tracing::debug!(
+                    "Skipping unparseable kiro session file {}: {e:?}",
+                    path.display()
+                );
                 continue;
             }
         };
