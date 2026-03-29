@@ -46,6 +46,15 @@ export type {
   WorkflowEntry,
 } from "@tyde/protocol";
 
+export interface Host {
+  id: string;
+  label: string;
+  hostname: string;
+  is_local: boolean;
+  enabled_backends: string[];
+  default_backend: string;
+}
+
 export function normalizeBackendKind(
   value: string | null | undefined,
 ): BackendKind {
@@ -376,6 +385,13 @@ export function setMcpHttpServerEnabled(enabled: boolean) {
   return execute("set_mcp_http_server_enabled", { enabled });
 }
 
+export function setMcpControlEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("set_mcp_control_enabled", { enabled }).catch((err) => {
+    console.error("bridge: setMcpControlEnabled failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
 export function getDriverMcpHttpServerSettings() {
   return execute(
     "get_driver_mcp_http_server_settings",
@@ -407,6 +423,71 @@ export function setDisabledBackends(backends: string[]) {
 
 export function installBackendDependency(backendKind: string) {
   return execute("install_backend_dependency", { backendKind });
+}
+
+// --- Host management ---
+
+export function listHosts(): Promise<Host[]> {
+  return invoke<Host[]>("list_hosts").catch((err) => {
+    console.error("bridge: listHosts failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
+export function addHost(label: string, hostname: string): Promise<Host> {
+  return invoke<Host>("add_host", { label, hostname }).catch((err) => {
+    console.error("bridge: addHost failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
+export function removeHost(id: string): Promise<void> {
+  return invoke<void>("remove_host", { id }).catch((err) => {
+    console.error("bridge: removeHost failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
+export function updateHostLabel(id: string, label: string): Promise<void> {
+  return invoke<void>("update_host_label", { id, label }).catch((err) => {
+    console.error("bridge: updateHostLabel failed:", err);
+    throw new Error(friendlyError(String(err)));
+  });
+}
+
+export function updateHostEnabledBackends(
+  id: string,
+  backends: string[],
+): Promise<void> {
+  return invoke<void>("update_host_enabled_backends", { id, backends }).catch(
+    (err) => {
+      console.error("bridge: updateHostEnabledBackends failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
+export function updateHostDefaultBackend(
+  id: string,
+  backend: string,
+): Promise<void> {
+  return invoke<void>("update_host_default_backend", { id, backend }).catch(
+    (err) => {
+      console.error("bridge: updateHostDefaultBackend failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
+}
+
+export function getHostForWorkspace(
+  workspacePath: string,
+): Promise<Host> {
+  return invoke<Host>("get_host_for_workspace", { workspacePath }).catch(
+    (err) => {
+      console.error("bridge: getHostForWorkspace failed:", err);
+      throw new Error(friendlyError(String(err)));
+    },
+  );
 }
 
 // --- Process management ---
@@ -493,10 +574,18 @@ export function onChatEvent(
     (event) => {
       const raw = event.payload.event as { kind?: string; data?: unknown };
       if (raw.kind === "ConversationRegistered") {
-        onRegistered({
-          conversation_id: event.payload.conversation_id,
-          data: raw.data as ConversationRegisteredData,
-        });
+        try {
+          onRegistered({
+            conversation_id: event.payload.conversation_id,
+            data: raw.data as ConversationRegisteredData,
+          });
+        } catch (err) {
+          console.error(
+            "bridge: ConversationRegistered handler threw:",
+            err,
+            event.payload,
+          );
+        }
         return;
       }
 
@@ -514,7 +603,7 @@ export function onChatEvent(
           );
           return;
         }
-        throw err;
+        console.error("bridge: chat event handler threw:", err, event.payload);
       }
     },
   );
@@ -540,7 +629,7 @@ export function onAdminEvent(
           );
           return;
         }
-        throw err;
+        console.error("bridge: admin event handler threw:", err, event.payload);
       }
     },
   );
@@ -631,9 +720,11 @@ export interface BackendUsageResult {
 
 export function queryBackendUsage(
   backendKind: BackendKind,
+  hostId?: string,
 ): Promise<BackendUsageResult> {
   return invoke<BackendUsageResult>("query_backend_usage", {
     backendKind,
+    hostId,
   }).catch((err) => {
     console.error("bridge: queryBackendUsage failed:", err);
     throw new Error(friendlyError(String(err)));

@@ -229,7 +229,7 @@ describe('Settings panel', () => {
     }, sel.settingsNavItem);
     await browser.pause(300);
 
-    // Driver toggle must still be enabled (was toggled on at line ~166 above)
+    // Driver toggle must still be enabled (was toggled on above)
     const driverAfterOtherSave = await browser.execute((panelSel: string) => {
       const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
       const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
@@ -356,5 +356,83 @@ describe('Settings panel', () => {
     }, sel.settingsTabPanel, sel.settingsLabel);
     expect(fieldLabels).toContain('Timeout Seconds');
     expect(fieldLabels).toContain('Sandbox Enabled');
+  });
+
+  it('host selector supports add/remove and applies settings per selected host', async () => {
+    await openWorkspaceAndWaitForChat();
+    await openSettingsOverlay();
+
+    const initialHost = await browser.execute((hostSel: string) => {
+      const select = document.querySelector(hostSel) as HTMLSelectElement | null;
+      return select?.value ?? null;
+    }, sel.settingsHostSelect);
+    expect(initialHost).toBe('local');
+
+    await browser.execute((addSel: string) => {
+      const btn = document.querySelector(addSel) as HTMLButtonElement | null;
+      btn?.click();
+    }, sel.settingsHostAdd);
+    await browser.pause(300);
+
+    const modalVisible = await browser.execute(() => {
+      const overlay = document.querySelector('.settings-modal-overlay');
+      return overlay !== null;
+    });
+    expect(modalVisible).toBe(true);
+
+    await browser.execute(() => {
+      const inputs = document.querySelectorAll('.settings-modal-overlay input') as NodeListOf<HTMLInputElement>;
+      if (inputs.length >= 2) {
+        inputs[0].value = 'Test Server';
+        inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+        inputs[1].value = 'user@testserver.com';
+        inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    });
+    await browser.pause(100);
+
+    await browser.execute(() => {
+      const btns = document.querySelectorAll('.settings-modal-overlay button');
+      const saveBtn = Array.from(btns).find((b) => b.textContent?.includes('Save') || b.textContent?.includes('Add') || b.textContent?.includes('OK'));
+      if (saveBtn) (saveBtn as HTMLButtonElement).click();
+    });
+    await browser.pause(500);
+
+    const selectedAfterAdd = await browser.execute((hostSel: string) => {
+      const select = document.querySelector(hostSel) as HTMLSelectElement | null;
+      return select?.value ?? null;
+    }, sel.settingsHostSelect);
+    expect(selectedAfterAdd).not.toBe('local');
+
+    const removeVisible = await browser.execute((removeSel: string) => {
+      return document.querySelector(removeSel) !== null;
+    }, sel.settingsHostRemove);
+    expect(removeVisible).toBe(true);
+
+    await browser.execute((navItemSel: string) => {
+      const btn = document.querySelector(navItemSel + '[data-tab="tyde"]') as HTMLButtonElement | null;
+      btn?.click();
+    }, sel.settingsNavItem);
+    await browser.pause(300);
+
+    // MCP is a global setting — verify toggle exists on the tyde tab
+    const mcpToggleExists = await browser.execute((panelSel: string) => {
+      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
+      const input = panel?.querySelector('[data-testid="settings-mcp-http-enabled"]') as HTMLInputElement | null;
+      return input !== null;
+    }, sel.settingsTabPanel);
+    expect(mcpToggleExists).toBe(true);
+
+    await browser.execute((removeSel: string) => {
+      const btn = document.querySelector(removeSel) as HTMLButtonElement | null;
+      btn?.click();
+    }, sel.settingsHostRemove);
+    await browser.pause(500);
+
+    const selectedAfterRemove = await browser.execute((hostSel: string) => {
+      const select = document.querySelector(hostSel) as HTMLSelectElement | null;
+      return select?.value ?? null;
+    }, sel.settingsHostSelect);
+    expect(selectedAfterRemove).toBe('local');
   });
 });

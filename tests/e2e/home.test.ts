@@ -468,4 +468,25 @@ describe('Home screen and app launch', () => {
       { timeout: 5000, timeoutMsg: 'Expected internal title helpers to be hidden from home dock Agents widget' },
     );
   });
+
+  it('sidebar groups projects under host headers after opening a workspace', async () => {
+    await openWorkspace();
+
+    await browser.waitUntil(
+      async () => browser.execute((headerSel: string) => {
+        const headers = document.querySelectorAll(headerSel);
+        return headers.length >= 1;
+      }, sel.railHostHeader),
+      { timeout: 5000, timeoutMsg: 'Expected at least one host group header in the sidebar' },
+    );
+
+    const firstHeaderText = await browser.execute((headerSel: string) => {
+      const header = document.querySelector(headerSel);
+      return header?.textContent?.trim() ?? '';
+    }, sel.railHostHeader);
+    expect(firstHeaderText).toContain('Local');
+
+    const projectExists = await $(sel.railProjectItem);
+    expect(await projectExists.isExisting()).toBe(true);
+  });
 });

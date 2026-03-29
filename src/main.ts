@@ -73,22 +73,28 @@ document.addEventListener("DOMContentLoaded", async () => {
   window.onerror = (message, source, lineno, colno, error) => {
     if (typeof message === "string" && message.includes("ResizeObserver loop"))
       return true;
-    console.error("Unhandled error:", {
-      message,
-      source,
-      lineno,
-      colno,
-      error,
-    });
+    console.error(
+      "%c[UNCAUGHT ERROR]",
+      "background:red;color:white;font-weight:bold;padding:2px 6px",
+      { message, source, lineno, colno, error },
+    );
     const msg = error?.message || String(message);
     app.showError(`Unexpected error: ${msg.slice(0, 200)}`);
-    return false;
+    // Return true to suppress the default browser error overlay — we already
+    // logged it and showed a notification. This also prevents the error from
+    // killing Tauri event listeners that might be higher on the call stack.
+    return true;
   };
 
   window.addEventListener("unhandledrejection", (event) => {
     const msg = event.reason?.message || String(event.reason);
     if (msg.includes("ResizeObserver loop")) return;
-    console.error("Unhandled promise rejection:", event.reason);
+    console.error(
+      "%c[UNHANDLED REJECTION]",
+      "background:red;color:white;font-weight:bold;padding:2px 6px",
+      event.reason,
+    );
+    event.preventDefault();
     app.showError(`Unexpected error: ${msg.slice(0, 200)}`);
   });
 

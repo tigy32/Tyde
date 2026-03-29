@@ -118,6 +118,26 @@ let mockDriverMcpHttpServerEnabled = false;
 let mockDriverMcpHttpServerAutoload = false;
 const mockDriverMcpHttpServerUrl = 'http://127.0.0.1:47772/mcp';
 
+interface MockHost {
+  id: string;
+  label: string;
+  hostname: string;
+  is_local: boolean;
+  enabled_backends: string[];
+  default_backend: string;
+}
+
+const mockHosts: MockHost[] = [
+  {
+    id: 'local',
+    label: 'Local',
+    hostname: '',
+    is_local: true,
+    enabled_backends: ['tycode', 'codex', 'claude', 'kiro'],
+    default_backend: 'tycode',
+  },
+];
+
 function syncMockMcpSettingsFromStorage(): void {
   try {
     const raw = window.localStorage.getItem('mock-mcp-http-enabled');
@@ -670,6 +690,93 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
 
     case 'set_default_backend':
       return null;
+
+    case 'query_backend_usage': {
+      const backendKind = typeof args?.backendKind === 'string' ? args.backendKind : 'codex';
+      const hostId = typeof args?.hostId === 'string' ? args.hostId : 'local';
+      return {
+        backend_kind: backendKind,
+        source: hostId === 'local' ? 'local' : `remote:${hostId}`,
+        captured_at_ms: Date.now(),
+        plan: hostId === 'local' ? 'Personal' : 'Work',
+        status: null,
+        windows: [
+          {
+            id: 'primary',
+            label: '5-hour',
+            used_percent: hostId === 'local' ? 35 : 62,
+            reset_at_text: null,
+            reset_at_unix: null,
+            window_minutes: 300,
+          },
+        ],
+        details: [],
+      };
+    }
+
+    case 'list_hosts':
+      return mockHosts.map((h) => ({ ...h }));
+
+    case 'add_host': {
+      const label = typeof args?.label === 'string' ? args.label : '';
+      const hostname = typeof args?.hostname === 'string' ? args.hostname : '';
+      const newHost: MockHost = {
+        id: `mock-host-${Date.now()}`,
+        label,
+        hostname,
+        is_local: false,
+        enabled_backends: ['tycode', 'codex', 'claude', 'kiro'],
+        default_backend: 'tycode',
+      };
+      mockHosts.push(newHost);
+      return { ...newHost };
+    }
+
+    case 'remove_host': {
+      const id = typeof args?.id === 'string' ? args.id : '';
+      const idx = mockHosts.findIndex((h) => h.id === id);
+      if (idx >= 0 && !mockHosts[idx].is_local) {
+        mockHosts.splice(idx, 1);
+      }
+      return null;
+    }
+
+    case 'update_host_label': {
+      const id = typeof args?.id === 'string' ? args.id : '';
+      const label = typeof args?.label === 'string' ? args.label : '';
+      const host = mockHosts.find((h) => h.id === id);
+      if (host) host.label = label;
+      return null;
+    }
+
+    case 'update_host_enabled_backends': {
+      const id = typeof args?.id === 'string' ? args.id : '';
+      const backends = Array.isArray(args?.backends) ? args.backends : [];
+      const host = mockHosts.find((h) => h.id === id);
+      if (host) host.enabled_backends = backends;
+      return null;
+    }
+
+    case 'update_host_default_backend': {
+      const id = typeof args?.id === 'string' ? args.id : '';
+      const backend = typeof args?.backend === 'string' ? args.backend : '';
+      const host = mockHosts.find((h) => h.id === id);
+      if (host) host.default_backend = backend;
+      return null;
+    }
+
+    case 'set_mcp_control_enabled':
+      return null;
+
+    case 'get_host_for_workspace': {
+      const workspacePath = typeof args?.workspacePath === 'string' ? args.workspacePath : '';
+      if (workspacePath.startsWith('ssh://')) {
+        const hostname = workspacePath.slice('ssh://'.length).split('/')[0];
+        const found = mockHosts.find((h) => h.hostname === hostname);
+        if (found) return { ...found };
+      }
+      return { ...mockHosts[0] };
+    }
 
     case 'create_terminal': {
       const workspacePath = typeof args?.workspacePath === 'string' ? args.workspacePath : '';

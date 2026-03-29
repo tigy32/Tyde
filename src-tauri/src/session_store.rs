@@ -39,6 +39,7 @@ struct StoreFile {
 pub struct SessionStore {
     records: HashMap<String, SessionRecord>,
     path: PathBuf,
+    dirty: bool,
 }
 
 impl SessionStore {
@@ -77,10 +78,14 @@ impl SessionStore {
                 ));
             }
         };
-        Ok(Self { records, path })
+        Ok(Self {
+            records,
+            path,
+            dirty: false,
+        })
     }
 
-    fn save(&self) -> Result<(), String> {
+    fn save(&mut self) -> Result<(), String> {
         let store_file = StoreFile {
             records: self.records.clone(),
         };
@@ -95,7 +100,17 @@ impl SessionStore {
                 "Failed to write session store to {}: {err}",
                 self.path.display()
             )
-        })
+        })?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), String> {
+        if self.dirty {
+            self.save()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&SessionRecord> {
@@ -145,7 +160,7 @@ impl SessionStore {
         if let Some(record) = self.records.get_mut(id) {
             record.backend_session_id = Some(backend_session_id.to_string());
             record.updated_at_ms = now_ms();
-            self.save()?;
+            self.dirty = true;
         }
         Ok(())
     }
@@ -154,7 +169,7 @@ impl SessionStore {
         if let Some(record) = self.records.get_mut(id) {
             record.alias = Some(alias.to_string());
             record.updated_at_ms = now_ms();
-            self.save()?;
+            self.dirty = true;
         }
         Ok(())
     }
@@ -176,7 +191,7 @@ impl SessionStore {
         if let Some(record) = self.records.get_mut(id) {
             record.parent_id = Some(parent_id.to_string());
             record.updated_at_ms = now_ms();
-            self.save()?;
+            self.dirty = true;
         }
         Ok(())
     }
@@ -185,7 +200,7 @@ impl SessionStore {
         if let Some(record) = self.records.get_mut(id) {
             record.message_count += 1;
             record.updated_at_ms = now_ms();
-            self.save()?;
+            self.dirty = true;
         }
         Ok(())
     }

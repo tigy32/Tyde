@@ -12,6 +12,7 @@ mod driver_mcp_http;
 mod file_service;
 mod file_watch;
 mod git_service;
+pub mod host;
 mod kiro;
 mod remote;
 mod session_store;
@@ -172,34 +173,26 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
             // Create session store record for this sub-agent
             {
                 let workspace_root = self.workspace_roots.first().map(|s| s.as_str());
-                match self
-                    .session_store
+                let parent_tyde_id = self
+                    .conversation_to_session
                     .lock()
-                    .create(&self.backend_kind, workspace_root)
-                {
+                    .get(&self.parent_conversation_id)
+                    .cloned();
+                let mut store = self.session_store.lock();
+                match store.create(&self.backend_kind, workspace_root) {
                     Ok(record) => {
                         let sub_sid = record.id;
-                        let parent_tyde_id = self
-                            .conversation_to_session
-                            .lock()
-                            .get(&self.parent_conversation_id)
-                            .cloned();
                         if let Some(ref parent_id) = parent_tyde_id {
-                            if let Err(err) =
-                                self.session_store.lock().set_parent(&sub_sid, parent_id)
-                            {
+                            if let Err(err) = store.set_parent(&sub_sid, parent_id) {
                                 tracing::error!("Failed to set sub-agent parent_id: {err}");
                             }
                         }
                         if !agent_info.name.is_empty() && !is_generic_agent_name(&agent_info.name) {
-                            if let Err(err) = self
-                                .session_store
-                                .lock()
-                                .set_alias(&sub_sid, &agent_info.name)
-                            {
+                            if let Err(err) = store.set_alias(&sub_sid, &agent_info.name) {
                                 tracing::error!("Failed to set sub-agent alias: {err}");
                             }
                         }
+                        drop(store);
                         self.conversation_to_session
                             .lock()
                             .insert(conversation_id, sub_sid);
@@ -368,8 +361,10 @@ pub(crate) struct AppState {
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
     session_store: Arc<SyncMutex<SessionStore>>,
+    host_store: SyncMutex<host::HostStore>,
     conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
     mcp_http_enabled: SyncMutex<bool>,
+    mcp_control_enabled: SyncMutex<bool>,
     driver_mcp_http_enabled: SyncMutex<bool>,
     driver_mcp_http_autoload: SyncMutex<bool>,
     driver_mcp_http_env_override: bool,
@@ -377,7 +372,6 @@ pub(crate) struct AppState {
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
-    default_backend: SyncMutex<String>,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
     dev_instance: SyncMutex<Option<dev_instance::DevInstance>>,
@@ -393,19 +387,22 @@ struct ChatEventPayload {
 struct AppSettings {
     #[serde(default = "default_mcp_http_enabled")]
     mcp_http_enabled: bool,
+    #[serde(default = "default_mcp_control_enabled")]
+    mcp_control_enabled: bool,
     #[serde(default = "default_driver_mcp_http_enabled")]
     driver_mcp_http_enabled: bool,
     #[serde(default = "default_driver_mcp_http_autoload")]
     driver_mcp_http_autoload: bool,
-    #[serde(default = "default_backend")]
+    // Legacy field — kept for serde backward compat, no longer read.
+    #[serde(default)]
     default_backend: String,
 }
 
-fn default_backend() -> String {
-    "tycode".to_string()
+fn default_mcp_http_enabled() -> bool {
+    true
 }
 
-fn default_mcp_http_enabled() -> bool {
+fn default_mcp_control_enabled() -> bool {
     true
 }
 
@@ -421,9 +418,10 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             mcp_http_enabled: default_mcp_http_enabled(),
+            mcp_control_enabled: default_mcp_control_enabled(),
             driver_mcp_http_enabled: default_driver_mcp_http_enabled(),
             driver_mcp_http_autoload: default_driver_mcp_http_autoload(),
-            default_backend: default_backend(),
+            default_backend: String::new(),
         }
     }
 }
@@ -832,9 +830,10 @@ fn app_settings_from_state(state: &AppState) -> AppSettings {
     };
     AppSettings {
         mcp_http_enabled: *state.mcp_http_enabled.lock(),
+        mcp_control_enabled: *state.mcp_control_enabled.lock(),
         driver_mcp_http_enabled: driver_enabled,
         driver_mcp_http_autoload: driver_autoload,
-        default_backend: state.default_backend.lock().clone(),
+        default_backend: String::new(),
     }
 }
 
@@ -913,21 +912,27 @@ fn summarize_value_for_debug(value: &Value) -> Value {
 fn startup_mcp_servers_for_new_sessions(
     state: &AppState,
     include_agent_control: bool,
+    workspace_roots: &[String],
 ) -> Result<Vec<StartupMcpServer>, String> {
-    startup_mcp_servers_for_agent(state, include_agent_control, None)
+    startup_mcp_servers_for_agent(state, include_agent_control, None, workspace_roots)
 }
 
 fn startup_mcp_servers_for_agent(
     state: &AppState,
     include_agent_control: bool,
     caller_agent_id: Option<u64>,
+    _workspace_roots: &[String],
 ) -> Result<Vec<StartupMcpServer>, String> {
     let mut servers = Vec::new();
 
     if include_agent_control {
-        let control_enabled = *state.mcp_http_enabled.lock();
-        if !control_enabled {
+        let server_enabled = *state.mcp_http_enabled.lock();
+        if !server_enabled {
             return Err("Tyde MCP control server must be enabled for Bridge chats".to_string());
+        }
+        let control_enabled = *state.mcp_control_enabled.lock();
+        if !control_enabled {
+            return Err("MCP control injection is disabled".to_string());
         }
 
         let Some(url) = agent_mcp_http::agent_mcp_http_server_url() else {
@@ -1154,14 +1159,50 @@ fn is_valid_session_id(session_id: &str) -> bool {
 fn resolve_requested_backend_kind(
     state: &AppState,
     backend_kind: Option<String>,
+    workspace_roots: &[String],
 ) -> Result<BackendKind, String> {
-    match backend_kind {
-        Some(raw) if !raw.trim().is_empty() => raw.parse::<BackendKind>(),
-        _ => {
-            let stored = state.default_backend.lock();
-            Ok(stored.parse::<BackendKind>().unwrap_or(BackendKind::Tycode))
-        }
+    let host = resolve_host_for_roots(state, workspace_roots)?;
+
+    let kind = match backend_kind {
+        Some(raw) if !raw.trim().is_empty() => raw.parse::<BackendKind>()?,
+        _ => host
+            .default_backend
+            .parse::<BackendKind>()
+            .unwrap_or(BackendKind::Tycode),
+    };
+
+    if !host.enabled_backends.iter().any(|b| b == kind.as_str()) {
+        return Err(format!(
+            "Backend '{}' is not enabled for host '{}'",
+            kind.as_str(),
+            host.label
+        ));
     }
+
+    Ok(kind)
+}
+
+fn resolve_host_for_roots(
+    state: &AppState,
+    workspace_roots: &[String],
+) -> Result<host::Host, String> {
+    let store = state.host_store.lock();
+    let first_root = workspace_roots.first().map(|s| s.as_str()).unwrap_or("");
+    if let Some(remote) = parse_remote_path(first_root) {
+        for h in store.list() {
+            if !h.is_local && h.hostname == remote.host {
+                return Ok(h);
+            }
+        }
+        return Err(format!(
+            "Remote host '{}' is not registered. Open Settings → Hosts to add it.",
+            remote.host
+        ));
+    }
+    store
+        .get("local")
+        .cloned()
+        .ok_or_else(|| "Local host not found in host store".to_string())
 }
 
 async fn resolve_backend_executable_path(
@@ -1263,8 +1304,25 @@ fn check_backend_dependencies() -> BackendDependencyStatus {
 }
 
 #[tauri::command]
-async fn query_backend_usage(backend_kind: String) -> Result<Value, String> {
-    usage::query_backend_usage(&backend_kind).await
+async fn query_backend_usage(
+    state: tauri::State<'_, AppState>,
+    backend_kind: String,
+    host_id: Option<String>,
+) -> Result<Value, String> {
+    let ssh_host = if let Some(id) = host_id.as_deref() {
+        let store = state.host_store.lock();
+        let host = store
+            .get(id)
+            .ok_or_else(|| format!("Host '{id}' not found"))?;
+        if host.is_local {
+            None
+        } else {
+            Some(host.hostname.clone())
+        }
+    } else {
+        None
+    };
+    usage::query_backend_usage_for_host(&backend_kind, ssh_host.as_deref()).await
 }
 
 #[tauri::command]
@@ -1396,7 +1454,7 @@ async fn create_conversation(
     ephemeral: Option<bool>,
     conversation_mode: Option<String>,
 ) -> Result<CreateConversationResponse, String> {
-    let backend_kind = resolve_requested_backend_kind(&state, backend_kind)?;
+    let backend_kind = resolve_requested_backend_kind(&state, backend_kind, &workspace_roots)?;
     let ephemeral = ephemeral.unwrap_or(false);
     let include_agent_control = matches!(
         conversation_mode
@@ -1418,8 +1476,12 @@ async fn create_conversation(
 
     let resolved_path =
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
-    let startup_mcp_servers =
-        startup_mcp_servers_for_agent(state.inner(), include_agent_control, reserved_agent_id)?;
+    let startup_mcp_servers = startup_mcp_servers_for_agent(
+        state.inner(),
+        include_agent_control,
+        reserved_agent_id,
+        &workspace_roots,
+    )?;
     let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
@@ -1638,6 +1700,11 @@ async fn forward_events(
             tracing::warn!("Failed to emit chat event: {e:?}");
         }
     }
+
+    // Flush any pending session store writes when the event stream ends.
+    if let Err(err) = session_store.lock().flush() {
+        tracing::error!("Failed to flush session store at conversation end: {err}");
+    }
 }
 
 fn emit_subprocess_exit(app: &tauri::AppHandle, conversation_id: u64) {
@@ -1817,17 +1884,11 @@ pub(crate) async fn spawn_agent_internal(
         }
     }
 
-    let backend_kind = resolve_requested_backend_kind(state, backend_kind)?;
-    {
-        let disabled = state.disabled_backends.lock();
-        if disabled.contains(backend_kind.as_str()) {
-            return Err(format!("Backend '{}' is disabled", backend_kind.as_str()));
-        }
-    }
+    let backend_kind = resolve_requested_backend_kind(state, backend_kind, &workspace_roots)?;
     let ephemeral = ephemeral.unwrap_or(false);
     let resolved_path =
         resolve_backend_executable_path(app, &workspace_roots, backend_kind).await?;
-    let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state, false)?;
+    let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state, false, &workspace_roots)?;
     let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
@@ -2695,13 +2756,81 @@ fn set_driver_mcp_http_server_autoload_enabled(
 }
 
 #[tauri::command]
-fn set_default_backend(state: tauri::State<'_, AppState>, backend: String) -> Result<(), String> {
-    // Validate that the backend kind is known.
-    backend
-        .parse::<BackendKind>()
-        .map_err(|e| format!("Invalid backend kind: {e}"))?;
-    *state.default_backend.lock() = backend;
+fn set_mcp_control_enabled(state: tauri::State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    *state.mcp_control_enabled.lock() = enabled;
     save_app_settings(&app_settings_from_state(&state))
+}
+
+#[tauri::command]
+fn list_hosts(state: tauri::State<'_, AppState>) -> Result<Vec<host::Host>, String> {
+    let store = state.host_store.lock();
+    Ok(store.list())
+}
+
+#[tauri::command]
+fn add_host(
+    state: tauri::State<'_, AppState>,
+    label: String,
+    hostname: String,
+) -> Result<host::Host, String> {
+    let mut store = state.host_store.lock();
+    store.add(label, hostname)
+}
+
+#[tauri::command]
+fn remove_host(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut store = state.host_store.lock();
+    store.remove(&id)
+}
+
+#[tauri::command]
+fn update_host_label(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    label: String,
+) -> Result<(), String> {
+    let mut store = state.host_store.lock();
+    store.update_label(&id, label)
+}
+
+#[tauri::command]
+fn update_host_enabled_backends(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    backends: Vec<String>,
+) -> Result<(), String> {
+    let mut store = state.host_store.lock();
+    store.update_enabled_backends(&id, backends)
+}
+
+#[tauri::command]
+fn update_host_default_backend(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    backend: String,
+) -> Result<(), String> {
+    let mut store = state.host_store.lock();
+    store.update_default_backend(&id, backend)
+}
+
+#[tauri::command]
+fn get_host_for_workspace(
+    state: tauri::State<'_, AppState>,
+    workspace_path: String,
+) -> Result<host::Host, String> {
+    let store = state.host_store.lock();
+    if let Some(remote) = parse_remote_path(&workspace_path) {
+        for h in store.list() {
+            if !h.is_local && h.hostname == remote.host {
+                return Ok(h);
+            }
+        }
+        return Err(format!("Remote host '{}' is not registered", remote.host));
+    }
+    store
+        .get("local")
+        .cloned()
+        .ok_or_else(|| "Local host not found".to_string())
 }
 
 #[tauri::command]
@@ -3001,7 +3130,7 @@ async fn create_admin_subprocess(
     workspace_roots: Vec<String>,
     backend_kind: Option<String>,
 ) -> Result<u64, String> {
-    let backend_kind = resolve_requested_backend_kind(&state, backend_kind)?;
+    let backend_kind = resolve_requested_backend_kind(&state, backend_kind, &workspace_roots)?;
     let path = resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
     let (session, rx) = BackendSession::spawn_admin(backend_kind, &path, &workspace_roots).await?;
 
@@ -3402,7 +3531,8 @@ async fn restart_subprocess(
 
     let resolved_path =
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
-    let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state.inner(), false)?;
+    let startup_mcp_servers =
+        startup_mcp_servers_for_new_sessions(state.inner(), false, &workspace_roots)?;
     let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
@@ -3618,6 +3748,14 @@ fn detect_system_dark_mode() -> bool {
 }
 
 pub fn run() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     #[cfg(unix)]
     raise_fd_limit();
 
@@ -3649,12 +3787,18 @@ pub fn run() {
                     .unwrap_or_else(|_| PathBuf::from("session-store.json"));
                 SessionStore::load(path).expect("failed to load session store")
             })),
+            host_store: SyncMutex::new({
+                let path = resolve_tyde_app_settings_path()
+                    .map(|p| p.parent().unwrap().join("hosts.json"))
+                    .unwrap_or_else(|_| PathBuf::from("hosts.json"));
+                host::HostStore::load(path).expect("failed to load host store")
+            }),
             conversation_to_session: Arc::new(SyncMutex::new(HashMap::new())),
             mcp_http_enabled: SyncMutex::new(app_settings.mcp_http_enabled),
+            mcp_control_enabled: SyncMutex::new(app_settings.mcp_control_enabled),
             driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
             driver_mcp_http_autoload: SyncMutex::new(app_settings.driver_mcp_http_autoload),
             driver_mcp_http_env_override,
-            default_backend: SyncMutex::new(app_settings.default_backend),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
@@ -3725,7 +3869,14 @@ pub fn run() {
             get_driver_mcp_http_server_settings,
             set_driver_mcp_http_server_enabled,
             set_driver_mcp_http_server_autoload_enabled,
-            set_default_backend,
+            set_mcp_control_enabled,
+            list_hosts,
+            add_host,
+            remove_host,
+            update_host_label,
+            update_host_enabled_backends,
+            update_host_default_backend,
+            get_host_for_workspace,
             submit_debug_ui_response,
             get_settings,
             list_models,
@@ -3860,11 +4011,18 @@ mod tests {
             session_store: Arc::new(SyncMutex::new(
                 SessionStore::load(tmp_path).expect("failed to create test session store"),
             )),
+            host_store: SyncMutex::new({
+                let tmp_host_path = std::env::temp_dir().join(format!(
+                    "tyde-test-host-store-{}.json",
+                    uuid::Uuid::new_v4()
+                ));
+                host::HostStore::load(tmp_host_path).expect("failed to create test host store")
+            }),
             conversation_to_session: Arc::new(SyncMutex::new(HashMap::new())),
             mcp_http_enabled: SyncMutex::new(true),
+            mcp_control_enabled: SyncMutex::new(true),
             driver_mcp_http_enabled: SyncMutex::new(false),
             driver_mcp_http_autoload: SyncMutex::new(false),
-            default_backend: SyncMutex::new("tycode".to_string()),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),

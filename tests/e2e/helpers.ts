@@ -106,6 +106,18 @@ export const sel = {
   settingsSelect: '[data-testid="settings-select"]',
   settingsCardName: '[data-testid="settings-card-name"]',
   settingsLabel: '[data-testid="settings-label"]',
+  settingsHostSelect: '[data-testid="settings-host-select"]',
+  settingsHostAdd: '[data-testid="settings-host-add"]',
+  settingsHostRemove: '[data-testid="settings-host-remove"]',
+
+  railHostHeader: '[data-testid="rail-host-header"]',
+  railHostAddBtn: '[data-testid="rail-host-add-btn"]',
+
+  remoteBrowserDialog: '[data-testid="remote-browser-dialog"]',
+  remoteBrowserPath: '[data-testid="remote-browser-path"]',
+  remoteBrowserList: '[data-testid="remote-browser-list"]',
+  remoteBrowserRow: '[data-testid="remote-browser-row"]',
+  remoteBrowserSelect: '[data-testid="remote-browser-select"]',
 
   // Notifications
   notificationError: '[data-testid="notification-error"]',

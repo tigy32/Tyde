@@ -3,18 +3,18 @@ import type { BackendDepResult, BackendKind, RuntimeAgent } from "./bridge";
 import {
   checkBackendDependencies as checkBackendDependenciesBridge,
   installBackendDependency as installBackendDependencyBridge,
+  listHosts,
+  updateHostEnabledBackends,
+  type Host,
 } from "./bridge";
 import { formatRelativeTime } from "./chat/message_renderer";
 import { formatShortcut } from "./keyboard";
 import type { Project, ProjectStateManager } from "./project_state";
+import { parseRemoteWorkspaceUri } from "./workspace";
 import {
   getCachedDependencyStatus,
-  getEnabledBackendPreferences,
-  getEnabledBackends,
   isOnboardingComplete,
   markOnboardingComplete,
-  setEnabledBackendPreferences,
-  syncDisabledBackendsToRust,
 } from "./settings";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -47,6 +47,7 @@ export class HomeView {
     null;
   private wizardInstallingBackends: Set<BackendKind> = new Set();
   private wizardInstallError: Map<BackendKind, string> = new Map();
+  private hosts: Host[] = [];
   onOpenWorkspace: (() => void) | null = null;
   onOpenRemoteWorkspace: (() => void) | null = null;
   onNewBridgeChat: ((backendOverride?: BackendKind) => void) | null = null;
@@ -63,6 +64,23 @@ export class HomeView {
   constructor(container: HTMLElement, projectState: ProjectStateManager) {
     this.container = container;
     this.projectState = projectState;
+  }
+
+  private getLocalHostEnabledBackends(): BackendKind[] {
+    const local = this.hosts.find((h) => h.is_local);
+    if (!local) return [];
+    return local.enabled_backends.filter((b): b is BackendKind =>
+      (["tycode", "codex", "claude", "kiro"] as string[]).includes(b),
+    );
+  }
+
+  refreshHosts(): void {
+    listHosts()
+      .then((hosts) => {
+        this.hosts = hosts;
+        this.render();
+      })
+      .catch((err) => console.error("Failed to load hosts:", err));
   }
 
   show(): void {
@@ -609,7 +627,7 @@ export class HomeView {
       { kind: "claude", label: "Claude" },
       { kind: "kiro", label: "Kiro" },
     ];
-    const enabledSet = new Set(getEnabledBackends());
+    const enabledSet = new Set(this.getLocalHostEnabledBackends());
     const backends = allBackends.filter((b) => enabledSet.has(b.kind));
     if (backends.length === 0) {
       const hint = document.createElement("div");
@@ -702,29 +720,56 @@ export class HomeView {
     const section = document.createElement("div");
     section.className = "home-projects-section";
 
-    const heading = document.createElement("h2");
-    heading.className = "home-section-title";
-    heading.textContent = "Open Projects";
-    section.appendChild(heading);
+    const grouped = this.groupProjectsByHost();
+
+    const localProjects = grouped.get("local") ?? [];
+    if (localProjects.length > 0) {
+      section.appendChild(this.buildHostSection("Local", localProjects));
+    }
+
+    for (const [hostname, projects] of grouped) {
+      if (hostname === "local") continue;
+      const host = this.hosts.find((h) => h.hostname === hostname);
+      const label = host ? host.label : hostname;
+      section.appendChild(this.buildHostSection(label, projects));
+    }
+
+    return section;
+  }
+
+  private groupProjectsByHost(): Map<string, Project[]> {
+    const groups = new Map<string, Project[]>();
+    groups.set("local", []);
+    for (const project of this.projectState.projects) {
+      const remote = parseRemoteWorkspaceUri(project.workspacePath);
+      const key = remote ? remote.host : "local";
+      const arr = groups.get(key) ?? [];
+      arr.push(project);
+      groups.set(key, arr);
+    }
+    return groups;
+  }
+
+  private buildHostSection(label: string, projects: Project[]): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    const title = document.createElement("h2");
+    title.className = "home-section-title";
+    title.textContent = label;
+    frag.appendChild(title);
 
     const grid = document.createElement("div");
     grid.className = "home-project-grid";
-
-    for (const project of this.projectState.projects) {
-      // Skip workbenches — they're rendered under their parent
+    for (const project of projects) {
       if (project.parentProjectId) continue;
       grid.appendChild(this.buildProjectCard(project));
-
-      const workbenches = this.projectState.getWorkbenches(project.id);
-      for (const wb of workbenches) {
+      for (const wb of this.projectState.getWorkbenches(project.id)) {
         const wbCard = this.buildProjectCard(wb);
         wbCard.classList.add("home-workbench-card");
         grid.appendChild(wbCard);
       }
     }
-
-    section.appendChild(grid);
-    return section;
+    frag.appendChild(grid);
+    return frag;
   }
 
   private buildProjectCard(project: Project): HTMLElement {
@@ -893,7 +938,7 @@ export class HomeView {
     const list = document.createElement("div");
     list.className = "home-wizard-backend-list";
 
-    const enabledPrefs = getEnabledBackendPreferences();
+    const enabledPrefs = this.getLocalHostEnabledBackends();
 
     for (const { kind, label, binary, description } of backends) {
       const dep = this.wizardDependencyStatus?.[kind];
@@ -928,15 +973,18 @@ export class HomeView {
       input.checked = enabledPrefs.includes(kind) && !depMissing;
       input.disabled = depMissing;
       input.addEventListener("change", () => {
-        const current = getEnabledBackendPreferences();
+        const current = [...this.getLocalHostEnabledBackends()];
         if (input.checked) {
           if (!current.includes(kind)) current.push(kind);
         } else {
           const idx = current.indexOf(kind);
           if (idx !== -1) current.splice(idx, 1);
         }
-        setEnabledBackendPreferences(current);
-        syncDisabledBackendsToRust();
+        updateHostEnabledBackends("local", current)
+          .then(() => this.refreshHosts())
+          .catch((err) =>
+            console.error("Failed to update backends:", err),
+          );
       });
       toggle.appendChild(input);
       const slider = document.createElement("span");
@@ -1030,7 +1078,7 @@ export class HomeView {
     title.textContent = "You\u2019re All Set";
     wizard.appendChild(title);
 
-    const enabledBackends = getEnabledBackends();
+    const enabledBackends = this.getLocalHostEnabledBackends();
     const text = document.createElement("p");
     text.className = "home-wizard-text";
     text.textContent =

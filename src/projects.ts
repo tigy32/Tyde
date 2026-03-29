@@ -1,5 +1,7 @@
 import type { Project, ProjectStateManager } from "./project_state";
 import { promptForText } from "./text_prompt";
+import { listHosts, type Host } from "./bridge";
+import { parseRemoteWorkspaceUri } from "./workspace";
 
 const AVATAR_COLORS = [
   "#e91e63",
@@ -23,6 +25,8 @@ export class ProjectSidebar {
   private onRemoveProject: (id: string) => void;
   onCreateWorkbench: ((parentProjectId: string) => void) | null = null;
   onRemoveWorkbench: ((projectId: string) => void) | null = null;
+  onAddRemoteProject: ((host: Host) => void) | null = null;
+  private hosts: Host[] = [];
 
   constructor(
     container: HTMLElement,
@@ -41,6 +45,15 @@ export class ProjectSidebar {
 
     this.stateManager.onChange = () => this.render();
     this.render();
+  }
+
+  refreshHosts(): void {
+    listHosts()
+      .then((hosts) => {
+        this.hosts = hosts;
+        this.render();
+      })
+      .catch((err) => console.error("Failed to load hosts:", err));
   }
 
   render(): void {
@@ -83,12 +96,14 @@ export class ProjectSidebar {
     homeItem.addEventListener("click", () => this.onSwitchToHome());
     this.container.appendChild(homeItem);
 
-    // Project list — render parents with their workbenches grouped
     const list = document.createElement("div");
     list.className = "rail-projects";
 
-    for (const project of this.stateManager.projects) {
-      // Skip workbenches here — they're rendered under their parent
+    const groupedByHost = this.groupProjectsByHost();
+
+    const localGroup = groupedByHost.get("local") ?? [];
+    list.appendChild(this.createHostGroupHeader("Local", null));
+    for (const project of localGroup) {
       if (project.parentProjectId) continue;
       list.appendChild(this.createProjectItem(project));
       for (const workbench of this.stateManager.getWorkbenches(project.id)) {
@@ -96,13 +111,44 @@ export class ProjectSidebar {
       }
     }
 
+    const remoteHostnames = new Set<string>();
+    for (const host of this.hosts) {
+      if (!host.is_local && host.hostname) remoteHostnames.add(host.hostname);
+    }
+    for (const hostname of groupedByHost.keys()) {
+      if (hostname !== "local") remoteHostnames.add(hostname);
+    }
+
+    const sortedRemoteHosts = Array.from(remoteHostnames).sort((a, b) =>
+      a.localeCompare(b),
+    );
+    for (const hostname of sortedRemoteHosts) {
+      const host = this.hosts.find((h) => h.hostname === hostname) ?? null;
+      const label = host ? host.label : hostname;
+      const projects = groupedByHost.get(hostname) ?? [];
+      list.appendChild(this.createHostGroupHeader(label, host));
+      if (projects.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "rail-host-empty";
+        empty.textContent = "No open projects";
+        list.appendChild(empty);
+        continue;
+      }
+      for (const project of projects) {
+        if (project.parentProjectId) continue;
+        list.appendChild(this.createProjectItem(project));
+        for (const workbench of this.stateManager.getWorkbenches(project.id)) {
+          list.appendChild(this.createWorkbenchItem(workbench));
+        }
+      }
+    }
+
     this.container.appendChild(list);
 
-    // Add button
     const addBtn = document.createElement("button");
     addBtn.className = "rail-add-btn";
     addBtn.dataset.testid = "rail-add-btn";
-    addBtn.innerHTML = '+<span class="rail-project-name">Add Project</span>';
+    addBtn.innerHTML = '+<span class="rail-project-name">Add Local Project</span>';
     addBtn.addEventListener("click", () => this.onAddProject());
     this.container.appendChild(addBtn);
 
@@ -312,5 +358,44 @@ export class ProjectSidebar {
     document
       .querySelectorAll(".rail-context-menu")
       .forEach((el) => el.remove());
+  }
+
+  private groupProjectsByHost(): Map<string, Project[]> {
+    const groups = new Map<string, Project[]>();
+    groups.set("local", []);
+    for (const project of this.stateManager.projects) {
+      const remote = parseRemoteWorkspaceUri(project.workspacePath);
+      const key = remote ? remote.host : "local";
+      const arr = groups.get(key) ?? [];
+      arr.push(project);
+      groups.set(key, arr);
+    }
+    return groups;
+  }
+
+  private createHostGroupHeader(label: string, host: Host | null): HTMLElement {
+    const header = document.createElement("div");
+    header.className = "rail-host-header";
+    header.dataset.testid = "rail-host-header";
+
+    const labelEl = document.createElement("span");
+    labelEl.className = "rail-host-label";
+    labelEl.textContent = label;
+    header.appendChild(labelEl);
+
+    if (host !== null && !host.is_local) {
+      const addBtn = document.createElement("button");
+      addBtn.className = "rail-host-add-btn";
+      addBtn.dataset.testid = "rail-host-add-btn";
+      addBtn.textContent = "+";
+      addBtn.title = `Add project from ${label}`;
+      addBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.onAddRemoteProject?.(host);
+      });
+      header.appendChild(addBtn);
+    }
+
+    return header;
   }
 }

@@ -5,11 +5,13 @@ import type {
   ChatEventPayload,
   ConversationRegisteredPayload,
   CreateWorkbenchEventPayload,
+  Host,
   DeleteWorkbenchEventPayload,
   McpHttpServerSettings,
   RuntimeAgent,
 } from "./bridge";
 import {
+  addHost,
   addRecentWorkspace,
   cancelConversation,
   closeConversation,
@@ -18,6 +20,7 @@ import {
   gitWorktreeRemove,
   installBackendDependency as installBackendDependencyBridge,
   interruptAgent,
+  listHosts,
   listAgents,
   onAdminEvent,
   onAgentChanged,
@@ -49,6 +52,7 @@ import {
   SettingsPanel,
 } from "./settings";
 import { promptForText } from "./text_prompt";
+import { RemoteBrowserDialog } from "./remote_browser_dialog";
 import {
   normalizeRemoteWorkspaceInput,
   parseRemoteWorkspaceUri,
@@ -66,6 +70,7 @@ export class AppController {
   private commandPalette!: CommandPalette;
   private settingsPanel!: SettingsPanel;
   private homeView!: HomeView;
+  private projectSidebar!: ProjectSidebar;
   private projectState!: ProjectStateManager;
   private connectionDialog = new ConnectionDialog();
   private settingsTabViewEl!: HTMLElement;
@@ -117,6 +122,7 @@ export class AppController {
 
     await initializeBackendDependencies();
     this.refreshAllBackendMenus();
+    await this.reconcileRustHostsWithProjects();
 
     // If the user previously enabled tycode but the binary is missing after an
     // app update, kick off a background install and notify. Don't block startup.
@@ -175,6 +181,37 @@ export class AppController {
   private getActiveView(): WorkspaceView | null {
     if (!this.activeWorkspaceId) return null;
     return this.workspaceViews.get(this.activeWorkspaceId) ?? null;
+  }
+
+  private getWorkspaceViewForHost(host: Host): WorkspaceView | null {
+    for (const project of this.projectState.projects) {
+      const view = this.workspaceViews.get(project.id);
+      if (!view) continue;
+      const remote = parseRemoteWorkspaceUri(project.workspacePath);
+      if (host.is_local && !remote) return view;
+      if (!host.is_local && remote?.host === host.hostname) return view;
+    }
+    if (host.is_local) return this.homeBridgeView;
+    return null;
+  }
+
+  private async handleSettingsHostChange(host: Host | null): Promise<void> {
+    if (!host) {
+      this.settingsPanel.adminId = null;
+      return;
+    }
+    const view = this.getWorkspaceViewForHost(host);
+    if (!view) {
+      this.settingsPanel.adminId = null;
+      return;
+    }
+    try {
+      const adminId = await view.ensureAdminSubprocess("tycode");
+      this.settingsPanel.adminId = adminId;
+    } catch (err) {
+      console.error("Failed to initialize admin subprocess for host:", err);
+      this.settingsPanel.adminId = null;
+    }
   }
 
   private getViewByAdminId(adminId: number): WorkspaceView | null {
@@ -238,7 +275,27 @@ export class AppController {
     this.settingsTabViewEl = settingsTabViewEl;
     this.settingsPanel = new SettingsPanel(settingsTabViewEl);
     this.settingsPanel.onClose = () => this.closeSettings();
-    this.settingsPanel.onBackendsChanged = () => this.refreshAllBackendMenus();
+    this.settingsPanel.onBackendsChanged = () => {
+      const hostRefreshes = Array.from(this.workspaceViews.values()).map(
+        (view) => view.refreshHostSettings(),
+      );
+      void Promise.all(hostRefreshes).then(() =>
+        this.refreshAllBackendMenus(),
+      );
+    };
+    this.settingsPanel.onHostChange = (host) => {
+      void this.handleSettingsHostChange(host);
+    };
+    this.settingsPanel.onHostsUpdated = () => {
+      if (this.projectSidebar) this.projectSidebar.refreshHosts();
+      if (this.homeView) this.homeView.refreshHosts();
+      const hostRefreshes = Array.from(this.workspaceViews.values()).map(
+        (view) => view.refreshHostSettings(),
+      );
+      void Promise.all(hostRefreshes).then(() =>
+        this.refreshAllBackendMenus(),
+      );
+    };
 
     settingsTabViewEl.classList.add("settings-overlay");
     const container = document.getElementById("workspace-container")!;
@@ -314,7 +371,7 @@ export class AppController {
     this.settingsPanel.onMcpHttpSettingsChange = (settings) => {
       this.handleBridgeControlSettingsChange(settings);
     };
-    this.settingsPanel.refreshMcpHttpServerSettings();
+    this.settingsPanel.notifySelectedHostChanged();
 
     const projectRail = document.getElementById("project-rail")!;
     const sidebar = new ProjectSidebar(
@@ -325,11 +382,18 @@ export class AppController {
       () => this.handleAddProject(),
       (id) => this.handleRemoveProject(id),
     );
+    this.projectSidebar = sidebar;
     sidebar.onCreateWorkbench = (parentId) => {
       void this.createWorkbench(parentId);
     };
     sidebar.onRemoveWorkbench = (projectId) => {
       void this.removeWorkbench(projectId);
+    };
+    sidebar.onAddRemoteProject = (host) => {
+      const dialog = new RemoteBrowserDialog(host, (sshUri) => {
+        void this.openWorkspacePath(sshUri);
+      });
+      dialog.show();
     };
 
     const sidebarOnChange = this.projectState.onChange;
@@ -760,7 +824,11 @@ export class AppController {
   private async openWorkspacePath(dir: string): Promise<void> {
     const remote = parseRemoteWorkspaceUri(dir);
     if (remote) {
+      await this.ensureRemoteHostRegistered(remote.host);
       await this.connectionDialog.show(remote.host);
+      this.settingsPanel.refreshHosts();
+      if (this.projectSidebar) this.projectSidebar.refreshHosts();
+      if (this.homeView) this.homeView.refreshHosts();
     }
 
     const displayName = workspaceDisplayName(dir);
@@ -817,6 +885,38 @@ export class AppController {
     }
 
     addRecentWorkspace(dir);
+  }
+
+  private async ensureRemoteHostRegistered(hostname: string): Promise<void> {
+    try {
+      const hosts = await listHosts();
+      if (hosts.some((host) => host.hostname === hostname)) return;
+      await addHost(hostname, hostname);
+    } catch (err) {
+      console.error("Failed to register remote host:", err);
+    }
+  }
+
+  private async reconcileRustHostsWithProjects(): Promise<void> {
+    try {
+      const hosts = await listHosts();
+      const known = new Set(hosts.map((host) => host.hostname));
+      const remoteHosts = new Set<string>();
+      for (const project of this.projectState.projects) {
+        const remote = parseRemoteWorkspaceUri(project.workspacePath);
+        if (!remote) continue;
+        remoteHosts.add(remote.host);
+      }
+      for (const remoteHost of remoteHosts) {
+        if (known.has(remoteHost)) continue;
+        await addHost(remoteHost, remoteHost);
+      }
+      this.settingsPanel.refreshHosts();
+      if (this.projectSidebar) this.projectSidebar.refreshHosts();
+      if (this.homeView) this.homeView.refreshHosts();
+    } catch (err) {
+      console.error("Failed to reconcile hosts from projects:", err);
+    }
   }
 
   private async openWorkspace(): Promise<void> {
@@ -1041,10 +1141,9 @@ export class AppController {
       return;
     }
     this.settingsPanel.refreshMcpHttpServerSettings();
-    const view = this.getActiveView();
-    if (view) {
-      this.settingsPanel.adminId = view.getAdminId();
-    }
+    this.settingsPanel.refreshDriverMcpHttpServerSettings();
+    this.settingsPanel.refreshHosts();
+    this.settingsPanel.notifySelectedHostChanged();
     if (tab) {
       this.settingsPanel.openToTab(tab);
     }

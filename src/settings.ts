@@ -17,11 +17,16 @@ import {
   type McpHttpServerSettings,
   normalizeBackendKind,
   queryBackendUsage as queryBackendUsageBridge,
-  setDefaultBackend as setDefaultBackendBridge,
-  setDisabledBackends as setDisabledBackendsBridge,
   setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
   setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
   setMcpHttpServerEnabled as setMcpHttpServerEnabledBridge,
+  listHosts as listHostsBridge,
+  addHost as addHostBridge,
+  removeHost as removeHostBridge,
+  updateHostEnabledBackends as updateHostEnabledBackendsBridge,
+  updateHostDefaultBackend as updateHostDefaultBackendsBridge,
+  setMcpControlEnabled as setMcpControlEnabledBridge,
+  type Host,
 } from "./bridge";
 import {
   broadcastToolOutputMode,
@@ -35,7 +40,7 @@ const APPEARANCE_STORAGE_KEY = "tyde-appearance";
 const ACTIVE_SETTINGS_TAB_KEY = "tyde-settings-active-tab";
 const ONBOARDING_COMPLETE_KEY = "tyde-onboarding-complete";
 const DEFAULT_SPAWN_PROFILE_STORAGE_KEY = "tyde-default-spawn-profile";
-const DEFAULT_BACKEND_STORAGE_KEY = "tyde-default-backend";
+const SELECTED_HOST_STORAGE_KEY = "tyde-selected-settings-host";
 
 const VALID_THEME = ["system", "dark", "light"] as const;
 type ThemeMode = (typeof VALID_THEME)[number];
@@ -105,6 +110,7 @@ type SettingsTabId = string;
 function loadActiveTab(): SettingsTabId {
   const stored = localStorage.getItem(ACTIVE_SETTINGS_TAB_KEY) ?? "appearance";
   if (stored.startsWith("codex")) return "general";
+  if (stored === "hosts") return "backends";
   return stored;
 }
 
@@ -112,33 +118,18 @@ function saveActiveTab(tab: SettingsTabId): void {
   localStorage.setItem(ACTIVE_SETTINGS_TAB_KEY, tab);
 }
 
+function loadSelectedHostId(): string | null {
+  return localStorage.getItem(SELECTED_HOST_STORAGE_KEY);
+}
+
+function saveSelectedHostId(hostId: string): void {
+  localStorage.setItem(SELECTED_HOST_STORAGE_KEY, hostId);
+}
+
 function normalizeProfileName(value: string | null): string | null {
   if (value === null) return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
-}
-
-export function getDefaultBackend(): BackendKind {
-  try {
-    return normalizeBackendKind(
-      localStorage.getItem(DEFAULT_BACKEND_STORAGE_KEY),
-    );
-  } catch (err) {
-    console.error("Failed to read default backend from localStorage:", err);
-    return "tycode";
-  }
-}
-
-export function setDefaultBackend(backend: string | null | undefined): void {
-  const normalized = normalizeBackendKind(backend);
-  try {
-    localStorage.setItem(DEFAULT_BACKEND_STORAGE_KEY, normalized);
-  } catch (err) {
-    console.error("Failed to save default backend to localStorage:", err);
-  }
-  setDefaultBackendBridge(normalized).catch((err) => {
-    console.error("Failed to sync default backend to Rust:", err);
-  });
 }
 
 export function getDefaultSpawnProfile(): string | null {
@@ -168,9 +159,8 @@ export function setDefaultSpawnProfile(profileName: string | null): void {
   }
 }
 
-// --- Backend enable/disable persistence ---
+// --- Backend dependencies ---
 
-const ENABLED_BACKENDS_STORAGE_KEY = "tyde-enabled-backends";
 const ALL_BACKENDS: BackendKind[] = ["tycode", "codex", "claude", "kiro"];
 type UsageAwareBackendKind = Exclude<BackendKind, "tycode" | "claude">;
 const USAGE_AWARE_BACKENDS: UsageAwareBackendKind[] = ["codex", "kiro"];
@@ -195,51 +185,10 @@ export function getCachedDependencyStatus(): Record<
   return cachedDependencyStatus;
 }
 
-export function getEnabledBackendPreferences(): BackendKind[] {
-  const raw = localStorage.getItem(ENABLED_BACKENDS_STORAGE_KEY);
-  if (!raw) return [...ALL_BACKENDS];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [...ALL_BACKENDS];
-    return parsed.filter((b: string) =>
-      (ALL_BACKENDS as string[]).includes(b),
-    ) as BackendKind[];
-  } catch {
-    return [...ALL_BACKENDS];
-  }
-}
-
-export function setEnabledBackendPreferences(backends: BackendKind[]): void {
-  localStorage.setItem(ENABLED_BACKENDS_STORAGE_KEY, JSON.stringify(backends));
-}
-
-export function isBackendEnabled(kind: BackendKind): boolean {
-  const prefs = getEnabledBackendPreferences();
-  if (!prefs.includes(kind)) return false;
-  if (cachedDependencyStatus && !cachedDependencyStatus[kind].available)
-    return false;
-  return true;
-}
-
-export function getEnabledBackends(): BackendKind[] {
-  return ALL_BACKENDS.filter(isBackendEnabled);
-}
-
-export function syncDisabledBackendsToRust(): void {
-  const disabled = ALL_BACKENDS.filter((b) => !isBackendEnabled(b));
-  setDisabledBackendsBridge(disabled).catch((err) => {
-    console.error("Failed to sync disabled backends to Rust:", err);
-  });
-}
-
 export async function initializeBackendDependencies(): Promise<void> {
   try {
     const status = await checkBackendDependenciesBridge();
     setCachedDependencyStatus(status);
-    syncDisabledBackendsToRust();
-    setDefaultBackendBridge(getDefaultBackend()).catch((err) => {
-      console.error("Failed to sync default backend to Rust:", err);
-    });
   } catch (err) {
     console.error("Failed to initialize backend dependencies:", err);
   }
@@ -250,14 +199,9 @@ export async function initializeBackendDependencies(): Promise<void> {
  * is no longer available (version bump after app update).
  */
 export function needsTycodeUpgrade(): boolean {
-  // Only trigger for users who explicitly set backend preferences before.
-  // When the key is absent, this is a first-time user — don't auto-install.
-  if (localStorage.getItem(ENABLED_BACKENDS_STORAGE_KEY) === null) return false;
-  const prefs = getEnabledBackendPreferences();
+  if (!isOnboardingComplete()) return false;
   const status = getCachedDependencyStatus();
-  return (
-    prefs.includes("tycode") && status !== null && !status.tycode.available
-  );
+  return status !== null && !status.tycode.available;
 }
 
 // --- Onboarding ---
@@ -471,10 +415,29 @@ export class SettingsPanel {
   onMcpHttpSettingsChange: ((settings: McpHttpServerSettings) => void) | null =
     null;
   onBackendsChanged: (() => void) | null = null;
+  onHostChange: ((host: Host | null) => void) | null = null;
+  onHostsUpdated: (() => void) | null = null;
 
   private container: HTMLElement;
   private appearance: AppearanceSettings;
   private backendSettings: Record<string, any> = {};
+  private moduleSchemas: any[] = [];
+  private profiles: string[] = [];
+  private activeProfile: string | null = null;
+  private defaultSpawnProfile: string | null = getDefaultSpawnProfile();
+  private activeTab: SettingsTabId;
+  private searchQuery = "";
+  private backendDependencyStatus: Record<
+    BackendKind,
+    BackendDepResult
+  > | null = null;
+  private installingBackends: Set<BackendKind> = new Set();
+  private backendInstallError: Map<BackendKind, string> = new Map();
+  private backendUsage: Partial<
+    Record<UsageAwareBackendKind, BackendUsageResult>
+  > = {};
+  private backendUsageLoading: Set<UsageAwareBackendKind> = new Set();
+  private backendUsageError: Map<UsageAwareBackendKind, string> = new Map();
   private mcpHttpServerSettings: McpHttpServerSettings = {
     enabled: true,
     running: false,
@@ -490,24 +453,9 @@ export class SettingsPanel {
   };
   private driverMcpHttpStatusLoading = false;
   private driverMcpHttpStatusError: string | null = null;
-  private moduleSchemas: any[] = [];
-  private profiles: string[] = [];
-  private activeProfile: string | null = null;
-  private defaultBackend: BackendKind = getDefaultBackend();
-  private defaultSpawnProfile: string | null = getDefaultSpawnProfile();
-  private activeTab: SettingsTabId;
-  private searchQuery = "";
-  private backendDependencyStatus: Record<
-    BackendKind,
-    BackendDepResult
-  > | null = null;
-  private installingBackends: Set<BackendKind> = new Set();
-  private backendInstallError: Map<BackendKind, string> = new Map();
-  private backendUsage: Partial<
-    Record<UsageAwareBackendKind, BackendUsageResult>
-  > = {};
-  private backendUsageLoading: Set<UsageAwareBackendKind> = new Set();
-  private backendUsageError: Map<UsageAwareBackendKind, string> = new Map();
+  private hosts: Host[] = [];
+  private hostsLoading = false;
+  private selectedHostId: string | null = loadSelectedHostId();
   private _adminId: number | null = null;
 
   get adminId(): number | null {
@@ -517,6 +465,13 @@ export class SettingsPanel {
   set adminId(id: number | null) {
     if (id === this._adminId) return;
     this._adminId = id;
+    this.backendSettings = {};
+    this.moduleSchemas = [];
+    this.profiles = [];
+    this.activeProfile = null;
+    this.rerenderBackendTabs();
+    this.renderModuleTabs();
+    this.syncProfileDropdown();
     if (id === null) return;
     adminGetSettings(id).catch((err) =>
       console.error("Failed to get admin settings:", err),
@@ -616,7 +571,6 @@ export class SettingsPanel {
           kiro: status.kiro,
         };
         setCachedDependencyStatus(status);
-        syncDisabledBackendsToRust();
         this.rerenderPanelContent("backends", () =>
           this.buildBackendsContent(),
         );
@@ -637,6 +591,130 @@ export class SettingsPanel {
     });
   }
 
+  private getSelectedHost(): Host | null {
+    if (this.hosts.length === 0) return null;
+    if (this.selectedHostId) {
+      const selected = this.hosts.find((h) => h.id === this.selectedHostId);
+      if (selected) return selected;
+    }
+    const local = this.hosts.find((h) => h.is_local);
+    return local ?? this.hosts[0];
+  }
+
+  private setSelectedHost(hostId: string, notify = true): void {
+    if (this.selectedHostId === hostId) return;
+    this.selectedHostId = hostId;
+    saveSelectedHostId(hostId);
+    this.backendUsage = {};
+    this.backendUsageError.clear();
+    this.backendUsageLoading.clear();
+    this.rerenderHostToolbar();
+    this.rerenderPanelContent("backends", () => this.buildBackendsContent());
+    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.syncProfileDropdown();
+    if (notify) this.notifySelectedHostChanged();
+  }
+
+  private ensureSelectedHost(notify = true): void {
+    const selected = this.getSelectedHost();
+    if (!selected) return;
+    const changed = this.selectedHostId !== selected.id;
+    if (changed) {
+      this.selectedHostId = selected.id;
+      saveSelectedHostId(selected.id);
+    }
+    if (notify && changed) this.notifySelectedHostChanged();
+  }
+
+  notifySelectedHostChanged(): void {
+    const host = this.getSelectedHost();
+    this.onHostChange?.(host);
+  }
+
+  private emitBridgeControlSettingsChange(): void {
+    this.onMcpHttpSettingsChange?.(this.mcpHttpServerSettings);
+  }
+
+  private buildHostToolbar(): HTMLElement {
+    const toolbar = el("div", { class: "settings-host-toolbar" });
+    toolbar.dataset.testid = "settings-host-toolbar";
+
+    const titleRow = el("div", { class: "settings-host-toolbar-header" });
+    const label = el(
+      "label",
+      { class: "settings-label settings-host-toolbar-label", "data-testid": "settings-label" },
+      "Settings Host",
+    );
+    label.setAttribute("for", "settings-host-select");
+    titleRow.appendChild(label);
+    const selectedHost = this.getSelectedHost();
+    const subtitle = el(
+      "p",
+      { class: "settings-description settings-host-toolbar-subtitle" },
+      selectedHost
+        ? selectedHost.is_local
+          ? "Local machine"
+          : selectedHost.hostname
+        : "No hosts configured",
+    );
+    titleRow.appendChild(subtitle);
+    toolbar.appendChild(titleRow);
+
+    const row = el("div", { class: "settings-profile-row settings-host-toolbar-row" });
+    const hostSelect = el("select", {
+      class: "settings-select settings-profile-select settings-host-select",
+      "aria-label": "Settings host",
+      id: "settings-host-select",
+      "data-testid": "settings-host-select",
+    }) as HTMLSelectElement;
+    hostSelect.disabled = this.hostsLoading || this.hosts.length === 0;
+    for (const host of this.hosts) {
+      const hostLabel = host.is_local ? host.label : `${host.label} • ${host.hostname}`;
+      const opt = el("option", { value: host.id }, hostLabel);
+      if (this.getSelectedHost()?.id === host.id) opt.selected = true;
+      hostSelect.appendChild(opt);
+    }
+    hostSelect.addEventListener("change", () => {
+      this.setSelectedHost(hostSelect.value);
+    });
+    row.appendChild(hostSelect);
+
+    const addBtn = el(
+      "button",
+      { class: "settings-host-toolbar-btn", type: "button", "data-testid": "settings-host-add" },
+      "Add Remote",
+    );
+    addBtn.addEventListener("click", () => this.showAddHostModal());
+    row.appendChild(addBtn);
+
+    if (selectedHost && !selectedHost.is_local) {
+      const removeBtn = el(
+        "button",
+        {
+          class: "settings-host-toolbar-btn settings-host-toolbar-btn-danger",
+          type: "button",
+          "data-testid": "settings-host-remove",
+        },
+        "Remove",
+      );
+      removeBtn.addEventListener("click", () => {
+        removeHostBridge(selectedHost.id)
+          .then(() => this.refreshHosts())
+          .catch((err) => console.error("Failed to remove host:", err));
+      });
+      row.appendChild(removeBtn);
+    }
+
+    toolbar.appendChild(row);
+    return toolbar;
+  }
+
+  private rerenderHostToolbar(): void {
+    const oldToolbar = this.container.querySelector(".settings-host-toolbar");
+    if (!oldToolbar) return;
+    oldToolbar.replaceWith(this.buildHostToolbar());
+  }
+
   // --- Render ---
 
   private render(): void {
@@ -655,6 +733,7 @@ export class SettingsPanel {
     closeBtn.dataset.testid = "settings-close";
     closeBtn.addEventListener("click", () => this.onClose?.());
     panel.appendChild(closeBtn);
+    panel.appendChild(this.buildHostToolbar());
 
     const layout = el("div", { class: "settings-layout" });
     const nav = el("nav", {
@@ -1197,7 +1276,8 @@ export class SettingsPanel {
       this.syncProfileDropdown();
     }
 
-    queryBackendUsageBridge(kind)
+    const hostId = this.getSelectedHost()?.id;
+    queryBackendUsageBridge(kind, hostId)
       .then((usage) => {
         this.backendUsage[kind] = usage;
         this.backendUsageError.delete(kind);
@@ -1442,6 +1522,14 @@ export class SettingsPanel {
 
   private buildBackendsContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    const selectedHost = this.getSelectedHost();
+    if (!selectedHost) {
+      frag.appendChild(
+        el("p", { class: "settings-description" }, "No hosts available."),
+      );
+      return frag;
+    }
+
     frag.appendChild(this.buildDefaultBackendSection());
     const toolbar = el("div", { class: "settings-backend-toolbar" });
     toolbar.appendChild(
@@ -1467,7 +1555,7 @@ export class SettingsPanel {
     );
     toolbar.appendChild(refreshAllBtn);
     frag.appendChild(toolbar);
-    const enabledPrefs = getEnabledBackendPreferences();
+    const enabledPrefs = selectedHost.enabled_backends;
 
     const backends: { kind: BackendKind; label: string; binary: string }[] = [
       { kind: "tycode", label: "Tycode", binary: "tycode-subprocess" },
@@ -1485,9 +1573,6 @@ export class SettingsPanel {
     const list = el("div", { class: "settings-backend-list" });
 
     for (const { kind, label, binary } of backends) {
-      const dep = this.backendDependencyStatus?.[kind];
-      const depMissing = dep !== undefined && !dep.available;
-
       const card = el("div", { class: "settings-backend-card" });
       const row = el("div", {
         class: "settings-toggle-row settings-backend-card-header",
@@ -1520,26 +1605,32 @@ export class SettingsPanel {
         type: "checkbox",
         "data-testid": `settings-backend-${kind}-enabled`,
       }) as HTMLInputElement;
-      input.checked = enabledPrefs.includes(kind) && !depMissing;
-      input.disabled = depMissing;
+      input.checked = enabledPrefs.includes(kind);
       input.addEventListener("change", () => {
-        const current = getEnabledBackendPreferences();
+        const current = [...selectedHost.enabled_backends];
         if (input.checked) {
           if (!current.includes(kind)) current.push(kind);
         } else {
           const idx = current.indexOf(kind);
           if (idx !== -1) current.splice(idx, 1);
         }
-        setEnabledBackendPreferences(current);
-        syncDisabledBackendsToRust();
-        this.syncProfileDropdown();
-        this.onBackendsChanged?.();
+        updateHostEnabledBackendsBridge(selectedHost.id, current)
+          .then(() => {
+            this.refreshHosts();
+            this.onBackendsChanged?.();
+          })
+          .catch((err) =>
+            console.error("Failed to update host backends:", err),
+          );
       });
       toggle.appendChild(input);
       toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
       row.appendChild(toggle);
       card.appendChild(row);
 
+      const dep = this.backendDependencyStatus?.[kind];
+      const depMissing =
+        selectedHost.is_local && dep !== undefined && !dep.available;
       if (depMissing) {
         card.appendChild(
           el(
@@ -1603,6 +1694,47 @@ export class SettingsPanel {
     return frag;
   }
 
+  // ========== HOST MANAGEMENT ==========
+
+  refreshHosts(): void {
+    this.hostsLoading = true;
+    listHostsBridge()
+      .then((hosts) => {
+        this.hosts = hosts;
+        this.ensureSelectedHost(true);
+      })
+      .catch((err) => {
+        console.error("Failed to load hosts:", err);
+      })
+      .finally(() => {
+        this.hostsLoading = false;
+        this.rerenderHostToolbar();
+        this.rerenderPanelContent("backends", () => this.buildBackendsContent());
+        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+        this.syncProfileDropdown();
+        this.onHostsUpdated?.();
+      });
+  }
+
+  private showAddHostModal(): void {
+    const fields: [string, string, string][] = [
+      ["label", "Display Name", ""],
+      ["hostname", "SSH Hostname (e.g. user@server.com)", ""],
+    ];
+    this.showGenericModal("Add Remote Host", fields, (values) => {
+      const label = values.label.trim();
+      const hostname = values.hostname.trim();
+      if (!label || !hostname) return;
+      addHostBridge(label, hostname)
+        .then((host) => {
+          this.selectedHostId = host.id;
+          saveSelectedHostId(host.id);
+          this.refreshHosts();
+        })
+        .catch((err) => console.error("Failed to add host:", err));
+    });
+  }
+
   // ========== GENERAL TAB ==========
 
   private buildGeneralPanel(): HTMLElement {
@@ -1619,6 +1751,16 @@ export class SettingsPanel {
 
   private buildGeneralContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    if (this.adminId === null) {
+      frag.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Open a workspace on the selected host to configure Tycode settings.",
+        ),
+      );
+      return frag;
+    }
     const section = el("div", { class: "settings-section" });
     const orderedKeys = [
       "model_quality",
@@ -1737,6 +1879,16 @@ export class SettingsPanel {
 
   private buildProvidersContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    if (this.adminId === null) {
+      frag.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Open a workspace on the selected host to configure providers.",
+        ),
+      );
+      return frag;
+    }
     const list = el("div", { class: "settings-card-list" });
 
     for (const entry of this.getProviderEntries()) {
@@ -2354,8 +2506,8 @@ export class SettingsPanel {
     toggle.appendChild(input);
     toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
     row.appendChild(toggle);
-
     field.appendChild(row);
+
     section.appendChild(field);
     return section;
   }
@@ -2418,9 +2570,7 @@ export class SettingsPanel {
     toggle.appendChild(input);
     toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
     row.appendChild(toggle);
-
     field.appendChild(row);
-
     const autoRow = el("div", { class: "settings-toggle-row" });
     const autoLabelCol = el("div", { class: "settings-toggle-label-col" });
     autoLabelCol.appendChild(
@@ -2493,6 +2643,16 @@ export class SettingsPanel {
 
   private buildMcpContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    if (this.adminId === null) {
+      frag.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Open a workspace on the selected host to configure MCP servers.",
+        ),
+      );
+      return frag;
+    }
     const list = el("div", { class: "settings-card-list" });
     for (const entry of this.getMcpEntries()) {
       list.appendChild(this.buildMcpCard(entry));
@@ -2718,6 +2878,16 @@ export class SettingsPanel {
 
   private buildAgentModelsContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    if (this.adminId === null) {
+      frag.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Open a workspace on the selected host to configure agent models.",
+        ),
+      );
+      return frag;
+    }
     const list = el("div", { class: "settings-card-list" });
     const models: Record<string, any> = this.backendSettings.agent_models ?? {};
 
@@ -2851,6 +3021,16 @@ export class SettingsPanel {
 
   private buildAdvancedContent(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    if (this.adminId === null) {
+      frag.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Open a workspace on the selected host to configure advanced settings.",
+        ),
+      );
+      return frag;
+    }
     const section = el("div", { class: "settings-section" });
 
     const toggleDefinitions: [string, string, string][] = [
@@ -3214,9 +3394,17 @@ export class SettingsPanel {
       "aria-label": "Default backend",
       "data-testid": "default-backend-select",
     });
+    const selectedHost = this.getSelectedHost();
+    backendSelect.disabled = !selectedHost;
     backendSelect.addEventListener("change", () => {
-      this.defaultBackend = normalizeBackendKind(backendSelect.value);
-      setDefaultBackend(this.defaultBackend);
+      const host = this.getSelectedHost();
+      if (!host) return;
+      const backend = normalizeBackendKind(backendSelect.value);
+      updateHostDefaultBackendsBridge(host.id, backend)
+        .then(() => this.refreshHosts())
+        .catch((err) =>
+          console.error("Failed to update host default backend:", err),
+        );
     });
     row.appendChild(backendSelect);
     wrapper.appendChild(row);
@@ -3239,6 +3427,7 @@ export class SettingsPanel {
       "aria-label": "Settings profile",
       "data-testid": "profile-select",
     });
+    (select as HTMLSelectElement).disabled = this.adminId === null;
     select.addEventListener("change", () => {
       if (this.adminId === null) return;
       adminSwitchProfile(this.adminId, select.value);
@@ -3250,6 +3439,7 @@ export class SettingsPanel {
       { class: "settings-refresh-btn", title: "Refresh profiles" },
       "↻",
     );
+    (refreshBtn as HTMLButtonElement).disabled = this.adminId === null;
     refreshBtn.addEventListener("click", () => {
       if (this.adminId === null) return;
       adminListProfiles(this.adminId);
@@ -3271,6 +3461,7 @@ export class SettingsPanel {
       "aria-label": "Default Tycode profile for new agents",
       "data-testid": "spawn-profile-select",
     });
+    (spawnSelect as HTMLSelectElement).disabled = this.adminId === null;
     spawnSelect.addEventListener("change", () => {
       const selected = normalizeProfileName(spawnSelect.value);
       this.defaultSpawnProfile = selected;
@@ -3296,7 +3487,15 @@ export class SettingsPanel {
 
     if (backendSelect) {
       backendSelect.innerHTML = "";
-      const enabledBackends = getEnabledBackends();
+      const selectedHost = this.getSelectedHost();
+      const enabledBackends = (selectedHost?.enabled_backends ?? []).filter(
+        (kind): kind is BackendKind =>
+          (ALL_BACKENDS as string[]).includes(kind) &&
+          (selectedHost?.is_local
+            ? (this.backendDependencyStatus?.[kind as BackendKind]?.available ??
+              true)
+            : true),
+      );
       const backendLabels: Record<BackendKind, string> = {
         tycode: "Tycode",
         codex: "Codex",
@@ -3305,21 +3504,38 @@ export class SettingsPanel {
       };
       for (const kind of enabledBackends) {
         const opt = el("option", { value: kind }, backendLabels[kind]);
-        if (kind === this.defaultBackend) opt.selected = true;
+        if (kind === normalizeBackendKind(selectedHost?.default_backend))
+          opt.selected = true;
         backendSelect.appendChild(opt);
       }
       if (
+        selectedHost &&
         enabledBackends.length > 0 &&
-        !enabledBackends.includes(this.defaultBackend)
+        !enabledBackends.includes(
+          normalizeBackendKind(selectedHost.default_backend),
+        )
       ) {
-        this.defaultBackend = enabledBackends[0];
-        setDefaultBackend(this.defaultBackend);
+        // Correct the host's default backend without cascading a full refresh
+        selectedHost.default_backend = enabledBackends[0];
+        void updateHostDefaultBackendsBridge(selectedHost.id, enabledBackends[0])
+          .catch((err) =>
+            console.error("Failed to update host default backend:", err),
+          );
       }
     }
 
     if (profileSelect) {
       profileSelect.innerHTML = "";
-      if (this.profiles.length === 0) {
+      profileSelect.disabled = this.adminId === null;
+      if (this.adminId === null) {
+        const opt = el(
+          "option",
+          { value: "", disabled: "true" },
+          "Not connected",
+        );
+        opt.selected = true;
+        profileSelect.appendChild(opt);
+      } else if (this.profiles.length === 0) {
         const opt = el(
           "option",
           { value: "", disabled: "true" },
@@ -3339,6 +3555,13 @@ export class SettingsPanel {
 
     if (!spawnSelect) return;
     spawnSelect.innerHTML = "";
+    spawnSelect.disabled = this.adminId === null;
+    if (this.adminId === null) {
+      const opt = el("option", { value: "", disabled: "true" }, "Not connected");
+      opt.selected = true;
+      spawnSelect.appendChild(opt);
+      return;
+    }
     if (this.profiles.length === 0) {
       const opt = el(
         "option",

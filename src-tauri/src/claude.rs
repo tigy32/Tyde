@@ -4519,41 +4519,54 @@ async fn list_claude_sessions_remote(
     host: &str,
     workspace_root: &str,
 ) -> Result<Vec<Value>, String> {
-    use crate::remote::{run_ssh_raw, shell_quote_arg};
+    use crate::remote::run_ssh_raw;
 
     let encoded = encode_workspace_root(workspace_root);
-    // List .jsonl files in the remote sessions directory.
-    // `ls -1` outputs one file per line. If the directory doesn't exist or has
-    // no matching files, we get empty output (exit 0 thanks to `|| true`).
-    let list_cmd = format!(
-        "dir=\"$HOME/.claude/projects/{encoded}\"; \
-         [ -d \"$dir\" ] && ls -1 \"$dir\" 2>/dev/null || true",
+    tracing::info!(
+        "list_claude_sessions_remote: host={host}, workspace_root={workspace_root}, encoded={encoded}"
     );
-    let output = run_ssh_raw(host, &list_cmd).await?;
-    let file_list = String::from_utf8_lossy(&output.stdout);
+    // Avoid transferring entire session files (can be megabytes) — instead
+    // extract metadata from head+tail in a single SSH round-trip.
+    let marker = "___TYDE_SESSION_BOUNDARY___";
+    let script = format!(
+        "dir=\"$HOME/.claude/projects/{encoded}\"; \
+         [ -d \"$dir\" ] || exit 0; \
+         for f in \"$dir\"/*.jsonl; do \
+           [ -f \"$f\" ] || continue; \
+           name=$(basename \"$f\"); \
+           cnt=$(grep -c '\"type\":\"' \"$f\" 2>/dev/null || echo 0); \
+           echo \"{marker}$name $cnt\"; \
+           head -5 \"$f\"; \
+           echo; \
+           tail -5 \"$f\"; \
+         done"
+    );
+    let output = run_ssh_raw(host, &script).await?;
+    let raw = String::from_utf8_lossy(&output.stdout);
 
     let mut sessions = Vec::new();
-    for line in file_list.lines() {
-        let name = line.trim();
-        if name.is_empty() || !name.ends_with(".jsonl") || name.starts_with("agent-") {
+    for chunk in raw.split(marker) {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
             continue;
         }
-
-        let remote_path = format!("$HOME/.claude/projects/{encoded}/{name}",);
-        let cat_cmd = format!("cat {}", shell_quote_arg(&remote_path));
-        let cat_output = run_ssh_raw(host, &cat_cmd)
-            .await
-            .map_err(|e| format!("Failed to read remote session file '{name}': {e}"))?;
-        if !cat_output.status.success() {
-            tracing::warn!("Failed to cat remote session '{name}', skipping");
+        let (header, contents) = match chunk.split_once('\n') {
+            Some((h, rest)) => (h.trim(), rest),
+            None => continue,
+        };
+        let (name, msg_count) = match header.rsplit_once(' ') {
+            Some((n, c)) => (n.trim(), c.trim().parse::<u64>().unwrap_or(0)),
+            None => (header, 0),
+        };
+        if !name.ends_with(".jsonl") || name.starts_with("agent-") {
             continue;
         }
-        let contents = String::from_utf8_lossy(&cat_output.stdout);
 
         let now = unix_now_ms();
-        if let Some(metadata) =
-            inspect_claude_session_contents(name, &contents, workspace_root, now, now)
+        if let Some(mut metadata) =
+            inspect_claude_session_contents(name, contents, workspace_root, now, now)
         {
+            metadata["message_count"] = serde_json::json!(msg_count);
             sessions.push(metadata);
         }
     }
@@ -4572,12 +4585,11 @@ async fn load_claude_session_history_remote(
     workspace_root: &str,
     session_id: &str,
 ) -> Result<ClaudeSessionReplay, String> {
-    use crate::remote::{run_ssh_raw, shell_quote_arg};
+    use crate::remote::run_ssh_raw;
 
     let encoded = encode_workspace_root(workspace_root);
     let id = normalize_nonempty(session_id).ok_or("Invalid session id")?;
-    let remote_path = format!("$HOME/.claude/projects/{encoded}/{id}.jsonl");
-    let cmd = format!("cat {}", shell_quote_arg(&remote_path));
+    let cmd = format!("cat \"$HOME/.claude/projects/{encoded}/{id}.jsonl\"");
     let output = run_ssh_raw(host, &cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4594,11 +4606,10 @@ async fn delete_claude_session_remote(
     workspace_root: &str,
     session_id: &str,
 ) -> Result<(), String> {
-    use crate::remote::{run_ssh_raw, shell_quote_arg};
+    use crate::remote::run_ssh_raw;
 
     let encoded = encode_workspace_root(workspace_root);
-    let remote_path = format!("$HOME/.claude/projects/{encoded}/{session_id}.jsonl");
-    let cmd = format!("rm -f {}", shell_quote_arg(&remote_path));
+    let cmd = format!("rm -f \"$HOME/.claude/projects/{encoded}/{session_id}.jsonl\"");
     let output = run_ssh_raw(host, &cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -5,6 +5,7 @@ import type {
   BackendKind,
   ChatEventPayload,
   ConversationMode,
+  Host,
   RuntimeAgent,
 } from "./bridge";
 import {
@@ -17,6 +18,7 @@ import {
   createAdminSubprocess,
   createConversation,
   exportSessionJson,
+  listHosts,
   normalizeBackendKind,
   onFileChanged,
   readFileContent,
@@ -44,14 +46,13 @@ import type { NotificationManager } from "./notifications";
 import { logTabPerf, perfNow } from "./perf_debug";
 import { SessionsPanel } from "./sessions";
 import {
-  getDefaultBackend,
   getDefaultSpawnProfile,
-  getEnabledBackends,
 } from "./settings";
 import type { TabState } from "./tabs";
 import { TabManager } from "./tabs";
 import { TerminalService } from "./terminal";
 import type { PanelType } from "./tiling/types";
+import { parseRemoteWorkspaceUri } from "./workspace";
 import { WorkflowBuilder } from "./workflows/builder";
 import { WorkflowEngine } from "./workflows/engine";
 import { WorkflowsPanel } from "./workflows/panel";
@@ -154,6 +155,9 @@ export class WorkspaceView {
   private centerNewTabMenuItems: Partial<
     Record<BackendKind, HTMLButtonElement>
   > = {};
+  private hostEnabledBackends: BackendKind[] | null = null;
+  private hostDefaultBackend: BackendKind | null = null;
+  private hostSettingsReady: Promise<void> = Promise.resolve();
   onConversationIdsChange: ((conversationIds: number[]) => void) | null = null;
   onAgentsChange: ((agents: AgentInfo[]) => void) | null = null;
   onRuntimeAgentAction:
@@ -177,6 +181,7 @@ export class WorkspaceView {
     ) {
       this.newConversationDisabledReason = config.bridgeChatDisabledReason;
     }
+    void this.refreshHostSettings();
 
     this.root = document.createElement("div");
     this.root.className = "workspace-view";
@@ -284,7 +289,7 @@ export class WorkspaceView {
       { kind: "claude", el: claudeMenuItem },
       { kind: "kiro", el: kiroMenuItem },
     ];
-    const enabledSet = new Set(getEnabledBackends());
+    const enabledSet = new Set(this.getWorkspaceEnabledBackends());
     if (enabledSet.size === 0) {
       const hint = document.createElement("div");
       hint.className = "center-tab-new-menu-empty";
@@ -790,11 +795,62 @@ export class WorkspaceView {
     );
   }
 
+  async refreshHostSettings(): Promise<void> {
+    const p = this._doRefreshHostSettings();
+    this.hostSettingsReady = p;
+    return p;
+  }
+
+  private async _doRefreshHostSettings(): Promise<void> {
+    try {
+      const hosts = await listHosts();
+      const host = this.resolveHostForWorkspace(hosts);
+      if (!host) return;
+
+      const nextEnabled = host.enabled_backends
+        .map((kind) => normalizeBackendKind(kind))
+        .filter((kind, index, list) => list.indexOf(kind) === index);
+      const nextDefault = normalizeBackendKind(host.default_backend);
+
+      const enabledChanged =
+        !this.hostEnabledBackends ||
+        this.hostEnabledBackends.length !== nextEnabled.length ||
+        this.hostEnabledBackends.some((kind, idx) => kind !== nextEnabled[idx]);
+      const defaultChanged = this.hostDefaultBackend !== nextDefault;
+
+      this.hostEnabledBackends = nextEnabled;
+      this.hostDefaultBackend = nextDefault;
+
+      if (enabledChanged || defaultChanged) {
+        this.refreshNewChatMenu();
+      }
+    } catch (err) {
+      console.error("Failed to load host settings for workspace:", err);
+    }
+  }
+
+  private resolveHostForWorkspace(hosts: Host[]): Host | null {
+    const remote = parseRemoteWorkspaceUri(this.workspacePath);
+    if (remote) {
+      return hosts.find((host) => host.hostname === remote.host) ?? null;
+    }
+    return hosts.find((host) => host.is_local) ?? null;
+  }
+
+  private getWorkspaceEnabledBackends(): BackendKind[] {
+    if (!this.hostEnabledBackends) return [];
+    return [...this.hostEnabledBackends];
+  }
+
+  private getWorkspaceDefaultBackend(): BackendKind | null {
+    return this.hostDefaultBackend;
+  }
+
   refreshNewChatMenu(): void {
     const menu = this.centerNewTabMenu;
     if (!menu) return;
     while (menu.firstChild) menu.removeChild(menu.firstChild);
-    const enabledSet = new Set(getEnabledBackends());
+    const enabledSet = new Set(this.getWorkspaceEnabledBackends());
     if (enabledSet.size === 0) {
       const hint = document.createElement("div");
       hint.className = "center-tab-new-menu-empty";
@@ -1209,6 +1265,7 @@ export class WorkspaceView {
     options?: { bootstrap?: boolean },
   ): Promise<number> {
     this.ensureConversationCreationAllowed();
+    await this.hostSettingsReady;
     const backendKind = this.resolveConversationBackend(backendOverride);
 
     // Show tab with loading state BEFORE blocking subprocess spawn
@@ -1300,7 +1357,7 @@ export class WorkspaceView {
   }
 
   private supportedSessionBackends(): BackendKind[] {
-    const enabled = new Set(getEnabledBackends());
+    const enabled = new Set(this.getWorkspaceEnabledBackends());
     const backends: BackendKind[] = [];
     if (enabled.has("tycode")) backends.push("tycode");
     if (
@@ -2134,13 +2191,13 @@ export class WorkspaceView {
   private resolveConversationBackend(
     preferredBackend?: BackendKind,
   ): BackendKind {
-    const preferred = preferredBackend ?? getDefaultBackend();
-    const enabled = getEnabledBackends();
+    const enabled = this.getWorkspaceEnabledBackends();
     if (enabled.length === 0) {
       throw new Error(
         "No backends are enabled. Enable at least one backend in Settings → Backends.",
       );
     }
+    const preferred = preferredBackend ?? this.getWorkspaceDefaultBackend() ?? enabled[0];
     if (!enabled.includes(preferred)) {
       const backendLabels: Record<string, string> = {
         tycode: "Tycode",

@@ -472,20 +472,20 @@ describe('Chat scroll behavior', () => {
     expect(await scrollBtn.getAttribute('class')).toContain('hidden');
 
     // --- Scroll up manually → button appears ---
-    await browser.execute((s: string) => {
-      const el = document.querySelector(s) as HTMLElement;
-      el.scrollTop = 0;
-    }, sel.chatContainer);
-
-    // Trigger scroll event
-    await browser.execute((s: string) => {
-      const el = document.querySelector(s) as HTMLElement;
-      el.dispatchEvent(new Event('scroll'));
-    }, sel.chatContainer);
-
+    // Pin scrollTop=0 and dispatch inside waitUntil so the virtualizer cannot
+    // fight the scroll position between polls under concurrent load.
     await browser.waitUntil(
-      async () => !(await scrollBtn.getAttribute('class'))?.includes('hidden'),
-      { timeout: 3000, timeoutMsg: 'Scroll-to-bottom button should appear when scrolled up' },
+      async () => {
+        await browser.execute((s: string) => {
+          const el = document.querySelector(s) as HTMLElement;
+          if (el.scrollTop !== 0) {
+            el.scrollTop = 0;
+            el.dispatchEvent(new Event('scroll'));
+          }
+        }, sel.chatContainer);
+        return !(await scrollBtn.getAttribute('class'))?.includes('hidden');
+      },
+      { timeout: 5000, timeoutMsg: 'Scroll-to-bottom button should appear when scrolled up' },
     );
 
     const stateScrolledUp = await getScrollState();

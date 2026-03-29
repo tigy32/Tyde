@@ -3142,6 +3142,67 @@ body {
   border-color: var(--accent-hover);
 }
 
+.remote-browser-card {
+  width: 520px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.remote-browser-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted, var(--text-tertiary));
+  padding: 6px 12px;
+  background: var(--bg-secondary);
+  border-radius: 4px;
+  margin-bottom: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remote-browser-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 200px;
+  max-height: 400px;
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  margin-bottom: 12px;
+}
+
+.remote-browser-row {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-primary) 50%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.remote-browser-row:hover {
+  background: var(--surface-hover);
+}
+
+.remote-browser-row:last-child {
+  border-bottom: none;
+}
+
+.remote-browser-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.remote-browser-error {
+  padding: 12px;
+  color: var(--color-error);
+  font-size: 13px;
+}
+
 .command-palette {
   background: var(--bg-secondary);
   border: 1px solid var(--border-secondary);
@@ -7633,6 +7694,53 @@ body {
   width: 0;
 }
 
+.rail-host-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px 4px;
+  margin-top: 8px;
+}
+
+.rail-host-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted, var(--text-tertiary));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rail-host-add-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted, var(--text-tertiary));
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.rail-host-add-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.05));
+}
+
+.rail-host-empty {
+  padding: 0 12px 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.collapsed .rail-host-header {
+  display: none;
+}
+
 .rail-add-btn {
   display: flex;
   align-items: center;
@@ -8941,6 +9049,65 @@ body {
   margin-bottom: 2px;
   border-top: 1px solid
     color-mix(in srgb, var(--border-primary) 65%, transparent);
+}
+
+.settings-host-toolbar {
+  margin: 8px 24px 0;
+  padding: 12px 0 10px;
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--border-primary) 65%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-host-toolbar-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.settings-host-toolbar-label {
+  margin: 0;
+}
+
+.settings-host-toolbar-subtitle {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.settings-host-toolbar-row {
+  align-items: center;
+}
+
+.settings-host-select {
+  min-width: 220px;
+}
+
+.settings-host-toolbar-btn {
+  border: 1px solid color-mix(in srgb, var(--border-primary) 85%, transparent);
+  background: color-mix(in srgb, var(--surface-2) 80%, transparent);
+  color: var(--text-secondary);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.settings-host-toolbar-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-secondary);
+  background: color-mix(in srgb, var(--surface-3) 76%, transparent);
+}
+
+.settings-host-toolbar-btn-danger {
+  color: var(--danger, #ff6b6b);
+  border-color: color-mix(in srgb, var(--danger, #ff6b6b) 35%, var(--border-primary));
 }
 
 .tab-title + .settings-profile-section {
