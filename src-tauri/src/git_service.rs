@@ -327,12 +327,14 @@ pub async fn git_current_branch(working_dir: &str) -> Result<String, String> {
 }
 
 pub async fn git_worktree_add(working_dir: &str, path: &str, branch: &str) -> Result<(), String> {
-    run_git(working_dir, &["worktree", "add", "-b", branch, path]).await?;
+    let local_path = parse_remote_path(path).map_or(path.to_string(), |r| r.path);
+    run_git(working_dir, &["worktree", "add", "-b", branch, &local_path]).await?;
     Ok(())
 }
 
 pub async fn git_worktree_remove(working_dir: &str, path: &str) -> Result<(), String> {
-    run_git(working_dir, &["worktree", "remove", "--force", path]).await?;
+    let local_path = parse_remote_path(path).map_or(path.to_string(), |r| r.path);
+    run_git(working_dir, &["worktree", "remove", "--force", &local_path]).await?;
     Ok(())
 }
 

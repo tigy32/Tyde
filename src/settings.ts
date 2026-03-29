@@ -1255,7 +1255,10 @@ export class SettingsPanel {
   }
 
   private refreshBackendUsage(force = false): void {
+    const host = this.getSelectedHost();
+    if (!host) return;
     for (const kind of USAGE_AWARE_BACKENDS) {
+      if (!host.enabled_backends.includes(kind)) continue;
       this.refreshSingleBackendUsage(kind, force);
     }
   }
@@ -1306,6 +1309,8 @@ export class SettingsPanel {
   }
 
   private isUsageBackendMissing(kind: UsageAwareBackendKind): boolean {
+    const host = this.getSelectedHost();
+    if (host && !host.is_local) return false;
     const dep = this.backendDependencyStatus?.[kind];
     return dep !== undefined && !dep.available;
   }
