@@ -540,7 +540,11 @@ export class AppController {
       if (project) return project;
     }
 
-    return this.resolveProjectForWorkspaceRoots(agent.workspace_roots);
+    return (
+      this.resolveProjectForWorkspaceRoots(agent.workspace_roots) ??
+      this.resolveProjectByParentAgent(agent.parent_agent_id) ??
+      this.resolveProjectByActiveView()
+    );
   }
 
   private shouldDisplayRuntimeAgent(agent: RuntimeAgent): boolean {
@@ -667,21 +671,25 @@ export class AppController {
   private handleConversationRegistered(
     payload: ConversationRegisteredPayload,
   ): void {
-    const project = this.resolveProjectForWorkspaceRoots(
+    let project = this.resolveProjectForWorkspaceRoots(
       payload.data.workspace_roots,
     );
     if (!project) {
-      console.error(
-        `ConversationRegistered: no project found for workspace_roots`,
-        payload.data.workspace_roots,
-      );
-      return;
+      project = this.resolveProjectByParentAgent(payload.data.parent_agent_id);
     }
-    const view = this.getOrCreateWorkspaceView(
-      project.id,
-      project.workspacePath,
-      project.name,
-    );
+    if (!project) {
+      project = this.resolveProjectByActiveView();
+    }
+    let view: WorkspaceView;
+    if (project) {
+      view = this.getOrCreateWorkspaceView(
+        project.id,
+        project.workspacePath,
+        project.name,
+      );
+    } else {
+      view = this.homeBridgeView;
+    }
 
     const agent: RuntimeAgent = {
       agent_id: payload.data.agent_id ?? 0,
@@ -728,6 +736,40 @@ export class AppController {
       bestLength = project.workspacePath.length;
     }
     return bestMatch;
+  }
+
+  private resolveProjectByParentAgent(
+    parentAgentId: number | null | undefined,
+  ): { id: string; workspacePath: string; name: string } | null {
+    if (parentAgentId == null) return null;
+    const parent = this.runtimeAgents.get(parentAgentId);
+    if (!parent) return null;
+    for (const [projectId, view] of this.workspaceViews) {
+      if (projectId === HOME_BRIDGE_VIEW_ID) continue;
+      if (!view.ownsConversation(parent.conversation_id)) continue;
+      const project = this.projectState.projects.find(
+        (entry) => entry.id === projectId,
+      );
+      if (project) return project;
+    }
+    return null;
+  }
+
+  private resolveProjectByActiveView(): {
+    id: string;
+    workspacePath: string;
+    name: string;
+  } | null {
+    if (
+      !this.activeWorkspaceId ||
+      this.activeWorkspaceId === HOME_BRIDGE_VIEW_ID
+    ) {
+      return null;
+    }
+    return (
+      this.projectState.projects.find((p) => p.id === this.activeWorkspaceId) ??
+      null
+    );
   }
 
   private normalizeWorkspacePath(path: string): string {
