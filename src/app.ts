@@ -932,7 +932,14 @@ export class AppController {
   private async openWorkspacePath(dir: string): Promise<void> {
     const remote = parseRemoteWorkspaceUri(dir);
     if (remote) {
-      await this.ensureRemoteHostRegistered(remote.host);
+      try {
+        await this.ensureRemoteHostRegistered(remote.host);
+      } catch (err) {
+        this.notifications.error(
+          `Failed to register remote host "${remote.host}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
       await this.connectionDialog.show(remote.host);
       this.settingsPanel.refreshHosts();
       if (this.projectSidebar) this.projectSidebar.refreshHosts();
@@ -996,13 +1003,9 @@ export class AppController {
   }
 
   private async ensureRemoteHostRegistered(hostname: string): Promise<void> {
-    try {
-      const hosts = await listHosts();
-      if (hosts.some((host) => host.hostname === hostname)) return;
-      await addHost(hostname, hostname);
-    } catch (err) {
-      console.error("Failed to register remote host:", err);
-    }
+    const hosts = await listHosts();
+    if (hosts.some((host) => host.hostname === hostname)) return;
+    await addHost(hostname, hostname);
   }
 
   private async reconcileRustHostsWithProjects(): Promise<void> {

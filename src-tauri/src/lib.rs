@@ -2992,11 +2992,33 @@ fn list_hosts(state: tauri::State<'_, AppState>) -> Result<Vec<host::Host>, Stri
 }
 
 #[tauri::command]
-fn add_host(
+async fn add_host(
     state: tauri::State<'_, AppState>,
     label: String,
     hostname: String,
 ) -> Result<host::Host, String> {
+    // Validate SSH connectivity before accepting the host.
+    let output = tokio::process::Command::new("ssh")
+        .args([
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            "-T",
+            &hostname,
+            "echo", "tycode-ok",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "SSH connection to '{}' failed: {}",
+            hostname,
+            stderr.trim()
+        ));
+    }
+
     let mut store = state.host_store.lock();
     store.add(label, hostname)
 }
