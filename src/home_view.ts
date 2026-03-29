@@ -2,20 +2,20 @@ import type { AgentCardAction } from "./agents";
 import type { BackendDepResult, BackendKind, RuntimeAgent } from "./bridge";
 import {
   checkBackendDependencies as checkBackendDependenciesBridge,
+  type Host,
   installBackendDependency as installBackendDependencyBridge,
   listHosts,
   updateHostEnabledBackends,
-  type Host,
 } from "./bridge";
 import { formatRelativeTime } from "./chat/message_renderer";
 import { formatShortcut } from "./keyboard";
 import type { Project, ProjectStateManager } from "./project_state";
-import { parseRemoteWorkspaceUri } from "./workspace";
 import {
   getCachedDependencyStatus,
   isOnboardingComplete,
   markOnboardingComplete,
 } from "./settings";
+import { parseRemoteWorkspaceUri } from "./workspace";
 
 const STATUS_COLORS: Record<string, string> = {
   active: "#4CAF50",
@@ -750,7 +750,10 @@ export class HomeView {
     return groups;
   }
 
-  private buildHostSection(label: string, projects: Project[]): DocumentFragment {
+  private buildHostSection(
+    label: string,
+    projects: Project[],
+  ): DocumentFragment {
     const frag = document.createDocumentFragment();
     const title = document.createElement("h2");
     title.className = "home-section-title";
@@ -982,9 +985,7 @@ export class HomeView {
         }
         updateHostEnabledBackends("local", current)
           .then(() => this.refreshHosts())
-          .catch((err) =>
-            console.error("Failed to update backends:", err),
-          );
+          .catch((err) => console.error("Failed to update backends:", err));
       });
       toggle.appendChild(input);
       const slider = document.createElement("span");

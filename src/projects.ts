@@ -1,6 +1,6 @@
+import { type Host, listHosts } from "./bridge";
 import type { Project, ProjectStateManager } from "./project_state";
 import { promptForText } from "./text_prompt";
-import { listHosts, type Host } from "./bridge";
 import { parseRemoteWorkspaceUri } from "./workspace";
 
 const AVATAR_COLORS = [
@@ -148,7 +148,8 @@ export class ProjectSidebar {
     const addBtn = document.createElement("button");
     addBtn.className = "rail-add-btn";
     addBtn.dataset.testid = "rail-add-btn";
-    addBtn.innerHTML = '+<span class="rail-project-name">Add Local Project</span>';
+    addBtn.innerHTML =
+      '+<span class="rail-project-name">Add Local Project</span>';
     addBtn.addEventListener("click", () => this.onAddProject());
     this.container.appendChild(addBtn);
 

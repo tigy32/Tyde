@@ -45,18 +45,16 @@ import { Layout, type PersistentWidgetId } from "./layout";
 import type { NotificationManager } from "./notifications";
 import { logTabPerf, perfNow } from "./perf_debug";
 import { SessionsPanel } from "./sessions";
-import {
-  getDefaultSpawnProfile,
-} from "./settings";
+import { getDefaultSpawnProfile } from "./settings";
 import type { TabState } from "./tabs";
 import { TabManager } from "./tabs";
 import { TerminalService } from "./terminal";
 import type { PanelType } from "./tiling/types";
-import { parseRemoteWorkspaceUri } from "./workspace";
 import { WorkflowBuilder } from "./workflows/builder";
 import { WorkflowEngine } from "./workflows/engine";
 import { WorkflowsPanel } from "./workflows/panel";
 import { WorkflowStore } from "./workflows/store";
+import { parseRemoteWorkspaceUri } from "./workspace";
 
 interface WorkspaceViewConfig {
   projectId: string;
@@ -459,7 +457,10 @@ export class WorkspaceView {
       this.workflowStore,
       this.workflowEngine,
     );
-    this.workflowBuilder = new WorkflowBuilder(this.workflowStore);
+    this.workflowBuilder = new WorkflowBuilder(
+      this.workflowStore,
+      config.workspacePath,
+    );
     this.workflowBuilder.onClose = () => {
       this.workflowStore.load().then(() => {
         this.workflowsPanel.render();
@@ -664,6 +665,7 @@ export class WorkspaceView {
     if (this.mode !== "bridge") {
       this.stopFileWatching();
     }
+    this.workflowBuilder.destroy();
     this.terminalService.destroy();
     for (const cleanup of this.uiCleanupFns) {
       cleanup();
@@ -1118,7 +1120,7 @@ export class WorkspaceView {
         true,
       );
       titleAgentId = spawned.agent_id;
-      await waitForAgent(titleAgentId, 15_000);
+      await waitForAgent(titleAgentId);
       const result = await collectAgentResult(titleAgentId);
       const rawTitle =
         result.final_message ??
@@ -2197,7 +2199,8 @@ export class WorkspaceView {
         "No backends are enabled. Enable at least one backend in Settings → Backends.",
       );
     }
-    const preferred = preferredBackend ?? this.getWorkspaceDefaultBackend() ?? enabled[0];
+    const preferred =
+      preferredBackend ?? this.getWorkspaceDefaultBackend() ?? enabled[0];
     if (!enabled.includes(preferred)) {
       const backendLabels: Record<string, string> = {
         tycode: "Tycode",

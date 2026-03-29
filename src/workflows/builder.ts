@@ -21,21 +21,36 @@ export class WorkflowBuilder {
 
   onClose: (() => void) | null = null;
 
-  constructor(store: WorkflowStore) {
+  constructor(store: WorkflowStore, workspacePath: string) {
     this.store = store;
 
-    // Remove stale overlay from previous HMR cycle
-    document.querySelector(".workflow-builder-overlay")?.remove();
+    // Remove stale overlay from previous HMR cycle — scoped to this workspace
+    const stale = document.querySelector(
+      `.workflow-builder-overlay[data-workspace-path="${CSS.escape(workspacePath)}"]`,
+    );
+    stale?.remove();
 
     this.overlay = document.createElement("div");
     this.overlay.className = "workflow-builder-overlay hidden";
+    this.overlay.setAttribute("data-workspace-path", workspacePath);
     this.overlay.addEventListener("keydown", (e) => {
       if (e.key === "Escape") this.hide();
     });
     document.getElementById("app")!.appendChild(this.overlay);
   }
 
+  private ensureAttached(): void {
+    if (!this.overlay.isConnected) {
+      document.getElementById("app")!.appendChild(this.overlay);
+    }
+  }
+
+  destroy(): void {
+    this.overlay.remove();
+  }
+
   showManager(): void {
+    this.ensureAttached();
     this.overlay.innerHTML = "";
 
     const dialog = document.createElement("div");
@@ -140,6 +155,7 @@ export class WorkflowBuilder {
       this.scope = "global";
     }
     this.buildForm();
+    this.ensureAttached();
     this.overlay.classList.remove("hidden");
   }
 

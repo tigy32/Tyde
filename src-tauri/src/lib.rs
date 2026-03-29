@@ -596,7 +596,6 @@ pub(crate) struct AgentIdRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct WaitForAgentRequest {
     pub(crate) agent_id: u64,
-    pub(crate) timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2206,17 +2205,7 @@ pub(crate) async fn wait_for_agent_internal(
     state: &AppState,
     request: WaitForAgentRequest,
 ) -> Result<AgentInfo, String> {
-    let WaitForAgentRequest {
-        agent_id,
-        timeout_ms,
-    } = request;
-    let idle_timeout = timeout_ms.unwrap_or(60_000).clamp(1, 30 * 60 * 1000);
-    let idle_duration = tokio::time::Duration::from_millis(idle_timeout);
-    // Cap total wall time at 10x the idle timeout to prevent infinite waits.
-    let max_wall = idle_duration.saturating_mul(10);
-    let wall_deadline = tokio::time::Instant::now() + max_wall;
-    let mut idle_deadline = tokio::time::Instant::now() + idle_duration;
-    let mut last_updated_at_ms: Option<u64> = None;
+    let agent_id = request.agent_id;
 
     loop {
         // Create the Notified future BEFORE checking state to avoid missing
@@ -2233,22 +2222,7 @@ pub(crate) async fn wait_for_agent_internal(
             return Ok(current);
         }
 
-        // Extend idle deadline when agent shows new activity.
-        if last_updated_at_ms.is_none_or(|prev| current.updated_at_ms > prev) {
-            idle_deadline = tokio::time::Instant::now() + idle_duration;
-            last_updated_at_ms = Some(current.updated_at_ms);
-        }
-
-        let now = tokio::time::Instant::now();
-        let effective_deadline = idle_deadline.min(wall_deadline);
-        if now >= effective_deadline {
-            return Err(format!("Timed out waiting for agent {agent_id}"));
-        }
-        let remaining = effective_deadline.saturating_duration_since(now);
-        match tokio::time::timeout(remaining, notified).await {
-            Ok(_) => {}
-            Err(_) => return Err(format!("Timed out waiting for agent {agent_id}")),
-        }
+        notified.await;
     }
 }
 
@@ -2287,7 +2261,6 @@ pub(crate) async fn run_agent_internal(
     let spawn_resp = spawn_agent_internal(app, state, request).await?;
     let wait_request = WaitForAgentRequest {
         agent_id: spawn_resp.agent_id,
-        timeout_ms: None,
     };
     let info = wait_for_agent_internal(state, wait_request).await?;
     Ok(agent_result_from_info(&info))
@@ -2314,7 +2287,6 @@ pub(crate) async fn run_query_screenshot_agent(
     app: &tauri::AppHandle,
     state: &AppState,
     question: String,
-    timeout_ms: Option<u64>,
 ) -> Result<String, String> {
     // 1. Take a screenshot via the debug MCP proxy.
     let screenshot_result = dev_instance::proxy_debug_tool_call(
@@ -2370,14 +2342,7 @@ pub(crate) async fn run_query_screenshot_agent(
     let spawn_resp = spawn_agent_internal(app, state, request).await?;
     let agent_id = spawn_resp.agent_id;
 
-    let wait_result = wait_for_agent_internal(
-        state,
-        WaitForAgentRequest {
-            agent_id,
-            timeout_ms: Some(timeout_ms.unwrap_or(300_000)),
-        },
-    )
-    .await;
+    let wait_result = wait_for_agent_internal(state, WaitForAgentRequest { agent_id }).await;
 
     // Collect result and terminate regardless of wait outcome.
     let result = collect_agent_result_internal(state, AgentIdRequest { agent_id }).await;
@@ -2628,16 +2593,8 @@ async fn list_agents(state: tauri::State<'_, AppState>) -> Result<Vec<AgentInfo>
 async fn wait_for_agent(
     state: tauri::State<'_, AppState>,
     agent_id: u64,
-    timeout_ms: Option<u64>,
 ) -> Result<AgentInfo, String> {
-    wait_for_agent_internal(
-        state.inner(),
-        WaitForAgentRequest {
-            agent_id,
-            timeout_ms,
-        },
-    )
-    .await
+    wait_for_agent_internal(state.inner(), WaitForAgentRequest { agent_id }).await
 }
 
 #[tauri::command]
@@ -4049,13 +4006,7 @@ mod tests {
             info.agent_id
         };
 
-        let wait_fut = wait_for_agent_internal(
-            &state,
-            WaitForAgentRequest {
-                agent_id,
-                timeout_ms: Some(1_000),
-            },
-        );
+        let wait_fut = wait_for_agent_internal(&state, WaitForAgentRequest { agent_id });
         let notifier = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             {

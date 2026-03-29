@@ -5,8 +5,8 @@ import type {
   ChatEventPayload,
   ConversationRegisteredPayload,
   CreateWorkbenchEventPayload,
-  Host,
   DeleteWorkbenchEventPayload,
+  Host,
   McpHttpServerSettings,
   RuntimeAgent,
 } from "./bridge";
@@ -20,8 +20,8 @@ import {
   gitWorktreeRemove,
   installBackendDependency as installBackendDependencyBridge,
   interruptAgent,
-  listHosts,
   listAgents,
+  listHosts,
   onAdminEvent,
   onAgentChanged,
   onChatEvent,
@@ -45,6 +45,7 @@ import {
 import { NotificationManager } from "./notifications";
 import { ProjectStateManager } from "./project_state";
 import { ProjectSidebar } from "./projects";
+import { RemoteBrowserDialog } from "./remote_browser_dialog";
 import {
   adjustFontSize,
   initializeBackendDependencies,
@@ -52,7 +53,6 @@ import {
   SettingsPanel,
 } from "./settings";
 import { promptForText } from "./text_prompt";
-import { RemoteBrowserDialog } from "./remote_browser_dialog";
 import {
   normalizeRemoteWorkspaceInput,
   parseRemoteWorkspaceUri,
@@ -279,9 +279,7 @@ export class AppController {
       const hostRefreshes = Array.from(this.workspaceViews.values()).map(
         (view) => view.refreshHostSettings(),
       );
-      void Promise.all(hostRefreshes).then(() =>
-        this.refreshAllBackendMenus(),
-      );
+      void Promise.all(hostRefreshes).then(() => this.refreshAllBackendMenus());
     };
     this.settingsPanel.onHostChange = (host) => {
       void this.handleSettingsHostChange(host);
@@ -292,9 +290,7 @@ export class AppController {
       const hostRefreshes = Array.from(this.workspaceViews.values()).map(
         (view) => view.refreshHostSettings(),
       );
-      void Promise.all(hostRefreshes).then(() =>
-        this.refreshAllBackendMenus(),
-      );
+      void Promise.all(hostRefreshes).then(() => this.refreshAllBackendMenus());
     };
 
     settingsTabViewEl.classList.add("settings-overlay");

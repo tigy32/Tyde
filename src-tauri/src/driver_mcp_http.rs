@@ -87,8 +87,6 @@ struct QueryScreenshotToolInput {
     /// A visual question about the UI, e.g. "Is the sidebar collapsed or expanded?",
     /// "What color is the error banner?", "Does the layout look correct?"
     question: String,
-    /// Max wait time in milliseconds for the inspection agent (default 300000).
-    timeout_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,14 +207,7 @@ impl TydeDriverMcpServer {
         Parameters(input): Parameters<QueryScreenshotToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match run_query_screenshot_agent(
-            &self.app,
-            app_state.inner(),
-            input.question,
-            input.timeout_ms,
-        )
-        .await
-        {
+        match run_query_screenshot_agent(&self.app, app_state.inner(), input.question).await {
             Ok(answer) => Ok(CallToolResult::success(vec![Content::text(answer)])),
             Err(err) => Ok(err_text(err)),
         }

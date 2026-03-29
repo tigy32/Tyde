@@ -220,8 +220,8 @@ export function listAgents() {
   return execute("list_agents", {} as Record<string, never>);
 }
 
-export function waitForAgent(agentId: number, timeoutMs?: number) {
-  return execute("wait_for_agent", { agentId, timeoutMs });
+export function waitForAgent(agentId: number) {
+  return execute("wait_for_agent", { agentId });
 }
 
 export function agentEventsSince(sinceSeq = 0, limit = 200) {
@@ -479,9 +479,7 @@ export function updateHostDefaultBackend(
   );
 }
 
-export function getHostForWorkspace(
-  workspacePath: string,
-): Promise<Host> {
+export function getHostForWorkspace(workspacePath: string): Promise<Host> {
   return invoke<Host>("get_host_for_workspace", { workspacePath }).catch(
     (err) => {
       console.error("bridge: getHostForWorkspace failed:", err);

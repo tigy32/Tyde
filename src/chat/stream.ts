@@ -203,7 +203,6 @@ export function handleStreamEnd(
   message: ChatMessage,
   createMessageElement: (msg: ChatMessage) => HTMLElement,
   resolveModelLabel: (info: unknown) => string | null,
-  scrollToBottom: () => void,
 ): { durationMs: number } | null {
   if (state.rafId !== null) {
     cancelAnimationFrame(state.rafId);

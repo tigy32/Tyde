@@ -1108,6 +1108,112 @@ describe('Chat tab lifecycle', () => {
       { timeout: 3000, timeoutMsg: 'Tool result should re-render stdout after switching back to compact' },
     );
 
+    // --- Regression: truncatable tool output in background tab preserves .collapsed ---
+    // When a conversation tab is hidden (display:none), elements report scrollHeight=0
+    // and clientHeight=0. Without the fix, the ResizeObserver in hideTruncationIfNotOverflowing
+    // would see scrollHeight(0) <= clientHeight(0), incorrectly conclude the content
+    // doesn't overflow, and remove .collapsed — breaking the "Show more" toggle.
+
+    // Create a second conversation tab — the first tab's wrapper goes display:none
+    await browser.keys(['Control', 'n']);
+    await browser.waitUntil(
+      async () => browser.execute((tabSel: string) => {
+        return document.querySelectorAll(tabSel).length >= 2;
+      }, sel.convTab),
+      { timeout: 5000, timeoutMsg: 'Second conversation tab should appear' },
+    );
+
+    // Emit a tool result with long stdout to the now-hidden first tab
+    const bgToolId = 'test-bg-truncation-tool';
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamDelta', { text: 'Running a long command.' });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'StreamEnd', {
+      message: makeAssistantMessage('Running a long command.', [
+        { id: bgToolId, name: 'RunCommand', arguments: { command: 'cat long.txt' } },
+      ]),
+    });
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolRequest', {
+      tool_call_id: bgToolId,
+      tool_name: 'RunCommand',
+      tool_type: { kind: 'RunCommand', command: 'cat long.txt', working_directory: '/mock' },
+    });
+
+    // Generate output long enough to exceed the 200px collapsed max-height
+    const longOutput = Array.from(
+      { length: 50 },
+      (_, i) => `Line ${i + 1}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.`,
+    ).join('\n');
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ToolExecutionCompleted', {
+      tool_call_id: bgToolId,
+      tool_name: 'RunCommand',
+      tool_result: { kind: 'RunCommand', exit_code: 0, stdout: longOutput, stderr: '' },
+      success: true,
+    });
+
+    // Give the ResizeObserver time to fire
+    await browser.pause(500);
+
+    // The truncatable element in the hidden tab should still have .collapsed.
+    // Without the fix, the observer would disconnect on 0×0 dimensions and remove it.
+    // The hidden conversation uses virtual scrolling, so elements are unmounted
+    // when the wrapper goes display:none. Instead, test the fix by toggling tool
+    // output mode while the first tab is hidden — this triggers re-rendering via
+    // mode change callbacks, which call hideTruncationIfNotOverflowing on fresh
+    // truncatable elements. When the tab becomes visible again and the virtualizer
+    // re-mounts the elements, the ResizeObserver fires with real dimensions.
+
+    // Toggle to verbose (no truncation) and back to compact (re-creates truncatables).
+    // The compact re-render calls hideTruncationIfNotOverflowing. Since the first
+    // tab's wrapper is display:none, the elements will be created inside a hidden
+    // ancestor when the virtualizer re-mounts on tab switch.
+    await browser.execute(() => {
+      const btn = document.querySelector('[data-testid="tool-output-toggle-global"]') as HTMLButtonElement | null;
+      btn?.click(); // compact → verbose
+    });
+    await browser.pause(100);
+    await browser.execute(() => {
+      const btn = document.querySelector('[data-testid="tool-output-toggle-global"]') as HTMLButtonElement | null;
+      btn?.click(); // verbose → summary
+    });
+    await browser.pause(100);
+    await browser.execute(() => {
+      const btn = document.querySelector('[data-testid="tool-output-toggle-global"]') as HTMLButtonElement | null;
+      btn?.click(); // summary → compact
+    });
+    await browser.pause(100);
+
+    // Switch back to the first tab — virtualizer re-mounts elements and
+    // ResizeObserver fires with real dimensions.
+    await browser.execute((tabSel: string) => {
+      const tabs = Array.from(document.querySelectorAll(tabSel)) as HTMLElement[];
+      const firstTab = tabs.find((t) => !t.classList.contains('conv-tab-active'));
+      firstTab?.click();
+    }, sel.convTab);
+
+    // After the tab becomes visible and the virtualizer re-mounts,
+    // the long tool output should retain .truncatable.collapsed.
+    // Without the fix, .collapsed would be lost because the ResizeObserver
+    // fires with 0×0 dimensions in the display:none phase and incorrectly
+    // concludes the content doesn't overflow.
+    await browser.waitUntil(
+      async () => browser.execute(() => {
+        const results = document.querySelectorAll('.tool-result-command');
+        const last = results[results.length - 1] as HTMLElement;
+        const truncatable = last?.closest('.embedded-tool-calls')?.querySelector('.truncatable');
+        return truncatable?.classList.contains('collapsed') ?? false;
+      }),
+      { timeout: 5000, timeoutMsg: 'Truncatable tool output should keep .collapsed after tab switch' },
+    );
+
+    // Close the second tab to restore single-tab state for subsequent tests
+    await browser.execute((tabSel: string) => {
+      const tabs = Array.from(document.querySelectorAll(tabSel)) as HTMLElement[];
+      const secondTab = tabs.find((t) => t !== tabs[0]);
+      const closeBtn = secondTab?.querySelector('.conv-tab-close') as HTMLElement | null;
+      closeBtn?.click();
+    }, sel.convTab);
+    await browser.pause(300);
+
     // --- AskUserQuestion renders as question card, not a stuck "Running..." card ---
     const askToolCallId = 'test-ask-user-1';
     await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });

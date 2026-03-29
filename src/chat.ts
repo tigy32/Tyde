@@ -1227,7 +1227,6 @@ export class ChatPanel {
           setRelativeTimeElement,
         ),
       resolveModelLabel,
-      () => this.scrollToBottom(view),
     );
     // Backend controls typing status — do NOT call setViewTypingVisible here
     if (!result) {

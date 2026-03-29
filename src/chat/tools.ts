@@ -28,6 +28,10 @@ function hideTruncationIfNotOverflowing(container: HTMLElement): void {
   if (!content) return;
 
   const observer = new ResizeObserver(() => {
+    // Elements inside display:none ancestors report 0 for both dimensions.
+    // Skip the check and keep observing until the element has real layout.
+    if (content.scrollHeight === 0 && content.clientHeight === 0) return;
+
     observer.disconnect();
     // Content has max-height:200px + padding-bottom:20px when collapsed.
     // If scrollHeight fits within that, the content isn't actually truncated.

@@ -3176,7 +3176,8 @@ body {
   padding: 8px 12px;
   cursor: pointer;
   font-size: 13px;
-  border-bottom: 1px solid color-mix(in srgb, var(--border-primary) 50%, transparent);
+  border-bottom: 1px solid
+    color-mix(in srgb, var(--border-primary) 50%, transparent);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -9096,7 +9097,10 @@ body {
   padding: 8px 10px;
   font-size: var(--text-sm);
   cursor: pointer;
-  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  transition:
+    border-color 0.15s,
+    color 0.15s,
+    background 0.15s;
 }
 
 .settings-host-toolbar-btn:hover {
@@ -9107,7 +9111,11 @@ body {
 
 .settings-host-toolbar-btn-danger {
   color: var(--danger, #ff6b6b);
-  border-color: color-mix(in srgb, var(--danger, #ff6b6b) 35%, var(--border-primary));
+  border-color: color-mix(
+    in srgb,
+    var(--danger, #ff6b6b) 35%,
+    var(--border-primary)
+  );
 }
 
 .tab-title + .settings-profile-section {

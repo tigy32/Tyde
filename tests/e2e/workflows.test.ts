@@ -286,8 +286,8 @@ describe('Workflows panel', () => {
     await browser.pause(500);
 
     const managerInfo = await browser.execute(() => {
-      const overlay = document.querySelector('.workflow-builder-overlay');
-      if (!overlay || overlay.classList.contains('hidden')) {
+      const overlay = document.querySelector('.workflow-builder-overlay:not(.hidden)');
+      if (!overlay) {
         return { visible: false, title: '', workflowNames: [] as string[] };
       }
       const title =
@@ -306,14 +306,15 @@ describe('Workflows panel', () => {
 
     // Close the manager overlay
     await browser.execute(() => {
-      const closeBtn = document.querySelector('.workflow-builder-close');
+      const overlay = document.querySelector('.workflow-builder-overlay:not(.hidden)');
+      const closeBtn = overlay?.querySelector('.workflow-builder-close');
       if (closeBtn) (closeBtn as HTMLElement).click();
     });
     await browser.pause(300);
 
     const overlayHidden = await browser.execute(() => {
-      const overlay = document.querySelector('.workflow-builder-overlay');
-      return !overlay || overlay.classList.contains('hidden');
+      const overlay = document.querySelector('.workflow-builder-overlay:not(.hidden)');
+      return !overlay;
     });
     expect(overlayHidden).toBe(true);
 
@@ -449,6 +450,127 @@ describe('Workflows panel', () => {
     await browser.execute(() => {
       delete (window as any).__mockWorkflows;
       delete (window as any).__mockShellCommandHandler;
+    });
+  });
+
+  it('gear icon overlay survives workspace switch in multi-project sessions', async () => {
+    // --- 1. Open workspace A with workflows ---
+    await openWorkspaceWithWorkflows();
+
+    // Switch to Workflows dock tab
+    const workflowsTab = await $(
+      '[data-testid="dock-widget-tab"][data-widget="workflows"]',
+    );
+    await workflowsTab.waitForExist({ timeout: 5000 });
+    await workflowsTab.click();
+    await browser.pause(300);
+
+    // Verify gear icon opens the overlay in workspace A
+    const gearBtn = await $(
+      '.workflows-toolbar-btn[title="Manage workflows"]',
+    );
+    await gearBtn.waitForDisplayed({ timeout: 5000 });
+    await gearBtn.click();
+    await browser.pause(500);
+
+    let overlayVisible = await browser.execute(() => {
+      return !!document.querySelector('.workflow-builder-overlay:not(.hidden)');
+    });
+    expect(overlayVisible).toBe(true);
+
+    // Close the overlay
+    await browser.execute(() => {
+      const overlay = document.querySelector('.workflow-builder-overlay:not(.hidden)');
+      const closeBtn = overlay?.querySelector('.workflow-builder-close');
+      if (closeBtn) (closeBtn as HTMLElement).click();
+    });
+    await browser.pause(300);
+
+    // --- 2. Open workspace B ---
+    await browser.execute(() => {
+      (window as any).__mockDialogPath = '/mock/workspace-b';
+    });
+
+    const addBtn = await $(sel.railAddBtn);
+    await addBtn.waitForClickable({ timeout: 5000 });
+    await addBtn.click();
+
+    const title = await $(sel.appTitle);
+    await browser.waitUntil(
+      async () => (await title.getText()).includes('workspace-b'),
+      { timeout: 10_000, timeoutMsg: 'Workspace B did not load' },
+    );
+
+    // --- 3. Switch back to workspace A ---
+    await browser.execute(
+      (projItemSel, homeItemSel, projNameSel) => {
+        const items = document.querySelectorAll(
+          `${projItemSel}:not(.active):not(${homeItemSel})`,
+        );
+        for (const item of items) {
+          const name = item.querySelector(projNameSel);
+          if (name?.textContent === 'workspace') {
+            (item as HTMLElement).click();
+            return;
+          }
+        }
+      },
+      sel.railProjectItem,
+      sel.railHomeItem,
+      sel.railProjectName,
+    );
+
+    await browser.waitUntil(
+      async () => {
+        const text = await title.getText();
+        return text.includes('workspace') && !text.includes('workspace-b');
+      },
+      { timeout: 10_000, timeoutMsg: 'Workspace A did not restore' },
+    );
+
+    // --- 4. Click gear icon again — regression: overlay must still be attached ---
+    // Without the fix, the overlay would be detached because workspace B's
+    // WorkflowBuilder constructor removed all .workflow-builder-overlay elements
+    // globally instead of only its own workspace-scoped overlay.
+    const workflowsTabAfter = await $(
+      '[data-testid="dock-widget-tab"][data-widget="workflows"]',
+    );
+    await workflowsTabAfter.waitForExist({ timeout: 5000 });
+    await workflowsTabAfter.click();
+    await browser.pause(300);
+
+    const gearBtnAfter = await $(
+      '.workflows-toolbar-btn[title="Manage workflows"]',
+    );
+    await gearBtnAfter.waitForDisplayed({ timeout: 5000 });
+    await gearBtnAfter.click();
+    await browser.pause(500);
+
+    const managerInfo = await browser.execute(() => {
+      const overlay = document.querySelector('.workflow-builder-overlay:not(.hidden)');
+      if (!overlay) {
+        return { visible: false, workflowNames: [] as string[] };
+      }
+      const rows = overlay.querySelectorAll('.workflow-manager-row');
+      const names = Array.from(rows).map(
+        (r) =>
+          r.querySelector('.workflow-manager-name')?.textContent ?? '',
+      );
+      return { visible: true, workflowNames: names };
+    });
+    expect(managerInfo.visible).toBe(true);
+    expect(managerInfo.workflowNames).toContain('Build Project');
+    expect(managerInfo.workflowNames).toContain('Lint Code');
+
+    // Close overlay and cleanup
+    await browser.execute(() => {
+      const overlay = document.querySelector('.workflow-builder-overlay:not(.hidden)');
+      const closeBtn = overlay?.querySelector('.workflow-builder-close');
+      if (closeBtn) (closeBtn as HTMLElement).click();
+    });
+    await browser.execute(() => {
+      delete (window as any).__mockDialogPath;
+      delete (window as any).__mockWorkflows;
     });
   });
 });

@@ -1,4 +1,5 @@
 import {
+  addHost as addHostBridge,
   adminGetModuleSchemas,
   adminGetSettings,
   adminListProfiles,
@@ -13,20 +14,18 @@ import {
   type DriverMcpHttpServerSettings,
   getDriverMcpHttpServerSettings as getDriverMcpHttpServerSettingsBridge,
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
+  type Host,
   installBackendDependency as installBackendDependencyBridge,
+  listHosts as listHostsBridge,
   type McpHttpServerSettings,
   normalizeBackendKind,
   queryBackendUsage as queryBackendUsageBridge,
+  removeHost as removeHostBridge,
   setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
   setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
   setMcpHttpServerEnabled as setMcpHttpServerEnabledBridge,
-  listHosts as listHostsBridge,
-  addHost as addHostBridge,
-  removeHost as removeHostBridge,
-  updateHostEnabledBackends as updateHostEnabledBackendsBridge,
   updateHostDefaultBackend as updateHostDefaultBackendsBridge,
-  setMcpControlEnabled as setMcpControlEnabledBridge,
-  type Host,
+  updateHostEnabledBackends as updateHostEnabledBackendsBridge,
 } from "./bridge";
 import {
   broadcastToolOutputMode,
@@ -631,10 +630,6 @@ export class SettingsPanel {
     this.onHostChange?.(host);
   }
 
-  private emitBridgeControlSettingsChange(): void {
-    this.onMcpHttpSettingsChange?.(this.mcpHttpServerSettings);
-  }
-
   private buildHostToolbar(): HTMLElement {
     const toolbar = el("div", { class: "settings-host-toolbar" });
     toolbar.dataset.testid = "settings-host-toolbar";
@@ -642,7 +637,10 @@ export class SettingsPanel {
     const titleRow = el("div", { class: "settings-host-toolbar-header" });
     const label = el(
       "label",
-      { class: "settings-label settings-host-toolbar-label", "data-testid": "settings-label" },
+      {
+        class: "settings-label settings-host-toolbar-label",
+        "data-testid": "settings-label",
+      },
       "Settings Host",
     );
     label.setAttribute("for", "settings-host-select");
@@ -660,7 +658,9 @@ export class SettingsPanel {
     titleRow.appendChild(subtitle);
     toolbar.appendChild(titleRow);
 
-    const row = el("div", { class: "settings-profile-row settings-host-toolbar-row" });
+    const row = el("div", {
+      class: "settings-profile-row settings-host-toolbar-row",
+    });
     const hostSelect = el("select", {
       class: "settings-select settings-profile-select settings-host-select",
       "aria-label": "Settings host",
@@ -669,7 +669,9 @@ export class SettingsPanel {
     }) as HTMLSelectElement;
     hostSelect.disabled = this.hostsLoading || this.hosts.length === 0;
     for (const host of this.hosts) {
-      const hostLabel = host.is_local ? host.label : `${host.label} • ${host.hostname}`;
+      const hostLabel = host.is_local
+        ? host.label
+        : `${host.label} • ${host.hostname}`;
       const opt = el("option", { value: host.id }, hostLabel);
       if (this.getSelectedHost()?.id === host.id) opt.selected = true;
       hostSelect.appendChild(opt);
@@ -681,7 +683,11 @@ export class SettingsPanel {
 
     const addBtn = el(
       "button",
-      { class: "settings-host-toolbar-btn", type: "button", "data-testid": "settings-host-add" },
+      {
+        class: "settings-host-toolbar-btn",
+        type: "button",
+        "data-testid": "settings-host-add",
+      },
       "Add Remote",
     );
     addBtn.addEventListener("click", () => this.showAddHostModal());
@@ -1709,7 +1715,9 @@ export class SettingsPanel {
       .finally(() => {
         this.hostsLoading = false;
         this.rerenderHostToolbar();
-        this.rerenderPanelContent("backends", () => this.buildBackendsContent());
+        this.rerenderPanelContent("backends", () =>
+          this.buildBackendsContent(),
+        );
         this.rerenderPanelContent("tyde", () => this.buildTydeContent());
         this.syncProfileDropdown();
         this.onHostsUpdated?.();
@@ -3517,10 +3525,12 @@ export class SettingsPanel {
       ) {
         // Correct the host's default backend without cascading a full refresh
         selectedHost.default_backend = enabledBackends[0];
-        void updateHostDefaultBackendsBridge(selectedHost.id, enabledBackends[0])
-          .catch((err) =>
-            console.error("Failed to update host default backend:", err),
-          );
+        void updateHostDefaultBackendsBridge(
+          selectedHost.id,
+          enabledBackends[0],
+        ).catch((err) =>
+          console.error("Failed to update host default backend:", err),
+        );
       }
     }
 
@@ -3557,7 +3567,11 @@ export class SettingsPanel {
     spawnSelect.innerHTML = "";
     spawnSelect.disabled = this.adminId === null;
     if (this.adminId === null) {
-      const opt = el("option", { value: "", disabled: "true" }, "Not connected");
+      const opt = el(
+        "option",
+        { value: "", disabled: "true" },
+        "Not connected",
+      );
       opt.selected = true;
       spawnSelect.appendChild(opt);
       return;

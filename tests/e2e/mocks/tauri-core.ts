@@ -572,13 +572,11 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
 
     case 'wait_for_agent': {
       const agentId = Number(args?.agentId);
-      const timeoutMs = Number.isFinite(Number(args?.timeoutMs))
-        ? Math.max(1, Math.min(30 * 60 * 1000, Number(args?.timeoutMs)))
-        : 60_000;
       if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
 
-      const deadline = Date.now() + timeoutMs;
-      while (Date.now() <= deadline) {
+      // No timeout — mirrors the real backend which waits indefinitely,
+      // relying on the notification system to wake up when agent state changes.
+      for (;;) {
         const agent = runtimeAgents.get(agentId);
         if (!agent) throw new Error(`Agent ${agentId} not found`);
         if (!agent.is_running) {
@@ -586,7 +584,6 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         }
         await sleep(20);
       }
-      throw new Error(`Timed out waiting for agent ${agentId}`);
     }
 
     case 'agent_events_since': {

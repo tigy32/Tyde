@@ -1,4 +1,4 @@
-import { listDirectory, type Host } from "./bridge";
+import { type Host, listDirectory } from "./bridge";
 
 export class RemoteBrowserDialog {
   private overlay: HTMLElement | null = null;
