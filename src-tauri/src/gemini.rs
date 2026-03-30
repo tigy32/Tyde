@@ -1149,19 +1149,21 @@ fn map_tool_completion_result(tool_name: &str, result_content: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 fn gemini_known_models() -> Vec<Value> {
-    let models = [
-        ("gemini-2.5-pro", "Gemini 2.5 Pro", true),
+    let models: &[(&str, &str, bool)] = &[
+        ("auto-gemini-2.5", "Auto (Gemini 2.5)", true),
+        ("auto-gemini-3", "Auto (Gemini 3)", false),
+        ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview", false),
+        ("gemini-3-pro-preview", "Gemini 3 Pro Preview", false),
+        ("gemini-3-flash-preview", "Gemini 3 Flash Preview", false),
+        ("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite Preview", false),
+        ("gemini-2.5-pro", "Gemini 2.5 Pro", false),
         ("gemini-2.5-flash", "Gemini 2.5 Flash", false),
-        ("gemini-2.0-flash", "Gemini 2.0 Flash", false),
+        ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite", false),
     ];
     models
         .iter()
-        .map(|(id, display_name, is_default)| {
-            json!({
-                "id": id,
-                "displayName": display_name,
-                "isDefault": is_default,
-            })
+        .map(|(id, display, default)| {
+            json!({ "id": id, "displayName": display, "isDefault": default })
         })
         .collect()
 }

@@ -104,6 +104,15 @@ pub struct StartupMcpServer {
     pub transport: StartupMcpTransport,
 }
 
+/// Identity of an agent definition, used by backends that support native agent
+/// flags (e.g. Claude CLI `--agents`/`--agent`).
+#[derive(Debug, Clone)]
+pub struct AgentIdentity {
+    pub id: String,
+    pub description: String,
+    pub instructions: String,
+}
+
 #[derive(Clone)]
 pub enum BackendCommandHandle {
     Tycode(Arc<Mutex<ChildStdin>>),
@@ -274,7 +283,28 @@ impl BackendSession {
         ephemeral: bool,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        agent_identity: Option<&AgentIdentity>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        // For non-Claude backends, merge agent instructions into the steering
+        // content since they don't support --agents/--agent flags.
+        let merged_steering: Option<String>;
+        let effective_steering = if kind != BackendKind::Claude {
+            if let Some(identity) = agent_identity {
+                let mut parts = vec![identity.instructions.clone()];
+                if let Some(s) = steering_content {
+                    if !s.trim().is_empty() {
+                        parts.push(s.to_string());
+                    }
+                }
+                merged_steering = Some(parts.join("\n\n"));
+                merged_steering.as_deref()
+            } else {
+                steering_content
+            }
+        } else {
+            steering_content
+        };
+
         match kind {
             BackendKind::Tycode => {
                 let (bridge, rx) = SubprocessBridge::spawn(
@@ -297,7 +327,7 @@ impl BackendSession {
                         workspace_roots,
                         ssh_host,
                         startup_mcp_servers,
-                        steering_content,
+                        effective_steering,
                     )
                     .await?
                 } else {
@@ -305,7 +335,7 @@ impl BackendSession {
                         workspace_roots,
                         ssh_host,
                         startup_mcp_servers,
-                        steering_content,
+                        effective_steering,
                     )
                     .await?
                 };
@@ -323,6 +353,7 @@ impl BackendSession {
                         ssh_host,
                         startup_mcp_servers,
                         steering_content,
+                        agent_identity,
                     )
                     .await?
                 } else {
@@ -331,6 +362,7 @@ impl BackendSession {
                         ssh_host,
                         startup_mcp_servers,
                         steering_content,
+                        agent_identity,
                     )
                     .await?
                 };
@@ -347,7 +379,7 @@ impl BackendSession {
                         workspace_roots,
                         ssh_host,
                         startup_mcp_servers,
-                        steering_content,
+                        effective_steering,
                     )
                     .await?
                 } else {
@@ -355,7 +387,7 @@ impl BackendSession {
                         workspace_roots,
                         ssh_host,
                         startup_mcp_servers,
-                        steering_content,
+                        effective_steering,
                     )
                     .await?
                 };
@@ -372,7 +404,7 @@ impl BackendSession {
                         workspace_roots,
                         ssh_host,
                         startup_mcp_servers,
-                        steering_content,
+                        effective_steering,
                     )
                     .await?
                 } else {
@@ -380,7 +412,7 @@ impl BackendSession {
                         workspace_roots,
                         ssh_host,
                         startup_mcp_servers,
-                        steering_content,
+                        effective_steering,
                     )
                     .await?
                 };
@@ -417,7 +449,7 @@ impl BackendSession {
                     Some(executable_path.to_string())
                 };
                 let (session, rx) =
-                    ClaudeSession::spawn(workspace_roots, ssh_host, &[], None).await?;
+                    ClaudeSession::spawn(workspace_roots, ssh_host, &[], None, None).await?;
                 Ok((Self::Claude(session), rx))
             }
             BackendKind::Kiro => {

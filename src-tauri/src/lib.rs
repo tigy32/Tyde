@@ -1621,10 +1621,27 @@ async fn create_conversation(
         &extra_mcp_servers,
     )?;
 
-    // Compose steering: definition instructions + tool policy + workspace steering
+    // Build agent identity for backends that support native agent flags.
+    // Instructions go through --agents/--agent (Claude) rather than
+    // --append-system-prompt, so the model treats them as first-class identity.
+    let agent_identity = definition.as_ref().and_then(|d| {
+        let instr = d.instructions.as_deref().unwrap_or("").trim();
+        if instr.is_empty() {
+            None
+        } else {
+            Some(backend::AgentIdentity {
+                id: d.id.clone(),
+                description: d.description.clone(),
+                instructions: instr.to_string(),
+            })
+        }
+    });
+
+    // Compose remaining steering: tool policy + workspace steering.
+    // Agent instructions are NOT included here — they go through agent_identity.
     let workspace_steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let steering = compose_steering(
-        definition.as_ref().and_then(|d| d.instructions.as_deref()),
+        None,
         &def_tool_policy,
         workspace_steering.as_deref(),
     );
@@ -1636,6 +1653,7 @@ async fn create_conversation(
         ephemeral,
         &startup_mcp_servers,
         steering.as_deref(),
+        agent_identity.as_ref(),
     )
     .await?;
 
@@ -2091,9 +2109,22 @@ pub(crate) async fn spawn_agent_internal(
         &extra_mcp_servers,
     )?;
 
+    let agent_identity = definition.as_ref().and_then(|d| {
+        let instr = d.instructions.as_deref().unwrap_or("").trim();
+        if instr.is_empty() {
+            None
+        } else {
+            Some(backend::AgentIdentity {
+                id: d.id.clone(),
+                description: d.description.clone(),
+                instructions: instr.to_string(),
+            })
+        }
+    });
+
     let workspace_steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let steering = compose_steering(
-        definition.as_ref().and_then(|d| d.instructions.as_deref()),
+        None,
         &def_tool_policy,
         workspace_steering.as_deref(),
     );
@@ -2105,6 +2136,7 @@ pub(crate) async fn spawn_agent_internal(
         ephemeral,
         &startup_mcp_servers,
         steering.as_deref(),
+        agent_identity.as_ref(),
     )
     .await?;
 
@@ -3726,6 +3758,7 @@ async fn restart_subprocess(
         false,
         &startup_mcp_servers,
         steering.as_deref(),
+        None,
     )
     .await?;
 

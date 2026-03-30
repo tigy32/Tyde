@@ -1,5 +1,4 @@
 import type { ChatEvent } from "@tyde/protocol";
-import { AgentMenu } from "./agent_defs/agent_menu";
 import { AgentDefinitionStore } from "./agent_defs/store";
 import type { AgentCardAction, AgentInfo } from "./agents";
 import type {
@@ -129,6 +128,7 @@ export class AppController {
     this.refreshAllBackendMenus();
     await this.agentDefinitionStore.load();
     this.homeBridgeView.refreshDefinitionLabel();
+    this.settingsPanel.setAgentDefinitionStore(this.agentDefinitionStore);
     await this.reconcileRustHostsWithProjects();
 
     // If the user previously enabled tycode but the binary is missing after an
@@ -366,9 +366,6 @@ export class AppController {
     this.homeView.onAgentClick = (agent) => {
       this.openRuntimeAgentInWorkspace(agent);
     };
-    this.homeView.onOpenAgentLibrary = () => {
-      this.showAgentLibrary();
-    };
     this.homeView.setBridgeChatAvailability(
       this.bridgeControlEnabled,
       this.bridgeChatDisabledReason(),
@@ -386,6 +383,22 @@ export class AppController {
     };
     this.settingsPanel.onMcpHttpSettingsChange = (settings) => {
       this.handleBridgeControlSettingsChange(settings);
+    };
+    this.settingsPanel.onSpawnAgent = (definitionId, backendOverride) => {
+      this.closeSettings();
+      void this.homeBridgeView
+        .createNewConversationTab(undefined, backendOverride, {
+          bootstrap: true,
+          agentDefinitionId: definitionId,
+        })
+        .catch((err) => {
+          console.error("Failed to spawn agent from library:", err);
+          this.notifications.error(
+            err instanceof Error
+              ? err.message
+              : "Failed to spawn agent from library",
+          );
+        });
     };
     this.settingsPanel.notifySelectedHostChanged();
 
@@ -449,6 +462,7 @@ export class AppController {
       projectName,
       notifications: this.notifications,
       roots: project?.roots,
+      agentDefinitionStore: this.agentDefinitionStore,
     });
 
     const viewContainer = document.getElementById("workspace-container")!;
@@ -638,52 +652,6 @@ export class AppController {
 
   private bridgeChatDisabledReason(): string {
     return "Enable Loopback MCP Control in Settings to start Bridge chats.";
-  }
-
-  private showAgentLibrary(): void {
-    const overlay = document.createElement("div");
-    overlay.className = "agent-library-overlay";
-    overlay.dataset.testid = "agent-library-overlay";
-
-    const panel = document.createElement("div");
-    panel.className = "agent-library-panel";
-
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "agent-library-close-btn";
-    closeBtn.textContent = "\u00D7";
-    closeBtn.title = "Close";
-    closeBtn.addEventListener("click", () => overlay.remove());
-
-    panel.appendChild(closeBtn);
-
-    const menuContainer = document.createElement("div");
-    menuContainer.className = "agent-library-menu-container";
-    const agentMenu = new AgentMenu(menuContainer, this.agentDefinitionStore);
-    agentMenu.onSpawnAgent = (definitionId) => {
-      overlay.remove();
-      void this.homeBridgeView
-        .createNewConversationTab(undefined, undefined, {
-          bootstrap: true,
-          agentDefinitionId: definitionId,
-        })
-        .catch((err) => {
-          console.error("Failed to spawn agent from library:", err);
-          this.notifications.error(
-            err instanceof Error
-              ? err.message
-              : "Failed to spawn agent from library",
-          );
-        });
-    };
-    void agentMenu.refresh();
-
-    panel.appendChild(menuContainer);
-    overlay.appendChild(panel);
-    overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) overlay.remove();
-    });
-    document.body.appendChild(overlay);
   }
 
   private handleBridgeControlSettingsChange(

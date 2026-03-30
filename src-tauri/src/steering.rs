@@ -38,30 +38,6 @@ pub async fn read_steering_from_roots(
     read_steering(root).await
 }
 
-/// Write steering content to `{workspace_root}/.kiro/steering/tyde.md`.
-pub async fn write_kiro_steering(workspace_root: &str, content: &str) -> Result<(), String> {
-    let dir = Path::new(workspace_root).join(".kiro").join("steering");
-    fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("Failed to create .kiro/steering dir: {e}"))?;
-    fs::write(dir.join("tyde.md"), content)
-        .await
-        .map_err(|e| format!("Failed to write .kiro/steering/tyde.md: {e}"))
-}
-
-/// Remove `{workspace_root}/.kiro/steering/tyde.md` if it exists.
-pub async fn cleanup_kiro_steering(workspace_root: &str) {
-    let path = Path::new(workspace_root)
-        .join(".kiro")
-        .join("steering")
-        .join("tyde.md");
-    if let Err(e) = fs::remove_file(&path).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("Failed to remove {}: {e}", path.display());
-        }
-    }
-}
-
 /// Write steering content to a temp file and return the path.
 pub fn write_codex_steering_tempfile(content: &str) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir();

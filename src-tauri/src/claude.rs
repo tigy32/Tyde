@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::backend::{AgentIdentity, SessionCommand, StartupMcpServer, StartupMcpTransport};
 use crate::subprocess::ImageAttachment;
 
 /// Handle returned by SubAgentEmitter::on_subagent_spawned.
@@ -98,6 +98,7 @@ impl ClaudeSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        agent_identity: Option<&AgentIdentity>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -105,6 +106,7 @@ impl ClaudeSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            agent_identity,
         )
         .await
     }
@@ -114,6 +116,7 @@ impl ClaudeSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        agent_identity: Option<&AgentIdentity>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -121,6 +124,7 @@ impl ClaudeSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            agent_identity,
         )
         .await
     }
@@ -131,6 +135,7 @@ impl ClaudeSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        agent_identity: Option<&AgentIdentity>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
@@ -158,6 +163,7 @@ impl ClaudeSession {
                 permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                 startup_mcp_config_json: build_claude_mcp_config_json(startup_mcp_servers),
                 steering_content: steering_content.map(|s| s.to_string()),
+                agent_identity: agent_identity.cloned(),
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -200,6 +206,7 @@ struct ClaudeState {
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
+    agent_identity: Option<AgentIdentity>,
     last_cumulative_usage: Option<Value>,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
@@ -406,6 +413,7 @@ struct RunTurnParams<'a> {
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
+    agent_identity: Option<AgentIdentity>,
 }
 
 impl ClaudeInner {
@@ -501,6 +509,7 @@ impl ClaudeInner {
             permission_mode,
             startup_mcp_config_json,
             steering_content,
+            agent_identity,
             conversation_history_bytes,
             cancel_rx,
         ) = {
@@ -534,6 +543,7 @@ impl ClaudeInner {
                 state.permission_mode.clone(),
                 state.startup_mcp_config_json.clone(),
                 state.steering_content.clone(),
+                state.agent_identity.clone(),
                 state.conversation_bytes_total,
                 cancel_rx,
             )
@@ -559,6 +569,7 @@ impl ClaudeInner {
                         permission_mode,
                         startup_mcp_config_json,
                         steering_content,
+                        agent_identity,
                     },
                     cancel_rx,
                 )
@@ -710,6 +721,7 @@ impl ClaudeInner {
             permission_mode,
             startup_mcp_config_json,
             steering_content,
+            agent_identity,
         } = params;
         let effective_permission_mode = permission_mode
             .as_deref()
@@ -753,6 +765,21 @@ impl ClaudeInner {
             }
         }
 
+        // Use --agents/--agent for agent definition instructions (first-class agent
+        // identity that Claude CLI respects). Use --append-system-prompt only for
+        // remaining steering (tool policy, workspace steering).
+        if let Some(identity) = agent_identity {
+            let agents_json = json!({
+                &identity.id: {
+                    "description": &identity.description,
+                    "prompt": &identity.instructions,
+                }
+            });
+            cli_args.push("--agents".to_string());
+            cli_args.push(agents_json.to_string());
+            cli_args.push("--agent".to_string());
+            cli_args.push(identity.id.clone());
+        }
         if let Some(steering) = steering_content {
             if !steering.trim().is_empty() {
                 cli_args.push("--append-system-prompt".to_string());
@@ -4656,6 +4683,7 @@ mod tests {
                 permission_mode: None,
                 startup_mcp_config_json: None,
                 steering_content: None,
+                agent_identity: None,
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -5319,6 +5347,7 @@ mod tests {
                     permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                     startup_mcp_config_json: None,
                     steering_content: None,
+                    agent_identity: None,
                     last_cumulative_usage: None,
                     conversation_bytes_total: 0,
                     active_turn: None,
@@ -5354,6 +5383,7 @@ mod tests {
                     permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
                     startup_mcp_config_json: None,
                     steering_content: None,
+                    agent_identity: None,
                 },
                 cancel_rx,
             )

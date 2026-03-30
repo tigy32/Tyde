@@ -51,7 +51,6 @@ export class HomeView {
   onOpenWorkspace: (() => void) | null = null;
   onOpenRemoteWorkspace: (() => void) | null = null;
   onNewBridgeChat: ((backendOverride?: BackendKind) => void) | null = null;
-  onOpenAgentLibrary: (() => void) | null = null;
   onSwitchProject: ((id: string) => void) | null = null;
   resolveProjectAgentCounts:
     | ((projectId: string) => { total: number; active: number })
@@ -712,15 +711,7 @@ export class HomeView {
     remoteBtn.textContent = "Open Remote";
     remoteBtn.addEventListener("click", () => this.onOpenRemoteWorkspace?.());
 
-    const agentLibBtn = document.createElement("button");
-    agentLibBtn.className = "home-action-btn home-action-secondary";
-    agentLibBtn.dataset.testid = "home-agent-library";
-    agentLibBtn.textContent = "Agent Library";
-    agentLibBtn.title = "Browse and spawn custom agent definitions";
-    agentLibBtn.addEventListener("click", () => this.onOpenAgentLibrary?.());
-
     actions.appendChild(splitContainer);
-    actions.appendChild(agentLibBtn);
     actions.appendChild(openBtn);
     actions.appendChild(remoteBtn);
     return actions;
@@ -952,6 +943,12 @@ export class HomeView {
         label: "Kiro",
         binary: "kiro-cli",
         description: "Kiro CLI backend.",
+      },
+      {
+        kind: "gemini",
+        label: "Gemini",
+        binary: "gemini",
+        description: "Google Gemini CLI backend.",
       },
     ];
 

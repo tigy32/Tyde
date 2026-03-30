@@ -325,6 +325,83 @@ export class WorkspaceView {
     centerNewTabSplit.appendChild(centerNewTabBtn);
     centerNewTabSplit.appendChild(centerNewTabMenuBtn);
 
+    // Agent definition submenu
+    const centerNewTabSubmenu = document.createElement("div");
+    centerNewTabSubmenu.className =
+      "center-tab-new-menu center-tab-new-submenu";
+    centerNewTabSubmenu.hidden = true;
+    centerNewTabSubmenu.setAttribute("role", "menu");
+    centerNewTabSubmenu.dataset.testid = "center-new-tab-submenu";
+
+    let submenuDismissTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const hideSubmenu = (): void => {
+      submenuDismissTimer = setTimeout(() => {
+        centerNewTabSubmenu.hidden = true;
+      }, 150);
+    };
+
+    const cancelHideSubmenu = (): void => {
+      if (submenuDismissTimer) {
+        clearTimeout(submenuDismissTimer);
+        submenuDismissTimer = null;
+      }
+    };
+
+    const showSubmenu = (
+      triggerItem: HTMLButtonElement,
+      backendKind: BackendKind,
+    ): void => {
+      cancelHideSubmenu();
+      const definitions = this.agentDefinitionStore?.getAll() ?? [];
+      if (definitions.length === 0) {
+        centerNewTabSubmenu.hidden = true;
+        return;
+      }
+      centerNewTabSubmenu.innerHTML = "";
+      for (const def of definitions) {
+        const defItem = document.createElement("button");
+        defItem.type = "button";
+        defItem.className = "center-tab-new-menu-item";
+        defItem.textContent = def.name;
+        defItem.setAttribute("role", "menuitem");
+        defItem.addEventListener("click", () => {
+          closeCenterNewTabMenu();
+          this.startNewConversation(undefined, backendKind, def.id);
+        });
+        centerNewTabSubmenu.appendChild(defItem);
+      }
+      if (!centerNewTabSubmenu.isConnected) {
+        document.body.appendChild(centerNewTabSubmenu);
+      }
+      centerNewTabSubmenu.style.visibility = "hidden";
+      centerNewTabSubmenu.hidden = false;
+      const itemRect = triggerItem.getBoundingClientRect();
+      const submenuRect = centerNewTabSubmenu.getBoundingClientRect();
+      const margin = 8;
+      let left = itemRect.right + 2;
+      if (left + submenuRect.width > window.innerWidth - margin) {
+        left = itemRect.left - submenuRect.width - 2;
+      }
+      left = Math.max(
+        margin,
+        Math.min(left, window.innerWidth - submenuRect.width - margin),
+      );
+      let top = itemRect.top;
+      top = Math.max(
+        margin,
+        Math.min(top, window.innerHeight - submenuRect.height - margin),
+      );
+      centerNewTabSubmenu.style.left = `${Math.round(left)}px`;
+      centerNewTabSubmenu.style.top = `${Math.round(top)}px`;
+      centerNewTabSubmenu.style.visibility = "";
+    };
+
+    centerNewTabSubmenu.addEventListener("mouseenter", () =>
+      cancelHideSubmenu(),
+    );
+    centerNewTabSubmenu.addEventListener("mouseleave", () => hideSubmenu());
+
     const positionCenterNewTabMenu = (): void => {
       const triggerRect = centerNewTabSplit.getBoundingClientRect();
       const menuRect = centerNewTabMenu.getBoundingClientRect();
@@ -346,6 +423,8 @@ export class WorkspaceView {
     const closeCenterNewTabMenu = (): void => {
       if (centerNewTabMenu.hidden) return;
       centerNewTabMenu.hidden = true;
+      centerNewTabSubmenu.hidden = true;
+      cancelHideSubmenu();
       centerNewTabMenuBtn.setAttribute("aria-expanded", "false");
       centerNewTabSplit.classList.remove("open");
     };
@@ -355,6 +434,12 @@ export class WorkspaceView {
       if (!centerNewTabMenu.hidden) return;
       if (!centerNewTabMenu.isConnected) {
         document.body.appendChild(centerNewTabMenu);
+      }
+      const hasDefs = (this.agentDefinitionStore?.getAll().length ?? 0) > 0;
+      for (const item of centerNewTabMenu.querySelectorAll(
+        ".center-tab-new-menu-item",
+      )) {
+        item.classList.toggle("center-tab-new-menu-item-has-submenu", hasDefs);
       }
       centerNewTabMenu.style.visibility = "hidden";
       centerNewTabMenu.hidden = false;
@@ -562,11 +647,18 @@ export class WorkspaceView {
       this.startNewConversation(undefined, "gemini");
     });
 
+    // Hover handlers for agent definition submenu
+    for (const { kind, el: item } of menuItems) {
+      item.addEventListener("mouseenter", () => showSubmenu(item, kind));
+      item.addEventListener("mouseleave", () => hideSubmenu());
+    }
+
     const handleMenuOutsidePointer = (event: PointerEvent): void => {
       const target = event.target as Node | null;
       if (
         !centerNewTabSplit.contains(target) &&
-        !centerNewTabMenu.contains(target)
+        !centerNewTabMenu.contains(target) &&
+        !centerNewTabSubmenu.contains(target)
       ) {
         closeCenterNewTabMenu();
       }
@@ -598,6 +690,7 @@ export class WorkspaceView {
     this.uiCleanupFns.push(() => {
       closeCenterNewTabMenu();
       centerNewTabMenu.remove();
+      centerNewTabSubmenu.remove();
     });
 
     this.centerNewTabBtn = centerNewTabBtn;
@@ -2261,15 +2354,18 @@ export class WorkspaceView {
   private startNewConversation(
     tabLabel?: string,
     backendOverride?: BackendKind,
+    agentDefinitionId?: string,
   ): void {
-    void this.createNewConversationTab(tabLabel, backendOverride).catch(
-      (err) => {
-        console.error("Failed to create conversation:", err);
-        this.notifications.error(
-          err instanceof Error ? err.message : "Failed to create conversation",
-        );
-      },
-    );
+    void this.createNewConversationTab(
+      tabLabel,
+      backendOverride,
+      agentDefinitionId ? { agentDefinitionId } : undefined,
+    ).catch((err) => {
+      console.error("Failed to create conversation:", err);
+      this.notifications.error(
+        err instanceof Error ? err.message : "Failed to create conversation",
+      );
+    });
   }
 
   private resolveConversationBackend(

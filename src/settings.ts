@@ -1,3 +1,5 @@
+import type { AgentDefinitionStore } from "./agent_defs/store";
+import type { AgentDefinitionEntry } from "./agent_defs/types";
 import {
   addHost as addHostBridge,
   adminGetModuleSchemas,
@@ -423,6 +425,9 @@ export class SettingsPanel {
   onBackendsChanged: (() => void) | null = null;
   onHostChange: ((host: Host | null) => void) | null = null;
   onHostsUpdated: (() => void) | null = null;
+  onSpawnAgent:
+    | ((definitionId: string, backendOverride?: BackendKind) => void)
+    | null = null;
 
   private container: HTMLElement;
   private appearance: AppearanceSettings;
@@ -462,6 +467,7 @@ export class SettingsPanel {
   private hosts: Host[] = [];
   private hostsLoading = false;
   private selectedHostId: string | null = loadSelectedHostId();
+  private agentDefinitionStore: AgentDefinitionStore | null = null;
   private _adminId: number | null = null;
 
   get adminId(): number | null {
@@ -499,6 +505,11 @@ export class SettingsPanel {
     this.refreshDriverMcpHttpServerSettings();
     this.refreshBackendDependencies();
     this.render();
+  }
+
+  setAgentDefinitionStore(store: AgentDefinitionStore): void {
+    this.agentDefinitionStore = store;
+    this.rerenderPanelContent("agents", () => this.buildAgentsContent());
   }
 
   // --- Public handlers called by event_router.ts ---
@@ -775,6 +786,7 @@ export class SettingsPanel {
     const uiExpanded =
       this.activeTab === "appearance" ||
       this.activeTab === "backends" ||
+      this.activeTab === "agents" ||
       this.activeTab === "tyde";
     const aiExpanded = !uiExpanded;
 
@@ -805,6 +817,18 @@ export class SettingsPanel {
     );
     backendsBtn.addEventListener("click", () => this.switchTab("backends"));
     uiItems.appendChild(backendsBtn);
+    const agentsBtn = el(
+      "button",
+      {
+        class: "nav-item",
+        "data-tab": "agents",
+        role: "tab",
+        "data-testid": "settings-nav-item",
+      },
+      "Agents",
+    );
+    agentsBtn.addEventListener("click", () => this.switchTab("agents"));
+    uiItems.appendChild(agentsBtn);
     const tydeBtn = el(
       "button",
       {
@@ -849,6 +873,7 @@ export class SettingsPanel {
     // Tab panels
     content.appendChild(this.buildAppearancePanel());
     content.appendChild(this.buildBackendsPanel());
+    content.appendChild(this.buildAgentsPanel());
     content.appendChild(this.buildTydePanel());
     content.appendChild(this.buildGeneralPanel());
     content.appendChild(this.buildProvidersPanel());
@@ -922,6 +947,7 @@ export class SettingsPanel {
     const uiActive =
       this.activeTab === "appearance" ||
       this.activeTab === "backends" ||
+      this.activeTab === "agents" ||
       this.activeTab === "tyde";
     this.setNavGroupExpanded("ui", uiActive);
     this.setNavGroupExpanded("ai", !uiActive);
@@ -1325,6 +1351,7 @@ export class SettingsPanel {
 
   private buildBackendUsageSection(kind: BackendKind): HTMLElement | null {
     if (kind === "tycode") return null;
+    if (kind === "gemini") return this.buildGeminiUsageNoticeSection();
     if (kind === "claude") return this.buildClaudeUsageNoticeSection();
     const usageKind = kind as UsageAwareBackendKind;
     if (this.isUsageBackendMissing(usageKind)) return null;
@@ -1409,6 +1436,39 @@ export class SettingsPanel {
         el("p", { class: "settings-description settings-usage-error" }, error),
       );
     }
+
+    return section;
+  }
+
+  private buildGeminiUsageNoticeSection(): HTMLElement {
+    const section = el("div", { class: "settings-backend-usage" });
+    const header = el("div", { class: "settings-backend-usage-header" });
+    header.appendChild(
+      el("span", { class: "settings-backend-usage-title" }, "Usage"),
+    );
+    section.appendChild(header);
+
+    const usageLink = el(
+      "a",
+      {
+        class: "settings-usage-link",
+        href: "https://aistudio.google.com/usage",
+        target: "_blank",
+        rel: "noopener noreferrer",
+      },
+      "View Gemini usage",
+    );
+    section.appendChild(usageLink);
+
+    section.appendChild(
+      el(
+        "p",
+        {
+          class: "settings-description settings-usage-meta settings-usage-note",
+        },
+        "Gemini CLI does not programmatically expose usage limits.",
+      ),
+    );
 
     return section;
   }
@@ -2631,6 +2691,373 @@ export class SettingsPanel {
 
     section.appendChild(field);
     return section;
+  }
+
+  // ========== AGENTS TAB ==========
+
+  private buildAgentsPanel(): HTMLElement {
+    const section = el("section", {
+      class: "tab-panel",
+      "data-panel": "agents",
+      role: "tabpanel",
+      "data-testid": "settings-tab-panel",
+    });
+    section.appendChild(el("h2", { class: "tab-title" }, "Agents"));
+    section.appendChild(this.buildAgentsContent());
+    return section;
+  }
+
+  private buildAgentsContent(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+
+    const description = el(
+      "p",
+      { class: "settings-description" },
+      "Agent definitions are reusable templates with custom instructions, MCP servers, tool policies, and a default backend. Spawn an agent to start a conversation using its configuration.",
+    );
+    frag.appendChild(description);
+
+    const list = el("div", { class: "settings-card-list" });
+    const definitions = this.agentDefinitionStore?.getAll() ?? [];
+    for (const def of definitions) {
+      list.appendChild(this.buildAgentDefCard(def));
+    }
+    frag.appendChild(list);
+
+    const addBtn = el(
+      "button",
+      { class: "settings-add-btn settings-add-btn-primary" },
+      "+ New Agent",
+    );
+    addBtn.dataset.testid = "agents-add-btn";
+    addBtn.addEventListener("click", () => this.showAgentDefModal(null));
+    frag.appendChild(addBtn);
+
+    return frag;
+  }
+
+  private buildAgentDefCard(def: AgentDefinitionEntry): HTMLElement {
+    const card = el("div", { class: "settings-provider-card" });
+    card.dataset.testid = `agent-def-card-${def.id}`;
+
+    const info = el("div", { class: "settings-provider-info" });
+    const header = el("div", { class: "settings-provider-header" });
+    header.appendChild(
+      el(
+        "span",
+        {
+          class: "settings-provider-name",
+          "data-testid": "settings-card-name",
+        },
+        def.name,
+      ),
+    );
+
+    const scopeClass =
+      def.scope === "builtin"
+        ? "status-connected"
+        : def.scope === "project"
+          ? "status-missing_key"
+          : "status-error";
+    header.appendChild(
+      el("span", { class: `settings-status-chip ${scopeClass}` }, def.scope),
+    );
+
+    if (def.default_backend) {
+      header.appendChild(
+        el(
+          "span",
+          { class: "settings-status-chip agent-def-backend-chip" },
+          def.default_backend,
+        ),
+      );
+    }
+    info.appendChild(header);
+
+    if (def.description) {
+      info.appendChild(
+        el("div", { class: "settings-provider-detail" }, def.description),
+      );
+    }
+
+    const details: string[] = [];
+    if (def.instructions) details.push("Has instructions");
+    const mcpCount = def.mcp_servers?.length ?? 0;
+    if (mcpCount > 0)
+      details.push(`${mcpCount} MCP server${mcpCount > 1 ? "s" : ""}`);
+    if (def.tool_policy?.mode && def.tool_policy.mode !== "Unrestricted")
+      details.push(`Tools: ${def.tool_policy.mode}`);
+    if (def.include_agent_control) details.push("Agent control");
+    if (details.length > 0) {
+      info.appendChild(
+        el("div", { class: "settings-provider-expanded" }, details.join(" · ")),
+      );
+    }
+    card.appendChild(info);
+
+    const actions = el("div", { class: "settings-provider-actions" });
+
+    const spawnWrap = el("div", { class: "agent-def-spawn-split" });
+    const spawnBtn = el(
+      "button",
+      {
+        class: "settings-action-btn agent-def-spawn-btn",
+        title: `Spawn a new ${def.name} conversation`,
+      },
+      "Spawn",
+    );
+    spawnBtn.dataset.testid = `agent-def-spawn-${def.id}`;
+    spawnBtn.addEventListener("click", () =>
+      this.onSpawnAgent?.(
+        def.id,
+        (def.default_backend as BackendKind) || undefined,
+      ),
+    );
+
+    const spawnMenuBtn = el(
+      "button",
+      {
+        class: "settings-action-btn agent-def-spawn-menu-btn",
+        title: "Choose backend",
+      },
+      "\u25BE",
+    );
+    spawnMenuBtn.dataset.testid = `agent-def-spawn-menu-${def.id}`;
+
+    const spawnMenu = el("div", { class: "agent-def-spawn-menu" });
+    spawnMenu.hidden = true;
+
+    const backendLabels: Record<string, string> = {
+      tycode: "Tycode",
+      codex: "Codex",
+      claude: "Claude",
+      kiro: "Kiro",
+      gemini: "Gemini",
+    };
+
+    const dismissMenu = () => {
+      spawnMenu.hidden = true;
+      document.removeEventListener("click", dismissMenu);
+    };
+
+    spawnMenuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!spawnMenu.hidden) {
+        dismissMenu();
+        return;
+      }
+      spawnMenu.innerHTML = "";
+      const host = this.getSelectedHost();
+      const enabledBackends = host?.enabled_backends ?? [];
+      for (const kind of enabledBackends) {
+        const label = backendLabels[kind] ?? kind;
+        const opt = el(
+          "button",
+          { class: "agent-def-spawn-menu-item" },
+          `Spawn with ${label}`,
+        );
+        opt.addEventListener("click", () => {
+          dismissMenu();
+          this.onSpawnAgent?.(def.id, kind as BackendKind);
+        });
+        spawnMenu.appendChild(opt);
+      }
+      spawnMenu.hidden = false;
+      requestAnimationFrame(() =>
+        document.addEventListener("click", dismissMenu),
+      );
+    });
+
+    spawnWrap.appendChild(spawnBtn);
+    spawnWrap.appendChild(spawnMenuBtn);
+    spawnWrap.appendChild(spawnMenu);
+    actions.appendChild(spawnWrap);
+
+    const editBtn = el(
+      "button",
+      { class: "settings-action-btn", title: "Edit agent" },
+      "Edit",
+    );
+    editBtn.addEventListener("click", () => this.showAgentDefModal(def));
+    actions.appendChild(editBtn);
+
+    if (def.scope !== "builtin") {
+      const delBtn = el(
+        "button",
+        {
+          class: "settings-action-btn settings-provider-delete",
+          title: "Delete agent",
+        },
+        "Delete",
+      );
+      delBtn.addEventListener("click", () => {
+        void this.agentDefinitionStore?.delete(def.id).then(() => {
+          this.rerenderPanelContent("agents", () => this.buildAgentsContent());
+        });
+      });
+      actions.appendChild(delBtn);
+    }
+
+    card.appendChild(actions);
+    return card;
+  }
+
+  private showAgentDefModal(existing: AgentDefinitionEntry | null): void {
+    const isNew = existing === null;
+    const title = isNew ? "New Agent" : `Edit ${existing.name}`;
+
+    const overlay = el("div", { class: "settings-modal-overlay" });
+    const modal = el("div", { class: "settings-modal agent-def-modal" });
+    modal.appendChild(el("h3", {}, title));
+
+    // Name
+    const nameField = el("div", { class: "settings-field" });
+    nameField.appendChild(el("label", { class: "settings-label" }, "Name"));
+    const nameInput = el("input", {
+      class: "settings-input",
+      type: "text",
+      placeholder: "e.g. Code Reviewer",
+    }) as HTMLInputElement;
+    nameInput.value = existing?.name ?? "";
+    nameField.appendChild(nameInput);
+    modal.appendChild(nameField);
+
+    // Description
+    const descField = el("div", { class: "settings-field" });
+    descField.appendChild(
+      el("label", { class: "settings-label" }, "Description"),
+    );
+    const descInput = el("input", {
+      class: "settings-input",
+      type: "text",
+      placeholder: "Short description of what this agent does",
+    }) as HTMLInputElement;
+    descInput.value = existing?.description ?? "";
+    descField.appendChild(descInput);
+    modal.appendChild(descField);
+
+    // Instructions
+    const instrField = el("div", {
+      class: "settings-field agent-def-instructions-field",
+    });
+    instrField.appendChild(
+      el("label", { class: "settings-label" }, "Instructions"),
+    );
+    const instrDesc = el(
+      "p",
+      { class: "settings-description" },
+      "Custom system instructions prepended to every conversation with this agent.",
+    );
+    instrField.appendChild(instrDesc);
+    const instrInput = el("textarea", {
+      class: "settings-textarea",
+      rows: "4",
+      placeholder:
+        "You are a code reviewer. Focus on correctness, security, and readability...",
+    }) as HTMLTextAreaElement;
+    instrInput.value = existing?.instructions ?? "";
+    instrField.appendChild(instrInput);
+    modal.appendChild(instrField);
+
+    // Default Backend
+    const backendField = el("div", { class: "settings-field" });
+    backendField.appendChild(
+      el("label", { class: "settings-label" }, "Default Backend"),
+    );
+    const backendSelect = el("select", {
+      class: "settings-select",
+    }) as HTMLSelectElement;
+    const backendOptions = [
+      ["", "None (use workspace default)"],
+      ["tycode", "Tycode"],
+      ["claude", "Claude"],
+      ["codex", "Codex"],
+      ["kiro", "Kiro"],
+      ["gemini", "Gemini"],
+    ];
+    for (const [value, label] of backendOptions) {
+      const opt = el("option", { value }, label);
+      if ((existing?.default_backend ?? "") === value) {
+        opt.selected = true;
+      }
+      backendSelect.appendChild(opt);
+    }
+    backendField.appendChild(backendSelect);
+    modal.appendChild(backendField);
+
+    // Include Agent Control toggle
+    const controlField = el("div", { class: "settings-field" });
+    const controlRow = el("div", { class: "settings-toggle-row" });
+    const controlLabelCol = el("div", { class: "settings-toggle-label-col" });
+    controlLabelCol.appendChild(
+      el("label", { class: "settings-label" }, "Include Agent Control"),
+    );
+    controlLabelCol.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Give this agent access to spawn and manage other agents.",
+      ),
+    );
+    controlRow.appendChild(controlLabelCol);
+    const controlToggle = el("label", { class: "settings-toggle" });
+    const controlInput = el("input", { type: "checkbox" }) as HTMLInputElement;
+    controlInput.checked = existing?.include_agent_control ?? false;
+    controlToggle.appendChild(controlInput);
+    controlToggle.appendChild(el("span", { class: "settings-toggle-slider" }));
+    controlRow.appendChild(controlToggle);
+    controlField.appendChild(controlRow);
+    modal.appendChild(controlField);
+
+    // Actions
+    const actions = el("div", { class: "settings-modal-actions" });
+    const cancelBtn = el("button", {}, "Cancel");
+    cancelBtn.addEventListener("click", () => overlay.remove());
+
+    const saveBtn = el(
+      "button",
+      { class: "settings-modal-save" },
+      isNew ? "Create" : "Save",
+    );
+    saveBtn.addEventListener("click", () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        nameInput.focus();
+        return;
+      }
+
+      const entry: AgentDefinitionEntry = {
+        id: existing?.id ?? name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+        name,
+        description: descInput.value.trim(),
+        instructions: instrInput.value.trim() || undefined,
+        bootstrap_prompt: existing?.bootstrap_prompt,
+        mcp_servers: existing?.mcp_servers ?? [],
+        tool_policy: existing?.tool_policy ?? { mode: "Unrestricted" },
+        default_backend: backendSelect.value || undefined,
+        include_agent_control: controlInput.checked,
+        builtin: false,
+        scope: existing?.scope === "project" ? "project" : "global",
+      };
+
+      overlay.remove();
+      void this.agentDefinitionStore
+        ?.save(entry, entry.scope === "project" ? "project" : "global")
+        .then(() => {
+          this.rerenderPanelContent("agents", () => this.buildAgentsContent());
+        });
+    });
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    modal.appendChild(actions);
+
+    overlay.appendChild(modal);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
+    nameInput.focus();
   }
 
   private buildTydePanel(): HTMLElement {

@@ -13,7 +13,7 @@ pub async fn query_backend_usage_for_host(
     match backend_kind.trim().to_ascii_lowercase().as_str() {
         "codex" => query_codex_usage(ssh_host).await,
         "kiro" => query_kiro_usage(ssh_host).await,
-        "tycode" | "claude" => Err(format!("{backend_kind} does not expose usage limits")),
+        "tycode" | "claude" | "gemini" => Err(format!("{backend_kind} does not expose usage limits")),
         other => Err(format!("Unknown backend kind: {other}")),
     }
 }

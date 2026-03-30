@@ -101,12 +101,15 @@ impl KiroSession {
             ephemeral,
         )
         .await?;
-        let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &["acp"])
+        let acp_args: Vec<&str> = vec!["acp"];
+
+        let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &acp_args)
             .with_local_cwd(roots.session_cwd.clone());
         spawn_spec.local_program = resolve_kiro_chat_binary();
         if ssh_host.is_some() {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
+
         let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, ssh_host.as_deref()).await?;
 
         bridge
@@ -130,26 +133,18 @@ impl KiroSession {
             )
             .await?;
 
-        let has_kiro_steering = if let Some(content) = steering_content {
-            if !content.trim().is_empty() {
-                crate::steering::write_kiro_steering(&roots.scope_root, content).await?;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
         let session_result: Result<(String, Value), String> = async {
+            let mut session_params = json!({
+                "cwd": roots.session_cwd,
+                "mcpServers": acp_mcp_servers_json(startup_mcp_servers)
+            });
+            if let Some(content) = steering_content {
+                if !content.trim().is_empty() {
+                    session_params["systemPrompt"] = Value::String(content.to_string());
+                }
+            }
             let session_started = bridge
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": roots.session_cwd,
-                        "mcpServers": acp_mcp_servers_json(startup_mcp_servers)
-                    }),
-                )
+                .request("session/new", session_params)
                 .await?;
 
             let session_id = session_started
@@ -168,15 +163,7 @@ impl KiroSession {
         }
         .await;
 
-        let (session_id, session_started) = match session_result {
-            Ok(v) => v,
-            Err(e) => {
-                if has_kiro_steering {
-                    crate::steering::cleanup_kiro_steering(&roots.scope_root).await;
-                }
-                return Err(e);
-            }
-        };
+        let (session_id, session_started) = session_result?;
 
         let initial_model = extract_current_model(&session_started);
         let initial_mode = extract_current_mode(&session_started);
@@ -187,12 +174,12 @@ impl KiroSession {
             bridge,
             event_tx,
             shutting_down: AtomicBool::new(false),
-            has_kiro_steering,
             ssh_host,
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
                 admin_session,
+                steering_content: steering_content.map(|s| s.to_string()),
                 startup_mcp_servers: startup_mcp_servers.to_vec(),
                 model: initial_model,
                 mode: initial_mode,
@@ -235,6 +222,7 @@ struct KiroState {
     session_id: String,
     workspace_root: String,
     admin_session: bool,
+    steering_content: Option<String>,
     startup_mcp_servers: Vec<StartupMcpServer>,
     model: Option<String>,
     mode: Option<String>,
@@ -271,7 +259,6 @@ struct KiroInner {
     event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
-    has_kiro_steering: bool,
     ssh_host: Option<String>,
 }
 
@@ -282,18 +269,25 @@ impl KiroInner {
                 self.emit_user_message_added(&message, images.as_deref());
                 self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
 
-                let (session_id, model, mode) = {
+                let (session_id, model, mode, steering) = {
                     let state = self.state.lock().await;
                     (
                         state.session_id.clone(),
                         state.model.clone(),
                         state.mode.clone(),
+                        state.steering_content.clone(),
                     )
+                };
+
+                let effective_message = if let Some(ref s) = steering {
+                    format!("{}\n\n{}", s, message)
+                } else {
+                    message.clone()
                 };
 
                 let mut prompt_blocks = vec![json!({
                     "type": "text",
-                    "text": message,
+                    "text": effective_message,
                 })];
 
                 if let Some(imgs) = images {
@@ -316,6 +310,9 @@ impl KiroInner {
                 }
                 if let Some(mode_id) = mode {
                     params["modeId"] = Value::String(mode_id);
+                }
+                if let Some(ref s) = steering {
+                    params["systemPrompt"] = Value::String(s.clone());
                 }
 
                 self.state.lock().await.cancelled = false;
@@ -654,10 +651,6 @@ impl KiroInner {
             let _ = crate::remote::run_ssh_raw(host, &cmd).await;
         }
 
-        if self.has_kiro_steering {
-            let workspace_root = self.state.lock().await.workspace_root.clone();
-            crate::steering::cleanup_kiro_steering(&workspace_root).await;
-        }
         self.bridge.shutdown().await;
     }
 
