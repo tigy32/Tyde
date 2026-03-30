@@ -28,6 +28,7 @@ import {
   onCreateWorkbench,
   onDeleteWorkbench,
   openWorkspaceDialog,
+  pickSubRootDialog,
   terminateAgent,
 } from "./bridge";
 import { CommandPalette } from "./command_palette";
@@ -309,6 +310,7 @@ export class AppController {
         this.projectState.projects.map((project) => ({
           name: project.name,
           workspacePath: project.workspacePath,
+          roots: project.roots,
         })),
       availableWidgets: ["sessions", "agents"],
     });
@@ -393,6 +395,9 @@ export class AppController {
     sidebar.onRemoveWorkbench = (projectId) => {
       void this.removeWorkbench(projectId);
     };
+    sidebar.onManageRoots = (projectId) => {
+      void this.showManageRootsDialog(projectId);
+    };
     sidebar.onAddRemoteProject = (host) => {
       const dialog = new RemoteBrowserDialog(host, (sshUri) => {
         void this.openWorkspacePath(sshUri);
@@ -427,11 +432,13 @@ export class AppController {
     const existing = this.workspaceViews.get(projectId);
     if (existing) return existing;
 
+    const project = this.projectState.projects.find((p) => p.id === projectId);
     const view = new WorkspaceView({
       projectId,
       workspacePath,
       projectName,
       notifications: this.notifications,
+      roots: project?.roots,
     });
 
     const viewContainer = document.getElementById("workspace-container")!;
@@ -1183,6 +1190,115 @@ export class AppController {
       return;
     }
     this.switchToHome();
+  }
+
+  private async showManageRootsDialog(projectId: string): Promise<void> {
+    const project = this.projectState.projects.find((p) => p.id === projectId);
+    if (!project) return;
+
+    const overlay = document.createElement("div");
+    overlay.className = "text-prompt-overlay";
+    overlay.dataset.testid = "manage-roots-dialog";
+
+    const card = document.createElement("div");
+    card.className = "text-prompt-card manage-roots-dialog";
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-modal", "true");
+    card.setAttribute("aria-label", "Manage Sub-Roots");
+
+    const title = document.createElement("h3");
+    title.className = "text-prompt-title";
+    title.textContent = `Sub-Roots — ${project.name}`;
+    card.appendChild(title);
+
+    const desc = document.createElement("p");
+    desc.className = "text-prompt-description";
+    desc.textContent =
+      "Sub-roots define workspace boundaries for Tycode agents within this project directory.";
+    card.appendChild(desc);
+
+    const listContainer = document.createElement("div");
+    listContainer.className = "manage-roots-list";
+    card.appendChild(listContainer);
+
+    const syncView = () => {
+      const view = this.workspaceViews.get(projectId);
+      if (view) view.setRoots(project.roots);
+    };
+
+    const renderList = () => {
+      listContainer.innerHTML = "";
+      if (project.roots.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "manage-roots-empty";
+        empty.textContent =
+          "No sub-roots. The project path is the sole workspace root.";
+        listContainer.appendChild(empty);
+      } else {
+        for (const root of project.roots) {
+          const row = document.createElement("div");
+          row.className = "manage-roots-row";
+
+          const label = document.createElement("span");
+          label.className = "manage-roots-label";
+          label.textContent = root;
+          row.appendChild(label);
+
+          const removeBtn = document.createElement("button");
+          removeBtn.className = "manage-roots-remove";
+          removeBtn.textContent = "Remove";
+          removeBtn.addEventListener("click", () => {
+            this.projectState.removeProjectRoot(projectId, root);
+            syncView();
+            renderList();
+          });
+          row.appendChild(removeBtn);
+          listContainer.appendChild(row);
+        }
+      }
+    };
+    renderList();
+
+    const actions = document.createElement("div");
+    actions.className = "text-prompt-actions";
+
+    const addBtn = document.createElement("button");
+    addBtn.className = "text-prompt-btn";
+    addBtn.textContent = "Add Sub-Root\u2026";
+    addBtn.addEventListener("click", async () => {
+      let selected: string | null;
+      try {
+        selected = await pickSubRootDialog(project.workspacePath);
+      } catch (err) {
+        this.notifications.error(
+          err instanceof Error ? err.message : String(err),
+        );
+        return;
+      }
+      if (!selected) return;
+      this.projectState.addProjectRoot(projectId, selected);
+      syncView();
+      renderList();
+    });
+    actions.appendChild(addBtn);
+
+    const doneBtn = document.createElement("button");
+    doneBtn.className = "text-prompt-btn text-prompt-btn-primary";
+    doneBtn.textContent = "Done";
+    doneBtn.addEventListener("click", () => overlay.remove());
+    actions.appendChild(doneBtn);
+
+    card.appendChild(actions);
+    overlay.appendChild(card);
+
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") overlay.remove();
+    });
+
+    document.body.appendChild(overlay);
   }
 
   private wireDockButtons(): void {

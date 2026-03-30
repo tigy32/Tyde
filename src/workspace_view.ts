@@ -62,8 +62,9 @@ interface WorkspaceViewConfig {
   projectName: string;
   notifications: NotificationManager;
   mode?: "workspace" | "bridge";
+  roots?: string[];
   getBridgeProjects?:
-    | (() => Array<{ name: string; workspacePath: string }>)
+    | (() => Array<{ name: string; workspacePath: string; roots: string[] }>)
     | null;
   bridgeChatLabel?: string;
   bridgeChatEnabled?: boolean;
@@ -101,9 +102,11 @@ export class WorkspaceView {
 
   private readonly mode: "workspace" | "bridge";
   private readonly bridgeChatLabel: string;
+  private roots: string[];
   private readonly getBridgeProjects: () => Array<{
     name: string;
     workspacePath: string;
+    roots: string[];
   }>;
   private chatPanel: ChatPanel;
   private tabManager: TabManager;
@@ -169,6 +172,7 @@ export class WorkspaceView {
     this.workspacePath = config.workspacePath;
     this.notifications = config.notifications;
     this.mode = config.mode ?? "workspace";
+    this.roots = config.roots ?? [];
     this.bridgeChatLabel =
       (config.bridgeChatLabel ?? "Bridge").trim() || "Bridge";
     this.getBridgeProjects = config.getBridgeProjects ?? (() => []);
@@ -460,7 +464,7 @@ export class WorkspaceView {
     this.workflowStore = new WorkflowStore(config.workspacePath);
     this.workflowEngine = new WorkflowEngine(
       config.workspacePath,
-      config.workspacePath ? [config.workspacePath] : [],
+      config.workspacePath ? this.getEffectiveRoots() : [],
       this.workflowStore,
     );
     this.workflowsPanel = new WorkflowsPanel(
@@ -811,6 +815,16 @@ export class WorkspaceView {
       enabled,
       this.newConversationDisabledReason,
     );
+  }
+
+  setRoots(roots: string[]): void {
+    this.roots = roots;
+    this.workflowEngine.setWorkspaceRoots(this.getEffectiveRoots());
+  }
+
+  private getEffectiveRoots(): string[] {
+    if (this.roots.length === 0) return [this.workspacePath];
+    return this.roots.map((r) => `${this.workspacePath}/${r}`);
   }
 
   async refreshHostSettings(): Promise<void> {
@@ -1221,7 +1235,11 @@ export class WorkspaceView {
 
   private resolveWorkspaceRootsForBackend(backendKind: BackendKind): string[] {
     if (this.mode !== "bridge") {
-      return this.workspacePath.trim() ? [this.workspacePath] : [];
+      if (!this.workspacePath.trim()) return [];
+      if (backendKind === "tycode") {
+        return this.getEffectiveRoots();
+      }
+      return [this.workspacePath];
     }
     if (backendKind === "tycode") {
       return [];
@@ -1258,10 +1276,13 @@ export class WorkspaceView {
     const projectLines =
       projects.length === 0
         ? ["- No projects are currently open in Tyde."]
-        : projects.map(
-            (project, index) =>
-              `- ${index + 1}. ${project.name} :: ${project.workspacePath}`,
-          );
+        : projects.map((project, index) => {
+            const rootsInfo =
+              project.roots.length > 0
+                ? ` (sub-roots: ${project.roots.join(", ")})`
+                : "";
+            return `- ${index + 1}. ${project.name} :: ${project.workspacePath}${rootsInfo}`;
+          });
     return [
       `[Tyde ${this.bridgeChatLabel} Charter]`,
       `You are the ${this.bridgeChatLabel}, a control agent operating inside Tyde.`,

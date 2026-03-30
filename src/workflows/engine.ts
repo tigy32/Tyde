@@ -37,6 +37,10 @@ export class WorkflowEngine {
     this.store = store;
   }
 
+  setWorkspaceRoots(roots: string[]): void {
+    this.workspaceRoots = roots;
+  }
+
   async execute(workflow: WorkflowDefinition): Promise<WorkflowRunState> {
     runCounter++;
     const runId = `run-${runCounter}-${Date.now()}`;

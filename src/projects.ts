@@ -25,6 +25,7 @@ export class ProjectSidebar {
   private onRemoveProject: (id: string) => void;
   onCreateWorkbench: ((parentProjectId: string) => void) | null = null;
   onRemoveWorkbench: ((projectId: string) => void) | null = null;
+  onManageRoots: ((projectId: string) => void) | null = null;
   onAddRemoteProject: ((host: Host) => void) | null = null;
   private hosts: Host[] = [];
 
@@ -193,6 +194,14 @@ export class ProjectSidebar {
     label.textContent = project.name;
     item.appendChild(label);
 
+    if (project.roots.length > 0) {
+      const badge = document.createElement("span");
+      badge.className = "rail-roots-badge";
+      badge.textContent = String(project.roots.length);
+      badge.title = project.roots.join(", ");
+      item.appendChild(badge);
+    }
+
     // Click to switch
     item.addEventListener("click", () => this.onSwitchProject(project.id));
 
@@ -292,7 +301,17 @@ export class ProjectSidebar {
       this.onRemoveProject(project.id);
     });
 
+    const manageRootsItem = document.createElement("div");
+    manageRootsItem.className = "rail-context-menu-item";
+    manageRootsItem.dataset.testid = "rail-context-manage-roots";
+    manageRootsItem.textContent = "Sub-Roots\u2026";
+    manageRootsItem.addEventListener("click", () => {
+      menu.remove();
+      this.onManageRoots?.(project.id);
+    });
+
     menu.appendChild(renameItem);
+    menu.appendChild(manageRootsItem);
     menu.appendChild(newWorkbenchItem);
     menu.appendChild(closeItem);
     document.body.appendChild(menu);

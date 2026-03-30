@@ -745,6 +745,29 @@ export async function openWorkspaceDialog(): Promise<string | null> {
   }
 }
 
+export async function pickSubRootDialog(
+  parentPath: string,
+): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Select Sub-Root Directory",
+    defaultPath: parentPath,
+  });
+  if (typeof selected !== "string") return null;
+
+  const normalizedParent = parentPath.replace(/\/+$/, "");
+  const normalizedSelected = selected.replace(/\/+$/, "");
+  if (
+    normalizedSelected === normalizedParent ||
+    !normalizedSelected.startsWith(`${normalizedParent}/`)
+  ) {
+    throw new Error("Selected directory must be inside the project directory.");
+  }
+
+  return normalizedSelected.slice(normalizedParent.length + 1);
+}
+
 export async function getInitialWorkspace(): Promise<string | null> {
   return invoke<string | null>("get_initial_workspace");
 }

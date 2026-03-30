@@ -10632,3 +10632,72 @@ body {
 .workflow-builder-save:hover {
   background: var(--accent-hover);
 }
+
+/* Manage roots dialog — extends text-prompt-card */
+.manage-roots-dialog {
+  max-width: 480px;
+}
+
+.manage-roots-list {
+  margin: 12px 0;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.manage-roots-empty {
+  color: var(--text-secondary);
+  font-style: italic;
+  padding: 8px 0;
+  font-size: 13px;
+}
+
+.manage-roots-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+
+.manage-roots-row:hover {
+  background: var(--surface-1);
+}
+
+.manage-roots-label {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manage-roots-remove {
+  background: none;
+  border: none;
+  color: var(--danger, #ff6b6b);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.manage-roots-remove:hover {
+  background: var(--surface-2);
+}
+
+.rail-roots-badge {
+  font-size: 10px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  border-radius: 8px;
+  padding: 0 5px;
+  margin-left: 4px;
+  line-height: 16px;
+}
+
+.home-card-roots {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}

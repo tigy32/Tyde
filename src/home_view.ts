@@ -839,6 +839,13 @@ export class HomeView {
     meta.appendChild(convCount);
     card.appendChild(meta);
 
+    if (project.roots.length > 0) {
+      const rootsInfo = document.createElement("div");
+      rootsInfo.className = "home-card-roots";
+      rootsInfo.textContent = `${project.roots.length} sub-root${project.roots.length !== 1 ? "s" : ""}`;
+      card.appendChild(rootsInfo);
+    }
+
     return card;
   }
 

@@ -6,6 +6,7 @@ export interface Project {
   id: string;
   name: string;
   workspacePath: string;
+  roots: string[];
   conversationIds: number[];
   activeConversationId: number | null;
   status: ProjectStatus;
@@ -18,6 +19,7 @@ interface PersistedState {
     id: string;
     name: string;
     workspacePath: string;
+    roots?: string[];
     parentProjectId?: string | null;
     workbenchKind?: WorkbenchKind | null;
   }>;
@@ -46,6 +48,7 @@ export class ProjectStateManager {
       id: crypto.randomUUID(),
       name,
       workspacePath,
+      roots: [],
       conversationIds: [],
       activeConversationId: null,
       status: "idle",
@@ -78,10 +81,12 @@ export class ProjectStateManager {
     name: string,
     kind: WorkbenchKind,
   ): Project {
+    const parent = this.projects.find((p) => p.id === parentProjectId);
     const project: Project = {
       id: crypto.randomUUID(),
       name,
       workspacePath,
+      roots: parent?.roots?.slice() ?? [],
       conversationIds: [],
       activeConversationId: null,
       status: "idle",
@@ -221,6 +226,23 @@ export class ProjectStateManager {
     );
   }
 
+  addProjectRoot(projectId: string, root: string): void {
+    const project = this.projects.find((p) => p.id === projectId);
+    if (!project) return;
+    if (project.roots.includes(root)) return;
+    project.roots.push(root);
+    this.onChange?.();
+    this.persist();
+  }
+
+  removeProjectRoot(projectId: string, root: string): void {
+    const project = this.projects.find((p) => p.id === projectId);
+    if (!project) return;
+    project.roots = project.roots.filter((r) => r !== root);
+    this.onChange?.();
+    this.persist();
+  }
+
   setSidebarCollapsed(collapsed: boolean): void {
     this.sidebarCollapsed = collapsed;
     this.persist();
@@ -232,6 +254,7 @@ export class ProjectStateManager {
         id: p.id,
         name: p.name,
         workspacePath: p.workspacePath,
+        roots: p.roots,
         parentProjectId: p.parentProjectId,
         workbenchKind: p.workbenchKind,
       })),
@@ -260,6 +283,7 @@ export class ProjectStateManager {
       id: p.id,
       name: p.name,
       workspacePath: p.workspacePath,
+      roots: p.roots ?? [],
       conversationIds: [],
       activeConversationId: null,
       status: "idle" as const,
