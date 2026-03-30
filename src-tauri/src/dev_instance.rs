@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -10,12 +11,90 @@ use crate::AppState;
 
 /// A running Tyde dev instance spawned via `tyde_dev_instance_start`.
 pub(crate) struct DevInstance {
+    pub(crate) instance_id: u64,
     /// Handle to the `npx tauri dev` child process tree.
     child: tokio::process::Child,
     /// Shared proxy state (cheap to clone for use across await points).
     proxy: Arc<McpProxy>,
     /// Project directory the dev instance was launched from.
     pub(crate) project_dir: String,
+    /// SSH host if this is a remote instance.
+    pub(crate) ssh_host: Option<String>,
+    /// Agent ID this instance is bound to (for auto-cleanup).
+    pub(crate) agent_id: Option<u64>,
+    /// SSH tunnel process for remote instances.
+    ssh_tunnel: Option<tokio::process::Child>,
+}
+
+/// Manages multiple concurrent dev instances.
+pub(crate) struct DevInstanceRegistry {
+    instances: HashMap<u64, DevInstance>,
+    next_id: u64,
+}
+
+impl DevInstanceRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            instances: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    fn next_instance_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn insert(&mut self, instance: DevInstance) {
+        self.instances.insert(instance.instance_id, instance);
+    }
+
+    fn remove(&mut self, id: u64) -> Option<DevInstance> {
+        self.instances.remove(&id)
+    }
+
+    fn get(&self, id: u64) -> Option<&DevInstance> {
+        self.instances.get(&id)
+    }
+
+    fn sole_instance(&self) -> Option<&DevInstance> {
+        if self.instances.len() == 1 {
+            self.instances.values().next()
+        } else {
+            None
+        }
+    }
+
+    fn instance_ids_for_agent(&self, agent_id: u64) -> Vec<u64> {
+        self.instances
+            .values()
+            .filter(|i| i.agent_id == Some(agent_id))
+            .map(|i| i.instance_id)
+            .collect()
+    }
+
+    fn list(&self) -> Vec<DevInstanceInfo> {
+        self.instances
+            .values()
+            .map(|i| DevInstanceInfo {
+                instance_id: i.instance_id,
+                project_dir: i.project_dir.clone(),
+                ssh_host: i.ssh_host.clone(),
+                agent_id: i.agent_id,
+                debug_mcp_url: i.proxy.debug_mcp_url.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DevInstanceInfo {
+    pub(crate) instance_id: u64,
+    pub(crate) project_dir: String,
+    pub(crate) ssh_host: Option<String>,
+    pub(crate) agent_id: Option<u64>,
+    pub(crate) debug_mcp_url: String,
 }
 
 /// Lightweight MCP client for proxying tool calls to the dev instance.
@@ -28,6 +107,7 @@ struct McpProxy {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DevInstanceStartResult {
+    pub(crate) instance_id: u64,
     pub(crate) debug_mcp_url: String,
     pub(crate) status: &'static str,
 }
@@ -182,25 +262,115 @@ impl McpProxy {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn find_free_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("Failed to find available port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to get local addr: {e}"))?
+        .port();
+    Ok(port)
+}
+
+fn drain_child_output(child: &mut tokio::process::Child) -> Arc<SyncMutex<Vec<String>>> {
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "dev_instance::stdout", "{line}");
+            }
+        });
+    }
+    let stderr_tail: Arc<SyncMutex<Vec<String>>> = Arc::new(SyncMutex::new(Vec::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail = Arc::clone(&stderr_tail);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "dev_instance::stderr", "{line}");
+                let mut buf = tail.lock();
+                buf.push(line);
+                if buf.len() > 50 {
+                    buf.remove(0);
+                }
+            }
+        });
+    }
+    stderr_tail
+}
+
+async fn poll_healthz(
+    child: &mut tokio::process::Child,
+    healthz_url: &str,
+    stderr_tail: &Arc<SyncMutex<Vec<String>>>,
+) -> Result<reqwest::Client, String> {
+    let client = reqwest::Client::new();
+    let poll_timeout = std::time::Duration::from_secs(300);
+    let poll_interval = std::time::Duration::from_secs(2);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > poll_timeout {
+            kill_process_tree(child).await;
+            let tail = stderr_tail.lock().join("\n");
+            return Err(format!(
+                "Dev instance did not become ready within {}s.\n\nstderr:\n{tail}",
+                poll_timeout.as_secs()
+            ));
+        }
+
+        if let Some(exit_status) = child
+            .try_wait()
+            .map_err(|e| format!("Failed to check dev instance process: {e}"))?
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let tail = stderr_tail.lock().join("\n");
+            return Err(format!(
+                "Dev instance exited with {exit_status} before becoming ready.\n\nstderr:\n{tail}"
+            ));
+        }
+
+        match client.get(healthz_url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(client),
+            _ => {}
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Start a new Tyde dev instance.
+/// Start a new Tyde dev instance (local or remote).
 pub(crate) async fn start_dev_instance(
     state: &AppState,
     project_dir: String,
     workspace_path: Option<String>,
+    ssh_host: Option<String>,
+    agent_id: Option<u64>,
 ) -> Result<DevInstanceStartResult, String> {
-    {
-        let guard = state.dev_instance.lock();
-        if guard.is_some() {
-            return Err(
-                "A dev instance is already running. Stop it first with tyde_dev_instance_stop."
-                    .to_string(),
-            );
-        }
-    }
+    let instance_id = state.dev_instances.lock().next_instance_id();
 
+    if let Some(ref host) = ssh_host {
+        start_remote_dev_instance(state, instance_id, project_dir, workspace_path, host, agent_id)
+            .await
+    } else {
+        start_local_dev_instance(state, instance_id, project_dir, workspace_path, agent_id).await
+    }
+}
+
+async fn start_local_dev_instance(
+    state: &AppState,
+    instance_id: u64,
+    project_dir: String,
+    workspace_path: Option<String>,
+    agent_id: Option<u64>,
+) -> Result<DevInstanceStartResult, String> {
     // Verify node_modules exists so we get a clear error instead of npx
     // hanging on an interactive "install?" prompt or silently failing.
     let node_modules = std::path::Path::new(&project_dir).join("node_modules");
@@ -213,15 +383,6 @@ pub(crate) async fn start_dev_instance(
     // Find available ports by binding to :0 and reading the assigned ports.
     // We need three: debug MCP, agent control MCP, and Vite (to avoid
     // colliding with the host's ports).
-    let find_free_port = || -> Result<u16, String> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("Failed to find available port: {e}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| format!("Failed to get local addr: {e}"))?
-            .port();
-        Ok(port)
-    };
     let debug_mcp_port = find_free_port()?;
     let agent_mcp_port = find_free_port()?;
     let vite_port = find_free_port()?;
@@ -270,71 +431,12 @@ pub(crate) async fn start_dev_instance(
         .map_err(|e| format!("Failed to spawn `npx tauri dev`: {e}"))?;
 
     // Drain stdout/stderr in background tasks so the child process doesn't
-    // block when the OS pipe buffer fills up. Stderr is collected into a
-    // shared buffer so we can surface build errors if the process exits early.
-    if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "dev_instance::stdout", "{line}");
-            }
-        });
-    }
-    let stderr_tail: Arc<SyncMutex<Vec<String>>> = Arc::new(SyncMutex::new(Vec::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let tail = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "dev_instance::stderr", "{line}");
-                let mut buf = tail.lock();
-                buf.push(line);
-                // Keep only the last 50 lines to avoid unbounded growth.
-                if buf.len() > 50 {
-                    buf.remove(0);
-                }
-            }
-        });
-    }
+    // block when the OS pipe buffer fills up.
+    let stderr_tail = drain_child_output(&mut child);
 
     // Poll healthz until the dev instance's debug MCP server is ready.
-    // Check if the child process has exited on each iteration so we fail
-    // fast instead of polling a dead port for 5 minutes.
     let healthz_url = format!("http://127.0.0.1:{debug_mcp_port}/healthz");
-    let client = reqwest::Client::new();
-    let poll_timeout = std::time::Duration::from_secs(300);
-    let poll_interval = std::time::Duration::from_secs(2);
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > poll_timeout {
-            kill_process_tree(&mut child).await;
-            let tail = stderr_tail.lock().join("\n");
-            return Err(format!(
-                "Dev instance did not become ready within {}s.\n\nstderr:\n{tail}",
-                poll_timeout.as_secs()
-            ));
-        }
-
-        if let Some(exit_status) = child
-            .try_wait()
-            .map_err(|e| format!("Failed to check dev instance process: {e}"))?
-        {
-            // Give the stderr drain task a moment to finish reading.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let tail = stderr_tail.lock().join("\n");
-            return Err(format!(
-                "Dev instance exited with {exit_status} before becoming ready.\n\nstderr:\n{tail}"
-            ));
-        }
-
-        match client.get(&healthz_url).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => {}
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
+    let client = poll_healthz(&mut child, &healthz_url, &stderr_tail).await?;
 
     let proxy = Arc::new(McpProxy {
         debug_mcp_url: debug_mcp_url.clone(),
@@ -344,43 +446,186 @@ pub(crate) async fn start_dev_instance(
     });
 
     let instance = DevInstance {
+        instance_id,
         child,
         proxy,
         project_dir: project_dir.clone(),
+        ssh_host: None,
+        agent_id,
+        ssh_tunnel: None,
     };
 
-    *state.dev_instance.lock() = Some(instance);
+    state.dev_instances.lock().insert(instance);
 
-    tracing::info!("Dev instance started: {debug_mcp_url} (project: {project_dir})");
+    tracing::info!("Dev instance {instance_id} started: {debug_mcp_url} (project: {project_dir})");
 
     Ok(DevInstanceStartResult {
+        instance_id,
         debug_mcp_url,
         status: "running",
     })
 }
 
-/// Stop the running dev instance.
-pub(crate) async fn stop_dev_instance(state: &AppState) -> Result<DevInstanceStopResult, String> {
+async fn start_remote_dev_instance(
+    state: &AppState,
+    instance_id: u64,
+    project_dir: String,
+    workspace_path: Option<String>,
+    host: &str,
+    agent_id: Option<u64>,
+) -> Result<DevInstanceStartResult, String> {
+    // Find 3 free ports on the remote host.
+    let remote_ports = crate::remote::find_remote_free_ports(host, 3).await?;
+    let remote_vite_port = remote_ports[0];
+    let remote_debug_port = remote_ports[1];
+    let remote_agent_port = remote_ports[2];
+
+    // Find 1 free local port for the SSH tunnel.
+    let local_tunnel_port = find_free_port()?;
+
+    let debug_mcp_url = format!("http://127.0.0.1:{local_tunnel_port}/mcp");
+
+    // Override tauri.conf.json devUrl to point at the remote Vite port.
+    let tauri_config_override =
+        format!(r#"{{"build":{{"devUrl":"http://localhost:{remote_vite_port}"}}}}"#);
+
+    // Build the remote command string.
+    let workspace_env = match workspace_path {
+        Some(ref ws) => format!(
+            "TYDE_OPEN_WORKSPACE={} ",
+            crate::remote::shell_quote_arg(ws)
+        ),
+        None => String::new(),
+    };
+
+    let remote_cmd = format!(
+        "cd {} && \
+         TYDE_VITE_PORT={remote_vite_port} \
+         TYDE_DEBUG_MCP_HTTP_BIND_ADDR=127.0.0.1:{remote_debug_port} \
+         TYDE_DEBUG_MCP_HTTP_ENABLED=true \
+         TYDE_AGENT_MCP_HTTP_BIND_ADDR=127.0.0.1:{remote_agent_port} \
+         TYDE_DRIVER_MCP_HTTP_ENABLED=false \
+         {workspace_env}\
+         npx tauri dev --config {}",
+        crate::remote::shell_quote_arg(&project_dir),
+        crate::remote::shell_quote_arg(&tauri_config_override),
+    );
+
+    // Spawn the remote dev process via SSH.
+    let control_args = crate::remote::ssh_control_args()?;
+    let mut cmd = tokio::process::Command::new("ssh");
+    for arg in &control_args {
+        cmd.arg(arg);
+    }
+    cmd.arg("-T")
+        .arg(host)
+        .arg(&remote_cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn remote dev instance on {host}: {e}"))?;
+
+    let stderr_tail = drain_child_output(&mut child);
+
+    // Start SSH tunnel: forward local_tunnel_port to remote_debug_port.
+    let mut tunnel_cmd = tokio::process::Command::new("ssh");
+    for arg in &control_args {
+        tunnel_cmd.arg(arg);
+    }
+    tunnel_cmd
+        .arg("-L")
+        .arg(format!(
+            "{local_tunnel_port}:127.0.0.1:{remote_debug_port}"
+        ))
+        .arg("-N")
+        .arg(host)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    tunnel_cmd.process_group(0);
+
+    let ssh_tunnel = tunnel_cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start SSH tunnel to {host}: {e}"))?;
+
+    // Poll healthz through the SSH tunnel.
+    let healthz_url = format!("http://127.0.0.1:{local_tunnel_port}/healthz");
+    let client = poll_healthz(&mut child, &healthz_url, &stderr_tail).await?;
+
+    let proxy = Arc::new(McpProxy {
+        debug_mcp_url: debug_mcp_url.clone(),
+        http_client: client,
+        session_id: SyncMutex::new(None),
+        rpc_id: AtomicU64::new(1),
+    });
+
+    let instance = DevInstance {
+        instance_id,
+        child,
+        proxy,
+        project_dir: project_dir.clone(),
+        ssh_host: Some(host.to_string()),
+        agent_id,
+        ssh_tunnel: Some(ssh_tunnel),
+    };
+
+    state.dev_instances.lock().insert(instance);
+
+    tracing::info!(
+        "Dev instance {instance_id} started on {host}: {debug_mcp_url} (project: {project_dir})"
+    );
+
+    Ok(DevInstanceStartResult {
+        instance_id,
+        debug_mcp_url,
+        status: "running",
+    })
+}
+
+/// Stop a dev instance by ID.
+pub(crate) async fn stop_dev_instance(
+    state: &AppState,
+    instance_id: u64,
+) -> Result<DevInstanceStopResult, String> {
     let mut instance = state
-        .dev_instance
+        .dev_instances
         .lock()
-        .take()
-        .ok_or_else(|| "No dev instance is running.".to_string())?;
+        .remove(instance_id)
+        .ok_or_else(|| format!("Dev instance {instance_id} not found."))?;
+
+    if let Some(ref mut tunnel) = instance.ssh_tunnel {
+        kill_process_tree(tunnel).await;
+    }
 
     kill_process_tree(&mut instance.child).await;
 
     tracing::info!(
-        "Dev instance stopped (was: {})",
+        "Dev instance {instance_id} stopped (was: {})",
         instance.proxy.debug_mcp_url
     );
 
     Ok(DevInstanceStopResult { status: "stopped" })
 }
 
-/// Return the project directory of the running dev instance, if any.
-pub(crate) fn dev_instance_project_dir(state: &AppState) -> Option<String> {
-    let guard = state.dev_instance.lock();
-    guard.as_ref().map(|i| i.project_dir.clone())
+/// Return the project directory of a dev instance.
+pub(crate) fn dev_instance_project_dir(
+    state: &AppState,
+    instance_id: Option<u64>,
+) -> Option<String> {
+    let guard = state.dev_instances.lock();
+    let instance = match instance_id {
+        Some(id) => guard.get(id),
+        None => guard.sole_instance(),
+    };
+    instance.map(|i| i.project_dir.clone())
 }
 
 /// Kill the child and its entire process tree.
@@ -426,20 +671,75 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
     }
 }
 
-/// Proxy an MCP tool call to the running dev instance.
-/// Returns an error if no dev instance is running.
+/// Proxy an MCP tool call to a dev instance.
 pub(crate) async fn proxy_debug_tool_call(
     state: &AppState,
+    instance_id: Option<u64>,
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
     // Clone the Arc out of the lock so we don't hold SyncMutex across await.
     let proxy = {
-        let guard = state.dev_instance.lock();
-        let instance = guard.as_ref().ok_or_else(|| {
-            "No dev instance running. Call tyde_dev_instance_start first.".to_string()
-        })?;
+        let guard = state.dev_instances.lock();
+        let instance = match instance_id {
+            Some(id) => guard
+                .get(id)
+                .ok_or_else(|| format!("Dev instance {id} not found"))?,
+            None => {
+                if guard.instances.is_empty() {
+                    return Err(
+                        "No dev instance running. Call tyde_dev_instance_start first.".to_string(),
+                    );
+                }
+                guard.sole_instance().ok_or_else(|| {
+                    "Multiple dev instances running; specify instance_id".to_string()
+                })?
+            }
+        };
         Arc::clone(&instance.proxy)
     };
     proxy.tool_call(tool_name, arguments).await
+}
+
+/// Stop all dev instances bound to a given agent.
+pub(crate) async fn stop_instances_for_agent(state: &AppState, agent_id: u64) -> Vec<u64> {
+    let ids = state
+        .dev_instances
+        .lock()
+        .instance_ids_for_agent(agent_id);
+
+    let mut stopped = Vec::new();
+    for id in ids {
+        tracing::info!("Auto-stopping dev instance {id} (agent {agent_id} terminated)");
+        if stop_dev_instance(state, id).await.is_ok() {
+            stopped.push(id);
+        }
+    }
+    stopped
+}
+
+/// List all running dev instances.
+pub(crate) fn dev_instance_list(state: &AppState) -> Vec<DevInstanceInfo> {
+    state.dev_instances.lock().list()
+}
+
+/// Resolve an optional instance_id, using sole_instance if None.
+/// Returns the resolved ID or an appropriate error.
+pub(crate) fn resolve_instance_id(state: &AppState, instance_id: Option<u64>) -> Result<u64, String> {
+    match instance_id {
+        Some(id) => Ok(id),
+        None => {
+            let guard = state.dev_instances.lock();
+            if guard.instances.is_empty() {
+                Err("No dev instance running.".to_string())
+            } else {
+                guard
+                    .sole_instance()
+                    .map(|i| i.instance_id)
+                    .ok_or_else(|| {
+                        "Multiple dev instances running; specify instance_id".to_string()
+                    })
+            }
+        }
+    }
 }

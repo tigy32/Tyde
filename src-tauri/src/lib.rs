@@ -377,7 +377,7 @@ pub(crate) struct AppState {
     debug_ui_request_seq: AtomicU64,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
-    dev_instance: SyncMutex<Option<dev_instance::DevInstance>>,
+    dev_instances: SyncMutex<dev_instance::DevInstanceRegistry>,
 }
 
 #[derive(Serialize, Clone)]
@@ -2403,6 +2403,9 @@ pub(crate) async fn terminate_agent_internal(
         .lock()
         .remove(&conversation_id);
 
+    // Clean up any dev instances bound to this agent.
+    dev_instance::stop_instances_for_agent(state, agent_id).await;
+
     Ok(())
 }
 
@@ -2504,11 +2507,13 @@ Question: ";
 pub(crate) async fn run_query_screenshot_agent(
     app: &tauri::AppHandle,
     state: &AppState,
+    instance_id: Option<u64>,
     question: String,
 ) -> Result<String, String> {
     // 1. Take a screenshot via the debug MCP proxy.
     let screenshot_result = dev_instance::proxy_debug_tool_call(
         state,
+        instance_id,
         "tyde_debug_capture_screenshot",
         serde_json::json!({}),
     )
@@ -2545,7 +2550,7 @@ pub(crate) async fn run_query_screenshot_agent(
     // 4. Spawn an ephemeral agent with the screenshot attached.
     let prompt = format!("{QUERY_SCREENSHOT_PREAMBLE}{question}");
     let project_dir =
-        dev_instance::dev_instance_project_dir(state).ok_or("No dev instance running")?;
+        dev_instance::dev_instance_project_dir(state, instance_id).ok_or("No dev instance running")?;
 
     let request = SpawnAgentRequest {
         workspace_roots: vec![project_dir],
@@ -2703,6 +2708,9 @@ pub(crate) async fn cancel_agent_internal(
         .conversation_to_session
         .lock()
         .remove(&conversation_id);
+
+    // Clean up any dev instances bound to this agent.
+    dev_instance::stop_instances_for_agent(state, agent_id).await;
 
     let runtime = state.agent_runtime.lock().await;
     let info = runtime
@@ -4008,7 +4016,7 @@ pub fn run() {
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
-            dev_instance: SyncMutex::new(None),
+            dev_instances: SyncMutex::new(dev_instance::DevInstanceRegistry::new()),
         })
         .setup(|app| {
             initialize_tray(app)?;
@@ -4235,7 +4243,7 @@ mod tests {
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
-            dev_instance: SyncMutex::new(None),
+            dev_instances: SyncMutex::new(dev_instance::DevInstanceRegistry::new()),
             driver_mcp_http_env_override: false,
         }
     }

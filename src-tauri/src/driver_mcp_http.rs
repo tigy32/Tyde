@@ -60,6 +60,19 @@ struct DevInstanceStartToolInput {
     /// Bypasses the native file dialog so MCP clients can control the
     /// full lifecycle without manual intervention.
     workspace_path: Option<String>,
+    /// Optional SSH host to spawn the dev instance on (e.g. "user@devbox").
+    /// If omitted, the instance runs locally.
+    ssh_host: Option<String>,
+    /// Optional agent ID to bind this instance to. When the agent terminates,
+    /// its dev instance is automatically stopped.
+    agent_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct DevInstanceStopToolInput {
+    /// ID of the dev instance to stop. If omitted and exactly one instance
+    /// is running, that instance is stopped.
+    instance_id: Option<u64>,
 }
 
 /// Empty input — no parameters needed.
@@ -67,7 +80,15 @@ struct DevInstanceStartToolInput {
 struct EmptyInput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct SnapshotToolInput {
+    /// Target dev instance. Required when multiple instances are running.
+    instance_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct DebugEventsToolInput {
+    /// Target dev instance. Required when multiple instances are running.
+    instance_id: Option<u64>,
     since_seq: Option<u64>,
     limit: Option<usize>,
     stream: Option<String>,
@@ -75,6 +96,8 @@ struct DebugEventsToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct EvaluateToolInput {
+    /// Target dev instance. Required when multiple instances are running.
+    instance_id: Option<u64>,
     /// JavaScript expression to evaluate in the webview. The body of an async
     /// function — use `return` to produce a value. Has access to the full DOM
     /// and any globals the app exposes.
@@ -84,6 +107,8 @@ struct EvaluateToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct QueryScreenshotToolInput {
+    /// Target dev instance. Required when multiple instances are running.
+    instance_id: Option<u64>,
     /// A visual question about the UI, e.g. "Is the sidebar collapsed or expanded?",
     /// "What color is the error banner?", "Does the layout look correct?"
     question: String,
@@ -101,15 +126,17 @@ fn err_text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
-/// Proxy a tool call to the dev instance's debug MCP server.
-/// Returns an error CallToolResult if no dev instance is running.
+/// Proxy a tool call to a dev instance's debug MCP server.
 async fn proxy_tool(
     app: &tauri::AppHandle,
     tool_name: &str,
+    instance_id: Option<u64>,
     arguments: serde_json::Value,
 ) -> Result<CallToolResult, McpError> {
     let app_state = app.state::<AppState>();
-    match dev_instance::proxy_debug_tool_call(app_state.inner(), tool_name, arguments).await {
+    match dev_instance::proxy_debug_tool_call(app_state.inner(), instance_id, tool_name, arguments)
+        .await
+    {
         Ok(value) => match serde_json::from_value::<CallToolResult>(value.clone()) {
             Ok(result) => Ok(result),
             Err(_) => ok_json(value),
@@ -119,7 +146,7 @@ async fn proxy_tool(
 }
 
 // ---------------------------------------------------------------------------
-// MCP Tools — 6 tools: 2 dev instance lifecycle + 3 proxied debug tools + 1 query_screenshot
+// MCP Tools — 7 tools: 3 dev instance lifecycle + 3 proxied debug tools + 1 query_screenshot
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -127,7 +154,7 @@ impl TydeDriverMcpServer {
     // -- Dev instance lifecycle ------------------------------------------------
 
     #[tool(
-        description = "Build and launch a Tyde dev instance with hot-reload. Runs `npx tauri dev` in the given project directory, waits for the debug MCP server to become ready, and returns the debug MCP URL. Only one dev instance can run at a time. The tyde_debug_* tools on this server will target the launched instance. This may take several minutes on first build."
+        description = "Build and launch a Tyde dev instance with hot-reload. Runs `npx tauri dev` in the given project directory, waits for the debug MCP server to become ready, and returns the debug MCP URL and instance ID. Supports multiple concurrent instances (local or on SSH remote hosts). The tyde_debug_* tools on this server will target the launched instance. This may take several minutes on first build."
     )]
     async fn tyde_dev_instance_start(
         &self,
@@ -138,6 +165,8 @@ impl TydeDriverMcpServer {
             app_state.inner(),
             input.project_dir,
             input.workspace_path,
+            input.ssh_host,
+            input.agent_id,
         )
         .await
         {
@@ -147,17 +176,32 @@ impl TydeDriverMcpServer {
     }
 
     #[tool(
-        description = "Stop the running Tyde dev instance. Kills the dev process and cleans up. The tyde_debug_* tools will return errors until a new instance is started."
+        description = "Stop a running Tyde dev instance. Kills the dev process and cleans up. If instance_id is omitted and exactly one instance is running, that instance is stopped. The tyde_debug_* tools will return errors for this instance after stopping."
     )]
     async fn tyde_dev_instance_stop(
+        &self,
+        Parameters(input): Parameters<DevInstanceStopToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        let instance_id =
+            match dev_instance::resolve_instance_id(app_state.inner(), input.instance_id) {
+                Ok(id) => id,
+                Err(err) => return Ok(err_text(err)),
+            };
+        match dev_instance::stop_dev_instance(app_state.inner(), instance_id).await {
+            Ok(value) => ok_json(value),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(description = "List all running dev instances with their IDs, project directories, SSH hosts, and bound agent IDs.")]
+    async fn tyde_dev_instance_list(
         &self,
         Parameters(_input): Parameters<EmptyInput>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match dev_instance::stop_dev_instance(app_state.inner()).await {
-            Ok(value) => ok_json(value),
-            Err(err) => Ok(err_text(err)),
-        }
+        let list = dev_instance::dev_instance_list(app_state.inner());
+        ok_json(list)
     }
 
     // -- Proxied debug tools ---------------------------------------------------
@@ -165,9 +209,15 @@ impl TydeDriverMcpServer {
     #[tool(description = "Get a runtime snapshot of the dev instance's app state.")]
     async fn tyde_debug_snapshot(
         &self,
-        Parameters(_input): Parameters<EmptyInput>,
+        Parameters(input): Parameters<SnapshotToolInput>,
     ) -> Result<CallToolResult, McpError> {
-        proxy_tool(&self.app, "tyde_debug_snapshot", serde_json::json!({})).await
+        proxy_tool(
+            &self.app,
+            "tyde_debug_snapshot",
+            input.instance_id,
+            serde_json::json!({}),
+        )
+        .await
     }
 
     #[tool(description = "Read debug event log entries from the dev instance.")]
@@ -180,7 +230,7 @@ impl TydeDriverMcpServer {
             "limit": input.limit,
             "stream": input.stream,
         });
-        proxy_tool(&self.app, "tyde_debug_events_since", args).await
+        proxy_tool(&self.app, "tyde_debug_events_since", input.instance_id, args).await
     }
 
     #[tool(
@@ -194,7 +244,7 @@ impl TydeDriverMcpServer {
             "expression": input.expression,
             "timeout_ms": input.timeout_ms,
         });
-        proxy_tool(&self.app, "tyde_debug_evaluate", args).await
+        proxy_tool(&self.app, "tyde_debug_evaluate", input.instance_id, args).await
     }
 
     // -- High-level screenshot query -------------------------------------------
@@ -207,7 +257,14 @@ impl TydeDriverMcpServer {
         Parameters(input): Parameters<QueryScreenshotToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        match run_query_screenshot_agent(&self.app, app_state.inner(), input.question).await {
+        match run_query_screenshot_agent(
+            &self.app,
+            app_state.inner(),
+            input.instance_id,
+            input.question,
+        )
+        .await
+        {
             Ok(answer) => Ok(CallToolResult::success(vec![Content::text(answer)])),
             Err(err) => Ok(err_text(err)),
         }
@@ -219,7 +276,7 @@ impl ServerHandler for TydeDriverMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for spawning and controlling a Tyde dev instance. Use tyde_dev_instance_start to build and launch a dev instance, then use the tyde_debug_* tools to interact with its UI. All debug tools proxy to the dev instance — they never target the host."
+                "Tools for spawning and controlling Tyde dev instances. Supports multiple concurrent instances (local or on SSH remote hosts). Use tyde_dev_instance_start to launch, tyde_dev_instance_list to see running instances, and tyde_debug_* tools to interact with a specific instance's UI. When multiple instances are running, pass instance_id to target the correct one."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

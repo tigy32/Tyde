@@ -473,6 +473,38 @@ pub async fn run_ssh_command(host: &str, args: &[String]) -> Result<std::process
         .map_err(|e| format!("Failed to run ssh command: {e}"))
 }
 
+/// Find `count` available TCP ports on a remote host by binding to :0.
+/// Returns the port numbers. Requires python3 on the remote.
+pub(crate) async fn find_remote_free_ports(
+    host: &str,
+    count: usize,
+) -> Result<Vec<u16>, String> {
+    let script = format!(
+        "python3 -c '\
+import socket\n\
+ports = []\n\
+for _ in range({count}):\n\
+    s = socket.socket()\n\
+    s.bind((\"127.0.0.1\", 0))\n\
+    ports.append(s.getsockname()[1])\n\
+    s.close()\n\
+print(\" \".join(str(p) for p in ports))\n\
+'"
+    );
+    let output = run_ssh_raw(host, &script).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Failed to find free ports on remote host: {stderr}"
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid port number '{s}': {e}")))
+        .collect()
+}
+
 /// Spawns a long-lived process on a remote host via SSH with the user's
 /// full login shell PATH. Backends describe WHAT to run — this handles HOW.
 pub async fn spawn_remote_process(
