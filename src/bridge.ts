@@ -62,6 +62,7 @@ export function normalizeBackendKind(
   if (normalized === "codex") return "codex";
   if (normalized === "claude" || normalized === "claude_code") return "claude";
   if (normalized === "kiro") return "kiro";
+  if (normalized === "gemini") return "gemini";
   return "tycode";
 }
 

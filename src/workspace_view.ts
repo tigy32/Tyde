@@ -281,11 +281,22 @@ export class WorkspaceView {
     kiroMenuItem.setAttribute("role", "menuitem");
     kiroMenuItem.dataset.testid = "center-new-tab-kiro";
 
+    const geminiMenuItem = document.createElement("button");
+    geminiMenuItem.type = "button";
+    geminiMenuItem.className = "center-tab-new-menu-item";
+    geminiMenuItem.textContent =
+      this.mode === "bridge"
+        ? `New Gemini ${this.bridgeChatLabel}`
+        : "New Gemini Chat";
+    geminiMenuItem.setAttribute("role", "menuitem");
+    geminiMenuItem.dataset.testid = "center-new-tab-gemini";
+
     const menuItems: { kind: BackendKind; el: HTMLButtonElement }[] = [
       { kind: "tycode", el: tycodeMenuItem },
       { kind: "codex", el: codexMenuItem },
       { kind: "claude", el: claudeMenuItem },
       { kind: "kiro", el: kiroMenuItem },
+      { kind: "gemini", el: geminiMenuItem },
     ];
     const enabledSet = new Set(this.getWorkspaceEnabledBackends());
     if (enabledSet.size === 0) {
@@ -535,6 +546,10 @@ export class WorkspaceView {
       closeCenterNewTabMenu();
       this.startNewConversation(undefined, "kiro");
     });
+    geminiMenuItem.addEventListener("click", () => {
+      closeCenterNewTabMenu();
+      this.startNewConversation(undefined, "gemini");
+    });
 
     const handleMenuOutsidePointer = (event: PointerEvent): void => {
       const target = event.target as Node | null;
@@ -582,6 +597,7 @@ export class WorkspaceView {
       codex: codexMenuItem,
       claude: claudeMenuItem,
       kiro: kiroMenuItem,
+      gemini: geminiMenuItem,
     };
 
     this.chatPanel.notificationManager = config.notifications;
@@ -865,6 +881,7 @@ export class WorkspaceView {
       "codex",
       "claude",
       "kiro",
+      "gemini",
     ];
     for (const kind of order) {
       const item = this.centerNewTabMenuItems[kind];
@@ -1214,7 +1231,9 @@ export class WorkspaceView {
       .filter(
         (workspacePath) =>
           workspacePath.trim().length > 0 &&
-          (backendKind === "kiro" || !workspacePath.startsWith("ssh://")),
+          (backendKind === "kiro" ||
+            backendKind === "gemini" ||
+            !workspacePath.startsWith("ssh://")),
       );
   }
 
@@ -1379,6 +1398,12 @@ export class WorkspaceView {
       this.resolveWorkspaceRootsForBackend("kiro").length > 0
     ) {
       backends.push("kiro");
+    }
+    if (
+      enabled.has("gemini") &&
+      this.resolveWorkspaceRootsForBackend("gemini").length > 0
+    ) {
+      backends.push("gemini");
     }
     return backends;
   }
@@ -2207,6 +2232,7 @@ export class WorkspaceView {
         codex: "Codex",
         claude: "Claude",
         kiro: "Kiro",
+        gemini: "Gemini",
       };
       const label = backendLabels[preferred] ?? preferred;
       this.notifications.warning(
@@ -2217,7 +2243,8 @@ export class WorkspaceView {
     if (
       (preferred === "codex" ||
         preferred === "claude" ||
-        preferred === "kiro") &&
+        preferred === "kiro" ||
+        preferred === "gemini") &&
       this.resolveWorkspaceRootsForBackend(preferred).length === 0
     ) {
       if (this.mode === "bridge") {
@@ -2226,7 +2253,9 @@ export class WorkspaceView {
             ? "Codex"
             : preferred === "claude"
               ? "Claude"
-              : "Kiro";
+              : preferred === "gemini"
+                ? "Gemini"
+                : "Kiro";
         this.notifications.warning(
           `${backendLabel} ${this.bridgeChatLabel} chats require at least one open local project. Using Tycode.`,
         );
@@ -2236,7 +2265,9 @@ export class WorkspaceView {
             ? "Codex"
             : preferred === "claude"
               ? "Claude"
-              : "Kiro";
+              : preferred === "gemini"
+                ? "Gemini"
+                : "Kiro";
         this.notifications.warning(
           `${backendLabel} backend does not support remote SSH workspaces yet. Using Tycode.`,
         );

@@ -160,7 +160,13 @@ export function setDefaultSpawnProfile(profileName: string | null): void {
 
 // --- Backend dependencies ---
 
-const ALL_BACKENDS: BackendKind[] = ["tycode", "codex", "claude", "kiro"];
+const ALL_BACKENDS: BackendKind[] = [
+  "tycode",
+  "codex",
+  "claude",
+  "kiro",
+  "gemini",
+];
 type UsageAwareBackendKind = Exclude<BackendKind, "tycode" | "claude">;
 const USAGE_AWARE_BACKENDS: UsageAwareBackendKind[] = ["codex", "kiro"];
 
@@ -174,6 +180,7 @@ export function setCachedDependencyStatus(
     codex: status.codex,
     claude: status.claude,
     kiro: status.kiro,
+    gemini: status.gemini,
   };
 }
 
@@ -568,6 +575,7 @@ export class SettingsPanel {
           codex: status.codex,
           claude: status.claude,
           kiro: status.kiro,
+          gemini: status.gemini,
         };
         setCachedDependencyStatus(status);
         this.rerenderPanelContent("backends", () =>
@@ -1573,12 +1581,14 @@ export class SettingsPanel {
       { kind: "codex", label: "Codex", binary: "codex" },
       { kind: "claude", label: "Claude Code", binary: "claude" },
       { kind: "kiro", label: "Kiro", binary: "kiro-cli" },
+      { kind: "gemini", label: "Gemini", binary: "gemini" },
     ];
     const backendDescriptions: Record<BackendKind, string> = {
       tycode: "Built-in Tyde backend.",
       codex: "OpenAI Codex CLI backend.",
       claude: "Anthropic Claude Code CLI backend.",
       kiro: "Kiro CLI backend.",
+      gemini: "Google Gemini CLI backend.",
     };
 
     const list = el("div", { class: "settings-backend-list" });
@@ -3514,6 +3524,7 @@ export class SettingsPanel {
         codex: "Codex",
         claude: "Claude Code",
         kiro: "Kiro",
+        gemini: "Gemini",
       };
       for (const kind of enabledBackends) {
         const opt = el("option", { value: kind }, backendLabels[kind]);

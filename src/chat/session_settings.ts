@@ -80,6 +80,9 @@ export function createSessionSettings(
   let kiroModel: string | null = null;
   let _kiroModelsLoaded = false;
 
+  let geminiModel: string | null = null;
+  let _geminiModelsLoaded = false;
+
   const panel = document.createElement("div");
   panel.className = "session-settings-panel";
   panel.dataset.testid = "session-settings-panel";
@@ -114,6 +117,9 @@ export function createSessionSettings(
   const kiroGrid = document.createElement("div");
   kiroGrid.className = "session-settings-grid";
 
+  const geminiGrid = document.createElement("div");
+  geminiGrid.className = "session-settings-grid";
+
   toggle.addEventListener("click", () => {
     const hidden = content.style.display === "none";
     content.style.display = hidden ? "" : "none";
@@ -130,7 +136,8 @@ export function createSessionSettings(
     if (
       backendKind === "codex" ||
       backendKind === "claude" ||
-      backendKind === "kiro"
+      backendKind === "kiro" ||
+      backendKind === "gemini"
     ) {
       listModels(conversationId).catch((err) =>
         console.error("Failed to list models on toggle:", err),
@@ -422,10 +429,39 @@ export function createSessionSettings(
 
   kiroGrid.appendChild(kiroModelRow);
 
+  // --- Gemini settings ---
+
+  const geminiModelRow = document.createElement("div");
+  geminiModelRow.className = "session-settings-row";
+
+  const geminiModelLabel = document.createElement("label");
+  geminiModelLabel.className = "session-settings-label";
+  geminiModelLabel.textContent = "Model";
+
+  const geminiModelSelect = document.createElement("select");
+  geminiModelSelect.className = "session-profile-select";
+
+  const geminiDefaultOpt = document.createElement("option");
+  geminiDefaultOpt.value = "";
+  geminiDefaultOpt.textContent = "Default";
+  geminiModelSelect.appendChild(geminiDefaultOpt);
+
+  geminiModelSelect.addEventListener("change", () => {
+    const next = geminiModelSelect.value;
+    geminiModel = next.length > 0 ? next : null;
+    updateSettings(conversationId, { model: geminiModel });
+  });
+
+  geminiModelRow.appendChild(geminiModelLabel);
+  geminiModelRow.appendChild(geminiModelSelect);
+
+  geminiGrid.appendChild(geminiModelRow);
+
   content.appendChild(tycodeGrid);
   content.appendChild(codexGrid);
   content.appendChild(claudeGrid);
   content.appendChild(kiroGrid);
+  content.appendChild(geminiGrid);
 
   panel.appendChild(toggle);
   panel.appendChild(content);
@@ -461,11 +497,14 @@ export function createSessionSettings(
           ? "Session Settings (Claude)"
           : backendKind === "kiro"
             ? "Session Settings (Kiro)"
-            : "Session Settings";
+            : backendKind === "gemini"
+              ? "Session Settings (Gemini)"
+              : "Session Settings";
     tycodeGrid.style.display = backendKind === "tycode" ? "" : "none";
     codexGrid.style.display = backendKind === "codex" ? "" : "none";
     claudeGrid.style.display = backendKind === "claude" ? "" : "none";
     kiroGrid.style.display = backendKind === "kiro" ? "" : "none";
+    geminiGrid.style.display = backendKind === "gemini" ? "" : "none";
   };
   syncBackendVisibility();
 
@@ -537,6 +576,18 @@ export function createSessionSettings(
         return;
       }
 
+      if (backendKind === "gemini") {
+        const modelRaw = data.model;
+        if (typeof modelRaw === "string") {
+          geminiModel = modelRaw.trim().length > 0 ? modelRaw.trim() : null;
+          geminiModelSelect.value = geminiModel ?? "";
+        } else if (modelRaw === null) {
+          geminiModel = null;
+          geminiModelSelect.value = "";
+        }
+        return;
+      }
+
       if (data.autonomy_level) {
         currentAutonomy = data.autonomy_level;
         const isAuto =
@@ -600,6 +651,9 @@ export function createSessionSettings(
       } else if (backendKind === "kiro") {
         _kiroModelsLoaded = true;
         populateModelSelect(kiroModelSelect, data.models, kiroModel);
+      } else if (backendKind === "gemini") {
+        _geminiModelsLoaded = true;
+        populateModelSelect(geminiModelSelect, data.models, geminiModel);
       }
     },
 
@@ -618,7 +672,8 @@ export function createSessionSettings(
         if (
           backendKind === "codex" ||
           backendKind === "claude" ||
-          backendKind === "kiro"
+          backendKind === "kiro" ||
+          backendKind === "gemini"
         ) {
           listModels(conversationId).catch((err) =>
             console.error("Failed to list models on backend switch:", err),

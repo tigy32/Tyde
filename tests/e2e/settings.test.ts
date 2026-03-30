@@ -260,7 +260,7 @@ describe('Settings panel', () => {
       return { exists: true, toggleCount: toggles.length };
     }, sel.settingsTabPanel);
     expect(backendsPanel.exists).toBe(true);
-    expect(backendsPanel.toggleCount).toBe(4);
+    expect(backendsPanel.toggleCount).toBe(5);
 
     // All backends should be enabled by default (assuming deps are available)
     const allEnabled = await browser.execute((panelSel: string) => {

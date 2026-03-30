@@ -133,7 +133,7 @@ const mockHosts: MockHost[] = [
     label: 'Local',
     hostname: '',
     is_local: true,
-    enabled_backends: ['tycode', 'codex', 'claude', 'kiro'],
+    enabled_backends: ['tycode', 'codex', 'claude', 'kiro', 'gemini'],
     default_backend: 'tycode',
   },
 ];
@@ -722,7 +722,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         label,
         hostname,
         is_local: false,
-        enabled_backends: ['tycode', 'codex', 'claude', 'kiro'],
+        enabled_backends: ['tycode', 'codex', 'claude', 'kiro', 'gemini'],
         default_backend: 'tycode',
       };
       mockHosts.push(newHost);

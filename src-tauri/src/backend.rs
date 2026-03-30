@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::claude::{ClaudeCommandHandle, ClaudeSession, SubAgentEmitter};
 use crate::codex::{CodexCommandHandle, CodexSession};
+use crate::gemini::{GeminiCommandHandle, GeminiSession};
 use crate::kiro::{KiroCommandHandle, KiroSession};
 use crate::subprocess::{ImageAttachment, SubprocessBridge};
 
@@ -19,6 +20,7 @@ pub enum BackendKind {
     Codex,
     Claude,
     Kiro,
+    Gemini,
 }
 
 impl BackendKind {
@@ -28,6 +30,7 @@ impl BackendKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Kiro => "kiro",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -47,6 +50,7 @@ impl FromStr for BackendKind {
             "codex" => Ok(Self::Codex),
             "claude" | "claude_code" => Ok(Self::Claude),
             "kiro" => Ok(Self::Kiro),
+            "gemini" => Ok(Self::Gemini),
             other => Err(format!("Unsupported backend '{other}'")),
         }
     }
@@ -106,6 +110,7 @@ pub enum BackendCommandHandle {
     Codex(CodexCommandHandle),
     Claude(ClaudeCommandHandle),
     Kiro(KiroCommandHandle),
+    Gemini(GeminiCommandHandle),
 }
 
 impl BackendCommandHandle {
@@ -125,6 +130,7 @@ impl BackendCommandHandle {
             Self::Codex(handle) => handle.execute(command).await,
             Self::Claude(handle) => handle.execute(command).await,
             Self::Kiro(handle) => handle.execute(command).await,
+            Self::Gemini(handle) => handle.execute(command).await,
         }
     }
 }
@@ -257,6 +263,7 @@ pub enum BackendSession {
     Codex(CodexSession),
     Claude(ClaudeSession),
     Kiro(KiroSession),
+    Gemini(GeminiSession),
 }
 
 impl BackendSession {
@@ -354,6 +361,31 @@ impl BackendSession {
                 };
                 Ok((Self::Kiro(session), rx))
             }
+            BackendKind::Gemini => {
+                let ssh_host = if executable_path.is_empty() {
+                    None
+                } else {
+                    Some(executable_path.to_string())
+                };
+                let (session, rx) = if ephemeral {
+                    GeminiSession::spawn_ephemeral(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
+                } else {
+                    GeminiSession::spawn(
+                        workspace_roots,
+                        ssh_host,
+                        startup_mcp_servers,
+                        steering_content,
+                    )
+                    .await?
+                };
+                Ok((Self::Gemini(session), rx))
+            }
         }
     }
 
@@ -398,6 +430,16 @@ impl BackendSession {
                     KiroSession::spawn_admin(workspace_roots, ssh_host, &[], None).await?;
                 Ok((Self::Kiro(session), rx))
             }
+            BackendKind::Gemini => {
+                let ssh_host = if executable_path.is_empty() {
+                    None
+                } else {
+                    Some(executable_path.to_string())
+                };
+                let (session, rx) =
+                    GeminiSession::spawn_admin(workspace_roots, ssh_host, &[], None).await?;
+                Ok((Self::Gemini(session), rx))
+            }
         }
     }
 
@@ -407,6 +449,7 @@ impl BackendSession {
             Self::Codex(_) => BackendKind::Codex,
             Self::Claude(_) => BackendKind::Claude,
             Self::Kiro(_) => BackendKind::Kiro,
+            Self::Gemini(_) => BackendKind::Gemini,
         }
     }
 
@@ -416,6 +459,7 @@ impl BackendSession {
             Self::Codex(session) => BackendCommandHandle::Codex(session.command_handle()),
             Self::Claude(session) => BackendCommandHandle::Claude(session.command_handle()),
             Self::Kiro(session) => BackendCommandHandle::Kiro(session.command_handle()),
+            Self::Gemini(session) => BackendCommandHandle::Gemini(session.command_handle()),
         }
     }
 
@@ -423,7 +467,7 @@ impl BackendSession {
         match self {
             Self::Claude(session) => session.set_subagent_emitter(emitter).await,
             Self::Codex(session) => session.set_subagent_emitter(emitter).await,
-            _ => {}
+            Self::Gemini(_) | Self::Tycode(_) | Self::Kiro(_) => {}
         }
     }
 
@@ -433,6 +477,7 @@ impl BackendSession {
             Self::Codex(session) => session.shutdown().await,
             Self::Claude(session) => session.shutdown().await,
             Self::Kiro(session) => session.shutdown().await,
+            Self::Gemini(session) => session.shutdown().await,
         }
     }
 }

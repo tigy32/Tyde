@@ -324,6 +324,14 @@ export class AppController {
     this.homeView.onOpenWorkspace = () => this.openWorkspace();
     this.homeView.onOpenRemoteWorkspace = () => this.openRemoteWorkspace();
     this.homeView.onNewBridgeChat = (backendOverride) => {
+      // Ensure the bridge view is the active workspace before creating the
+      // conversation.  This is normally already the case (the button lives in
+      // HomeView which is inside homeBridgeView), but an explicit switch
+      // prevents races where async operations during conversation creation
+      // could cause a project view to become active.
+      if (this.activeWorkspaceId !== HOME_BRIDGE_VIEW_ID) {
+        this.switchToHome();
+      }
       void this.homeBridgeView
         .createNewConversationTab(undefined, backendOverride)
         .catch((err) => {
@@ -532,7 +540,12 @@ export class AppController {
     agent: RuntimeAgent,
   ): { id: string; workspacePath: string } | null {
     for (const [projectId, view] of this.workspaceViews) {
-      if (projectId === HOME_BRIDGE_VIEW_ID) continue;
+      if (projectId === HOME_BRIDGE_VIEW_ID) {
+        // If the bridge view owns this conversation, it should stay there —
+        // don't resolve to a project view (which would cause dual-ownership).
+        if (view.ownsConversation(agent.conversation_id)) return null;
+        continue;
+      }
       if (!view.ownsConversation(agent.conversation_id)) continue;
       const project = this.projectState.projects.find(
         (entry) => entry.id === projectId,
@@ -671,24 +684,49 @@ export class AppController {
   private handleConversationRegistered(
     payload: ConversationRegisteredPayload,
   ): void {
-    let project = this.resolveProjectForWorkspaceRoots(
-      payload.data.workspace_roots,
-    );
-    if (!project) {
-      project = this.resolveProjectByParentAgent(payload.data.parent_agent_id);
+    // If a view already owns this conversation (e.g. createNewConversationTab
+    // registered it before this event arrived), route to that view to avoid
+    // dual-ownership that sends events to a hidden workspace view.
+    let view: WorkspaceView | undefined;
+    for (const v of this.workspaceViews.values()) {
+      if (v.ownsConversation(payload.conversation_id)) {
+        view = v;
+        break;
+      }
     }
-    if (!project) {
-      project = this.resolveProjectByActiveView();
-    }
-    let view: WorkspaceView;
-    if (project) {
-      view = this.getOrCreateWorkspaceView(
-        project.id,
-        project.workspacePath,
-        project.name,
-      );
-    } else {
-      view = this.homeBridgeView;
+
+    if (!view) {
+      // Top-level conversations created while the bridge view is active belong
+      // to the bridge view.  Resolve early to avoid getOrCreateWorkspaceView
+      // side-effects (e.g. syncing agents onto a project view, causing
+      // dual-ownership).
+      if (
+        payload.data.parent_agent_id == null &&
+        this.activeWorkspaceId === HOME_BRIDGE_VIEW_ID
+      ) {
+        view = this.homeBridgeView;
+      } else {
+        let project = this.resolveProjectForWorkspaceRoots(
+          payload.data.workspace_roots,
+        );
+        if (!project) {
+          project = this.resolveProjectByParentAgent(
+            payload.data.parent_agent_id,
+          );
+        }
+        if (!project) {
+          project = this.resolveProjectByActiveView();
+        }
+        if (project) {
+          view = this.getOrCreateWorkspaceView(
+            project.id,
+            project.workspacePath,
+            project.name,
+          );
+        } else {
+          view = this.homeBridgeView;
+        }
+      }
     }
 
     const agent: RuntimeAgent = {

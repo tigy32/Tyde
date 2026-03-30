@@ -448,7 +448,9 @@ export class SessionsPanel {
           ? "Claude"
           : session.backendKind === "kiro"
             ? "Kiro"
-            : "Tycode";
+            : session.backendKind === "gemini"
+              ? "Gemini"
+              : "Tycode";
     meta.appendChild(backend);
 
     const dot0 = document.createElement("span");

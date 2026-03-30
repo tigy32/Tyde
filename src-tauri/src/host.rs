@@ -34,6 +34,7 @@ fn default_local_host() -> Host {
             "codex".to_string(),
             "claude".to_string(),
             "kiro".to_string(),
+            "gemini".to_string(),
         ],
         default_backend: "tycode".to_string(),
     }
@@ -45,6 +46,7 @@ fn all_backends() -> Vec<String> {
         "codex".to_string(),
         "claude".to_string(),
         "kiro".to_string(),
+        "gemini".to_string(),
     ]
 }
 
@@ -90,7 +92,22 @@ impl HostStore {
             hosts.insert(0, default_local_host());
         }
 
+        // Ensure newly added backends appear in each host's enabled list.
+        let known = all_backends();
+        let mut migrated = false;
+        for host in &mut hosts {
+            for backend in &known {
+                if !host.enabled_backends.contains(backend) {
+                    host.enabled_backends.push(backend.clone());
+                    migrated = true;
+                }
+            }
+        }
+
         let store = Self { path, hosts };
+        if migrated {
+            store.save()?;
+        }
         Ok(store)
     }
 

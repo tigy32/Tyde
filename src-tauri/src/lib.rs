@@ -11,6 +11,7 @@ mod dev_instance;
 mod driver_mcp_http;
 mod file_service;
 mod file_watch;
+mod gemini;
 mod git_service;
 pub mod host;
 mod kiro;
@@ -350,6 +351,7 @@ fn backend_assistant_sender_name(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Claude => "Claude",
         BackendKind::Kiro => "Kiro",
+        BackendKind::Gemini => "Gemini",
     }
 }
 
@@ -1249,6 +1251,16 @@ async fn resolve_backend_executable_path(
                 _ => Ok(String::new()),
             }
         }
+        BackendKind::Gemini => {
+            let remote_roots = parse_remote_workspace_roots(workspace_roots)?;
+            match &remote_roots {
+                Some((host, _)) => {
+                    validate_remote_cli(app, host, "gemini").await?;
+                    Ok(host.clone())
+                }
+                None => Ok(String::new()),
+            }
+        }
     }
 }
 
@@ -1264,6 +1276,7 @@ struct BackendDependencyStatus {
     codex: BackendDepResult,
     claude: BackendDepResult,
     kiro: BackendDepResult,
+    gemini: BackendDepResult,
 }
 
 #[tauri::command]
@@ -1299,6 +1312,7 @@ fn check_backend_dependencies() -> BackendDependencyStatus {
         codex: check("codex"),
         claude: check("claude"),
         kiro: check("kiro-cli"),
+        gemini: check("gemini"),
     }
 }
 
@@ -1433,6 +1447,19 @@ async fn install_kiro() -> Result<(), String> {
     Ok(())
 }
 
+async fn install_gemini() -> Result<(), String> {
+    let output = tokio::process::Command::new("npm")
+        .args(["install", "-g", "@google/gemini-cli"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run npm: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to install gemini-cli: {stderr}"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn install_backend_dependency(backend_kind: String) -> Result<(), String> {
     match backend_kind.as_str() {
@@ -1440,6 +1467,7 @@ async fn install_backend_dependency(backend_kind: String) -> Result<(), String> 
         "codex" => install_codex().await,
         "claude" => install_claude_code().await,
         "kiro" => install_kiro().await,
+        "gemini" => install_gemini().await,
         other => Err(format!("Unknown backend kind: {other}")),
     }
 }

@@ -525,7 +525,8 @@ export class ChatPanel {
     } else if (
       backendKind === "codex" ||
       backendKind === "claude" ||
-      backendKind === "kiro"
+      backendKind === "kiro" ||
+      backendKind === "gemini"
     ) {
       listModels(conversationId).catch((err) =>
         console.error("Failed to list models for conversation:", err),
@@ -787,13 +788,18 @@ export class ChatPanel {
       false,
     );
     showViewMs = perfNow() - showViewStart;
-    if (!view.userScrolledUp) {
-      requestAnimationFrame(() => {
-        if (this.activeConversationId !== conversationId) return;
+
+    // After the wrapper becomes visible, the virtualizer's scroll element
+    // gains dimensions.  Force a render pass so any messages that were added
+    // while the container was hidden (0-height) get mounted to the DOM.
+    requestAnimationFrame(() => {
+      if (this.activeConversationId !== conversationId) return;
+      renderVisibleMessages(view);
+      if (!view.userScrolledUp) {
         this.scrollToBottom(view);
-        this.updateViewScrollButton(view);
-      });
-    }
+      }
+      this.updateViewScrollButton(view);
+    });
 
     const uiUpdateStart = perfNow();
     this.updateViewSendButton(view);
@@ -845,6 +851,8 @@ export class ChatPanel {
         this.setConversationBackendKind(conversationId, "claude");
       } else if (agent === "kiro") {
         this.setConversationBackendKind(conversationId, "kiro");
+      } else if (agent === "gemini") {
+        this.setConversationBackendKind(conversationId, "gemini");
       }
     }
 

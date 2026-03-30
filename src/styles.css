@@ -3735,8 +3735,11 @@ body {
   }
 }
 
-/* Message fade-in */
-.message,
+/* Message fade-in – only for tool-cards; .message elements are managed
+   by the virtualizer and may be mounted while their container is hidden
+   (e.g. bridge conversations created from the home screen).  CSS
+   animations do not run in hidden containers, leaving opacity stuck at
+   the keyframe "from" value (0). */
 .tool-card {
   animation: fade-in 0.15s ease;
 }

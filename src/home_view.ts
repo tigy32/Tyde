@@ -70,7 +70,7 @@ export class HomeView {
     const local = this.hosts.find((h) => h.is_local);
     if (!local) return [];
     return local.enabled_backends.filter((b): b is BackendKind =>
-      (["tycode", "codex", "claude", "kiro"] as string[]).includes(b),
+      (["tycode", "codex", "claude", "kiro", "gemini"] as string[]).includes(b),
     );
   }
 
@@ -626,6 +626,7 @@ export class HomeView {
       { kind: "codex", label: "Codex" },
       { kind: "claude", label: "Claude" },
       { kind: "kiro", label: "Kiro" },
+      { kind: "gemini", label: "Gemini" },
     ];
     const enabledSet = new Set(this.getLocalHostEnabledBackends());
     const backends = allBackends.filter((b) => enabledSet.has(b.kind));
@@ -1024,6 +1025,7 @@ export class HomeView {
                 codex: status.codex,
                 claude: status.claude,
                 kiro: status.kiro,
+                gemini: status.gemini,
               };
               this.render();
             })
