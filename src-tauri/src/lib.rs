@@ -1,5 +1,6 @@
 mod acp;
 mod admin;
+mod agent_defs_io;
 mod agent_mcp_http;
 mod agent_runtime;
 mod backend;
@@ -582,6 +583,7 @@ pub(crate) struct SpawnAgentRequest {
     /// Images to attach to the initial message sent to the agent.
     #[serde(skip)]
     pub(crate) images: Option<Vec<ImageAttachment>>,
+    pub(crate) agent_definition_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -915,7 +917,7 @@ fn startup_mcp_servers_for_new_sessions(
     include_agent_control: bool,
     workspace_roots: &[String],
 ) -> Result<Vec<StartupMcpServer>, String> {
-    startup_mcp_servers_for_agent(state, include_agent_control, None, workspace_roots)
+    startup_mcp_servers_for_agent(state, include_agent_control, None, workspace_roots, &[])
 }
 
 fn startup_mcp_servers_for_agent(
@@ -923,13 +925,14 @@ fn startup_mcp_servers_for_agent(
     include_agent_control: bool,
     caller_agent_id: Option<u64>,
     _workspace_roots: &[String],
+    extra_mcp_servers: &[StartupMcpServer],
 ) -> Result<Vec<StartupMcpServer>, String> {
     let mut servers = Vec::new();
 
     if include_agent_control {
         let server_enabled = *state.mcp_http_enabled.lock();
         if !server_enabled {
-            return Err("Tyde MCP control server must be enabled for Bridge chats".to_string());
+            return Err("Tyde MCP control server must be enabled for agent control".to_string());
         }
         let control_enabled = *state.mcp_control_enabled.lock();
         if !control_enabled {
@@ -975,7 +978,80 @@ fn startup_mcp_servers_for_agent(
         }
     }
 
+    servers.extend(extra_mcp_servers.iter().cloned());
+
     Ok(servers)
+}
+
+/// Convert agent definition MCP servers to startup format.
+fn definition_mcp_servers_to_startup(
+    servers: &[agent_defs_io::AgentMcpServer],
+) -> Vec<StartupMcpServer> {
+    servers
+        .iter()
+        .map(|s| StartupMcpServer {
+            name: s.name.clone(),
+            transport: match &s.transport {
+                agent_defs_io::AgentMcpTransport::Http { url, headers } => {
+                    StartupMcpTransport::Http {
+                        url: url.clone(),
+                        headers: headers.clone(),
+                        bearer_token_env_var: None,
+                    }
+                }
+                agent_defs_io::AgentMcpTransport::Stdio { command, args, env } => {
+                    StartupMcpTransport::Stdio {
+                        command: command.clone(),
+                        args: args.clone(),
+                        env: env.clone(),
+                    }
+                }
+            },
+        })
+        .collect()
+}
+
+/// Compose steering content from definition instructions, tool policy, and workspace steering.
+fn compose_steering(
+    instructions: Option<&str>,
+    tool_policy: &agent_defs_io::ToolPolicy,
+    workspace_steering: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(instr) = instructions {
+        if !instr.trim().is_empty() {
+            parts.push(instr.to_string());
+        }
+    }
+
+    match tool_policy {
+        agent_defs_io::ToolPolicy::AllowList(tools) if !tools.is_empty() => {
+            parts.push(format!(
+                "[Tool Policy]\nYou MUST only use the following tools: {}",
+                tools.join(", ")
+            ));
+        }
+        agent_defs_io::ToolPolicy::DenyList(tools) if !tools.is_empty() => {
+            parts.push(format!(
+                "[Tool Policy]\nYou MUST NOT use the following tools: {}",
+                tools.join(", ")
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(ws) = workspace_steering {
+        if !ws.trim().is_empty() {
+            parts.push(ws.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
 }
 
 fn record_debug_event(state: &AppState, stream: &str, payload: Value) {
@@ -1479,19 +1555,46 @@ async fn create_conversation(
     workspace_roots: Vec<String>,
     backend_kind: Option<String>,
     ephemeral: Option<bool>,
-    conversation_mode: Option<String>,
+    agent_definition_id: Option<String>,
 ) -> Result<CreateConversationResponse, String> {
-    let backend_kind = resolve_requested_backend_kind(&state, backend_kind, &workspace_roots)?;
-    let ephemeral = ephemeral.unwrap_or(false);
-    let include_agent_control = matches!(
-        conversation_mode
-            .as_deref()
-            .map(|raw| raw.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("bridge")
-    );
+    // Resolve definition if provided
+    let definition = if let Some(ref def_id) = agent_definition_id {
+        let def_workspace = workspace_roots
+            .iter()
+            .find(|r| !r.starts_with("ssh://"))
+            .map(|r| r.to_string());
+        let defs = agent_defs_io::list_agent_definitions(def_workspace).await?;
+        let found = defs
+            .into_iter()
+            .find(|e| e.definition.id == *def_id);
+        Some(
+            found
+                .ok_or_else(|| format!("Agent definition '{def_id}' not found"))?
+                .definition,
+        )
+    } else {
+        None
+    };
 
-    // For Bridge conversations, reserve an agent_id upfront so we can embed it
+    let include_agent_control = definition
+        .as_ref()
+        .map(|d| d.include_agent_control)
+        .unwrap_or(false);
+    let def_tool_policy = definition
+        .as_ref()
+        .map(|d| d.tool_policy.clone())
+        .unwrap_or_default();
+
+    // Use definition's default_backend if caller didn't specify one
+    let effective_backend = if backend_kind.is_none() {
+        definition.as_ref().and_then(|d| d.default_backend.clone())
+    } else {
+        backend_kind
+    };
+    let backend_kind = resolve_requested_backend_kind(&state, effective_backend, &workspace_roots)?;
+    let ephemeral = ephemeral.unwrap_or(false);
+
+    // For agent-control conversations, reserve an agent_id upfront so we can embed it
     // in the MCP startup config. The MCP server uses this to auto-inject
     // parent_agent_id when spawning sub-agents.
     let reserved_agent_id = if include_agent_control {
@@ -1503,13 +1606,29 @@ async fn create_conversation(
 
     let resolved_path =
         resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
+
+    // Build extra MCP servers from definition
+    let extra_mcp_servers = definition
+        .as_ref()
+        .map(|d| definition_mcp_servers_to_startup(&d.mcp_servers))
+        .unwrap_or_default();
+
     let startup_mcp_servers = startup_mcp_servers_for_agent(
         state.inner(),
         include_agent_control,
         reserved_agent_id,
         &workspace_roots,
+        &extra_mcp_servers,
     )?;
-    let steering = steering::read_steering_from_roots(&workspace_roots).await?;
+
+    // Compose steering: definition instructions + tool policy + workspace steering
+    let workspace_steering = steering::read_steering_from_roots(&workspace_roots).await?;
+    let steering = compose_steering(
+        definition.as_ref().and_then(|d| d.instructions.as_deref()),
+        &def_tool_policy,
+        workspace_steering.as_deref(),
+    );
+
     let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
@@ -1525,7 +1644,12 @@ async fn create_conversation(
         mgr.create_conversation(session, &workspace_roots)
     };
 
-    // For Bridge conversations, complete the agent registration using the
+    let def_name = definition
+        .as_ref()
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "Conversation".to_string());
+
+    // For agent-control conversations, complete the agent registration using the
     // reserved ID so it appears in the hierarchy and sub-agents can reference it.
     if let Some(agent_id) = reserved_agent_id {
         let mut runtime = state.agent_runtime.lock().await;
@@ -1535,7 +1659,13 @@ async fn create_conversation(
             workspace_roots.clone(),
             backend_kind.as_str().to_string(),
             None,
-            "Bridge".to_string(),
+            def_name.clone(),
+        );
+        runtime.update_agent_type(agent_id, agent_definition_id.clone());
+        runtime.set_agent_definition(
+            agent_id,
+            agent_definition_id.clone(),
+            def_tool_policy,
         );
         drop(runtime);
         state.agent_runtime_notify.notify_waiters();
@@ -1568,7 +1698,7 @@ async fn create_conversation(
             "agent_id": reserved_agent_id,
             "workspace_roots": workspace_roots,
             "backend_kind": backend_kind.as_str(),
-            "name": if reserved_agent_id.is_some() { "Bridge" } else { "Conversation" },
+            "name": if reserved_agent_id.is_some() { &def_name } else { "Conversation" },
             "parent_agent_id": null,
         }
     });
@@ -1892,6 +2022,7 @@ pub(crate) async fn spawn_agent_internal(
         name,
         ephemeral,
         images,
+        agent_definition_id,
     } = request;
 
     if workspace_roots.iter().all(|root| root.trim().is_empty()) {
@@ -1911,12 +2042,62 @@ pub(crate) async fn spawn_agent_internal(
         }
     }
 
-    let backend_kind = resolve_requested_backend_kind(state, backend_kind, &workspace_roots)?;
+    // Resolve definition if provided
+    let definition = if let Some(ref def_id) = agent_definition_id {
+        let def_workspace = workspace_roots
+            .iter()
+            .find(|r| !r.starts_with("ssh://"))
+            .map(|r| r.to_string());
+        let defs = agent_defs_io::list_agent_definitions(def_workspace).await?;
+        let found = defs.into_iter().find(|e| e.definition.id == *def_id);
+        Some(
+            found
+                .ok_or_else(|| format!("Agent definition '{def_id}' not found"))?
+                .definition,
+        )
+    } else {
+        None
+    };
+
+    let include_agent_control = definition
+        .as_ref()
+        .map(|d| d.include_agent_control)
+        .unwrap_or(false);
+    let def_tool_policy = definition
+        .as_ref()
+        .map(|d| d.tool_policy.clone())
+        .unwrap_or_default();
+
+    let effective_backend = if backend_kind.is_none() {
+        definition.as_ref().and_then(|d| d.default_backend.clone())
+    } else {
+        backend_kind
+    };
+    let backend_kind = resolve_requested_backend_kind(state, effective_backend, &workspace_roots)?;
     let ephemeral = ephemeral.unwrap_or(false);
     let resolved_path =
         resolve_backend_executable_path(app, &workspace_roots, backend_kind).await?;
-    let startup_mcp_servers = startup_mcp_servers_for_new_sessions(state, false, &workspace_roots)?;
-    let steering = steering::read_steering_from_roots(&workspace_roots).await?;
+
+    let extra_mcp_servers = definition
+        .as_ref()
+        .map(|d| definition_mcp_servers_to_startup(&d.mcp_servers))
+        .unwrap_or_default();
+
+    let startup_mcp_servers = startup_mcp_servers_for_agent(
+        state,
+        include_agent_control,
+        None,
+        &workspace_roots,
+        &extra_mcp_servers,
+    )?;
+
+    let workspace_steering = steering::read_steering_from_roots(&workspace_roots).await?;
+    let steering = compose_steering(
+        definition.as_ref().and_then(|d| d.instructions.as_deref()),
+        &def_tool_policy,
+        workspace_steering.as_deref(),
+    );
+
     let (session, rx) = BackendSession::spawn(
         backend_kind,
         &resolved_path,
@@ -1939,13 +2120,22 @@ pub(crate) async fn spawn_agent_internal(
 
     let info = {
         let mut runtime = state.agent_runtime.lock().await;
-        runtime.register_agent(
+        let info = runtime.register_agent(
             conversation_id,
             workspace_roots.clone(),
             backend_kind.as_str().to_string(),
             parent_agent_id,
             display_name.clone(),
-        )
+        );
+        if agent_definition_id.is_some() {
+            runtime.update_agent_type(info.agent_id, agent_definition_id.clone());
+            runtime.set_agent_definition(
+                info.agent_id,
+                agent_definition_id,
+                def_tool_policy,
+            );
+        }
+        info
     };
     state.agent_runtime_notify.notify_waiters();
     emit_agent_changed(app, state, info.agent_id).await;
@@ -2365,6 +2555,7 @@ pub(crate) async fn run_query_screenshot_agent(
         name: "__internal_query_screenshot__".to_string(),
         ephemeral: Some(true),
         images: Some(vec![image]),
+        agent_definition_id: None,
     };
 
     let spawn_resp = spawn_agent_internal(app, state, request).await?;
@@ -2542,6 +2733,7 @@ async fn spawn_agent(
             name,
             ephemeral,
             images: None,
+            agent_definition_id: None,
         },
     )
     .await
@@ -3709,6 +3901,33 @@ async fn run_shell_command(
     workflow_io::run_shell_command(&command, &cwd).await
 }
 
+// --- Agent definition commands ---
+
+#[tauri::command]
+async fn list_agent_definitions(
+    workspace_path: Option<String>,
+) -> Result<Vec<agent_defs_io::AgentDefinitionEntry>, String> {
+    agent_defs_io::list_agent_definitions(workspace_path).await
+}
+
+#[tauri::command]
+async fn save_agent_definition(
+    definition_json: String,
+    scope: String,
+    workspace_path: Option<String>,
+) -> Result<(), String> {
+    agent_defs_io::save_agent_definition(&definition_json, &scope, workspace_path).await
+}
+
+#[tauri::command]
+async fn delete_agent_definition(
+    id: String,
+    scope: String,
+    workspace_path: Option<String>,
+) -> Result<(), String> {
+    agent_defs_io::delete_agent_definition(&id, &scope, workspace_path).await
+}
+
 #[cfg(target_os = "linux")]
 fn detect_system_dark_mode() -> bool {
     let output = Command::new("dbus-send")
@@ -3913,6 +4132,9 @@ pub fn run() {
             save_workflow,
             delete_workflow,
             run_shell_command,
+            list_agent_definitions,
+            save_agent_definition,
+            delete_agent_definition,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

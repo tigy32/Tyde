@@ -253,14 +253,14 @@ describe('Settings panel', () => {
     await browser.pause(300);
 
     // Verify backends panel is visible with toggle controls
-    const backendsPanel = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
-      if (!panel) return { exists: false, toggleCount: 0 };
-      const toggles = panel.querySelectorAll('input[type="checkbox"]');
-      return { exists: true, toggleCount: toggles.length };
-    }, sel.settingsTabPanel);
-    expect(backendsPanel.exists).toBe(true);
-    expect(backendsPanel.toggleCount).toBe(5);
+    await browser.waitUntil(async () => {
+      const res = await browser.execute((panelSel: string) => {
+        const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+        if (!panel) return 0;
+        return panel.querySelectorAll('input[type="checkbox"]').length;
+      }, sel.settingsTabPanel);
+      return res === 5;
+    }, { timeout: 5_000, timeoutMsg: 'Expected 5 backend toggles' });
 
     // All backends should be enabled by default (assuming deps are available)
     const allEnabled = await browser.execute((panelSel: string) => {

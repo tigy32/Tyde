@@ -25,6 +25,8 @@ interface MockRuntimeAgent {
   parent_agent_id: number | null;
   keep_alive_without_tab: boolean;
   name: string;
+  agent_type: string | null;
+  agent_definition_id: string | null;
   is_running: boolean;
   summary: string;
   created_at_ms: number;
@@ -493,6 +495,8 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         parent_agent_id: parentAgentId,
         keep_alive_without_tab: keepAliveWithoutTab,
         name: typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : `Agent ${agentId}`,
+        agent_type: null,
+        agent_definition_id: null,
         is_running: false,
         summary: 'Queued',
         created_at_ms: now,
@@ -1107,6 +1111,32 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         const current = mockSessionsByBackend[backendKind] ?? [];
         mockSessionsByBackend[backendKind] = current.filter((session) => session.id !== sessionId);
       }
+      return null;
+    }
+
+    case 'list_agent_definitions': {
+      return [
+        {
+          id: 'bridge',
+          name: 'Bridge',
+          description: 'Default orchestrator agent that coordinates work between the human and other Tyde agents.',
+          instructions: null,
+          bootstrap_prompt: null,
+          mcp_servers: [],
+          tool_policy: { mode: 'Unrestricted' },
+          default_backend: null,
+          include_agent_control: true,
+          builtin: true,
+          scope: 'builtin',
+        },
+      ];
+    }
+
+    case 'save_agent_definition': {
+      return null;
+    }
+
+    case 'delete_agent_definition': {
       return null;
     }
 

@@ -8,7 +8,6 @@ import {
   type CommandName,
   type CommandParams,
   type CommandResponse,
-  type ConversationMode,
   type ConversationRegisteredData,
   type ConversationRegisteredPayload,
   type FileChangedPayload,
@@ -23,12 +22,12 @@ import {
 
 export type {
   AdminEventPayload,
+  AgentDefinitionEntry,
   BackendDependencyStatus,
   BackendDepResult,
   BackendKind,
   ChatEventPayload,
   CollectedAgentResult,
-  ConversationMode,
   ConversationRegisteredData,
   ConversationRegisteredPayload,
   CreateConversationResponse,
@@ -87,13 +86,13 @@ export function createConversation(
   workspaceRoots: string[],
   backendKind?: BackendKind,
   ephemeral?: boolean,
-  conversationMode?: ConversationMode,
+  agentDefinitionId?: string,
 ) {
   return execute("create_conversation", {
     workspaceRoots,
     backendKind,
     ephemeral,
-    conversationMode,
+    agentDefinitionId,
   });
 }
 
@@ -796,4 +795,30 @@ export function deleteWorkflow(
 
 export function runShellCommand(command: string, cwd: string) {
   return execute("run_shell_command", { command, cwd });
+}
+
+// --- Agent definition operations ---
+
+export function listAgentDefinitions(workspacePath?: string) {
+  return execute("list_agent_definitions", { workspacePath });
+}
+
+export function saveAgentDefinition(
+  definitionJson: string,
+  scope: string,
+  workspacePath?: string,
+) {
+  return execute("save_agent_definition", {
+    definitionJson,
+    scope,
+    workspacePath,
+  });
+}
+
+export function deleteAgentDefinition(
+  id: string,
+  scope: string,
+  workspacePath?: string,
+) {
+  return execute("delete_agent_definition", { id, scope, workspacePath });
 }

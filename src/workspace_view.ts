@@ -1,10 +1,11 @@
 import type { SessionMetadata } from "@tyde/protocol";
+import type { AgentDefinitionStore } from "./agent_defs/store";
+import type { AgentDefinitionEntry } from "./agent_defs/types";
 import { type AgentCardAction, type AgentInfo, AgentsPanel } from "./agents";
 import type {
   AdminEventPayload,
   BackendKind,
   ChatEventPayload,
-  ConversationMode,
   Host,
   RuntimeAgent,
 } from "./bridge";
@@ -61,12 +62,13 @@ interface WorkspaceViewConfig {
   workspacePath: string;
   projectName: string;
   notifications: NotificationManager;
-  mode?: "workspace" | "bridge";
+  mode?: "workspace" | "bridge" | "orchestrator";
   roots?: string[];
+  agentDefinitionId?: string;
+  agentDefinitionStore?: AgentDefinitionStore;
   getBridgeProjects?:
     | (() => Array<{ name: string; workspacePath: string; roots: string[] }>)
     | null;
-  bridgeChatLabel?: string;
   bridgeChatEnabled?: boolean;
   bridgeChatDisabledReason?: string;
   availableWidgets?: PersistentWidgetId[];
@@ -100,9 +102,11 @@ export class WorkspaceView {
   readonly workspacePath: string;
   readonly root: HTMLElement;
 
-  private readonly mode: "workspace" | "bridge";
-  private readonly bridgeChatLabel: string;
+  private readonly mode: "workspace" | "bridge" | "orchestrator";
   private roots: string[];
+  private readonly agentDefinitionId: string | undefined;
+  private definitionLabel: string;
+  private readonly agentDefinitionStore: AgentDefinitionStore | null;
   private readonly getBridgeProjects: () => Array<{
     name: string;
     workspacePath: string;
@@ -173,8 +177,9 @@ export class WorkspaceView {
     this.notifications = config.notifications;
     this.mode = config.mode ?? "workspace";
     this.roots = config.roots ?? [];
-    this.bridgeChatLabel =
-      (config.bridgeChatLabel ?? "Bridge").trim() || "Bridge";
+    this.agentDefinitionId = config.agentDefinitionId;
+    this.agentDefinitionStore = config.agentDefinitionStore ?? null;
+    this.definitionLabel = this.resolveDefinitionLabel();
     this.getBridgeProjects = config.getBridgeProjects ?? (() => []);
     this.newConversationEnabled = config.bridgeChatEnabled ?? true;
     if (
@@ -212,12 +217,14 @@ export class WorkspaceView {
     centerNewTabBtn.type = "button";
     centerNewTabBtn.textContent = "+";
     centerNewTabBtn.title =
-      this.mode === "bridge"
-        ? `New ${this.bridgeChatLabel} tab (${formatShortcut("Ctrl+N")})`
+      this.agentDefinitionId != null
+        ? `New ${this.definitionLabel} tab (${formatShortcut("Ctrl+N")})`
         : `New tab (${formatShortcut("Ctrl+N")})`;
     centerNewTabBtn.setAttribute(
       "aria-label",
-      this.mode === "bridge" ? `New ${this.bridgeChatLabel} chat` : "New chat",
+      this.agentDefinitionId != null
+        ? `New ${this.definitionLabel} chat`
+        : "New chat",
     );
 
     const centerNewTabMenuBtn = document.createElement("button");
@@ -226,13 +233,13 @@ export class WorkspaceView {
     centerNewTabMenuBtn.type = "button";
     centerNewTabMenuBtn.textContent = "v";
     centerNewTabMenuBtn.title =
-      this.mode === "bridge"
-        ? `New ${this.bridgeChatLabel} chat options`
+      this.agentDefinitionId != null
+        ? `New ${this.definitionLabel} chat options`
         : "New chat options";
     centerNewTabMenuBtn.setAttribute(
       "aria-label",
-      this.mode === "bridge"
-        ? `Choose backend for new ${this.bridgeChatLabel} chat`
+      this.agentDefinitionId != null
+        ? `Choose backend for new ${this.definitionLabel} chat`
         : "Choose backend for new chat",
     );
     centerNewTabMenuBtn.setAttribute("aria-haspopup", "menu");
@@ -249,8 +256,8 @@ export class WorkspaceView {
     tycodeMenuItem.type = "button";
     tycodeMenuItem.className = "center-tab-new-menu-item";
     tycodeMenuItem.textContent =
-      this.mode === "bridge"
-        ? `New Tycode ${this.bridgeChatLabel}`
+      this.agentDefinitionId != null
+        ? `New Tycode ${this.definitionLabel}`
         : "New Tycode Chat";
     tycodeMenuItem.setAttribute("role", "menuitem");
     tycodeMenuItem.dataset.testid = "center-new-tab-tycode";
@@ -259,8 +266,8 @@ export class WorkspaceView {
     codexMenuItem.type = "button";
     codexMenuItem.className = "center-tab-new-menu-item";
     codexMenuItem.textContent =
-      this.mode === "bridge"
-        ? `New Codex ${this.bridgeChatLabel}`
+      this.agentDefinitionId != null
+        ? `New Codex ${this.definitionLabel}`
         : "New Codex Chat";
     codexMenuItem.setAttribute("role", "menuitem");
     codexMenuItem.dataset.testid = "center-new-tab-codex";
@@ -269,8 +276,8 @@ export class WorkspaceView {
     claudeMenuItem.type = "button";
     claudeMenuItem.className = "center-tab-new-menu-item";
     claudeMenuItem.textContent =
-      this.mode === "bridge"
-        ? `New Claude ${this.bridgeChatLabel}`
+      this.agentDefinitionId != null
+        ? `New Claude ${this.definitionLabel}`
         : "New Claude Chat";
     claudeMenuItem.setAttribute("role", "menuitem");
     claudeMenuItem.dataset.testid = "center-new-tab-claude";
@@ -279,8 +286,8 @@ export class WorkspaceView {
     kiroMenuItem.type = "button";
     kiroMenuItem.className = "center-tab-new-menu-item";
     kiroMenuItem.textContent =
-      this.mode === "bridge"
-        ? `New Kiro ${this.bridgeChatLabel}`
+      this.agentDefinitionId != null
+        ? `New Kiro ${this.definitionLabel}`
         : "New Kiro Chat";
     kiroMenuItem.setAttribute("role", "menuitem");
     kiroMenuItem.dataset.testid = "center-new-tab-kiro";
@@ -289,8 +296,8 @@ export class WorkspaceView {
     geminiMenuItem.type = "button";
     geminiMenuItem.className = "center-tab-new-menu-item";
     geminiMenuItem.textContent =
-      this.mode === "bridge"
-        ? `New Gemini ${this.bridgeChatLabel}`
+      this.agentDefinitionId != null
+        ? `New Gemini ${this.definitionLabel}`
         : "New Gemini Chat";
     geminiMenuItem.setAttribute("role", "menuitem");
     geminiMenuItem.dataset.testid = "center-new-tab-gemini";
@@ -636,7 +643,7 @@ export class WorkspaceView {
       this.newConversationDisabledReason,
     );
 
-    if (this.mode === "bridge") {
+    if (this.mode === "orchestrator") {
       this.showEmptyState();
     } else {
       this._constructorWork.push(
@@ -659,12 +666,12 @@ export class WorkspaceView {
   show(): void {
     this.root.style.display = "";
     const work: Promise<unknown>[] = [];
-    if (this.mode !== "bridge") {
+    if (this.mode !== "orchestrator") {
       work.push(this.startFileWatching());
       work.push(this.refreshOpenFileTabs());
     }
     void this.requestSessionsList(false);
-    if (this.mode === "bridge" && !this.tabManager.hasTabs()) {
+    if (this.mode === "orchestrator" && !this.tabManager.hasTabs()) {
       this.layout.setHomeMode(true);
     }
     this._readyPromise = Promise.all([...this._constructorWork, ...work]).then(
@@ -676,13 +683,13 @@ export class WorkspaceView {
     return this._readyPromise ?? Promise.resolve();
   }
   hide(): void {
-    if (this.mode !== "bridge") {
+    if (this.mode !== "orchestrator") {
       this.stopFileWatching();
     }
     this.root.style.display = "none";
   }
   destroy(): void {
-    if (this.mode !== "bridge") {
+    if (this.mode !== "orchestrator") {
       this.stopFileWatching();
     }
     this.workflowBuilder.destroy();
@@ -774,7 +781,7 @@ export class WorkspaceView {
   }
 
   isBridgeMode(): boolean {
-    return this.mode === "bridge";
+    return this.mode === "orchestrator";
   }
 
   updateNewConversationAvailability(
@@ -786,8 +793,8 @@ export class WorkspaceView {
       this.newConversationDisabledReason = reason;
     }
     const tooltip = enabled
-      ? this.mode === "bridge"
-        ? `New ${this.bridgeChatLabel} chat (${formatShortcut("Ctrl+N")})`
+      ? this.agentDefinitionId != null
+        ? `New ${this.definitionLabel} chat (${formatShortcut("Ctrl+N")})`
         : `New tab (${formatShortcut("Ctrl+N")})`
       : this.newConversationDisabledReason;
     if (this.centerNewTabBtn) {
@@ -797,8 +804,8 @@ export class WorkspaceView {
     if (this.centerNewTabMenuBtn) {
       this.centerNewTabMenuBtn.disabled = !enabled;
       this.centerNewTabMenuBtn.title = enabled
-        ? this.mode === "bridge"
-          ? `New ${this.bridgeChatLabel} chat options`
+        ? this.agentDefinitionId != null
+          ? `New ${this.definitionLabel} chat options`
           : "New chat options"
         : this.newConversationDisabledReason;
     }
@@ -908,7 +915,7 @@ export class WorkspaceView {
   showEmptyState(): void {
     this.chatPanel.clear();
     this.diffPanel.clear();
-    if (this.mode === "bridge") {
+    if (this.mode === "orchestrator") {
       this.layout.setHomeMode(true);
       return;
     }
@@ -1221,7 +1228,7 @@ export class WorkspaceView {
   }
 
   private resolveTitleWorkspaceRoots(): string[] {
-    if (this.mode !== "bridge") {
+    if (this.mode !== "orchestrator") {
       return this.workspacePath.trim() ? [this.workspacePath] : [];
     }
     const projects = this.getBridgeProjects();
@@ -1229,12 +1236,62 @@ export class WorkspaceView {
     return [projects[0].workspacePath];
   }
 
-  private resolveConversationMode(): ConversationMode | undefined {
-    return this.mode === "bridge" ? "bridge" : undefined;
+  refreshDefinitionLabel(): void {
+    this.definitionLabel = this.resolveDefinitionLabel();
+  }
+
+  private resolveDefinitionLabel(): string {
+    if (!this.agentDefinitionId || !this.agentDefinitionStore) return "Agent";
+    const def = this.agentDefinitionStore.getById(this.agentDefinitionId);
+    return def?.name?.trim() || "Agent";
+  }
+
+  private async resolveBootstrapPrompt(
+    definitionId?: string,
+  ): Promise<string | null> {
+    if (!definitionId || !this.agentDefinitionStore) return null;
+    const def = this.agentDefinitionStore.getById(definitionId);
+    if (!def) return null;
+
+    if (def.bootstrap_prompt) return def.bootstrap_prompt;
+
+    if (def.include_agent_control && this.mode === "orchestrator") {
+      return this.buildOrchestratorBootstrap(def);
+    }
+
+    return null;
+  }
+
+  private buildOrchestratorBootstrap(def: AgentDefinitionEntry): string {
+    const projects = this.getBridgeProjects();
+    const projectLines =
+      projects.length === 0
+        ? ["- No projects are currently open in Tyde."]
+        : projects.map((p, i) => {
+            const rootsInfo =
+              p.roots.length > 0 ? ` (sub-roots: ${p.roots.join(", ")})` : "";
+            return `- ${i + 1}. ${p.name} :: ${p.workspacePath}${rootsInfo}`;
+          });
+    return [
+      `[Tyde ${def.name} Charter]`,
+      `You are the ${def.name}, a control agent operating inside Tyde.`,
+      "Your role is to coordinate work between the human and other Tyde agents.",
+      "Rules:",
+      "- Do not directly perform implementation work yourself.",
+      "- Delegate concrete execution to other agents using the Tyde agent control MCP tools.",
+      "- Choose the right workspace and agent for each task, monitor progress, wait for results, and report back to the human.",
+      "- Ask clarifying questions when the objective or success criteria are unclear.",
+      "- Keep your own messages focused on coordination, delegation, status tracking, and synthesis.",
+      "",
+      "Projects currently open in Tyde:",
+      ...projectLines,
+      "",
+      "Respond with a brief acknowledgment that you understand this operating mode, then wait for the human.",
+    ].join("\n");
   }
 
   private resolveWorkspaceRootsForBackend(backendKind: BackendKind): string[] {
-    if (this.mode !== "bridge") {
+    if (this.mode !== "bridge" && this.mode !== "orchestrator") {
       if (!this.workspacePath.trim()) return [];
       if (backendKind === "tycode") {
         return this.getEffectiveRoots();
@@ -1260,10 +1317,10 @@ export class WorkspaceView {
   ): string | undefined {
     const trimmed = tabLabel?.trim();
     if (trimmed) return trimmed;
-    if (this.mode !== "bridge") return undefined;
+    if (this.mode !== "orchestrator") return undefined;
     const nextIndex =
       this.tabManager.getTabs().filter((tab) => tab.kind === "chat").length + 1;
-    return `${this.bridgeChatLabel} ${nextIndex}`;
+    return `${this.definitionLabel} ${nextIndex}`;
   }
 
   private ensureConversationCreationAllowed(): void {
@@ -1271,44 +1328,16 @@ export class WorkspaceView {
     throw new Error(this.newConversationDisabledReason);
   }
 
-  private buildBridgeBootstrapPrompt(): string {
-    const projects = this.getBridgeProjects();
-    const projectLines =
-      projects.length === 0
-        ? ["- No projects are currently open in Tyde."]
-        : projects.map((project, index) => {
-            const rootsInfo =
-              project.roots.length > 0
-                ? ` (sub-roots: ${project.roots.join(", ")})`
-                : "";
-            return `- ${index + 1}. ${project.name} :: ${project.workspacePath}${rootsInfo}`;
-          });
-    return [
-      `[Tyde ${this.bridgeChatLabel} Charter]`,
-      `You are the ${this.bridgeChatLabel}, a control agent operating inside Tyde.`,
-      "Your role is to coordinate work between the human and other Tyde agents.",
-      "Rules:",
-      "- Do not directly perform implementation work yourself.",
-      "- Delegate concrete execution to other agents using the Tyde agent control MCP tools.",
-      "- Choose the right workspace and agent for each task, monitor progress, wait for results, and report back to the human.",
-      "- Ask clarifying questions when the objective or success criteria are unclear.",
-      "- Keep your own messages focused on coordination, delegation, status tracking, and synthesis.",
-      "",
-      "Projects currently open in Tyde:",
-      ...projectLines,
-      "",
-      "Respond with a brief acknowledgment that you understand this operating mode, then wait for the human.",
-    ].join("\n");
-  }
-
   async createNewConversationTab(
     tabLabel?: string,
     backendOverride?: BackendKind,
-    options?: { bootstrap?: boolean },
+    options?: { bootstrap?: boolean; agentDefinitionId?: string },
   ): Promise<number> {
     this.ensureConversationCreationAllowed();
     await this.hostSettingsReady;
     const backendKind = this.resolveConversationBackend(backendOverride);
+    const effectiveDefinitionId =
+      options?.agentDefinitionId ?? this.agentDefinitionId;
 
     // Show tab with loading state BEFORE blocking subprocess spawn
     const tabTitle = this.resolveTitleForNewConversation(tabLabel);
@@ -1328,7 +1357,7 @@ export class WorkspaceView {
         conversationRoots,
         backendKind,
         undefined,
-        this.resolveConversationMode(),
+        effectiveDefinitionId,
       );
       id = result.conversation_id;
       tydeSessionId = result.session_id;
@@ -1345,7 +1374,9 @@ export class WorkspaceView {
       .getTabs()
       .some((t) => t.id === tab.id);
     if (!tabStillExists) {
-      closeConversation(id).catch(() => {});
+      closeConversation(id).catch((err) =>
+        console.error("Failed to close orphaned conversation:", err),
+      );
       return id;
     }
 
@@ -1366,8 +1397,13 @@ export class WorkspaceView {
     });
     this.chatPanel.switchToConversation(id);
     await this.applyDefaultSpawnProfile(id, backendKind);
-    if (this.mode === "bridge" && options?.bootstrap !== false) {
-      await sendMessage(id, this.buildBridgeBootstrapPrompt());
+    if (effectiveDefinitionId && options?.bootstrap !== false) {
+      const bootstrap = await this.resolveBootstrapPrompt(
+        effectiveDefinitionId,
+      );
+      if (bootstrap) {
+        await sendMessage(id, bootstrap);
+      }
     }
     return id;
   }
@@ -1682,9 +1718,9 @@ export class WorkspaceView {
   private async createDockedTerminal(
     zone: "left" | "right" | "bottom" = "bottom",
   ): Promise<void> {
-    if (this.mode === "bridge" && !this.workspacePath.trim()) {
+    if (this.mode === "orchestrator" && !this.workspacePath.trim()) {
       this.notifications.warning(
-        `${this.bridgeChatLabel} chats do not expose a workspace terminal.`,
+        `${this.definitionLabel} chats do not expose a workspace terminal.`,
       );
       return;
     }
@@ -1815,7 +1851,7 @@ export class WorkspaceView {
       if (!this.tabManager.hasTabs()) {
         this.showEmptyState();
       }
-      if (this.mode !== "bridge") {
+      if (this.mode !== "orchestrator") {
         void this.syncFileWatchSubscriptions();
       }
     };
@@ -2268,7 +2304,7 @@ export class WorkspaceView {
         preferred === "gemini") &&
       this.resolveWorkspaceRootsForBackend(preferred).length === 0
     ) {
-      if (this.mode === "bridge") {
+      if (this.mode === "orchestrator") {
         const backendLabel =
           preferred === "codex"
             ? "Codex"
@@ -2278,7 +2314,7 @@ export class WorkspaceView {
                 ? "Gemini"
                 : "Kiro";
         this.notifications.warning(
-          `${backendLabel} ${this.bridgeChatLabel} chats require at least one open local project. Using Tycode.`,
+          `${backendLabel} ${this.definitionLabel} chats require at least one open local project. Using Tycode.`,
         );
       } else {
         const backendLabel =

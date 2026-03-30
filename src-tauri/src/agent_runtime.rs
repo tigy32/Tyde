@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::agent_defs_io::ToolPolicy;
+
 const MAX_SUMMARY_LEN: usize = 180;
 const MAX_MESSAGE_LEN: usize = 4_000;
 const DEFAULT_EVENT_LOG_LIMIT: usize = 5_000;
@@ -17,6 +19,9 @@ pub struct AgentInfo {
     pub parent_agent_id: Option<u64>,
     pub name: String,
     pub agent_type: Option<String>,
+    pub agent_definition_id: Option<String>,
+    #[serde(skip)]
+    pub tool_policy: ToolPolicy,
     pub is_running: bool,
     pub summary: String,
     pub created_at_ms: u64,
@@ -152,6 +157,8 @@ impl AgentRuntime {
             parent_agent_id,
             name,
             agent_type: None,
+            agent_definition_id: None,
+            tool_policy: ToolPolicy::Unrestricted,
             is_running: true,
             summary: "Running...".to_string(),
             created_at_ms: now,
@@ -182,6 +189,18 @@ impl AgentRuntime {
         info.name = name;
         info.updated_at_ms = now_ms();
         true
+    }
+
+    pub fn set_agent_definition(
+        &mut self,
+        agent_id: u64,
+        definition_id: Option<String>,
+        tool_policy: ToolPolicy,
+    ) {
+        if let Some(info) = self.agents.get_mut(&agent_id) {
+            info.agent_definition_id = definition_id;
+            info.tool_policy = tool_policy;
+        }
     }
 
     pub fn update_agent_type(&mut self, agent_id: u64, agent_type: Option<String>) {

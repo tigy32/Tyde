@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::{
+    agent_defs_io::ToolPolicy,
     await_agents_internal, cancel_agent_internal, create_workbench_internal,
     delete_workbench_internal, list_agents_internal, run_agent_internal,
     send_agent_message_internal, spawn_agent_internal, AgentIdRequest, AppState,
@@ -147,6 +148,7 @@ fn spawn_request_from(input: SpawnAgentToolInput) -> SpawnAgentRequest {
         name: input.name,
         ephemeral: input.ephemeral,
         images: None,
+        agent_definition_id: None,
     }
 }
 
@@ -157,6 +159,39 @@ fn caller_agent_id_from_parts(parts: &http::request::Parts) -> Option<u64> {
     let header = parts.headers.get("x-tyde-agent-id")?;
     let s = header.to_str().ok()?;
     s.parse::<u64>().ok()
+}
+
+/// Check the caller agent's tool policy. Returns `Some(err_text(...))` if the
+/// tool is blocked, `None` if allowed.
+fn check_tool_policy(
+    app_state: &AppState,
+    parts: &http::request::Parts,
+    tool_name: &str,
+) -> Option<CallToolResult> {
+    let caller_id = caller_agent_id_from_parts(parts)?;
+    let runtime = app_state.agent_runtime.blocking_lock();
+    let agent = runtime.get_agent(caller_id)?;
+    match &agent.tool_policy {
+        ToolPolicy::Unrestricted => None,
+        ToolPolicy::AllowList(tools) => {
+            if tools.iter().any(|t| t == tool_name) {
+                None
+            } else {
+                Some(err_text(format!(
+                    "Tool '{tool_name}' is not permitted by this agent's tool policy"
+                )))
+            }
+        }
+        ToolPolicy::DenyList(tools) => {
+            if tools.iter().any(|t| t == tool_name) {
+                Some(err_text(format!(
+                    "Tool '{tool_name}' is not permitted by this agent's tool policy"
+                )))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +209,9 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_spawn_agent") {
+            return Ok(denied);
+        }
         let mut request = spawn_request_from(input);
         // Use the caller's agent ID from the HTTP header as parent, unless
         // the caller explicitly provided a parent_agent_id in the request.
@@ -195,6 +233,9 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_run_agent") {
+            return Ok(denied);
+        }
         let explicit_parent = input.parent_agent_id;
         let mut request = SpawnAgentRequest {
             workspace_roots: input.workspace_roots,
@@ -204,6 +245,7 @@ impl TydeAgentMcpServer {
             name: input.name,
             ephemeral: Some(false),
             images: None,
+            agent_definition_id: None,
         };
         if request.parent_agent_id.is_none() {
             request.parent_agent_id = caller_agent_id_from_parts(&parts);
@@ -220,8 +262,12 @@ impl TydeAgentMcpServer {
     async fn tyde_await_agent(
         &self,
         Parameters(input): Parameters<AwaitAgentsToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_await_agent") {
+            return Ok(denied);
+        }
         let request = AwaitAgentsRequest {
             agent_ids: input.agent_ids,
             timeout_ms: input.timeout_ms,
@@ -236,8 +282,12 @@ impl TydeAgentMcpServer {
     async fn tyde_send_agent_message(
         &self,
         Parameters(input): Parameters<SendAgentMessageToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_send_agent_message") {
+            return Ok(denied);
+        }
         let request = SendAgentMessageRequest {
             agent_id: input.agent_id,
             message: input.message,
@@ -254,8 +304,12 @@ impl TydeAgentMcpServer {
     async fn tyde_cancel_agent(
         &self,
         Parameters(input): Parameters<AgentIdToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_cancel_agent") {
+            return Ok(denied);
+        }
         let request = AgentIdRequest {
             agent_id: input.agent_id,
         };
@@ -268,8 +322,14 @@ impl TydeAgentMcpServer {
     #[tool(
         description = "List all Tyde agents with their running state, last message, and metadata."
     )]
-    async fn tyde_list_agents(&self) -> Result<CallToolResult, McpError> {
+    async fn tyde_list_agents(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_list_agents") {
+            return Ok(denied);
+        }
         match list_agents_internal(app_state.inner()).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
@@ -282,7 +342,14 @@ impl TydeAgentMcpServer {
     async fn tyde_create_workbench(
         &self,
         Parameters(input): Parameters<CreateWorkbenchToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        if let Some(denied) =
+            check_tool_policy(app_state.inner(), &parts, "tyde_create_workbench")
+        {
+            return Ok(denied);
+        }
         match create_workbench_internal(&self.app, input.parent_workspace_path, input.branch).await
         {
             Ok(workspace_path) => ok_json(serde_json::json!({ "workspace_path": workspace_path })),
@@ -296,7 +363,14 @@ impl TydeAgentMcpServer {
     async fn tyde_delete_workbench(
         &self,
         Parameters(input): Parameters<DeleteWorkbenchToolInput>,
+        Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let app_state = self.app.state::<AppState>();
+        if let Some(denied) =
+            check_tool_policy(app_state.inner(), &parts, "tyde_delete_workbench")
+        {
+            return Ok(denied);
+        }
         match delete_workbench_internal(&self.app, input.workspace_path).await {
             Ok(()) => ok_json(serde_json::json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
