@@ -24,11 +24,13 @@ export default defineConfig({
           { text: 'Claude Code', link: '/backends/claude-code' },
           { text: 'Codex', link: '/backends/codex' },
           { text: 'Kiro', link: '/backends/kiro' },
+          { text: 'Gemini CLI', link: '/backends/gemini' },
         ],
       },
       {
         text: 'Features',
         items: [
+          { text: 'Agent Definitions', link: '/features/agents' },
           { text: 'Agent Control', link: '/features/agent-control' },
           { text: 'Workbenches', link: '/features/workbenches' },
           { text: 'Workflows', link: '/features/workflows' },
