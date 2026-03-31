@@ -204,6 +204,17 @@ impl KiroSession {
             }
         });
 
+        // Emit SessionStarted so forward_events sets backend_session_id on the store record
+        {
+            let state = inner.state.lock().await;
+            if let Err(e) = inner.event_tx.send(json!({
+                "kind": "SessionStarted",
+                "data": { "session_id": &state.session_id }
+            })) {
+                tracing::error!("Failed to emit SessionStarted: {e}");
+            }
+        }
+
         Ok((Self { inner }, event_rx))
     }
 
@@ -627,6 +638,14 @@ impl KiroInner {
                 state.known_models = known_models;
             }
             state.replaying_history = false;
+
+            // Emit SessionStarted so forward_events sets backend_session_id on resume
+            if let Err(e) = self.event_tx.send(json!({
+                "kind": "SessionStarted",
+                "data": { "session_id": &state.session_id }
+            })) {
+                tracing::error!("Failed to emit SessionStarted on resume: {e}");
+            }
         }
 
         self.flush_replay_assistant_message().await;

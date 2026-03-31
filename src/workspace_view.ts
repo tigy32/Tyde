@@ -27,6 +27,7 @@ import {
   renameSession,
   resumeSession,
   sendMessage,
+  setSessionAlias,
   spawnAgent,
   switchProfile,
   syncFileWatchPaths,
@@ -1263,16 +1264,19 @@ export class WorkspaceView {
       const renamed = this.tabManager.autoRenameChatTab(
         conversationId,
         normalizedTitle,
-        "user",
+        "system",
       );
       if (!renamed) return;
 
-      // Alias is written by Rust via renameAgent → store.set_alias
       this.agentsPanel.updateAgent(conversationId, { name: normalizedTitle });
       const agentInfo =
         this.agentsPanel.getAgentByConversationId(conversationId);
       if (agentInfo?.agentId != null) {
         void renameAgent(agentInfo.agentId, normalizedTitle);
+      }
+      const tydeSessionId = this.conversationTydeSessionMap.get(conversationId);
+      if (tydeSessionId) {
+        void setSessionAlias(tydeSessionId, normalizedTitle);
       }
     } catch (err) {
       console.warn(

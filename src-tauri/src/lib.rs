@@ -1727,17 +1727,22 @@ async fn create_conversation(
         watchers.insert(id, settings_tx.clone());
     }
 
-    // Create session store record
-    let workspace_root = workspace_roots.first().map(|s| s.as_str());
-    let session_record = {
-        let mut store = state.session_store.lock();
-        store.create(backend_kind.as_str(), workspace_root)?
+    // Create session store record (skip for ephemeral conversations)
+    let tyde_session_id = if !ephemeral {
+        let workspace_root = workspace_roots.first().map(|s| s.as_str());
+        let session_record = {
+            let mut store = state.session_store.lock();
+            store.create(backend_kind.as_str(), workspace_root)?
+        };
+        let sid = session_record.id.clone();
+        {
+            let mut map = state.conversation_to_session.lock();
+            map.insert(id, sid.clone());
+        }
+        sid
+    } else {
+        String::new()
     };
-    let tyde_session_id = session_record.id.clone();
-    {
-        let mut map = state.conversation_to_session.lock();
-        map.insert(id, tyde_session_id.clone());
-    }
 
     tokio::spawn(forward_events(
         app.clone(),
@@ -2172,46 +2177,48 @@ pub(crate) async fn spawn_agent_internal(
     state.agent_runtime_notify.notify_waiters();
     emit_agent_changed(app, state, info.agent_id).await;
 
-    // Create session store record for this agent
-    let tyde_session_id = {
-        let workspace_root = workspace_roots.first().map(|s| s.as_str());
-        let record = state
-            .session_store
-            .lock()
-            .create(backend_kind.as_str(), workspace_root)?;
-        record.id
-    };
-    // Set parent_id if this agent has a parent
-    if let Some(parent_runtime_agent_id) = parent_agent_id {
-        let parent_cid = {
-            let runtime = state.agent_runtime.lock().await;
-            runtime.conversation_id_for_agent(parent_runtime_agent_id)
-        };
-        if let Some(parent_cid) = parent_cid {
-            let parent_tyde_id = state
-                .conversation_to_session
+    // Create session store record for this agent (skip for ephemeral agents)
+    if !ephemeral {
+        let tyde_session_id = {
+            let workspace_root = workspace_roots.first().map(|s| s.as_str());
+            let record = state
+                .session_store
                 .lock()
-                .get(&parent_cid)
-                .cloned();
-            if let Some(parent_tyde_id) = parent_tyde_id {
-                state
-                    .session_store
+                .create(backend_kind.as_str(), workspace_root)?;
+            record.id
+        };
+        // Set parent_id if this agent has a parent
+        if let Some(parent_runtime_agent_id) = parent_agent_id {
+            let parent_cid = {
+                let runtime = state.agent_runtime.lock().await;
+                runtime.conversation_id_for_agent(parent_runtime_agent_id)
+            };
+            if let Some(parent_cid) = parent_cid {
+                let parent_tyde_id = state
+                    .conversation_to_session
                     .lock()
-                    .set_parent(&tyde_session_id, &parent_tyde_id)?;
+                    .get(&parent_cid)
+                    .cloned();
+                if let Some(parent_tyde_id) = parent_tyde_id {
+                    state
+                        .session_store
+                        .lock()
+                        .set_parent(&tyde_session_id, &parent_tyde_id)?;
+                }
             }
         }
-    }
-    // Set alias from display name if non-generic
-    if !display_name.is_empty() && !is_generic_agent_name(&display_name) {
+        // Set alias from display name if non-generic
+        if !display_name.is_empty() && !is_generic_agent_name(&display_name) {
+            state
+                .session_store
+                .lock()
+                .set_alias(&tyde_session_id, &display_name)?;
+        }
         state
-            .session_store
+            .conversation_to_session
             .lock()
-            .set_alias(&tyde_session_id, &display_name)?;
+            .insert(conversation_id, tyde_session_id);
     }
-    state
-        .conversation_to_session
-        .lock()
-        .insert(conversation_id, tyde_session_id);
 
     // Set up the sub-agent emitter AFTER registration so we know this agent's id.
     // Sub-agents spawned by this agent will have parent_agent_id = info.agent_id.
@@ -3525,6 +3532,16 @@ fn rename_session(
 }
 
 #[tauri::command]
+fn set_session_alias(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    alias: String,
+) -> Result<(), String> {
+    let mut store = state.session_store.lock();
+    store.set_alias(&id, &alias)
+}
+
+#[tauri::command]
 async fn export_session_json(session_id: String) -> Result<String, String> {
     if !is_valid_session_id(&session_id) {
         return Err("Invalid session id".to_string());
@@ -4131,6 +4148,7 @@ pub fn run() {
             get_session_id,
             list_session_records,
             rename_session,
+            set_session_alias,
             list_profiles,
             switch_profile,
             get_module_schemas,

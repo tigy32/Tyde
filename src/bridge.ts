@@ -26,6 +26,8 @@ export type {
   BackendDependencyStatus,
   BackendDepResult,
   BackendKind,
+  BackendUsageResult,
+  BackendUsageWindow,
   ChatEventPayload,
   CollectedAgentResult,
   ConversationRegisteredData,
@@ -33,6 +35,7 @@ export type {
   CreateConversationResponse,
   DriverMcpHttpServerSettings,
   FileChangedPayload,
+  Host,
   McpHttpServerSettings,
   RemoteConnectionProgress,
   RuntimeAgent,
@@ -44,15 +47,6 @@ export type {
   TerminalOutputPayload,
   WorkflowEntry,
 } from "@tyde/protocol";
-
-export interface Host {
-  id: string;
-  label: string;
-  hostname: string;
-  is_local: boolean;
-  enabled_backends: string[];
-  default_backend: string;
-}
 
 export function normalizeBackendKind(
   value: string | null | undefined,
@@ -140,6 +134,10 @@ export function listSessionRecords() {
 
 export function renameSession(id: string, name: string) {
   return execute("rename_session", { id, name });
+}
+
+export function setSessionAlias(id: string, alias: string) {
+  return execute("set_session_alias", { id, alias });
 }
 
 // --- Settings & models ---
@@ -278,13 +276,8 @@ export function adminDeleteSession(adminId: number, sessionId: string) {
 
 // --- Git operations ---
 
-export function discoverGitRepos(workspaceDir: string): Promise<string[]> {
-  return invoke<string[]>("discover_git_repos", { workspaceDir }).catch(
-    (err) => {
-      console.error("bridge: discoverGitRepos failed:", err);
-      throw new Error(friendlyError(String(err)));
-    },
-  );
+export function discoverGitRepos(workspaceDir: string) {
+  return execute("discover_git_repos", { workspaceDir });
 }
 
 export function gitCurrentBranch(workingDir: string) {
@@ -385,11 +378,8 @@ export function setMcpHttpServerEnabled(enabled: boolean) {
   return execute("set_mcp_http_server_enabled", { enabled });
 }
 
-export function setMcpControlEnabled(enabled: boolean): Promise<void> {
-  return invoke<void>("set_mcp_control_enabled", { enabled }).catch((err) => {
-    console.error("bridge: setMcpControlEnabled failed:", err);
-    throw new Error(friendlyError(String(err)));
-  });
+export function setMcpControlEnabled(enabled: boolean) {
+  return execute("set_mcp_control_enabled", { enabled });
 }
 
 export function getDriverMcpHttpServerSettings() {
@@ -427,65 +417,32 @@ export function installBackendDependency(backendKind: string) {
 
 // --- Host management ---
 
-export function listHosts(): Promise<Host[]> {
-  return invoke<Host[]>("list_hosts").catch((err) => {
-    console.error("bridge: listHosts failed:", err);
-    throw new Error(friendlyError(String(err)));
-  });
+export function listHosts() {
+  return execute("list_hosts", {} as Record<string, never>);
 }
 
-export function addHost(label: string, hostname: string): Promise<Host> {
-  return invoke<Host>("add_host", { label, hostname }).catch((err) => {
-    console.error("bridge: addHost failed:", err);
-    throw new Error(friendlyError(String(err)));
-  });
+export function addHost(label: string, hostname: string) {
+  return execute("add_host", { label, hostname });
 }
 
-export function removeHost(id: string): Promise<void> {
-  return invoke<void>("remove_host", { id }).catch((err) => {
-    console.error("bridge: removeHost failed:", err);
-    throw new Error(friendlyError(String(err)));
-  });
+export function removeHost(id: string) {
+  return execute("remove_host", { id });
 }
 
-export function updateHostLabel(id: string, label: string): Promise<void> {
-  return invoke<void>("update_host_label", { id, label }).catch((err) => {
-    console.error("bridge: updateHostLabel failed:", err);
-    throw new Error(friendlyError(String(err)));
-  });
+export function updateHostLabel(id: string, label: string) {
+  return execute("update_host_label", { id, label });
 }
 
-export function updateHostEnabledBackends(
-  id: string,
-  backends: string[],
-): Promise<void> {
-  return invoke<void>("update_host_enabled_backends", { id, backends }).catch(
-    (err) => {
-      console.error("bridge: updateHostEnabledBackends failed:", err);
-      throw new Error(friendlyError(String(err)));
-    },
-  );
+export function updateHostEnabledBackends(id: string, backends: string[]) {
+  return execute("update_host_enabled_backends", { id, backends });
 }
 
-export function updateHostDefaultBackend(
-  id: string,
-  backend: string,
-): Promise<void> {
-  return invoke<void>("update_host_default_backend", { id, backend }).catch(
-    (err) => {
-      console.error("bridge: updateHostDefaultBackend failed:", err);
-      throw new Error(friendlyError(String(err)));
-    },
-  );
+export function updateHostDefaultBackend(id: string, backend: string) {
+  return execute("update_host_default_backend", { id, backend });
 }
 
-export function getHostForWorkspace(workspacePath: string): Promise<Host> {
-  return invoke<Host>("get_host_for_workspace", { workspacePath }).catch(
-    (err) => {
-      console.error("bridge: getHostForWorkspace failed:", err);
-      throw new Error(friendlyError(String(err)));
-    },
-  );
+export function getHostForWorkspace(workspacePath: string) {
+  return execute("get_host_for_workspace", { workspacePath });
 }
 
 // --- Process management ---
@@ -697,36 +654,8 @@ export function addRecentWorkspace(path: string): void {
   }
 }
 
-export interface BackendUsageWindow {
-  id: string;
-  label: string;
-  used_percent: number | null;
-  reset_at_text: string | null;
-  reset_at_unix: number | null;
-  window_minutes: number | null;
-}
-
-export interface BackendUsageResult {
-  backend_kind: BackendKind;
-  source: string;
-  captured_at_ms: number;
-  plan: string | null;
-  status: string | null;
-  windows: BackendUsageWindow[];
-  details: string[];
-}
-
-export function queryBackendUsage(
-  backendKind: BackendKind,
-  hostId?: string,
-): Promise<BackendUsageResult> {
-  return invoke<BackendUsageResult>("query_backend_usage", {
-    backendKind,
-    hostId,
-  }).catch((err) => {
-    console.error("bridge: queryBackendUsage failed:", err);
-    throw new Error(friendlyError(String(err)));
-  });
+export function queryBackendUsage(backendKind: BackendKind, hostId?: string) {
+  return execute("query_backend_usage", { backendKind, hostId });
 }
 
 export async function openWorkspaceDialog(): Promise<string | null> {
@@ -767,8 +696,8 @@ export async function pickSubRootDialog(
   return normalizedSelected.slice(normalizedParent.length + 1);
 }
 
-export async function getInitialWorkspace(): Promise<string | null> {
-  return invoke<string | null>("get_initial_workspace");
+export function getInitialWorkspace() {
+  return execute("get_initial_workspace", {} as Record<string, never>);
 }
 
 // --- Workflow operations ---

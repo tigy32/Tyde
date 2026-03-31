@@ -41,6 +41,7 @@ export class SessionsPanel {
   private errorMessage = "";
   private records = new Map<string, SessionRecord>();
   private showAgentSessions = false;
+  private showNonTydeSessions = false;
   private newSessionEnabled = true;
   private newSessionDisabledReason = "New sessions are unavailable.";
 
@@ -81,9 +82,33 @@ export class SessionsPanel {
   }
 
   update(sessions: SessionMetadata[]): void {
-    this.sessions = sessions
+    const normalized = sessions
       .map((s) => this.normalizeSession(s))
       .filter((s): s is NormalizedSession => s !== null);
+
+    // Inject sub-agent sessions from store that aren't in the backend list
+    const matchedRecordIds = new Set(
+      normalized
+        .map((s) => s.tydeSessionId)
+        .filter((id): id is string => id !== null),
+    );
+    for (const record of this.records.values()) {
+      if (matchedRecordIds.has(record.id)) continue;
+      if (!record.parent_id) continue;
+      normalized.push({
+        key: `store:${record.id}`,
+        id: record.backend_session_id ?? record.id,
+        tydeSessionId: record.id,
+        backendKind: normalizeBackendKind(record.backend_kind),
+        preview: record.alias ?? "Sub-agent session",
+        createdAtMs: record.created_at_ms,
+        messageCount: record.message_count,
+        workspaceRoot: record.workspace_root ?? undefined,
+        parentId: record.parent_id,
+      });
+    }
+
+    this.sessions = normalized;
     this.state = "loaded";
     this.errorMessage = "";
     this.resumingSessionKey = null;
@@ -155,6 +180,12 @@ export class SessionsPanel {
 
   private applyFilter(): void {
     let base = this.sessions;
+    // Exclude sessions with zero messages (created but never used)
+    base = base.filter((s) => s.messageCount !== 0);
+    // Hide sessions not tracked by Tyde unless toggle is on
+    if (!this.showNonTydeSessions) {
+      base = base.filter((s) => s.tydeSessionId !== null);
+    }
     // Filter out agent sessions unless toggle is on
     if (!this.showAgentSessions) {
       base = base.filter((s) => s.parentId === null);
@@ -231,8 +262,25 @@ export class SessionsPanel {
       this.updateVirtualList();
     });
 
+    const externalToggle = document.createElement("button");
+    externalToggle.className = `sessions-action-btn sessions-external-toggle${this.showNonTydeSessions ? " active" : ""}`;
+    externalToggle.title = this.showNonTydeSessions
+      ? "Hide sessions from outside Tyde"
+      : "Show sessions from outside Tyde";
+    externalToggle.textContent = "\u29C9";
+    externalToggle.addEventListener("click", () => {
+      this.showNonTydeSessions = !this.showNonTydeSessions;
+      externalToggle.classList.toggle("active", this.showNonTydeSessions);
+      externalToggle.title = this.showNonTydeSessions
+        ? "Hide sessions from outside Tyde"
+        : "Show sessions from outside Tyde";
+      this.applyFilter();
+      this.updateVirtualList();
+    });
+
     toolbar.appendChild(newBtn);
     toolbar.appendChild(agentToggle);
+    toolbar.appendChild(externalToggle);
     toolbar.appendChild(refreshBtn);
     this.container.appendChild(toolbar);
 
@@ -631,7 +679,7 @@ export class SessionsPanel {
         }
       }
     }
-    return this.truncate(session.preview, 80);
+    return this.truncate(session.preview, 50);
   }
 
   private async renameSessionAlias(session: NormalizedSession): Promise<void> {

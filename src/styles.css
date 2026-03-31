@@ -5970,7 +5970,8 @@ body {
   color: var(--text-bright);
 }
 
-.sessions-agent-toggle.active {
+.sessions-agent-toggle.active,
+.sessions-external-toggle.active {
   background: color-mix(in srgb, var(--accent-primary) 18%, var(--bg-primary));
   border-color: color-mix(
     in srgb,

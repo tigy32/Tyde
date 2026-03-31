@@ -78,11 +78,22 @@ impl SessionStore {
                 ));
             }
         };
-        Ok(Self {
+        let mut store = Self {
             records,
             path,
             dirty: false,
-        })
+        };
+        match store.delete_orphaned() {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("Cleaned up {count} orphaned session records");
+                }
+            }
+            Err(err) => {
+                tracing::error!("Failed to clean up orphaned session records: {err}");
+            }
+        }
+        Ok(store)
     }
 
     fn save(&mut self) -> Result<(), String> {
@@ -214,5 +225,27 @@ impl SessionStore {
             self.save()?;
         }
         Ok(())
+    }
+
+    pub fn delete_orphaned(&mut self) -> Result<usize, String> {
+        let cutoff = now_ms().saturating_sub(24 * 60 * 60 * 1000);
+        let to_delete: Vec<String> = self
+            .records
+            .values()
+            .filter(|r| {
+                r.backend_session_id.is_none()
+                    && r.message_count == 0
+                    && r.created_at_ms < cutoff
+            })
+            .map(|r| r.id.clone())
+            .collect();
+        let count = to_delete.len();
+        for id in &to_delete {
+            self.records.remove(id);
+        }
+        if count > 0 {
+            self.save()?;
+        }
+        Ok(count)
     }
 }
