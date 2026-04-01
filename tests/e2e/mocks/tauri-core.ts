@@ -108,9 +108,39 @@ interface MockSessionRecord {
   message_count: number;
 }
 
-let nextMockRecordId = 1;
+let nextMockRecordId = 100;
 const mockSessionRecords = new Map<string, MockSessionRecord>();
 const conversationToRecordId = new Map<number, string>();
+
+// Seed store records that match the default backend sessions so they survive
+// the showNonTydeSessions filter (which hides sessions with tydeSessionId===null).
+{
+  const now = Date.now();
+  mockSessionRecords.set('rec-tycode-1', {
+    id: 'rec-tycode-1',
+    backend_session_id: 'tycode-session-1',
+    backend_kind: 'tycode',
+    alias: 'Tycode Session 1',
+    user_alias: null,
+    parent_id: null,
+    workspace_root: '/mock/workspace',
+    created_at_ms: now - 30_000,
+    updated_at_ms: now - 10_000,
+    message_count: 5,
+  });
+  mockSessionRecords.set('rec-codex-1', {
+    id: 'rec-codex-1',
+    backend_session_id: 'codex-session-1',
+    backend_kind: 'codex',
+    alias: 'Codex Session 1',
+    user_alias: null,
+    parent_id: null,
+    workspace_root: '/mock/workspace',
+    created_at_ms: now - 25_000,
+    updated_at_ms: now - 8_000,
+    message_count: 3,
+  });
+}
 
 let nextTerminalId = 70_000;
 const terminalWorkspaceById = new Map<number, string>();
@@ -941,13 +971,26 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
     case 'resume_session': {
       const resumeCid = Number(args?.conversationId);
       const resumeSessionId = typeof args?.sessionId === 'string' ? args.sessionId : '';
-      // Mirror real backend: set backend_session_id on the record created by create_conversation
+      // Mirror real backend: set backend_session_id on the placeholder record
+      // created by create_conversation, absorb metadata from any prior record
+      // that tracked this backend session, then remove the prior record so
+      // normalizeSession finds exactly one match.
       const resumeRecordId = conversationToRecordId.get(resumeCid);
       if (resumeRecordId && resumeSessionId) {
         const rec = mockSessionRecords.get(resumeRecordId);
-        if (rec && !rec.backend_session_id) {
+        if (rec) {
           rec.backend_session_id = resumeSessionId;
           rec.updated_at_ms = Date.now();
+          // Absorb metadata from the prior record (if any)
+          for (const [otherId, otherRec] of mockSessionRecords) {
+            if (otherId !== resumeRecordId && otherRec.backend_session_id === resumeSessionId) {
+              rec.alias = otherRec.alias;
+              rec.message_count = otherRec.message_count;
+              rec.created_at_ms = otherRec.created_at_ms;
+              mockSessionRecords.delete(otherId);
+              break;
+            }
+          }
         }
       }
       return null;

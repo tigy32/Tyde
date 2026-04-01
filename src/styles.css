@@ -5444,7 +5444,7 @@ body {
 
 .agent-def-modal {
   width: 540px;
-  height: min(80vh, 620px);
+  height: min(85vh, 760px);
 }
 
 .agent-def-modal .agent-def-instructions-field {
@@ -5458,6 +5458,104 @@ body {
   flex: 1;
   min-height: 80px;
   resize: none;
+}
+
+/* Agent definition MCP server list */
+.agent-def-mcp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-def-mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agent-def-mcp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-secondary);
+  border-radius: 6px;
+}
+
+.agent-def-mcp-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.agent-def-mcp-row-name {
+  font-size: calc(var(--base-font-size) * 0.9286);
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-def-mcp-row-detail {
+  font-size: calc(var(--base-font-size) * 0.8);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-def-mcp-row-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.agent-def-mcp-row-btn {
+  background: transparent;
+  border: 1px solid var(--border-secondary);
+  color: var(--text-secondary);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: calc(var(--base-font-size) * 0.8);
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.agent-def-mcp-row-btn:hover {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.agent-def-mcp-row-remove:hover {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.agent-def-mcp-add {
+  margin-top: 4px;
+  font-size: calc(var(--base-font-size) * 0.8571);
+}
+
+.agent-mcp-transport-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.agent-mcp-transport-fields[hidden] {
+  display: none;
+}
+
+.agent-mcp-transport-fields .settings-input,
+.agent-mcp-transport-fields .settings-textarea {
+  width: 100%;
+  max-width: none;
 }
 
 /* Settings input used in modals */

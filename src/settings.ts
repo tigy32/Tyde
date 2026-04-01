@@ -1,5 +1,5 @@
 import type { AgentDefinitionStore } from "./agent_defs/store";
-import type { AgentDefinitionEntry } from "./agent_defs/types";
+import type { AgentDefinitionEntry, AgentMcpServer } from "./agent_defs/types";
 import {
   addHost as addHostBridge,
   adminGetModuleSchemas,
@@ -3009,6 +3009,96 @@ export class SettingsPanel {
     controlField.appendChild(controlRow);
     modal.appendChild(controlField);
 
+    // MCP Servers
+    const mcpServers: AgentMcpServer[] = [...(existing?.mcp_servers ?? [])];
+
+    const mcpField = el("div", {
+      class: "settings-field agent-def-mcp-field",
+    });
+    mcpField.appendChild(
+      el("label", { class: "settings-label" }, "MCP Servers"),
+    );
+    mcpField.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Custom MCP servers available only to this agent.",
+      ),
+    );
+
+    const mcpList = el("div", { class: "agent-def-mcp-list" });
+
+    const renderMcpList = () => {
+      mcpList.innerHTML = "";
+      for (let i = 0; i < mcpServers.length; i++) {
+        const srv = mcpServers[i];
+        const isHttp = srv.transport.type === "http";
+        const detail = isHttp
+          ? (srv.transport as any).url
+          : (srv.transport as any).command;
+
+        const row = el("div", { class: "agent-def-mcp-row" });
+        const info = el("div", { class: "agent-def-mcp-row-info" });
+        info.appendChild(
+          el("span", { class: "agent-def-mcp-row-name" }, srv.name),
+        );
+        info.appendChild(
+          el(
+            "span",
+            { class: "agent-def-mcp-row-detail" },
+            `${isHttp ? "HTTP" : "Stdio"}: ${detail}`,
+          ),
+        );
+        row.appendChild(info);
+
+        const rowActions = el("div", { class: "agent-def-mcp-row-actions" });
+        const editBtn = el(
+          "button",
+          { class: "agent-def-mcp-row-btn", title: "Edit" },
+          "Edit",
+        );
+        editBtn.addEventListener("click", () => {
+          this.showAgentMcpServerModal(srv, (updated) => {
+            mcpServers[i] = updated;
+            renderMcpList();
+          });
+        });
+        const removeBtn = el(
+          "button",
+          {
+            class: "agent-def-mcp-row-btn agent-def-mcp-row-remove",
+            title: "Remove",
+          },
+          "Remove",
+        );
+        removeBtn.addEventListener("click", () => {
+          mcpServers.splice(i, 1);
+          renderMcpList();
+        });
+        rowActions.appendChild(editBtn);
+        rowActions.appendChild(removeBtn);
+        row.appendChild(rowActions);
+        mcpList.appendChild(row);
+      }
+    };
+    renderMcpList();
+
+    mcpField.appendChild(mcpList);
+
+    const addMcpBtn = el(
+      "button",
+      { class: "settings-add-btn agent-def-mcp-add" },
+      "+ Add Server",
+    );
+    addMcpBtn.addEventListener("click", () => {
+      this.showAgentMcpServerModal(null, (srv) => {
+        mcpServers.push(srv);
+        renderMcpList();
+      });
+    });
+    mcpField.appendChild(addMcpBtn);
+    modal.appendChild(mcpField);
+
     // Actions
     const actions = el("div", { class: "settings-modal-actions" });
     const cancelBtn = el("button", {}, "Cancel");
@@ -3032,7 +3122,7 @@ export class SettingsPanel {
         description: descInput.value.trim(),
         instructions: instrInput.value.trim() || undefined,
         bootstrap_prompt: existing?.bootstrap_prompt,
-        mcp_servers: existing?.mcp_servers ?? [],
+        mcp_servers: mcpServers,
         tool_policy: existing?.tool_policy ?? { mode: "Unrestricted" },
         default_backend: backendSelect.value || undefined,
         include_agent_control: controlInput.checked,
@@ -3046,6 +3136,221 @@ export class SettingsPanel {
         .then(() => {
           this.rerenderPanelContent("agents", () => this.buildAgentsContent());
         });
+    });
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    modal.appendChild(actions);
+
+    overlay.appendChild(modal);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.body.appendChild(overlay);
+    nameInput.focus();
+  }
+
+  private showAgentMcpServerModal(
+    existing: AgentMcpServer | null,
+    onSave: (server: AgentMcpServer) => void,
+  ): void {
+    const isHttp = existing ? existing.transport.type === "http" : false;
+
+    const overlay = el("div", { class: "settings-modal-overlay" });
+    const modal = el("div", { class: "settings-modal" });
+    modal.appendChild(
+      el("h3", {}, existing ? "Edit MCP Server" : "Add MCP Server"),
+    );
+
+    // Name
+    const nameField = el("div", { class: "settings-field" });
+    nameField.appendChild(el("label", { class: "settings-label" }, "Name"));
+    const nameInput = el("input", {
+      class: "settings-input",
+      type: "text",
+      placeholder: "e.g. ops_mcp",
+    }) as HTMLInputElement;
+    nameInput.value = existing?.name ?? "";
+    nameField.appendChild(nameInput);
+    modal.appendChild(nameField);
+
+    // Transport type selector
+    const typeField = el("div", { class: "settings-field" });
+    typeField.appendChild(
+      el("label", { class: "settings-label" }, "Transport"),
+    );
+    const typeSelect = el("select", {
+      class: "settings-select",
+    }) as HTMLSelectElement;
+    for (const [value, label] of [
+      ["stdio", "Stdio"],
+      ["http", "HTTP"],
+    ]) {
+      const opt = el("option", { value }, label);
+      if ((value === "http" && isHttp) || (value === "stdio" && !isHttp)) {
+        opt.selected = true;
+      }
+      typeSelect.appendChild(opt);
+    }
+    typeField.appendChild(typeSelect);
+    modal.appendChild(typeField);
+
+    // Stdio fields
+    const stdioFields = el("div", {
+      class: "agent-mcp-transport-fields",
+    });
+
+    const cmdField = el("div", { class: "settings-field" });
+    cmdField.appendChild(el("label", { class: "settings-label" }, "Command"));
+    const cmdInput = el("input", {
+      class: "settings-input",
+      type: "text",
+      placeholder: "e.g. npx",
+    }) as HTMLInputElement;
+    cmdInput.value =
+      existing && existing.transport.type === "stdio"
+        ? (existing.transport as any).command
+        : "";
+    cmdField.appendChild(cmdInput);
+    stdioFields.appendChild(cmdField);
+
+    const argsField = el("div", { class: "settings-field" });
+    argsField.appendChild(
+      el("label", { class: "settings-label" }, "Arguments (one per line)"),
+    );
+    const argsInput = el("textarea", {
+      class: "settings-textarea",
+      rows: "3",
+    }) as HTMLTextAreaElement;
+    argsInput.value =
+      existing && existing.transport.type === "stdio"
+        ? ((existing.transport as any).args ?? []).join("\n")
+        : "";
+    argsField.appendChild(argsInput);
+    stdioFields.appendChild(argsField);
+
+    const envField = el("div", { class: "settings-field" });
+    envField.appendChild(
+      el("label", { class: "settings-label" }, "Env Vars (KEY=VALUE per line)"),
+    );
+    const envInput = el("textarea", {
+      class: "settings-textarea",
+      rows: "3",
+    }) as HTMLTextAreaElement;
+    envInput.value =
+      existing && existing.transport.type === "stdio"
+        ? Object.entries((existing.transport as any).env ?? {})
+            .map(([k, v]) => `${k}=${v}`)
+            .join("\n")
+        : "";
+    envField.appendChild(envInput);
+    stdioFields.appendChild(envField);
+    modal.appendChild(stdioFields);
+
+    // HTTP fields
+    const httpFields = el("div", {
+      class: "agent-mcp-transport-fields",
+    });
+
+    const urlField = el("div", { class: "settings-field" });
+    urlField.appendChild(el("label", { class: "settings-label" }, "URL"));
+    const urlInput = el("input", {
+      class: "settings-input",
+      type: "text",
+      placeholder: "http://localhost:9000/mcp",
+    }) as HTMLInputElement;
+    urlInput.value =
+      existing && existing.transport.type === "http"
+        ? (existing.transport as any).url
+        : "";
+    urlField.appendChild(urlInput);
+    httpFields.appendChild(urlField);
+
+    const headersField = el("div", { class: "settings-field" });
+    headersField.appendChild(
+      el("label", { class: "settings-label" }, "Headers (KEY=VALUE per line)"),
+    );
+    const headersInput = el("textarea", {
+      class: "settings-textarea",
+      rows: "3",
+    }) as HTMLTextAreaElement;
+    headersInput.value =
+      existing && existing.transport.type === "http"
+        ? Object.entries((existing.transport as any).headers ?? {})
+            .map(([k, v]) => `${k}=${v}`)
+            .join("\n")
+        : "";
+    headersField.appendChild(headersInput);
+    httpFields.appendChild(headersField);
+    modal.appendChild(httpFields);
+
+    // Show/hide based on transport type
+    const updateVisibility = () => {
+      const isHttpSelected = typeSelect.value === "http";
+      stdioFields.hidden = isHttpSelected;
+      httpFields.hidden = !isHttpSelected;
+    };
+    typeSelect.addEventListener("change", updateVisibility);
+    updateVisibility();
+
+    // Actions
+    const actions = el("div", { class: "settings-modal-actions" });
+    const cancelBtn = el("button", {}, "Cancel");
+    cancelBtn.addEventListener("click", () => overlay.remove());
+
+    const saveBtn = el("button", { class: "settings-modal-save" }, "Save");
+    saveBtn.addEventListener("click", () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        nameInput.focus();
+        return;
+      }
+
+      let server: AgentMcpServer;
+      if (typeSelect.value === "http") {
+        const url = urlInput.value.trim();
+        if (!url) {
+          urlInput.focus();
+          return;
+        }
+        const headers: Record<string, string> = {};
+        for (const line of headersInput.value.split("\n")) {
+          const eq = line.indexOf("=");
+          if (eq === -1) continue;
+          const k = line.substring(0, eq).trim();
+          const v = line.substring(eq + 1).trim();
+          if (k) headers[k] = v;
+        }
+        server = {
+          name,
+          transport: { type: "http", url, headers },
+        } as AgentMcpServer;
+      } else {
+        const command = cmdInput.value.trim();
+        if (!command) {
+          cmdInput.focus();
+          return;
+        }
+        const args = argsInput.value
+          .split("\n")
+          .map((l: string) => l.trim())
+          .filter(Boolean);
+        const env: Record<string, string> = {};
+        for (const line of envInput.value.split("\n")) {
+          const eq = line.indexOf("=");
+          if (eq === -1) continue;
+          const k = line.substring(0, eq).trim();
+          const v = line.substring(eq + 1).trim();
+          if (k) env[k] = v;
+        }
+        server = {
+          name,
+          transport: { type: "stdio", command, args, env },
+        } as AgentMcpServer;
+      }
+
+      overlay.remove();
+      onSave(server);
     });
 
     actions.appendChild(cancelBtn);
