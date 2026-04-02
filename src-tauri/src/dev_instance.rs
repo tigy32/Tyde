@@ -498,8 +498,11 @@ async fn start_remote_dev_instance(
         None => String::new(),
     };
 
+    let remote_path = crate::remote::resolve_remote_shell_path(host).await?;
+
     let remote_cmd = format!(
         "cd {} && \
+         PATH={} \
          TYDE_VITE_PORT={remote_vite_port} \
          TYDE_DEBUG_MCP_HTTP_BIND_ADDR=127.0.0.1:{remote_debug_port} \
          TYDE_DEBUG_MCP_HTTP_ENABLED=true \
@@ -508,6 +511,7 @@ async fn start_remote_dev_instance(
          {workspace_env}\
          npx tauri dev --config {}",
         crate::remote::shell_quote_arg(&project_dir),
+        crate::remote::shell_quote_arg(&remote_path),
         crate::remote::shell_quote_arg(&tauri_config_override),
     );
 

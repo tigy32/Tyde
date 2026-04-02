@@ -13,7 +13,7 @@ use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
-use crate::remote::{parse_remote_workspace_roots, shell_quote_arg, shell_quote_command, ssh_control_args};
+use crate::remote::{parse_remote_workspace_roots, resolve_remote_shell_path, shell_quote_arg, shell_quote_command, ssh_control_args};
 use crate::subprocess::ImageAttachment;
 
 const GEMINI_AGENT_NAME: &str = "gemini";
@@ -375,6 +375,16 @@ impl GeminiInner {
         }
 
         let mut command = if let Some(host) = ssh_host {
+            let remote_path = match resolve_remote_shell_path(host).await {
+                Ok(path) => path,
+                Err(err) => {
+                    restore_gemini_mcp_settings(mcp_cleanup.take());
+                    return TurnOutcome::Failed {
+                        summary: GeminiStdoutSummary::default(),
+                        error: format!("Failed to resolve remote PATH: {err}"),
+                    };
+                }
+            };
             let quoted_args = shell_quote_command(&cli_args);
             // For remote: write .gemini/settings.json on the remote host via heredoc,
             // run gemini, then restore the original file.
@@ -385,7 +395,7 @@ impl GeminiInner {
                     "mkdir -p {}/.gemini && \
                      {{ [ -f {settings} ] && cp {settings} {backup}; }} 2>/dev/null; \
                      cat > {settings} <<'TYDE_MCP_EOF'\n{json}\nTYDE_MCP_EOF\n\
-                     cd {ws} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" gemini {args}; \
+                     cd {ws} && PATH={path} gemini {args}; \
                      _exit=$?; \
                      {{ [ -f {backup} ] && mv {backup} {settings} || rm -f {settings}; }} 2>/dev/null; \
                      exit $_exit",
@@ -393,12 +403,14 @@ impl GeminiInner {
                     settings = shell_quote_arg(&settings_path),
                     backup = shell_quote_arg(&backup_path),
                     ws = shell_quote_arg(workspace_root),
+                    path = shell_quote_arg(&remote_path),
                     args = quoted_args,
                 )
             } else {
                 format!(
-                    "cd {} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" gemini {}",
+                    "cd {} && PATH={} gemini {}",
                     shell_quote_arg(workspace_root),
+                    shell_quote_arg(&remote_path),
                     quoted_args,
                 )
             };
