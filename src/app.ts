@@ -28,8 +28,10 @@ import {
   onChatEvent,
   onCreateWorkbench,
   onDeleteWorkbench,
+  onTydeServerConnectionState,
   openWorkspaceDialog,
   pickSubRootDialog,
+  type TydeServerConnectionState,
   terminateAgent,
 } from "./bridge";
 import { CommandPalette } from "./command_palette";
@@ -86,10 +88,13 @@ export class AppController {
   private workspaceViews = new Map<string, WorkspaceView>();
   private activeWorkspaceId: string | null = null;
   private homeBridgeView!: WorkspaceView;
-  private agentDefinitionStore: AgentDefinitionStore;
+  private readonly agentDefinitionStores = new Map<
+    string,
+    AgentDefinitionStore
+  >();
+  private settingsHostSyncSeq = 0;
 
   constructor() {
-    this.agentDefinitionStore = new AgentDefinitionStore("");
     this.initializeTheme();
     this.buildSharedComponents();
   }
@@ -126,9 +131,8 @@ export class AppController {
 
     await initializeBackendDependencies();
     this.refreshAllBackendMenus();
-    await this.agentDefinitionStore.load();
+    await this.ensureAgentDefinitionStoreLoaded("");
     this.homeBridgeView.refreshDefinitionLabel();
-    this.settingsPanel.setAgentDefinitionStore(this.agentDefinitionStore);
     await this.reconcileRustHostsWithProjects();
 
     // If the user previously enabled tycode but the binary is missing after an
@@ -156,12 +160,12 @@ export class AppController {
       this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
     });
 
+    await onTydeServerConnectionState((payload) => {
+      this.handleTydeServerConnectionState(payload);
+    });
+
     // Seed agent map with current state at startup
-    const initialAgents = await listAgents();
-    this.runtimeAgents = new Map(
-      initialAgents.map((agent) => [agent.agent_id, agent]),
-    );
-    this.applyRuntimeAgents(initialAgents);
+    await this.refreshRuntimeAgentsSnapshot();
 
     await this.bootstrapStartup();
 
@@ -177,6 +181,24 @@ export class AppController {
   }
 
   persistActiveProjectUiState(): void {}
+
+  private getAgentDefinitionStore(workspacePath: string): AgentDefinitionStore {
+    const key = workspacePath.trim();
+    let store = this.agentDefinitionStores.get(key);
+    if (!store) {
+      store = new AgentDefinitionStore(key);
+      this.agentDefinitionStores.set(key, store);
+    }
+    return store;
+  }
+
+  private async ensureAgentDefinitionStoreLoaded(
+    workspacePath: string,
+  ): Promise<AgentDefinitionStore> {
+    const store = this.getAgentDefinitionStore(workspacePath);
+    await store.load();
+    return store;
+  }
 
   private refreshAllBackendMenus(): void {
     for (const view of this.workspaceViews.values()) {
@@ -202,7 +224,66 @@ export class AppController {
     return null;
   }
 
+  private resolveSettingsWorkspaceForHost(host: Host): string | null {
+    if (host.is_local) {
+      const activeLocalProject =
+        this.projectState.getActiveProject()?.workspacePath;
+      if (activeLocalProject && !parseRemoteWorkspaceUri(activeLocalProject)) {
+        return activeLocalProject;
+      }
+      const firstLocalProject = this.projectState.projects.find(
+        (project) => !parseRemoteWorkspaceUri(project.workspacePath),
+      );
+      return firstLocalProject?.workspacePath ?? "";
+    }
+
+    const remoteProject = this.projectState.projects.find((project) => {
+      const remote = parseRemoteWorkspaceUri(project.workspacePath);
+      return remote?.host === host.hostname;
+    });
+    return remoteProject?.workspacePath ?? null;
+  }
+
+  private async syncSettingsAgentDefinitionStore(
+    host: Host | null,
+  ): Promise<void> {
+    const seq = ++this.settingsHostSyncSeq;
+
+    if (!host) {
+      this.settingsPanel.setAgentDefinitionStore(
+        null,
+        "No host selected for agent definitions.",
+      );
+      return;
+    }
+
+    const workspacePath = this.resolveSettingsWorkspaceForHost(host);
+    if (workspacePath === null) {
+      const reason =
+        host.remote_kind === "tyde_server"
+          ? `Open a workspace on ${host.hostname} to load its remote agent definitions.`
+          : `Open a workspace on ${host.hostname} to load project-scoped agent definitions.`;
+      this.settingsPanel.setAgentDefinitionStore(null, reason);
+      return;
+    }
+
+    try {
+      const store = await this.ensureAgentDefinitionStoreLoaded(workspacePath);
+      if (seq !== this.settingsHostSyncSeq) return;
+      this.settingsPanel.setAgentDefinitionStore(store);
+    } catch (err) {
+      if (seq !== this.settingsHostSyncSeq) return;
+      console.error("Failed to load host-scoped agent definitions:", err);
+      this.settingsPanel.setAgentDefinitionStore(
+        null,
+        `Failed to load agent definitions: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   private async handleSettingsHostChange(host: Host | null): Promise<void> {
+    void this.syncSettingsAgentDefinitionStore(host);
+
     if (!host) {
       this.settingsPanel.adminId = null;
       return;
@@ -297,7 +378,10 @@ export class AppController {
       const hostRefreshes = Array.from(this.workspaceViews.values()).map(
         (view) => view.refreshHostSettings(),
       );
-      void Promise.all(hostRefreshes).then(() => this.refreshAllBackendMenus());
+      void Promise.all(hostRefreshes).then(() => {
+        this.refreshAllBackendMenus();
+        this.settingsPanel.notifySelectedHostChanged();
+      });
     };
 
     settingsTabViewEl.classList.add("settings-overlay");
@@ -310,7 +394,7 @@ export class AppController {
       notifications: this.notifications,
       mode: "orchestrator",
       agentDefinitionId: "bridge",
-      agentDefinitionStore: this.agentDefinitionStore,
+      agentDefinitionStore: this.getAgentDefinitionStore(""),
       bridgeChatEnabled: this.bridgeControlEnabled,
       bridgeChatDisabledReason: this.bridgeChatDisabledReason(),
       getBridgeProjects: () =>
@@ -356,8 +440,8 @@ export class AppController {
     this.homeView.resolveProjectAgentCounts = (projectId) =>
       this.getProjectAgentCounts(projectId);
     this.homeView.resolveAllAgents = async () => {
-      return Array.from(this.runtimeAgents.values()).filter((agent) =>
-        this.shouldDisplayRuntimeAgent(agent),
+      return Array.from(this.runtimeAgents.values()).filter(
+        (agent) => !this.isInternalAgent(agent),
       );
     };
     this.homeView.onAgentAction = (agent, action) => {
@@ -384,9 +468,26 @@ export class AppController {
     this.settingsPanel.onMcpHttpSettingsChange = (settings) => {
       this.handleBridgeControlSettingsChange(settings);
     };
-    this.settingsPanel.onSpawnAgent = (definitionId, backendOverride) => {
+    this.settingsPanel.onSpawnAgent = (definitionId, backendOverride, host) => {
       this.closeSettings();
-      void this.homeBridgeView
+      const targetView = host
+        ? this.getWorkspaceViewForHost(host)
+        : this.homeBridgeView;
+      if (!targetView) {
+        this.notifications.error(
+          host
+            ? `Open a workspace on ${host.hostname} before spawning this agent.`
+            : "No workspace available for spawning this agent.",
+        );
+        return;
+      }
+      if (targetView.projectId === HOME_BRIDGE_VIEW_ID) {
+        this.switchToHome();
+      } else {
+        this.switchToWorkspace(targetView.projectId);
+      }
+
+      void targetView
         .createNewConversationTab(undefined, backendOverride, {
           bootstrap: true,
           agentDefinitionId: definitionId,
@@ -456,13 +557,21 @@ export class AppController {
     if (existing) return existing;
 
     const project = this.projectState.projects.find((p) => p.id === projectId);
+    const agentDefinitionStore = this.getAgentDefinitionStore(workspacePath);
+
     const view = new WorkspaceView({
       projectId,
       workspacePath,
       projectName,
       notifications: this.notifications,
       roots: project?.roots,
-      agentDefinitionStore: this.agentDefinitionStore,
+      agentDefinitionStore,
+    });
+    void agentDefinitionStore.load().catch((err) => {
+      console.error(
+        `Failed to load agent definitions for workspace "${workspacePath}":`,
+        err,
+      );
     });
 
     const viewContainer = document.getElementById("workspace-container")!;
@@ -528,8 +637,10 @@ export class AppController {
   }
 
   private applyRuntimeAgents(agents: RuntimeAgent[]): void {
-    const visibleAgents = agents.filter((agent) =>
-      this.shouldDisplayRuntimeAgent(agent),
+    const visibleAgents = agents.filter(
+      (agent) =>
+        !this.isInternalAgent(agent) &&
+        !this.hiddenRuntimeAgentIds.has(agent.agent_id),
     );
     const byProjectId = new Map<string, RuntimeAgent[]>();
 
@@ -558,6 +669,7 @@ export class AppController {
   }
 
   private openRuntimeAgentInWorkspace(agent: RuntimeAgent): void {
+    this.hiddenRuntimeAgentIds.delete(agent.agent_id);
     const project = this.resolveProjectForRuntimeAgent(agent);
     if (!project) return;
     this.switchToWorkspace(project.id);
@@ -591,16 +703,12 @@ export class AppController {
     );
   }
 
-  private shouldDisplayRuntimeAgent(agent: RuntimeAgent): boolean {
-    if (this.hiddenRuntimeAgentIds.has(agent.agent_id)) return false;
-
+  private isInternalAgent(agent: RuntimeAgent): boolean {
     const name = agent.name.trim();
-    if (name.startsWith(INTERNAL_AGENT_PREFIX)) return false;
-
+    if (name.startsWith(INTERNAL_AGENT_PREFIX)) return true;
     // Backward compatibility for older title helpers created before the internal prefix.
-    if (/^title\s+\d+$/i.test(name)) return false;
-
-    return true;
+    if (/^title\s+\d+$/i.test(name)) return true;
+    return false;
   }
 
   private async handleRuntimeAgentAction(
@@ -671,22 +779,38 @@ export class AppController {
   }
 
   private switchToWorkspace(projectId: string): void {
-    if (this.activeWorkspaceId) {
-      const current = this.workspaceViews.get(this.activeWorkspaceId);
+    const project = this.projectState.projects.find((p) => p.id === projectId);
+    if (!project) {
+      console.warn(`switchToWorkspace: unknown project id "${projectId}"`);
+      return;
+    }
+
+    let view: WorkspaceView;
+    try {
+      view = this.getOrCreateWorkspaceView(
+        project.id,
+        project.workspacePath,
+        project.name,
+      );
+      view.show();
+    } catch (err) {
+      console.error(
+        `Failed to open workspace view for "${project.name}" (${project.workspacePath}):`,
+        err,
+      );
+      this.notifications.error(
+        `Failed to open workspace "${project.name}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    const previousWorkspaceId = this.activeWorkspaceId;
+    if (previousWorkspaceId && previousWorkspaceId !== projectId) {
+      const current = this.workspaceViews.get(previousWorkspaceId);
       current?.hide();
     }
 
-    const project = this.projectState.projects.find((p) => p.id === projectId);
-    if (!project) return;
-
-    const view = this.getOrCreateWorkspaceView(
-      project.id,
-      project.workspacePath,
-      project.name,
-    );
-    view.show();
     this.activeWorkspaceId = projectId;
-
     this.projectState.switchProject(projectId);
     this.commandPalette.setWorkspaceRoot(project.workspacePath);
     document.querySelector(".app-title")!.textContent =
@@ -760,8 +884,16 @@ export class AppController {
       }
     }
 
+    const agentId = payload.data.agent_id;
+    if (agentId == null || agentId <= 0) {
+      // Some ConversationRegistered events can arrive before an agent id exists.
+      // Wait for the subsequent agent-changed event instead of creating a
+      // synthetic agent_id=0 entry that breaks agent routing/actions.
+      return;
+    }
+
     const agent: RuntimeAgent = {
-      agent_id: payload.data.agent_id ?? 0,
+      agent_id: agentId,
       conversation_id: payload.conversation_id,
       workspace_roots: payload.data.workspace_roots,
       backend_kind: payload.data.backend_kind,
@@ -940,7 +1072,11 @@ export class AppController {
         );
         return;
       }
-      await this.connectionDialog.show(remote.host);
+      // Look up the host to determine its remote_kind for the connection dialog
+      const hosts = await listHosts();
+      const matchedHost = hosts.find((h) => h.hostname === remote.host);
+      const remoteKind = matchedHost?.remote_kind ?? "ssh_pipe";
+      await this.connectionDialog.show(remote.host, undefined, remoteKind);
       this.settingsPanel.refreshHosts();
       if (this.projectSidebar) this.projectSidebar.refreshHosts();
       if (this.homeView) this.homeView.refreshHosts();
@@ -1000,6 +1136,46 @@ export class AppController {
     }
 
     addRecentWorkspace(dir);
+    this.settingsPanel.notifySelectedHostChanged();
+  }
+
+  private handleTydeServerConnectionState(
+    payload: TydeServerConnectionState,
+  ): void {
+    const state = payload.state;
+    if (typeof state === "string") {
+      if (state === "connected") {
+        this.notifications.success("Connected to remote Tyde server");
+        void this.refreshRuntimeAgentsSnapshot();
+      }
+    } else if ("reconnecting" in state) {
+      if (state.reconnecting.attempt === 1) {
+        this.notifications.info(
+          "Lost connection to remote Tyde — reconnecting...",
+        );
+      }
+    } else if ("disconnected" in state) {
+      this.notifications.error(
+        `Disconnected from remote Tyde: ${state.disconnected.reason}`,
+      );
+    }
+
+    // Update all workspace views that match this host
+    for (const [, view] of this.workspaceViews) {
+      view.updateServerConnectionState?.(payload);
+    }
+  }
+
+  private async refreshRuntimeAgentsSnapshot(): Promise<void> {
+    try {
+      const agents = await listAgents();
+      this.runtimeAgents = new Map(
+        agents.map((agent) => [agent.agent_id, agent]),
+      );
+      this.applyRuntimeAgents(agents);
+    } catch (err) {
+      console.error("Failed to refresh runtime agents:", err);
+    }
   }
 
   private async ensureRemoteHostRegistered(hostname: string): Promise<void> {
@@ -1088,6 +1264,7 @@ export class AppController {
     }
 
     this.projectState.removeProject(projectId);
+    this.settingsPanel.notifySelectedHostChanged();
 
     const active = this.projectState.getActiveProject();
     if (active) {
@@ -1211,6 +1388,7 @@ export class AppController {
     }
 
     this.projectState.removeProject(projectId);
+    this.settingsPanel.notifySelectedHostChanged();
 
     const active = this.projectState.getActiveProject();
     if (active) {

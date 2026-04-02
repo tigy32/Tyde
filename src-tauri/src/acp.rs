@@ -9,6 +9,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
+use crate::backend_transport::BackendTransport;
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
 const ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
 
@@ -89,9 +90,9 @@ pub struct AcpBridge {
 impl AcpBridge {
     pub async fn spawn(
         spec: AcpSpawnSpec,
-        ssh_host: Option<&str>,
+        transport: BackendTransport,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
-        let (rpc, inbound_rx) = AcpRpc::spawn(spec, ssh_host).await?;
+        let (rpc, inbound_rx) = AcpRpc::spawn(spec, transport).await?;
         Ok((
             Self {
                 rpc,
@@ -991,34 +992,29 @@ struct AcpRpc {
 impl AcpRpc {
     async fn spawn(
         spec: AcpSpawnSpec,
-        ssh_host: Option<&str>,
+        transport: BackendTransport,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
-        let mut child = if let Some(host) = ssh_host {
-            crate::remote::spawn_remote_process(
-                host,
-                &spec.remote_args[0],
-                &spec.remote_args[1..],
-                spec.remote_cwd.as_deref(),
-            )
-            .await
-            .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?
+        let (program, args, cwd) = if transport.is_remote() {
+            let program = spec
+                .remote_args
+                .first()
+                .cloned()
+                .ok_or_else(|| format!("{} remote args are empty", spec.display_name))?;
+            let args = spec.remote_args[1..].to_vec();
+            (program, args, spec.remote_cwd.as_deref())
         } else {
-            let mut cmd = Command::new(&spec.local_program);
-            cmd.args(&spec.local_args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            if let Some(path) = spec
+            let cwd = spec
                 .local_cwd
                 .as_deref()
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                cmd.current_dir(path);
-            }
-            cmd.spawn()
-                .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?
+                .filter(|value| !value.is_empty());
+            (spec.local_program.clone(), spec.local_args.clone(), cwd)
         };
+
+        let mut child = transport
+            .spawn_process(&program, &args, cwd)
+            .await
+            .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?;
 
         let stdin = child.stdin.take().ok_or("Failed to capture ACP stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to capture ACP stdout")?;

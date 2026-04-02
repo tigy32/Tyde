@@ -1,26 +1,29 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use tokio::process::Command;
+
+use crate::backend_transport::BackendTransport;
 
 const KIRO_USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const USAGE_ERROR_SNIPPET_MAX_CHARS: usize = 280;
 
 pub async fn query_backend_usage_for_host(
     backend_kind: &str,
-    ssh_host: Option<&str>,
+    transport: BackendTransport,
 ) -> Result<Value, String> {
     match backend_kind.trim().to_ascii_lowercase().as_str() {
-        "codex" => query_codex_usage(ssh_host).await,
-        "kiro" => query_kiro_usage(ssh_host).await,
-        "tycode" | "claude" | "gemini" => Err(format!("{backend_kind} does not expose usage limits")),
+        "codex" => query_codex_usage(transport).await,
+        "kiro" => query_kiro_usage(transport).await,
+        "tycode" | "claude" | "gemini" => {
+            Err(format!("{backend_kind} does not expose usage limits"))
+        }
         other => Err(format!("Unknown backend kind: {other}")),
     }
 }
 
-async fn query_codex_usage(ssh_host: Option<&str>) -> Result<Value, String> {
+async fn query_codex_usage(transport: BackendTransport) -> Result<Value, String> {
     let captured_at_ms = unix_now_ms();
-    let raw = crate::codex::query_account_rate_limits(ssh_host).await?;
+    let raw = crate::codex::query_account_rate_limits(transport).await?;
     let snapshot = select_codex_snapshot(&raw).ok_or_else(|| {
         let snippet = truncate_chars(&raw.to_string(), USAGE_ERROR_SNIPPET_MAX_CHARS);
         format!("Codex returned no rate-limit snapshot: {snippet}")
@@ -71,33 +74,27 @@ async fn query_codex_usage(ssh_host: Option<&str>) -> Result<Value, String> {
     }))
 }
 
-async fn query_kiro_usage(ssh_host: Option<&str>) -> Result<Value, String> {
+async fn query_kiro_usage(transport: BackendTransport) -> Result<Value, String> {
     let captured_at_ms = unix_now_ms();
-    let output = if let Some(host) = ssh_host {
-        let args: Vec<String> = ["chat", "--no-interactive", "/usage"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut child = crate::remote::spawn_remote_process(host, "kiro-cli", &args, None).await?;
-        // Close stdin so kiro-cli doesn't wait for input.
-        drop(child.stdin.take());
-        tokio::time::timeout(KIRO_USAGE_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                "Timed out waiting for remote `kiro-cli chat --no-interactive /usage`".to_string()
-            })?
-            .map_err(|err| format!("Failed to run remote Kiro usage command: {err}"))?
-    } else {
-        tokio::time::timeout(
-            KIRO_USAGE_TIMEOUT,
-            Command::new("kiro-cli")
-                .args(["chat", "--no-interactive", "/usage"])
-                .output(),
-        )
+    let args: Vec<String> = ["chat", "--no-interactive", "/usage"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut child = transport
+        .spawn_process("kiro-cli", &args, None)
         .await
-        .map_err(|_| "Timed out waiting for `kiro-cli chat --no-interactive /usage`".to_string())?
-        .map_err(|err| format!("Failed to run Kiro usage command: {err}"))?
+        .map_err(|err| format!("Failed to run Kiro usage command: {err}"))?;
+    // Close stdin so kiro-cli doesn't wait for input.
+    drop(child.stdin.take());
+    let timeout_message = if transport.is_remote() {
+        "Timed out waiting for remote `kiro-cli chat --no-interactive /usage`".to_string()
+    } else {
+        "Timed out waiting for `kiro-cli chat --no-interactive /usage`".to_string()
     };
+    let output = tokio::time::timeout(KIRO_USAGE_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| timeout_message)?
+        .map_err(|err| format!("Failed to run Kiro usage command: {err}"))?;
 
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&output.stdout));

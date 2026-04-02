@@ -1937,6 +1937,8 @@ export class ChatPanel {
     conversationId: number,
     backendKind: BackendKind,
   ): void {
+    const current = this.conversationBackendKinds.get(conversationId);
+    if (current === backendKind) return;
     this.conversationBackendKinds.set(conversationId, backendKind);
     const view = this.views.get(conversationId);
     if (!view) return;

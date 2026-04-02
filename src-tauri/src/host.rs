@@ -3,12 +3,25 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteKind {
+    SshPipe,
+    TydeServer,
+}
+
+fn default_remote_kind() -> RemoteKind {
+    RemoteKind::SshPipe
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Host {
     pub id: String,
     pub label: String,
     pub hostname: String,
     pub is_local: bool,
+    #[serde(default = "default_remote_kind")]
+    pub remote_kind: RemoteKind,
     pub enabled_backends: Vec<String>,
     pub default_backend: String,
 }
@@ -29,6 +42,7 @@ fn default_local_host() -> Host {
         label: "Local".to_string(),
         hostname: String::new(),
         is_local: true,
+        remote_kind: RemoteKind::SshPipe,
         enabled_backends: all_backends(),
         default_backend: "tycode".to_string(),
     }
@@ -104,12 +118,18 @@ impl HostStore {
         self.hosts.iter().find(|h| h.id == id)
     }
 
-    pub fn add(&mut self, label: String, hostname: String) -> Result<Host, String> {
+    pub fn add(
+        &mut self,
+        label: String,
+        hostname: String,
+        remote_kind: RemoteKind,
+    ) -> Result<Host, String> {
         let host = Host {
             id: uuid::Uuid::new_v4().to_string(),
             label,
             hostname,
             is_local: false,
+            remote_kind,
             enabled_backends: all_backends(),
             default_backend: "tycode".to_string(),
         };
@@ -205,7 +225,11 @@ mod tests {
         let mut store = HostStore::load(path).unwrap();
 
         let host = store
-            .add("Dev Server".into(), "user@dev.example.com".into())
+            .add(
+                "Dev Server".into(),
+                "user@dev.example.com".into(),
+                RemoteKind::SshPipe,
+            )
             .unwrap();
         assert!(!host.is_local);
         assert_eq!(store.list().len(), 2);
@@ -247,8 +271,12 @@ mod tests {
         let path = dir.path().join("hosts.json");
         let mut store = HostStore::load(path).unwrap();
 
-        store.add("Alpha".into(), "alpha.com".into()).unwrap();
-        store.add("Beta".into(), "beta.com".into()).unwrap();
+        store
+            .add("Alpha".into(), "alpha.com".into(), RemoteKind::SshPipe)
+            .unwrap();
+        store
+            .add("Beta".into(), "beta.com".into(), RemoteKind::SshPipe)
+            .unwrap();
 
         let hosts = store.list();
         assert_eq!(hosts[0].id, "local");
@@ -264,7 +292,11 @@ mod tests {
         {
             let mut store = HostStore::load(path.clone()).unwrap();
             store
-                .add("My Server".into(), "me@server.com".into())
+                .add(
+                    "My Server".into(),
+                    "me@server.com".into(),
+                    RemoteKind::SshPipe,
+                )
                 .unwrap();
         }
 

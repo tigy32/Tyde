@@ -163,6 +163,7 @@ export class WorkspaceView {
   > = {};
   private hostEnabledBackends: BackendKind[] | null = null;
   private hostDefaultBackend: BackendKind | null = null;
+  private resolvedHostId: string | null = null;
   private hostSettingsReady: Promise<void> = Promise.resolve();
   onConversationIdsChange: ((conversationIds: number[]) => void) | null = null;
   onAgentsChange: ((agents: AgentInfo[]) => void) | null = null;
@@ -171,6 +172,7 @@ export class WorkspaceView {
     | null = null;
   onRuntimeAgentClick: ((agent: AgentInfo) => void) | null = null;
   onWorkflowsChanged: (() => void) | null = null;
+  private serverConnStatusEl: HTMLElement | null = null;
 
   constructor(config: WorkspaceViewConfig) {
     this.projectId = config.projectId;
@@ -181,6 +183,17 @@ export class WorkspaceView {
     this.agentDefinitionId = config.agentDefinitionId;
     this.agentDefinitionStore = config.agentDefinitionStore ?? null;
     this.definitionLabel = this.resolveDefinitionLabel();
+    if (this.agentDefinitionStore) {
+      this.uiCleanupFns.push(
+        this.agentDefinitionStore.subscribe(() => {
+          this.refreshDefinitionLabel();
+          this.updateNewConversationAvailability(
+            this.newConversationEnabled,
+            this.newConversationDisabledReason,
+          );
+        }),
+      );
+    }
     this.getBridgeProjects = config.getBridgeProjects ?? (() => []);
     this.newConversationEnabled = config.bridgeChatEnabled ?? true;
     if (
@@ -610,6 +623,14 @@ export class WorkspaceView {
     tabActionsWrap.style.display = "flex";
     tabActionsWrap.style.alignItems = "center";
     tabActionsWrap.style.gap = "4px";
+    // Connection status indicator for TydeServer remotes
+    const connStatus = document.createElement("div");
+    connStatus.className = "tyde-server-conn-status";
+    connStatus.style.display = "none";
+    connStatus.dataset.testid = "tyde-server-conn-status";
+    this.serverConnStatusEl = connStatus;
+    tabActionsWrap.appendChild(connStatus);
+
     tabActionsWrap.appendChild(createToolOutputToggleButton());
     tabActionsWrap.appendChild(centerNewTabSplit);
     this.layout.setCenterTabActions(tabActionsWrap);
@@ -939,6 +960,7 @@ export class WorkspaceView {
       const hosts = await listHosts();
       const host = this.resolveHostForWorkspace(hosts);
       if (!host) return;
+      this.resolvedHostId = host.id;
 
       const nextEnabled = host.enabled_backends
         .map((kind) => normalizeBackendKind(kind))
@@ -1042,11 +1064,16 @@ export class WorkspaceView {
 
   syncRuntimeAgent(agent: RuntimeAgent): void {
     const backendKind = normalizeBackendKind(agent.backend_kind);
-    this.chatPanel.setConversationBackendKind(
+    const currentBackendKind = this.conversationBackendKindMap.get(
       agent.conversation_id,
-      backendKind,
     );
-    this.conversationBackendKindMap.set(agent.conversation_id, backendKind);
+    if (currentBackendKind !== backendKind) {
+      this.chatPanel.setConversationBackendKind(
+        agent.conversation_id,
+        backendKind,
+      );
+      this.conversationBackendKindMap.set(agent.conversation_id, backendKind);
+    }
     this.registerConversation(this.runtimeAgentToPanelInfo(agent));
   }
 
@@ -2743,5 +2770,42 @@ export class WorkspaceView {
 
   private emitConversationIdsChanged(): void {
     this.onConversationIdsChange?.(Array.from(this.conversationIds));
+  }
+
+  updateServerConnectionState(payload: {
+    host_id: string;
+    state:
+      | string
+      | { reconnecting: { attempt: number } }
+      | { disconnected: { reason: string } };
+  }): void {
+    // Only show for this workspace's host
+    const remote = parseRemoteWorkspaceUri(this.workspacePath);
+    if (!remote) return;
+    if (this.resolvedHostId && payload.host_id !== this.resolvedHostId) return;
+
+    const el = this.serverConnStatusEl;
+    if (!el) return;
+
+    const state = payload.state;
+    if (typeof state === "string") {
+      if (state === "connected") {
+        el.style.display = "flex";
+        el.className = "tyde-server-conn-status connected";
+        el.textContent = "Server Connected";
+      } else if (state === "connecting") {
+        el.style.display = "flex";
+        el.className = "tyde-server-conn-status connecting";
+        el.textContent = "Connecting...";
+      }
+    } else if ("reconnecting" in state) {
+      el.style.display = "flex";
+      el.className = "tyde-server-conn-status reconnecting";
+      el.textContent = `Reconnecting (${state.reconnecting.attempt})...`;
+    } else if ("disconnected" in state) {
+      el.style.display = "flex";
+      el.className = "tyde-server-conn-status disconnected";
+      el.textContent = "Disconnected";
+    }
   }
 }

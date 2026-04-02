@@ -13,6 +13,7 @@ use crate::acp::{
     AcpBridge, AcpInbound, AcpSpawnSpec,
 };
 use crate::backend::{SessionCommand, StartupMcpServer};
+use crate::backend_transport::BackendTransport;
 use crate::subprocess::ImageAttachment;
 
 const KIRO_AGENT_NAME: &str = "kiro";
@@ -37,7 +38,7 @@ pub struct KiroSession {
 impl KiroSession {
     pub async fn spawn(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
@@ -45,7 +46,7 @@ impl KiroSession {
             workspace_roots,
             false,
             false,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
         )
@@ -54,7 +55,7 @@ impl KiroSession {
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
@@ -62,7 +63,7 @@ impl KiroSession {
             workspace_roots,
             true,
             false,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
         )
@@ -71,7 +72,7 @@ impl KiroSession {
 
     pub async fn spawn_admin(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
@@ -79,7 +80,7 @@ impl KiroSession {
             workspace_roots,
             true,
             true,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
         )
@@ -90,27 +91,23 @@ impl KiroSession {
         workspace_roots: &[String],
         ephemeral: bool,
         admin_session: bool,
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let roots = resolve_kiro_session_roots(
-            workspace_roots,
-            ssh_host.as_deref(),
-            admin_session,
-            ephemeral,
-        )
-        .await?;
+        let roots =
+            resolve_kiro_session_roots(workspace_roots, &transport, admin_session, ephemeral)
+                .await?;
         let acp_args: Vec<&str> = vec!["acp"];
 
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &acp_args)
             .with_local_cwd(roots.session_cwd.clone());
         spawn_spec.local_program = resolve_kiro_chat_binary();
-        if ssh_host.is_some() {
+        if transport.is_remote() {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
 
-        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, ssh_host.as_deref()).await?;
+        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, transport.clone()).await?;
 
         bridge
             .request(
@@ -143,9 +140,7 @@ impl KiroSession {
                     session_params["systemPrompt"] = Value::String(content.to_string());
                 }
             }
-            let session_started = bridge
-                .request("session/new", session_params)
-                .await?;
+            let session_started = bridge.request("session/new", session_params).await?;
 
             let session_id = session_started
                 .get("sessionId")
@@ -174,7 +169,7 @@ impl KiroSession {
             bridge,
             event_tx,
             shutting_down: AtomicBool::new(false),
-            ssh_host,
+            transport,
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
@@ -270,7 +265,7 @@ struct KiroInner {
     event_tx: mpsc::UnboundedSender<Value>,
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
-    ssh_host: Option<String>,
+    transport: BackendTransport,
 }
 
 impl KiroInner {
@@ -519,10 +514,7 @@ impl KiroInner {
             }
         };
 
-        let raw_sessions = match &self.ssh_host {
-            Some(host) => load_remote_kiro_sessions(host).await?,
-            None => load_local_kiro_sessions().await?,
-        };
+        let raw_sessions = load_kiro_sessions_for_transport(&self.transport).await?;
 
         let mut sessions = Vec::new();
         for (session_id, metadata) in &raw_sessions {
@@ -571,10 +563,7 @@ impl KiroInner {
         let normalized = normalize_optional_string(&Value::String(session_id))
             .ok_or("Invalid session id".to_string())?;
 
-        match &self.ssh_host {
-            Some(host) => delete_remote_kiro_session(host, &normalized).await,
-            None => delete_local_kiro_session(&normalized).await,
-        }
+        delete_kiro_session_for_transport(&self.transport, &normalized).await
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
@@ -596,10 +585,7 @@ impl KiroInner {
         // kiro-cli-chat doesn't check PID liveness when reading .lock files,
         // so stale locks from dead processes block session/load. Remove the
         // lock file before attempting to load.
-        let _ = match &self.ssh_host {
-            Some(host) => clear_remote_kiro_session_lock(host, &session_id).await,
-            None => clear_local_kiro_session_lock(&session_id).await,
-        };
+        let _ = clear_kiro_session_lock_for_transport(&self.transport, &session_id).await;
 
         let response = match self
             .bridge
@@ -660,14 +646,14 @@ impl KiroInner {
         // local slave is killed, so the remote kiro-cli-chat never gets
         // EOF and stays running. Kill the remote process explicitly
         // using the PID from its session lock file.
-        if let Some(host) = &self.ssh_host {
+        if self.transport.is_remote() {
             let session_id = self.state.lock().await.session_id.clone();
             let cmd = format!(
                 "PID=$(grep -oE '[0-9]+' ~/.kiro/sessions/cli/{0}.lock 2>/dev/null | head -1); \
                  [ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null; true",
                 crate::remote::shell_quote_arg(&session_id)
             );
-            let _ = crate::remote::run_ssh_raw(host, &cmd).await;
+            let _ = self.transport.run_shell_command(&cmd).await;
         }
 
         self.bridge.shutdown().await;
@@ -1616,11 +1602,11 @@ struct KiroSessionRoots {
 
 async fn resolve_kiro_session_roots(
     workspace_roots: &[String],
-    ssh_host: Option<&str>,
+    transport: &BackendTransport,
     admin_session: bool,
     ephemeral: bool,
 ) -> Result<KiroSessionRoots, String> {
-    if let Some(host) = ssh_host {
+    if transport.ssh_host().is_some() {
         let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
             .ok_or("Expected remote workspace roots for SSH session")?;
         let scope_root = parsed
@@ -1636,7 +1622,7 @@ async fn resolve_kiro_session_roots(
             scope_root.clone()
         };
         if admin_session || ephemeral {
-            ensure_remote_directory(host, &session_cwd).await?;
+            ensure_remote_directory(transport, &session_cwd).await?;
         }
         return Ok(KiroSessionRoots {
             session_cwd,
@@ -1675,9 +1661,12 @@ async fn resolve_kiro_session_roots(
     })
 }
 
-async fn ensure_remote_directory(host: &str, dir: &str) -> Result<(), String> {
+async fn ensure_remote_directory(transport: &BackendTransport, dir: &str) -> Result<(), String> {
+    let host = transport
+        .ssh_host()
+        .ok_or("Expected SSH transport for remote directory creation")?;
     let command = format!("mkdir -p {}", crate::remote::shell_quote_arg(dir));
-    let output = crate::remote::run_ssh_raw(host, &command).await?;
+    let output = transport.run_shell_command(&command).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -2565,7 +2554,10 @@ async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn clear_remote_kiro_session_lock(host: &str, session_id: &str) -> Result<(), String> {
+async fn clear_remote_kiro_session_lock(
+    transport: &BackendTransport,
+    session_id: &str,
+) -> Result<(), String> {
     let cmd = format!(
         "LOCKFILE=~/.kiro/sessions/cli/{0}.lock; \
          if [ -f \"$LOCKFILE\" ]; then \
@@ -2576,12 +2568,22 @@ async fn clear_remote_kiro_session_lock(host: &str, session_id: &str) -> Result<
          fi",
         crate::remote::shell_quote_arg(session_id)
     );
-    let output = crate::remote::run_ssh_raw(host, &cmd).await?;
+    let output = transport.run_shell_command(&cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Failed to clear remote session lock: {stderr}"));
     }
     Ok(())
+}
+
+async fn clear_kiro_session_lock_for_transport(
+    transport: &BackendTransport,
+    session_id: &str,
+) -> Result<(), String> {
+    match transport.ssh_host() {
+        Some(_) => clear_remote_kiro_session_lock(transport, session_id).await,
+        None => clear_local_kiro_session_lock(session_id).await,
+    }
 }
 
 async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
@@ -2597,17 +2599,30 @@ async fn delete_local_kiro_session(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn delete_remote_kiro_session(host: &str, session_id: &str) -> Result<(), String> {
+async fn delete_remote_kiro_session(
+    transport: &BackendTransport,
+    session_id: &str,
+) -> Result<(), String> {
     let cmd = format!(
         "rm -f ~/.kiro/sessions/cli/{0}.json ~/.kiro/sessions/cli/{0}.jsonl ~/.kiro/sessions/cli/{0}.lock",
         crate::remote::shell_quote_arg(session_id)
     );
-    let output = crate::remote::run_ssh_raw(host, &cmd).await?;
+    let output = transport.run_shell_command(&cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Failed to delete remote kiro session: {stderr}"));
     }
     Ok(())
+}
+
+async fn delete_kiro_session_for_transport(
+    transport: &BackendTransport,
+    session_id: &str,
+) -> Result<(), String> {
+    match transport.ssh_host() {
+        Some(_) => delete_remote_kiro_session(transport, session_id).await,
+        None => delete_local_kiro_session(session_id).await,
+    }
 }
 
 async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
@@ -2657,7 +2672,9 @@ async fn load_local_kiro_sessions() -> Result<Vec<(String, Value)>, String> {
     Ok(result)
 }
 
-async fn load_remote_kiro_sessions(host: &str) -> Result<Vec<(String, Value)>, String> {
+async fn load_remote_kiro_sessions(
+    transport: &BackendTransport,
+) -> Result<Vec<(String, Value)>, String> {
     let cmd = concat!(
         "for f in ~/.kiro/sessions/cli/*.json; do ",
         "[ -f \"$f\" ] && ",
@@ -2666,13 +2683,22 @@ async fn load_remote_kiro_sessions(host: &str) -> Result<Vec<(String, Value)>, S
         "printf '\nTYDE_SEND\n'; ",
         "done"
     );
-    let output = crate::remote::run_ssh_raw(host, cmd).await?;
+    let output = transport.run_shell_command(cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Failed to list remote kiro sessions: {stderr}"));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_remote_session_dump(&stdout)
+}
+
+async fn load_kiro_sessions_for_transport(
+    transport: &BackendTransport,
+) -> Result<Vec<(String, Value)>, String> {
+    match transport.ssh_host() {
+        Some(_) => load_remote_kiro_sessions(transport).await,
+        None => load_local_kiro_sessions().await,
+    }
 }
 
 fn parse_remote_session_dump(dump: &str) -> Result<Vec<(String, Value)>, String> {

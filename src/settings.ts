@@ -16,6 +16,7 @@ import {
   type DriverMcpHttpServerSettings,
   getDriverMcpHttpServerSettings as getDriverMcpHttpServerSettingsBridge,
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
+  getRemoteControlSettings as getRemoteControlSettingsBridge,
   type Host,
   installBackendDependency as installBackendDependencyBridge,
   listHosts as listHostsBridge,
@@ -26,6 +27,7 @@ import {
   setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
   setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
   setMcpHttpServerEnabled as setMcpHttpServerEnabledBridge,
+  setRemoteControlEnabled as setRemoteControlEnabledBridge,
   updateHostDefaultBackend as updateHostDefaultBackendsBridge,
   updateHostEnabledBackends as updateHostEnabledBackendsBridge,
 } from "./bridge";
@@ -435,7 +437,11 @@ export class SettingsPanel {
   onHostChange: ((host: Host | null) => void) | null = null;
   onHostsUpdated: (() => void) | null = null;
   onSpawnAgent:
-    | ((definitionId: string, backendOverride?: BackendKind) => void)
+    | ((
+        definitionId: string,
+        backendOverride: BackendKind | undefined,
+        host: Host | null,
+      ) => void)
     | null = null;
 
   private container: HTMLElement;
@@ -473,10 +479,23 @@ export class SettingsPanel {
   };
   private driverMcpHttpStatusLoading = false;
   private driverMcpHttpStatusError: string | null = null;
+  private remoteControlSettings: {
+    enabled: boolean;
+    running: boolean;
+    socket_path: string | null;
+    connected_clients: number;
+  } = {
+    enabled: false,
+    running: false,
+    socket_path: null,
+    connected_clients: 0,
+  };
+  private remoteControlLoading = false;
   private hosts: Host[] = [];
   private hostsLoading = false;
   private selectedHostId: string | null = loadSelectedHostId();
   private agentDefinitionStore: AgentDefinitionStore | null = null;
+  private agentDefinitionUnavailableReason: string | null = null;
   private _adminId: number | null = null;
 
   get adminId(): number | null {
@@ -512,12 +531,17 @@ export class SettingsPanel {
     applyAppearanceToDocument(this.appearance);
     this.refreshMcpHttpServerSettings();
     this.refreshDriverMcpHttpServerSettings();
+    this.refreshRemoteControlSettings();
     this.refreshBackendDependencies();
     this.render();
   }
 
-  setAgentDefinitionStore(store: AgentDefinitionStore): void {
+  setAgentDefinitionStore(
+    store: AgentDefinitionStore | null,
+    unavailableReason: string | null = null,
+  ): void {
     this.agentDefinitionStore = store;
+    this.agentDefinitionUnavailableReason = unavailableReason;
     this.rerenderPanelContent("agents", () => this.buildAgentsContent());
   }
 
@@ -583,6 +607,21 @@ export class SettingsPanel {
       })
       .finally(() => {
         this.driverMcpHttpStatusLoading = false;
+        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+      });
+  }
+
+  private refreshRemoteControlSettings(): void {
+    this.remoteControlLoading = true;
+    getRemoteControlSettingsBridge()
+      .then((settings) => {
+        this.remoteControlSettings = settings;
+      })
+      .catch((err) => {
+        console.error("Failed to load remote control settings:", err);
+      })
+      .finally(() => {
+        this.remoteControlLoading = false;
         this.rerenderPanelContent("tyde", () => this.buildTydeContent());
       });
   }
@@ -674,14 +713,17 @@ export class SettingsPanel {
     label.setAttribute("for", "settings-host-select");
     titleRow.appendChild(label);
     const selectedHost = this.getSelectedHost();
+    const subtitleText = selectedHost
+      ? selectedHost.is_local
+        ? "Local machine"
+        : selectedHost.remote_kind === "tyde_server"
+          ? `${selectedHost.hostname} (Tyde Server)`
+          : selectedHost.hostname
+      : "No hosts configured";
     const subtitle = el(
       "p",
       { class: "settings-description settings-host-toolbar-subtitle" },
-      selectedHost
-        ? selectedHost.is_local
-          ? "Local machine"
-          : selectedHost.hostname
-        : "No hosts configured",
+      subtitleText,
     );
     titleRow.appendChild(subtitle);
     toolbar.appendChild(titleRow);
@@ -1813,18 +1855,65 @@ export class SettingsPanel {
       ["label", "Display Name", ""],
       ["hostname", "SSH Hostname (e.g. user@server.com)", ""],
     ];
-    this.showGenericModal("Add Remote Host", fields, (values) => {
-      const label = values.label.trim();
-      const hostname = values.hostname.trim();
-      if (!label || !hostname) return;
-      addHostBridge(label, hostname)
-        .then((host) => {
-          this.selectedHostId = host.id;
-          saveSelectedHostId(host.id);
-          this.refreshHosts();
-        })
-        .catch((err) => console.error("Failed to add host:", err));
-    });
+    let selectedKind: "ssh_pipe" | "tyde_server" = "ssh_pipe";
+    this.showGenericModal(
+      "Add Remote Host",
+      fields,
+      (values) => {
+        const label = values.label.trim();
+        const hostname = values.hostname.trim();
+        if (!label || !hostname) return;
+        addHostBridge(label, hostname, selectedKind)
+          .then((host) => {
+            this.selectedHostId = host.id;
+            saveSelectedHostId(host.id);
+            this.refreshHosts();
+          })
+          .catch((err) => console.error("Failed to add host:", err));
+      },
+      (form) => {
+        const row = el("div", {
+          class: "settings-field",
+          style: "margin-top: 12px",
+        });
+        row.appendChild(
+          el("label", { class: "settings-label" }, "Remote Type"),
+        );
+        const segmentRow = el("div", {
+          style: "display: flex; gap: 8px; margin-top: 4px",
+        });
+        const makeSeg = (label: string, value: "ssh_pipe" | "tyde_server") => {
+          const btn = el(
+            "button",
+            {
+              class: `segment-btn${value === selectedKind ? " active" : ""}`,
+              style:
+                "padding: 4px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); cursor: pointer; font-size: 12px;",
+            },
+            label,
+          ) as HTMLButtonElement;
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            selectedKind = value;
+            segmentRow.querySelectorAll("button").forEach((b) => {
+              b.style.background = "var(--bg-secondary)";
+              b.style.fontWeight = "normal";
+            });
+            btn.style.background = "var(--accent)";
+            btn.style.fontWeight = "bold";
+          });
+          if (value === selectedKind) {
+            btn.style.background = "var(--accent)";
+            btn.style.fontWeight = "bold";
+          }
+          return btn;
+        };
+        segmentRow.appendChild(makeSeg("SSH Pipe", "ssh_pipe"));
+        segmentRow.appendChild(makeSeg("Tyde Server", "tyde_server"));
+        row.appendChild(segmentRow);
+        form.appendChild(row);
+      },
+    );
   }
 
   // ========== GENERAL TAB ==========
@@ -2726,8 +2815,20 @@ export class SettingsPanel {
     );
     frag.appendChild(description);
 
+    if (!this.agentDefinitionStore) {
+      frag.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          this.agentDefinitionUnavailableReason ??
+            "Agent definitions are unavailable for this host.",
+        ),
+      );
+      return frag;
+    }
+
     const list = el("div", { class: "settings-card-list" });
-    const definitions = this.agentDefinitionStore?.getAll() ?? [];
+    const definitions = this.agentDefinitionStore.getAll();
     for (const def of definitions) {
       list.appendChild(this.buildAgentDefCard(def));
     }
@@ -2816,12 +2917,14 @@ export class SettingsPanel {
       "Spawn",
     );
     spawnBtn.dataset.testid = `agent-def-spawn-${def.id}`;
-    spawnBtn.addEventListener("click", () =>
+    spawnBtn.addEventListener("click", () => {
+      const selectedHost = this.getSelectedHost();
       this.onSpawnAgent?.(
         def.id,
         (def.default_backend as BackendKind) || undefined,
-      ),
-    );
+        selectedHost,
+      );
+    });
 
     const spawnMenuBtn = el(
       "button",
@@ -2867,7 +2970,8 @@ export class SettingsPanel {
         );
         opt.addEventListener("click", () => {
           dismissMenu();
-          this.onSpawnAgent?.(def.id, kind as BackendKind);
+          const selectedHost = this.getSelectedHost();
+          this.onSpawnAgent?.(def.id, kind as BackendKind, selectedHost);
         });
         spawnMenu.appendChild(opt);
       }
@@ -2912,6 +3016,8 @@ export class SettingsPanel {
   }
 
   private showAgentDefModal(existing: AgentDefinitionEntry | null): void {
+    if (!this.agentDefinitionStore) return;
+
     const isNew = existing === null;
     const title = isNew ? "New Agent" : `Edit ${existing.name}`;
 
@@ -3390,7 +3496,78 @@ export class SettingsPanel {
     const frag = document.createDocumentFragment();
     frag.appendChild(this.buildMcpRuntimeControl());
     frag.appendChild(this.buildDriverMcpRuntimeControl());
+    frag.appendChild(this.buildRemoteControlSection());
     return frag;
+  }
+
+  private buildRemoteControlSection(): HTMLElement {
+    const section = el("div", { class: "settings-section" });
+    section.appendChild(
+      el("h3", { class: "settings-section-header" }, "Remote Control"),
+    );
+
+    const field = el("div", { class: "settings-field" });
+    const row = el("div", { class: "settings-toggle-row" });
+    const labelCol = el("div", { class: "settings-toggle-label-col" });
+    labelCol.appendChild(
+      el("label", { class: "settings-label" }, "Allow Remote Control over SSH"),
+    );
+
+    const statusText = this.remoteControlLoading
+      ? "Loading..."
+      : this.remoteControlSettings.running
+        ? `Running (${this.remoteControlSettings.connected_clients} client${this.remoteControlSettings.connected_clients !== 1 ? "s" : ""})`
+        : "Stopped";
+    labelCol.appendChild(
+      el("p", { class: "settings-description" }, statusText),
+    );
+    if (
+      this.remoteControlSettings.running &&
+      this.remoteControlSettings.socket_path
+    ) {
+      labelCol.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          this.remoteControlSettings.socket_path,
+        ),
+      );
+    }
+    row.appendChild(labelCol);
+
+    const toggle = el("label", { class: "settings-toggle" });
+    const input = el("input", {
+      type: "checkbox",
+      "data-testid": "settings-remote-control-enabled",
+    }) as HTMLInputElement;
+    input.checked = this.remoteControlSettings.enabled;
+    input.disabled = this.remoteControlLoading;
+    input.addEventListener("change", () => {
+      this.setRemoteControlEnabled(input.checked);
+    });
+    toggle.appendChild(input);
+    toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
+    row.appendChild(toggle);
+    field.appendChild(row);
+
+    section.appendChild(field);
+    return section;
+  }
+
+  private setRemoteControlEnabled(enabled: boolean): void {
+    this.remoteControlLoading = true;
+    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    setRemoteControlEnabledBridge(enabled)
+      .then((settings) => {
+        this.remoteControlSettings = settings;
+      })
+      .catch((err) => {
+        console.error("Failed to update remote control setting:", err);
+      })
+      .finally(() => {
+        this.remoteControlLoading = false;
+        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+      });
   }
 
   private buildMcpPanel(): HTMLElement {
@@ -4369,6 +4546,7 @@ export class SettingsPanel {
     title: string,
     fields: [string, string, string][],
     onSave: (values: Record<string, string>) => void,
+    customizeForm?: (form: HTMLElement) => void,
   ): void {
     const overlay = el("div", { class: "settings-modal-overlay" });
     const modal = el("div", { class: "settings-modal" });
@@ -4403,6 +4581,10 @@ export class SettingsPanel {
         fieldEl.appendChild(inp);
       }
       modal.appendChild(fieldEl);
+    }
+
+    if (customizeForm) {
+      customizeForm(modal);
     }
 
     const actions = el("div", { class: "settings-modal-actions" });

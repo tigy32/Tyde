@@ -1,7 +1,11 @@
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::Emitter;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Serialize, Clone)]
@@ -105,6 +109,8 @@ pub fn shell_quote_command(args: &[String]) -> String {
 pub(crate) const SUBPROCESS_VERSION: &str = env!("SUBPROCESS_VERSION");
 pub(crate) const SUBPROCESS_GIT_REPO: &str = "https://github.com/tigy32/Tycode";
 pub(crate) const SUBPROCESS_CRATE_NAME: &str = "tycode-subprocess";
+pub(crate) const TYDE_REMOTE_SOCKET_SUFFIX: &str = ".tyde/tyde.sock";
+static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 fn ssh_control_socket_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME")
@@ -142,6 +148,46 @@ pub fn ssh_control_args() -> Result<Vec<String>, String> {
     ])
 }
 
+/// SSH args that explicitly disable ControlMaster multiplexing while keeping
+/// TCP keepalives. Useful for long-lived remote subprocesses where stale
+/// control sockets can break session opens.
+fn ssh_no_multiplex_args() -> Vec<String> {
+    vec![
+        "-S".to_string(),
+        "none".to_string(),
+        "-o".to_string(),
+        "ControlMaster=no".to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=60".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+    ]
+}
+
+fn looks_like_mux_failure(stderr: &str) -> bool {
+    stderr.contains("mux_client_request_session: session request failed")
+        || stderr.contains("ControlSocket")
+            && stderr.contains("already exists")
+            && stderr.contains("disabling multiplexing")
+        || stderr.contains("Master refused session request")
+}
+
+async fn run_ssh_raw_without_multiplex(
+    host: &str,
+    raw_cmd: &str,
+) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_no_multiplex_args() {
+        cmd.arg(arg);
+    }
+    cmd.arg("-T")
+        .arg(host)
+        .arg(raw_cmd)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ssh command: {e}"))
+}
+
 pub async fn resolve_remote_shell_path(host: &str) -> Result<String, String> {
     let output = run_ssh_raw(host, "$SHELL -li -c 'echo TYDE_PATH_MARKER=$PATH'").await?;
     if !output.status.success() {
@@ -167,12 +213,147 @@ pub async fn run_ssh_raw(host: &str, raw_cmd: &str) -> Result<std::process::Outp
     for arg in ssh_control_args()? {
         cmd.arg(arg);
     }
-    cmd.arg("-T")
+    let output = cmd
+        .arg("-T")
         .arg(host)
         .arg(raw_cmd)
         .output()
         .await
-        .map_err(|e| format!("Failed to run ssh command: {e}"))
+        .map_err(|e| format!("Failed to run ssh command: {e}"))?;
+
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if looks_like_mux_failure(&stderr) {
+        tracing::warn!(
+            "SSH multiplexing failed for host '{}', retrying without ControlMaster: {}",
+            host,
+            stderr.trim()
+        );
+        return run_ssh_raw_without_multiplex(host, raw_cmd).await;
+    }
+
+    Ok(output)
+}
+
+async fn resolve_remote_home_dir(host: &str) -> Result<String, String> {
+    let output = run_ssh_raw(host, "printf '%s' \"$HOME\"").await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to resolve remote home directory: {stderr}"));
+    }
+    let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if home.is_empty() {
+        return Err("Remote home directory resolved to empty path".to_string());
+    }
+    Ok(home)
+}
+
+pub(crate) fn tyde_socket_path_from_home(home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        format!("/{}", TYDE_REMOTE_SOCKET_SUFFIX)
+    } else {
+        format!("{home}/{}", TYDE_REMOTE_SOCKET_SUFFIX)
+    }
+}
+
+async fn is_remote_tyde_server_running(
+    host: &str,
+    remote_socket_path: &str,
+) -> Result<bool, String> {
+    let socket_check = format!("test -S {}", shell_quote_arg(remote_socket_path));
+    let socket_output = run_ssh_raw(host, &socket_check).await?;
+    Ok(socket_output.status.success())
+}
+
+fn make_local_tunnel_socket_path(host: &str) -> PathBuf {
+    let sanitized_host: String = host
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect();
+    let id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "tyde-tunnel-{}-{}-{}.sock",
+        std::process::id(),
+        if sanitized_host.is_empty() {
+            "host"
+        } else {
+            &sanitized_host
+        },
+        id
+    ))
+}
+
+async fn read_child_stderr(child: &mut tokio::process::Child) -> String {
+    let mut stderr = String::new();
+    if let Some(mut reader) = child.stderr.take() {
+        let mut buf = Vec::new();
+        if reader.read_to_end(&mut buf).await.is_ok() {
+            stderr = String::from_utf8_lossy(&buf).trim().to_string();
+        }
+    }
+    stderr
+}
+
+pub(crate) async fn open_ssh_unix_socket_tunnel(
+    host: &str,
+    remote_socket_path: &str,
+) -> Result<(tokio::process::Child, PathBuf, tokio::net::UnixStream), String> {
+    let local_socket_path = make_local_tunnel_socket_path(host);
+    let _ = std::fs::remove_file(&local_socket_path);
+
+    let forward_arg = format!("{}:{}", local_socket_path.display(), remote_socket_path);
+    let mut cmd = Command::new("ssh");
+    for arg in ssh_no_multiplex_args() {
+        cmd.arg(arg);
+    }
+    let mut child = cmd
+        .arg("-T")
+        .arg("-N")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-L")
+        .arg(forward_arg)
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start SSH socket tunnel: {e}"))?;
+
+    for _ in 0..120 {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&local_socket_path).await {
+            return Ok((child, local_socket_path, stream));
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("Failed to check SSH tunnel status: {e}"))?
+        {
+            let stderr = read_child_stderr(&mut child).await;
+            let _ = std::fs::remove_file(&local_socket_path);
+            let msg = if stderr.is_empty() {
+                format!("SSH socket tunnel exited early with status {status}")
+            } else {
+                format!("SSH socket tunnel failed: {stderr}")
+            };
+            return Err(msg);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = child.start_kill();
+    let _ = std::fs::remove_file(&local_socket_path);
+    Err(format!(
+        "Timed out waiting for SSH socket tunnel to become ready at {}",
+        local_socket_path.display()
+    ))
 }
 
 /// Checks whether the versioned subprocess binary exists on the remote host.
@@ -459,6 +640,104 @@ pub async fn validate_remote_cli(
     Ok(())
 }
 
+/// Multi-step connection to a remote Tyde server. Validates SSH, resolves the
+/// remote socket path, and verifies the remote control socket exists.
+/// Does not install or launch Tyde.
+pub async fn connect_tyde_server_with_progress(
+    app: &tauri::AppHandle,
+    host: &str,
+) -> Result<String, String> {
+    let emit_progress = |step: &str, status: &str, message: &str| {
+        let payload = RemoteConnectionProgress {
+            host: host.to_string(),
+            step: step.to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+        };
+        let _ = app.emit("remote-connection-progress", payload.clone());
+        crate::record_debug_event_from_app(
+            app,
+            "remote_connection_progress",
+            serde_json::json!({
+                "host": payload.host,
+                "step": payload.step,
+                "status": payload.status,
+                "message": payload.message,
+            }),
+        );
+    };
+
+    // Step 1: Validate SSH
+    emit_progress(
+        "validating_connection",
+        "in_progress",
+        "Testing SSH connection...",
+    );
+    let mut ssh_cmd = Command::new("ssh");
+    for arg in ssh_control_args()? {
+        ssh_cmd.arg(arg);
+    }
+    let ssh_output = ssh_cmd
+        .arg("-T")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(host)
+        .arg("echo tycode-ok")
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+
+    if !ssh_output.status.success() {
+        let stderr = String::from_utf8_lossy(&ssh_output.stderr);
+        let msg = format!("SSH connection failed: {stderr}");
+        emit_progress("validating_connection", "failed", &msg);
+        return Err(msg);
+    }
+    emit_progress(
+        "validating_connection",
+        "completed",
+        "SSH connection established",
+    );
+
+    // Step 2: Resolve remote home and socket path.
+    emit_progress(
+        "checking_tyde",
+        "in_progress",
+        "Resolving Tyde socket path...",
+    );
+    let remote_home = resolve_remote_home_dir(host).await.map_err(|err| {
+        let msg = format!("Failed to resolve remote home path: {err}");
+        emit_progress("checking_tyde", "failed", &msg);
+        msg
+    })?;
+    let remote_socket_path = tyde_socket_path_from_home(&remote_home);
+    emit_progress(
+        "checking_tyde",
+        "completed",
+        &format!("Using socket path {remote_socket_path}"),
+    );
+
+    // Step 3: Verify remote control server is running.
+    emit_progress(
+        "checking_server",
+        "in_progress",
+        "Checking if Tyde server is running...",
+    );
+    if !is_remote_tyde_server_running(host, &remote_socket_path).await? {
+        let msg = format!(
+            "Tyde server is not running on '{host}' (missing {remote_socket_path}). \
+Start Tyde on the remote host with '--headless' and retry."
+        );
+        emit_progress("checking_server", "failed", &msg);
+        return Err(msg);
+    }
+    emit_progress("checking_server", "completed", "Tyde server is running");
+
+    // Step 4: Ready
+    emit_progress("ready", "completed", &format!("Connected to {host}"));
+    Ok(remote_socket_path)
+}
+
 pub async fn run_ssh_command(host: &str, args: &[String]) -> Result<std::process::Output, String> {
     let remote_cmd = shell_quote_command(args);
     let mut cmd = Command::new("ssh");
@@ -473,12 +752,35 @@ pub async fn run_ssh_command(host: &str, args: &[String]) -> Result<std::process
         .map_err(|e| format!("Failed to run ssh command: {e}"))
 }
 
+/// Spawn a command either locally or through SSH, with stdin/stdout/stderr
+/// piped in both modes.
+pub async fn spawn_local_or_remote_process(
+    ssh_host: Option<&str>,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+) -> Result<tokio::process::Child, String> {
+    if let Some(host) = ssh_host {
+        return spawn_remote_process(host, program, args, cwd).await;
+    }
+
+    let mut cmd = Command::new(program);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    if let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.spawn()
+        .map_err(|err| format!("Failed to spawn local process '{program}': {err}"))
+}
+
 /// Find `count` available TCP ports on a remote host by binding to :0.
 /// Returns the port numbers. Requires python3 on the remote.
-pub(crate) async fn find_remote_free_ports(
-    host: &str,
-    count: usize,
-) -> Result<Vec<u16>, String> {
+pub(crate) async fn find_remote_free_ports(host: &str, count: usize) -> Result<Vec<u16>, String> {
     let script = format!(
         "python3 -c '\
 import socket\n\
@@ -501,7 +803,10 @@ print(\" \".join(str(p) for p in ports))\n\
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
         .split_whitespace()
-        .map(|s| s.parse::<u16>().map_err(|e| format!("Invalid port number '{s}': {e}")))
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|e| format!("Invalid port number '{s}': {e}"))
+        })
         .collect()
 }
 
@@ -527,7 +832,7 @@ pub async fn spawn_remote_process(
         shell_quote_command(&cmd_parts),
     );
     let mut cmd = Command::new("ssh");
-    for arg in ssh_control_args()? {
+    for arg in ssh_no_multiplex_args() {
         cmd.arg(arg);
     }
     cmd.arg("-T")

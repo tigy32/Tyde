@@ -13,17 +13,31 @@ interface StepState {
   message: string;
 }
 
-const STEP_LABELS: Record<string, string> = {
+const SSH_PIPE_STEP_LABELS: Record<string, string> = {
   validating_connection: "Validate SSH Connection",
   checking_environment: "Check Remote Environment",
   installing_subprocess: "Install Tyde",
   ready: "Connected",
 };
 
-const STEP_ORDER = [
+const SSH_PIPE_STEP_ORDER = [
   "validating_connection",
   "checking_environment",
   "installing_subprocess",
+  "ready",
+];
+
+const TYDE_SERVER_STEP_LABELS: Record<string, string> = {
+  validating_connection: "Validate SSH Connection",
+  checking_tyde: "Resolve Tyde Socket",
+  checking_server: "Verify Remote Control Enabled",
+  ready: "Connected",
+};
+
+const TYDE_SERVER_STEP_ORDER = [
+  "validating_connection",
+  "checking_tyde",
+  "checking_server",
   "ready",
 ];
 
@@ -34,12 +48,26 @@ export class ConnectionDialog {
   private dismissTimer: number | null = null;
   private onDismiss: (() => void) | null = null;
 
-  async show(host: string, onDismiss?: () => void): Promise<void> {
+  private stepOrder: string[] = SSH_PIPE_STEP_ORDER;
+
+  async show(
+    host: string,
+    onDismiss?: () => void,
+    remoteKind?: "ssh_pipe" | "tyde_server",
+  ): Promise<void> {
     this.onDismiss = onDismiss ?? null;
+    const isTydeServer = remoteKind === "tyde_server";
+    this.stepOrder = isTydeServer
+      ? TYDE_SERVER_STEP_ORDER
+      : SSH_PIPE_STEP_ORDER;
+    const stepLabels = isTydeServer
+      ? TYDE_SERVER_STEP_LABELS
+      : SSH_PIPE_STEP_LABELS;
+
     this.steps.clear();
-    for (const key of STEP_ORDER) {
+    for (const key of this.stepOrder) {
       this.steps.set(key, {
-        label: STEP_LABELS[key] ?? key,
+        label: stepLabels[key] ?? key,
         status: "pending",
         message: "",
       });
@@ -95,7 +123,7 @@ export class ConnectionDialog {
     const stepList = document.createElement("div");
     stepList.className = "conn-dialog-steps";
 
-    for (const key of STEP_ORDER) {
+    for (const key of this.stepOrder) {
       const state = this.steps.get(key)!;
       const row = document.createElement("div");
       row.className = "conn-dialog-step";

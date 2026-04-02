@@ -2229,6 +2229,33 @@ describe('Agents panel parity', () => {
     await newChatBtn.waitForExist({ timeout: 5000 });
     await browser.execute((el: HTMLElement) => el.click(), newChatBtn);
 
+    const agentId = 99;
+    await emitChatEvent(WORKSPACE_CONV_ID, 'ConversationRegistered', {
+      agent_id: agentId,
+      workspace_roots: ['/mock/workspace'],
+      backend_kind: 'tycode',
+      name: 'Hidden Agent',
+      agent_type: null,
+      parent_agent_id: null,
+    });
+    await browser.execute((agent: any) => {
+      (window as any).__mockSetRuntimeAgent(agent);
+    }, {
+      agent_id: agentId,
+      conversation_id: WORKSPACE_CONV_ID,
+      workspace_roots: ['/mock/workspace'],
+      backend_kind: 'tycode',
+      parent_agent_id: null,
+      keep_alive_without_tab: false,
+      name: 'Hidden Agent',
+      is_running: true,
+      summary: '',
+      last_message: null,
+      agent_type: null,
+      started_at: Date.now(),
+      isTyping: true,
+    });
+
     await emitChatEvent(WORKSPACE_CONV_ID, 'StreamStart', { agent: 'tycode', model: null });
     await emitChatEvent(WORKSPACE_CONV_ID, 'StreamEnd', {
       message: makeAssistantMessage('Initial visible response'),

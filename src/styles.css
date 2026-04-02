@@ -10946,3 +10946,53 @@ body {
   color: var(--text-secondary);
   margin-top: 4px;
 }
+
+/* Tyde Server connection status indicator */
+.tyde-server-conn-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.tyde-server-conn-status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tyde-server-conn-status.connected {
+  color: var(--text-secondary);
+}
+.tyde-server-conn-status.connected::before {
+  background: #22c55e;
+}
+.tyde-server-conn-status.connecting::before {
+  background: #f59e0b;
+  animation: pulse-dot 1s infinite;
+}
+.tyde-server-conn-status.reconnecting {
+  color: var(--text-secondary);
+}
+.tyde-server-conn-status.reconnecting::before {
+  background: #f59e0b;
+  animation: pulse-dot 1s infinite;
+}
+.tyde-server-conn-status.disconnected {
+  color: #ef4444;
+}
+.tyde-server-conn-status.disconnected::before {
+  background: #ef4444;
+}
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}

@@ -23,9 +23,8 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::{
-    agent_defs_io::ToolPolicy,
-    await_agents_internal, cancel_agent_internal, create_workbench_internal,
-    delete_workbench_internal, list_agents_internal, run_agent_internal,
+    agent_defs_io::ToolPolicy, await_agents_internal, cancel_agent_internal,
+    create_workbench_internal, delete_workbench_internal, list_agents_internal, run_agent_internal,
     send_agent_message_internal, spawn_agent_internal, AgentIdRequest, AppState,
     AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
 };
@@ -209,7 +208,8 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_spawn_agent").await {
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_spawn_agent").await
+        {
             return Ok(denied);
         }
         let mut request = spawn_request_from(input);
@@ -265,7 +265,8 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_await_agent").await {
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_await_agent").await
+        {
             return Ok(denied);
         }
         let request = AwaitAgentsRequest {
@@ -285,7 +286,9 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_send_agent_message").await {
+        if let Some(denied) =
+            check_tool_policy(app_state.inner(), &parts, "tyde_send_agent_message").await
+        {
             return Ok(denied);
         }
         let request = SendAgentMessageRequest {
@@ -307,7 +310,9 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_cancel_agent").await {
+        if let Some(denied) =
+            check_tool_policy(app_state.inner(), &parts, "tyde_cancel_agent").await
+        {
             return Ok(denied);
         }
         let request = AgentIdRequest {
@@ -327,7 +332,8 @@ impl TydeAgentMcpServer {
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let app_state = self.app.state::<AppState>();
-        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_list_agents").await {
+        if let Some(denied) = check_tool_policy(app_state.inner(), &parts, "tyde_list_agents").await
+        {
             return Ok(denied);
         }
         match list_agents_internal(app_state.inner()).await {

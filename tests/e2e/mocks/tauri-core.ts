@@ -157,6 +157,7 @@ interface MockHost {
   is_local: boolean;
   enabled_backends: string[];
   default_backend: string;
+  remote_kind: 'ssh_pipe' | 'tyde_server';
 }
 
 const mockHosts: MockHost[] = [
@@ -167,6 +168,7 @@ const mockHosts: MockHost[] = [
     is_local: true,
     enabled_backends: ['tycode', 'codex', 'claude', 'kiro', 'gemini'],
     default_backend: 'tycode',
+    remote_kind: 'ssh_pipe',
   },
 ];
 
@@ -751,6 +753,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
     case 'add_host': {
       const label = typeof args?.label === 'string' ? args.label : '';
       const hostname = typeof args?.hostname === 'string' ? args.hostname : '';
+      const remoteKind = args?.remote_kind === 'tyde_server' ? 'tyde_server' : 'ssh_pipe';
       const newHost: MockHost = {
         id: `mock-host-${Date.now()}`,
         label,
@@ -758,6 +761,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         is_local: false,
         enabled_backends: ['tycode', 'codex', 'claude', 'kiro', 'gemini'],
         default_backend: 'tycode',
+        remote_kind: remoteKind,
       };
       mockHosts.push(newHost);
       return { ...newHost };
@@ -1232,6 +1236,12 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         success: true,
       };
     }
+
+    case 'get_remote_control_settings':
+      return { enabled: false, running: false, socket_path: null, connected_clients: 0 };
+
+    case 'set_remote_control_enabled':
+      return { enabled: !!args?.enabled, running: false, socket_path: null, connected_clients: 0 };
 
     default:
       return null;

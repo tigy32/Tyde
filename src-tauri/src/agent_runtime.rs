@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent_defs_io::ToolPolicy;
@@ -10,7 +10,7 @@ const MAX_SUMMARY_LEN: usize = 180;
 const MAX_MESSAGE_LEN: usize = 4_000;
 const DEFAULT_EVENT_LOG_LIMIT: usize = 5_000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub agent_id: u64,
     pub conversation_id: u64,
@@ -48,7 +48,7 @@ pub struct AgentEventBatch {
     pub latest_seq: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectedAgentResult {
     pub agent: AgentInfo,
     pub final_message: Option<String>,
@@ -407,6 +407,14 @@ impl AgentRuntime {
             events,
             latest_seq: self.next_event_seq.saturating_sub(1),
         }
+    }
+
+    pub fn latest_event_seq_for_agent(&self, agent_id: u64) -> Option<u64> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| event.agent_id == agent_id)
+            .map(|event| event.seq)
     }
 
     pub fn collect_result(&self, agent_id: u64) -> Result<CollectedAgentResult, String> {

@@ -29,6 +29,24 @@ interface PersistedState {
 
 const STORAGE_KEY = "tyde-projects";
 
+function normalizeRoots(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const roots: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    roots.push(trimmed);
+  }
+  return roots;
+}
+
+function normalizeWorkbenchKind(raw: unknown): WorkbenchKind | null {
+  return raw === "git-worktree" ? raw : null;
+}
+
 export class ProjectStateManager {
   projects: Project[] = [];
   activeProjectId: string | null = null;
@@ -271,26 +289,84 @@ export class ProjectStateManager {
       this.activeProjectId = null;
       return;
     }
-    let state: PersistedState;
+    let state: unknown;
     try {
       state = JSON.parse(raw);
     } catch (err) {
       console.error("Failed to parse persisted project state, resetting:", err);
       localStorage.removeItem(STORAGE_KEY);
+      this.projects = [];
+      this.activeProjectId = null;
+      this.sidebarCollapsed = false;
       return;
     }
-    this.projects = state.projects.map((p) => ({
-      id: p.id,
-      name: p.name,
-      workspacePath: p.workspacePath,
-      roots: p.roots ?? [],
-      conversationIds: [],
-      activeConversationId: null,
-      status: "idle" as const,
-      parentProjectId: p.parentProjectId ?? null,
-      workbenchKind: p.workbenchKind ?? null,
-    }));
-    this.activeProjectId = state.activeProjectId;
-    this.sidebarCollapsed = state.sidebarCollapsed;
+    if (!state || typeof state !== "object") {
+      this.projects = [];
+      this.activeProjectId = null;
+      this.sidebarCollapsed = false;
+      return;
+    }
+
+    const parsed = state as Partial<PersistedState>;
+    const projectsRaw = Array.isArray(parsed.projects) ? parsed.projects : [];
+    const projects: Project[] = [];
+    const seenIds = new Set<string>();
+
+    for (const entry of projectsRaw) {
+      if (!entry || typeof entry !== "object") continue;
+      const project = entry as Partial<PersistedState["projects"][number]>;
+      const workspacePath =
+        typeof project.workspacePath === "string"
+          ? project.workspacePath.trim()
+          : "";
+      if (!workspacePath) continue;
+
+      const candidateId =
+        typeof project.id === "string" && project.id.trim().length > 0
+          ? project.id
+          : crypto.randomUUID();
+      const id = seenIds.has(candidateId) ? crypto.randomUUID() : candidateId;
+      seenIds.add(id);
+
+      const name =
+        typeof project.name === "string" && project.name.trim().length > 0
+          ? project.name
+          : workspacePath.split("/").pop() ||
+            workspacePath.split("\\").pop() ||
+            workspacePath;
+
+      const parentProjectId =
+        typeof project.parentProjectId === "string" &&
+        project.parentProjectId.trim().length > 0
+          ? project.parentProjectId
+          : null;
+
+      projects.push({
+        id,
+        name,
+        workspacePath,
+        roots: normalizeRoots(project.roots),
+        conversationIds: [],
+        activeConversationId: null,
+        status: "idle",
+        parentProjectId,
+        workbenchKind: normalizeWorkbenchKind(project.workbenchKind),
+      });
+    }
+
+    this.projects = projects;
+
+    const activeProjectId =
+      typeof parsed.activeProjectId === "string"
+        ? parsed.activeProjectId
+        : null;
+    this.activeProjectId =
+      activeProjectId && this.projects.some((p) => p.id === activeProjectId)
+        ? activeProjectId
+        : null;
+    this.sidebarCollapsed =
+      typeof parsed.sidebarCollapsed === "boolean"
+        ? parsed.sidebarCollapsed
+        : false;
   }
 }

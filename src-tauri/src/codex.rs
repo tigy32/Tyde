@@ -7,10 +7,11 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::backend_transport::BackendTransport;
 use crate::claude::{SubAgentEmitter, SubAgentHandle};
 use crate::subprocess::ImageAttachment;
 
@@ -44,14 +45,14 @@ pub struct CodexSession {
 impl CodexSession {
     pub async fn spawn(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             false,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
         )
@@ -60,14 +61,14 @@ impl CodexSession {
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             true,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
         )
@@ -76,14 +77,14 @@ impl CodexSession {
 
     pub async fn spawn_admin(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             true,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
         )
@@ -93,7 +94,7 @@ impl CodexSession {
     async fn spawn_with_mode(
         workspace_roots: &[String],
         ephemeral: bool,
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
@@ -104,7 +105,7 @@ impl CodexSession {
             _ => None,
         };
         let (rpc, inbound_rx) = CodexRpc::spawn(
-            ssh_host.as_deref(),
+            &transport,
             startup_mcp_servers,
             steering_tempfile.as_deref(),
         )
@@ -125,7 +126,7 @@ impl CodexSession {
         )
         .await?;
 
-        let cwd = if ssh_host.is_some() {
+        let cwd = if transport.is_remote() {
             // For remote sessions, extract the remote path (host already stripped)
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
                 .ok_or("Expected remote workspace roots for SSH session")?;
@@ -223,8 +224,8 @@ impl CodexSession {
     }
 }
 
-pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, String> {
-    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[], None).await?;
+pub async fn query_account_rate_limits(transport: BackendTransport) -> Result<Value, String> {
+    let (rpc, _inbound_rx) = CodexRpc::spawn(&transport, &[], None).await?;
 
     rpc.request(
         "initialize",
@@ -4299,7 +4300,7 @@ struct CodexRpc {
 
 impl CodexRpc {
     async fn spawn(
-        ssh_host: Option<&str>,
+        transport: &BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
@@ -4310,29 +4311,19 @@ impl CodexRpc {
                 toml_quoted(&path.display().to_string())
             ));
         }
-        let mut child = if let Some(host) = ssh_host {
-            let mut remote_args = vec![
-                "app-server".to_string(),
-                "--listen".to_string(),
-                "stdio://".to_string(),
-            ];
-            for override_key_value in &config_overrides {
-                remote_args.push("-c".to_string());
-                remote_args.push(override_key_value.clone());
-            }
-            crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
-        } else {
-            let mut cmd = Command::new("codex");
-            cmd.arg("app-server").arg("--listen").arg("stdio://");
-            for override_key_value in &config_overrides {
-                cmd.arg("-c").arg(override_key_value);
-            }
-            cmd.stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?
-        };
+        let mut codex_args = vec![
+            "app-server".to_string(),
+            "--listen".to_string(),
+            "stdio://".to_string(),
+        ];
+        for override_key_value in &config_overrides {
+            codex_args.push("-c".to_string());
+            codex_args.push(override_key_value.clone());
+        }
+        let mut child = transport
+            .spawn_process("codex", &codex_args, None)
+            .await
+            .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?;
 
         let stdin = child.stdin.take().ok_or("Failed to capture Codex stdin")?;
         let stdout = child
@@ -4623,7 +4614,7 @@ mod tests {
     }
 
     fn test_codex_inner() -> (Arc<CodexInner>, mpsc::UnboundedReceiver<Value>) {
-        let mut child = Command::new("cat")
+        let mut child = tokio::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -4830,9 +4821,14 @@ mod tests {
 
             let workspace_roots = vec![workspace.to_string_lossy().to_string()];
             live_test_log("spawning CodexSession");
-            let (session, mut event_rx) = CodexSession::spawn(&workspace_roots, None, &[], None)
-                .await
-                .expect("spawn codex session");
+            let (session, mut event_rx) = CodexSession::spawn(
+                &workspace_roots,
+                BackendTransport::Local,
+                &[],
+                None,
+            )
+            .await
+            .expect("spawn codex session");
             live_test_log("CodexSession spawned");
             let emitter = Arc::new(RecordingSubAgentEmitter::new());
             session

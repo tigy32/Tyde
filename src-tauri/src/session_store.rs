@@ -233,9 +233,7 @@ impl SessionStore {
             .records
             .values()
             .filter(|r| {
-                r.backend_session_id.is_none()
-                    && r.message_count == 0
-                    && r.created_at_ms < cutoff
+                r.backend_session_id.is_none() && r.message_count == 0 && r.created_at_ms < cutoff
             })
             .map(|r| r.id.clone())
             .collect();

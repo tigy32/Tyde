@@ -8,11 +8,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, Mutex};
 
+use crate::backend_transport::BackendLaunchTarget;
 use crate::claude::{ClaudeCommandHandle, ClaudeSession, SubAgentEmitter};
 use crate::codex::{CodexCommandHandle, CodexSession};
 use crate::gemini::{GeminiCommandHandle, GeminiSession};
 use crate::kiro::{KiroCommandHandle, KiroSession};
 use crate::subprocess::{ImageAttachment, SubprocessBridge};
+use crate::tyde_server_conn::TydeServerConnection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -120,6 +122,7 @@ pub enum BackendCommandHandle {
     Claude(ClaudeCommandHandle),
     Kiro(KiroCommandHandle),
     Gemini(GeminiCommandHandle),
+    TydeServer(TydeServerProxyCommandHandle),
 }
 
 impl BackendCommandHandle {
@@ -140,6 +143,7 @@ impl BackendCommandHandle {
             Self::Claude(handle) => handle.execute(command).await,
             Self::Kiro(handle) => handle.execute(command).await,
             Self::Gemini(handle) => handle.execute(command).await,
+            Self::TydeServer(handle) => handle.execute(command).await,
         }
     }
 }
@@ -267,18 +271,88 @@ fn tycode_mcp_servers_json(
         .map_err(|err| format!("Failed to serialize startup MCP servers: {err}"))
 }
 
+/// A proxy session that forwards commands to a remote Tyde server over the
+/// protocol connection. Events come back through the TydeServerConnection's
+/// reader task and are re-emitted as Tauri events — no local event receiver.
+pub struct TydeServerProxySession {
+    pub connection: Arc<TydeServerConnection>,
+    pub server_conversation_id: u64,
+    pub backend_kind: BackendKind,
+}
+
+#[derive(Clone)]
+pub struct TydeServerProxyCommandHandle {
+    connection: Arc<TydeServerConnection>,
+    server_conversation_id: u64,
+}
+
+impl TydeServerProxyCommandHandle {
+    async fn execute(&self, command: SessionCommand) -> Result<(), String> {
+        let params = session_command_to_json(self.server_conversation_id, &command);
+        let cmd_name = match &command {
+            SessionCommand::SendMessage { .. } => "send_message",
+            SessionCommand::CancelConversation => "cancel_conversation",
+            SessionCommand::GetSettings => "get_settings",
+            SessionCommand::ListSessions => "list_sessions",
+            SessionCommand::ResumeSession { .. } => "resume_session",
+            SessionCommand::DeleteSession { .. } => "delete_session",
+            SessionCommand::ListProfiles => "list_profiles",
+            SessionCommand::SwitchProfile { .. } => "switch_profile",
+            SessionCommand::GetModuleSchemas => "get_module_schemas",
+            SessionCommand::ListModels => "list_models",
+            SessionCommand::UpdateSettings { .. } => "update_settings",
+        };
+        self.connection.invoke(cmd_name, params).await?;
+        Ok(())
+    }
+}
+
+fn session_command_to_json(conversation_id: u64, command: &SessionCommand) -> Value {
+    match command {
+        SessionCommand::SendMessage { message, images } => json!({
+            "conversation_id": conversation_id,
+            "message": message,
+            "images": images,
+        }),
+        SessionCommand::CancelConversation => json!({ "conversation_id": conversation_id }),
+        SessionCommand::GetSettings => json!({ "conversation_id": conversation_id }),
+        SessionCommand::ListSessions => json!({ "conversation_id": conversation_id }),
+        SessionCommand::ResumeSession { session_id } => json!({
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+        }),
+        SessionCommand::DeleteSession { session_id } => json!({
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+        }),
+        SessionCommand::ListProfiles => json!({ "conversation_id": conversation_id }),
+        SessionCommand::SwitchProfile { profile_name } => json!({
+            "conversation_id": conversation_id,
+            "profile_name": profile_name,
+        }),
+        SessionCommand::GetModuleSchemas => json!({ "conversation_id": conversation_id }),
+        SessionCommand::ListModels => json!({ "conversation_id": conversation_id }),
+        SessionCommand::UpdateSettings { settings, persist } => json!({
+            "conversation_id": conversation_id,
+            "settings": settings,
+            "persist": persist,
+        }),
+    }
+}
+
 pub enum BackendSession {
     Tycode(SubprocessBridge),
     Codex(CodexSession),
     Claude(ClaudeSession),
     Kiro(KiroSession),
     Gemini(GeminiSession),
+    TydeServer(TydeServerProxySession),
 }
 
 impl BackendSession {
     pub async fn spawn(
         kind: BackendKind,
-        executable_path: &str,
+        launch: &BackendLaunchTarget,
         workspace_roots: &[String],
         ephemeral: bool,
         startup_mcp_servers: &[StartupMcpServer],
@@ -308,7 +382,7 @@ impl BackendSession {
         match kind {
             BackendKind::Tycode => {
                 let (bridge, rx) = SubprocessBridge::spawn(
-                    executable_path,
+                    &launch.executable_path,
                     workspace_roots,
                     tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
                     ephemeral,
@@ -317,15 +391,10 @@ impl BackendSession {
                 Ok((Self::Tycode(bridge), rx))
             }
             BackendKind::Codex => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
                 let (session, rx) = if ephemeral {
                     CodexSession::spawn_ephemeral(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         effective_steering,
                     )
@@ -333,7 +402,7 @@ impl BackendSession {
                 } else {
                     CodexSession::spawn(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         effective_steering,
                     )
@@ -342,15 +411,10 @@ impl BackendSession {
                 Ok((Self::Codex(session), rx))
             }
             BackendKind::Claude => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
                 let (session, rx) = if ephemeral {
                     ClaudeSession::spawn_ephemeral(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         steering_content,
                         agent_identity,
@@ -359,7 +423,7 @@ impl BackendSession {
                 } else {
                     ClaudeSession::spawn(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         steering_content,
                         agent_identity,
@@ -369,15 +433,10 @@ impl BackendSession {
                 Ok((Self::Claude(session), rx))
             }
             BackendKind::Kiro => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
                 let (session, rx) = if ephemeral {
                     KiroSession::spawn_ephemeral(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         effective_steering,
                     )
@@ -385,7 +444,7 @@ impl BackendSession {
                 } else {
                     KiroSession::spawn(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         effective_steering,
                     )
@@ -394,15 +453,10 @@ impl BackendSession {
                 Ok((Self::Kiro(session), rx))
             }
             BackendKind::Gemini => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
                 let (session, rx) = if ephemeral {
                     GeminiSession::spawn_ephemeral(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         effective_steering,
                     )
@@ -410,7 +464,7 @@ impl BackendSession {
                 } else {
                     GeminiSession::spawn(
                         workspace_roots,
-                        ssh_host,
+                        launch.transport.clone(),
                         startup_mcp_servers,
                         effective_steering,
                     )
@@ -423,53 +477,47 @@ impl BackendSession {
 
     pub async fn spawn_admin(
         kind: BackendKind,
-        executable_path: &str,
+        launch: &BackendLaunchTarget,
         workspace_roots: &[String],
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         match kind {
             BackendKind::Tycode => {
                 let (bridge, rx) =
-                    SubprocessBridge::spawn(executable_path, workspace_roots, None, true).await?;
+                    SubprocessBridge::spawn(&launch.executable_path, workspace_roots, None, true)
+                        .await?;
                 Ok((Self::Tycode(bridge), rx))
             }
             BackendKind::Codex => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
                 let (session, rx) =
-                    CodexSession::spawn_admin(workspace_roots, ssh_host, &[], None).await?;
+                    CodexSession::spawn_admin(workspace_roots, launch.transport.clone(), &[], None)
+                        .await?;
                 Ok((Self::Codex(session), rx))
             }
             BackendKind::Claude => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
-                let (session, rx) =
-                    ClaudeSession::spawn(workspace_roots, ssh_host, &[], None, None).await?;
+                let (session, rx) = ClaudeSession::spawn(
+                    workspace_roots,
+                    launch.transport.clone(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await?;
                 Ok((Self::Claude(session), rx))
             }
             BackendKind::Kiro => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
                 let (session, rx) =
-                    KiroSession::spawn_admin(workspace_roots, ssh_host, &[], None).await?;
+                    KiroSession::spawn_admin(workspace_roots, launch.transport.clone(), &[], None)
+                        .await?;
                 Ok((Self::Kiro(session), rx))
             }
             BackendKind::Gemini => {
-                let ssh_host = if executable_path.is_empty() {
-                    None
-                } else {
-                    Some(executable_path.to_string())
-                };
-                let (session, rx) =
-                    GeminiSession::spawn_admin(workspace_roots, ssh_host, &[], None).await?;
+                let (session, rx) = GeminiSession::spawn_admin(
+                    workspace_roots,
+                    launch.transport.clone(),
+                    &[],
+                    None,
+                )
+                .await?;
                 Ok((Self::Gemini(session), rx))
             }
         }
@@ -482,6 +530,7 @@ impl BackendSession {
             Self::Claude(_) => BackendKind::Claude,
             Self::Kiro(_) => BackendKind::Kiro,
             Self::Gemini(_) => BackendKind::Gemini,
+            Self::TydeServer(proxy) => proxy.backend_kind,
         }
     }
 
@@ -492,6 +541,12 @@ impl BackendSession {
             Self::Claude(session) => BackendCommandHandle::Claude(session.command_handle()),
             Self::Kiro(session) => BackendCommandHandle::Kiro(session.command_handle()),
             Self::Gemini(session) => BackendCommandHandle::Gemini(session.command_handle()),
+            Self::TydeServer(proxy) => {
+                BackendCommandHandle::TydeServer(TydeServerProxyCommandHandle {
+                    connection: proxy.connection.clone(),
+                    server_conversation_id: proxy.server_conversation_id,
+                })
+            }
         }
     }
 
@@ -499,7 +554,7 @@ impl BackendSession {
         match self {
             Self::Claude(session) => session.set_subagent_emitter(emitter).await,
             Self::Codex(session) => session.set_subagent_emitter(emitter).await,
-            Self::Gemini(_) | Self::Tycode(_) | Self::Kiro(_) => {}
+            Self::Gemini(_) | Self::Tycode(_) | Self::Kiro(_) | Self::TydeServer(_) => {}
         }
     }
 
@@ -510,6 +565,16 @@ impl BackendSession {
             Self::Claude(session) => session.shutdown().await,
             Self::Kiro(session) => session.shutdown().await,
             Self::Gemini(session) => session.shutdown().await,
+            Self::TydeServer(proxy) => {
+                // Tell the remote server to close this conversation
+                let _ = proxy
+                    .connection
+                    .invoke(
+                        "close_conversation",
+                        json!({ "conversation_id": proxy.server_conversation_id }),
+                    )
+                    .await;
+            }
         }
     }
 }

@@ -397,6 +397,16 @@ export function setDriverMcpHttpServerAutoloadEnabled(enabled: boolean) {
   return execute("set_driver_mcp_http_server_autoload_enabled", { enabled });
 }
 
+// --- Remote control ---
+
+export function getRemoteControlSettings() {
+  return execute("get_remote_control_settings", {} as Record<string, never>);
+}
+
+export function setRemoteControlEnabled(enabled: boolean) {
+  return execute("set_remote_control_enabled", { enabled });
+}
+
 export function setDefaultBackend(backend: string) {
   return execute("set_default_backend", { backend });
 }
@@ -421,8 +431,16 @@ export function listHosts() {
   return execute("list_hosts", {} as Record<string, never>);
 }
 
-export function addHost(label: string, hostname: string) {
-  return execute("add_host", { label, hostname });
+export function addHost(
+  label: string,
+  hostname: string,
+  remoteKind?: "ssh_pipe" | "tyde_server",
+) {
+  return execute("add_host", {
+    label,
+    hostname,
+    remote_kind: remoteKind,
+  });
 }
 
 export function removeHost(id: string) {
@@ -619,6 +637,26 @@ export function onRemoteConnectionProgress(
 ): Promise<UnlistenFn> {
   return listen<RemoteConnectionProgress>(
     "remote-connection-progress",
+    (event) => {
+      callback(event.payload);
+    },
+  );
+}
+
+export interface TydeServerConnectionState {
+  host_id: string;
+  state:
+    | "connecting"
+    | "connected"
+    | { reconnecting: { attempt: number } }
+    | { disconnected: { reason: string } };
+}
+
+export function onTydeServerConnectionState(
+  callback: (payload: TydeServerConnectionState) => void,
+): Promise<UnlistenFn> {
+  return listen<TydeServerConnectionState>(
+    "tyde-server-connection-state",
     (event) => {
       callback(event.payload);
     },

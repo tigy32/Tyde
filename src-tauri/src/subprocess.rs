@@ -1,4 +1,3 @@
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,9 +5,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::backend_transport::BackendTransport;
 use crate::remote::parse_remote_workspace_roots;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,38 +39,31 @@ impl SubprocessBridge {
             None => serde_json::to_string(workspace_roots).map_err(|e| format!("{e:?}"))?,
         };
 
-        let mut child = if let Some((host, _)) = remote_roots {
+        let mut args = vec!["--workspace-roots".to_string(), roots_json];
+        if let Some(mcp_servers_json) = mcp_servers_json {
+            args.push("--mcp-servers".to_string());
+            args.push(mcp_servers_json.to_string());
+        }
+        if ephemeral {
+            args.push("--ephemeral".to_string());
+        }
+
+        let (transport, program) = if let Some((host, _)) = remote_roots {
             let remote_binary = if subprocess_path.is_empty() {
                 std::env::var("TYDE_REMOTE_SUBPROCESS_PATH")
                     .unwrap_or_else(|_| "tycode-subprocess".to_string())
             } else {
                 subprocess_path.to_string()
             };
-
-            let mut remote_args = vec!["--workspace-roots".to_string(), roots_json.clone()];
-            if let Some(mcp) = mcp_servers_json {
-                remote_args.push("--mcp-servers".to_string());
-                remote_args.push(mcp.to_string());
-            }
-            if ephemeral {
-                remote_args.push("--ephemeral".to_string());
-            }
-            crate::remote::spawn_remote_process(&host, &remote_binary, &remote_args, None).await?
+            (BackendTransport::from_ssh_host(Some(host)), remote_binary)
         } else {
-            let mut cmd = Command::new(subprocess_path);
-            cmd.arg("--workspace-roots").arg(&roots_json);
-            if let Some(mcp_servers_json) = mcp_servers_json {
-                cmd.arg("--mcp-servers").arg(mcp_servers_json);
-            }
-            if ephemeral {
-                cmd.arg("--ephemeral");
-            }
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("Failed to spawn subprocess: {e:?}"))?
+            (BackendTransport::Local, subprocess_path.to_string())
         };
+
+        let mut child = transport
+            .spawn_process(&program, &args, None)
+            .await
+            .map_err(|e| format!("Failed to spawn subprocess: {e}"))?;
 
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;

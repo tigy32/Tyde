@@ -4,6 +4,8 @@ mod agent_defs_io;
 mod agent_mcp_http;
 mod agent_runtime;
 mod backend;
+mod backend_transport;
+mod chat_buffer;
 mod claude;
 mod codex;
 mod conversation;
@@ -15,12 +17,16 @@ mod file_watch;
 mod gemini;
 mod git_service;
 pub mod host;
+mod host_router;
 mod kiro;
+mod protocol;
 mod remote;
+mod remote_control;
 mod session_store;
 mod steering;
 mod subprocess;
 mod terminal;
+mod tyde_server_conn;
 mod usage;
 mod workflow_io;
 
@@ -47,13 +53,14 @@ use crate::agent_runtime::{AgentEventBatch, AgentInfo, AgentRuntime, CollectedAg
 use crate::backend::{
     BackendKind, BackendSession, SessionCommand, StartupMcpServer, StartupMcpTransport,
 };
+use crate::backend_transport::{BackendLaunchTarget, BackendTransport};
 use crate::claude::{SubAgentEmitter, SubAgentHandle};
 use crate::conversation::ConversationManager;
 use crate::file_service::{FileContent, FileEntry};
 use crate::file_watch::FileWatchManager;
 use crate::git_service::GitFileStatus;
 use crate::remote::{
-    connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots,
+    connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots, to_remote_uri,
     validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
 use crate::session_store::SessionStore;
@@ -94,18 +101,32 @@ impl BackendSubAgentEmitter {
         if let Some(id) = *lazy {
             return Some(id);
         }
-        // Register the parent conversation in the runtime so sub-agents
-        // can reference it as their parent.
-        let mut runtime = self.agent_runtime.lock().await;
-        let info = runtime.register_agent(
-            self.parent_conversation_id,
-            self.workspace_roots.clone(),
-            self.backend_kind.clone(),
-            None,
-            "Conversation".to_string(),
-        );
-        let id = info.agent_id;
+        let (id, created) = {
+            // Reuse existing registration if present; otherwise register the
+            // parent conversation so sub-agents can reference it.
+            let mut runtime = self.agent_runtime.lock().await;
+            if let Some(existing) = runtime.get_agent_by_conversation(self.parent_conversation_id) {
+                (existing.agent_id, false)
+            } else {
+                (
+                    runtime
+                        .register_agent(
+                            self.parent_conversation_id,
+                            self.workspace_roots.clone(),
+                            self.backend_kind.clone(),
+                            None,
+                            "Conversation".to_string(),
+                        )
+                        .agent_id,
+                    true,
+                )
+            }
+        };
         *lazy = Some(id);
+        if created {
+            self.agent_runtime_notify.notify_waiters();
+            self.emit_agent_changed(id).await;
+        }
         Some(id)
     }
 
@@ -375,9 +396,12 @@ pub(crate) struct AppState {
     debug_ui_pending:
         SyncMutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     debug_ui_request_seq: AtomicU64,
+    remote_control_enabled: SyncMutex<bool>,
     disabled_backends: SyncMutex<HashSet<String>>,
     settings_watch: Mutex<HashMap<u64, watch::Sender<Value>>>,
     dev_instances: SyncMutex<dev_instance::DevInstanceRegistry>,
+    tyde_server_connections:
+        SyncMutex<HashMap<String, Arc<tyde_server_conn::TydeServerConnection>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -396,6 +420,11 @@ struct AppSettings {
     driver_mcp_http_enabled: bool,
     #[serde(default = "default_driver_mcp_http_autoload")]
     driver_mcp_http_autoload: bool,
+    #[serde(default)]
+    remote_control_enabled: bool,
+    // Legacy field — kept for serde backward compat, no longer read.
+    #[serde(default)]
+    default_backend: String,
 }
 
 fn default_mcp_http_enabled() -> bool {
@@ -421,6 +450,8 @@ impl Default for AppSettings {
             mcp_control_enabled: default_mcp_control_enabled(),
             driver_mcp_http_enabled: default_driver_mcp_http_enabled(),
             driver_mcp_http_autoload: default_driver_mcp_http_autoload(),
+            remote_control_enabled: false,
+            default_backend: String::new(),
         }
     }
 }
@@ -611,7 +642,7 @@ pub(crate) struct AwaitAgentsRequest {
 }
 
 /// Simplified agent result returned by the push-oriented MCP tools.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AgentResult {
     pub(crate) agent_id: u64,
     pub(crate) is_running: bool,
@@ -620,7 +651,7 @@ pub(crate) struct AgentResult {
     pub(crate) summary: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AwaitAgentsResponse {
     pub(crate) ready: Vec<AgentResult>,
     pub(crate) still_running: Vec<u64>,
@@ -832,6 +863,8 @@ fn app_settings_from_state(state: &AppState) -> AppSettings {
         mcp_control_enabled: *state.mcp_control_enabled.lock(),
         driver_mcp_http_enabled: driver_enabled,
         driver_mcp_http_autoload: driver_autoload,
+        remote_control_enabled: *state.remote_control_enabled.lock(),
+        default_backend: String::new(),
     }
 }
 
@@ -1233,7 +1266,7 @@ fn resolve_requested_backend_kind(
     backend_kind: Option<String>,
     workspace_roots: &[String],
 ) -> Result<BackendKind, String> {
-    let host = resolve_host_for_roots(state, workspace_roots)?;
+    let host = host_router::resolve_host_for_roots(state, workspace_roots)?;
 
     let kind = match backend_kind {
         Some(raw) if !raw.trim().is_empty() => raw.parse::<BackendKind>()?,
@@ -1254,40 +1287,247 @@ fn resolve_requested_backend_kind(
     Ok(kind)
 }
 
-fn resolve_host_for_roots(
+pub(crate) async fn materialize_remote_conversation(
     state: &AppState,
+    conn: Arc<tyde_server_conn::TydeServerConnection>,
+    server_cid: u64,
+    backend_kind_str: &str,
     workspace_roots: &[String],
-) -> Result<host::Host, String> {
-    let store = state.host_store.lock();
-    let first_root = workspace_roots.first().map(|s| s.as_str()).unwrap_or("");
-    if let Some(remote) = parse_remote_path(first_root) {
-        for h in store.list() {
-            if !h.is_local && h.hostname == remote.host {
-                return Ok(h);
-            }
+) -> Result<u64, String> {
+    if let Some(existing) = conn.translate_conversation_id(server_cid).await {
+        let exists = {
+            let mgr = state.manager.lock().await;
+            mgr.get(existing).is_some()
+        };
+        if exists {
+            ensure_settings_watch_sender(state, existing).await;
+            return Ok(existing);
         }
-        return Err(format!(
-            "Remote host '{}' is not registered. Open Settings → Hosts to add it.",
-            remote.host
-        ));
     }
-    store
-        .get("local")
-        .cloned()
-        .ok_or_else(|| "Local host not found in host store".to_string())
+
+    let backend_kind = backend_kind_str
+        .parse::<BackendKind>()
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                "Unknown backend kind '{}' for remote conversation {}: {}. Falling back to tycode.",
+                backend_kind_str,
+                server_cid,
+                err
+            );
+            BackendKind::Tycode
+        });
+
+    let normalized_workspace_roots: Vec<String> = workspace_roots
+        .iter()
+        .map(|root| {
+            if parse_remote_path(root).is_some() {
+                root.clone()
+            } else if root.starts_with('/') {
+                to_remote_uri(conn.ssh_host(), root)
+            } else {
+                root.clone()
+            }
+        })
+        .collect();
+
+    let proxy = backend::TydeServerProxySession {
+        connection: conn.clone(),
+        server_conversation_id: server_cid,
+        backend_kind,
+    };
+
+    let local_id = {
+        let mut mgr = state.manager.lock().await;
+        mgr.create_conversation(
+            BackendSession::TydeServer(proxy),
+            &normalized_workspace_roots,
+        )
+    };
+
+    conn.register_conversation_mapping(server_cid, local_id)
+        .await;
+    ensure_settings_watch_sender(state, local_id).await;
+    Ok(local_id)
 }
 
-async fn resolve_backend_executable_path(
+async fn ensure_settings_watch_sender(state: &AppState, conversation_id: u64) {
+    let mut watchers = state.settings_watch.lock().await;
+    if watchers.contains_key(&conversation_id) {
+        return;
+    }
+    let (settings_tx, _) = watch::channel(Value::Null);
+    watchers.insert(conversation_id, settings_tx);
+}
+
+pub(crate) async fn publish_settings_update(
+    state: &AppState,
+    conversation_id: u64,
+    settings: Value,
+) {
+    let settings_tx = {
+        let watchers = state.settings_watch.lock().await;
+        watchers.get(&conversation_id).cloned()
+    };
+    if let Some(tx) = settings_tx {
+        let _ = tx.send(settings);
+    }
+}
+
+async fn ensure_conversation_agent_registered(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    conversation_id: u64,
+    workspace_roots: &[String],
+    backend_kind: &str,
+    name: &str,
+) -> AgentInfo {
+    if let Some(existing) = {
+        let runtime = state.agent_runtime.lock().await;
+        runtime.get_agent_by_conversation(conversation_id)
+    } {
+        return existing;
+    }
+
+    let info = {
+        let mut runtime = state.agent_runtime.lock().await;
+        runtime.register_agent(
+            conversation_id,
+            workspace_roots.to_vec(),
+            backend_kind.to_string(),
+            None,
+            name.to_string(),
+        )
+    };
+    state.agent_runtime_notify.notify_waiters();
+    emit_agent_changed(app, state, info.agent_id).await;
+    info
+}
+
+async fn create_conversation_via_server(
+    state: &AppState,
+    conn: Arc<tyde_server_conn::TydeServerConnection>,
+    workspace_roots: Vec<String>,
+    backend_kind: Option<String>,
+    ephemeral: Option<bool>,
+    agent_definition_id: Option<String>,
+) -> Result<CreateConversationResponse, String> {
+    let remote_roots = host_router::strip_ssh_roots(&workspace_roots);
+
+    let resp = conn
+        .invoke(
+            "create_conversation",
+            serde_json::json!({
+                "workspace_roots": remote_roots,
+                "backend_kind": backend_kind,
+                "ephemeral": ephemeral,
+                "agent_definition_id": agent_definition_id,
+            }),
+        )
+        .await?;
+
+    let server_conv_id = resp
+        .get("conversation_id")
+        .and_then(|v| v.as_u64())
+        .ok_or("Server did not return conversation_id")?;
+    let session_id = resp
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let backend_kind_str = if let Some(kind) = resp.get("backend_kind").and_then(|v| v.as_str()) {
+        kind.to_string()
+    } else {
+        tracing::warn!(
+            "Remote create_conversation response missing backend_kind; using local fallback"
+        );
+        resolve_requested_backend_kind(state, backend_kind.clone(), &workspace_roots)?
+            .as_str()
+            .to_string()
+    };
+    let local_id = materialize_remote_conversation(
+        state,
+        conn,
+        server_conv_id,
+        &backend_kind_str,
+        &workspace_roots,
+    )
+    .await?;
+
+    Ok(CreateConversationResponse {
+        conversation_id: local_id,
+        session_id,
+    })
+}
+
+async fn spawn_agent_via_server(
+    state: &AppState,
+    conn: Arc<tyde_server_conn::TydeServerConnection>,
+    request: SpawnAgentRequest,
+) -> Result<SpawnAgentResponse, String> {
+    let requested_backend_kind = request.backend_kind.clone();
+    let remote_roots = host_router::strip_ssh_roots(&request.workspace_roots);
+
+    let resp = conn
+        .invoke(
+            "spawn_agent",
+            serde_json::json!({
+                "workspace_roots": remote_roots,
+                "prompt": request.prompt,
+                "backend_kind": request.backend_kind,
+                "parent_agent_id": request.parent_agent_id,
+                "name": request.name,
+                "ephemeral": request.ephemeral,
+                "agent_definition_id": request.agent_definition_id,
+            }),
+        )
+        .await?;
+
+    let agent_id = resp
+        .get("agent_id")
+        .and_then(|v| v.as_u64())
+        .ok_or("Server did not return agent_id")?;
+    let conversation_id = resp
+        .get("conversation_id")
+        .and_then(|v| v.as_u64())
+        .ok_or("Server did not return conversation_id")?;
+    conn.register_remote_agent_id(agent_id).await;
+    let backend_kind_str = if let Some(kind) = resp.get("backend_kind").and_then(|v| v.as_str()) {
+        kind.to_string()
+    } else {
+        tracing::warn!("Remote spawn_agent response missing backend_kind; using local fallback");
+        resolve_requested_backend_kind(state, requested_backend_kind, &request.workspace_roots)?
+            .as_str()
+            .to_string()
+    };
+    let local_conversation_id = materialize_remote_conversation(
+        state,
+        conn,
+        conversation_id,
+        &backend_kind_str,
+        &request.workspace_roots,
+    )
+    .await?;
+
+    Ok(SpawnAgentResponse {
+        agent_id,
+        conversation_id: local_conversation_id,
+    })
+}
+
+async fn resolve_backend_launch_target(
     app: &tauri::AppHandle,
     workspace_roots: &[String],
     backend_kind: BackendKind,
-) -> Result<String, String> {
+) -> Result<BackendLaunchTarget, String> {
     match backend_kind {
         BackendKind::Tycode => {
             let remote_roots = parse_remote_workspace_roots(workspace_roots)?;
             match &remote_roots {
-                Some((host, _)) => connect_remote_with_progress(app, host).await,
-                None => subprocess_path(),
+                Some((host, _)) => {
+                    let path = connect_remote_with_progress(app, host).await?;
+                    launch_target_for_backend(backend_kind, Some(host.clone()), Some(path))
+                }
+                None => launch_target_for_backend(backend_kind, None, Some(subprocess_path()?)),
             }
         }
         BackendKind::Codex => {
@@ -1295,9 +1535,9 @@ async fn resolve_backend_executable_path(
             match &remote_roots {
                 Some((host, _)) => {
                     validate_remote_cli(app, host, "codex").await?;
-                    Ok(host.clone())
+                    launch_target_for_backend(backend_kind, Some(host.clone()), None)
                 }
-                None => Ok(String::new()),
+                None => launch_target_for_backend(backend_kind, None, None),
             }
         }
         BackendKind::Claude => {
@@ -1305,9 +1545,9 @@ async fn resolve_backend_executable_path(
             match &remote_roots {
                 Some((host, _)) => {
                     validate_remote_cli(app, host, "claude").await?;
-                    Ok(host.clone())
+                    launch_target_for_backend(backend_kind, Some(host.clone()), None)
                 }
-                None => Ok(String::new()),
+                None => launch_target_for_backend(backend_kind, None, None),
             }
         }
         BackendKind::Kiro => {
@@ -1317,9 +1557,9 @@ async fn resolve_backend_executable_path(
             match parse_remote_workspace_roots(workspace_roots) {
                 Ok(Some((host, _))) => {
                     validate_remote_cli(app, &host, "kiro-cli-chat").await?;
-                    Ok(host.clone())
+                    launch_target_for_backend(backend_kind, Some(host), None)
                 }
-                _ => Ok(String::new()),
+                _ => launch_target_for_backend(backend_kind, None, None),
             }
         }
         BackendKind::Gemini => {
@@ -1327,9 +1567,32 @@ async fn resolve_backend_executable_path(
             match &remote_roots {
                 Some((host, _)) => {
                     validate_remote_cli(app, host, "gemini").await?;
-                    Ok(host.clone())
+                    launch_target_for_backend(backend_kind, Some(host.clone()), None)
                 }
-                None => Ok(String::new()),
+                None => launch_target_for_backend(backend_kind, None, None),
+            }
+        }
+    }
+}
+
+fn launch_target_for_backend(
+    backend_kind: BackendKind,
+    remote_host: Option<String>,
+    executable_path: Option<String>,
+) -> Result<BackendLaunchTarget, String> {
+    match backend_kind {
+        BackendKind::Tycode => {
+            let path = executable_path
+                .ok_or("Missing tycode executable path for launch target".to_string())?;
+            match remote_host {
+                Some(host) => Ok(BackendLaunchTarget::remote(host, path)),
+                None => Ok(BackendLaunchTarget::local(path)),
+            }
+        }
+        BackendKind::Codex | BackendKind::Claude | BackendKind::Kiro | BackendKind::Gemini => {
+            match remote_host {
+                Some(host) => Ok(BackendLaunchTarget::remote(host, String::new())),
+                None => Ok(BackendLaunchTarget::local(String::new())),
             }
         }
     }
@@ -1393,20 +1656,26 @@ async fn query_backend_usage(
     backend_kind: String,
     host_id: Option<String>,
 ) -> Result<Value, String> {
-    let ssh_host = if let Some(id) = host_id.as_deref() {
-        let store = state.host_store.lock();
-        let host = store
-            .get(id)
-            .ok_or_else(|| format!("Host '{id}' not found"))?;
-        if host.is_local {
-            None
-        } else {
-            Some(host.hostname.clone())
-        }
-    } else {
-        None
+    let transport = usage_transport_for_host_id(state.inner(), host_id.as_deref())?;
+    usage::query_backend_usage_for_host(&backend_kind, transport).await
+}
+
+fn usage_transport_for_host_id(
+    state: &AppState,
+    host_id: Option<&str>,
+) -> Result<BackendTransport, String> {
+    let Some(id) = host_id else {
+        return Ok(BackendTransport::Local);
     };
-    usage::query_backend_usage_for_host(&backend_kind, ssh_host.as_deref()).await
+    let store = state.host_store.lock();
+    let host = store
+        .get(id)
+        .ok_or_else(|| format!("Host '{id}' not found"))?;
+    if host.is_local {
+        Ok(BackendTransport::Local)
+    } else {
+        Ok(BackendTransport::from_ssh_host(Some(host.hostname.clone())))
+    }
 }
 
 #[tauri::command]
@@ -1552,6 +1821,41 @@ async fn create_conversation(
     ephemeral: Option<bool>,
     agent_definition_id: Option<String>,
 ) -> Result<CreateConversationResponse, String> {
+    create_conversation_tauri_free(
+        &app,
+        state.inner(),
+        workspace_roots,
+        backend_kind,
+        ephemeral,
+        agent_definition_id,
+    )
+    .await
+}
+
+pub(crate) async fn create_conversation_tauri_free(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    workspace_roots: Vec<String>,
+    backend_kind: Option<String>,
+    ephemeral: Option<bool>,
+    agent_definition_id: Option<String>,
+) -> Result<CreateConversationResponse, String> {
+    // Route through TydeServer if the host is configured for it.
+    match host_router::route_workspace(app, state, &workspace_roots).await? {
+        host_router::WorkspaceRoute::TydeServer { connection } => {
+            return create_conversation_via_server(
+                state,
+                connection,
+                workspace_roots,
+                backend_kind,
+                ephemeral,
+                agent_definition_id,
+            )
+            .await;
+        }
+        host_router::WorkspaceRoute::Local => {}
+    }
+
     // Resolve definition if provided
     let definition = if let Some(ref def_id) = agent_definition_id {
         let def_workspace = workspace_roots
@@ -1559,9 +1863,7 @@ async fn create_conversation(
             .find(|r| !r.starts_with("ssh://"))
             .map(|r| r.to_string());
         let defs = agent_defs_io::list_agent_definitions(def_workspace).await?;
-        let found = defs
-            .into_iter()
-            .find(|e| e.definition.id == *def_id);
+        let found = defs.into_iter().find(|e| e.definition.id == *def_id);
         Some(
             found
                 .ok_or_else(|| format!("Agent definition '{def_id}' not found"))?
@@ -1586,7 +1888,7 @@ async fn create_conversation(
     } else {
         backend_kind
     };
-    let backend_kind = resolve_requested_backend_kind(&state, effective_backend, &workspace_roots)?;
+    let backend_kind = resolve_requested_backend_kind(state, effective_backend, &workspace_roots)?;
     let ephemeral = ephemeral.unwrap_or(false);
 
     // For agent-control conversations, reserve an agent_id upfront so we can embed it
@@ -1599,8 +1901,7 @@ async fn create_conversation(
         None
     };
 
-    let resolved_path =
-        resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
+    let launch_target = resolve_backend_launch_target(app, &workspace_roots, backend_kind).await?;
 
     // Build extra MCP servers from definition
     let extra_mcp_servers = definition
@@ -1609,7 +1910,7 @@ async fn create_conversation(
         .unwrap_or_default();
 
     let startup_mcp_servers = startup_mcp_servers_for_agent(
-        state.inner(),
+        state,
         include_agent_control,
         reserved_agent_id,
         &workspace_roots,
@@ -1635,15 +1936,11 @@ async fn create_conversation(
     // Compose remaining steering: tool policy + workspace steering.
     // Agent instructions are NOT included here — they go through agent_identity.
     let workspace_steering = steering::read_steering_from_roots(&workspace_roots).await?;
-    let steering = compose_steering(
-        None,
-        &def_tool_policy,
-        workspace_steering.as_deref(),
-    );
+    let steering = compose_steering(None, &def_tool_policy, workspace_steering.as_deref());
 
     let (session, rx) = BackendSession::spawn(
         backend_kind,
-        &resolved_path,
+        &launch_target,
         &workspace_roots,
         ephemeral,
         &startup_mcp_servers,
@@ -1664,7 +1961,7 @@ async fn create_conversation(
 
     // For agent-control conversations, complete the agent registration using the
     // reserved ID so it appears in the hierarchy and sub-agents can reference it.
-    if let Some(agent_id) = reserved_agent_id {
+    let root_agent = if let Some(agent_id) = reserved_agent_id {
         let mut runtime = state.agent_runtime.lock().await;
         let info = runtime.register_agent_with_id(
             agent_id,
@@ -1678,12 +1975,43 @@ async fn create_conversation(
         runtime.set_agent_definition(
             agent_id,
             agent_definition_id.clone(),
-            def_tool_policy,
+            def_tool_policy.clone(),
         );
         drop(runtime);
         state.agent_runtime_notify.notify_waiters();
-        emit_agent_changed(&app, &state, info.agent_id).await;
-    }
+        emit_agent_changed(app, state, info.agent_id).await;
+        info
+    } else {
+        let info = ensure_conversation_agent_registered(
+            app,
+            state,
+            id,
+            &workspace_roots,
+            backend_kind.as_str(),
+            &def_name,
+        )
+        .await;
+        if agent_definition_id.is_some() {
+            let updated = {
+                let mut runtime = state.agent_runtime.lock().await;
+                runtime.update_agent_type(info.agent_id, agent_definition_id.clone());
+                runtime.set_agent_definition(
+                    info.agent_id,
+                    agent_definition_id.clone(),
+                    def_tool_policy.clone(),
+                );
+                runtime.get_agent(info.agent_id)
+            };
+            if let Some(updated) = updated {
+                emit_agent_changed(app, state, updated.agent_id).await;
+                updated
+            } else {
+                info
+            }
+        } else {
+            info
+        }
+    };
 
     {
         let mgr = state.manager.lock().await;
@@ -1708,10 +2036,10 @@ async fn create_conversation(
     let registration = serde_json::json!({
         "kind": "ConversationRegistered",
         "data": {
-            "agent_id": reserved_agent_id,
+            "agent_id": root_agent.agent_id,
             "workspace_roots": workspace_roots,
             "backend_kind": backend_kind.as_str(),
-            "name": if reserved_agent_id.is_some() { &def_name } else { "Conversation" },
+            "name": &root_agent.name,
             "parent_agent_id": null,
         }
     });
@@ -1853,14 +2181,23 @@ async fn forward_events(
         };
         if changed {
             agent_runtime_notify.notify_waiters();
-            let info = {
-                agent_runtime
-                    .lock()
-                    .await
-                    .get_agent_by_conversation(conversation_id)
+            let (info, agent_seq) = {
+                let runtime = agent_runtime.lock().await;
+                let info = runtime.get_agent_by_conversation(conversation_id);
+                let seq = info
+                    .as_ref()
+                    .and_then(|agent| runtime.latest_event_seq_for_agent(agent.agent_id));
+                (info, seq)
             };
             if let Some(info) = info {
                 let _ = app.emit("agent-changed", &info);
+                if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+                    let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+                        event: "agent-changed".into(),
+                        seq: agent_seq,
+                        payload: serde_json::to_value(&info).unwrap_or_default(),
+                    });
+                }
             }
         }
 
@@ -1874,11 +2211,30 @@ async fn forward_events(
         if let Err(e) = app.emit("chat-event", &payload) {
             tracing::warn!("Failed to emit chat event: {e:?}");
         }
+
+        // Tap events into the remote control chat buffer + broadcast.
+        if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+            let entry = rc
+                .chat_buffer
+                .lock()
+                .push(conversation_id, payload.event.clone());
+            let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+                event: "chat-event".into(),
+                seq: Some(entry.seq),
+                payload: serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "event": payload.event,
+                }),
+            });
+        }
     }
 
     // Flush any pending session store writes when the event stream ends.
     if let Err(err) = session_store.lock().flush() {
         tracing::error!("Failed to flush session store at conversation end: {err}");
+    }
+    if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+        rc.chat_buffer.lock().remove_conversation(conversation_id);
     }
 }
 
@@ -1899,9 +2255,22 @@ fn emit_subprocess_exit(app: &tauri::AppHandle, conversation_id: u64) {
 }
 
 async fn emit_agent_changed(app: &tauri::AppHandle, state: &AppState, agent_id: u64) {
-    let info = { state.agent_runtime.lock().await.get_agent(agent_id) };
+    let (info, agent_seq) = {
+        let runtime = state.agent_runtime.lock().await;
+        (
+            runtime.get_agent(agent_id),
+            runtime.latest_event_seq_for_agent(agent_id),
+        )
+    };
     if let Some(info) = info {
         let _ = app.emit("agent-changed", &info);
+        if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+            let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+                event: "agent-changed".into(),
+                seq: agent_seq,
+                payload: serde_json::to_value(&info).unwrap_or_default(),
+            });
+        }
     }
 }
 
@@ -1910,19 +2279,27 @@ async fn emit_agent_changed_for_conversation(
     state: &AppState,
     conversation_id: u64,
 ) {
-    let info = {
-        state
-            .agent_runtime
-            .lock()
-            .await
-            .get_agent_by_conversation(conversation_id)
+    let (info, agent_seq) = {
+        let runtime = state.agent_runtime.lock().await;
+        let info = runtime.get_agent_by_conversation(conversation_id);
+        let seq = info
+            .as_ref()
+            .and_then(|agent| runtime.latest_event_seq_for_agent(agent.agent_id));
+        (info, seq)
     };
     if let Some(info) = info {
         let _ = app.emit("agent-changed", &info);
+        if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+            let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+                event: "agent-changed".into(),
+                seq: agent_seq,
+                payload: serde_json::to_value(&info).unwrap_or_default(),
+            });
+        }
     }
 }
 
-async fn execute_conversation_command(
+pub(crate) async fn execute_conversation_command(
     app: &tauri::AppHandle,
     state: &AppState,
     conversation_id: u64,
@@ -1957,6 +2334,9 @@ async fn execute_conversation_command(
                 .conversation_to_session
                 .lock()
                 .remove(&conversation_id);
+            if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+                rc.chat_buffer.lock().remove_conversation(conversation_id);
+            }
             emit_subprocess_exit(app, conversation_id);
             Err(err)
         }
@@ -2001,30 +2381,52 @@ async fn close_conversation(
     state: tauri::State<'_, AppState>,
     conversation_id: u64,
 ) -> Result<(), String> {
+    close_conversation_tauri_free(&app, state.inner(), conversation_id).await
+}
+
+pub(crate) async fn close_conversation_tauri_free(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    conversation_id: u64,
+) -> Result<(), String> {
     let session = {
         let mut mgr = state.manager.lock().await;
         mgr.remove(conversation_id)
             .ok_or("Conversation not found")?
     };
     session.shutdown().await;
-    {
-        let mut watchers = state.settings_watch.lock().await;
-        watchers.remove(&conversation_id);
-    }
     let changed = {
         let mut runtime = state.agent_runtime.lock().await;
         runtime.mark_conversation_closed(conversation_id, Some("Conversation closed".to_string()))
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
-        emit_agent_changed_for_conversation(&app, &state, conversation_id).await;
+        emit_agent_changed_for_conversation(app, state, conversation_id).await;
     }
+    cleanup_conversation_runtime_state(app, state, conversation_id).await;
+    Ok(())
+}
+
+async fn cleanup_conversation_runtime_state(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    conversation_id: u64,
+) {
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.remove(&conversation_id);
+    }
+
     // Clean up runtime map (store record persists)
     state
         .conversation_to_session
         .lock()
         .remove(&conversation_id);
-    Ok(())
+
+    // Clean up remote control chat buffer for this conversation.
+    if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+        rc.chat_buffer.lock().remove_conversation(conversation_id);
+    }
 }
 
 pub(crate) async fn spawn_agent_internal(
@@ -2032,6 +2434,14 @@ pub(crate) async fn spawn_agent_internal(
     state: &AppState,
     request: SpawnAgentRequest,
 ) -> Result<SpawnAgentResponse, String> {
+    // Route through TydeServer if the host is configured for it.
+    match host_router::route_workspace(app, state, &request.workspace_roots).await? {
+        host_router::WorkspaceRoute::TydeServer { connection } => {
+            return spawn_agent_via_server(state, connection, request).await;
+        }
+        host_router::WorkspaceRoute::Local => {}
+    }
+
     let SpawnAgentRequest {
         workspace_roots,
         prompt,
@@ -2093,8 +2503,7 @@ pub(crate) async fn spawn_agent_internal(
     };
     let backend_kind = resolve_requested_backend_kind(state, effective_backend, &workspace_roots)?;
     let ephemeral = ephemeral.unwrap_or(false);
-    let resolved_path =
-        resolve_backend_executable_path(app, &workspace_roots, backend_kind).await?;
+    let launch_target = resolve_backend_launch_target(app, &workspace_roots, backend_kind).await?;
 
     let extra_mcp_servers = definition
         .as_ref()
@@ -2123,15 +2532,11 @@ pub(crate) async fn spawn_agent_internal(
     });
 
     let workspace_steering = steering::read_steering_from_roots(&workspace_roots).await?;
-    let steering = compose_steering(
-        None,
-        &def_tool_policy,
-        workspace_steering.as_deref(),
-    );
+    let steering = compose_steering(None, &def_tool_policy, workspace_steering.as_deref());
 
     let (session, rx) = BackendSession::spawn(
         backend_kind,
-        &resolved_path,
+        &launch_target,
         &workspace_roots,
         ephemeral,
         &startup_mcp_servers,
@@ -2161,11 +2566,7 @@ pub(crate) async fn spawn_agent_internal(
         );
         if agent_definition_id.is_some() {
             runtime.update_agent_type(info.agent_id, agent_definition_id.clone());
-            runtime.set_agent_definition(
-                info.agent_id,
-                agent_definition_id,
-                def_tool_policy,
-            );
+            runtime.set_agent_definition(info.agent_id, agent_definition_id, def_tool_policy);
         }
         info
     };
@@ -2293,6 +2694,22 @@ pub(crate) async fn send_agent_message_internal(
         return Err("send_agent_message requires a non-empty message".to_string());
     }
 
+    // Forward to remote server if agent lives there.
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, agent_id).await?
+    {
+        connection
+            .invoke(
+                "send_agent_message",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "message": message,
+                }),
+            )
+            .await?;
+        return Ok(());
+    }
+
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
@@ -2320,6 +2737,19 @@ pub(crate) async fn interrupt_agent_internal(
     request: AgentIdRequest,
 ) -> Result<(), String> {
     let agent_id = request.agent_id;
+
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, agent_id).await?
+    {
+        connection
+            .invoke(
+                "interrupt_agent",
+                serde_json::json!({ "agent_id": agent_id }),
+            )
+            .await?;
+        return Ok(());
+    }
+
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
@@ -2388,6 +2818,37 @@ pub(crate) async fn terminate_agent_internal(
     request: AgentIdRequest,
 ) -> Result<(), String> {
     let agent_id = request.agent_id;
+
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, agent_id).await?
+    {
+        connection
+            .invoke(
+                "terminate_agent",
+                serde_json::json!({ "agent_id": agent_id }),
+            )
+            .await?;
+
+        // Best-effort local cleanup for mirrored proxy conversations.
+        if let Some(local_cid) = connection.detach_remote_agent(agent_id).await {
+            let removed = {
+                let mut mgr = state.manager.lock().await;
+                mgr.remove(local_cid)
+            };
+            if let Some(session) = removed {
+                // Remote already handled teardown; only shut down non-proxy sessions.
+                match session {
+                    BackendSession::TydeServer(_) => {}
+                    other => other.shutdown().await,
+                }
+            }
+            cleanup_conversation_runtime_state(app, state, local_cid).await;
+        }
+
+        dev_instance::stop_instances_for_agent(state, agent_id).await;
+        return Ok(());
+    }
+
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
@@ -2431,11 +2892,7 @@ pub(crate) async fn terminate_agent_internal(
         emit_agent_changed(app, state, agent_id).await;
     }
 
-    // Clean up conversation_to_session map (store record persists)
-    state
-        .conversation_to_session
-        .lock()
-        .remove(&conversation_id);
+    cleanup_conversation_runtime_state(app, state, conversation_id).await;
 
     // Clean up any dev instances bound to this agent.
     dev_instance::stop_instances_for_agent(state, agent_id).await;
@@ -2447,13 +2904,92 @@ pub(crate) async fn get_agent_internal(
     state: &AppState,
     request: AgentIdRequest,
 ) -> Result<Option<AgentInfo>, String> {
+    if let Some(local) = {
+        let runtime = state.agent_runtime.lock().await;
+        runtime.get_agent(request.agent_id)
+    } {
+        return Ok(Some(local));
+    }
+
+    let mut found: Option<AgentInfo> = None;
+    for conn in tyde_server_connections_snapshot(state) {
+        match conn.fetch_remote_agents().await {
+            Ok(remote_agents) => {
+                if let Some(agent) = remote_agents
+                    .into_iter()
+                    .find(|a| a.agent_id == request.agent_id)
+                {
+                    if found.is_some() {
+                        return Err(format!(
+                            "Agent {} exists on multiple remote hosts (ambiguous owner)",
+                            request.agent_id
+                        ));
+                    }
+                    found = Some(agent);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to fetch remote agents for host {} while resolving get_agent({}): {}",
+                    conn.host_id,
+                    request.agent_id,
+                    err
+                );
+            }
+        }
+    }
+
+    Ok(found)
+}
+
+pub(crate) async fn list_agents_local_only_internal(state: &AppState) -> Vec<AgentInfo> {
     let runtime = state.agent_runtime.lock().await;
-    Ok(runtime.get_agent(request.agent_id))
+    runtime.list_agents()
+}
+
+fn tyde_server_connections_snapshot(
+    state: &AppState,
+) -> Vec<Arc<tyde_server_conn::TydeServerConnection>> {
+    let conns = state.tyde_server_connections.lock();
+    conns.values().cloned().collect()
 }
 
 pub(crate) async fn list_agents_internal(state: &AppState) -> Result<Vec<AgentInfo>, String> {
-    let runtime = state.agent_runtime.lock().await;
-    Ok(runtime.list_agents())
+    let mut merged = list_agents_local_only_internal(state).await;
+    let mut seen = HashSet::new();
+    for agent in &merged {
+        if !seen.insert(agent.agent_id) {
+            return Err(format!(
+                "Duplicate local agent id {} detected while listing agents",
+                agent.agent_id
+            ));
+        }
+    }
+
+    for conn in tyde_server_connections_snapshot(state) {
+        match conn.fetch_remote_agents().await {
+            Ok(remote_agents) => {
+                for agent in remote_agents {
+                    if !seen.insert(agent.agent_id) {
+                        return Err(format!(
+                            "Agent {} exists in both local and remote runtimes (ambiguous owner)",
+                            agent.agent_id
+                        ));
+                    }
+                    merged.push(agent);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to fetch remote agents for host {} while listing agents: {}",
+                    conn.host_id,
+                    err
+                );
+            }
+        }
+    }
+
+    Ok(merged)
 }
 
 pub(crate) async fn wait_for_agent_internal(
@@ -2461,6 +2997,27 @@ pub(crate) async fn wait_for_agent_internal(
     request: WaitForAgentRequest,
 ) -> Result<AgentInfo, String> {
     let agent_id = request.agent_id;
+
+    // Forward to remote server if agent lives there
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, agent_id).await?
+    {
+        let resp = connection
+            .invoke(
+                "wait_for_agent",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                }),
+            )
+            .await?;
+        let mut info: AgentInfo =
+            serde_json::from_value(resp).map_err(|e| format!("Failed to parse agent info: {e}"))?;
+        info.conversation_id = connection
+            .to_local_conversation_id(info.conversation_id)
+            .await?;
+        connection.register_remote_agent_id(info.agent_id).await;
+        return Ok(info);
+    }
 
     loop {
         // Create the Notified future BEFORE checking state to avoid missing
@@ -2493,6 +3050,27 @@ pub(crate) async fn collect_agent_result_internal(
     state: &AppState,
     request: AgentIdRequest,
 ) -> Result<CollectedAgentResult, String> {
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, request.agent_id).await?
+    {
+        let resp = connection
+            .invoke(
+                "collect_agent_result",
+                serde_json::json!({
+                    "agent_id": request.agent_id,
+                }),
+            )
+            .await?;
+        let mut result: CollectedAgentResult = serde_json::from_value(resp)
+            .map_err(|e| format!("Failed to parse collected result: {e}"))?;
+        result.agent.conversation_id = connection
+            .to_local_conversation_id(result.agent.conversation_id)
+            .await?;
+        connection
+            .register_remote_agent_id(result.agent.agent_id)
+            .await;
+        return Ok(result);
+    }
     let runtime = state.agent_runtime.lock().await;
     runtime.collect_result(request.agent_id)
 }
@@ -2583,8 +3161,8 @@ pub(crate) async fn run_query_screenshot_agent(
 
     // 4. Spawn an ephemeral agent with the screenshot attached.
     let prompt = format!("{QUERY_SCREENSHOT_PREAMBLE}{question}");
-    let project_dir =
-        dev_instance::dev_instance_project_dir(state, instance_id).ok_or("No dev instance running")?;
+    let project_dir = dev_instance::dev_instance_project_dir(state, instance_id)
+        .ok_or("No dev instance running")?;
 
     let request = SpawnAgentRequest {
         workspace_roots: vec![project_dir],
@@ -2622,6 +3200,10 @@ pub(crate) async fn await_agents_internal(
     state: &AppState,
     request: AwaitAgentsRequest,
 ) -> Result<AwaitAgentsResponse, String> {
+    if request.agent_ids.is_empty() {
+        return Err("No agents to watch".to_string());
+    }
+
     let idle_timeout = request
         .timeout_ms
         .unwrap_or(60_000)
@@ -2634,41 +3216,32 @@ pub(crate) async fn await_agents_internal(
 
     loop {
         // Create the Notified future BEFORE checking state to avoid missing
-        // a notification that fires between the state check and the await.
+        // a local-runtime notification that fires between the state check
+        // and the await.
         let notified = state.agent_runtime_notify.notified();
 
-        let (ready, still_running, newest_updated_at) = {
-            let runtime = state.agent_runtime.lock().await;
-            // Validate all requested IDs exist.
-            for &id in &request.agent_ids {
-                if !runtime.has_agent(id) {
-                    return Err(format!("Agent {id} not found"));
-                }
-            }
-            let watch_ids = request.agent_ids.clone();
+        // Pull a unified local+remote snapshot so this works for TydeServer
+        // agents too.
+        let all_agents = list_agents_internal(state).await?;
+        let mut by_id = HashMap::with_capacity(all_agents.len());
+        for agent in all_agents {
+            by_id.insert(agent.agent_id, agent);
+        }
 
-            if watch_ids.is_empty() {
-                return Err("No agents to watch".to_string());
+        let mut ready = Vec::new();
+        let mut still_running = Vec::new();
+        let mut newest_updated_at: u64 = 0;
+        for &id in &request.agent_ids {
+            let info = by_id.get(&id).ok_or(format!("Agent {id} not found"))?;
+            if info.updated_at_ms > newest_updated_at {
+                newest_updated_at = info.updated_at_ms;
             }
-
-            let mut ready = Vec::new();
-            let mut still_running = Vec::new();
-            let mut newest: u64 = 0;
-            for &id in &watch_ids {
-                let info = runtime
-                    .get_agent(id)
-                    .ok_or(format!("Agent {id} not found"))?;
-                if info.updated_at_ms > newest {
-                    newest = info.updated_at_ms;
-                }
-                if !info.is_running {
-                    ready.push(agent_result_from_info(&info));
-                } else {
-                    still_running.push(id);
-                }
+            if info.is_running {
+                still_running.push(id);
+            } else {
+                ready.push(agent_result_from_info(info));
             }
-            (ready, still_running, newest)
-        };
+        }
 
         if !ready.is_empty() {
             return Ok(AwaitAgentsResponse {
@@ -2689,9 +3262,10 @@ pub(crate) async fn await_agents_internal(
             return Err("Timed out waiting for agents".to_string());
         }
         let remaining = effective_deadline.saturating_duration_since(now);
-        match tokio::time::timeout(remaining, notified).await {
-            Ok(_) => {}
-            Err(_) => return Err("Timed out waiting for agents".to_string()),
+        let poll_sleep = remaining.min(tokio::time::Duration::from_millis(500));
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(poll_sleep) => {}
         }
     }
 }
@@ -2703,6 +3277,40 @@ pub(crate) async fn cancel_agent_internal(
     request: AgentIdRequest,
 ) -> Result<AgentResult, String> {
     let agent_id = request.agent_id;
+
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, agent_id).await?
+    {
+        let response = connection
+            .invoke(
+                "cancel_agent",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                }),
+            )
+            .await?;
+
+        if let Some(local_cid) = connection.detach_remote_agent(agent_id).await {
+            let removed = {
+                let mut mgr = state.manager.lock().await;
+                mgr.remove(local_cid)
+            };
+            if let Some(session) = removed {
+                // Remote already handled teardown; only shut down non-proxy sessions.
+                match session {
+                    BackendSession::TydeServer(_) => {}
+                    other => other.shutdown().await,
+                }
+            }
+            cleanup_conversation_runtime_state(app, state, local_cid).await;
+        }
+
+        dev_instance::stop_instances_for_agent(state, agent_id).await;
+
+        return serde_json::from_value(response)
+            .map_err(|e| format!("Failed to parse remote cancel result: {e}"));
+    }
+
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
@@ -2737,11 +3345,7 @@ pub(crate) async fn cancel_agent_internal(
         emit_agent_changed(app, state, agent_id).await;
     }
 
-    // Clean up conversation_to_session map (store record persists)
-    state
-        .conversation_to_session
-        .lock()
-        .remove(&conversation_id);
+    cleanup_conversation_runtime_state(app, state, conversation_id).await;
 
     // Clean up any dev instances bound to this agent.
     dev_instance::stop_instances_for_agent(state, agent_id).await;
@@ -2828,6 +3432,30 @@ async fn rename_agent(
     agent_id: u64,
     name: String,
 ) -> Result<(), String> {
+    rename_agent_tauri_free(state.inner(), agent_id, name).await
+}
+
+pub(crate) async fn rename_agent_tauri_free(
+    state: &AppState,
+    agent_id: u64,
+    name: String,
+) -> Result<(), String> {
+    // Forward to remote server if agent lives there.
+    if let host_router::AgentRoute::TydeServer { connection } =
+        host_router::route_agent(state, agent_id).await?
+    {
+        connection
+            .invoke(
+                "rename_agent",
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "name": name,
+                }),
+            )
+            .await?;
+        return Ok(());
+    }
+
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime.conversation_id_for_agent(agent_id)
@@ -2980,26 +3608,106 @@ fn set_mcp_control_enabled(state: tauri::State<'_, AppState>, enabled: bool) -> 
     save_app_settings(&app_settings_from_state(&state))
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RemoteControlSettings {
+    enabled: bool,
+    running: bool,
+    socket_path: Option<String>,
+    connected_clients: usize,
+}
+
+#[tauri::command]
+async fn get_remote_control_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<RemoteControlSettings, String> {
+    let enabled = *state.remote_control_enabled.lock();
+    let (running, socket_path, connected_clients) =
+        if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+            if rc.is_running() {
+                (
+                    true,
+                    Some(rc.socket_path().display().to_string()),
+                    rc.connected_client_count().await,
+                )
+            } else {
+                (false, None, 0)
+            }
+        } else {
+            (false, None, 0)
+        };
+    Ok(RemoteControlSettings {
+        enabled,
+        running,
+        socket_path,
+        connected_clients,
+    })
+}
+
+#[tauri::command]
+async fn set_remote_control_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<RemoteControlSettings, String> {
+    *state.remote_control_enabled.lock() = enabled;
+    save_app_settings(&app_settings_from_state(&state))?;
+
+    if enabled {
+        if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+            if let Err(err) = rc.start_listening(app.clone()) {
+                *state.remote_control_enabled.lock() = false;
+                let _ = save_app_settings(&app_settings_from_state(&state));
+                return Err(format!("Failed to start remote control server: {err}"));
+            }
+        } else {
+            match remote_control::RemoteControlServer::start(app.clone()) {
+                Ok(server) => {
+                    app.manage(server);
+                }
+                Err(err) => {
+                    *state.remote_control_enabled.lock() = false;
+                    let _ = save_app_settings(&app_settings_from_state(&state));
+                    return Err(format!("Failed to start remote control server: {err}"));
+                }
+            }
+        }
+    } else if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+        rc.shutdown();
+    }
+
+    get_remote_control_settings(app, state).await
+}
+
 #[tauri::command]
 fn list_hosts(state: tauri::State<'_, AppState>) -> Result<Vec<host::Host>, String> {
     let store = state.host_store.lock();
     Ok(store.list())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn add_host(
     state: tauri::State<'_, AppState>,
     label: String,
     hostname: String,
+    remote_kind: Option<String>,
 ) -> Result<host::Host, String> {
+    let remote_kind = match remote_kind.as_deref() {
+        Some("tyde_server") => host::RemoteKind::TydeServer,
+        _ => host::RemoteKind::SshPipe,
+    };
+
     // Validate SSH connectivity before accepting the host.
     let output = tokio::process::Command::new("ssh")
         .args([
-            "-o", "ConnectTimeout=10",
-            "-o", "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "BatchMode=yes",
             "-T",
             &hostname,
-            "echo", "tycode-ok",
+            "echo",
+            "tycode-ok",
         ])
         .output()
         .await
@@ -3015,7 +3723,7 @@ async fn add_host(
     }
 
     let mut store = state.host_store.lock();
-    store.add(label, hostname)
+    store.add(label, hostname, remote_kind)
 }
 
 #[tauri::command]
@@ -3372,8 +4080,9 @@ async fn create_admin_subprocess(
     backend_kind: Option<String>,
 ) -> Result<u64, String> {
     let backend_kind = resolve_requested_backend_kind(&state, backend_kind, &workspace_roots)?;
-    let path = resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
-    let (session, rx) = BackendSession::spawn_admin(backend_kind, &path, &workspace_roots).await?;
+    let launch_target = resolve_backend_launch_target(&app, &workspace_roots, backend_kind).await?;
+    let (session, rx) =
+        BackendSession::spawn_admin(backend_kind, &launch_target, &workspace_roots).await?;
 
     let id = {
         let mut mgr = state.admin.lock().await;
@@ -3780,14 +4489,13 @@ async fn restart_subprocess(
 
     old_session.shutdown().await;
 
-    let resolved_path =
-        resolve_backend_executable_path(&app, &workspace_roots, backend_kind).await?;
+    let launch_target = resolve_backend_launch_target(&app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers =
         startup_mcp_servers_for_new_sessions(state.inner(), false, &workspace_roots)?;
     let steering = steering::read_steering_from_roots(&workspace_roots).await?;
     let (session, rx) = BackendSession::spawn(
         backend_kind,
-        &resolved_path,
+        &launch_target,
         &workspace_roots,
         false,
         &startup_mcp_servers,
@@ -3796,21 +4504,31 @@ async fn restart_subprocess(
     )
     .await?;
 
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.insert(conversation_id, session, workspace_roots.clone());
+    }
+
+    let root_agent = ensure_conversation_agent_registered(
+        &app,
+        state.inner(),
+        conversation_id,
+        &workspace_roots,
+        backend_kind.as_str(),
+        "Conversation",
+    )
+    .await;
+
     let registration = serde_json::json!({
         "kind": "ConversationRegistered",
         "data": {
-            "agent_id": null,
+            "agent_id": root_agent.agent_id,
             "workspace_roots": &workspace_roots,
             "backend_kind": backend_kind.as_str(),
-            "name": "Conversation",
+            "name": &root_agent.name,
             "parent_agent_id": null,
         }
     });
-
-    {
-        let mut mgr = state.manager.lock().await;
-        mgr.insert(conversation_id, session, workspace_roots);
-    }
 
     let (settings_tx, _) = watch::channel(Value::Null);
     {
@@ -3978,29 +4696,137 @@ async fn run_shell_command(
 
 // --- Agent definition commands ---
 
+enum AgentDefinitionRoute {
+    Local,
+    TydeServer {
+        connection: Arc<tyde_server_conn::TydeServerConnection>,
+        remote_workspace_path: Option<String>,
+    },
+}
+
+async fn route_agent_definition_command(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    workspace_path: Option<String>,
+) -> Result<AgentDefinitionRoute, String> {
+    let Some(workspace_path) = workspace_path else {
+        return Ok(AgentDefinitionRoute::Local);
+    };
+
+    if parse_remote_path(&workspace_path).is_none() {
+        return Ok(AgentDefinitionRoute::Local);
+    }
+
+    let roots = vec![workspace_path];
+    match host_router::route_workspace(app, state, &roots).await? {
+        host_router::WorkspaceRoute::Local => Ok(AgentDefinitionRoute::Local),
+        host_router::WorkspaceRoute::TydeServer { connection } => {
+            Ok(AgentDefinitionRoute::TydeServer {
+                connection,
+                remote_workspace_path: host_router::strip_ssh_roots(&roots).into_iter().next(),
+            })
+        }
+    }
+}
+
 #[tauri::command]
 async fn list_agent_definitions(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     workspace_path: Option<String>,
 ) -> Result<Vec<agent_defs_io::AgentDefinitionEntry>, String> {
-    agent_defs_io::list_agent_definitions(workspace_path).await
+    let local_workspace_path = workspace_path
+        .clone()
+        .filter(|path| parse_remote_path(path).is_none());
+    match route_agent_definition_command(&app, state.inner(), workspace_path.clone()).await? {
+        AgentDefinitionRoute::Local => {
+            agent_defs_io::list_agent_definitions(local_workspace_path).await
+        }
+        AgentDefinitionRoute::TydeServer {
+            connection,
+            remote_workspace_path,
+        } => {
+            let response = connection
+                .invoke(
+                    "list_agent_definitions",
+                    serde_json::json!({
+                        "workspace_path": remote_workspace_path,
+                    }),
+                )
+                .await?;
+            serde_json::from_value(response)
+                .map_err(|e| format!("Failed to parse remote agent definitions: {e}"))
+        }
+    }
 }
 
 #[tauri::command]
 async fn save_agent_definition(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     definition_json: String,
     scope: String,
     workspace_path: Option<String>,
 ) -> Result<(), String> {
-    agent_defs_io::save_agent_definition(&definition_json, &scope, workspace_path).await
+    let local_workspace_path = workspace_path
+        .clone()
+        .filter(|path| parse_remote_path(path).is_none());
+    match route_agent_definition_command(&app, state.inner(), workspace_path.clone()).await? {
+        AgentDefinitionRoute::Local => {
+            agent_defs_io::save_agent_definition(&definition_json, &scope, local_workspace_path)
+                .await
+        }
+        AgentDefinitionRoute::TydeServer {
+            connection,
+            remote_workspace_path,
+        } => {
+            connection
+                .invoke(
+                    "save_agent_definition",
+                    serde_json::json!({
+                        "definition_json": definition_json,
+                        "scope": scope,
+                        "workspace_path": remote_workspace_path,
+                    }),
+                )
+                .await?;
+            Ok(())
+        }
+    }
 }
 
 #[tauri::command]
 async fn delete_agent_definition(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     id: String,
     scope: String,
     workspace_path: Option<String>,
 ) -> Result<(), String> {
-    agent_defs_io::delete_agent_definition(&id, &scope, workspace_path).await
+    let local_workspace_path = workspace_path
+        .clone()
+        .filter(|path| parse_remote_path(path).is_none());
+    match route_agent_definition_command(&app, state.inner(), workspace_path.clone()).await? {
+        AgentDefinitionRoute::Local => {
+            agent_defs_io::delete_agent_definition(&id, &scope, local_workspace_path).await
+        }
+        AgentDefinitionRoute::TydeServer {
+            connection,
+            remote_workspace_path,
+        } => {
+            connection
+                .invoke(
+                    "delete_agent_definition",
+                    serde_json::json!({
+                        "id": id,
+                        "scope": scope,
+                        "workspace_path": remote_workspace_path,
+                    }),
+                )
+                .await?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4026,7 +4852,7 @@ fn detect_system_dark_mode() -> bool {
     }
 }
 
-pub fn run() {
+pub fn run_with_options(headless: bool) {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -4039,17 +4865,26 @@ pub fn run() {
     raise_fd_limit();
 
     resolve_shell_path();
-    #[cfg(target_os = "linux")]
-    if detect_system_dark_mode() {
-        std::env::set_var("GTK_THEME", "Adwaita:dark");
+    if !headless {
+        #[cfg(target_os = "linux")]
+        if detect_system_dark_mode() {
+            std::env::set_var("GTK_THEME", "Adwaita:dark");
+        }
+    }
+    if headless {
+        tracing::info!("Starting Tyde in headless mode");
     }
     let driver_mcp_http_env_override = std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED").is_ok();
     let mut app_settings = load_app_settings();
     if !app_settings.driver_mcp_http_enabled {
         app_settings.driver_mcp_http_autoload = false;
     }
+    // In headless mode, always enable remote control
+    if headless {
+        app_settings.remote_control_enabled = true;
+    }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -4078,15 +4913,19 @@ pub fn run() {
             driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
             driver_mcp_http_autoload: SyncMutex::new(app_settings.driver_mcp_http_autoload),
             driver_mcp_http_env_override,
+            remote_control_enabled: SyncMutex::new(app_settings.remote_control_enabled),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instances: SyncMutex::new(dev_instance::DevInstanceRegistry::new()),
+            tyde_server_connections: SyncMutex::new(HashMap::new()),
         })
-        .setup(|app| {
-            initialize_tray(app)?;
+        .setup(move |app| {
+            if !headless {
+                initialize_tray(app)?;
+            }
             let mcp_http_enabled = *app.state::<AppState>().mcp_http_enabled.lock();
             if mcp_http_enabled {
                 if let Err(err) = agent_mcp_http::start_agent_mcp_http_server(app.handle()) {
@@ -4109,17 +4948,41 @@ pub fn run() {
             } else {
                 tracing::info!("Driver MCP HTTP server disabled by app settings");
             }
-            if let Some(window) = app.get_webview_window("main") {
-                let window_handle = window.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        if cfg!(target_os = "macos") {
-                            api.prevent_close();
-                            let _ = window_handle.hide();
-                        }
-                        // On Linux/Windows, let the close proceed normally and exit the app
+            let remote_control_enabled = *app.state::<AppState>().remote_control_enabled.lock();
+            if remote_control_enabled {
+                match remote_control::RemoteControlServer::start(app.handle().clone()) {
+                    Ok(server) => {
+                        tracing::info!(
+                            "Remote control server started on {}",
+                            server.socket_path().display()
+                        );
+                        app.manage(server);
                     }
-                });
+                    Err(err) => {
+                        tracing::warn!("Remote control server failed to start: {err}");
+                    }
+                }
+            } else {
+                tracing::info!("Remote control server disabled by app settings");
+            }
+            if !headless {
+                if let Some(window) = app.get_webview_window("main") {
+                    let window_handle = window.clone();
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            if cfg!(target_os = "macos") {
+                                api.prevent_close();
+                                let _ = window_handle.hide();
+                            }
+                        }
+                    });
+                }
+            } else {
+                // In headless mode, destroy the default window created by tauri.conf.json.
+                // On display-less Linux this prevents WebView initialization failures.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.destroy();
+                }
             }
             Ok(())
         })
@@ -4149,6 +5012,8 @@ pub fn run() {
             set_driver_mcp_http_server_enabled,
             set_driver_mcp_http_server_autoload_enabled,
             set_mcp_control_enabled,
+            get_remote_control_settings,
+            set_remote_control_enabled,
             list_hosts,
             add_host,
             remove_host,
@@ -4212,8 +5077,27 @@ pub fn run() {
             save_agent_definition,
             delete_agent_definition,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(move |app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            if headless && code.is_none() {
+                // Headless mode has no windows/tray, so prevent implicit app exit.
+                api.prevent_exit();
+                return;
+            }
+            if let Some(rc) = app_handle.try_state::<remote_control::RemoteControlServer>() {
+                rc.shutdown();
+            }
+        }
+        tauri::RunEvent::Exit => {
+            if let Some(rc) = app_handle.try_state::<remote_control::RemoteControlServer>() {
+                rc.shutdown();
+            }
+        }
+        _ => {}
+    });
 }
 
 fn initialize_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -4306,13 +5190,29 @@ mod tests {
             mcp_control_enabled: SyncMutex::new(true),
             driver_mcp_http_enabled: SyncMutex::new(false),
             driver_mcp_http_autoload: SyncMutex::new(false),
+            remote_control_enabled: SyncMutex::new(false),
             debug_event_log: SyncMutex::new(DebugEventLog::new()),
             debug_ui_pending: SyncMutex::new(HashMap::new()),
             debug_ui_request_seq: AtomicU64::new(1),
             disabled_backends: SyncMutex::new(HashSet::new()),
             settings_watch: Mutex::new(HashMap::new()),
             dev_instances: SyncMutex::new(dev_instance::DevInstanceRegistry::new()),
+            tyde_server_connections: SyncMutex::new(HashMap::new()),
             driver_mcp_http_env_override: false,
+        }
+    }
+
+    fn assert_transport_is_local(transport: BackendTransport) {
+        assert!(
+            matches!(transport, BackendTransport::Local),
+            "expected local transport"
+        );
+    }
+
+    fn assert_transport_is_remote(transport: BackendTransport, expected_host: &str) {
+        match transport {
+            BackendTransport::Ssh { host } => assert_eq!(host, expected_host),
+            BackendTransport::Local => panic!("expected remote transport"),
         }
     }
 
@@ -4401,6 +5301,78 @@ mod tests {
             path_line.contains(':'),
             "PATH has no colon separators: {path_line}"
         );
+    }
+
+    #[test]
+    fn launch_target_for_backend_routes_local_and_remote() {
+        let local_codex = launch_target_for_backend(BackendKind::Codex, None, None).unwrap();
+        assert_transport_is_local(local_codex.transport);
+        assert!(local_codex.executable_path.is_empty());
+
+        let remote_codex =
+            launch_target_for_backend(BackendKind::Codex, Some("dev.example.com".into()), None)
+                .unwrap();
+        assert_transport_is_remote(remote_codex.transport, "dev.example.com");
+        assert!(remote_codex.executable_path.is_empty());
+
+        let local_tycode = launch_target_for_backend(
+            BackendKind::Tycode,
+            None,
+            Some("/tmp/tycode-subprocess".into()),
+        )
+        .unwrap();
+        assert_transport_is_local(local_tycode.transport);
+        assert_eq!(local_tycode.executable_path, "/tmp/tycode-subprocess");
+
+        let remote_tycode = launch_target_for_backend(
+            BackendKind::Tycode,
+            Some("ssh-host".into()),
+            Some("/opt/tycode-subprocess".into()),
+        )
+        .unwrap();
+        assert_transport_is_remote(remote_tycode.transport, "ssh-host");
+        assert_eq!(remote_tycode.executable_path, "/opt/tycode-subprocess");
+    }
+
+    #[test]
+    fn launch_target_for_backend_requires_tycode_path() {
+        let err = launch_target_for_backend(BackendKind::Tycode, None, None).unwrap_err();
+        assert!(
+            err.contains("Missing tycode executable path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn usage_transport_for_host_id_maps_local_and_remote_hosts() {
+        let state = test_app_state();
+        let remote_id = {
+            let mut store = state.host_store.lock();
+            store
+                .add(
+                    "Remote".into(),
+                    "alice@remote.example.com".into(),
+                    host::RemoteKind::SshPipe,
+                )
+                .unwrap()
+                .id
+        };
+
+        let local_transport = usage_transport_for_host_id(&state, Some("local")).unwrap();
+        assert_transport_is_local(local_transport);
+
+        let remote_transport = usage_transport_for_host_id(&state, Some(&remote_id)).unwrap();
+        assert_transport_is_remote(remote_transport, "alice@remote.example.com");
+
+        let implicit_local = usage_transport_for_host_id(&state, None).unwrap();
+        assert_transport_is_local(implicit_local);
+    }
+
+    #[test]
+    fn usage_transport_for_host_id_errors_for_unknown_host() {
+        let state = test_app_state();
+        let err = usage_transport_for_host_id(&state, Some("missing-host")).unwrap_err();
+        assert!(err.contains("Host 'missing-host' not found"));
     }
 }
 

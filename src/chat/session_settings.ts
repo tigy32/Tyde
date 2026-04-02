@@ -658,6 +658,7 @@ export function createSessionSettings(
     },
 
     setBackendKind(kind: BackendKind) {
+      if (backendKind === kind) return;
       backendKind = kind;
       syncBackendVisibility();
       if (content.style.display !== "none") {

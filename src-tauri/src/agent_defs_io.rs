@@ -280,8 +280,10 @@ mod tests {
         // Also verify list_agent_definitions always returns exactly one "bridge" entry
         // (whether builtin or overridden by global/project scope).
         let entries = list_agent_definitions(None).await.unwrap();
-        let bridge_entries: Vec<_> =
-            entries.iter().filter(|e| e.definition.id == "bridge").collect();
+        let bridge_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.definition.id == "bridge")
+            .collect();
         assert_eq!(bridge_entries.len(), 1);
     }
 
@@ -371,7 +373,10 @@ mod tests {
             .unwrap();
 
         let entries = list_agent_definitions(Some(project_path)).await.unwrap();
-        let bridge: Vec<_> = entries.iter().filter(|e| e.definition.id == "bridge").collect();
+        let bridge: Vec<_> = entries
+            .iter()
+            .filter(|e| e.definition.id == "bridge")
+            .collect();
         assert_eq!(bridge.len(), 1);
         assert_eq!(bridge[0].definition.name, "Custom Bridge");
         assert_eq!(bridge[0].scope, "project");
@@ -423,7 +428,10 @@ mod tests {
         sync_fs::write(global_dir.join("bridge.json"), def_json).unwrap();
 
         let entries = list_agent_definitions(None).await.unwrap();
-        let bridge: Vec<_> = entries.iter().filter(|e| e.definition.id == "bridge").collect();
+        let bridge: Vec<_> = entries
+            .iter()
+            .filter(|e| e.definition.id == "bridge")
+            .collect();
         assert_eq!(bridge.len(), 1);
         assert_eq!(bridge[0].definition.name, "Global Bridge");
         assert_eq!(bridge[0].scope, "global");

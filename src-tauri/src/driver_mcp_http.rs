@@ -194,7 +194,9 @@ impl TydeDriverMcpServer {
         }
     }
 
-    #[tool(description = "List all running dev instances with their IDs, project directories, SSH hosts, and bound agent IDs.")]
+    #[tool(
+        description = "List all running dev instances with their IDs, project directories, SSH hosts, and bound agent IDs."
+    )]
     async fn tyde_dev_instance_list(
         &self,
         Parameters(_input): Parameters<EmptyInput>,
@@ -230,7 +232,13 @@ impl TydeDriverMcpServer {
             "limit": input.limit,
             "stream": input.stream,
         });
-        proxy_tool(&self.app, "tyde_debug_events_since", input.instance_id, args).await
+        proxy_tool(
+            &self.app,
+            "tyde_debug_events_since",
+            input.instance_id,
+            args,
+        )
+        .await
     }
 
     #[tool(

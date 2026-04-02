@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,11 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{from_str, json, to_value, Map, Value};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
-use crate::remote::{parse_remote_workspace_roots, resolve_remote_shell_path, shell_quote_arg, shell_quote_command, ssh_control_args};
+use crate::backend_transport::BackendTransport;
+use crate::remote::{parse_remote_workspace_roots, shell_quote_arg, shell_quote_command};
 use crate::subprocess::ImageAttachment;
 
 const GEMINI_AGENT_NAME: &str = "gemini";
@@ -38,48 +39,65 @@ pub struct GeminiSession {
 impl GeminiSession {
     pub async fn spawn(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            transport,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            transport,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     pub async fn spawn_admin(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(workspace_roots, ssh_host, startup_mcp_servers, steering_content).await
+        Self::spawn_with_mode(
+            workspace_roots,
+            transport,
+            startup_mcp_servers,
+            steering_content,
+        )
+        .await
     }
 
     async fn spawn_with_mode(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
+        let workspace_root = if transport.is_remote() {
             let parsed = parse_remote_workspace_roots(workspace_roots)?
                 .ok_or("Expected remote workspace roots for SSH session")?;
-            let remote_path = parsed
+            parsed
                 .1
                 .into_iter()
                 .next()
-                .ok_or("No remote workspace root found")?;
-            (remote_path, Some(host))
+                .ok_or("No remote workspace root found")?
         } else {
-            (pick_workspace_root(workspace_roots)?, None)
+            pick_workspace_root(workspace_roots)?
         };
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -87,7 +105,7 @@ impl GeminiSession {
             event_tx,
             state: Mutex::new(GeminiState {
                 workspace_root,
-                ssh_host: resolved_ssh_host,
+                transport,
                 model: None,
                 permission_mode: None,
                 steering_content: steering_content
@@ -120,7 +138,7 @@ struct ActiveTurn {
 
 struct GeminiState {
     workspace_root: String,
-    ssh_host: Option<String>,
+    transport: BackendTransport,
     model: Option<String>,
     permission_mode: Option<String>,
     steering_content: Option<String>,
@@ -175,9 +193,16 @@ enum WaitResult {
 }
 
 enum TurnOutcome {
-    Completed { summary: GeminiStdoutSummary },
-    Cancelled { summary: GeminiStdoutSummary },
-    Failed { summary: GeminiStdoutSummary, error: String },
+    Completed {
+        summary: GeminiStdoutSummary,
+    },
+    Cancelled {
+        summary: GeminiStdoutSummary,
+    },
+    Failed {
+        summary: GeminiStdoutSummary,
+        error: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +232,10 @@ impl GeminiInner {
                 }));
                 Ok(())
             }
-            SessionCommand::UpdateSettings { settings, persist: _ } => {
+            SessionCommand::UpdateSettings {
+                settings,
+                persist: _,
+            } => {
                 if let Some(obj) = settings.as_object() {
                     let mut state = this.state.lock().await;
                     if let Some(model_value) = obj.get("model") {
@@ -256,7 +284,16 @@ impl GeminiInner {
             return;
         }
 
-        let (turn_id, workspace_root, ssh_host, model, permission_mode, steering_content, startup_mcp_servers, cancel_rx) = {
+        let (
+            turn_id,
+            workspace_root,
+            transport,
+            model,
+            permission_mode,
+            steering_content,
+            startup_mcp_servers,
+            cancel_rx,
+        ) = {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
                 self.emit_error("Gemini is still processing the previous turn.");
@@ -273,7 +310,7 @@ impl GeminiInner {
             (
                 turn_id,
                 state.workspace_root.clone(),
-                state.ssh_host.clone(),
+                state.transport.clone(),
                 state.model.clone(),
                 state.permission_mode.clone(),
                 state.steering_content.clone(),
@@ -291,7 +328,7 @@ impl GeminiInner {
                 .run_turn(
                     &message_id,
                     &workspace_root,
-                    ssh_host.as_deref(),
+                    &transport,
                     &message,
                     model,
                     permission_mode.as_deref(),
@@ -304,7 +341,8 @@ impl GeminiInner {
             match outcome {
                 TurnOutcome::Completed { mut summary } => {
                     if !self.emit_summary_and_tool_requests(&mut summary) {
-                        let error = summary.error_message()
+                        let error = summary
+                            .error_message()
                             .unwrap_or_else(|| "Gemini returned no assistant output.".to_string());
                         self.emit_error(&error);
                     }
@@ -329,7 +367,7 @@ impl GeminiInner {
         self: &Arc<Self>,
         message_id: &str,
         workspace_root: &str,
-        ssh_host: Option<&str>,
+        transport: &BackendTransport,
         prompt: &str,
         model: Option<String>,
         _permission_mode: Option<&str>,
@@ -361,7 +399,7 @@ impl GeminiInner {
         let mut mcp_cleanup: Option<GeminiMcpCleanup> = None;
 
         if let Some(ref json) = mcp_settings_json {
-            if ssh_host.is_none() {
+            if !transport.is_remote() {
                 match inject_gemini_mcp_settings(workspace_root, json) {
                     Ok(cleanup) => mcp_cleanup = Some(cleanup),
                     Err(err) => {
@@ -374,17 +412,7 @@ impl GeminiInner {
             }
         }
 
-        let mut command = if let Some(host) = ssh_host {
-            let remote_path = match resolve_remote_shell_path(host).await {
-                Ok(path) => path,
-                Err(err) => {
-                    restore_gemini_mcp_settings(mcp_cleanup.take());
-                    return TurnOutcome::Failed {
-                        summary: GeminiStdoutSummary::default(),
-                        error: format!("Failed to resolve remote PATH: {err}"),
-                    };
-                }
-            };
+        let (program, args, cwd) = if transport.is_remote() {
             let quoted_args = shell_quote_command(&cli_args);
             // For remote: write .gemini/settings.json on the remote host via heredoc,
             // run gemini, then restore the original file.
@@ -395,7 +423,7 @@ impl GeminiInner {
                     "mkdir -p {}/.gemini && \
                      {{ [ -f {settings} ] && cp {settings} {backup}; }} 2>/dev/null; \
                      cat > {settings} <<'TYDE_MCP_EOF'\n{json}\nTYDE_MCP_EOF\n\
-                     cd {ws} && PATH={path} gemini {args}; \
+                     cd {ws} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" gemini {args}; \
                      _exit=$?; \
                      {{ [ -f {backup} ] && mv {backup} {settings} || rm -f {settings}; }} 2>/dev/null; \
                      exit $_exit",
@@ -403,57 +431,27 @@ impl GeminiInner {
                     settings = shell_quote_arg(&settings_path),
                     backup = shell_quote_arg(&backup_path),
                     ws = shell_quote_arg(workspace_root),
-                    path = shell_quote_arg(&remote_path),
                     args = quoted_args,
                 )
             } else {
                 format!(
-                    "cd {} && PATH={} gemini {}",
+                    "cd {} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" gemini {}",
                     shell_quote_arg(workspace_root),
-                    shell_quote_arg(&remote_path),
                     quoted_args,
                 )
             };
-            let mut cmd = Command::new("ssh");
-            let control_args = match ssh_control_args() {
-                Ok(args) => args,
-                Err(err) => {
-                    restore_gemini_mcp_settings(mcp_cleanup.take());
-                    return TurnOutcome::Failed {
-                        summary: GeminiStdoutSummary::default(),
-                        error: format!("Failed to get SSH control args: {err}"),
-                    };
-                }
-            };
-            for arg in control_args {
-                cmd.arg(arg);
-            }
-            cmd.arg("-T")
-                .arg(host)
-                .arg(remote_cmd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd
+            ("sh".to_string(), vec!["-lc".to_string(), remote_cmd], None)
         } else {
-            let mut cmd = Command::new("gemini");
-            for arg in &cli_args {
-                cmd.arg(arg);
-            }
-            cmd.current_dir(workspace_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            cmd
+            ("gemini".to_string(), cli_args.clone(), Some(workspace_root))
         };
 
-        let mut child = match command.spawn() {
+        let mut child = match transport.spawn_process(&program, &args, cwd).await {
             Ok(child) => child,
             Err(err) => {
                 restore_gemini_mcp_settings(mcp_cleanup.take());
                 return TurnOutcome::Failed {
                     summary: GeminiStdoutSummary::default(),
-                    error: format!("Failed to start Gemini CLI: {err:?}"),
+                    error: format!("Failed to start Gemini CLI: {err}"),
                 };
             }
         };
@@ -598,7 +596,13 @@ impl GeminiInner {
             return false;
         }
 
-        self.emit_stream_end(text, summary.model.clone(), summary.usage.take(), reasoning, tool_calls_json);
+        self.emit_stream_end(
+            text,
+            summary.model.clone(),
+            summary.usage.take(),
+            reasoning,
+            tool_calls_json,
+        );
         for tool_call in &summary.tool_calls {
             self.emit_tool_request(tool_call);
         }
@@ -666,7 +670,6 @@ impl GeminiInner {
             }
         }));
     }
-
 
     fn emit_stream_end(
         &self,
@@ -829,7 +832,14 @@ fn consume_gemini_event(
             }
         }
         "message" => {
-            consume_message_event(value, summary, segment, inner, base_message_id, current_message_id);
+            consume_message_event(
+                value,
+                summary,
+                segment,
+                inner,
+                base_message_id,
+                current_message_id,
+            );
         }
         "tool_use" => {
             let Some(tool_call) = extract_gemini_tool_call(value) else {
@@ -879,11 +889,7 @@ fn consume_gemini_event(
                 map_tool_completion_result(&tool_name, &result_content)
             };
 
-            let error = if is_error {
-                Some(result_content)
-            } else {
-                None
-            };
+            let error = if is_error { Some(result_content) } else { None };
             inner.emit_tool_execution_completed(
                 &tool_call_id,
                 &tool_name,
@@ -905,10 +911,7 @@ fn consume_gemini_event(
             summary.errors.push(message);
         }
         "result" => {
-            if let Some(usage) = value
-                .get("stats")
-                .and_then(|v| parse_gemini_usage(Some(v)))
-            {
+            if let Some(usage) = value.get("stats").and_then(|v| parse_gemini_usage(Some(v))) {
                 summary.usage = Some(usage);
             }
             if value
@@ -953,7 +956,13 @@ fn consume_message_event(
     let text = extract_message_text(value).filter(|t| !t.trim().is_empty());
 
     if let Some(ref text) = text {
-        maybe_emit_next_stream_start(segment, inner, base_message_id, current_message_id, summary.model.clone());
+        maybe_emit_next_stream_start(
+            segment,
+            inner,
+            base_message_id,
+            current_message_id,
+            summary.model.clone(),
+        );
         summary.streamed_text.push_str(text);
         segment.has_content = true;
         inner.emit_stream_delta(current_message_id, text);
@@ -980,10 +989,7 @@ fn extract_gemini_tool_call(value: &Value) -> Option<GeminiToolCall> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "tool".to_string());
-    let arguments = value
-        .get("parameters")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let arguments = value.get("parameters").cloned().unwrap_or(Value::Null);
 
     Some(GeminiToolCall {
         id,
@@ -1167,7 +1173,11 @@ fn gemini_known_models() -> Vec<Value> {
         ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview", false),
         ("gemini-3-pro-preview", "Gemini 3 Pro Preview", false),
         ("gemini-3-flash-preview", "Gemini 3 Flash Preview", false),
-        ("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite Preview", false),
+        (
+            "gemini-3.1-flash-lite-preview",
+            "Gemini 3.1 Flash Lite Preview",
+            false,
+        ),
         ("gemini-2.5-pro", "Gemini 2.5 Pro", false),
         ("gemini-2.5-flash", "Gemini 2.5 Flash", false),
         ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite", false),
@@ -1213,10 +1223,7 @@ fn parse_gemini_usage(raw: Option<&Value>) -> Option<Value> {
         .get("duration_ms")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let tool_call_count = stats
-        .get("tool_calls")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let tool_call_count = stats.get("tool_calls").and_then(Value::as_u64).unwrap_or(0);
 
     if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
         return None;
@@ -1251,7 +1258,9 @@ fn build_gemini_settings_json(startup_mcp_servers: &[StartupMcpServer]) -> Optio
         }
         let config = match &server.transport {
             StartupMcpTransport::Http { url, headers, .. } => build_http_mcp_config(url, headers),
-            StartupMcpTransport::Stdio { command, args, env } => build_stdio_mcp_config(command, args, env),
+            StartupMcpTransport::Stdio { command, args, env } => {
+                build_stdio_mcp_config(command, args, env)
+            }
         };
         if let Some(config) = config {
             servers.insert(name.to_string(), config);
@@ -1281,13 +1290,20 @@ fn build_http_mcp_config(url: &str, headers: &HashMap<String, String>) -> Option
     Some(Value::Object(cfg))
 }
 
-fn build_stdio_mcp_config(command: &str, args: &[String], env: &HashMap<String, String>) -> Option<Value> {
+fn build_stdio_mcp_config(
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Option<Value> {
     let trimmed_command = command.trim();
     if trimmed_command.is_empty() {
         return None;
     }
     let mut cfg = Map::new();
-    cfg.insert("command".to_string(), Value::String(trimmed_command.to_string()));
+    cfg.insert(
+        "command".to_string(),
+        Value::String(trimmed_command.to_string()),
+    );
     if !args.is_empty() {
         cfg.insert(
             "args".to_string(),
@@ -1309,12 +1325,19 @@ fn evaluate_exit_status(
     stderr_output: &str,
 ) -> TurnOutcome {
     if status.code() == Some(130) {
-        return TurnOutcome::Cancelled { summary: stdout_summary };
+        return TurnOutcome::Cancelled {
+            summary: stdout_summary,
+        };
     }
     if status.success() {
         return match stdout_summary.error_message() {
-            Some(error) => TurnOutcome::Failed { summary: stdout_summary, error },
-            None => TurnOutcome::Completed { summary: stdout_summary },
+            Some(error) => TurnOutcome::Failed {
+                summary: stdout_summary,
+                error,
+            },
+            None => TurnOutcome::Completed {
+                summary: stdout_summary,
+            },
         };
     }
     let error = stdout_summary
@@ -1324,7 +1347,10 @@ fn evaluate_exit_status(
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         })
         .unwrap_or_else(|| format!("Gemini exited with status {status}"));
-    TurnOutcome::Failed { summary: stdout_summary, error }
+    TurnOutcome::Failed {
+        summary: stdout_summary,
+        error,
+    }
 }
 
 struct GeminiMcpCleanup {
@@ -1335,7 +1361,10 @@ struct GeminiMcpCleanup {
 
 /// Writes MCP server config to `{workspace_root}/.gemini/settings.json`.
 /// Returns a cleanup handle to restore the original state after the turn.
-fn inject_gemini_mcp_settings(workspace_root: &str, json: &str) -> Result<GeminiMcpCleanup, String> {
+fn inject_gemini_mcp_settings(
+    workspace_root: &str,
+    json: &str,
+) -> Result<GeminiMcpCleanup, String> {
     let gemini_dir = Path::new(workspace_root).join(".gemini");
     let settings_path = gemini_dir.join("settings.json");
 

@@ -7,10 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdout, Command};
+use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::{AgentIdentity, SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::backend_transport::BackendTransport;
 use crate::subprocess::ImageAttachment;
 
 /// Handle returned by SubAgentEmitter::on_subagent_spawned.
@@ -95,7 +96,7 @@ pub struct ClaudeSession {
 impl ClaudeSession {
     pub async fn spawn(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
@@ -103,7 +104,7 @@ impl ClaudeSession {
         Self::spawn_with_mode(
             workspace_roots,
             false,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
             agent_identity,
@@ -113,7 +114,7 @@ impl ClaudeSession {
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
@@ -121,7 +122,7 @@ impl ClaudeSession {
         Self::spawn_with_mode(
             workspace_roots,
             true,
-            ssh_host,
+            transport,
             startup_mcp_servers,
             steering_content,
             agent_identity,
@@ -132,22 +133,21 @@ impl ClaudeSession {
     async fn spawn_with_mode(
         workspace_roots: &[String],
         no_session_persistence: bool,
-        ssh_host: Option<String>,
+        transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
+        let workspace_root = if transport.is_remote() {
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
                 .ok_or("Expected remote workspace roots for SSH session")?;
-            let remote_path = parsed
+            parsed
                 .1
                 .into_iter()
                 .next()
-                .ok_or("No remote workspace root found")?;
-            (remote_path, Some(host))
+                .ok_or("No remote workspace root found")?
         } else {
-            (pick_workspace_root(workspace_roots)?, None)
+            pick_workspace_root(workspace_roots)?
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -155,7 +155,7 @@ impl ClaudeSession {
             event_tx,
             state: Mutex::new(ClaudeState {
                 workspace_root,
-                ssh_host: resolved_ssh_host,
+                transport,
                 session_id: None,
                 ephemeral: no_session_persistence,
                 model: None,
@@ -198,7 +198,7 @@ struct ActiveTurn {
 #[derive(Default)]
 struct ClaudeState {
     workspace_root: String,
-    ssh_host: Option<String>,
+    transport: BackendTransport,
     session_id: Option<String>,
     ephemeral: bool,
     model: Option<String>,
@@ -403,7 +403,7 @@ enum TurnOutcome {
 struct RunTurnParams<'a> {
     message_id: &'a str,
     workspace_root: &'a str,
-    ssh_host: Option<&'a str>,
+    transport: BackendTransport,
     prompt: &'a str,
     images: &'a [ImageAttachment],
     session_id: Option<String>,
@@ -501,7 +501,7 @@ impl ClaudeInner {
         let (
             turn_id,
             workspace_root,
-            ssh_host,
+            transport,
             session_id,
             ephemeral,
             model,
@@ -531,7 +531,7 @@ impl ClaudeInner {
             (
                 turn_id,
                 state.workspace_root.clone(),
-                state.ssh_host.clone(),
+                state.transport.clone(),
                 if state.ephemeral {
                     None
                 } else {
@@ -559,7 +559,7 @@ impl ClaudeInner {
                     RunTurnParams {
                         message_id: &message_id,
                         workspace_root: &workspace_root,
-                        ssh_host: ssh_host.as_deref(),
+                        transport,
                         prompt: &message,
                         images: &images,
                         session_id,
@@ -711,7 +711,7 @@ impl ClaudeInner {
         let RunTurnParams {
             message_id,
             workspace_root,
-            ssh_host,
+            transport,
             prompt,
             images,
             session_id,
@@ -797,40 +797,16 @@ impl ClaudeInner {
             }
         }
 
-        let mut child = if let Some(host) = ssh_host {
-            match crate::remote::spawn_remote_process(
-                host,
-                "claude",
-                &cli_args,
-                Some(workspace_root),
-            )
+        let mut child = match transport
+            .spawn_process("claude", &cli_args, Some(workspace_root))
             .await
-            {
-                Ok(child) => child,
-                Err(err) => {
-                    return TurnOutcome::Failed {
-                        summary: ClaudeStdoutSummary::default(),
-                        error: format!("Failed to start Claude CLI over SSH: {err}"),
-                    };
-                }
-            }
-        } else {
-            let mut cmd = Command::new("claude");
-            for arg in &cli_args {
-                cmd.arg(arg);
-            }
-            cmd.current_dir(workspace_root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            match cmd.spawn() {
-                Ok(child) => child,
-                Err(err) => {
-                    return TurnOutcome::Failed {
-                        summary: ClaudeStdoutSummary::default(),
-                        error: format!("Failed to start Claude CLI: {err}"),
-                    };
-                }
+        {
+            Ok(child) => child,
+            Err(err) => {
+                return TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error: format!("Failed to start Claude CLI: {err}"),
+                };
             }
         };
 
@@ -1041,16 +1017,12 @@ impl ClaudeInner {
     }
 
     async fn list_sessions(&self) -> Result<(), String> {
-        let (workspace_root, ssh_host) = {
+        let (workspace_root, transport) = {
             let state = self.state.lock().await;
-            (state.workspace_root.clone(), state.ssh_host.clone())
+            (state.workspace_root.clone(), state.transport.clone())
         };
 
-        let sessions = if let Some(host) = &ssh_host {
-            list_claude_sessions_remote(host, &workspace_root).await?
-        } else {
-            list_claude_sessions(&workspace_root).await?
-        };
+        let sessions = list_claude_sessions_for_transport(&transport, &workspace_root).await?;
         self.emit_event(json!({
             "kind": "SessionsList",
             "data": { "sessions": sessions }
@@ -1060,12 +1032,12 @@ impl ClaudeInner {
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
-        let (workspace_root, ssh_host) = {
+        let (workspace_root, transport) = {
             let mut state = self.state.lock().await;
             state.session_id = Some(normalized.clone());
             state.last_cumulative_usage = None;
             state.conversation_bytes_total = 0;
-            (state.workspace_root.clone(), state.ssh_host.clone())
+            (state.workspace_root.clone(), state.transport.clone())
         };
 
         self.emit_event(json!({
@@ -1075,11 +1047,9 @@ impl ClaudeInner {
         self.emit_event(json!({ "kind": "ConversationCleared" }));
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
 
-        let replay = if let Some(host) = &ssh_host {
-            load_claude_session_history_remote(host, &workspace_root, &normalized).await?
-        } else {
-            load_claude_session_history(&workspace_root, &normalized).await?
-        };
+        let replay =
+            load_claude_session_history_for_transport(&transport, &workspace_root, &normalized)
+                .await?;
         for item in replay.items {
             match item {
                 ClaudeHistoryReplayItem::Message(message) => {
@@ -1111,29 +1081,17 @@ impl ClaudeInner {
 
     async fn delete_session(&self, session_id: String) -> Result<(), String> {
         let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
-        let (workspace_root, ssh_host) = {
+        let (workspace_root, transport) = {
             let mut state = self.state.lock().await;
             if state.session_id.as_deref() == Some(normalized.as_str()) {
                 state.session_id = None;
                 state.last_cumulative_usage = None;
                 state.conversation_bytes_total = 0;
             }
-            (state.workspace_root.clone(), state.ssh_host.clone())
+            (state.workspace_root.clone(), state.transport.clone())
         };
 
-        if let Some(host) = &ssh_host {
-            delete_claude_session_remote(host, &workspace_root, &normalized).await?;
-        } else {
-            let session_file = claude_session_file_path(&workspace_root, &normalized)?;
-            if let Err(err) = tokio_fs::remove_file(&session_file).await {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(format!(
-                        "Failed to delete Claude session '{}': {err}",
-                        session_file.display()
-                    ));
-                }
-            }
-        }
+        delete_claude_session_for_transport(&transport, &workspace_root, &normalized).await?;
         self.list_sessions().await?;
         Ok(())
     }
@@ -4543,10 +4501,12 @@ fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 async fn list_claude_sessions_remote(
-    host: &str,
+    transport: &BackendTransport,
     workspace_root: &str,
 ) -> Result<Vec<Value>, String> {
-    use crate::remote::run_ssh_raw;
+    let host = transport
+        .ssh_host()
+        .ok_or("Expected SSH transport for remote Claude session listing")?;
 
     let encoded = encode_workspace_root(workspace_root);
     tracing::info!(
@@ -4568,7 +4528,7 @@ async fn list_claude_sessions_remote(
            tail -5 \"$f\"; \
          done"
     );
-    let output = run_ssh_raw(host, &script).await?;
+    let output = transport.run_shell_command(&script).await?;
     let raw = String::from_utf8_lossy(&output.stdout);
 
     let mut sessions = Vec::new();
@@ -4607,17 +4567,25 @@ async fn list_claude_sessions_remote(
     Ok(sessions)
 }
 
+async fn list_claude_sessions_for_transport(
+    transport: &BackendTransport,
+    workspace_root: &str,
+) -> Result<Vec<Value>, String> {
+    match transport.ssh_host() {
+        Some(_) => list_claude_sessions_remote(transport, workspace_root).await,
+        None => list_claude_sessions(workspace_root).await,
+    }
+}
+
 async fn load_claude_session_history_remote(
-    host: &str,
+    transport: &BackendTransport,
     workspace_root: &str,
     session_id: &str,
 ) -> Result<ClaudeSessionReplay, String> {
-    use crate::remote::run_ssh_raw;
-
     let encoded = encode_workspace_root(workspace_root);
     let id = normalize_nonempty(session_id).ok_or("Invalid session id")?;
     let cmd = format!("cat \"$HOME/.claude/projects/{encoded}/{id}.jsonl\"");
-    let output = run_ssh_raw(host, &cmd).await?;
+    let output = transport.run_shell_command(&cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -4628,16 +4596,25 @@ async fn load_claude_session_history_remote(
     Ok(parse_claude_session_replay(&contents))
 }
 
+async fn load_claude_session_history_for_transport(
+    transport: &BackendTransport,
+    workspace_root: &str,
+    session_id: &str,
+) -> Result<ClaudeSessionReplay, String> {
+    match transport.ssh_host() {
+        Some(_) => load_claude_session_history_remote(transport, workspace_root, session_id).await,
+        None => load_claude_session_history(workspace_root, session_id).await,
+    }
+}
+
 async fn delete_claude_session_remote(
-    host: &str,
+    transport: &BackendTransport,
     workspace_root: &str,
     session_id: &str,
 ) -> Result<(), String> {
-    use crate::remote::run_ssh_raw;
-
     let encoded = encode_workspace_root(workspace_root);
     let cmd = format!("rm -f \"$HOME/.claude/projects/{encoded}/{session_id}.jsonl\"");
-    let output = run_ssh_raw(host, &cmd).await?;
+    let output = transport.run_shell_command(&cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -4645,6 +4622,28 @@ async fn delete_claude_session_remote(
         ));
     }
     Ok(())
+}
+
+async fn delete_claude_session_for_transport(
+    transport: &BackendTransport,
+    workspace_root: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    match transport.ssh_host() {
+        Some(_) => delete_claude_session_remote(transport, workspace_root, session_id).await,
+        None => {
+            let session_file = claude_session_file_path(workspace_root, session_id)?;
+            if let Err(err) = tokio_fs::remove_file(&session_file).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "Failed to delete Claude session '{}': {err}",
+                        session_file.display()
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn unix_now_ms() -> u64 {
@@ -4675,7 +4674,7 @@ mod tests {
             event_tx,
             state: Mutex::new(ClaudeState {
                 workspace_root: "/tmp/test-workspace".to_string(),
-                ssh_host: None,
+                transport: BackendTransport::Local,
                 session_id: None,
                 ephemeral: false,
                 model: None,
@@ -5339,7 +5338,7 @@ mod tests {
                 event_tx,
                 state: Mutex::new(ClaudeState {
                     workspace_root,
-                    ssh_host: None,
+                    transport: BackendTransport::Local,
                     session_id: None,
                     ephemeral: true,
                     model: None,
@@ -5373,7 +5372,7 @@ mod tests {
                 RunTurnParams {
                     message_id: "claude-live-integration-msg-1",
                     workspace_root: &workspace_root,
-                    ssh_host: None,
+                    transport: BackendTransport::Local,
                     prompt,
                     images: &[],
                     session_id,

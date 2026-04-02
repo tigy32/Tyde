@@ -357,8 +357,15 @@ pub(crate) async fn start_dev_instance(
     let instance_id = state.dev_instances.lock().next_instance_id();
 
     if let Some(ref host) = ssh_host {
-        start_remote_dev_instance(state, instance_id, project_dir, workspace_path, host, agent_id)
-            .await
+        start_remote_dev_instance(
+            state,
+            instance_id,
+            project_dir,
+            workspace_path,
+            host,
+            agent_id,
+        )
+        .await
     } else {
         start_local_dev_instance(state, instance_id, project_dir, workspace_path, agent_id).await
     }
@@ -544,9 +551,7 @@ async fn start_remote_dev_instance(
     }
     tunnel_cmd
         .arg("-L")
-        .arg(format!(
-            "{local_tunnel_port}:127.0.0.1:{remote_debug_port}"
-        ))
+        .arg(format!("{local_tunnel_port}:127.0.0.1:{remote_debug_port}"))
         .arg("-N")
         .arg(host)
         .stdin(std::process::Stdio::null())
@@ -707,10 +712,7 @@ pub(crate) async fn proxy_debug_tool_call(
 
 /// Stop all dev instances bound to a given agent.
 pub(crate) async fn stop_instances_for_agent(state: &AppState, agent_id: u64) -> Vec<u64> {
-    let ids = state
-        .dev_instances
-        .lock()
-        .instance_ids_for_agent(agent_id);
+    let ids = state.dev_instances.lock().instance_ids_for_agent(agent_id);
 
     let mut stopped = Vec::new();
     for id in ids {
@@ -729,7 +731,10 @@ pub(crate) fn dev_instance_list(state: &AppState) -> Vec<DevInstanceInfo> {
 
 /// Resolve an optional instance_id, using sole_instance if None.
 /// Returns the resolved ID or an appropriate error.
-pub(crate) fn resolve_instance_id(state: &AppState, instance_id: Option<u64>) -> Result<u64, String> {
+pub(crate) fn resolve_instance_id(
+    state: &AppState,
+    instance_id: Option<u64>,
+) -> Result<u64, String> {
     match instance_id {
         Some(id) => Ok(id),
         None => {
@@ -737,12 +742,9 @@ pub(crate) fn resolve_instance_id(state: &AppState, instance_id: Option<u64>) ->
             if guard.instances.is_empty() {
                 Err("No dev instance running.".to_string())
             } else {
-                guard
-                    .sole_instance()
-                    .map(|i| i.instance_id)
-                    .ok_or_else(|| {
-                        "Multiple dev instances running; specify instance_id".to_string()
-                    })
+                guard.sole_instance().map(|i| i.instance_id).ok_or_else(|| {
+                    "Multiple dev instances running; specify instance_id".to_string()
+                })
             }
         }
     }

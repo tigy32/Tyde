@@ -1,4 +1,8 @@
-import { openWorkspace, openWorkspaceAndWaitForChat, sel } from './helpers';
+import {
+  openWorkspace,
+  resetAppState,
+  sel,
+} from './helpers';
 
 describe('Multi-workspace management', () => {
   it('comprehensive workspace flow: welcome → tab isolation → settings overlay', async () => {
@@ -169,5 +173,33 @@ describe('Multi-workspace management', () => {
     await browser.execute(() => {
       delete (window as any).__mockDialogPath;
     });
+  });
+
+  it('recovers from malformed persisted project roots without a blank workspace', async () => {
+    const malformedProjectState = JSON.stringify({
+      projects: [
+        {
+          id: 'project-1',
+          name: 'workspace',
+          workspacePath: '/mock/workspace',
+          roots: 'not-an-array',
+        },
+      ],
+      activeProjectId: 'project-1',
+      sidebarCollapsed: false,
+    });
+
+    await resetAppState({
+      'tyde-projects': malformedProjectState,
+    });
+
+    const title = await $(sel.appTitle);
+    await browser.waitUntil(
+      async () => (await title.getText()).includes('workspace'),
+      { timeout: 10_000, timeoutMsg: 'Workspace did not recover from malformed persisted state' },
+    );
+
+    const workspaceView = await $('[data-testid="workspace-view"][data-view-mode="workspace"]');
+    await workspaceView.waitForDisplayed({ timeout: 10_000 });
   });
 });
