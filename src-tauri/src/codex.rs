@@ -22,7 +22,7 @@ const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX: u64 = 400_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
-const CODEX_FORCED_THREAD_SANDBOX: &str = "workspace-write";
+const CODEX_FORCED_THREAD_SANDBOX: &str = "danger-full-access";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 
@@ -380,9 +380,9 @@ impl CodexInner {
                 let approval_policy = approval_policy_override
                     .unwrap_or_else(|| CODEX_FORCED_APPROVAL_POLICY.to_string());
                 params["approvalPolicy"] = Value::String(approval_policy);
-                // Force writable sandbox on each turn so resumed/continued threads
-                // cannot fall back to a read-only default.
-                params["sandboxPolicy"] = codex_workspace_write_sandbox_policy();
+                // Force sandbox mode on each turn so resumed/continued threads
+                // cannot fall back to a more restrictive default.
+                params["sandboxPolicy"] = codex_danger_full_access_sandbox_policy();
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
                     self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
@@ -4115,8 +4115,8 @@ fn parse_review_decision(message: &str) -> &'static str {
     }
 }
 
-fn codex_workspace_write_sandbox_policy() -> Value {
-    json!({ "type": "workspaceWrite" })
+fn codex_danger_full_access_sandbox_policy() -> Value {
+    json!({ "type": "dangerFullAccess" })
 }
 
 fn normalize_reasoning_effort(raw: &str) -> Option<String> {
@@ -5779,11 +5779,11 @@ If you skip spawn_agent or wait_agent, this test fails."#;
     }
 
     #[test]
-    fn codex_workspace_write_sandbox_policy_is_workspace_write() {
-        let policy = codex_workspace_write_sandbox_policy();
+    fn codex_danger_full_access_sandbox_policy_is_danger_full_access() {
+        let policy = codex_danger_full_access_sandbox_policy();
         assert_eq!(
             policy.get("type").and_then(Value::as_str),
-            Some("workspaceWrite")
+            Some("dangerFullAccess")
         );
     }
 }

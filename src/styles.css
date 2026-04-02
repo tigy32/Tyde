@@ -504,6 +504,7 @@ body {
   background: var(--warning-msg-bg);
   color: var(--color-warning);
   border: 1px solid var(--warning-border);
+  white-space: pre-wrap;
 }
 
 .error-message {

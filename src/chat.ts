@@ -96,6 +96,8 @@ interface ConversationView {
   programmaticScroll: boolean;
   retryCard: HTMLElement | null;
   retryCountdownTimer: number | null;
+  pendingStderrLines: string[];
+  stderrFlushTimer: number | null;
   loadingOverlay: HTMLElement;
   messages: StoredMessage[];
   virtualizer: Virtualizer<HTMLElement, HTMLElement>;
@@ -245,6 +247,9 @@ function renderVisibleMessages(view: ConversationView): void {
 
 const ANSI_OSC_RE = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g;
 const ANSI_CSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const STDERR_FLUSH_DELAY_MS = 250;
+const STDERR_MAX_BATCH_LINES = 120;
+const STDERR_MAX_BATCH_CHARS = 6_000;
 
 function stripAnsiSequences(value: string): string {
   return value
@@ -498,6 +503,8 @@ export class ChatPanel {
       programmaticScroll: false,
       retryCard: null,
       retryCountdownTimer: null,
+      pendingStderrLines: [],
+      stderrFlushTimer: null,
       loadingOverlay,
       messages,
       virtualizer,
@@ -827,6 +834,7 @@ export class ChatPanel {
     this.typingByConversation.delete(conversationId);
     const view = this.views.get(conversationId);
     if (!view) return;
+    this.clearPendingStderr(view);
     view.childResizeObserver.disconnect();
     if (view.teardownVirtualizer) {
       view.teardownVirtualizer();
@@ -874,6 +882,7 @@ export class ChatPanel {
         this.handleStreamEnd(view, event.data.message);
         break;
       case "Error":
+        this.flushPendingStderr(view);
         if (view.streamState.currentBubble) {
           this.handleStreamInterruption(view, event.data);
         } else {
@@ -882,11 +891,7 @@ export class ChatPanel {
         this.notificationManager?.notifyError(event.data);
         break;
       case "SubprocessStderr": {
-        const line = stripAnsiSequences(event.data).trim();
-        if (!line) break;
-        const clipped =
-          line.length > 300 ? `${line.slice(0, 300)}\u2026` : line;
-        this.appendSystemMessage(view, `Backend stderr: ${clipped}`, "warning");
+        this.queuePendingStderr(view, event.data);
         break;
       }
       case "ToolRequest":
@@ -936,6 +941,7 @@ export class ChatPanel {
         this.setConversationTypingVisible(view, event.data === true);
         break;
       case "SubprocessExit":
+        this.flushPendingStderr(view);
         view.disconnected = true;
         this.setConversationTypingVisible(view, false);
         if (view.streamState.currentBubble) {
@@ -1112,6 +1118,7 @@ export class ChatPanel {
   }
 
   private clearConversation(view: ConversationView): void {
+    this.clearPendingStderr(view);
     this.typingByConversation.set(view.conversationId, false);
     this.applyViewTypingVisible(view, false, false);
     if (view.retryCountdownTimer !== null) {
@@ -1140,6 +1147,56 @@ export class ChatPanel {
     view.messages.push({ kind: "system", text, style, element: null });
     updateVirtualizerCount(view);
     this.scrollToBottom(view);
+  }
+
+  private queuePendingStderr(view: ConversationView, rawLine: string): void {
+    const line = stripAnsiSequences(rawLine).replace(/\r/g, "").trimEnd();
+    if (line.trim().length === 0) return;
+
+    view.pendingStderrLines.push(line);
+    if (view.pendingStderrLines.length >= STDERR_MAX_BATCH_LINES) {
+      this.flushPendingStderr(view);
+      return;
+    }
+
+    if (view.stderrFlushTimer !== null) {
+      clearTimeout(view.stderrFlushTimer);
+    }
+    view.stderrFlushTimer = window.setTimeout(() => {
+      view.stderrFlushTimer = null;
+      this.flushPendingStderr(view);
+    }, STDERR_FLUSH_DELAY_MS);
+  }
+
+  private flushPendingStderr(view: ConversationView): void {
+    if (view.stderrFlushTimer !== null) {
+      clearTimeout(view.stderrFlushTimer);
+      view.stderrFlushTimer = null;
+    }
+    if (view.pendingStderrLines.length === 0) return;
+
+    const lines = view.pendingStderrLines;
+    view.pendingStderrLines = [];
+
+    let body = lines.join("\n");
+    if (body.length > STDERR_MAX_BATCH_CHARS) {
+      const overflow = body.length - STDERR_MAX_BATCH_CHARS;
+      body = `${body.slice(0, STDERR_MAX_BATCH_CHARS)}\n\u2026 (${overflow} more chars)`;
+    }
+
+    const header =
+      lines.length === 1
+        ? "Backend stderr:"
+        : `Backend stderr (${lines.length} lines):`;
+    this.appendSystemMessage(view, `${header}\n${body}`, "warning");
+  }
+
+  private clearPendingStderr(view: ConversationView): void {
+    if (view.stderrFlushTimer !== null) {
+      clearTimeout(view.stderrFlushTimer);
+      view.stderrFlushTimer = null;
+    }
+    view.pendingStderrLines = [];
   }
 
   // --- Stream handlers ---
