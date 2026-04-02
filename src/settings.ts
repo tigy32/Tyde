@@ -107,12 +107,21 @@ function applyAppearanceToDocument(a: AppearanceSettings): void {
 // --- Tab ID management ---
 
 type SettingsTabId = string;
+const VALID_SETTINGS_TABS = new Set<SettingsTabId>([
+  "appearance",
+  "backends",
+  "agents",
+  "tyde",
+  "general",
+  "providers",
+  "mcp",
+  "agent-models",
+  "advanced",
+]);
 
 function loadActiveTab(): SettingsTabId {
   const stored = localStorage.getItem(ACTIVE_SETTINGS_TAB_KEY) ?? "appearance";
-  if (stored.startsWith("codex")) return "general";
-  if (stored === "hosts") return "backends";
-  return stored;
+  return VALID_SETTINGS_TABS.has(stored) ? stored : "appearance";
 }
 
 function saveActiveTab(tab: SettingsTabId): void {

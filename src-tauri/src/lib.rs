@@ -396,9 +396,6 @@ struct AppSettings {
     driver_mcp_http_enabled: bool,
     #[serde(default = "default_driver_mcp_http_autoload")]
     driver_mcp_http_autoload: bool,
-    // Legacy field — kept for serde backward compat, no longer read.
-    #[serde(default)]
-    default_backend: String,
 }
 
 fn default_mcp_http_enabled() -> bool {
@@ -424,7 +421,6 @@ impl Default for AppSettings {
             mcp_control_enabled: default_mcp_control_enabled(),
             driver_mcp_http_enabled: default_driver_mcp_http_enabled(),
             driver_mcp_http_autoload: default_driver_mcp_http_autoload(),
-            default_backend: String::new(),
         }
     }
 }
@@ -836,7 +832,6 @@ fn app_settings_from_state(state: &AppState) -> AppSettings {
         mcp_control_enabled: *state.mcp_control_enabled.lock(),
         driver_mcp_http_enabled: driver_enabled,
         driver_mcp_http_autoload: driver_autoload,
-        default_backend: String::new(),
     }
 }
 

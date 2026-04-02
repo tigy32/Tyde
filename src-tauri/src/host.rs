@@ -29,13 +29,7 @@ fn default_local_host() -> Host {
         label: "Local".to_string(),
         hostname: String::new(),
         is_local: true,
-        enabled_backends: vec![
-            "tycode".to_string(),
-            "codex".to_string(),
-            "claude".to_string(),
-            "kiro".to_string(),
-            "gemini".to_string(),
-        ],
+        enabled_backends: all_backends(),
         default_backend: "tycode".to_string(),
     }
 }
@@ -86,29 +80,10 @@ impl HostStore {
             }
         };
 
-        let mut hosts = file.hosts;
-
-        if !hosts.iter().any(|h| h.id == "local") {
-            hosts.insert(0, default_local_host());
-        }
-
-        // Ensure newly added backends appear in each host's enabled list.
-        let known = all_backends();
-        let mut migrated = false;
-        for host in &mut hosts {
-            for backend in &known {
-                if !host.enabled_backends.contains(backend) {
-                    host.enabled_backends.push(backend.clone());
-                    migrated = true;
-                }
-            }
-        }
-
-        let store = Self { path, hosts };
-        if migrated {
-            store.save()?;
-        }
-        Ok(store)
+        Ok(Self {
+            path,
+            hosts: file.hosts,
+        })
     }
 
     pub fn list(&self) -> Vec<Host> {
@@ -217,6 +192,9 @@ mod tests {
         let hosts = store.list();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].id, "local");
+        assert!(hosts[0].is_local);
+        assert_eq!(hosts[0].enabled_backends, all_backends());
+        assert_eq!(hosts[0].default_backend, "tycode");
         assert!(path.exists());
     }
 
@@ -293,5 +271,22 @@ mod tests {
         let store = HostStore::load(path).unwrap();
         assert_eq!(store.list().len(), 2);
         assert_eq!(store.list()[1].label, "My Server");
+    }
+
+    #[test]
+    fn enabled_backends_persist_across_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+
+        {
+            let mut store = HostStore::load(path.clone()).unwrap();
+            store
+                .update_enabled_backends("local", vec!["tycode".into(), "codex".into()])
+                .unwrap();
+        }
+
+        let store = HostStore::load(path).unwrap();
+        let host = store.get("local").unwrap();
+        assert_eq!(host.enabled_backends, vec!["tycode", "codex"]);
     }
 }
