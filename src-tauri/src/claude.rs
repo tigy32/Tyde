@@ -3789,6 +3789,8 @@ fn inspect_claude_session_contents(
 
     let mut preview = String::new();
     let mut message_count = 0u64;
+    let mut observed_created_at = u64::MAX;
+    let mut observed_last_modified = 0u64;
     for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3806,6 +3808,11 @@ fn inspect_claude_session_contents(
             .and_then(normalize_nonempty)
         {
             session_id = raw_session_id;
+        }
+
+        if let Some(ts_ms) = extract_claude_line_timestamp_ms(&value) {
+            observed_created_at = observed_created_at.min(ts_ms);
+            observed_last_modified = observed_last_modified.max(ts_ms);
         }
 
         let line_type = value
@@ -3826,17 +3833,112 @@ fn inspect_claude_session_contents(
         preview.clone()
     };
 
+    let fallback_created = if observed_created_at == u64::MAX {
+        0
+    } else {
+        observed_created_at
+    };
+    let fallback_modified = observed_last_modified.max(fallback_created);
+    let resolved_created_at = match created_at {
+        0 => fallback_created,
+        value => value,
+    };
+    let resolved_last_modified = match last_modified {
+        0 => fallback_modified,
+        value => value,
+    };
+    let resolved_created_at = if resolved_created_at == 0 {
+        resolved_last_modified
+    } else {
+        resolved_created_at
+    };
+    let resolved_last_modified = if resolved_last_modified == 0 {
+        resolved_created_at
+    } else {
+        resolved_last_modified
+    };
+    let resolved_created_at = if resolved_created_at == 0 {
+        unix_now_ms()
+    } else {
+        resolved_created_at
+    };
+    let resolved_last_modified = if resolved_last_modified == 0 {
+        resolved_created_at
+    } else {
+        resolved_last_modified
+    };
+
     Some(json!({
         "id": session_id,
         "session_id": session_id,
         "title": title,
-        "created_at": created_at,
-        "last_modified": last_modified,
+        "created_at": resolved_created_at,
+        "last_modified": resolved_last_modified,
         "last_message_preview": preview,
         "workspace_root": workspace_root,
         "message_count": message_count,
         "backend_kind": "claude",
     }))
+}
+
+fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
+    let utc = s.trim().strip_suffix('Z').unwrap_or(s.trim());
+    let (date, time) = utc.split_once('T')?;
+    let mut dp = date.splitn(3, '-');
+    let y: u64 = dp.next()?.parse().ok()?;
+    let m: u64 = dp.next()?.parse().ok()?;
+    let d: u64 = dp.next()?.parse().ok()?;
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut tp = hms.splitn(3, ':');
+    let h: u64 = tp.next()?.parse().ok()?;
+    let min: u64 = tp.next()?.parse().ok()?;
+    let sec: u64 = tp.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut frac_ms = 0u64;
+    let frac_digits = frac
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(3)
+        .collect::<String>();
+    if !frac_digits.is_empty() {
+        let parsed = frac_digits.parse::<u64>().ok()?;
+        frac_ms = match frac_digits.len() {
+            1 => parsed * 100,
+            2 => parsed * 10,
+            _ => parsed,
+        };
+    }
+    let month_days: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut days: u64 = 0;
+    for yr in 1970..y {
+        days += if yr.is_multiple_of(4) && (!yr.is_multiple_of(100) || yr.is_multiple_of(400)) {
+            366
+        } else {
+            365
+        };
+    }
+    for mo in 1..m {
+        days += month_days.get((mo - 1) as usize).copied().unwrap_or(30);
+        if mo == 2 && y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
+            days += 1;
+        }
+    }
+    days += d.saturating_sub(1);
+    Some((days * 86400 + h * 3600 + min * 60 + sec) * 1000 + frac_ms)
+}
+
+fn extract_claude_line_timestamp_ms(value: &Value) -> Option<u64> {
+    let timestamp = value.get("timestamp")?;
+    if let Some(raw) = timestamp.as_str() {
+        return parse_iso8601_to_unix_ms(raw).or_else(|| parse_unix_timestamp_ms(raw));
+    }
+    if let Some(raw) = timestamp.as_u64() {
+        return Some(if raw > 1_000_000_000_000 {
+            raw
+        } else {
+            raw.saturating_mul(1000)
+        });
+    }
+    None
 }
 
 fn extract_preview_from_session_line(value: &Value) -> Option<String> {
@@ -4500,6 +4602,39 @@ fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
 // Remote (SSH) session file helpers
 // ---------------------------------------------------------------------------
 
+fn parse_unix_timestamp_ms(raw: &str) -> Option<u64> {
+    let parsed = raw.trim().parse::<u64>().ok()?;
+    if parsed == 0 {
+        return None;
+    }
+    Some(if parsed > 1_000_000_000_000 {
+        parsed
+    } else {
+        parsed.saturating_mul(1000)
+    })
+}
+
+fn parse_remote_claude_session_header(header: &str) -> Option<(String, u64, u64, u64)> {
+    let mut parts = header.split('\t');
+    let file_name = normalize_nonempty(parts.next()?)?.to_string();
+    let message_count = parts
+        .next()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let created_at = parts.next().and_then(parse_unix_timestamp_ms);
+    let last_modified = parts.next().and_then(parse_unix_timestamp_ms);
+
+    let resolved_last_modified = last_modified.or(created_at).unwrap_or(0);
+    let resolved_created_at = created_at.unwrap_or(resolved_last_modified);
+
+    Some((
+        file_name,
+        message_count,
+        resolved_created_at,
+        resolved_last_modified,
+    ))
+}
+
 async fn list_claude_sessions_remote(
     transport: &BackendTransport,
     workspace_root: &str,
@@ -4522,7 +4657,14 @@ async fn list_claude_sessions_remote(
            [ -f \"$f\" ] || continue; \
            name=$(basename \"$f\"); \
            cnt=$(grep -c '\"type\":\"' \"$f\" 2>/dev/null || echo 0); \
-           echo \"{marker}$name $cnt\"; \
+           ts=$(stat -c '%W %Y' \"$f\" 2>/dev/null || stat -f '%B %m' \"$f\" 2>/dev/null || echo '0 0'); \
+           created=${{ts%% *}}; \
+           modified=${{ts#* }}; \
+           case \"$created\" in ''|*[!0-9]*) created=0 ;; esac; \
+           case \"$modified\" in ''|*[!0-9]*) modified=0 ;; esac; \
+           [ \"$created\" -gt 0 ] 2>/dev/null || created=\"$modified\"; \
+           [ \"$modified\" -gt 0 ] 2>/dev/null || modified=\"$created\"; \
+           printf \"{marker}%s\\t%s\\t%s\\t%s\\n\" \"$name\" \"$cnt\" \"$created\" \"$modified\"; \
            head -5 \"$f\"; \
            echo; \
            tail -5 \"$f\"; \
@@ -4541,18 +4683,22 @@ async fn list_claude_sessions_remote(
             Some((h, rest)) => (h.trim(), rest),
             None => continue,
         };
-        let (name, msg_count) = match header.rsplit_once(' ') {
-            Some((n, c)) => (n.trim(), c.trim().parse::<u64>().unwrap_or(0)),
-            None => (header, 0),
-        };
+        let (name, msg_count, created_at, last_modified) =
+            match parse_remote_claude_session_header(header) {
+                Some(values) => values,
+                None => continue,
+            };
         if !name.ends_with(".jsonl") || name.starts_with("agent-") {
             continue;
         }
 
-        let now = unix_now_ms();
-        if let Some(mut metadata) =
-            inspect_claude_session_contents(name, contents, workspace_root, now, now)
-        {
+        if let Some(mut metadata) = inspect_claude_session_contents(
+            &name,
+            contents,
+            workspace_root,
+            created_at,
+            last_modified,
+        ) {
             metadata["message_count"] = serde_json::json!(msg_count);
             sessions.push(metadata);
         }
@@ -4723,6 +4869,65 @@ mod tests {
             .get("token_usage")
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(Value::as_u64)
+    }
+
+    #[test]
+    fn parse_remote_claude_session_header_converts_seconds_to_millis() {
+        let (name, message_count, created_at, last_modified) =
+            parse_remote_claude_session_header("session-a.jsonl\t12\t1710000000\t1710001234")
+                .expect("header should parse");
+
+        assert_eq!(name, "session-a.jsonl");
+        assert_eq!(message_count, 12);
+        assert_eq!(created_at, 1_710_000_000_000);
+        assert_eq!(last_modified, 1_710_001_234_000);
+    }
+
+    #[test]
+    fn parse_remote_claude_session_header_keeps_epoch_millis() {
+        let (name, message_count, created_at, last_modified) = parse_remote_claude_session_header(
+            "session-b.jsonl\t5\t1710000000123\t1710009999123",
+        )
+        .expect("header should parse");
+
+        assert_eq!(name, "session-b.jsonl");
+        assert_eq!(message_count, 5);
+        assert_eq!(created_at, 1_710_000_000_123);
+        assert_eq!(last_modified, 1_710_009_999_123);
+    }
+
+    #[test]
+    fn parse_remote_claude_session_header_uses_modified_when_created_missing() {
+        let (_, _, created_at, last_modified) =
+            parse_remote_claude_session_header("session-c.jsonl\t3\t0\t1710011111")
+                .expect("header should parse");
+
+        assert_eq!(created_at, 1_710_011_111_000);
+        assert_eq!(last_modified, 1_710_011_111_000);
+    }
+
+    #[test]
+    fn inspect_claude_session_contents_uses_line_timestamps_when_header_missing() {
+        let contents = r#"{"type":"user","timestamp":"2026-04-02T18:17:22.438Z","message":{"content":[{"type":"text","text":"first"}]}}
+{"type":"assistant","timestamp":"2026-04-02T19:20:23.100Z","message":{"content":[{"type":"text","text":"second"}]}}"#;
+
+        let parsed = inspect_claude_session_contents(
+            "session-d.jsonl",
+            contents,
+            "/tmp/workspace",
+            0,
+            0,
+        )
+        .expect("session should parse");
+
+        let created_at = parsed.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+        let last_modified = parsed
+            .get("last_modified")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        assert_eq!(created_at, 1_775_153_842_438);
+        assert_eq!(last_modified, 1_775_157_623_100);
     }
 
     fn emit_test_phase_end(inner: &ClaudeInner, summary: &mut ClaudeStdoutSummary) {
