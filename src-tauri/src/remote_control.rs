@@ -1,33 +1,49 @@
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(unix)]
 use serde::Deserialize;
+#[cfg(unix)]
 use serde_json::Value;
+#[cfg(unix)]
 use tauri::async_runtime::JoinHandle;
+#[cfg(unix)]
 use tauri::Manager;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::chat_buffer::ChatEventBuffer;
+#[cfg(unix)]
 use crate::protocol::{
     ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION,
 };
+#[cfg(not(unix))]
+use crate::protocol::ServerFrame;
 
 /// Manages the UDS listener that accepts remote Tyde clients.
 /// Started when "Allow remote control" is enabled in settings.
 pub struct RemoteControlServer {
     socket_path: PathBuf,
+    #[cfg(unix)]
     instance_id: String,
+    #[cfg(unix)]
     accept_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     pub event_broadcast: broadcast::Sender<ServerFrame>,
     pub chat_buffer: Arc<parking_lot::Mutex<ChatEventBuffer>>,
+    #[cfg(unix)]
     clients: Arc<Mutex<Vec<u64>>>,
 }
 
+#[cfg(unix)]
 impl RemoteControlServer {
     pub fn start(app: tauri::AppHandle) -> Result<Self, String> {
         let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
@@ -130,6 +146,32 @@ impl RemoteControlServer {
     }
 }
 
+#[cfg(not(unix))]
+impl RemoteControlServer {
+    pub fn start(_app: tauri::AppHandle) -> Result<Self, String> {
+        Err("Remote control requires Unix domain sockets (not available on this platform)".into())
+    }
+
+    pub fn start_listening(&self, _app: tauri::AppHandle) -> Result<(), String> {
+        Err("Remote control requires Unix domain sockets (not available on this platform)".into())
+    }
+
+    pub fn socket_path(&self) -> &PathBuf {
+        &self.socket_path
+    }
+
+    pub async fn connected_client_count(&self) -> usize {
+        0
+    }
+
+    pub fn shutdown(&self) {}
+
+    pub fn is_running(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(unix)]
 impl Drop for RemoteControlServer {
     fn drop(&mut self) {
         if let Some(handle) = self.accept_task.get_mut().take() {
@@ -143,6 +185,7 @@ impl Drop for RemoteControlServer {
 // Accept loop
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 async fn accept_loop(
     app: tauri::AppHandle,
     listener: UnixListener,
@@ -194,6 +237,7 @@ async fn accept_loop(
 // Per-client handler
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 async fn handle_client(
     app: tauri::AppHandle,
     stream: tokio::net::UnixStream,
@@ -382,6 +426,7 @@ async fn handle_client(
 // Command dispatch — routes Invoke frames to existing Tauri command logic
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 async fn dispatch(app: &tauri::AppHandle, frame: ClientFrame) -> ServerFrame {
     match frame {
         ClientFrame::Handshake { req_id, .. } => ServerFrame::Error {
@@ -400,6 +445,7 @@ async fn dispatch(app: &tauri::AppHandle, frame: ClientFrame) -> ServerFrame {
     }
 }
 
+#[cfg(unix)]
 async fn dispatch_invoke(
     app: &tauri::AppHandle,
     command: &str,
@@ -812,6 +858,7 @@ async fn dispatch_invoke(
 // Wire helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 async fn send(
     writer: &Mutex<tokio::net::unix::OwnedWriteHalf>,
     frame: &ServerFrame,

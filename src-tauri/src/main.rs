@@ -12,8 +12,15 @@ fn main() {
     tyde_lib::run_with_options(headless);
 }
 
+#[cfg(not(unix))]
+fn run_connect() {
+    eprintln!("The 'connect' subcommand requires Unix domain sockets and is not available on Windows.");
+    std::process::exit(1);
+}
+
 /// Thin stdin/stdout ↔ UDS proxy. No protocol awareness — just raw bytes.
 /// Used by the remote Tyde client: `ssh host tyde connect`
+#[cfg(unix)]
 fn run_connect() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -110,7 +111,13 @@ pub(crate) const SUBPROCESS_VERSION: &str = env!("SUBPROCESS_VERSION");
 pub(crate) const SUBPROCESS_GIT_REPO: &str = "https://github.com/tigy32/Tycode";
 pub(crate) const SUBPROCESS_CRATE_NAME: &str = "tycode-subprocess";
 pub(crate) const TYDE_REMOTE_SOCKET_SUFFIX: &str = ".tyde/tyde.sock";
+#[cfg(unix)]
 static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+pub(crate) type IpcStream = tokio::net::UnixStream;
+#[cfg(not(unix))]
+pub(crate) type IpcStream = tokio::net::TcpStream;
 
 fn ssh_control_socket_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME")
@@ -269,6 +276,7 @@ async fn is_remote_tyde_server_running(
     Ok(socket_output.status.success())
 }
 
+#[cfg(unix)]
 fn make_local_tunnel_socket_path(host: &str) -> PathBuf {
     let sanitized_host: String = host
         .chars()
@@ -288,6 +296,7 @@ fn make_local_tunnel_socket_path(host: &str) -> PathBuf {
     ))
 }
 
+#[cfg(unix)]
 async fn read_child_stderr(child: &mut tokio::process::Child) -> String {
     let mut stderr = String::new();
     if let Some(mut reader) = child.stderr.take() {
@@ -299,10 +308,20 @@ async fn read_child_stderr(child: &mut tokio::process::Child) -> String {
     stderr
 }
 
+#[cfg(not(unix))]
+pub(crate) async fn open_ssh_unix_socket_tunnel(
+    _host: &str,
+    _remote_socket_path: &str,
+) -> Result<(tokio::process::Child, PathBuf, IpcStream), String> {
+    Err("SSH Unix socket tunnels require Unix domain sockets (not available on this platform)"
+        .into())
+}
+
+#[cfg(unix)]
 pub(crate) async fn open_ssh_unix_socket_tunnel(
     host: &str,
     remote_socket_path: &str,
-) -> Result<(tokio::process::Child, PathBuf, tokio::net::UnixStream), String> {
+) -> Result<(tokio::process::Child, PathBuf, IpcStream), String> {
     let local_socket_path = make_local_tunnel_socket_path(host);
     let _ = std::fs::remove_file(&local_socket_path);
 
