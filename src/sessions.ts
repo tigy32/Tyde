@@ -21,7 +21,7 @@ interface NormalizedSession {
   tydeSessionId: string | null;
   backendKind: BackendKind;
   preview: string;
-  createdAtMs: number;
+  timestampMs: number;
   messageCount: number | null;
   workspaceRoot?: string;
   parentId: string | null;
@@ -29,11 +29,17 @@ interface NormalizedSession {
 
 const SESSION_ALIAS_STORAGE_KEY = "tyde-session-aliases";
 const ROW_HEIGHT = 68;
+const SEPARATOR_HEIGHT = 32;
+
+type DisplayItem =
+  | { kind: "separator"; label: string }
+  | { kind: "session"; session: NormalizedSession };
 
 export class SessionsPanel {
   private container: HTMLElement;
   private sessions: NormalizedSession[] = [];
   private filteredSessions: NormalizedSession[] = [];
+  private displayItems: DisplayItem[] = [];
   private searchQuery = "";
   private activeSessionKey: string | null = null;
   private resumingSessionKey: string | null = null;
@@ -101,13 +107,14 @@ export class SessionsPanel {
         tydeSessionId: record.id,
         backendKind: normalizeBackendKind(record.backend_kind),
         preview: record.alias ?? "Sub-agent session",
-        createdAtMs: record.created_at_ms,
+        timestampMs: record.created_at_ms,
         messageCount: record.message_count,
         workspaceRoot: record.workspace_root ?? undefined,
         parentId: record.parent_id,
       });
     }
 
+    normalized.sort((a, b) => b.timestampMs - a.timestampMs);
     this.sessions = normalized;
     this.state = "loaded";
     this.errorMessage = "";
@@ -193,13 +200,14 @@ export class SessionsPanel {
     const q = this.searchQuery.toLowerCase();
     if (!q) {
       this.filteredSessions = base;
+      this.buildDisplayItems();
       return;
     }
     this.filteredSessions = base.filter((s) => {
       const title = this.resolveSessionTitle(s).toLowerCase();
       const preview = s.preview.toLowerCase();
       const workspace = (s.workspaceRoot ?? "").toLowerCase();
-      const date = this.formatDate(s.createdAtMs).toLowerCase();
+      const date = this.formatDate(s.timestampMs).toLowerCase();
       const backend = s.backendKind.toLowerCase();
       return (
         title.includes(q) ||
@@ -209,6 +217,80 @@ export class SessionsPanel {
         backend.includes(q)
       );
     });
+    this.buildDisplayItems();
+  }
+
+  private buildDisplayItems(): void {
+    const items: DisplayItem[] = [];
+    let lastDay = "";
+    for (const session of this.filteredSessions) {
+      const day = this.dayKey(session.timestampMs);
+      if (day !== lastDay) {
+        items.push({
+          kind: "separator",
+          label: this.formatDayLabel(session.timestampMs),
+        });
+        lastDay = day;
+      }
+      items.push({ kind: "session", session });
+    }
+    this.displayItems = items;
+  }
+
+  private dayKey(epochMs: number): string {
+    const d = new Date(epochMs);
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  }
+
+  private formatDayLabel(epochMs: number): string {
+    const date = new Date(epochMs);
+    const now = new Date();
+    const days = [
+      "Sunday",
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+    ];
+    const months = [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ];
+
+    if (
+      date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate()
+    ) {
+      return "Today";
+    }
+
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (
+      date.getFullYear() === yesterday.getFullYear() &&
+      date.getMonth() === yesterday.getMonth() &&
+      date.getDate() === yesterday.getDate()
+    ) {
+      return "Yesterday";
+    }
+
+    if (date.getFullYear() === now.getFullYear()) {
+      return `${days[date.getDay()]}, ${months[date.getMonth()]} ${date.getDate()}`;
+    }
+    return `${days[date.getDay()]}, ${months[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
   }
 
   private destroyVirtualizer(): void {
@@ -342,9 +424,12 @@ export class SessionsPanel {
     this.container.appendChild(list);
 
     const virtualizer = new Virtualizer<HTMLElement, HTMLElement>({
-      count: this.filteredSessions.length,
+      count: this.displayItems.length,
       getScrollElement: () => list,
-      estimateSize: () => ROW_HEIGHT,
+      estimateSize: (i) =>
+        this.displayItems[i]?.kind === "separator"
+          ? SEPARATOR_HEIGHT
+          : ROW_HEIGHT,
       overscan: 5,
       gap: 6,
       scrollToFn: elementScroll,
@@ -363,7 +448,11 @@ export class SessionsPanel {
     if (!this.virtualizer) return;
     this.virtualizer.setOptions({
       ...this.virtualizer.options,
-      count: this.filteredSessions.length,
+      count: this.displayItems.length,
+      estimateSize: (i) =>
+        this.displayItems[i]?.kind === "separator"
+          ? SEPARATOR_HEIGHT
+          : ROW_HEIGHT,
     });
     this.virtualizer._willUpdate();
     this.renderVisibleCards();
@@ -375,7 +464,7 @@ export class SessionsPanel {
     if (!wrapper || !virtualizer) return;
 
     virtualizer._willUpdate();
-    const count = this.filteredSessions.length;
+    const count = this.displayItems.length;
 
     if (count === 0) {
       if (this.searchQuery) {
@@ -407,8 +496,12 @@ export class SessionsPanel {
     }
 
     for (const item of virtualItems) {
-      const card = this.createSessionCard(this.filteredSessions[item.index]);
-      frag.appendChild(card);
+      const displayItem = this.displayItems[item.index];
+      if (displayItem.kind === "separator") {
+        frag.appendChild(this.createDaySeparator(displayItem.label));
+      } else {
+        frag.appendChild(this.createSessionCard(displayItem.session));
+      }
     }
 
     const bottomSpacerSize = Math.max(0, totalSize - last.end);
@@ -424,6 +517,13 @@ export class SessionsPanel {
     spacer.style.height = `${heightPx}px`;
     spacer.setAttribute("aria-hidden", "true");
     return spacer;
+  }
+
+  private createDaySeparator(label: string): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "sessions-day-separator";
+    el.textContent = label;
+    return el;
   }
 
   private createSessionCard(session: NormalizedSession): HTMLElement {
@@ -508,7 +608,7 @@ export class SessionsPanel {
 
     const date = document.createElement("span");
     date.className = "session-card-date";
-    date.textContent = this.formatDate(session.createdAtMs);
+    date.textContent = this.formatDate(session.timestampMs);
     meta.appendChild(date);
 
     if (session.workspaceRoot) {
@@ -563,21 +663,11 @@ export class SessionsPanel {
     if (!Number.isFinite(epochMs)) return "Unknown";
     const date = new Date(epochMs);
     if (Number.isNaN(date.getTime())) return "Unknown";
-    const months = [
-      "Jan",
-      "Feb",
-      "Mar",
-      "Apr",
-      "May",
-      "Jun",
-      "Jul",
-      "Aug",
-      "Sep",
-      "Oct",
-      "Nov",
-      "Dec",
-    ];
-    return `${months[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
+    const h = date.getHours();
+    const m = date.getMinutes().toString().padStart(2, "0");
+    const period = h >= 12 ? "PM" : "AM";
+    const h12 = h % 12 || 12;
+    return `${h12}:${m} ${period}`;
   }
 
   private normalizeSession(raw: SessionMetadata): NormalizedSession | null {
@@ -592,10 +682,10 @@ export class SessionsPanel {
       "New Session";
 
     const createdValue =
-      this.asNumber(raw.created_at) ??
       this.asNumber(raw.last_modified) ??
+      this.asNumber(raw.created_at) ??
       Date.now();
-    const createdAtMs =
+    const timestampMs =
       createdValue > 1_000_000_000_000 ? createdValue : createdValue * 1000;
 
     // Match with store record by backend_session_id + backend_kind
@@ -615,10 +705,7 @@ export class SessionsPanel {
       ? matchedRecord.message_count
       : this.asNumber(raw.message_count);
 
-    // Use store created_at if available
-    const finalCreatedAtMs = matchedRecord
-      ? matchedRecord.created_at_ms
-      : createdAtMs;
+    const finalTimestampMs = timestampMs || matchedRecord?.created_at_ms || 0;
 
     return {
       key: this.sessionKey(sessionId, backendKind),
@@ -626,7 +713,7 @@ export class SessionsPanel {
       tydeSessionId: matchedRecord?.id ?? null,
       backendKind,
       preview,
-      createdAtMs: finalCreatedAtMs,
+      timestampMs: finalTimestampMs,
       messageCount:
         messageCountRaw === null
           ? null

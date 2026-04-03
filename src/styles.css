@@ -6124,6 +6124,25 @@ body {
   padding: 0 8px;
 }
 
+.sessions-day-separator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 4px 4px;
+}
+
+.sessions-day-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-primary);
+}
+
 .session-card {
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
