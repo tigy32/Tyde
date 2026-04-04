@@ -342,7 +342,7 @@ async fn handle_client(
         let runtime = state.agent_runtime.lock().await;
         let batch = runtime.events_since(last_agent_seq, 1000);
         for ev in &batch.events {
-            if let Some(info) = runtime.get_agent(ev.agent_id) {
+            if let Some(info) = runtime.get_agent(&ev.agent_id) {
                 send(
                     &writer,
                     &ServerFrame::Event {
@@ -537,7 +537,7 @@ async fn dispatch_invoke(
                 workspace_roots: Vec<String>,
                 prompt: String,
                 backend_kind: Option<String>,
-                parent_agent_id: Option<u64>,
+                parent_agent_id: Option<String>,
                 name: String,
                 ephemeral: Option<bool>,
                 agent_definition_id: Option<String>,
@@ -573,7 +573,7 @@ async fn dispatch_invoke(
         "send_agent_message" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
                 message: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
@@ -592,7 +592,7 @@ async fn dispatch_invoke(
         "interrupt_agent" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
             crate::interrupt_agent_internal(
@@ -609,7 +609,7 @@ async fn dispatch_invoke(
         "terminate_agent" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
             crate::terminate_agent_internal(
@@ -626,7 +626,7 @@ async fn dispatch_invoke(
         "cancel_agent" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
             let result = crate::cancel_agent_internal(
@@ -648,7 +648,7 @@ async fn dispatch_invoke(
         "wait_for_agent" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
             let info = crate::wait_for_agent_internal(
@@ -664,7 +664,7 @@ async fn dispatch_invoke(
         "collect_agent_result" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
             let result = crate::collect_agent_result_internal(
@@ -698,7 +698,7 @@ async fn dispatch_invoke(
         "rename_agent" => {
             #[derive(Deserialize)]
             struct P {
-                agent_id: u64,
+                agent_id: String,
                 name: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;

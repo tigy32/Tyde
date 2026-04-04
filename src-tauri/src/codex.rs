@@ -4651,13 +4651,13 @@ mod tests {
         name: String,
         description: String,
         agent_type: String,
-        agent_id: u64,
+        agent_id: String,
     }
 
     #[derive(Debug)]
     struct RecordedCompletion {
         tool_use_id: String,
-        agent_id: u64,
+        agent_id: String,
         success: bool,
         final_response: Option<String>,
     }
@@ -4666,7 +4666,7 @@ mod tests {
         next_agent_id: AtomicU64,
         spawns: tokio::sync::Mutex<Vec<RecordedSpawn>>,
         completions: tokio::sync::Mutex<Vec<RecordedCompletion>>,
-        events_by_agent_id: Arc<tokio::sync::Mutex<HashMap<u64, Vec<Value>>>>,
+        events_by_agent_id: Arc<tokio::sync::Mutex<HashMap<String, Vec<Value>>>>,
     }
 
     impl RecordingSubAgentEmitter {
@@ -4687,7 +4687,7 @@ mod tests {
             self.completions.lock().await.len()
         }
 
-        async fn events_by_agent(&self) -> HashMap<u64, Vec<Value>> {
+        async fn events_by_agent(&self) -> HashMap<String, Vec<Value>> {
             self.events_by_agent_id.lock().await.clone()
         }
     }
@@ -4702,13 +4702,15 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>
         {
             Box::pin(async move {
-                let agent_id = self.next_agent_id.fetch_add(1, Ordering::Relaxed);
+                let agent_num = self.next_agent_id.fetch_add(1, Ordering::Relaxed);
+                let agent_id = agent_num.to_string();
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
                 let events_by_agent_id = Arc::clone(&self.events_by_agent_id);
+                let agent_id_clone = agent_id.clone();
                 tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
                         let mut guard = events_by_agent_id.lock().await;
-                        guard.entry(agent_id).or_default().push(event);
+                        guard.entry(agent_id_clone.clone()).or_default().push(event);
                     }
                 });
                 live_test_log(&format!(
@@ -4719,11 +4721,11 @@ mod tests {
                     name,
                     description,
                     agent_type,
-                    agent_id,
+                    agent_id: agent_id.clone(),
                 });
                 SubAgentHandle {
                     agent_id,
-                    conversation_id: 10_000 + agent_id,
+                    conversation_id: 10_000 + agent_num,
                     event_tx,
                 }
             })
@@ -4732,7 +4734,7 @@ mod tests {
         fn on_subagent_completed(
             &self,
             tool_use_id: &str,
-            agent_id: u64,
+            agent_id: String,
             success: bool,
             final_response: Option<String>,
             _event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
@@ -5006,7 +5008,7 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 "spawn callback should include a tool_use_id. diagnostics={wait_diagnostics}"
             );
             assert!(
-                spawns.iter().any(|s| s.agent_id > 0),
+                spawns.iter().any(|s| !s.agent_id.is_empty()),
                 "spawn callback should include a non-zero agent_id. diagnostics={wait_diagnostics}"
             );
             assert!(
@@ -5020,7 +5022,7 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 "spawn callback should include description or agent type metadata. diagnostics={wait_diagnostics}"
             );
             assert!(
-                completions.iter().any(|c| !c.tool_use_id.is_empty() && c.agent_id > 0),
+                completions.iter().any(|c| !c.tool_use_id.is_empty() && !c.agent_id.is_empty()),
                 "completion callback should include tool_use_id and agent_id. diagnostics={wait_diagnostics}"
             );
             assert!(
@@ -5081,7 +5083,7 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                     "spawn-1".to_string(),
                     CodexSubAgentStream {
                         handle: SubAgentHandle {
-                            agent_id: 1,
+                            agent_id: "1".to_string(),
                             conversation_id: 10_001,
                             event_tx: subagent_tx,
                         },

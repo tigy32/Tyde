@@ -55,9 +55,9 @@ pub struct TydeServerConnection {
     /// Maps server-side conversation IDs to local conversation IDs.
     server_to_local_conv: Mutex<HashMap<u64, u64>>,
     /// Agent IDs known to be managed by this remote server.
-    remote_agent_ids: Mutex<std::collections::HashSet<u64>>,
+    remote_agent_ids: Mutex<std::collections::HashSet<String>>,
     /// Server-side conversation mapping for each known remote agent.
-    agent_to_server_conversation: Mutex<HashMap<u64, u64>>,
+    agent_to_server_conversation: Mutex<HashMap<String, u64>>,
 }
 
 impl TydeServerConnection {
@@ -100,20 +100,20 @@ impl TydeServerConnection {
             .insert(server_id, local_id);
     }
 
-    pub async fn register_remote_agent_id(&self, agent_id: u64) {
+    pub async fn register_remote_agent_id(&self, agent_id: String) {
         self.remote_agent_ids.lock().await.insert(agent_id);
     }
 
     /// Detach local ownership metadata for a remote agent that was cancelled/
     /// terminated. Returns the mapped local conversation ID, if any.
-    pub async fn detach_remote_agent(&self, agent_id: u64) -> Option<u64> {
-        self.remote_agent_ids.lock().await.remove(&agent_id);
+    pub async fn detach_remote_agent(&self, agent_id: &str) -> Option<u64> {
+        self.remote_agent_ids.lock().await.remove(agent_id);
 
         let server_cid = self
             .agent_to_server_conversation
             .lock()
             .await
-            .remove(&agent_id)?;
+            .remove(agent_id)?;
 
         let local_cid = self
             .server_to_local_conv
@@ -210,8 +210,12 @@ impl TydeServerConnection {
             } => {
                 // Track remote agent IDs and advance agent event seq cursor
                 if event == "agent-changed" {
-                    if let Some(aid) = payload.get("agent_id").and_then(|v| v.as_u64()) {
-                        self.remote_agent_ids.lock().await.insert(aid);
+                    if let Some(aid) = payload
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    {
+                        self.remote_agent_ids.lock().await.insert(aid.clone());
                         if let Some(server_cid) =
                             payload.get("conversation_id").and_then(|v| v.as_u64())
                         {
@@ -416,8 +420,8 @@ impl TydeServerConnection {
         self.state.lock().await.clone()
     }
 
-    pub async fn owns_agent(&self, agent_id: u64) -> bool {
-        self.remote_agent_ids.lock().await.contains(&agent_id)
+    pub async fn owns_agent(&self, agent_id: &str) -> bool {
+        self.remote_agent_ids.lock().await.contains(agent_id)
     }
 
     pub async fn fetch_remote_agents(
@@ -432,8 +436,8 @@ impl TydeServerConnection {
         let mut fresh_agent_to_server_cid = HashMap::new();
         for mut agent in agents {
             let server_cid = agent.conversation_id;
-            fresh_agent_ids.insert(agent.agent_id);
-            fresh_agent_to_server_cid.insert(agent.agent_id, server_cid);
+            fresh_agent_ids.insert(agent.agent_id.clone());
+            fresh_agent_to_server_cid.insert(agent.agent_id.clone(), server_cid);
             let local_cid = if let Some(local_cid) =
                 self.translate_conversation_id(server_cid).await
             {
@@ -630,11 +634,14 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
 
             // 2. Then sync agents
             for agent in &result.agents {
-                this.remote_agent_ids.lock().await.insert(agent.agent_id);
+                this.remote_agent_ids
+                    .lock()
+                    .await
+                    .insert(agent.agent_id.clone());
                 this.agent_to_server_conversation
                     .lock()
                     .await
-                    .insert(agent.agent_id, agent.conversation_id);
+                    .insert(agent.agent_id.clone(), agent.conversation_id);
                 let mut local_cid = this.translate_conversation_id(agent.conversation_id).await;
                 if local_cid.is_none() {
                     let app_state = this.app.state::<crate::AppState>();

@@ -21,7 +21,7 @@ pub(crate) struct DevInstance {
     /// SSH host if this is a remote instance.
     pub(crate) ssh_host: Option<String>,
     /// Agent ID this instance is bound to (for auto-cleanup).
-    pub(crate) agent_id: Option<u64>,
+    pub(crate) agent_id: Option<String>,
     /// SSH tunnel process for remote instances.
     ssh_tunnel: Option<tokio::process::Child>,
 }
@@ -66,10 +66,10 @@ impl DevInstanceRegistry {
         }
     }
 
-    fn instance_ids_for_agent(&self, agent_id: u64) -> Vec<u64> {
+    fn instance_ids_for_agent(&self, agent_id: &str) -> Vec<u64> {
         self.instances
             .values()
-            .filter(|i| i.agent_id == Some(agent_id))
+            .filter(|i| i.agent_id.as_deref() == Some(agent_id))
             .map(|i| i.instance_id)
             .collect()
     }
@@ -81,7 +81,7 @@ impl DevInstanceRegistry {
                 instance_id: i.instance_id,
                 project_dir: i.project_dir.clone(),
                 ssh_host: i.ssh_host.clone(),
-                agent_id: i.agent_id,
+                agent_id: i.agent_id.clone(),
                 debug_mcp_url: i.proxy.debug_mcp_url.clone(),
             })
             .collect()
@@ -93,7 +93,7 @@ pub(crate) struct DevInstanceInfo {
     pub(crate) instance_id: u64,
     pub(crate) project_dir: String,
     pub(crate) ssh_host: Option<String>,
-    pub(crate) agent_id: Option<u64>,
+    pub(crate) agent_id: Option<String>,
     pub(crate) debug_mcp_url: String,
 }
 
@@ -352,7 +352,7 @@ pub(crate) async fn start_dev_instance(
     project_dir: String,
     workspace_path: Option<String>,
     ssh_host: Option<String>,
-    agent_id: Option<u64>,
+    agent_id: Option<String>,
 ) -> Result<DevInstanceStartResult, String> {
     let instance_id = state.dev_instances.lock().next_instance_id();
 
@@ -376,7 +376,7 @@ async fn start_local_dev_instance(
     instance_id: u64,
     project_dir: String,
     workspace_path: Option<String>,
-    agent_id: Option<u64>,
+    agent_id: Option<String>,
 ) -> Result<DevInstanceStartResult, String> {
     // Verify node_modules exists so we get a clear error instead of npx
     // hanging on an interactive "install?" prompt or silently failing.
@@ -479,7 +479,7 @@ async fn start_remote_dev_instance(
     project_dir: String,
     workspace_path: Option<String>,
     host: &str,
-    agent_id: Option<u64>,
+    agent_id: Option<String>,
 ) -> Result<DevInstanceStartResult, String> {
     // Find 3 free ports on the remote host.
     let remote_ports = crate::remote::find_remote_free_ports(host, 3).await?;
@@ -711,8 +711,11 @@ pub(crate) async fn proxy_debug_tool_call(
 }
 
 /// Stop all dev instances bound to a given agent.
-pub(crate) async fn stop_instances_for_agent(state: &AppState, agent_id: u64) -> Vec<u64> {
-    let ids = state.dev_instances.lock().instance_ids_for_agent(agent_id);
+pub(crate) async fn stop_instances_for_agent(state: &AppState, agent_id: &str) -> Vec<u64> {
+    let ids = state
+        .dev_instances
+        .lock()
+        .instance_ids_for_agent(agent_id);
 
     let mut stopped = Vec::new();
     for id in ids {

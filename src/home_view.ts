@@ -37,7 +37,7 @@ export class HomeView {
   private agentsLoading = false;
   private actionListenerController: AbortController | null = null;
   private bridgeMenuOpen = false;
-  private collapsedParents: Set<number> = new Set();
+  private collapsedParents: Set<string> = new Set();
   private homeHideInactive = false;
   private homeHideSubAgents = false;
   private homeHideOtherWorkspaces = false;
@@ -199,7 +199,7 @@ export class HomeView {
     }
 
     // Build parent→children map for hierarchy display
-    const childrenByParent = new Map<number, RuntimeAgent[]>();
+    const childrenByParent = new Map<string, RuntimeAgent[]>();
     const roots: RuntimeAgent[] = [];
     for (const agent of filtered) {
       if (

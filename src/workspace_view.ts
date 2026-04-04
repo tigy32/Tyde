@@ -1267,7 +1267,7 @@ export class WorkspaceView {
       this.titleGenerationRequested.delete(conversationId);
       return;
     }
-    let titleAgentId: number | null = null;
+    let titleAgentId: string | null = null;
 
     try {
       const spawned = await spawnAgent(

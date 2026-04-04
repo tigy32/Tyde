@@ -65,7 +65,7 @@ struct DevInstanceStartToolInput {
     ssh_host: Option<String>,
     /// Optional agent ID to bind this instance to. When the agent terminates,
     /// its dev instance is automatically stopped.
-    agent_id: Option<u64>,
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

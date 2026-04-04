@@ -18,7 +18,7 @@ use crate::subprocess::ImageAttachment;
 /// Holds the per-sub-agent event channel.
 #[allow(dead_code)]
 pub struct SubAgentHandle {
-    pub agent_id: u64,
+    pub agent_id: String,
     pub conversation_id: u64,
     pub event_tx: mpsc::UnboundedSender<Value>,
 }
@@ -45,7 +45,7 @@ pub trait SubAgentEmitter: Send + Sync {
     fn on_subagent_completed(
         &self,
         tool_use_id: &str,
-        agent_id: u64,
+        agent_id: String,
         success: bool,
         final_response: Option<String>,
         event_tx: mpsc::UnboundedSender<Value>,
@@ -6533,7 +6533,7 @@ mod tests {
     async fn pending_subagent_prompt_is_emitted_on_content_block_stop() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let handle = SubAgentHandle {
-            agent_id: 1,
+            agent_id: "1".to_string(),
             conversation_id: 1,
             event_tx: event_tx.clone(),
         };

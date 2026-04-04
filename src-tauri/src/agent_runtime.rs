@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent_defs_io::ToolPolicy;
+use crate::AgentId;
 
 const MAX_SUMMARY_LEN: usize = 180;
 const MAX_MESSAGE_LEN: usize = 4_000;
@@ -12,11 +13,11 @@ const DEFAULT_EVENT_LOG_LIMIT: usize = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
-    pub agent_id: u64,
+    pub agent_id: AgentId,
     pub conversation_id: u64,
     pub workspace_roots: Vec<String>,
     pub backend_kind: String,
-    pub parent_agent_id: Option<u64>,
+    pub parent_agent_id: Option<AgentId>,
     pub name: String,
     pub agent_type: Option<String>,
     pub agent_definition_id: Option<String>,
@@ -34,7 +35,7 @@ pub struct AgentInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentEvent {
     pub seq: u64,
-    pub agent_id: u64,
+    pub agent_id: AgentId,
     pub conversation_id: u64,
     pub kind: String,
     pub is_running: bool,
@@ -57,10 +58,9 @@ pub struct CollectedAgentResult {
 }
 
 pub struct AgentRuntime {
-    next_agent_id: u64,
     next_event_seq: u64,
-    agents: HashMap<u64, AgentInfo>,
-    conversation_to_agent: HashMap<u64, u64>,
+    agents: HashMap<AgentId, AgentInfo>,
+    conversation_to_agent: HashMap<u64, AgentId>,
     events: VecDeque<AgentEvent>,
     event_log_limit: usize,
 }
@@ -68,7 +68,6 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     pub fn new() -> Self {
         Self {
-            next_agent_id: 1,
             next_event_seq: 1,
             agents: HashMap::new(),
             conversation_to_agent: HashMap::new(),
@@ -77,20 +76,20 @@ impl AgentRuntime {
         }
     }
 
-    pub fn has_agent(&self, agent_id: u64) -> bool {
-        self.agents.contains_key(&agent_id)
+    pub fn has_agent(&self, agent_id: &str) -> bool {
+        self.agents.contains_key(agent_id)
     }
 
-    pub fn conversation_id_for_agent(&self, agent_id: u64) -> Option<u64> {
-        self.agents.get(&agent_id).map(|a| a.conversation_id)
+    pub fn conversation_id_for_agent(&self, agent_id: &str) -> Option<u64> {
+        self.agents.get(agent_id).map(|a| a.conversation_id)
     }
 
-    pub fn get_agent(&self, agent_id: u64) -> Option<AgentInfo> {
-        self.agents.get(&agent_id).cloned()
+    pub fn get_agent(&self, agent_id: &str) -> Option<AgentInfo> {
+        self.agents.get(agent_id).cloned()
     }
 
     pub fn get_agent_by_conversation(&self, conversation_id: u64) -> Option<AgentInfo> {
-        let agent_id = self.conversation_to_agent.get(&conversation_id).copied()?;
+        let agent_id = self.conversation_to_agent.get(&conversation_id)?.clone();
         self.agents.get(&agent_id).cloned()
     }
 
@@ -100,11 +99,11 @@ impl AgentRuntime {
         out
     }
 
-    pub fn children_of(&self, agent_id: u64) -> Vec<AgentInfo> {
+    pub fn children_of(&self, agent_id: &str) -> Vec<AgentInfo> {
         let mut children: Vec<AgentInfo> = self
             .agents
             .values()
-            .filter(|a| a.parent_agent_id == Some(agent_id))
+            .filter(|a| a.parent_agent_id.as_deref() == Some(agent_id))
             .cloned()
             .collect();
         children.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
@@ -113,10 +112,13 @@ impl AgentRuntime {
 
     /// Reserve an agent ID without registering the agent yet.
     /// Use `register_agent_with_id` to complete registration later.
-    pub fn reserve_agent_id(&mut self) -> u64 {
-        let id = self.next_agent_id;
-        self.next_agent_id += 1;
-        id
+    pub fn reserve_agent_id(&mut self) -> AgentId {
+        loop {
+            let id = uuid::Uuid::new_v4().to_string();
+            if !self.agents.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     pub fn register_agent(
@@ -124,7 +126,7 @@ impl AgentRuntime {
         conversation_id: u64,
         workspace_roots: Vec<String>,
         backend_kind: String,
-        parent_agent_id: Option<u64>,
+        parent_agent_id: Option<AgentId>,
         name: String,
     ) -> AgentInfo {
         let agent_id = self.reserve_agent_id();
@@ -140,17 +142,17 @@ impl AgentRuntime {
 
     pub fn register_agent_with_id(
         &mut self,
-        agent_id: u64,
+        agent_id: AgentId,
         conversation_id: u64,
         workspace_roots: Vec<String>,
         backend_kind: String,
-        parent_agent_id: Option<u64>,
+        parent_agent_id: Option<AgentId>,
         name: String,
     ) -> AgentInfo {
         let now = now_ms();
 
         let info = AgentInfo {
-            agent_id,
+            agent_id: agent_id.clone(),
             conversation_id,
             workspace_roots,
             backend_kind,
@@ -167,8 +169,9 @@ impl AgentRuntime {
             last_error: None,
             last_message: None,
         };
-        self.agents.insert(agent_id, info.clone());
-        self.conversation_to_agent.insert(conversation_id, agent_id);
+        self.agents.insert(agent_id.clone(), info.clone());
+        self.conversation_to_agent
+            .insert(conversation_id, agent_id.clone());
         self.push_event(
             agent_id,
             conversation_id,
@@ -179,8 +182,8 @@ impl AgentRuntime {
         info
     }
 
-    pub fn rename_agent(&mut self, agent_id: u64, name: String) -> bool {
-        let Some(info) = self.agents.get_mut(&agent_id) else {
+    pub fn rename_agent(&mut self, agent_id: &str, name: String) -> bool {
+        let Some(info) = self.agents.get_mut(agent_id) else {
             return false;
         };
         if info.name == name {
@@ -193,33 +196,33 @@ impl AgentRuntime {
 
     pub fn set_agent_definition(
         &mut self,
-        agent_id: u64,
+        agent_id: &str,
         definition_id: Option<String>,
         tool_policy: ToolPolicy,
     ) {
-        if let Some(info) = self.agents.get_mut(&agent_id) {
+        if let Some(info) = self.agents.get_mut(agent_id) {
             info.agent_definition_id = definition_id;
             info.tool_policy = tool_policy;
         }
     }
 
-    pub fn update_agent_type(&mut self, agent_id: u64, agent_type: Option<String>) {
-        if let Some(info) = self.agents.get_mut(&agent_id) {
+    pub fn update_agent_type(&mut self, agent_id: &str, agent_type: Option<String>) {
+        if let Some(info) = self.agents.get_mut(agent_id) {
             info.agent_type = agent_type;
         }
     }
 
-    pub fn mark_agent_running(&mut self, agent_id: u64, summary: Option<String>) -> bool {
+    pub fn mark_agent_running(&mut self, agent_id: &str, summary: Option<String>) -> bool {
         self.update_agent(agent_id, Some(true), summary, None, "agent_running", None)
     }
 
     pub fn mark_conversation_failed(&mut self, conversation_id: u64, message: String) -> bool {
-        let agent_id = match self.conversation_to_agent.get(&conversation_id).copied() {
+        let agent_id = match self.conversation_to_agent.get(&conversation_id).cloned() {
             Some(id) => id,
             None => return false,
         };
         self.update_agent(
-            agent_id,
+            &agent_id,
             Some(false),
             Some(message.clone()),
             Some(message),
@@ -233,12 +236,12 @@ impl AgentRuntime {
         conversation_id: u64,
         message: Option<String>,
     ) -> bool {
-        let agent_id = match self.conversation_to_agent.get(&conversation_id).copied() {
+        let agent_id = match self.conversation_to_agent.get(&conversation_id).cloned() {
             Some(id) => id,
             None => return false,
         };
         self.update_agent(
-            agent_id,
+            &agent_id,
             Some(false),
             Some(message.unwrap_or_else(|| "Conversation closed".to_string())),
             None,
@@ -251,7 +254,7 @@ impl AgentRuntime {
         let Some(kind) = event.get("kind").and_then(Value::as_str) else {
             return false;
         };
-        let agent_id = match self.conversation_to_agent.get(&conversation_id).copied() {
+        let agent_id = match self.conversation_to_agent.get(&conversation_id).cloned() {
             Some(id) => id,
             None => return false,
         };
@@ -268,7 +271,7 @@ impl AgentRuntime {
                     Some("Completed".to_string())
                 };
                 self.update_agent(
-                    agent_id,
+                    &agent_id,
                     Some(typing),
                     summary,
                     None,
@@ -299,7 +302,7 @@ impl AgentRuntime {
                     Some(normalized_message)
                 };
                 self.update_agent(
-                    agent_id,
+                    &agent_id,
                     None, // don't touch is_running — TypingStatusChanged is authoritative
                     summary,
                     None,
@@ -314,7 +317,7 @@ impl AgentRuntime {
                     .unwrap_or("Agent failed")
                     .to_string();
                 self.update_agent(
-                    agent_id,
+                    &agent_id,
                     None,
                     Some(error.clone()),
                     Some(error),
@@ -329,7 +332,7 @@ impl AgentRuntime {
                     .and_then(Value::as_str)
                     .unwrap_or("tool");
                 self.update_agent(
-                    agent_id,
+                    &agent_id,
                     None,
                     Some(format!("Using {tool_name}...")),
                     None,
@@ -345,7 +348,7 @@ impl AgentRuntime {
                     .unwrap_or("Operation cancelled")
                     .to_string();
                 self.update_agent(
-                    agent_id,
+                    &agent_id,
                     None,
                     Some(message),
                     None,
@@ -360,7 +363,7 @@ impl AgentRuntime {
                     .and_then(Value::as_i64);
                 if code == Some(0) {
                     self.update_agent(
-                        agent_id,
+                        &agent_id,
                         Some(false),
                         Some("Completed".to_string()),
                         None,
@@ -373,7 +376,7 @@ impl AgentRuntime {
                         None => "Backend exited unexpectedly".to_string(),
                     };
                     self.update_agent(
-                        agent_id,
+                        &agent_id,
                         Some(false),
                         Some(message.clone()),
                         Some(message),
@@ -383,7 +386,7 @@ impl AgentRuntime {
                 }
             }
             "StreamStart" => self.update_agent(
-                agent_id,
+                &agent_id,
                 None,
                 None, // keep existing summary — ToolRequest/StreamEnd provide richer context
                 None,
@@ -409,7 +412,7 @@ impl AgentRuntime {
         }
     }
 
-    pub fn latest_event_seq_for_agent(&self, agent_id: u64) -> Option<u64> {
+    pub fn latest_event_seq_for_agent(&self, agent_id: &str) -> Option<u64> {
         self.events
             .iter()
             .rev()
@@ -417,10 +420,10 @@ impl AgentRuntime {
             .map(|event| event.seq)
     }
 
-    pub fn collect_result(&self, agent_id: u64) -> Result<CollectedAgentResult, String> {
+    pub fn collect_result(&self, agent_id: &str) -> Result<CollectedAgentResult, String> {
         let agent = self
             .agents
-            .get(&agent_id)
+            .get(agent_id)
             .ok_or_else(|| format!("Agent {agent_id} not found"))?
             .clone();
 
@@ -448,7 +451,7 @@ impl AgentRuntime {
 
     fn update_agent(
         &mut self,
-        agent_id: u64,
+        agent_id: &str,
         is_running: Option<bool>,
         summary: Option<String>,
         last_error: Option<String>,
@@ -459,7 +462,7 @@ impl AgentRuntime {
         let now = now_ms();
 
         let event_payload = {
-            let Some(agent) = self.agents.get_mut(&agent_id) else {
+            let Some(agent) = self.agents.get_mut(agent_id) else {
                 return false;
             };
 
@@ -522,14 +525,20 @@ impl AgentRuntime {
         };
 
         let (conversation_id, running, message) = event_payload;
-        self.push_event(agent_id, conversation_id, event_kind, running, message);
+        self.push_event(
+            agent_id.to_string(),
+            conversation_id,
+            event_kind,
+            running,
+            message,
+        );
 
         changed
     }
 
     fn push_event(
         &mut self,
-        agent_id: u64,
+        agent_id: AgentId,
         conversation_id: u64,
         kind: &str,
         is_running: bool,
@@ -588,7 +597,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_runtime_with_stopped_agent() -> (AgentRuntime, u64) {
+    fn make_runtime_with_stopped_agent() -> (AgentRuntime, AgentId) {
         let mut rt = AgentRuntime::new();
         let info = rt.register_agent(
             100,
@@ -610,7 +619,7 @@ mod tests {
             &json!({ "kind": "TypingStatusChanged", "data": false }),
         );
 
-        assert!(!rt.get_agent(agent_id).unwrap().is_running);
+        assert!(!rt.get_agent(&agent_id).unwrap().is_running);
         (rt, agent_id)
     }
 
@@ -624,16 +633,16 @@ mod tests {
             None,
             "test".into(),
         );
-        assert!(rt.get_agent(info.agent_id).unwrap().is_running);
+        assert!(rt.get_agent(&info.agent_id).unwrap().is_running);
 
         rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
-        assert!(rt.get_agent(info.agent_id).unwrap().is_running);
+        assert!(rt.get_agent(&info.agent_id).unwrap().is_running);
 
         rt.record_chat_event(
             100,
             &json!({ "kind": "TypingStatusChanged", "data": false }),
         );
-        let agent = rt.get_agent(info.agent_id).unwrap();
+        let agent = rt.get_agent(&info.agent_id).unwrap();
         assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
     }
@@ -655,7 +664,7 @@ mod tests {
             &json!({ "kind": "StreamEnd", "data": { "message": { "content": "Done with the task" } } }),
         );
 
-        let agent = rt.get_agent(info.agent_id).unwrap();
+        let agent = rt.get_agent(&info.agent_id).unwrap();
         // StreamEnd should NOT stop the agent — only TypingStatusChanged does that
         assert!(agent.is_running);
         assert_eq!(agent.last_message.as_deref(), Some("Done with the task"));
@@ -665,7 +674,7 @@ mod tests {
     fn collect_result_succeeds_for_stopped_agent() {
         let (rt, agent_id) = make_runtime_with_stopped_agent();
 
-        let result = rt.collect_result(agent_id);
+        let result = rt.collect_result(&agent_id);
         assert!(result.is_ok());
         let collected = result.unwrap();
         assert!(!collected.agent.is_running);
@@ -685,7 +694,7 @@ mod tests {
             None,
             "test".into(),
         );
-        let result = rt.collect_result(info.agent_id);
+        let result = rt.collect_result(&info.agent_id);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("still running"));
     }
@@ -693,7 +702,7 @@ mod tests {
     #[test]
     fn collect_result_errors_for_unknown_agent() {
         let rt = AgentRuntime::new();
-        let result = rt.collect_result(999);
+        let result = rt.collect_result("999");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -715,7 +724,7 @@ mod tests {
             &json!({ "kind": "Error", "data": "Something went wrong" }),
         );
 
-        let agent = rt.get_agent(info.agent_id).unwrap();
+        let agent = rt.get_agent(&info.agent_id).unwrap();
         assert!(agent.last_error.is_some());
         // Error doesn't change is_running — TypingStatusChanged does
         assert!(agent.is_running);
@@ -738,7 +747,7 @@ mod tests {
             &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }),
         );
 
-        let agent = rt.get_agent(info.agent_id).unwrap();
+        let agent = rt.get_agent(&info.agent_id).unwrap();
         assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
     }
@@ -760,7 +769,7 @@ mod tests {
             &json!({ "kind": "SubprocessExit", "data": { "exit_code": 1 } }),
         );
 
-        let agent = rt.get_agent(info.agent_id).unwrap();
+        let agent = rt.get_agent(&info.agent_id).unwrap();
         assert!(!agent.is_running);
         assert!(agent.last_error.is_some());
     }
@@ -781,7 +790,7 @@ mod tests {
             &json!({ "kind": "SubprocessExit", "data": { "exit_code": 0 } }),
         );
 
-        let result = rt.collect_result(info.agent_id).unwrap();
+        let result = rt.collect_result(&info.agent_id).unwrap();
         assert_eq!(result.final_message.as_deref(), Some("Completed"));
     }
 
@@ -798,7 +807,7 @@ mod tests {
         let changed = rt.mark_conversation_closed(700, Some("Terminated".to_string()));
         assert!(changed);
 
-        let agent = rt.get_agent(info.agent_id).unwrap();
+        let agent = rt.get_agent(&info.agent_id).unwrap();
         assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
     }

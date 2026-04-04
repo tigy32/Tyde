@@ -80,9 +80,9 @@ export class AppController {
   private settingsTabViewEl!: HTMLElement;
   private escapeStack!: EscapeStack;
   private bridgeControlEnabled = true;
-  private runtimeAgents = new Map<number, RuntimeAgent>();
+  private runtimeAgents = new Map<string, RuntimeAgent>();
   private runtimeAgentsByProjectId = new Map<string, RuntimeAgent[]>();
-  private hiddenRuntimeAgentIds = new Set<number>();
+  private hiddenRuntimeAgentIds = new Set<string>();
   private registeredWorkflowCommandIds: string[] = [];
 
   private workspaceViews = new Map<string, WorkspaceView>();
@@ -885,7 +885,7 @@ export class AppController {
     }
 
     const agentId = payload.data.agent_id;
-    if (agentId == null || agentId <= 0) {
+    if (agentId == null || agentId.trim().length === 0) {
       // Some ConversationRegistered events can arrive before an agent id exists.
       // Wait for the subsequent agent-changed event instead of creating a
       // synthetic agent_id=0 entry that breaks agent routing/actions.
@@ -941,7 +941,7 @@ export class AppController {
   }
 
   private resolveProjectByParentAgent(
-    parentAgentId: number | null | undefined,
+    parentAgentId: string | null | undefined,
   ): { id: string; workspacePath: string; name: string } | null {
     if (parentAgentId == null) return null;
     const parent = this.runtimeAgents.get(parentAgentId);

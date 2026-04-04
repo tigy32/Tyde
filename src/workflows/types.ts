@@ -36,7 +36,7 @@ export type ActionResult = {
   output: string;
   success: boolean;
   error?: string;
-  agentId?: number;
+  agentId?: string;
   conversationId?: number;
 };
 

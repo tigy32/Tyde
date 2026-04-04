@@ -72,7 +72,7 @@ pub(crate) async fn route_workspace(
     Ok(WorkspaceRoute::Local)
 }
 
-pub(crate) async fn route_agent(state: &AppState, agent_id: u64) -> Result<AgentRoute, String> {
+pub(crate) async fn route_agent(state: &AppState, agent_id: &str) -> Result<AgentRoute, String> {
     // First check local runtime — if it knows the agent, it's local.
     let has_local = {
         let runtime = state.agent_runtime.lock().await;

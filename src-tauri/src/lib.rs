@@ -67,6 +67,8 @@ use crate::session_store::SessionStore;
 use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
 
+pub(crate) type AgentId = String;
+
 /// Implements SubAgentEmitter for backend sessions that expose provider-native
 /// sub-agent lifecycle events. Registers sub-agents in the Tyde AgentRuntime
 /// and creates per-sub-agent event forwarding.
@@ -78,10 +80,10 @@ struct BackendSubAgentEmitter {
     app: tauri::AppHandle,
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
-    parent_agent_id: Option<u64>,
+    parent_agent_id: Option<AgentId>,
     /// Lazily populated when `parent_agent_id` is `None` and the first
     /// sub-agent is spawned. Subsequent sub-agents reuse this value.
-    lazy_parent_agent_id: Mutex<Option<u64>>,
+    lazy_parent_agent_id: Mutex<Option<AgentId>>,
     parent_conversation_id: u64,
     workspace_roots: Vec<String>,
     backend_kind: String,
@@ -93,13 +95,13 @@ struct BackendSubAgentEmitter {
 impl BackendSubAgentEmitter {
     /// Resolve the parent agent_id. If no explicit parent was set (non-bridge
     /// conversations), lazily register the parent conversation in the runtime.
-    async fn resolve_parent_agent_id(&self) -> Option<u64> {
-        if let Some(id) = self.parent_agent_id {
-            return Some(id);
+    async fn resolve_parent_agent_id(&self) -> Option<AgentId> {
+        if let Some(id) = &self.parent_agent_id {
+            return Some(id.clone());
         }
         let mut lazy = self.lazy_parent_agent_id.lock().await;
-        if let Some(id) = *lazy {
-            return Some(id);
+        if let Some(id) = lazy.as_ref() {
+            return Some(id.clone());
         }
         let (id, created) = {
             // Reuse existing registration if present; otherwise register the
@@ -122,15 +124,15 @@ impl BackendSubAgentEmitter {
                 )
             }
         };
-        *lazy = Some(id);
+        *lazy = Some(id.clone());
         if created {
             self.agent_runtime_notify.notify_waiters();
-            self.emit_agent_changed(id).await;
+            self.emit_agent_changed(&id).await;
         }
         Some(id)
     }
 
-    async fn emit_agent_changed(&self, agent_id: u64) {
+    async fn emit_agent_changed(&self, agent_id: &str) {
         let info = { self.agent_runtime.lock().await.get_agent(agent_id) };
         if let Some(info) = info {
             let _ = self.app.emit("agent-changed", &info);
@@ -170,7 +172,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                     conversation_id,
                     self.workspace_roots.clone(),
                     self.backend_kind.clone(),
-                    parent_agent_id,
+                    parent_agent_id.clone(),
                     display_name,
                 );
                 info.agent_type = if agent_type.is_empty() {
@@ -178,11 +180,11 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                 } else {
                     Some(agent_type)
                 };
-                runtime.update_agent_type(info.agent_id, info.agent_type.clone());
+                runtime.update_agent_type(&info.agent_id, info.agent_type.clone());
                 info
             };
             self.agent_runtime_notify.notify_waiters();
-            self.emit_agent_changed(agent_info.agent_id).await;
+            self.emit_agent_changed(&agent_info.agent_id).await;
 
             tracing::info!(
                 "{} sub-agent spawned: agent_id={}, conversation_id={}, parent={:?}, tool_use_id={}",
@@ -235,7 +237,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
             let registration = serde_json::json!({
                 "kind": "ConversationRegistered",
                 "data": {
-                    "agent_id": agent_info.agent_id,
+                    "agent_id": &agent_info.agent_id,
                     "workspace_roots": self.workspace_roots,
                     "backend_kind": &self.backend_kind,
                     "name": &agent_info.name,
@@ -286,7 +288,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
     fn on_subagent_completed(
         &self,
         tool_use_id: &str,
-        agent_id: u64,
+        agent_id: AgentId,
         success: bool,
         final_response: Option<String>,
         event_tx: mpsc::UnboundedSender<Value>,
@@ -301,7 +303,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
 
             let should_emit = {
                 let runtime = self.agent_runtime.lock().await;
-                let current_info = runtime.get_agent(agent_id);
+                let current_info = runtime.get_agent(&agent_id);
                 let already_stopped = current_info
                     .as_ref()
                     .map(|info| !info.is_running)
@@ -595,7 +597,7 @@ struct CreateConversationResponse {
 
 #[derive(Serialize, Clone)]
 pub(crate) struct SpawnAgentResponse {
-    pub(crate) agent_id: u64,
+    pub(crate) agent_id: AgentId,
     pub(crate) conversation_id: u64,
 }
 
@@ -604,7 +606,7 @@ pub(crate) struct SpawnAgentRequest {
     pub(crate) workspace_roots: Vec<String>,
     pub(crate) prompt: String,
     pub(crate) backend_kind: Option<String>,
-    pub(crate) parent_agent_id: Option<u64>,
+    pub(crate) parent_agent_id: Option<AgentId>,
     pub(crate) name: String,
     pub(crate) ephemeral: Option<bool>,
     /// Images to attach to the initial message sent to the agent.
@@ -615,18 +617,18 @@ pub(crate) struct SpawnAgentRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct SendAgentMessageRequest {
-    pub(crate) agent_id: u64,
+    pub(crate) agent_id: AgentId,
     pub(crate) message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AgentIdRequest {
-    pub(crate) agent_id: u64,
+    pub(crate) agent_id: AgentId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct WaitForAgentRequest {
-    pub(crate) agent_id: u64,
+    pub(crate) agent_id: AgentId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -637,14 +639,14 @@ pub(crate) struct AgentEventsSinceRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AwaitAgentsRequest {
-    pub(crate) agent_ids: Vec<u64>,
+    pub(crate) agent_ids: Vec<AgentId>,
     pub(crate) timeout_ms: Option<u64>,
 }
 
 /// Simplified agent result returned by the push-oriented MCP tools.
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AgentResult {
-    pub(crate) agent_id: u64,
+    pub(crate) agent_id: AgentId,
     pub(crate) is_running: bool,
     pub(crate) message: Option<String>,
     pub(crate) error: Option<String>,
@@ -654,7 +656,7 @@ pub(crate) struct AgentResult {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct AwaitAgentsResponse {
     pub(crate) ready: Vec<AgentResult>,
-    pub(crate) still_running: Vec<u64>,
+    pub(crate) still_running: Vec<AgentId>,
 }
 
 fn is_generic_agent_name(name: &str) -> bool {
@@ -951,7 +953,7 @@ fn startup_mcp_servers_for_new_sessions(
 fn startup_mcp_servers_for_agent(
     state: &AppState,
     include_agent_control: bool,
-    caller_agent_id: Option<u64>,
+    caller_agent_id: Option<&str>,
     _workspace_roots: &[String],
     extra_mcp_servers: &[StartupMcpServer],
 ) -> Result<Vec<StartupMcpServer>, String> {
@@ -1399,7 +1401,7 @@ async fn ensure_conversation_agent_registered(
         )
     };
     state.agent_runtime_notify.notify_waiters();
-    emit_agent_changed(app, state, info.agent_id).await;
+    emit_agent_changed(app, state, &info.agent_id).await;
     info
 }
 
@@ -1484,13 +1486,14 @@ async fn spawn_agent_via_server(
 
     let agent_id = resp
         .get("agent_id")
-        .and_then(|v| v.as_u64())
-        .ok_or("Server did not return agent_id")?;
+        .and_then(|v| v.as_str())
+        .ok_or("Server did not return agent_id")?
+        .to_string();
     let conversation_id = resp
         .get("conversation_id")
         .and_then(|v| v.as_u64())
         .ok_or("Server did not return conversation_id")?;
-    conn.register_remote_agent_id(agent_id).await;
+    conn.register_remote_agent_id(agent_id.clone()).await;
     let backend_kind_str = if let Some(kind) = resp.get("backend_kind").and_then(|v| v.as_str()) {
         kind.to_string()
     } else {
@@ -1912,7 +1915,7 @@ pub(crate) async fn create_conversation_tauri_free(
     let startup_mcp_servers = startup_mcp_servers_for_agent(
         state,
         include_agent_control,
-        reserved_agent_id,
+        reserved_agent_id.as_deref(),
         &workspace_roots,
         &extra_mcp_servers,
     )?;
@@ -1961,10 +1964,10 @@ pub(crate) async fn create_conversation_tauri_free(
 
     // For agent-control conversations, complete the agent registration using the
     // reserved ID so it appears in the hierarchy and sub-agents can reference it.
-    let root_agent = if let Some(agent_id) = reserved_agent_id {
+    let root_agent = if let Some(ref agent_id) = reserved_agent_id {
         let mut runtime = state.agent_runtime.lock().await;
         let info = runtime.register_agent_with_id(
-            agent_id,
+            agent_id.clone(),
             id,
             workspace_roots.clone(),
             backend_kind.as_str().to_string(),
@@ -1979,7 +1982,7 @@ pub(crate) async fn create_conversation_tauri_free(
         );
         drop(runtime);
         state.agent_runtime_notify.notify_waiters();
-        emit_agent_changed(app, state, info.agent_id).await;
+        emit_agent_changed(app, state, &info.agent_id).await;
         info
     } else {
         let info = ensure_conversation_agent_registered(
@@ -1994,16 +1997,16 @@ pub(crate) async fn create_conversation_tauri_free(
         if agent_definition_id.is_some() {
             let updated = {
                 let mut runtime = state.agent_runtime.lock().await;
-                runtime.update_agent_type(info.agent_id, agent_definition_id.clone());
+                runtime.update_agent_type(&info.agent_id, agent_definition_id.clone());
                 runtime.set_agent_definition(
-                    info.agent_id,
+                    &info.agent_id,
                     agent_definition_id.clone(),
                     def_tool_policy.clone(),
                 );
-                runtime.get_agent(info.agent_id)
+                runtime.get_agent(&info.agent_id)
             };
             if let Some(updated) = updated {
-                emit_agent_changed(app, state, updated.agent_id).await;
+                emit_agent_changed(app, state, &updated.agent_id).await;
                 updated
             } else {
                 info
@@ -2186,7 +2189,7 @@ async fn forward_events(
                 let info = runtime.get_agent_by_conversation(conversation_id);
                 let seq = info
                     .as_ref()
-                    .and_then(|agent| runtime.latest_event_seq_for_agent(agent.agent_id));
+                    .and_then(|agent| runtime.latest_event_seq_for_agent(&agent.agent_id));
                 (info, seq)
             };
             if let Some(info) = info {
@@ -2254,7 +2257,7 @@ fn emit_subprocess_exit(app: &tauri::AppHandle, conversation_id: u64) {
     }
 }
 
-async fn emit_agent_changed(app: &tauri::AppHandle, state: &AppState, agent_id: u64) {
+async fn emit_agent_changed(app: &tauri::AppHandle, state: &AppState, agent_id: &str) {
     let (info, agent_seq) = {
         let runtime = state.agent_runtime.lock().await;
         (
@@ -2284,7 +2287,7 @@ async fn emit_agent_changed_for_conversation(
         let info = runtime.get_agent_by_conversation(conversation_id);
         let seq = info
             .as_ref()
-            .and_then(|agent| runtime.latest_event_seq_for_agent(agent.agent_id));
+            .and_then(|agent| runtime.latest_event_seq_for_agent(&agent.agent_id));
         (info, seq)
     };
     if let Some(info) = info {
@@ -2460,7 +2463,7 @@ pub(crate) async fn spawn_agent_internal(
         return Err("spawn_agent requires a non-empty prompt".to_string());
     }
 
-    if let Some(parent_id) = parent_agent_id {
+    if let Some(ref parent_id) = parent_agent_id {
         let exists = {
             let runtime = state.agent_runtime.lock().await;
             runtime.has_agent(parent_id)
@@ -2561,17 +2564,17 @@ pub(crate) async fn spawn_agent_internal(
             conversation_id,
             workspace_roots.clone(),
             backend_kind.as_str().to_string(),
-            parent_agent_id,
+            parent_agent_id.clone(),
             display_name.clone(),
         );
         if agent_definition_id.is_some() {
-            runtime.update_agent_type(info.agent_id, agent_definition_id.clone());
-            runtime.set_agent_definition(info.agent_id, agent_definition_id, def_tool_policy);
+            runtime.update_agent_type(&info.agent_id, agent_definition_id.clone());
+            runtime.set_agent_definition(&info.agent_id, agent_definition_id, def_tool_policy);
         }
         info
     };
     state.agent_runtime_notify.notify_waiters();
-    emit_agent_changed(app, state, info.agent_id).await;
+    emit_agent_changed(app, state, &info.agent_id).await;
 
     // Create session store record for this agent (skip for ephemeral agents)
     if !ephemeral {
@@ -2584,7 +2587,7 @@ pub(crate) async fn spawn_agent_internal(
             record.id
         };
         // Set parent_id if this agent has a parent
-        if let Some(parent_runtime_agent_id) = parent_agent_id {
+        if let Some(ref parent_runtime_agent_id) = parent_agent_id {
             let parent_cid = {
                 let runtime = state.agent_runtime.lock().await;
                 runtime.conversation_id_for_agent(parent_runtime_agent_id)
@@ -2626,7 +2629,7 @@ pub(crate) async fn spawn_agent_internal(
                 app: app.clone(),
                 agent_runtime: state.agent_runtime.clone(),
                 agent_runtime_notify: state.agent_runtime_notify.clone(),
-                parent_agent_id: Some(info.agent_id),
+                parent_agent_id: Some(info.agent_id.clone()),
                 lazy_parent_agent_id: Mutex::new(None),
                 parent_conversation_id: conversation_id,
                 workspace_roots: workspace_roots.clone(),
@@ -2641,10 +2644,10 @@ pub(crate) async fn spawn_agent_internal(
     let registration = serde_json::json!({
         "kind": "ConversationRegistered",
         "data": {
-            "agent_id": info.agent_id,
+            "agent_id": &info.agent_id,
             "workspace_roots": workspace_roots,
             "backend_kind": backend_kind.as_str(),
-            "name": info.name,
+            "name": &info.name,
             "parent_agent_id": parent_agent_id,
         }
     });
@@ -2696,13 +2699,13 @@ pub(crate) async fn send_agent_message_internal(
 
     // Forward to remote server if agent lives there.
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, agent_id).await?
+        host_router::route_agent(state, &agent_id).await?
     {
         connection
             .invoke(
                 "send_agent_message",
                 serde_json::json!({
-                    "agent_id": agent_id,
+                    "agent_id": &agent_id,
                     "message": message,
                 }),
             )
@@ -2713,7 +2716,7 @@ pub(crate) async fn send_agent_message_internal(
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
-            .conversation_id_for_agent(agent_id)
+            .conversation_id_for_agent(&agent_id)
             .ok_or(format!("Agent {agent_id} not found"))?
     };
 
@@ -2739,12 +2742,12 @@ pub(crate) async fn interrupt_agent_internal(
     let agent_id = request.agent_id;
 
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, agent_id).await?
+        host_router::route_agent(state, &agent_id).await?
     {
         connection
             .invoke(
                 "interrupt_agent",
-                serde_json::json!({ "agent_id": agent_id }),
+                serde_json::json!({ "agent_id": &agent_id }),
             )
             .await?;
         return Ok(());
@@ -2753,18 +2756,18 @@ pub(crate) async fn interrupt_agent_internal(
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
-            .conversation_id_for_agent(agent_id)
+            .conversation_id_for_agent(&agent_id)
             .ok_or(format!("Agent {agent_id} not found"))?
     };
 
     // Cascade interrupt to child agents first
-    let child_ids: Vec<u64> = {
+    let child_ids: Vec<AgentId> = {
         let runtime = state.agent_runtime.lock().await;
         runtime
-            .children_of(agent_id)
+            .children_of(&agent_id)
             .iter()
             .filter(|c| c.is_running)
-            .map(|c| c.agent_id)
+            .map(|c| c.agent_id.clone())
             .collect()
     };
     for child_id in child_ids {
@@ -2787,7 +2790,7 @@ pub(crate) async fn interrupt_agent_internal(
         };
         if changed {
             state.agent_runtime_notify.notify_waiters();
-            emit_agent_changed(app, state, agent_id).await;
+            emit_agent_changed(app, state, &agent_id).await;
         }
         return Ok(());
     }
@@ -2802,11 +2805,11 @@ pub(crate) async fn interrupt_agent_internal(
 
     let changed = {
         let mut runtime = state.agent_runtime.lock().await;
-        runtime.mark_agent_running(agent_id, Some("Cancelling...".to_string()))
+        runtime.mark_agent_running(&agent_id, Some("Cancelling...".to_string()))
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
-        emit_agent_changed(app, state, agent_id).await;
+        emit_agent_changed(app, state, &agent_id).await;
     }
 
     Ok(())
@@ -2820,17 +2823,17 @@ pub(crate) async fn terminate_agent_internal(
     let agent_id = request.agent_id;
 
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, agent_id).await?
+        host_router::route_agent(state, &agent_id).await?
     {
         connection
             .invoke(
                 "terminate_agent",
-                serde_json::json!({ "agent_id": agent_id }),
+                serde_json::json!({ "agent_id": &agent_id }),
             )
             .await?;
 
         // Best-effort local cleanup for mirrored proxy conversations.
-        if let Some(local_cid) = connection.detach_remote_agent(agent_id).await {
+        if let Some(local_cid) = connection.detach_remote_agent(&agent_id).await {
             let removed = {
                 let mut mgr = state.manager.lock().await;
                 mgr.remove(local_cid)
@@ -2845,25 +2848,25 @@ pub(crate) async fn terminate_agent_internal(
             cleanup_conversation_runtime_state(app, state, local_cid).await;
         }
 
-        dev_instance::stop_instances_for_agent(state, agent_id).await;
+        dev_instance::stop_instances_for_agent(state, &agent_id).await;
         return Ok(());
     }
 
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
-            .conversation_id_for_agent(agent_id)
+            .conversation_id_for_agent(&agent_id)
             .ok_or(format!("Agent {agent_id} not found"))?
     };
 
     // Cascade termination to child agents first
-    let child_ids: Vec<u64> = {
+    let child_ids: Vec<AgentId> = {
         let runtime = state.agent_runtime.lock().await;
         runtime
-            .children_of(agent_id)
+            .children_of(&agent_id)
             .iter()
             .filter(|c| c.is_running)
-            .map(|c| c.agent_id)
+            .map(|c| c.agent_id.clone())
             .collect()
     };
     for child_id in child_ids {
@@ -2889,13 +2892,13 @@ pub(crate) async fn terminate_agent_internal(
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
-        emit_agent_changed(app, state, agent_id).await;
+        emit_agent_changed(app, state, &agent_id).await;
     }
 
     cleanup_conversation_runtime_state(app, state, conversation_id).await;
 
     // Clean up any dev instances bound to this agent.
-    dev_instance::stop_instances_for_agent(state, agent_id).await;
+    dev_instance::stop_instances_for_agent(state, &agent_id).await;
 
     Ok(())
 }
@@ -2906,7 +2909,7 @@ pub(crate) async fn get_agent_internal(
 ) -> Result<Option<AgentInfo>, String> {
     if let Some(local) = {
         let runtime = state.agent_runtime.lock().await;
-        runtime.get_agent(request.agent_id)
+        runtime.get_agent(&request.agent_id)
     } {
         return Ok(Some(local));
     }
@@ -2958,7 +2961,7 @@ pub(crate) async fn list_agents_internal(state: &AppState) -> Result<Vec<AgentIn
     let mut merged = list_agents_local_only_internal(state).await;
     let mut seen = HashSet::new();
     for agent in &merged {
-        if !seen.insert(agent.agent_id) {
+        if !seen.insert(agent.agent_id.clone()) {
             return Err(format!(
                 "Duplicate local agent id {} detected while listing agents",
                 agent.agent_id
@@ -2970,7 +2973,7 @@ pub(crate) async fn list_agents_internal(state: &AppState) -> Result<Vec<AgentIn
         match conn.fetch_remote_agents().await {
             Ok(remote_agents) => {
                 for agent in remote_agents {
-                    if !seen.insert(agent.agent_id) {
+                    if !seen.insert(agent.agent_id.clone()) {
                         return Err(format!(
                             "Agent {} exists in both local and remote runtimes (ambiguous owner)",
                             agent.agent_id
@@ -3000,13 +3003,13 @@ pub(crate) async fn wait_for_agent_internal(
 
     // Forward to remote server if agent lives there
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, agent_id).await?
+        host_router::route_agent(state, &agent_id).await?
     {
         let resp = connection
             .invoke(
                 "wait_for_agent",
                 serde_json::json!({
-                    "agent_id": agent_id,
+                    "agent_id": &agent_id,
                 }),
             )
             .await?;
@@ -3015,7 +3018,7 @@ pub(crate) async fn wait_for_agent_internal(
         info.conversation_id = connection
             .to_local_conversation_id(info.conversation_id)
             .await?;
-        connection.register_remote_agent_id(info.agent_id).await;
+        connection.register_remote_agent_id(info.agent_id.clone()).await;
         return Ok(info);
     }
 
@@ -3027,7 +3030,7 @@ pub(crate) async fn wait_for_agent_internal(
         let current = {
             let runtime = state.agent_runtime.lock().await;
             runtime
-                .get_agent(agent_id)
+                .get_agent(&agent_id)
                 .ok_or(format!("Agent {agent_id} not found"))?
         };
         if !current.is_running {
@@ -3051,13 +3054,13 @@ pub(crate) async fn collect_agent_result_internal(
     request: AgentIdRequest,
 ) -> Result<CollectedAgentResult, String> {
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, request.agent_id).await?
+        host_router::route_agent(state, &request.agent_id).await?
     {
         let resp = connection
             .invoke(
                 "collect_agent_result",
                 serde_json::json!({
-                    "agent_id": request.agent_id,
+                    "agent_id": &request.agent_id,
                 }),
             )
             .await?;
@@ -3067,17 +3070,17 @@ pub(crate) async fn collect_agent_result_internal(
             .to_local_conversation_id(result.agent.conversation_id)
             .await?;
         connection
-            .register_remote_agent_id(result.agent.agent_id)
+            .register_remote_agent_id(result.agent.agent_id.clone())
             .await;
         return Ok(result);
     }
     let runtime = state.agent_runtime.lock().await;
-    runtime.collect_result(request.agent_id)
+    runtime.collect_result(&request.agent_id)
 }
 
 fn agent_result_from_info(info: &AgentInfo) -> AgentResult {
     AgentResult {
-        agent_id: info.agent_id,
+        agent_id: info.agent_id.clone(),
         is_running: info.is_running,
         message: info.last_message.clone(),
         error: info.last_error.clone(),
@@ -3178,10 +3181,10 @@ pub(crate) async fn run_query_screenshot_agent(
     let spawn_resp = spawn_agent_internal(app, state, request).await?;
     let agent_id = spawn_resp.agent_id;
 
-    let wait_result = wait_for_agent_internal(state, WaitForAgentRequest { agent_id }).await;
+    let wait_result = wait_for_agent_internal(state, WaitForAgentRequest { agent_id: agent_id.clone() }).await;
 
     // Collect result and terminate regardless of wait outcome.
-    let result = collect_agent_result_internal(state, AgentIdRequest { agent_id }).await;
+    let result = collect_agent_result_internal(state, AgentIdRequest { agent_id: agent_id.clone() }).await;
 
     let _ = terminate_agent_internal(app, state, AgentIdRequest { agent_id }).await;
 
@@ -3225,19 +3228,19 @@ pub(crate) async fn await_agents_internal(
         let all_agents = list_agents_internal(state).await?;
         let mut by_id = HashMap::with_capacity(all_agents.len());
         for agent in all_agents {
-            by_id.insert(agent.agent_id, agent);
+            by_id.insert(agent.agent_id.clone(), agent);
         }
 
         let mut ready = Vec::new();
         let mut still_running = Vec::new();
         let mut newest_updated_at: u64 = 0;
-        for &id in &request.agent_ids {
-            let info = by_id.get(&id).ok_or(format!("Agent {id} not found"))?;
+        for id in &request.agent_ids {
+            let info = by_id.get(id.as_str()).ok_or(format!("Agent {id} not found"))?;
             if info.updated_at_ms > newest_updated_at {
                 newest_updated_at = info.updated_at_ms;
             }
             if info.is_running {
-                still_running.push(id);
+                still_running.push(id.clone());
             } else {
                 ready.push(agent_result_from_info(info));
             }
@@ -3279,18 +3282,18 @@ pub(crate) async fn cancel_agent_internal(
     let agent_id = request.agent_id;
 
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, agent_id).await?
+        host_router::route_agent(state, &agent_id).await?
     {
         let response = connection
             .invoke(
                 "cancel_agent",
                 serde_json::json!({
-                    "agent_id": agent_id,
+                    "agent_id": &agent_id,
                 }),
             )
             .await?;
 
-        if let Some(local_cid) = connection.detach_remote_agent(agent_id).await {
+        if let Some(local_cid) = connection.detach_remote_agent(&agent_id).await {
             let removed = {
                 let mut mgr = state.manager.lock().await;
                 mgr.remove(local_cid)
@@ -3305,7 +3308,7 @@ pub(crate) async fn cancel_agent_internal(
             cleanup_conversation_runtime_state(app, state, local_cid).await;
         }
 
-        dev_instance::stop_instances_for_agent(state, agent_id).await;
+        dev_instance::stop_instances_for_agent(state, &agent_id).await;
 
         return serde_json::from_value(response)
             .map_err(|e| format!("Failed to parse remote cancel result: {e}"));
@@ -3314,7 +3317,7 @@ pub(crate) async fn cancel_agent_internal(
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
         runtime
-            .conversation_id_for_agent(agent_id)
+            .conversation_id_for_agent(&agent_id)
             .ok_or(format!("Agent {agent_id} not found"))?
     };
 
@@ -3342,17 +3345,17 @@ pub(crate) async fn cancel_agent_internal(
     };
     if changed {
         state.agent_runtime_notify.notify_waiters();
-        emit_agent_changed(app, state, agent_id).await;
+        emit_agent_changed(app, state, &agent_id).await;
     }
 
     cleanup_conversation_runtime_state(app, state, conversation_id).await;
 
     // Clean up any dev instances bound to this agent.
-    dev_instance::stop_instances_for_agent(state, agent_id).await;
+    dev_instance::stop_instances_for_agent(state, &agent_id).await;
 
     let runtime = state.agent_runtime.lock().await;
     let info = runtime
-        .get_agent(agent_id)
+        .get_agent(&agent_id)
         .ok_or(format!("Agent {agent_id} not found"))?;
     Ok(agent_result_from_info(&info))
 }
@@ -3364,7 +3367,7 @@ async fn spawn_agent(
     workspace_roots: Vec<String>,
     prompt: String,
     backend_kind: Option<String>,
-    parent_agent_id: Option<u64>,
+    parent_agent_id: Option<AgentId>,
     name: String,
     ephemeral: Option<bool>,
 ) -> Result<SpawnAgentResponse, String> {
@@ -3389,7 +3392,7 @@ async fn spawn_agent(
 async fn send_agent_message(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
     message: String,
 ) -> Result<(), String> {
     send_agent_message_internal(
@@ -3404,7 +3407,7 @@ async fn send_agent_message(
 async fn interrupt_agent(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
 ) -> Result<(), String> {
     interrupt_agent_internal(&app, state.inner(), AgentIdRequest { agent_id }).await
 }
@@ -3413,7 +3416,7 @@ async fn interrupt_agent(
 async fn terminate_agent(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
 ) -> Result<(), String> {
     terminate_agent_internal(&app, state.inner(), AgentIdRequest { agent_id }).await
 }
@@ -3421,7 +3424,7 @@ async fn terminate_agent(
 #[tauri::command]
 async fn get_agent(
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
 ) -> Result<Option<AgentInfo>, String> {
     get_agent_internal(state.inner(), AgentIdRequest { agent_id }).await
 }
@@ -3429,7 +3432,7 @@ async fn get_agent(
 #[tauri::command]
 async fn rename_agent(
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
     name: String,
 ) -> Result<(), String> {
     rename_agent_tauri_free(state.inner(), agent_id, name).await
@@ -3437,18 +3440,18 @@ async fn rename_agent(
 
 pub(crate) async fn rename_agent_tauri_free(
     state: &AppState,
-    agent_id: u64,
+    agent_id: AgentId,
     name: String,
 ) -> Result<(), String> {
     // Forward to remote server if agent lives there.
     if let host_router::AgentRoute::TydeServer { connection } =
-        host_router::route_agent(state, agent_id).await?
+        host_router::route_agent(state, &agent_id).await?
     {
         connection
             .invoke(
                 "rename_agent",
                 serde_json::json!({
-                    "agent_id": agent_id,
+                    "agent_id": &agent_id,
                     "name": name,
                 }),
             )
@@ -3458,11 +3461,11 @@ pub(crate) async fn rename_agent_tauri_free(
 
     let conversation_id = {
         let runtime = state.agent_runtime.lock().await;
-        runtime.conversation_id_for_agent(agent_id)
+        runtime.conversation_id_for_agent(&agent_id)
     };
     {
         let mut runtime = state.agent_runtime.lock().await;
-        runtime.rename_agent(agent_id, name.clone());
+        runtime.rename_agent(&agent_id, name.clone());
     }
     // Update session store alias
     if let Some(cid) = conversation_id {
@@ -3482,7 +3485,7 @@ async fn list_agents(state: tauri::State<'_, AppState>) -> Result<Vec<AgentInfo>
 #[tauri::command]
 async fn wait_for_agent(
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
 ) -> Result<AgentInfo, String> {
     wait_for_agent_internal(state.inner(), WaitForAgentRequest { agent_id }).await
 }
@@ -3499,7 +3502,7 @@ async fn agent_events_since(
 #[tauri::command]
 async fn collect_agent_result(
     state: tauri::State<'_, AppState>,
-    agent_id: u64,
+    agent_id: AgentId,
 ) -> Result<CollectedAgentResult, String> {
     collect_agent_result_internal(state.inner(), AgentIdRequest { agent_id }).await
 }

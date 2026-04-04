@@ -180,7 +180,7 @@ export function spawnAgent(
   workspaceRoots: string[],
   prompt: string,
   backendKind?: BackendKind,
-  parentAgentId?: number,
+  parentAgentId?: string,
   name?: string,
   ephemeral?: boolean,
 ) {
@@ -194,23 +194,23 @@ export function spawnAgent(
   });
 }
 
-export function sendAgentMessage(agentId: number, message: string) {
+export function sendAgentMessage(agentId: string, message: string) {
   return execute("send_agent_message", { agentId, message });
 }
 
-export function interruptAgent(agentId: number) {
+export function interruptAgent(agentId: string) {
   return execute("interrupt_agent", { agentId });
 }
 
-export function terminateAgent(agentId: number) {
+export function terminateAgent(agentId: string) {
   return execute("terminate_agent", { agentId });
 }
 
-export function getAgent(agentId: number) {
+export function getAgent(agentId: string) {
   return execute("get_agent", { agentId });
 }
 
-export function renameAgent(agentId: number, name: string) {
+export function renameAgent(agentId: string, name: string) {
   return execute("rename_agent", { agentId, name });
 }
 
@@ -218,7 +218,7 @@ export function listAgents() {
   return execute("list_agents", {} as Record<string, never>);
 }
 
-export function waitForAgent(agentId: number) {
+export function waitForAgent(agentId: string) {
   return execute("wait_for_agent", { agentId });
 }
 
@@ -226,7 +226,7 @@ export function agentEventsSince(sinceSeq = 0, limit = 200) {
   return execute("agent_events_since", { sinceSeq, limit });
 }
 
-export function collectAgentResult(agentId: number) {
+export function collectAgentResult(agentId: string) {
   return execute("collect_agent_result", { agentId });
 }
 

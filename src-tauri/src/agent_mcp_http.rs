@@ -69,7 +69,7 @@ struct SpawnAgentToolInput {
     /// Backend to use (e.g. "tycode", "claude", "codex"). Defaults to "tycode".
     backend_kind: Option<String>,
     /// Parent agent ID if this is a sub-agent.
-    parent_agent_id: Option<u64>,
+    parent_agent_id: Option<String>,
     /// Human-readable name for the agent.
     name: String,
     /// Whether this is an ephemeral (non-persisted) session.
@@ -85,7 +85,7 @@ struct RunAgentToolInput {
     /// Backend to use (e.g. "tycode", "claude", "codex"). Defaults to "tycode".
     backend_kind: Option<String>,
     /// Parent agent ID if this is a sub-agent.
-    parent_agent_id: Option<u64>,
+    parent_agent_id: Option<String>,
     /// Human-readable name for the agent.
     name: String,
 }
@@ -93,7 +93,7 @@ struct RunAgentToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct SendAgentMessageToolInput {
     /// The agent to send the message to.
-    agent_id: u64,
+    agent_id: String,
     /// The follow-up message text.
     message: String,
 }
@@ -101,7 +101,7 @@ struct SendAgentMessageToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct AwaitAgentsToolInput {
     /// Agent IDs to watch.
-    agent_ids: Vec<u64>,
+    agent_ids: Vec<String>,
     /// Idle timeout in milliseconds. Resets on agent activity. Defaults to 60s.
     timeout_ms: Option<u64>,
 }
@@ -109,7 +109,7 @@ struct AwaitAgentsToolInput {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 struct AgentIdToolInput {
     /// The agent to cancel.
-    agent_id: u64,
+    agent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -154,10 +154,14 @@ fn spawn_request_from(input: SpawnAgentToolInput) -> SpawnAgentRequest {
 /// Extract the caller's agent ID from the `X-Tyde-Agent-Id` HTTP header.
 /// This header is set by `startup_mcp_servers_for_agent` when the MCP server
 /// config is injected into each agent's session.
-fn caller_agent_id_from_parts(parts: &http::request::Parts) -> Option<u64> {
+fn caller_agent_id_from_parts(parts: &http::request::Parts) -> Option<String> {
     let header = parts.headers.get("x-tyde-agent-id")?;
     let s = header.to_str().ok()?;
-    s.parse::<u64>().ok()
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Check the caller agent's tool policy. Returns `Some(err_text(...))` if the
@@ -169,7 +173,7 @@ async fn check_tool_policy(
 ) -> Option<CallToolResult> {
     let caller_id = caller_agent_id_from_parts(parts)?;
     let runtime = app_state.agent_runtime.lock().await;
-    let agent = runtime.get_agent(caller_id)?;
+    let agent = runtime.get_agent(&caller_id)?;
     match &agent.tool_policy {
         ToolPolicy::Unrestricted => None,
         ToolPolicy::AllowList(tools) => {

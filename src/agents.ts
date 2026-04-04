@@ -1,9 +1,10 @@
 import { formatRelativeTime } from "./chat/message_renderer";
 
 export type AgentCardAction = "interrupt" | "terminate" | "remove";
+type AgentId = string;
 
 export interface AgentInfo {
-  agentId?: number;
+  agentId?: AgentId;
   conversationId: number;
   name: string;
   agentType?: string | null;
@@ -12,14 +13,14 @@ export interface AgentInfo {
   hasError?: boolean;
   createdAt: number;
   projectId: string;
-  parentAgentId?: number | null;
+  parentAgentId?: AgentId | null;
 }
 
 export class AgentsPanel {
   private container: HTMLElement;
   private agents: AgentInfo[] = [];
   private projectFilter: string | null = null;
-  private collapsedParents: Set<number> = new Set();
+  private collapsedParents: Set<AgentId> = new Set();
   private hideInactive = false;
   private hideSubAgents = false;
   private searchQuery = "";
@@ -103,7 +104,7 @@ export class AgentsPanel {
     }
 
     // Build parent→children map keyed by agentId
-    const childrenByParent = new Map<number, AgentInfo[]>();
+    const childrenByParent = new Map<AgentId, AgentInfo[]>();
     const roots: AgentInfo[] = [];
 
     for (const agent of filtered) {
