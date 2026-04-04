@@ -51,6 +51,7 @@ export class SessionsPanel {
   private showNonTydeSessions = false;
   private newSessionEnabled = true;
   private newSessionDisabledReason = "New sessions are unavailable.";
+  workspaceRoot: string | undefined;
 
   private wrapperEl: HTMLElement | null = null;
   private virtualizer: Virtualizer<HTMLElement, HTMLElement> | null = null;
@@ -80,7 +81,7 @@ export class SessionsPanel {
 
   async refresh(): Promise<void> {
     try {
-      const records = await listSessionRecords();
+      const records = await listSessionRecords(this.workspaceRoot);
       this.updateFromRecords(records);
     } catch (err) {
       console.error("Failed to fetch session records:", err);

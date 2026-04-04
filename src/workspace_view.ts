@@ -553,6 +553,7 @@ export class WorkspaceView {
     this.fileExplorer = new FileExplorer(filesPanelEl);
     this.diffPanel = new DiffPanel(diffPanelEl);
     this.sessionsPanel = new SessionsPanel(sessionsContainer);
+    this.sessionsPanel.workspaceRoot = this.workspacePath;
     this.sessionsPanel.setNewSessionAvailability(
       this.newConversationEnabled,
       this.newConversationDisabledReason,
@@ -1755,7 +1756,7 @@ export class WorkspaceView {
     }
 
     try {
-      const records = await listSessionRecords();
+      const records = await listSessionRecords(this.workspacePath);
       this.eventRouter.clearSessionsLoadingTimeout();
       this.sessionsPanel.updateFromRecords(records);
     } catch (err) {

@@ -4252,21 +4252,31 @@ async fn admin_delete_session(
 #[tauri::command]
 async fn list_session_records(
     state: tauri::State<'_, AppState>,
+    workspace_root: Option<String>,
 ) -> Result<Vec<session_store::SessionRecord>, String> {
-    let mut records = state.session_store.lock().list()?;
-    // Include server-authoritative records from all TydeServer connections
-    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
-        state.tyde_server_connections.lock().values().cloned().collect();
-    for conn in conns {
-        let fresh = conn.fetch_session_records().await.map_err(|err| {
-            format!(
-                "Failed to fetch session records from {}: {err}",
-                conn.host_id
-            )
-        })?;
-        records.extend(fresh);
+    // If the workspace is remote, return only the remote server's records.
+    if let Some(ref root) = workspace_root {
+        if let Some(remote) = parse_remote_path(root) {
+            let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
+                state.tyde_server_connections.lock().values().cloned().collect();
+            for conn in &conns {
+                if conn.ssh_host() == remote.host {
+                    return conn.fetch_session_records().await.map_err(|err| {
+                        format!(
+                            "Failed to fetch session records from {}: {err}",
+                            conn.host_id
+                        )
+                    });
+                }
+            }
+            return Err(format!(
+                "No TydeServer connection for remote host '{}'",
+                remote.host
+            ));
+        }
     }
-    Ok(records)
+    // Local workspace: return only local store records.
+    state.session_store.lock().list()
 }
 
 #[tauri::command]

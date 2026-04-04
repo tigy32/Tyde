@@ -16,6 +16,7 @@ import {
   parseChatEvent,
   type RemoteConnectionProgress,
   type RuntimeAgent,
+  type SessionRecord,
   type TerminalExitPayload,
   type TerminalOutputPayload,
 } from "@tyde/protocol";
@@ -142,8 +143,8 @@ export function deleteSession(conversationId: number, sessionId: string) {
   return execute("delete_session", { conversationId, sessionId });
 }
 
-export function listSessionRecords() {
-  return execute("list_session_records", {} as Record<string, never>);
+export function listSessionRecords(workspaceRoot?: string) {
+  return invoke<SessionRecord[]>("list_session_records", { workspaceRoot });
 }
 
 export function renameSession(id: string, name: string) {
