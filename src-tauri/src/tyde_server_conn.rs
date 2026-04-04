@@ -52,6 +52,8 @@ pub struct TydeServerConnection {
     tunnel_child: Mutex<Option<tokio::process::Child>>,
     tunnel_socket_path: Mutex<Option<PathBuf>>,
     pub remote_conversations: Mutex<Vec<ConversationSnapshot>>,
+    /// Server-authoritative session records, synced from handshake.
+    pub remote_session_records: Mutex<Vec<crate::session_store::SessionRecord>>,
     /// Maps server-side conversation IDs to local conversation IDs.
     server_to_local_conv: Mutex<HashMap<u64, u64>>,
     /// Agent IDs known to be managed by this remote server.
@@ -84,6 +86,7 @@ impl TydeServerConnection {
             tunnel_child: Mutex::new(None),
             tunnel_socket_path: Mutex::new(None),
             remote_conversations: Mutex::new(Vec::new()),
+            remote_session_records: Mutex::new(Vec::new()),
             server_to_local_conv: Mutex::new(HashMap::new()),
             remote_agent_ids: Mutex::new(std::collections::HashSet::new()),
             agent_to_server_conversation: Mutex::new(HashMap::new()),
@@ -257,6 +260,7 @@ impl TydeServerConnection {
                                 if roots.len() == arr.len() {
                                     let app_state = self.app.state::<crate::AppState>();
                                     if let Err(e) = crate::materialize_remote_conversation(
+                                        &self.app,
                                         &app_state,
                                         Arc::clone(self),
                                         server_cid,
@@ -346,32 +350,33 @@ impl TydeServerConnection {
                         self.last_chat_event_seqs.lock().await.insert(server_cid, s);
                     }
 
-                    // Keep proxy settings watches in sync so update_settings'
-                    // GetSettings -> Settings round-trip works for remote
-                    // tycode conversations too.
-                    let settings_payload = translated
-                        .get("event")
-                        .and_then(|ev| {
-                            ev.get("kind")
-                                .and_then(|kind| kind.as_str())
-                                .map(|kind| (ev, kind))
-                        })
-                        .and_then(|(ev, kind)| {
-                            if kind == "Settings" {
-                                ev.get("data").cloned()
+                    // Route chat events through the unified forward_events
+                    // pipeline so session store tracking (message counts,
+                    // aliases, etc.) works identically for remote sessions.
+                    if let Some(local_cid) =
+                        translated.get("conversation_id").and_then(|v| v.as_u64())
+                    {
+                        if let Some(inner_event) = translated.get("event").cloned() {
+                            let app_state = self.app.state::<crate::AppState>();
+                            let sender = app_state
+                                .remote_chat_senders
+                                .lock()
+                                .get(&local_cid)
+                                .cloned();
+                            if let Some(tx) = sender {
+                                let _ = tx.send(inner_event);
                             } else {
-                                None
+                                tracing::error!(
+                                    "No remote_chat_sender for local conversation {local_cid} — \
+                                     session store tracking will be missing"
+                                );
+                                let _ = self.app.emit(&event, &translated);
                             }
-                        });
-                    if let (Some(local_cid), Some(settings)) = (
-                        translated.get("conversation_id").and_then(|v| v.as_u64()),
-                        settings_payload,
-                    ) {
-                        let app_state = self.app.state::<crate::AppState>();
-                        crate::publish_settings_update(&app_state, local_cid, settings).await;
+                        }
                     }
+                } else {
+                    let _ = self.app.emit(&event, &translated);
                 }
-                let _ = self.app.emit(&event, &translated);
             }
             ServerFrame::Shutdown { reason } => {
                 tracing::info!("Remote Tyde server shutting down: {reason}");
@@ -424,6 +429,26 @@ impl TydeServerConnection {
         self.remote_agent_ids.lock().await.contains(agent_id)
     }
 
+    pub async fn fetch_session_records(
+        &self,
+    ) -> Result<Vec<crate::session_store::SessionRecord>, String> {
+        let resp = self
+            .invoke("list_session_records", serde_json::json!({}))
+            .await?;
+        let records: Vec<crate::session_store::SessionRecord> = serde_json::from_value(resp)
+            .map_err(|e| format!("Failed to parse remote session records: {e}"))?;
+        *self.remote_session_records.lock().await = records.clone();
+        Ok(records)
+    }
+
+    pub async fn owns_session_record(&self, id: &str) -> bool {
+        self.remote_session_records
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.id == id)
+    }
+
     pub async fn fetch_remote_agents(
         self: &Arc<Self>,
     ) -> Result<Vec<crate::agent_runtime::AgentInfo>, String> {
@@ -436,8 +461,6 @@ impl TydeServerConnection {
         let mut fresh_agent_to_server_cid = HashMap::new();
         for mut agent in agents {
             let server_cid = agent.conversation_id;
-            fresh_agent_ids.insert(agent.agent_id.clone());
-            fresh_agent_to_server_cid.insert(agent.agent_id.clone(), server_cid);
             let local_cid = if let Some(local_cid) =
                 self.translate_conversation_id(server_cid).await
             {
@@ -445,6 +468,7 @@ impl TydeServerConnection {
             } else {
                 let app_state = self.app.state::<crate::AppState>();
                 match crate::materialize_remote_conversation(
+                    &self.app,
                     &app_state,
                     Arc::clone(self),
                     server_cid,
@@ -465,6 +489,9 @@ impl TydeServerConnection {
                     }
                 }
             };
+            // Only register ownership after successful materialization
+            fresh_agent_ids.insert(agent.agent_id.clone());
+            fresh_agent_to_server_cid.insert(agent.agent_id.clone(), server_cid);
             agent.conversation_id = local_cid;
             agent.workspace_roots = self.normalize_workspace_roots(&agent.workspace_roots);
             out.push(agent);
@@ -616,6 +643,7 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
             // 1. Materialize conversations first
             for conv in &result.conversations {
                 if let Err(e) = crate::materialize_remote_conversation(
+                    &this.app,
                     &app_state,
                     this.clone(),
                     conv.conversation_id,
@@ -646,6 +674,7 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
                 if local_cid.is_none() {
                     let app_state = this.app.state::<crate::AppState>();
                     if let Err(err) = crate::materialize_remote_conversation(
+                        &this.app,
                         &app_state,
                         Arc::clone(&this),
                         agent.conversation_id,
@@ -679,6 +708,7 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
                 }
             }
             *this.remote_conversations.lock().await = result.conversations;
+            *this.remote_session_records.lock().await = result.session_records;
         }
         ServerFrame::Error { error, .. } => {
             return Err(format!("Handshake rejected: {error}"));

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent_runtime::AgentInfo;
+use crate::session_store::SessionRecord;
 
 // ---------------------------------------------------------------------------
 // Wire format: newline-delimited JSON.
@@ -140,6 +141,8 @@ pub struct HandshakeResult {
     pub conversations: Vec<ConversationSnapshot>,
     #[serde(default)]
     pub instance_id: Option<String>,
+    #[serde(default)]
+    pub session_records: Vec<SessionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

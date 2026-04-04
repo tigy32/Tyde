@@ -20,6 +20,16 @@ import {
   type TerminalOutputPayload,
 } from "@tyde/protocol";
 
+// Extend CommandMap for commands not yet in the protocol package
+declare module "@tyde/protocol" {
+  interface CommandMap {
+    delete_session_record: {
+      params: { id: string };
+      response: undefined;
+    };
+  }
+}
+
 export type {
   AdminEventPayload,
   AgentDefinitionEntry,
@@ -48,15 +58,23 @@ export type {
   WorkflowEntry,
 } from "@tyde/protocol";
 
+const VALID_BACKEND_KINDS = new Set<BackendKind>([
+  "tycode",
+  "codex",
+  "claude",
+  "kiro",
+  "gemini",
+]);
+
 export function normalizeBackendKind(
   value: string | null | undefined,
 ): BackendKind {
   const normalized = (value ?? "").trim().toLowerCase();
-  if (normalized === "codex") return "codex";
-  if (normalized === "claude" || normalized === "claude_code") return "claude";
-  if (normalized === "kiro") return "kiro";
-  if (normalized === "gemini") return "gemini";
-  return "tycode";
+  if (normalized === "claude_code") return "claude";
+  if (VALID_BACKEND_KINDS.has(normalized as BackendKind)) {
+    return normalized as BackendKind;
+  }
+  throw new Error(`Unknown backend kind: '${value}'`);
 }
 
 function friendlyError(raw: string): string {
@@ -124,10 +142,6 @@ export function deleteSession(conversationId: number, sessionId: string) {
   return execute("delete_session", { conversationId, sessionId });
 }
 
-export function exportSessionJson(sessionId: string) {
-  return execute("export_session_json", { sessionId });
-}
-
 export function listSessionRecords() {
   return execute("list_session_records", {} as Record<string, never>);
 }
@@ -138,6 +152,10 @@ export function renameSession(id: string, name: string) {
 
 export function setSessionAlias(id: string, alias: string) {
   return execute("set_session_alias", { id, alias });
+}
+
+export function deleteSessionRecord(id: string) {
+  return execute("delete_session_record", { id });
 }
 
 // --- Settings & models ---

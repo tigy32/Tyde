@@ -1002,7 +1002,6 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
 
     case 'cancel_conversation':
     case 'delete_session':
-    case 'export_session_json':
     case 'get_module_schemas': {
       const cid = Number(args?.conversationId);
       if (Number.isFinite(cid)) {
@@ -1158,6 +1157,19 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         const current = mockSessionsByBackend[backendKind] ?? [];
         mockSessionsByBackend[backendKind] = current.filter((session) => session.id !== sessionId);
       }
+      return null;
+    }
+
+    case 'delete_session_record': {
+      const recordId = typeof args?.id === 'string' ? args.id : '';
+      const rec = mockSessionRecords.get(recordId);
+      if (rec && rec.backend_session_id) {
+        const current = mockSessionsByBackend[rec.backend_kind] ?? [];
+        mockSessionsByBackend[rec.backend_kind] = current.filter(
+          (session) => session.id !== rec.backend_session_id,
+        );
+      }
+      mockSessionRecords.delete(recordId);
       return null;
     }
 

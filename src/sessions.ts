@@ -46,6 +46,7 @@ export class SessionsPanel {
   private state: "loading" | "loaded" | "error" = "loaded";
   private errorMessage = "";
   private records = new Map<string, SessionRecord>();
+  private externalSessions: NormalizedSession[] = [];
   private showAgentSessions = false;
   private showNonTydeSessions = false;
   private newSessionEnabled = true;
@@ -61,11 +62,13 @@ export class SessionsPanel {
   onNewSession: (() => void) | null = null;
   onRefresh: (() => void) | null = null;
   onDeleteSession:
-    | ((sessionId: string, backendKind: BackendKind) => void)
+    | ((
+        sessionId: string,
+        backendKind: BackendKind,
+        tydeSessionId: string | null,
+      ) => void)
     | null = null;
-  onExportSession:
-    | ((sessionId: string, backendKind: BackendKind) => void)
-    | null = null;
+  onRequestExternalSessions: (() => void) | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -75,44 +78,25 @@ export class SessionsPanel {
     this.render();
   }
 
-  async refreshRecords(): Promise<void> {
+  async refresh(): Promise<void> {
     try {
       const records = await listSessionRecords();
-      this.records.clear();
-      for (const r of records) {
-        this.records.set(r.id, r);
-      }
+      this.updateFromRecords(records);
     } catch (err) {
       console.error("Failed to fetch session records:", err);
+      this.showError("Failed to load session records.");
     }
   }
 
-  update(sessions: SessionMetadata[]): void {
-    const normalized = sessions
-      .map((s) => this.normalizeSession(s))
-      .filter((s): s is NormalizedSession => s !== null);
-
-    // Inject sub-agent sessions from store that aren't in the backend list
-    const matchedRecordIds = new Set(
-      normalized
-        .map((s) => s.tydeSessionId)
-        .filter((id): id is string => id !== null),
-    );
-    for (const record of this.records.values()) {
-      if (matchedRecordIds.has(record.id)) continue;
-      if (!record.parent_id) continue;
-      normalized.push({
-        key: `store:${record.id}`,
-        id: record.backend_session_id ?? record.id,
-        tydeSessionId: record.id,
-        backendKind: normalizeBackendKind(record.backend_kind),
-        preview: record.alias ?? "Sub-agent session",
-        timestampMs: record.created_at_ms,
-        messageCount: record.message_count,
-        workspaceRoot: record.workspace_root ?? undefined,
-        parentId: record.parent_id,
-      });
+  updateFromRecords(records: SessionRecord[]): void {
+    this.records.clear();
+    for (const r of records) {
+      this.records.set(r.id, r);
     }
+
+    const normalized: NormalizedSession[] = records
+      .filter((r) => r.message_count > 0 || r.backend_session_id)
+      .map((r) => this.recordToSession(r));
 
     normalized.sort((a, b) => b.timestampMs - a.timestampMs);
     this.sessions = normalized;
@@ -121,6 +105,39 @@ export class SessionsPanel {
     this.resumingSessionKey = null;
     this.applyFilter();
     this.render();
+  }
+
+  private recordToSession(record: SessionRecord): NormalizedSession {
+    return {
+      key: `${record.backend_kind}:${record.backend_session_id ?? record.id}`,
+      id: record.backend_session_id ?? record.id,
+      tydeSessionId: record.id,
+      backendKind: normalizeBackendKind(record.backend_kind),
+      preview: record.user_alias ?? record.alias ?? "New Session",
+      timestampMs: record.updated_at_ms,
+      messageCount: record.message_count,
+      workspaceRoot: record.workspace_root ?? undefined,
+      parentId: record.parent_id ?? null,
+    };
+  }
+
+  updateExternalSessions(sessions: SessionMetadata[]): void {
+    const knownBackendIds = new Set<string>();
+    for (const record of this.records.values()) {
+      if (record.backend_session_id) {
+        knownBackendIds.add(
+          `${record.backend_kind}:${record.backend_session_id}`,
+        );
+      }
+    }
+
+    this.externalSessions = sessions
+      .map((s) => this.normalizeExternalSession(s))
+      .filter((s): s is NormalizedSession => s !== null)
+      .filter((s) => !knownBackendIds.has(`${s.backendKind}:${s.id}`));
+
+    this.applyFilter();
+    this.updateVirtualList();
   }
 
   showLoading(): void {
@@ -186,12 +203,11 @@ export class SessionsPanel {
   }
 
   private applyFilter(): void {
-    let base = this.sessions;
-    // Exclude sessions with zero messages (created but never used)
-    base = base.filter((s) => s.messageCount !== 0);
-    // Hide sessions not tracked by Tyde unless toggle is on
-    if (!this.showNonTydeSessions) {
-      base = base.filter((s) => s.tydeSessionId !== null);
+    let base = [...this.sessions];
+    // Include external backend sessions when toggle is on
+    if (this.showNonTydeSessions) {
+      base.push(...this.externalSessions);
+      base.sort((a, b) => b.timestampMs - a.timestampMs);
     }
     // Filter out agent sessions unless toggle is on
     if (!this.showAgentSessions) {
@@ -356,6 +372,11 @@ export class SessionsPanel {
       externalToggle.title = this.showNonTydeSessions
         ? "Hide sessions from outside Tyde"
         : "Show sessions from outside Tyde";
+      if (this.showNonTydeSessions) {
+        this.onRequestExternalSessions?.();
+      } else {
+        this.externalSessions = [];
+      }
       this.applyFilter();
       this.updateVirtualList();
     });
@@ -577,7 +598,11 @@ export class SessionsPanel {
         { title: "Delete session", kind: "warning" },
       );
       if (!confirmed) return;
-      this.onDeleteSession?.(session.id, session.backendKind);
+      this.onDeleteSession?.(
+        session.id,
+        session.backendKind,
+        session.tydeSessionId,
+      );
     });
     actions.appendChild(deleteBtn);
 
@@ -670,7 +695,9 @@ export class SessionsPanel {
     return `${h12}:${m} ${period}`;
   }
 
-  private normalizeSession(raw: SessionMetadata): NormalizedSession | null {
+  private normalizeExternalSession(
+    raw: SessionMetadata,
+  ): NormalizedSession | null {
     const sessionId = this.asString(raw.session_id) ?? this.asString(raw.id);
     if (!sessionId) return null;
     const backendKind = normalizeBackendKind(raw.backend_kind);
@@ -687,40 +714,21 @@ export class SessionsPanel {
       Date.now();
     const timestampMs =
       createdValue > 1_000_000_000_000 ? createdValue : createdValue * 1000;
-
-    // Match with store record by backend_session_id + backend_kind
-    let matchedRecord: SessionRecord | undefined;
-    for (const record of this.records.values()) {
-      if (
-        record.backend_session_id === sessionId &&
-        normalizeBackendKind(record.backend_kind) === backendKind
-      ) {
-        matchedRecord = record;
-        break;
-      }
-    }
-
-    // Use store message_count if available, otherwise fall back to backend
-    const messageCountRaw = matchedRecord
-      ? matchedRecord.message_count
-      : this.asNumber(raw.message_count);
-
-    const finalTimestampMs = timestampMs || matchedRecord?.created_at_ms || 0;
+    const messageCountRaw = this.asNumber(raw.message_count);
 
     return {
       key: this.sessionKey(sessionId, backendKind),
       id: sessionId,
-      tydeSessionId: matchedRecord?.id ?? null,
+      tydeSessionId: null,
       backendKind,
       preview,
-      timestampMs: finalTimestampMs,
+      timestampMs,
       messageCount:
         messageCountRaw === null
           ? null
           : Math.max(0, Math.floor(messageCountRaw)),
-      workspaceRoot:
-        matchedRecord?.workspace_root ?? this.asString(raw.workspace_root),
-      parentId: matchedRecord?.parent_id ?? null,
+      workspaceRoot: this.asString(raw.workspace_root),
+      parentId: null,
     };
   }
 
@@ -781,7 +789,7 @@ export class SessionsPanel {
     const trimmed = next.trim();
     if (session.tydeSessionId) {
       await renameSession(session.tydeSessionId, trimmed);
-      await this.refreshRecords();
+      await this.refresh();
     }
     this.renderVisibleCards();
   }
@@ -789,7 +797,7 @@ export class SessionsPanel {
   private async migrateLocalStorageAliases(): Promise<void> {
     const raw = localStorage.getItem(SESSION_ALIAS_STORAGE_KEY);
     if (!raw) {
-      await this.refreshRecords();
+      await this.refresh();
       return;
     }
     const parsed = JSON.parse(raw);
@@ -798,11 +806,11 @@ export class SessionsPanel {
       parsed === null ||
       Array.isArray(parsed)
     ) {
-      await this.refreshRecords();
+      await this.refresh();
       return;
     }
     const aliases = parsed as Record<string, string>;
-    await this.refreshRecords();
+    await this.refresh();
     const promises: Promise<void>[] = [];
     for (const [key, alias] of Object.entries(aliases)) {
       if (!alias || !alias.trim()) continue;

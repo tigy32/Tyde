@@ -180,16 +180,13 @@ export class EventRouter {
         }
         break;
       case "SessionStarted":
-        void sessionsPanel.refreshRecords();
+        void sessionsPanel.refresh();
         break;
       case "SessionsList":
+        // Session list display is driven by session records, not backend
+        // metadata. Trigger a store refresh to pick up any new records.
         this.clearSessionsLoadingTimeout();
-        try {
-          sessionsPanel.update(event.data.sessions);
-        } catch (err) {
-          sessionsPanel.showError("Failed to render sessions list.");
-          notifications.error(`Sessions rendering failed: ${String(err)}`);
-        }
+        void sessionsPanel.refresh();
         break;
       case "SubprocessExit":
         if (tab) tabManager.setStreaming(tab.id, false);

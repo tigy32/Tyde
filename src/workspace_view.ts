@@ -18,8 +18,9 @@ import {
   collectAgentResult,
   createAdminSubprocess,
   createConversation,
-  exportSessionJson,
+  deleteSessionRecord,
   listHosts,
+  listSessionRecords,
   normalizeBackendKind,
   onFileChanged,
   readFileContent,
@@ -1206,22 +1207,17 @@ export class WorkspaceView {
     }
     if (event.kind === "SessionsList") {
       this.eventRouter.clearSessionsLoadingTimeout();
-      try {
-        const backendKind =
-          this.adminBackendById.get(payload.admin_id) ?? "tycode";
-        this.resolveSessionsListWaiters(backendKind);
-        const sessions = event.data.sessions.map((session) => ({
-          ...session,
-          backend_kind: session.backend_kind ?? backendKind,
-        }));
-        this.sessionsByBackend.set(backendKind, sessions);
-        void this.sessionsPanel.refreshRecords().then(() => {
-          this.sessionsPanel.update(this.mergeSessions());
-        });
-      } catch (err) {
-        this.sessionsPanel.showError("Failed to render sessions list.");
-        this.notifications.error(`Sessions rendering failed: ${String(err)}`);
-      }
+      const backendKind =
+        this.adminBackendById.get(payload.admin_id) ?? "tycode";
+      this.resolveSessionsListWaiters(backendKind);
+      // Store backend sessions for the external sessions toggle
+      const sessions = event.data.sessions.map((session) => ({
+        ...session,
+        backend_kind: session.backend_kind ?? backendKind,
+      }));
+      this.sessionsByBackend.set(backendKind, sessions);
+      // Refresh the session panel from the store
+      void this.sessionsPanel.refresh();
     }
   }
 
@@ -1589,35 +1585,6 @@ export class WorkspaceView {
     return backends;
   }
 
-  private mergeSessions(): SessionMetadata[] {
-    const merged: SessionMetadata[] = [];
-    for (const backendKind of this.supportedSessionBackends()) {
-      const sessions = this.sessionsByBackend.get(backendKind) ?? [];
-      for (const session of sessions) {
-        merged.push({
-          ...session,
-          backend_kind: session.backend_kind ?? backendKind,
-        });
-      }
-    }
-
-    const toTimestamp = (value: unknown): number => {
-      if (typeof value !== "number" || !Number.isFinite(value)) return 0;
-      return value > 1_000_000_000_000 ? value : value * 1000;
-    };
-
-    merged.sort((a, b) => {
-      const aTs = toTimestamp(
-        (a as any).last_modified ?? (a as any).created_at,
-      );
-      const bTs = toTimestamp(
-        (b as any).last_modified ?? (b as any).created_at,
-      );
-      return bTs - aTs;
-    });
-    return merged;
-  }
-
   private createSessionsListWaiter(backendKind: BackendKind): {
     promise: Promise<void>;
     cancel: () => void;
@@ -1688,23 +1655,6 @@ export class WorkspaceView {
       this.rejectSessionsListWaiters(backendKind, new Error(reason));
     }
     this.sessionsListWaitersByBackend.clear();
-  }
-
-  private resolveSessionIdentifier(session: SessionMetadata): string | null {
-    const sessionId =
-      typeof session.session_id === "string" ? session.session_id.trim() : "";
-    if (sessionId.length > 0) return sessionId;
-    const id = typeof session.id === "string" ? session.id.trim() : "";
-    return id.length > 0 ? id : null;
-  }
-
-  private hasSession(backendKind: BackendKind, sessionId: string): boolean {
-    const normalizedTarget = sessionId.trim();
-    if (!normalizedTarget) return false;
-    const sessions = this.sessionsByBackend.get(backendKind) ?? [];
-    return sessions.some(
-      (session) => this.resolveSessionIdentifier(session) === normalizedTarget,
-    );
   }
 
   private async refreshSessionsForBackend(
@@ -1804,37 +1754,18 @@ export class WorkspaceView {
       this.eventRouter.beginSessionsLoading();
     }
 
-    const backends = this.supportedSessionBackends();
-    const failures: string[] = [];
-
-    await Promise.all(
-      backends.map(async (backendKind) => {
-        try {
-          await this.refreshSessionsForBackend(backendKind);
-        } catch (err) {
-          failures.push(`${backendKind}: ${String(err)}`);
-        }
-      }),
-    );
-
-    if (failures.length === backends.length) {
+    try {
+      const records = await listSessionRecords();
+      this.eventRouter.clearSessionsLoadingTimeout();
+      this.sessionsPanel.updateFromRecords(records);
+    } catch (err) {
       if (showPanel) {
         this.eventRouter.clearSessionsLoadingTimeout();
         this.sessionsPanel.showError(
-          `Failed to load sessions: ${failures[0] ?? "Unknown error"}`,
+          `Failed to load sessions: ${err instanceof Error ? err.message : String(err)}`,
         );
       } else {
-        console.warn("Background session refresh failed:", failures);
-      }
-      return;
-    }
-
-    if (failures.length > 0) {
-      const message = `Some session sources failed to refresh: ${failures.join(" | ")}`;
-      if (showPanel) {
-        this.notifications.warning(message);
-      } else {
-        console.warn(message);
+        console.warn("Background session refresh failed:", err);
       }
     }
   }
@@ -1989,9 +1920,7 @@ export class WorkspaceView {
       );
       if (tydeSessionId) {
         void renameSession(tydeSessionId, tab.title).then(() =>
-          this.sessionsPanel
-            .refreshRecords()
-            .then(() => this.sessionsPanel.update(this.mergeSessions())),
+          this.sessionsPanel.refresh(),
         );
       }
     };
@@ -2057,71 +1986,66 @@ export class WorkspaceView {
       void this.requestSessionsList();
     };
 
-    this.sessionsPanel.onDeleteSession = async (sessionId, backendKind) => {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        let adminId: number;
-        try {
-          adminId = await this.ensureAdminSubprocess(backendKind);
-        } catch (err) {
-          this.notifications.error(
-            `Failed to start ${backendKind} admin process: ${String(err)}`,
-          );
-          return;
-        }
-        try {
+    this.sessionsPanel.onDeleteSession = async (
+      sessionId,
+      backendKind,
+      tydeSessionId,
+    ) => {
+      try {
+        if (tydeSessionId) {
+          // Store-sourced session: Rust handles backend deletion + store cleanup,
+          // including routing to remote TydeServer when appropriate.
+          await deleteSessionRecord(tydeSessionId);
+        } else {
+          // External session (no store record): use admin subprocess to delete
+          // from the backend directly.
+          const adminId = await this.ensureAdminSubprocess(backendKind);
           await adminDeleteSession(adminId, sessionId);
-          await this.refreshSessionsForBackend(backendKind);
-          if (this.hasSession(backendKind, sessionId)) {
-            if (backendKind === "kiro") {
-              await new Promise((resolve) => setTimeout(resolve, 250));
-              await this.refreshSessionsForBackend(backendKind);
-            }
-            if (this.hasSession(backendKind, sessionId)) {
-              throw new Error(
-                "Delete command returned, but the session still exists.",
-              );
-            }
-          }
-          // Close the tab if this session is currently open.
-          for (const [cid, info] of this.conversationSessionMap) {
-            if (
-              info.sessionId === sessionId &&
-              info.backendKind === backendKind
-            ) {
-              const tab = this.tabManager.getTabByConversationId(cid);
-              if (tab) this.tabManager.closeTab(tab.id);
-              this.closeConversationPermanently(cid, false);
-              break;
-            }
-          }
-          // Store record is cleaned up by Rust in admin_delete_session
-          this.notifications.success("Session deleted");
-          return;
-        } catch (err) {
-          this.invalidateAdminSubprocess(backendKind);
-          if (attempt === 1) {
-            this.notifications.error(
-              `Failed to delete session: ${String(err)}`,
-            );
+        }
+        // Close the tab if this session is currently open.
+        for (const [cid, info] of this.conversationSessionMap) {
+          if (
+            info.sessionId === sessionId &&
+            info.backendKind === backendKind
+          ) {
+            const tab = this.tabManager.getTabByConversationId(cid);
+            if (tab) this.tabManager.closeTab(tab.id);
+            this.closeConversationPermanently(cid, false);
+            break;
           }
         }
+        await this.sessionsPanel.refresh();
+        this.notifications.success("Session deleted");
+      } catch (err) {
+        this.notifications.error(`Failed to delete session: ${String(err)}`);
       }
     };
 
-    this.sessionsPanel.onExportSession = async (sessionId, backendKind) => {
-      if (backendKind !== "tycode") {
-        this.notifications.warning(
-          "Session export is currently available for Tycode sessions only.",
-        );
-        return;
+    this.sessionsPanel.onRequestExternalSessions = async () => {
+      const backends = this.supportedSessionBackends();
+      await Promise.all(
+        backends.map(async (backendKind) => {
+          try {
+            await this.refreshSessionsForBackend(backendKind);
+          } catch (err) {
+            console.warn(
+              `Failed to fetch ${backendKind} sessions for external toggle:`,
+              err,
+            );
+          }
+        }),
+      );
+      const allExternal: import("@tyde/protocol").SessionMetadata[] = [];
+      for (const backendKind of backends) {
+        const sessions = this.sessionsByBackend.get(backendKind) ?? [];
+        for (const session of sessions) {
+          allExternal.push({
+            ...session,
+            backend_kind: session.backend_kind ?? backendKind,
+          });
+        }
       }
-      try {
-        const json = await exportSessionJson(sessionId);
-        await navigator.clipboard.writeText(json);
-        this.notifications.success("Session JSON copied to clipboard");
-      } catch (err) {
-        this.notifications.error(`Failed to export session: ${String(err)}`);
-      }
+      this.sessionsPanel.updateExternalSessions(allExternal);
     };
   }
 

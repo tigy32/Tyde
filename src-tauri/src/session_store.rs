@@ -39,50 +39,12 @@ struct StoreFile {
 pub struct SessionStore {
     records: HashMap<String, SessionRecord>,
     path: PathBuf,
-    dirty: bool,
 }
 
 impl SessionStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        let records = match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<StoreFile>(&contents) {
-                Ok(store_file) => store_file.records,
-                Err(err) => {
-                    // Back up the corrupt file so data isn't silently lost on next save
-                    let corrupt_path = path.with_extension("json.corrupt");
-                    tracing::error!(
-                        "Session store at {} is corrupt ({err}), backing up to {}",
-                        path.display(),
-                        corrupt_path.display(),
-                    );
-                    if let Err(rename_err) = std::fs::rename(&path, &corrupt_path) {
-                        tracing::error!("Failed to back up corrupt session store: {rename_err}");
-                    }
-                    return Err(format!(
-                        "Failed to parse session store at {}: {err}",
-                        path.display()
-                    ));
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(
-                    "Session store not found at {}, starting empty",
-                    path.display()
-                );
-                HashMap::new()
-            }
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read session store at {}: {err}",
-                    path.display()
-                ));
-            }
-        };
-        let mut store = Self {
-            records,
-            path,
-            dirty: false,
-        };
+        let records = Self::read_from_disk(&path)?;
+        let mut store = Self { records, path };
         match store.delete_orphaned() {
             Ok(count) => {
                 if count > 0 {
@@ -94,6 +56,45 @@ impl SessionStore {
             }
         }
         Ok(store)
+    }
+
+    fn read_from_disk(path: &PathBuf) -> Result<HashMap<String, SessionRecord>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match serde_json::from_str::<StoreFile>(&contents) {
+                Ok(store_file) => Ok(store_file.records),
+                Err(err) => {
+                    let corrupt_path = path.with_extension("json.corrupt");
+                    tracing::error!(
+                        "Session store at {} is corrupt ({err}), backing up to {}",
+                        path.display(),
+                        corrupt_path.display(),
+                    );
+                    if let Err(rename_err) = std::fs::rename(path, &corrupt_path) {
+                        tracing::error!("Failed to back up corrupt session store: {rename_err}");
+                    }
+                    Err(format!(
+                        "Failed to parse session store at {}: {err}",
+                        path.display()
+                    ))
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(err) => Err(format!(
+                "Failed to read session store at {}: {err}",
+                path.display()
+            )),
+        }
+    }
+
+    /// Re-read the file from disk, apply a mutation, and write back.
+    /// Minimizes the race window when multiple Tyde instances share the file.
+    fn read_modify_write<F>(&mut self, modify: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut HashMap<String, SessionRecord>),
+    {
+        self.records = Self::read_from_disk(&self.path)?;
+        modify(&mut self.records);
+        self.save()
     }
 
     fn save(&mut self) -> Result<(), String> {
@@ -111,28 +112,24 @@ impl SessionStore {
                 "Failed to write session store to {}: {err}",
                 self.path.display()
             )
-        })?;
-        self.dirty = false;
-        Ok(())
+        })
     }
 
-    pub fn flush(&mut self) -> Result<(), String> {
-        if self.dirty {
-            self.save()
-        } else {
-            Ok(())
+    pub fn get(&mut self, id: &str) -> Option<&SessionRecord> {
+        if let Ok(fresh) = Self::read_from_disk(&self.path) {
+            self.records = fresh;
         }
-    }
-
-    pub fn get(&self, id: &str) -> Option<&SessionRecord> {
         self.records.get(id)
     }
 
     pub fn get_by_backend_session(
-        &self,
+        &mut self,
         backend_kind: &str,
         backend_session_id: &str,
     ) -> Option<&SessionRecord> {
+        if let Ok(fresh) = Self::read_from_disk(&self.path) {
+            self.records = fresh;
+        }
         self.records.values().find(|r| {
             r.backend_kind == backend_kind
                 && r.backend_session_id.as_deref() == Some(backend_session_id)
@@ -158,9 +155,11 @@ impl SessionStore {
             updated_at_ms: now,
             message_count: 0,
         };
-        self.records.insert(id, record.clone());
-        self.save()?;
-        Ok(record)
+        let record_clone = record.clone();
+        self.read_modify_write(|records| {
+            records.insert(id, record);
+        })?;
+        Ok(record_clone)
     }
 
     pub fn set_backend_session_id(
@@ -168,63 +167,83 @@ impl SessionStore {
         id: &str,
         backend_session_id: &str,
     ) -> Result<(), String> {
-        if let Some(record) = self.records.get_mut(id) {
-            record.backend_session_id = Some(backend_session_id.to_string());
-            record.updated_at_ms = now_ms();
-            self.dirty = true;
-        }
-        Ok(())
+        let id = id.to_string();
+        let backend_session_id = backend_session_id.to_string();
+        self.read_modify_write(|records| {
+            if let Some(record) = records.get_mut(&id) {
+                record.backend_session_id = Some(backend_session_id);
+                record.updated_at_ms = now_ms();
+            }
+        })
     }
 
     pub fn set_alias(&mut self, id: &str, alias: &str) -> Result<(), String> {
-        if let Some(record) = self.records.get_mut(id) {
-            record.alias = Some(alias.to_string());
-            record.updated_at_ms = now_ms();
-            self.dirty = true;
+        let id = id.to_string();
+        let alias = alias.to_string();
+        let id_check = id.clone();
+        self.read_modify_write(|records| {
+            if let Some(record) = records.get_mut(&id) {
+                record.alias = Some(alias);
+                record.updated_at_ms = now_ms();
+            }
+        })?;
+        if !self.records.contains_key(&id_check) {
+            return Err(format!("Session record '{id_check}' not found"));
         }
         Ok(())
     }
 
     pub fn set_user_alias(&mut self, id: &str, user_alias: &str) -> Result<(), String> {
-        if let Some(record) = self.records.get_mut(id) {
-            if user_alias.is_empty() {
-                record.user_alias = None;
-            } else {
-                record.user_alias = Some(user_alias.to_string());
+        let id = id.to_string();
+        let user_alias = user_alias.to_string();
+        let id_check = id.clone();
+        self.read_modify_write(|records| {
+            if let Some(record) = records.get_mut(&id) {
+                if user_alias.is_empty() {
+                    record.user_alias = None;
+                } else {
+                    record.user_alias = Some(user_alias);
+                }
+                record.updated_at_ms = now_ms();
             }
-            record.updated_at_ms = now_ms();
-            self.save()?;
+        })?;
+        if !self.records.contains_key(&id_check) {
+            return Err(format!("Session record '{id_check}' not found"));
         }
         Ok(())
     }
 
     pub fn set_parent(&mut self, id: &str, parent_id: &str) -> Result<(), String> {
-        if let Some(record) = self.records.get_mut(id) {
-            record.parent_id = Some(parent_id.to_string());
-            record.updated_at_ms = now_ms();
-            self.dirty = true;
-        }
-        Ok(())
+        let id = id.to_string();
+        let parent_id = parent_id.to_string();
+        self.read_modify_write(|records| {
+            if let Some(record) = records.get_mut(&id) {
+                record.parent_id = Some(parent_id);
+                record.updated_at_ms = now_ms();
+            }
+        })
     }
 
     pub fn increment_message_count(&mut self, id: &str) -> Result<(), String> {
-        if let Some(record) = self.records.get_mut(id) {
-            record.message_count += 1;
-            record.updated_at_ms = now_ms();
-            self.dirty = true;
-        }
-        Ok(())
+        let id = id.to_string();
+        self.read_modify_write(|records| {
+            if let Some(record) = records.get_mut(&id) {
+                record.message_count += 1;
+                record.updated_at_ms = now_ms();
+            }
+        })
     }
 
-    pub fn list(&self) -> Vec<SessionRecord> {
-        self.records.values().cloned().collect()
+    pub fn list(&mut self) -> Result<Vec<SessionRecord>, String> {
+        self.records = Self::read_from_disk(&self.path)?;
+        Ok(self.records.values().cloned().collect())
     }
 
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
-        if self.records.remove(id).is_some() {
-            self.save()?;
-        }
-        Ok(())
+        let id = id.to_string();
+        self.read_modify_write(|records| {
+            records.remove(&id);
+        })
     }
 
     pub fn delete_orphaned(&mut self) -> Result<usize, String> {
@@ -238,11 +257,12 @@ impl SessionStore {
             .map(|r| r.id.clone())
             .collect();
         let count = to_delete.len();
-        for id in &to_delete {
-            self.records.remove(id);
-        }
         if count > 0 {
-            self.save()?;
+            self.read_modify_write(|records| {
+                for id in &to_delete {
+                    records.remove(id);
+                }
+            })?;
         }
         Ok(count)
     }

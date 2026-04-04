@@ -45,7 +45,6 @@ use serde_json::Value;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
-use tokio::fs as tokio_fs;
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::admin::AdminManager;
@@ -389,6 +388,9 @@ pub(crate) struct AppState {
     session_store: Arc<SyncMutex<SessionStore>>,
     host_store: SyncMutex<host::HostStore>,
     conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
+    /// Senders for forwarding remote TydeServer chat events through
+    /// the unified `forward_events` pipeline.
+    remote_chat_senders: Arc<SyncMutex<HashMap<u64, mpsc::UnboundedSender<Value>>>>,
     mcp_http_enabled: SyncMutex<bool>,
     mcp_control_enabled: SyncMutex<bool>,
     driver_mcp_http_enabled: SyncMutex<bool>,
@@ -764,16 +766,6 @@ fn subprocess_path() -> Result<String, String> {
         .to_string())
 }
 
-fn resolve_tycode_sessions_dir() -> Result<PathBuf, String> {
-    if let Ok(home) = std::env::var("HOME") {
-        return Ok(PathBuf::from(home).join(".tycode").join("sessions"));
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        return Ok(PathBuf::from(profile).join(".tycode").join("sessions"));
-    }
-    Err("Could not determine home directory for session export".to_string())
-}
-
 fn resolve_tyde_app_settings_path() -> Result<PathBuf, String> {
     if let Ok(home) = std::env::var("HOME") {
         return Ok(PathBuf::from(home).join(".tyde").join("app-settings.json"));
@@ -823,7 +815,9 @@ fn load_app_settings() -> AppSettings {
 
     // Allow env vars to override settings (used by dev instances spawned from the host).
     if let Ok(val) = std::env::var("TYDE_DRIVER_MCP_HTTP_ENABLED") {
-        settings.driver_mcp_http_enabled = val == "true" || val == "1";
+        let enabled = val == "true" || val == "1";
+        settings.driver_mcp_http_enabled = enabled;
+        settings.driver_mcp_http_autoload = enabled;
     }
 
     settings
@@ -1256,14 +1250,7 @@ pub(crate) async fn delete_workbench_internal(
     Ok(())
 }
 
-fn is_valid_session_id(session_id: &str) -> bool {
-    !session_id.is_empty()
-        && session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-fn resolve_requested_backend_kind(
+pub(crate) fn resolve_requested_backend_kind(
     state: &AppState,
     backend_kind: Option<String>,
     workspace_roots: &[String],
@@ -1290,6 +1277,7 @@ fn resolve_requested_backend_kind(
 }
 
 pub(crate) async fn materialize_remote_conversation(
+    app: &tauri::AppHandle,
     state: &AppState,
     conn: Arc<tyde_server_conn::TydeServerConnection>,
     server_cid: u64,
@@ -1309,15 +1297,12 @@ pub(crate) async fn materialize_remote_conversation(
 
     let backend_kind = backend_kind_str
         .parse::<BackendKind>()
-        .unwrap_or_else(|err| {
-            tracing::warn!(
-                "Unknown backend kind '{}' for remote conversation {}: {}. Falling back to tycode.",
-                backend_kind_str,
-                server_cid,
-                err
-            );
-            BackendKind::Tycode
-        });
+        .map_err(|err| {
+            format!(
+                "Unknown backend kind '{}' for remote conversation {}: {}",
+                backend_kind_str, server_cid, err
+            )
+        })?;
 
     let normalized_workspace_roots: Vec<String> = workspace_roots
         .iter()
@@ -1348,7 +1333,33 @@ pub(crate) async fn materialize_remote_conversation(
 
     conn.register_conversation_mapping(server_cid, local_id)
         .await;
-    ensure_settings_watch_sender(state, local_id).await;
+
+    // Session tracking is server-authoritative — no local SessionRecord.
+    // The server's records are synced via handshake + list_session_records.
+
+    // Spawn forward_events for chat event forwarding to the frontend.
+    // No conversation_to_session mapping, so store updates are skipped.
+    let (tx, rx) = mpsc::unbounded_channel();
+    state.remote_chat_senders.lock().insert(local_id, tx);
+
+    let (settings_tx, _) = watch::channel(Value::Null);
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.insert(local_id, settings_tx.clone());
+    }
+
+    tokio::spawn(forward_events(
+        app.clone(),
+        local_id,
+        rx,
+        state.agent_runtime.clone(),
+        state.agent_runtime_notify.clone(),
+        Value::Null, // remote — server sends ConversationRegistered via replay
+        settings_tx,
+        state.session_store.clone(),
+        state.conversation_to_session.clone(),
+    ));
+
     Ok(local_id)
 }
 
@@ -1359,20 +1370,6 @@ async fn ensure_settings_watch_sender(state: &AppState, conversation_id: u64) {
     }
     let (settings_tx, _) = watch::channel(Value::Null);
     watchers.insert(conversation_id, settings_tx);
-}
-
-pub(crate) async fn publish_settings_update(
-    state: &AppState,
-    conversation_id: u64,
-    settings: Value,
-) {
-    let settings_tx = {
-        let watchers = state.settings_watch.lock().await;
-        watchers.get(&conversation_id).cloned()
-    };
-    if let Some(tx) = settings_tx {
-        let _ = tx.send(settings);
-    }
 }
 
 async fn ensure_conversation_agent_registered(
@@ -1406,6 +1403,7 @@ async fn ensure_conversation_agent_registered(
 }
 
 async fn create_conversation_via_server(
+    app: &tauri::AppHandle,
     state: &AppState,
     conn: Arc<tyde_server_conn::TydeServerConnection>,
     workspace_roots: Vec<String>,
@@ -1447,8 +1445,9 @@ async fn create_conversation_via_server(
             .to_string()
     };
     let local_id = materialize_remote_conversation(
+        app,
         state,
-        conn,
+        conn.clone(),
         server_conv_id,
         &backend_kind_str,
         &workspace_roots,
@@ -1462,6 +1461,7 @@ async fn create_conversation_via_server(
 }
 
 async fn spawn_agent_via_server(
+    app: &tauri::AppHandle,
     state: &AppState,
     conn: Arc<tyde_server_conn::TydeServerConnection>,
     request: SpawnAgentRequest,
@@ -1503,6 +1503,7 @@ async fn spawn_agent_via_server(
             .to_string()
     };
     let local_conversation_id = materialize_remote_conversation(
+        app,
         state,
         conn,
         conversation_id,
@@ -1517,7 +1518,7 @@ async fn spawn_agent_via_server(
     })
 }
 
-async fn resolve_backend_launch_target(
+pub(crate) async fn resolve_backend_launch_target(
     app: &tauri::AppHandle,
     workspace_roots: &[String],
     backend_kind: BackendKind,
@@ -1847,6 +1848,7 @@ pub(crate) async fn create_conversation_tauri_free(
     match host_router::route_workspace(app, state, &workspace_roots).await? {
         host_router::WorkspaceRoute::TydeServer { connection } => {
             return create_conversation_via_server(
+                app,
                 state,
                 connection,
                 workspace_roots,
@@ -2098,15 +2100,20 @@ async fn forward_events(
     session_store: Arc<SyncMutex<SessionStore>>,
     conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
 ) {
-    let reg_payload = ChatEventPayload {
-        conversation_id,
-        event: registration,
-    };
-    if let Ok(debug_payload) = serde_json::to_value(&reg_payload) {
-        record_debug_event_from_app(&app, "chat", debug_payload);
-    }
-    if let Err(e) = app.emit("chat-event", &reg_payload) {
-        tracing::warn!("Failed to emit ConversationRegistered event: {e:?}");
+    // Emit the initial registration event for locally-spawned sessions.
+    // Remote TydeServer sessions pass Value::Null — the server sends
+    // ConversationRegistered via event replay through the same channel.
+    if !registration.is_null() {
+        let reg_payload = ChatEventPayload {
+            conversation_id,
+            event: registration,
+        };
+        if let Ok(debug_payload) = serde_json::to_value(&reg_payload) {
+            record_debug_event_from_app(&app, "chat", debug_payload);
+        }
+        if let Err(e) = app.emit("chat-event", &reg_payload) {
+            tracing::warn!("Failed to emit ConversationRegistered event: {e:?}");
+        }
     }
 
     while let Some(event) = rx.recv().await {
@@ -2232,10 +2239,6 @@ async fn forward_events(
         }
     }
 
-    // Flush any pending session store writes when the event stream ends.
-    if let Err(err) = session_store.lock().flush() {
-        tracing::error!("Failed to flush session store at conversation end: {err}");
-    }
     if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
         rc.chat_buffer.lock().remove_conversation(conversation_id);
     }
@@ -2420,9 +2423,13 @@ async fn cleanup_conversation_runtime_state(
         watchers.remove(&conversation_id);
     }
 
-    // Clean up runtime map (store record persists)
+    // Clean up runtime maps (store record persists)
     state
         .conversation_to_session
+        .lock()
+        .remove(&conversation_id);
+    state
+        .remote_chat_senders
         .lock()
         .remove(&conversation_id);
 
@@ -2440,7 +2447,7 @@ pub(crate) async fn spawn_agent_internal(
     // Route through TydeServer if the host is configured for it.
     match host_router::route_workspace(app, state, &request.workspace_roots).await? {
         host_router::WorkspaceRoute::TydeServer { connection } => {
-            return spawn_agent_via_server(state, connection, request).await;
+            return spawn_agent_via_server(app, state, connection, request).await;
         }
         host_router::WorkspaceRoute::Local => {}
     }
@@ -3941,7 +3948,7 @@ async fn get_session_id(
     let Some(sid) = tyde_session_id else {
         return Ok(None);
     };
-    let store = state.session_store.lock();
+    let mut store = state.session_store.lock();
     Ok(store.get(&sid).and_then(|r| r.backend_session_id.clone()))
 }
 
@@ -4243,44 +4250,121 @@ async fn admin_delete_session(
 }
 
 #[tauri::command]
-fn list_session_records(
+async fn list_session_records(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<session_store::SessionRecord>, String> {
-    let store = state.session_store.lock();
-    Ok(store.list())
+    let mut records = state.session_store.lock().list()?;
+    // Include server-authoritative records from all TydeServer connections
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
+        state.tyde_server_connections.lock().values().cloned().collect();
+    for conn in conns {
+        let fresh = conn.fetch_session_records().await.map_err(|err| {
+            format!(
+                "Failed to fetch session records from {}: {err}",
+                conn.host_id
+            )
+        })?;
+        records.extend(fresh);
+    }
+    Ok(records)
 }
 
 #[tauri::command]
-fn rename_session(
+async fn rename_session(
     state: tauri::State<'_, AppState>,
     id: String,
     name: String,
 ) -> Result<(), String> {
+    // Route to TydeServer if the session belongs to a remote connection
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
+        state.tyde_server_connections.lock().values().cloned().collect();
+    for conn in &conns {
+        if conn.owns_session_record(&id).await {
+            conn.invoke("rename_session", serde_json::json!({ "id": id, "name": name })).await?;
+            conn.fetch_session_records().await.map_err(|err| {
+                format!("Renamed session but failed to refresh cached records: {err}")
+            })?;
+            return Ok(());
+        }
+    }
     let mut store = state.session_store.lock();
     store.set_user_alias(&id, &name)
 }
 
 #[tauri::command]
-fn set_session_alias(
+async fn set_session_alias(
     state: tauri::State<'_, AppState>,
     id: String,
     alias: String,
 ) -> Result<(), String> {
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
+        state.tyde_server_connections.lock().values().cloned().collect();
+    for conn in &conns {
+        if conn.owns_session_record(&id).await {
+            conn.invoke("set_session_alias", serde_json::json!({ "id": id, "alias": alias })).await?;
+            conn.fetch_session_records().await.map_err(|err| {
+                format!("Set alias but failed to refresh cached records: {err}")
+            })?;
+            return Ok(());
+        }
+    }
     let mut store = state.session_store.lock();
     store.set_alias(&id, &alias)
 }
 
 #[tauri::command]
-async fn export_session_json(session_id: String) -> Result<String, String> {
-    if !is_valid_session_id(&session_id) {
-        return Err("Invalid session id".to_string());
+async fn delete_session_record(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    // Route to TydeServer if the session belongs to a remote connection
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
+        state.tyde_server_connections.lock().values().cloned().collect();
+    for conn in &conns {
+        if conn.owns_session_record(&id).await {
+            conn.invoke("delete_session_record", serde_json::json!({ "id": id }))
+                .await?;
+            conn.fetch_session_records().await.map_err(|err| {
+                format!("Deleted session but failed to refresh cached records: {err}")
+            })?;
+            return Ok(());
+        }
     }
 
-    let sessions_dir = resolve_tycode_sessions_dir()?;
-    let file_path = sessions_dir.join(format!("{session_id}.json"));
-    tokio_fs::read_to_string(&file_path)
-        .await
-        .map_err(|e| format!("Failed to export session JSON: {e}"))
+    // Local: look up the record, delete from backend via temp admin subprocess,
+    // then remove from the store.
+    let (backend_session_id, backend_kind_str, workspace_root) = {
+        let mut store = state.session_store.lock();
+        let record = store
+            .get(&id)
+            .ok_or_else(|| format!("Session record '{id}' not found"))?;
+        (
+            record.backend_session_id.clone(),
+            record.backend_kind.clone(),
+            record.workspace_root.clone(),
+        )
+    };
+
+    if let Some(ref bsid) = backend_session_id {
+        let roots: Vec<String> = workspace_root.iter().cloned().collect();
+        let backend_kind =
+            resolve_requested_backend_kind(&state, Some(backend_kind_str), &roots)?;
+        let launch_target =
+            resolve_backend_launch_target(&app, &roots, backend_kind).await?;
+        let (session, _rx) =
+            BackendSession::spawn_admin(backend_kind, &launch_target, &roots).await?;
+        let handle = session.command_handle();
+        let result = handle
+            .execute(SessionCommand::DeleteSession {
+                session_id: bsid.clone(),
+            })
+            .await;
+        session.shutdown().await;
+        result?;
+    }
+
+    state.session_store.lock().delete(&id)
 }
 
 #[tauri::command]
@@ -4585,6 +4669,7 @@ async fn shutdown_all_subprocesses(state: tauri::State<'_, AppState>) -> Result<
 
     // Clean up all conversation_to_session mappings (store records persist)
     state.conversation_to_session.lock().clear();
+    state.remote_chat_senders.lock().clear();
 
     {
         let mut mgr = state.terminals.lock().await;
@@ -4911,6 +4996,7 @@ pub fn run_with_options(headless: bool) {
                 host::HostStore::load(path).expect("failed to load host store")
             }),
             conversation_to_session: Arc::new(SyncMutex::new(HashMap::new())),
+            remote_chat_senders: Arc::new(SyncMutex::new(HashMap::new())),
             mcp_http_enabled: SyncMutex::new(app_settings.mcp_http_enabled),
             mcp_control_enabled: SyncMutex::new(app_settings.mcp_control_enabled),
             driver_mcp_http_enabled: SyncMutex::new(app_settings.driver_mcp_http_enabled),
@@ -5038,7 +5124,6 @@ pub fn run_with_options(headless: bool) {
             switch_profile,
             get_module_schemas,
             update_settings,
-            export_session_json,
             restart_subprocess,
             list_active_conversations,
             shutdown_all_subprocesses,
@@ -5051,6 +5136,7 @@ pub fn run_with_options(headless: bool) {
             admin_switch_profile,
             admin_get_module_schemas,
             admin_delete_session,
+            delete_session_record,
             discover_git_repos,
             git_current_branch,
             git_status,
@@ -5189,6 +5275,7 @@ mod tests {
                 host::HostStore::load(tmp_host_path).expect("failed to create test host store")
             }),
             conversation_to_session: Arc::new(SyncMutex::new(HashMap::new())),
+            remote_chat_senders: Arc::new(SyncMutex::new(HashMap::new())),
             mcp_http_enabled: SyncMutex::new(true),
             mcp_control_enabled: SyncMutex::new(true),
             driver_mcp_http_enabled: SyncMutex::new(false),

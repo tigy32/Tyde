@@ -309,18 +309,21 @@ async fn handle_client(
             .into_iter()
             .map(|id| ConversationSnapshot {
                 conversation_id: id,
-                backend_kind: mgr
-                    .backend_kind(id)
-                    .map(|k| k.as_str().to_string())
-                    .unwrap_or_default(),
+                // active_ids() returns keys from the same map, so these lookups
+                // cannot fail while we hold the lock.
+                backend_kind: mgr.backend_kind(id).expect("active conversation has backend_kind").as_str().to_string(),
                 workspace_roots: mgr
                     .workspace_roots(id)
-                    .map(|r| r.to_vec())
-                    .unwrap_or_default(),
+                    .expect("active conversation has workspace_roots")
+                    .to_vec(),
                 chat_event_seq: buf.latest_seq_for_conversation(id),
             })
             .collect()
     };
+
+    let session_records = state.session_store.lock().list()
+        .map_err(|e| format!("Failed to read session store: {e}"))?;
+
 
     send(
         &writer,
@@ -331,6 +334,7 @@ async fn handle_client(
                 agents,
                 conversations,
                 instance_id: Some(instance_id),
+                session_records,
             })
             .unwrap_or_default(),
         },
@@ -841,6 +845,87 @@ async fn dispatch_invoke(
                 },
             )
             .await?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        "list_session_records" => {
+            let mut store = state.session_store.lock();
+            let records = store.list()?;
+            serde_json::to_value(records).map_err(|e| e.to_string())
+        }
+
+        "rename_session" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                name: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            let mut store = state.session_store.lock();
+            store.set_user_alias(&p.id, &p.name)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        "set_session_alias" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                alias: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            let mut store = state.session_store.lock();
+            store.set_alias(&p.id, &p.alias)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        "delete_session_record" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+
+            // Look up the record to get backend info before deleting
+            let (backend_session_id, backend_kind_str, workspace_root) = {
+                let mut store = state.session_store.lock();
+                let record = store
+                    .get(&p.id)
+                    .ok_or_else(|| format!("Session record '{}' not found", p.id))?;
+                (
+                    record.backend_session_id.clone(),
+                    record.backend_kind.clone(),
+                    record.workspace_root.clone(),
+                )
+            };
+
+            // Delete from backend via temp admin subprocess if there's a backend session
+            if let Some(ref bsid) = backend_session_id {
+                let roots: Vec<String> = workspace_root.iter().cloned().collect();
+                let backend_kind = crate::resolve_requested_backend_kind(
+                    &state,
+                    Some(backend_kind_str),
+                    &roots,
+                )?;
+                let launch_target =
+                    crate::resolve_backend_launch_target(app, &roots, backend_kind).await?;
+                let (session, _rx) = crate::backend::BackendSession::spawn_admin(
+                    backend_kind,
+                    &launch_target,
+                    &roots,
+                )
+                .await?;
+                let handle = session.command_handle();
+                let result = handle
+                    .execute(crate::backend::SessionCommand::DeleteSession {
+                        session_id: bsid.clone(),
+                    })
+                    .await;
+                session.shutdown().await;
+                result?;
+            }
+
+            // Delete from store
+            state.session_store.lock().delete(&p.id)?;
             Ok(serde_json::json!({"ok": true}))
         }
 
