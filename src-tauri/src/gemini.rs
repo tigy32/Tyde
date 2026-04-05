@@ -43,13 +43,8 @@ impl GeminiSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            transport,
-            startup_mcp_servers,
-            steering_content,
-        )
-        .await
+        Self::spawn_with_mode(workspace_roots, transport, startup_mcp_servers, steering_content)
+            .await
     }
 
     pub async fn spawn_ephemeral(
@@ -58,13 +53,8 @@ impl GeminiSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            transport,
-            startup_mcp_servers,
-            steering_content,
-        )
-        .await
+        Self::spawn_with_mode(workspace_roots, transport, startup_mcp_servers, steering_content)
+            .await
     }
 
     pub async fn spawn_admin(
@@ -73,13 +63,8 @@ impl GeminiSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        Self::spawn_with_mode(
-            workspace_roots,
-            transport,
-            startup_mcp_servers,
-            steering_content,
-        )
-        .await
+        Self::spawn_with_mode(workspace_roots, transport, startup_mcp_servers, steering_content)
+            .await
     }
 
     async fn spawn_with_mode(

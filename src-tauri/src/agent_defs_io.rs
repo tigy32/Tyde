@@ -14,6 +14,10 @@ pub struct AgentDefinition {
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_prompt: Option<String>,
+    /// Skill names from `~/.tyde/skills/`, e.g. `["code-review", "test-writer"]`.
+    /// Resolved and injected into the backend at launch time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<AgentMcpServer>,
     #[serde(default)]
@@ -77,6 +81,7 @@ fn builtin_definitions() -> Vec<AgentDefinition> {
         description: "Orchestrator that coordinates work between human and agents".into(),
         instructions: None,
         bootstrap_prompt: None,
+        skill_names: vec![],
         mcp_servers: vec![],
         tool_policy: ToolPolicy::Unrestricted,
         default_backend: None,

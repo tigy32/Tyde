@@ -100,6 +100,7 @@ impl ClaudeSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
+        skill_dir: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -108,6 +109,7 @@ impl ClaudeSession {
             startup_mcp_servers,
             steering_content,
             agent_identity,
+            skill_dir,
         )
         .await
     }
@@ -118,6 +120,7 @@ impl ClaudeSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
+        skill_dir: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -126,6 +129,7 @@ impl ClaudeSession {
             startup_mcp_servers,
             steering_content,
             agent_identity,
+            skill_dir,
         )
         .await
     }
@@ -137,6 +141,7 @@ impl ClaudeSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
+        skill_dir: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let workspace_root = if transport.is_remote() {
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
@@ -164,6 +169,7 @@ impl ClaudeSession {
                 startup_mcp_config_json: build_claude_mcp_config_json(startup_mcp_servers),
                 steering_content: steering_content.map(|s| s.to_string()),
                 agent_identity: agent_identity.cloned(),
+                skill_dir: skill_dir.map(|s| s.to_string()),
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -207,6 +213,8 @@ struct ClaudeState {
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
+    /// Directory to pass via `--add-dir` for per-agent skill isolation.
+    skill_dir: Option<String>,
     last_cumulative_usage: Option<Value>,
     conversation_bytes_total: u64,
     active_turn: Option<ActiveTurn>,
@@ -415,6 +423,7 @@ struct RunTurnParams<'a> {
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
+    skill_dir: Option<String>,
 }
 
 impl ClaudeInner {
@@ -511,6 +520,7 @@ impl ClaudeInner {
             startup_mcp_config_json,
             steering_content,
             agent_identity,
+            skill_dir,
             conversation_history_bytes,
             cancel_rx,
         ) = {
@@ -545,6 +555,7 @@ impl ClaudeInner {
                 state.startup_mcp_config_json.clone(),
                 state.steering_content.clone(),
                 state.agent_identity.clone(),
+                state.skill_dir.clone(),
                 state.conversation_bytes_total,
                 cancel_rx,
             )
@@ -571,6 +582,7 @@ impl ClaudeInner {
                         startup_mcp_config_json,
                         steering_content,
                         agent_identity,
+                        skill_dir,
                     },
                     cancel_rx,
                 )
@@ -765,6 +777,7 @@ impl ClaudeInner {
             startup_mcp_config_json,
             steering_content,
             agent_identity,
+            skill_dir,
         } = params;
         let effective_permission_mode = permission_mode
             .as_deref()
@@ -838,6 +851,11 @@ impl ClaudeInner {
                     cli_args.push(trimmed.to_string());
                 }
             }
+        }
+
+        if let Some(ref dir) = skill_dir {
+            cli_args.push("--add-dir".to_string());
+            cli_args.push(dir.clone());
         }
 
         let mut child = match transport
@@ -4949,6 +4967,7 @@ mod tests {
                 startup_mcp_config_json: None,
                 steering_content: None,
                 agent_identity: None,
+                skill_dir: None,
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -5672,6 +5691,7 @@ mod tests {
                     startup_mcp_config_json: None,
                     steering_content: None,
                     agent_identity: None,
+                    skill_dir: None,
                     last_cumulative_usage: None,
                     conversation_bytes_total: 0,
                     active_turn: None,
@@ -5708,6 +5728,7 @@ mod tests {
                     startup_mcp_config_json: None,
                     steering_content: None,
                     agent_identity: None,
+                    skill_dir: None,
                 },
                 cancel_rx,
             )

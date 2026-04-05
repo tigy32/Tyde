@@ -24,6 +24,7 @@ mod remote;
 mod remote_control;
 mod project_store;
 mod session_store;
+mod skill_injection;
 mod steering;
 mod subprocess;
 mod terminal;
@@ -409,6 +410,8 @@ pub(crate) struct AppState {
     dev_instances: SyncMutex<dev_instance::DevInstanceRegistry>,
     tyde_server_connections:
         SyncMutex<HashMap<String, Arc<tyde_server_conn::TydeServerConnection>>>,
+    /// Cleanup handles for skills injected per-conversation.
+    skill_cleanups: SyncMutex<HashMap<u64, skill_injection::SkillCleanup>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1038,7 +1041,8 @@ fn definition_mcp_servers_to_startup(
         .collect()
 }
 
-/// Compose steering content from definition instructions, tool policy, and workspace steering.
+
+/// Compose steering content from definition instructions, tool policy, skills, and workspace steering.
 fn compose_steering(
     instructions: Option<&str>,
     tool_policy: &agent_defs_io::ToolPolicy,
@@ -1973,6 +1977,32 @@ pub(crate) async fn create_conversation_tauri_free(
         &extra_mcp_servers,
     )?;
 
+    // Resolve and inject skills from ~/.tyde/skills/.
+    let def_skill_names = definition
+        .as_ref()
+        .map(|d| d.skill_names.as_slice())
+        .unwrap_or(&[]);
+    let skill_injection = if !def_skill_names.is_empty() {
+        let workspace_root_for_skills = workspace_roots
+            .first()
+            .map(|s| s.as_str())
+            .ok_or("Skill injection requires a workspace root")?;
+        let agent_id = definition.as_ref().map(|d| d.id.as_str()).unwrap_or("unknown");
+        Some(
+            skill_injection::inject_skills_for_backend(
+                backend_kind,
+                &launch_target.transport,
+                workspace_root_for_skills,
+                agent_id,
+                def_skill_names,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let skill_dir = skill_injection.as_ref().and_then(|r| r.skill_dir.as_deref());
+
     // Build agent identity for backends that support native agent flags.
     // Instructions go through --agents/--agent (Claude) rather than
     // --append-system-prompt, so the model treats them as first-class identity.
@@ -2002,6 +2032,7 @@ pub(crate) async fn create_conversation_tauri_free(
         &startup_mcp_servers,
         steering.as_deref(),
         agent_identity.as_ref(),
+        skill_dir,
     )
     .await?;
 
@@ -2009,6 +2040,11 @@ pub(crate) async fn create_conversation_tauri_free(
         let mut mgr = state.manager.lock().await;
         mgr.create_conversation(session, &workspace_roots)
     };
+
+    // Store skill cleanup handle for this conversation.
+    if let Some(injection) = skill_injection {
+        state.skill_cleanups.lock().insert(id, injection.cleanup);
+    }
 
     let def_name = definition
         .as_ref()
@@ -2488,6 +2524,12 @@ async fn cleanup_conversation_runtime_state(
     if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
         rc.chat_buffer.lock().remove_conversation(conversation_id);
     }
+
+    // Clean up injected skills for this conversation.
+    let skill_cleanup = state.skill_cleanups.lock().remove(&conversation_id);
+    if let Some(cleanup) = skill_cleanup {
+        skill_injection::cleanup_injected_skills(cleanup).await;
+    }
 }
 
 pub(crate) async fn spawn_agent_internal(
@@ -2579,6 +2621,32 @@ pub(crate) async fn spawn_agent_internal(
         &extra_mcp_servers,
     )?;
 
+    // Resolve and inject skills from ~/.tyde/skills/.
+    let def_skill_names = definition
+        .as_ref()
+        .map(|d| d.skill_names.as_slice())
+        .unwrap_or(&[]);
+    let skill_injection = if !def_skill_names.is_empty() {
+        let workspace_root_for_skills = workspace_roots
+            .first()
+            .map(|s| s.as_str())
+            .ok_or("Skill injection requires a workspace root")?;
+        let agent_id = definition.as_ref().map(|d| d.id.as_str()).unwrap_or("unknown");
+        Some(
+            skill_injection::inject_skills_for_backend(
+                backend_kind,
+                &launch_target.transport,
+                workspace_root_for_skills,
+                agent_id,
+                def_skill_names,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let skill_dir = skill_injection.as_ref().and_then(|r| r.skill_dir.as_deref());
+
     let agent_identity = definition.as_ref().and_then(|d| {
         let instr = d.instructions.as_deref().unwrap_or("").trim();
         if instr.is_empty() {
@@ -2603,6 +2671,7 @@ pub(crate) async fn spawn_agent_internal(
         &startup_mcp_servers,
         steering.as_deref(),
         agent_identity.as_ref(),
+        skill_dir,
     )
     .await?;
 
@@ -2615,6 +2684,11 @@ pub(crate) async fn spawn_agent_internal(
         let mut mgr = state.manager.lock().await;
         mgr.create_conversation(session, &workspace_roots)
     };
+
+    // Store skill cleanup handle for this conversation.
+    if let Some(injection) = skill_injection {
+        state.skill_cleanups.lock().insert(conversation_id, injection.cleanup);
+    }
 
     let info = {
         let mut runtime = state.agent_runtime.lock().await;
@@ -4816,6 +4890,7 @@ async fn restart_subprocess(
         &startup_mcp_servers,
         steering.as_deref(),
         None,
+        None,
     )
     .await?;
 
@@ -4920,6 +4995,7 @@ async fn relaunch_conversation(
         false,
         &startup_mcp_servers,
         steering.as_deref(),
+        None,
         None,
     )
     .await?;
@@ -5266,6 +5342,11 @@ async fn delete_agent_definition(
     }
 }
 
+#[tauri::command]
+async fn list_available_skills() -> Result<Vec<String>, String> {
+    skill_injection::list_available_skills()
+}
+
 #[cfg(target_os = "linux")]
 fn detect_system_dark_mode() -> bool {
     let output = Command::new("dbus-send")
@@ -5365,6 +5446,7 @@ pub fn run_with_options(headless: bool) {
             settings_watch: Mutex::new(HashMap::new()),
             dev_instances: SyncMutex::new(dev_instance::DevInstanceRegistry::new()),
             tyde_server_connections: SyncMutex::new(HashMap::new()),
+            skill_cleanups: SyncMutex::new(HashMap::new()),
         })
         .setup(move |app| {
             if !headless {
@@ -5527,6 +5609,7 @@ pub fn run_with_options(headless: bool) {
             list_agent_definitions,
             save_agent_definition,
             delete_agent_definition,
+            list_available_skills,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -5651,6 +5734,7 @@ mod tests {
             dev_instances: SyncMutex::new(dev_instance::DevInstanceRegistry::new()),
             tyde_server_connections: SyncMutex::new(HashMap::new()),
             driver_mcp_http_env_override: false,
+            skill_cleanups: SyncMutex::new(HashMap::new()),
         }
     }
 

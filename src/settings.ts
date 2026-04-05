@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import type { AgentDefinitionStore } from "./agent_defs/store";
 import type { AgentDefinitionEntry, AgentMcpServer } from "./agent_defs/types";
 import {
@@ -3008,6 +3009,9 @@ export class SettingsPanel {
     const mcpCount = def.mcp_servers?.length ?? 0;
     if (mcpCount > 0)
       details.push(`${mcpCount} MCP server${mcpCount > 1 ? "s" : ""}`);
+    const skillNameCount = def.skill_names?.length ?? 0;
+    if (skillNameCount > 0)
+      details.push(`${skillNameCount} skill${skillNameCount > 1 ? "s" : ""}`);
     if (def.tool_policy?.mode && def.tool_policy.mode !== "Unrestricted")
       details.push(`Tools: ${def.tool_policy.mode}`);
     if (def.include_agent_control) details.push("Agent control");
@@ -3327,6 +3331,163 @@ export class SettingsPanel {
     mcpField.appendChild(addMcpBtn);
     modal.appendChild(mcpField);
 
+    // Skills (names from ~/.tyde/skills/)
+    const skillNames: string[] = [...(existing?.skill_names ?? [])];
+
+    const skillNamesField = el("div", {
+      class: "settings-field agent-def-mcp-field",
+    });
+    skillNamesField.appendChild(
+      el("label", { class: "settings-label" }, "Skills"),
+    );
+    skillNamesField.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Skills from ~/.tyde/skills/ to load for this agent.",
+      ),
+    );
+
+    const skillNamesList = el("div", { class: "agent-def-mcp-list" });
+
+    const renderSkillNamesList = () => {
+      skillNamesList.innerHTML = "";
+      for (let i = 0; i < skillNames.length; i++) {
+        const sn = skillNames[i];
+
+        const row = el("div", { class: "agent-def-mcp-row" });
+        const info = el("div", { class: "agent-def-mcp-row-info" });
+        info.appendChild(el("span", { class: "agent-def-mcp-row-name" }, sn));
+        row.appendChild(info);
+
+        const rowActions = el("div", { class: "agent-def-mcp-row-actions" });
+        const removeBtn = el(
+          "button",
+          {
+            class: "agent-def-mcp-row-btn agent-def-mcp-row-remove",
+            title: "Remove",
+          },
+          "Remove",
+        );
+        removeBtn.addEventListener("click", () => {
+          skillNames.splice(i, 1);
+          renderSkillNamesList();
+        });
+        rowActions.appendChild(removeBtn);
+        row.appendChild(rowActions);
+        skillNamesList.appendChild(row);
+      }
+    };
+    renderSkillNamesList();
+
+    skillNamesField.appendChild(skillNamesList);
+
+    const addSkillNameBtn = el(
+      "button",
+      { class: "settings-add-btn agent-def-mcp-add" },
+      "+ Add Skill",
+    );
+    addSkillNameBtn.addEventListener("click", async () => {
+      const inputRow = el("div", { class: "agent-def-skill-path-input-row" });
+
+      // Load available skills for a dropdown.
+      let availableSkills: string[] = [];
+      let loadError: string | null = null;
+      try {
+        availableSkills = await invoke("list_available_skills");
+      } catch (err) {
+        loadError = String(err);
+        console.error("Failed to list available skills:", err);
+      }
+
+      // Show error or info text.
+      if (loadError) {
+        inputRow.appendChild(
+          el(
+            "p",
+            {
+              class: "settings-description",
+              style: "color: var(--error-color, #e55)",
+            },
+            `Failed to load available skills: ${loadError}`,
+          ),
+        );
+      } else if ((availableSkills || []).length === 0) {
+        inputRow.appendChild(
+          el(
+            "p",
+            { class: "settings-description" },
+            "No skills found in ~/.tyde/skills/",
+          ),
+        );
+      }
+
+      // Filter out already-added skills.
+      const remaining = (availableSkills || []).filter(
+        (s: string) => !skillNames.includes(s),
+      );
+
+      if (remaining.length > 0) {
+        const selectEl = el("select", {
+          class: "settings-select",
+        }) as HTMLSelectElement;
+        selectEl.appendChild(el("option", { value: "" }, "Select a skill..."));
+        for (const name of remaining) {
+          selectEl.appendChild(el("option", { value: name }, name));
+        }
+        inputRow.appendChild(selectEl);
+
+        const confirmBtn = el(
+          "button",
+          { class: "settings-action-btn" },
+          "Add",
+        );
+        const addSelectedSkill = () => {
+          const val = selectEl.value;
+          if (val && !skillNames.includes(val)) {
+            skillNames.push(val);
+            renderSkillNamesList();
+          }
+          inputRow.remove();
+        };
+        confirmBtn.addEventListener("click", addSelectedSkill);
+        inputRow.appendChild(confirmBtn);
+        selectEl.addEventListener("change", addSelectedSkill);
+      } else {
+        // Manual entry.
+        const nameInput = el("input", {
+          class: "settings-input",
+          type: "text",
+          placeholder: "Skill name",
+        }) as HTMLInputElement;
+        inputRow.appendChild(nameInput);
+
+        const confirmBtn = el(
+          "button",
+          { class: "settings-action-btn" },
+          "Add",
+        );
+        confirmBtn.addEventListener("click", () => {
+          const val = nameInput.value.trim();
+          if (val) {
+            skillNames.push(val);
+            renderSkillNamesList();
+          }
+          inputRow.remove();
+        });
+        inputRow.appendChild(confirmBtn);
+
+        nameInput.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") confirmBtn.click();
+          else if (e.key === "Escape") inputRow.remove();
+        });
+      }
+
+      skillNamesField.insertBefore(inputRow, addSkillNameBtn);
+    });
+    skillNamesField.appendChild(addSkillNameBtn);
+    modal.appendChild(skillNamesField);
+
     // Actions
     const actions = el("div", { class: "settings-modal-actions" });
     const cancelBtn = el("button", {}, "Cancel");
@@ -3350,6 +3511,7 @@ export class SettingsPanel {
         description: descInput.value.trim(),
         instructions: instrInput.value.trim() || undefined,
         bootstrap_prompt: existing?.bootstrap_prompt,
+        skill_names: skillNames.length > 0 ? skillNames : undefined,
         mcp_servers: mcpServers,
         tool_policy: existing?.tool_policy ?? { mode: "Unrestricted" },
         default_backend: backendSelect.value || undefined,

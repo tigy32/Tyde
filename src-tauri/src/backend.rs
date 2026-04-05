@@ -358,6 +358,7 @@ impl BackendSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
+        skill_dir: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         // For non-Claude backends, merge agent instructions into the steering
         // content since they don't support --agents/--agent flags.
@@ -381,9 +382,22 @@ impl BackendSession {
 
         match kind {
             BackendKind::Tycode => {
+                // Tycode treats extra workspace roots as additional scan dirs,
+                // so append the skill temp dir as an extra root.
+                let effective_roots;
+                let roots = if let Some(dir) = skill_dir {
+                    effective_roots = workspace_roots
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(dir.to_string()))
+                        .collect::<Vec<_>>();
+                    &effective_roots[..]
+                } else {
+                    workspace_roots
+                };
                 let (bridge, rx) = SubprocessBridge::spawn(
                     &launch.executable_path,
-                    workspace_roots,
+                    roots,
                     tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
                     ephemeral,
                 )
@@ -418,6 +432,7 @@ impl BackendSession {
                         startup_mcp_servers,
                         steering_content,
                         agent_identity,
+                        skill_dir,
                     )
                     .await?
                 } else {
@@ -427,6 +442,7 @@ impl BackendSession {
                         startup_mcp_servers,
                         steering_content,
                         agent_identity,
+                        skill_dir,
                     )
                     .await?
                 };
@@ -498,6 +514,7 @@ impl BackendSession {
                     workspace_roots,
                     launch.transport.clone(),
                     &[],
+                    None,
                     None,
                     None,
                 )
