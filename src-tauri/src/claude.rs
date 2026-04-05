@@ -393,6 +393,7 @@ enum TurnOutcome {
     },
     Cancelled {
         summary: ClaudeStdoutSummary,
+        process_exited_cleanly: bool,
     },
     Failed {
         summary: ClaudeStdoutSummary,
@@ -641,14 +642,28 @@ impl ClaudeInner {
                         self.emit_error("Claude returned no assistant output.");
                     }
                 }
-                TurnOutcome::Cancelled { summary } => {
+                TurnOutcome::Cancelled {
+                    summary,
+                    process_exited_cleanly,
+                } => {
                     let mut summary = summary;
+                    if !ephemeral {
+                        if let Some(session_id) = summary.session_id.clone() {
+                            self.set_session_id(turn_id, session_id.clone()).await;
+                            self.emit_event(json!({
+                                "kind": "SessionStarted",
+                                "data": { "session_id": session_id }
+                            }));
+                        }
+                    }
                     let _ = self
                         .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
                         .await;
                     let known_context_window = summary.result_context_window;
+                    let mut canonical_assistant_text = String::new();
                     if let Some(phase) = take_phase_emission(&mut summary) {
                         let partial = phase.text;
+                        canonical_assistant_text = partial.clone();
                         let selected_model = phase.model.clone();
                         let tool_calls = phase
                             .tool_calls
@@ -685,6 +700,34 @@ impl ClaudeInner {
                         }
                     } else if summary.emitted_phase_count == 0 {
                         self.emit_error("Claude turn cancelled.");
+                    }
+                    if !ephemeral && !process_exited_cleanly {
+                        let state = self.state.lock().await;
+                        let resolved_session_id = summary
+                            .session_id
+                            .clone()
+                            .or_else(|| state.session_id.clone());
+                        let transport = state.transport.clone();
+                        drop(state);
+                        if let Some(session_id) = resolved_session_id {
+                            if let Err(err) = append_interrupted_turn_to_session_file(
+                                &transport,
+                                &workspace_root,
+                                &session_id,
+                                &message,
+                                &images,
+                                &canonical_assistant_text,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "Failed to append interrupted turn to session file: {err}"
+                                );
+                                self.emit_error(&format!(
+                                    "Failed to preserve interrupted turn context: {err}"
+                                ));
+                            }
+                        }
                     }
                     self.emit_operation_cancelled("Claude turn cancelled.");
                 }
@@ -885,10 +928,15 @@ impl ClaudeInner {
             }
         };
 
-        if matches!(wait_result, WaitResult::Cancelled) {
+        let process_exited_cleanly = if matches!(wait_result, WaitResult::Cancelled) {
             let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+            child
+                .wait()
+                .await
+                .is_ok_and(|status| status.success())
+        } else {
+            false
+        };
 
         let (stdout_summary, _segment_state) = match stdout_task.await {
             Ok(pair) => pair,
@@ -913,6 +961,7 @@ impl ClaudeInner {
         match wait_result {
             WaitResult::Cancelled => TurnOutcome::Cancelled {
                 summary: stdout_summary,
+                process_exited_cleanly,
             },
             WaitResult::Exited(Err(error)) => TurnOutcome::Failed {
                 summary: stdout_summary,
@@ -4787,6 +4836,77 @@ async fn delete_claude_session_for_transport(
                     ));
                 }
             }
+            Ok(())
+        }
+    }
+}
+
+async fn append_interrupted_turn_to_session_file(
+    transport: &BackendTransport,
+    workspace_root: &str,
+    session_id: &str,
+    user_message: &str,
+    images: &[ImageAttachment],
+    assistant_text: &str,
+) -> Result<(), String> {
+    let mut lines = String::new();
+    let user_line = build_stream_json_user_message(user_message, images);
+    lines.push_str(
+        &serde_json::to_string(&user_line)
+            .map_err(|e| format!("Failed to serialize user message: {e}"))?,
+    );
+    lines.push('\n');
+
+    if !assistant_text.is_empty() {
+        let assistant_line = json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": assistant_text}]
+            }
+        });
+        lines.push_str(
+            &serde_json::to_string(&assistant_line)
+                .map_err(|e| format!("Failed to serialize assistant message: {e}"))?,
+        );
+        lines.push('\n');
+    }
+
+    match transport.ssh_host() {
+        Some(_) => {
+            let encoded = encode_workspace_root(workspace_root);
+            let id = normalize_nonempty(session_id).ok_or("Invalid session id")?;
+            let cmd = format!(
+                "cat <<'TYDE_EOF' >> \"$HOME/.claude/projects/{encoded}/{id}.jsonl\"\n{lines}TYDE_EOF"
+            );
+            let output = transport.run_shell_command(&cmd).await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "Failed to append interrupted turn via SSH: {stderr}"
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            let session_file = claude_session_file_path(workspace_root, session_id)?;
+            let mut file = tokio_fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&session_file)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to open session file '{}' for append: {e}",
+                        session_file.display()
+                    )
+                })?;
+            file.write_all(lines.as_bytes()).await.map_err(|e| {
+                format!(
+                    "Failed to append to session file '{}': {e}",
+                    session_file.display()
+                )
+            })?;
             Ok(())
         }
     }
