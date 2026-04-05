@@ -6,6 +6,12 @@ import {
 } from "@tanstack/virtual-core";
 import { createTwoFilesPatch } from "diff";
 import hljs from "highlight.js/lib/core";
+import {
+  type DiffViewMode,
+  getDiffSettings,
+  onDiffSettingsChange,
+  setDiffSettings,
+} from "./diff_settings";
 import { logTabPerf, perfNow } from "./perf_debug";
 import { escapeHtml } from "./renderer";
 
@@ -25,7 +31,6 @@ interface DiffTab {
   highlightCache?: Map<number, string>;
 }
 
-type ViewMode = "unified" | "side-by-side";
 const DEFAULT_DIFF_CONTEXT_LINES = 3;
 const VIRTUAL_FILE_OVERSCAN_LINES = 80;
 const VIRTUAL_HIGHLIGHT_BATCH_SIZE = 24;
@@ -265,7 +270,7 @@ export class DiffPanel {
   private container: HTMLElement;
   private tabs: DiffTab[] = [];
   private activeTabId: string | null = null;
-  private viewMode: ViewMode = "unified";
+  private viewMode: DiffViewMode = getDiffSettings().viewMode;
   private currentHunkIndex = -1;
   private selectionAnchor: number | null = null;
   private selectionEnd: number | null = null;
@@ -317,6 +322,26 @@ export class DiffPanel {
       () => this.scheduleNativeSelectionSync(),
       { signal: this.abortController.signal },
     );
+
+    onDiffSettingsChange((settings) => {
+      let needsRerender = false;
+      if (this.viewMode !== settings.viewMode) {
+        this.viewMode = settings.viewMode;
+        needsRerender = true;
+      }
+
+      const showFullContext = settings.contextMode === "full";
+      for (const tab of this.tabs) {
+        if (tab.type === "diff" && tab.showFullContext !== showFullContext) {
+          this.setDiffContextMode(tab, showFullContext);
+          needsRerender = true;
+        }
+      }
+
+      if (needsRerender) {
+        this.renderPreservingScroll();
+      }
+    });
   }
 
   dispose(): void {
@@ -381,13 +406,14 @@ export class DiffPanel {
         (preferredTabId ? t.id === preferredTabId : false) ||
         (t.filePath === filePath && t.type === "diff"),
     );
+    const showFullContext = getDiffSettings().contextMode === "full";
     if (existing) {
       existing.diffContent = diff;
       existing.beforeContent = before;
       existing.afterContent = after;
       existing.fullContextDiffContent = undefined;
       existing.hunkContextExpansion = [];
-      this.setDiffContextMode(existing, existing.showFullContext === true);
+      this.setDiffContextMode(existing, showFullContext);
       this.switchTab(existing.id);
       return existing.id;
     }
@@ -402,9 +428,10 @@ export class DiffPanel {
       diffContent: diff,
       beforeContent: before,
       afterContent: after,
-      showFullContext: false,
+      showFullContext,
       hunkContextExpansion: [],
     };
+    this.setDiffContextMode(tab, showFullContext);
     this.addTab(tab);
     return tab.id;
   }
@@ -419,6 +446,7 @@ export class DiffPanel {
         (preferredTabId ? t.id === preferredTabId : false) ||
         (t.filePath === filePath && t.type === "diff"),
     );
+    const showFullContext = getDiffSettings().contextMode === "full";
     if (existing) {
       existing.content = diff;
       existing.diffContent = diff;
@@ -427,6 +455,7 @@ export class DiffPanel {
       existing.fullContextDiffContent = undefined;
       existing.showFullContext = false;
       existing.hunkContextExpansion = [];
+      this.setDiffContextMode(existing, showFullContext);
       this.switchTab(existing.id);
       return existing.id;
     }
@@ -439,9 +468,10 @@ export class DiffPanel {
       type: "diff",
       content: diff,
       diffContent: diff,
-      showFullContext: false,
+      showFullContext,
       hunkContextExpansion: [],
     };
+    this.setDiffContextMode(tab, showFullContext);
     this.addTab(tab);
     return tab.id;
   }
@@ -945,8 +975,9 @@ export class DiffPanel {
     toggleBtn.title = `Switch to ${this.viewMode === "unified" ? "side-by-side" : "unified"} view`;
     toggleBtn.addEventListener("click", () => {
       this.saveScrollPosition();
-      this.viewMode = this.viewMode === "unified" ? "side-by-side" : "unified";
-      this.render();
+      const nextMode: DiffViewMode =
+        this.viewMode === "unified" ? "side-by-side" : "unified";
+      setDiffSettings({ viewMode: nextMode });
     });
     controls.appendChild(toggleBtn);
 
@@ -965,8 +996,8 @@ export class DiffPanel {
     fullContextBtn.disabled = !canShowFullContext;
     fullContextBtn.addEventListener("click", () => {
       this.saveScrollPosition();
-      this.setDiffContextMode(tab, !(tab.showFullContext === true));
-      this.render();
+      const nextMode = tab.showFullContext ? "hunks" : "full";
+      setDiffSettings({ contextMode: nextMode });
     });
     controls.appendChild(fullContextBtn);
 

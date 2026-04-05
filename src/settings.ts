@@ -38,6 +38,11 @@ import {
   setToolOutputMode,
   type ToolOutputMode,
 } from "./chat/tools";
+import {
+  getDiffSettings,
+  onDiffSettingsChange,
+  setDiffSettings,
+} from "./diff_settings";
 
 const APPEARANCE_STORAGE_KEY = "tyde-appearance";
 const ACTIVE_SETTINGS_TAB_KEY = "tyde-settings-active-tab";
@@ -1317,6 +1322,109 @@ export class SettingsPanel {
     outputSection.appendChild(outputField);
     section.appendChild(outputSection);
 
+    // Diff View
+    const diffSection = el("div", { class: "settings-section" });
+    diffSection.appendChild(
+      el("h3", { class: "settings-section-header" }, "Diff View"),
+    );
+
+    // Diff Layout
+    const layoutField = el("div", { class: "settings-field" });
+    layoutField.appendChild(
+      el(
+        "label",
+        { class: "settings-label", "data-testid": "settings-label" },
+        "Diff Layout",
+      ),
+    );
+    layoutField.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Choose between unified (inline) and side-by-side view.",
+      ),
+    );
+
+    const layoutControl = el("div", {
+      class: "settings-segmented-control",
+      "data-setting": "diff-view-mode",
+      role: "radiogroup",
+    });
+    for (const [v, label] of [
+      ["unified", "Unified"],
+      ["side-by-side", "Side-by-Side"],
+    ]) {
+      const btn = el(
+        "button",
+        {
+          class: "segment",
+          "data-value": v,
+          role: "radio",
+          "aria-checked": "false",
+        },
+        label,
+      );
+      btn.addEventListener("click", () => {
+        setDiffSettings({ viewMode: v as any });
+        this.setActiveSegment(layoutControl, v);
+      });
+      layoutControl.appendChild(btn);
+    }
+    layoutField.appendChild(layoutControl);
+    diffSection.appendChild(layoutField);
+
+    // Diff Context
+    const contextField = el("div", { class: "settings-field" });
+    contextField.appendChild(
+      el(
+        "label",
+        { class: "settings-label", "data-testid": "settings-label" },
+        "Diff Context",
+      ),
+    );
+    contextField.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Prefer showing only changed hunks or full file context.",
+      ),
+    );
+
+    const contextControl = el("div", {
+      class: "settings-segmented-control",
+      "data-setting": "diff-context-mode",
+      role: "radiogroup",
+    });
+    for (const [v, label] of [
+      ["hunks", "Hunks Only"],
+      ["full", "Full Context"],
+    ]) {
+      const btn = el(
+        "button",
+        {
+          class: "segment",
+          "data-value": v,
+          role: "radio",
+          "aria-checked": "false",
+        },
+        label,
+      );
+      btn.addEventListener("click", () => {
+        setDiffSettings({ contextMode: v as any });
+        this.setActiveSegment(contextControl, v);
+      });
+      contextControl.appendChild(btn);
+    }
+    contextField.appendChild(contextControl);
+    diffSection.appendChild(contextField);
+
+    onDiffSettingsChange((settings) => {
+      this.setActiveSegment(layoutControl, settings.viewMode);
+      this.setActiveSegment(contextControl, settings.contextMode);
+    });
+
+    section.appendChild(diffSection);
+
     return section;
   }
 
@@ -1337,6 +1445,19 @@ export class SettingsPanel {
     ) as HTMLElement | null;
     if (outputControl)
       this.setActiveSegment(outputControl, getToolOutputMode());
+
+    const diffSettings = getDiffSettings();
+    const layoutControl = this.container.querySelector(
+      '.settings-segmented-control[data-setting="diff-view-mode"]',
+    ) as HTMLElement | null;
+    if (layoutControl)
+      this.setActiveSegment(layoutControl, diffSettings.viewMode);
+
+    const contextControl = this.container.querySelector(
+      '.settings-segmented-control[data-setting="diff-context-mode"]',
+    ) as HTMLElement | null;
+    if (contextControl)
+      this.setActiveSegment(contextControl, diffSettings.contextMode);
   }
 
   private refreshBackendUsage(force = false): void {
