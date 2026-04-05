@@ -1624,25 +1624,13 @@ export class SettingsPanel {
     );
     section.appendChild(header);
 
-    const usageLink = el(
-      "a",
-      {
-        class: "settings-usage-link",
-        href: "https://aistudio.google.com/usage",
-        target: "_blank",
-        rel: "noopener noreferrer",
-      },
-      "View Gemini usage",
-    );
-    section.appendChild(usageLink);
-
     section.appendChild(
       el(
         "p",
         {
           class: "settings-description settings-usage-meta settings-usage-note",
         },
-        "Gemini CLI does not programmatically expose usage limits.",
+        "Gemini CLI does not programmatically expose usage limits or provide a usage dashboard.",
       ),
     );
 
