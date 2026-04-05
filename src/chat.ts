@@ -32,6 +32,7 @@ import { InputHistory } from "./chat/input_handler";
 import {
   copyToClipboard,
   createMessageElement,
+  createRelaunchMessageElement,
   createSystemMessageElement,
   refreshRelativeTimes,
   resolveModelLabel,
@@ -69,7 +70,8 @@ type StoredMessage =
       element: HTMLElement | null;
     }
   | { kind: "streaming"; element: HTMLElement }
-  | { kind: "retry"; element: HTMLElement };
+  | { kind: "retry"; element: HTMLElement }
+  | { kind: "relaunch"; element: HTMLElement };
 
 interface ConversationView {
   wrapper: HTMLElement;
@@ -131,11 +133,17 @@ function createMessageElementForStored(stored: StoredMessage): HTMLElement {
       return stored.element;
     case "retry":
       return stored.element;
+    case "relaunch":
+      return stored.element;
   }
 }
 
 function getOrCreateElement(stored: StoredMessage): HTMLElement {
-  if (stored.kind === "streaming" || stored.kind === "retry") {
+  if (
+    stored.kind === "streaming" ||
+    stored.kind === "retry" ||
+    stored.kind === "relaunch"
+  ) {
     return stored.element;
   }
   if (stored.element) return stored.element;
@@ -286,6 +294,7 @@ export class ChatPanel {
   onOpenFileLink: ((filePath: string, oneBasedLine?: number) => void) | null =
     null;
   onSlashCommand: ((command: string) => boolean) | null = null;
+  onRelaunch: ((conversationId: number) => void) | null = null;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -947,11 +956,9 @@ export class ChatPanel {
         if (view.streamState.currentBubble) {
           this.handleStreamInterruption(view, "Backend process exited");
         }
-        this.appendSystemMessage(
-          view,
-          "Backend process exited. Open a new tab to continue.",
-          "error",
-        );
+        if (event.data.exit_code !== 0) {
+          this.appendRelaunchMessage(view);
+        }
         this.updateViewSendButton(view);
         break;
       default:
@@ -1951,12 +1958,36 @@ export class ChatPanel {
     if (view) view.taskPanel.toggle();
   }
 
-  setConnected(): void {
-    if (this.activeConversationId === null) return;
-    const view = this.views.get(this.activeConversationId);
+  setConnected(conversationId: number): void {
+    const view = this.views.get(conversationId);
     if (!view) return;
     view.disconnected = false;
     this.updateViewSendButton(view);
+  }
+
+  private appendRelaunchMessage(view: ConversationView): void {
+    const el = createRelaunchMessageElement(() => {
+      this.onRelaunch?.(view.conversationId);
+    });
+    const stored: StoredMessage = { kind: "relaunch", element: el };
+    view.messages.push(stored);
+    updateVirtualizerCount(view);
+    this.scrollToBottom(view);
+  }
+
+  /** Re-enable the relaunch button after a failed relaunch attempt. */
+  resetRelaunchButton(conversationId: number): void {
+    const view = this.views.get(conversationId);
+    if (!view) return;
+    for (const msg of view.messages) {
+      if (msg.kind !== "relaunch") continue;
+      const btn = msg.element.querySelector<HTMLButtonElement>(".relaunch-btn");
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove("relaunch-btn-loading");
+        btn.textContent = "Relaunch Agent";
+      }
+    }
   }
 
   setHistoryLoading(conversationId: number, loading: boolean): void {

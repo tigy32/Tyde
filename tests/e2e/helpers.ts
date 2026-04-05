@@ -37,6 +37,8 @@ export const sel = {
 
   // Error
   errorMessage: '[data-testid="error-message"]',
+  relaunchMessage: '[data-testid="relaunch-message"]',
+  relaunchBtn: '[data-testid="relaunch-btn"]',
 
   // Context bar
   contextUsage: '[data-testid="context-usage"]',

@@ -1038,6 +1038,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
     case 'switch_profile':
     case 'update_settings':
     case 'restart_subprocess':
+    case 'relaunch_conversation':
     case 'plugin:opener|reveal_item_in_dir':
     case 'plugin:shell|open':
       return null;

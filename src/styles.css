@@ -6901,6 +6901,54 @@ body {
   cursor: not-allowed;
 }
 
+/* === Relaunch Message === */
+.relaunch-message {
+  align-self: center;
+  background: var(--error-msg-bg);
+  border: 1px solid var(--color-error);
+  border-radius: 8px;
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 400px;
+  width: 100%;
+  animation: fade-in 0.2s ease;
+}
+
+.relaunch-message span {
+  font-size: calc(var(--base-font-size) * 0.9286);
+  color: var(--text-secondary);
+  flex: 1;
+}
+
+.relaunch-btn {
+  background: var(--accent-primary);
+  color: var(--text-white);
+  border: none;
+  padding: 6px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: calc(var(--base-font-size) * 0.8571);
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.relaunch-btn:hover {
+  background: var(--accent-hover);
+}
+
+.relaunch-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.relaunch-btn-loading {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 /* === Responsive Layout === */
 @media (max-width: 768px) {
   #right-panel {

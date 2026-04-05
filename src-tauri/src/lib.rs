@@ -4648,6 +4648,127 @@ async fn restart_subprocess(
 }
 
 #[tauri::command]
+async fn relaunch_conversation(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    conversation_id: u64,
+) -> Result<(), String> {
+    // 1. Look up the backend_session_id from the session store so we can resume
+    //    the same session on the newly spawned backend. This is None when the
+    //    backend crashed before emitting SessionStarted — in that case we simply
+    //    start fresh (nothing to resume).
+    let backend_session_id: Option<String> = {
+        let tyde_session_id = state
+            .conversation_to_session
+            .lock()
+            .get(&conversation_id)
+            .cloned();
+        tyde_session_id.and_then(|sid| {
+            let mut store = state.session_store.lock();
+            store
+                .get(&sid)
+                .and_then(|r| r.backend_session_id.clone())
+        })
+    };
+
+    // 2. Extract workspace_roots + backend_kind, then remove + shutdown old session.
+    let (workspace_roots, backend_kind, old_session) = {
+        let mut mgr = state.manager.lock().await;
+        let roots = mgr
+            .workspace_roots(conversation_id)
+            .ok_or("Conversation not found")?
+            .to_vec();
+        let kind = mgr
+            .backend_kind(conversation_id)
+            .ok_or("Conversation not found")?;
+        let session = mgr
+            .remove(conversation_id)
+            .ok_or("Conversation not found")?;
+        (roots, kind, session)
+    };
+
+    old_session.shutdown().await;
+
+    // 3. Spawn a fresh backend process.
+    let launch_target =
+        resolve_backend_launch_target(&app, &workspace_roots, backend_kind).await?;
+    let startup_mcp_servers =
+        startup_mcp_servers_for_new_sessions(state.inner(), false, &workspace_roots)?;
+    let steering = steering::read_steering_from_roots(&workspace_roots).await?;
+    let (session, rx) = BackendSession::spawn(
+        backend_kind,
+        &launch_target,
+        &workspace_roots,
+        false,
+        &startup_mcp_servers,
+        steering.as_deref(),
+        None,
+    )
+    .await?;
+
+    // 4. Re-insert into ConversationManager under the same conversation_id.
+    {
+        let mut mgr = state.manager.lock().await;
+        mgr.insert(conversation_id, session, workspace_roots.clone());
+    }
+
+    // 5. Re-register agent in AgentRuntime.
+    let root_agent = ensure_conversation_agent_registered(
+        &app,
+        state.inner(),
+        conversation_id,
+        &workspace_roots,
+        backend_kind.as_str(),
+        "Conversation",
+    )
+    .await;
+
+    let registration = serde_json::json!({
+        "kind": "ConversationRegistered",
+        "data": {
+            "agent_id": root_agent.agent_id,
+            "workspace_roots": &workspace_roots,
+            "backend_kind": backend_kind.as_str(),
+            "name": &root_agent.name,
+            "parent_agent_id": null,
+        }
+    });
+
+    // 6. Set up settings watch and event forwarding.
+    let (settings_tx, _) = watch::channel(Value::Null);
+    {
+        let mut watchers = state.settings_watch.lock().await;
+        watchers.insert(conversation_id, settings_tx.clone());
+    }
+
+    tokio::spawn(forward_events(
+        app.clone(),
+        conversation_id,
+        rx,
+        state.agent_runtime.clone(),
+        state.agent_runtime_notify.clone(),
+        registration,
+        settings_tx,
+        state.session_store.clone(),
+        state.conversation_to_session.clone(),
+    ));
+
+    // 7. Resume the old session on the new backend (skip when there is nothing
+    //    to resume, e.g. the backend crashed before SessionStarted).
+    if let Some(session_id) = backend_session_id {
+        execute_conversation_command(
+            &app,
+            &state,
+            conversation_id,
+            SessionCommand::ResumeSession { session_id },
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn list_active_conversations(state: tauri::State<'_, AppState>) -> Result<Vec<u64>, String> {
     let mgr = state.manager.lock().await;
     Ok(mgr.active_ids())
@@ -5135,6 +5256,7 @@ pub fn run_with_options(headless: bool) {
             get_module_schemas,
             update_settings,
             restart_subprocess,
+            relaunch_conversation,
             list_active_conversations,
             shutdown_all_subprocesses,
             create_admin_subprocess,

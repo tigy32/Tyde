@@ -373,6 +373,31 @@ export function createSystemMessageElement(
   return el;
 }
 
+export function createRelaunchMessageElement(onClick: () => void): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "message relaunch-message";
+  el.dataset.testid = "relaunch-message";
+  el.setAttribute("role", "article");
+
+  const text = document.createElement("span");
+  text.textContent = "Backend process exited unexpectedly.";
+  el.appendChild(text);
+
+  const btn = document.createElement("button");
+  btn.className = "relaunch-btn";
+  btn.textContent = "Relaunch Agent";
+  btn.dataset.testid = "relaunch-btn";
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    btn.classList.add("relaunch-btn-loading");
+    btn.textContent = "Relaunching…";
+    onClick();
+  });
+  el.appendChild(btn);
+
+  return el;
+}
+
 /** @deprecated Use createSystemMessageElement + virtualizer store instead */
 export function addSystemMessage(
   chatContainer: HTMLElement,

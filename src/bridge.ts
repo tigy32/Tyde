@@ -28,6 +28,10 @@ declare module "@tyde/protocol" {
       params: { id: string };
       response: undefined;
     };
+    relaunch_conversation: {
+      params: { conversationId: number };
+      response: undefined;
+    };
   }
 }
 
@@ -486,6 +490,10 @@ export function getHostForWorkspace(workspacePath: string) {
 
 export function restartSubprocess(conversationId: number) {
   return execute("restart_subprocess", { conversationId });
+}
+
+export function relaunchConversation(conversationId: number) {
+  return execute("relaunch_conversation", { conversationId });
 }
 
 export function listActiveConversations() {

@@ -1405,20 +1405,21 @@ describe('Chat tab lifecycle', () => {
       { timeout: 5000, timeoutMsg: 'Sessions should reload after second refresh' },
     );
 
-    // --- SubprocessExit shows crash notice and disables send (LAST) ---
+    // --- SubprocessExit shows relaunch notice and disables send (LAST) ---
+    const relaunchInput = await $(sel.messageInput);
+    await relaunchInput.setValue('pending message');
     await emitChatEvent(WORKSPACE_CONV_ID, 'SubprocessExit', { exit_code: 1 });
 
     await browser.waitUntil(
       async () => {
-        const errorMsgs = await $$(sel.errorMessage);
-        for (const msg of errorMsgs) {
-          const text = await msg.getText();
-          if (text.includes('Backend process exited')) return true;
-        }
-        return false;
+        const msg = await $(sel.relaunchMessage);
+        return await msg.isDisplayed();
       },
-      { timeout: 5000, timeoutMsg: 'Backend process exited notice should appear' },
+      { timeout: 5000, timeoutMsg: 'Relaunch notice should appear' },
     );
+
+    const relaunchBtn = await $(sel.relaunchBtn);
+    expect(await relaunchBtn.isDisplayed()).toBe(true);
 
     await browser.waitUntil(
       async () => {
@@ -1427,6 +1428,20 @@ describe('Chat tab lifecycle', () => {
       },
       { timeout: 5000, timeoutMsg: 'Send button should be disabled after SubprocessExit' },
     );
+
+    // --- Clicking Relaunch Agent restores connection ---
+    await browser.execute((el: HTMLElement) => el.click(), relaunchBtn);
+
+    await browser.waitUntil(
+      async () => {
+        const disabled = await sendBtn.getAttribute('disabled');
+        return disabled === null;
+      },
+      { timeout: 5000, timeoutMsg: 'Send button should be re-enabled after relaunch' },
+    );
+
+    // Relaunch message should still be there (history), but we can send messages again
+    expect(await sendBtn.isEnabled()).toBe(true);
   });
 
   it('clears stale context usage when the latest assistant message has no breakdown', async () => {

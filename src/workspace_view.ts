@@ -24,6 +24,7 @@ import {
   normalizeBackendKind,
   onFileChanged,
   readFileContent,
+  relaunchConversation,
   renameAgent,
   renameSession,
   resumeSession,
@@ -2240,6 +2241,17 @@ export class WorkspaceView {
     };
     this.chatPanel.onViewDiff = (filePath, before, after) =>
       this.openBeforeAfterDiffTab(before, after, filePath);
+    this.chatPanel.onRelaunch = (conversationId) => {
+      relaunchConversation(conversationId).then(
+        () => {
+          this.chatPanel.setConnected(conversationId);
+        },
+        (err) => {
+          this.notifications.error(`Relaunch failed: ${String(err)}`);
+          this.chatPanel.resetRelaunchButton(conversationId);
+        },
+      );
+    };
 
     this.agentsPanel.onAgentClick = (agent) => {
       const focused = this.focusConversation(agent.conversationId, agent.name);
