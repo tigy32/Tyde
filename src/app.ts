@@ -732,6 +732,27 @@ export class AppController {
         return;
       }
 
+      const descendants: string[] = [];
+      const queue = [agentId];
+      while (queue.length > 0) {
+        const parentId = queue.shift()!;
+        for (const [id, a] of this.runtimeAgents) {
+          if (a.parent_agent_id === parentId) {
+            descendants.push(id);
+            queue.push(id);
+          }
+        }
+      }
+
+      for (const descId of descendants) {
+        const desc = this.runtimeAgents.get(descId)!;
+        if (desc.is_running) {
+          await terminateAgent(descId);
+        }
+        this.closeRuntimeAgentTab(desc);
+        this.hiddenRuntimeAgentIds.add(descId);
+      }
+
       this.closeRuntimeAgentTab(agent);
       this.hiddenRuntimeAgentIds.add(agentId);
       this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
