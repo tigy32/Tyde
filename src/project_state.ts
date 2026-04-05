@@ -1,3 +1,14 @@
+import {
+  addProject as addProjectCmd,
+  addProjectWorkbench as addProjectWorkbenchCmd,
+  listProjects,
+  type ProjectRecord,
+  type ProjectsChangedPayload,
+  removeProject as removeProjectCmd,
+  renameProjectRecord,
+  updateProjectRoots,
+} from "./bridge";
+
 export type ProjectStatus = "idle" | "active" | "needs_attention";
 
 export type WorkbenchKind = "git-worktree";
@@ -14,37 +25,25 @@ export interface Project {
   workbenchKind: WorkbenchKind | null;
 }
 
-interface PersistedState {
-  projects: Array<{
-    id: string;
-    name: string;
-    workspacePath: string;
-    roots?: string[];
-    parentProjectId?: string | null;
-    workbenchKind?: WorkbenchKind | null;
-  }>;
-  activeProjectId: string | null;
-  sidebarCollapsed: boolean;
-}
-
-const STORAGE_KEY = "tyde-projects";
-
-function normalizeRoots(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
-  const seen = new Set<string>();
-  const roots: string[] = [];
-  for (const entry of raw) {
-    if (typeof entry !== "string") continue;
-    const trimmed = entry.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    roots.push(trimmed);
-  }
-  return roots;
-}
+const UI_STATE_KEY = "tyde-projects-ui";
+const LEGACY_STORAGE_KEY = "tyde-projects";
 
 function normalizeWorkbenchKind(raw: unknown): WorkbenchKind | null {
   return raw === "git-worktree" ? raw : null;
+}
+
+function projectFromRecord(record: ProjectRecord): Project {
+  return {
+    id: record.id,
+    name: record.name,
+    workspacePath: record.workspace_path,
+    roots: record.roots ?? [],
+    conversationIds: [],
+    activeConversationId: null,
+    status: "idle",
+    parentProjectId: record.parent_project_id ?? null,
+    workbenchKind: normalizeWorkbenchKind(record.workbench_kind),
+  };
 }
 
 export class ProjectStateManager {
@@ -54,9 +53,183 @@ export class ProjectStateManager {
   onChange: (() => void) | null = null;
 
   constructor() {
-    this.restore();
+    this.restoreUiState();
   }
 
+  /** Load projects from the server-side store. Called once on startup. */
+  async loadFromServer(): Promise<void> {
+    const records = await listProjects();
+    this.applyServerRecords({ projects: records });
+  }
+
+  /** Load projects from a remote server-side store. */
+  async loadFromRemoteServer(host: string): Promise<void> {
+    const records = await listProjects(host);
+    this.applyServerRecords({ projects: records, host });
+  }
+
+  /** Migrate projects from legacy localStorage to server-side store, then clear. */
+  async migrateFromLocalStorage(): Promise<void> {
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!raw) return;
+
+    let parsed: {
+      projects?: Array<{
+        workspacePath?: string;
+        name?: string;
+        roots?: string[];
+        parentProjectId?: string | null;
+        workbenchKind?: string | null;
+      }>;
+    } | null = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return;
+    }
+    if (!parsed || !Array.isArray(parsed.projects)) {
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return;
+    }
+
+    // Import each project, parents first then workbenches
+    const parents = parsed.projects.filter((p) => !p.parentProjectId);
+    const workbenches = parsed.projects.filter((p) => p.parentProjectId);
+
+    // Map old ids to new server-side ids
+    const idMap = new Map<string, string>();
+    let hadFailure = false;
+
+    for (const p of parents) {
+      if (!p.workspacePath) continue;
+      const name =
+        p.name || p.workspacePath.split("/").pop() || p.workspacePath;
+      try {
+        const record = await addProjectCmd(p.workspacePath, name);
+        // Store mapping from old to new ID for workbench migration
+        const oldEntry = parsed.projects.find(
+          (e) => e.workspacePath === p.workspacePath,
+        );
+        if (oldEntry && (oldEntry as { id?: string }).id) {
+          idMap.set((oldEntry as { id: string }).id, record.id);
+        }
+        // Migrate roots if any
+        if (Array.isArray(p.roots) && p.roots.length > 0) {
+          await updateProjectRoots(record.id, p.roots);
+        }
+      } catch (err) {
+        console.error("Migration: failed to add project", p.workspacePath, err);
+        hadFailure = true;
+      }
+    }
+
+    for (const p of workbenches) {
+      if (!p.workspacePath || !p.parentProjectId) continue;
+      const parentId = idMap.get(p.parentProjectId) ?? p.parentProjectId;
+      const name =
+        p.name || p.workspacePath.split("/").pop() || p.workspacePath;
+      const kind = p.workbenchKind || "git-worktree";
+      try {
+        await addProjectWorkbenchCmd(parentId, p.workspacePath, name, kind);
+      } catch (err) {
+        console.error(
+          "Migration: failed to add workbench",
+          p.workspacePath,
+          err,
+        );
+        hadFailure = true;
+      }
+    }
+
+    if (hadFailure) {
+      console.warn(
+        "Migration: some projects failed to import; keeping legacy localStorage for retry",
+      );
+      return;
+    }
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
+
+    // Migrate activeProjectId and sidebarCollapsed if they were in the legacy state
+    const oldActiveId = (parsed as any).activeProjectId;
+    if (oldActiveId && idMap.has(oldActiveId)) {
+      this.activeProjectId = idMap.get(oldActiveId)!;
+    }
+    const oldSidebarCollapsed = (parsed as any).sidebarCollapsed;
+    if (typeof oldSidebarCollapsed === "boolean") {
+      this.sidebarCollapsed = oldSidebarCollapsed;
+    }
+    this.persistUiState();
+  }
+
+  /**
+   * Apply a fresh list of ProjectRecords from a server (local or remote).
+   * Preserves client-only state (conversationIds, status, activeConversationId).
+   * Merges with existing projects from other hosts.
+   */
+  applyServerRecords(payload: ProjectsChangedPayload): void {
+    if (!payload || !Array.isArray(payload.projects)) {
+      console.warn("applyServerRecords: invalid payload", payload);
+      return;
+    }
+    const { projects: records, host } = payload;
+    const recordsById = new Map(
+      records.filter((r) => r !== null).map((r) => [r.id, r]),
+    );
+
+    // Identify which existing projects belong to this source.
+    // Local projects have no ssh:// prefix. Remote projects have ssh://host/ prefix.
+    const isFromThisSource = (project: Project): boolean => {
+      if (!host) {
+        return !project.workspacePath.startsWith("ssh://");
+      }
+      // For remote, the records already have ssh://host/ prefix from normalization
+      return project.workspacePath.startsWith(`ssh://${host}/`);
+    };
+
+    const updatedProjects: Project[] = [];
+
+    // Keep projects from OTHER sources
+    for (const p of this.projects) {
+      if (!isFromThisSource(p)) {
+        updatedProjects.push(p);
+      } else {
+        // If it's from this source, we'll update it from the new records
+        const record = recordsById.get(p.id);
+        if (record) {
+          const updated = projectFromRecord(record);
+          updated.conversationIds = p.conversationIds;
+          updated.activeConversationId = p.activeConversationId;
+          updated.status = p.status;
+          updatedProjects.push(updated);
+          recordsById.delete(p.id); // Done with this record
+        }
+        // If not in recordsById, it was removed on the server; don't push it
+      }
+    }
+
+    // Add remaining NEW records from this source
+    for (const record of recordsById.values()) {
+      updatedProjects.push(projectFromRecord(record));
+    }
+
+    this.projects = updatedProjects;
+
+    // Validate activeProjectId
+    if (
+      this.activeProjectId &&
+      !this.projects.some((p) => p.id === this.activeProjectId)
+    ) {
+      this.activeProjectId = null;
+    }
+    this.persistUiState();
+    this.onChange?.();
+  }
+
+  /**
+   * Create an unpersisted project (used by remote workspace flow).
+   * Call commitProject() after successful connection.
+   */
   createProject(workspacePath: string): Project {
     const name =
       workspacePath.split("/").pop() ||
@@ -78,8 +251,24 @@ export class ProjectStateManager {
     return project;
   }
 
-  commitProject(_project: Project): void {
-    this.persist();
+  /** Persist a previously-created project to the server store. */
+  async commitProject(project: Project, host?: string): Promise<void> {
+    const record = await addProjectCmd(
+      project.workspacePath,
+      project.name,
+      host,
+    );
+    // Update the in-memory project with the server-assigned ID
+    const idx = this.projects.findIndex((p) => p.id === project.id);
+    if (idx !== -1) {
+      const old = this.projects[idx];
+      old.id = record.id;
+      // Update activeProjectId if it pointed to the old ID
+      if (this.activeProjectId === project.id) {
+        this.activeProjectId = record.id;
+      }
+    }
+    this.persistUiState();
   }
 
   abandonProject(projectId: string): void {
@@ -87,45 +276,56 @@ export class ProjectStateManager {
     this.onChange?.();
   }
 
-  addProject(workspacePath: string): Project {
-    const project = this.createProject(workspacePath);
-    this.commitProject(project);
-    return project;
+  async addProject(workspacePath: string, host?: string): Promise<Project> {
+    const name =
+      workspacePath.split("/").pop() ||
+      workspacePath.split("\\").pop() ||
+      workspacePath;
+    const record = await addProjectCmd(workspacePath, name, host);
+    if (!record) {
+      throw new Error(`Failed to add project: backend returned null`);
+    }
+    const project = projectFromRecord(record);
+    // Avoid duplicate if server event already added it
+    if (!this.projects.some((p) => p.id === project.id)) {
+      this.projects.push(project);
+      this.onChange?.();
+    }
+    return this.projects.find((p) => p.id === project.id) ?? project;
   }
 
-  addWorkbench(
+  async addWorkbench(
     parentProjectId: string,
     workspacePath: string,
     name: string,
     kind: WorkbenchKind,
-  ): Project {
-    const parent = this.projects.find((p) => p.id === parentProjectId);
-    const project: Project = {
-      id: crypto.randomUUID(),
-      name,
-      workspacePath,
-      roots: parent?.roots?.slice() ?? [],
-      conversationIds: [],
-      activeConversationId: null,
-      status: "idle",
+    host?: string,
+  ): Promise<Project> {
+    const record = await addProjectWorkbenchCmd(
       parentProjectId,
-      workbenchKind: kind,
-    };
-    // Insert right after the parent and its existing workbenches
-    const parentIndex = this.projects.findIndex(
-      (p) => p.id === parentProjectId,
+      workspacePath,
+      name,
+      kind,
+      host,
     );
-    let insertIndex = parentIndex + 1;
-    while (
-      insertIndex < this.projects.length &&
-      this.projects[insertIndex].parentProjectId === parentProjectId
-    ) {
-      insertIndex++;
+    const project = projectFromRecord(record);
+    // Insert after parent and its existing workbenches, if not already present
+    if (!this.projects.some((p) => p.id === project.id)) {
+      const parentIndex = this.projects.findIndex(
+        (p) => p.id === parentProjectId,
+      );
+      let insertIndex = parentIndex + 1;
+      while (
+        insertIndex < this.projects.length &&
+        this.projects[insertIndex].parentProjectId === parentProjectId
+      ) {
+        insertIndex++;
+      }
+      this.projects.splice(insertIndex, 0, project);
+      this.onChange?.();
     }
-    this.projects.splice(insertIndex, 0, project);
-    this.onChange?.();
-    this.persist();
-    return project;
+    this.persistUiState();
+    return this.projects.find((p) => p.id === project.id) ?? project;
   }
 
   getWorkbenches(parentId: string): Project[] {
@@ -146,8 +346,20 @@ export class ProjectStateManager {
     return this.projects.find((p) => p.id === project.parentProjectId) ?? null;
   }
 
-  removeProject(id: string): void {
-    // Also remove child workbenches when removing a parent
+  private getHostForProject(project: Project): string | undefined {
+    if (project.workspacePath.startsWith("ssh://")) {
+      const parts = project.workspacePath.slice(6).split("/");
+      return parts[0];
+    }
+    return undefined;
+  }
+
+  async removeProject(id: string): Promise<void> {
+    const project = this.projects.find((p) => p.id === id);
+    if (project) {
+      await removeProjectCmd(id, this.getHostForProject(project));
+    }
+    // Also remove child workbenches from local state
     const childIds = this.projects
       .filter((p) => p.parentProjectId === id)
       .map((p) => p.id);
@@ -157,7 +369,7 @@ export class ProjectStateManager {
       this.activeProjectId = this.projects[0]?.id ?? null;
     }
     this.onChange?.();
-    this.persist();
+    this.persistUiState();
   }
 
   switchProject(id: string): void {
@@ -167,13 +379,13 @@ export class ProjectStateManager {
       project.status = "idle";
     }
     this.onChange?.();
-    this.persist();
+    this.persistUiState();
   }
 
   switchToHome(): void {
     this.activeProjectId = null;
     this.onChange?.();
-    this.persist();
+    this.persistUiState();
   }
 
   isHomeActive(): boolean {
@@ -190,15 +402,15 @@ export class ProjectStateManager {
     if (!project) return;
     project.status = status;
     this.onChange?.();
-    this.persist();
   }
 
-  renameProject(id: string, name: string): void {
+  async renameProject(id: string, name: string): Promise<void> {
     const project = this.projects.find((p) => p.id === id);
-    if (!project) return;
-    project.name = name;
+    if (project) {
+      await renameProjectRecord(id, name, this.getHostForProject(project));
+      project.name = name;
+    }
     this.onChange?.();
-    this.persist();
   }
 
   addConversationToProject(projectId: string, conversationId: number): void {
@@ -244,129 +456,64 @@ export class ProjectStateManager {
     );
   }
 
-  addProjectRoot(projectId: string, root: string): void {
+  async addProjectRoot(projectId: string, root: string): Promise<void> {
     const project = this.projects.find((p) => p.id === projectId);
     if (!project) return;
     if (project.roots.includes(root)) return;
-    project.roots.push(root);
+    const newRoots = [...project.roots, root];
+    await updateProjectRoots(
+      projectId,
+      newRoots,
+      this.getHostForProject(project),
+    );
+    project.roots = newRoots;
     this.onChange?.();
-    this.persist();
   }
 
-  removeProjectRoot(projectId: string, root: string): void {
+  async removeProjectRoot(projectId: string, root: string): Promise<void> {
     const project = this.projects.find((p) => p.id === projectId);
     if (!project) return;
-    project.roots = project.roots.filter((r) => r !== root);
+    const newRoots = project.roots.filter((r) => r !== root);
+    await updateProjectRoots(
+      projectId,
+      newRoots,
+      this.getHostForProject(project),
+    );
+    project.roots = newRoots;
     this.onChange?.();
-    this.persist();
   }
 
   setSidebarCollapsed(collapsed: boolean): void {
     this.sidebarCollapsed = collapsed;
-    this.persist();
+    this.persistUiState();
   }
 
-  persist(): void {
-    const state: PersistedState = {
-      projects: this.projects.map((p) => ({
-        id: p.id,
-        name: p.name,
-        workspacePath: p.workspacePath,
-        roots: p.roots,
-        parentProjectId: p.parentProjectId,
-        workbenchKind: p.workbenchKind,
-      })),
+  private persistUiState(): void {
+    const state = {
       activeProjectId: this.activeProjectId,
       sidebarCollapsed: this.sidebarCollapsed,
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify(state));
   }
 
-  restore(): void {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      this.projects = [];
-      this.activeProjectId = null;
-      return;
-    }
-    let state: unknown;
+  private restoreUiState(): void {
+    const raw = localStorage.getItem(UI_STATE_KEY);
+    if (!raw) return;
     try {
-      state = JSON.parse(raw);
-    } catch (err) {
-      console.error("Failed to parse persisted project state, resetting:", err);
-      localStorage.removeItem(STORAGE_KEY);
-      this.projects = [];
-      this.activeProjectId = null;
-      this.sidebarCollapsed = false;
-      return;
-    }
-    if (!state || typeof state !== "object") {
-      this.projects = [];
-      this.activeProjectId = null;
-      this.sidebarCollapsed = false;
-      return;
-    }
-
-    const parsed = state as Partial<PersistedState>;
-    const projectsRaw = Array.isArray(parsed.projects) ? parsed.projects : [];
-    const projects: Project[] = [];
-    const seenIds = new Set<string>();
-
-    for (const entry of projectsRaw) {
-      if (!entry || typeof entry !== "object") continue;
-      const project = entry as Partial<PersistedState["projects"][number]>;
-      const workspacePath =
-        typeof project.workspacePath === "string"
-          ? project.workspacePath.trim()
-          : "";
-      if (!workspacePath) continue;
-
-      const candidateId =
-        typeof project.id === "string" && project.id.trim().length > 0
-          ? project.id
-          : crypto.randomUUID();
-      const id = seenIds.has(candidateId) ? crypto.randomUUID() : candidateId;
-      seenIds.add(id);
-
-      const name =
-        typeof project.name === "string" && project.name.trim().length > 0
-          ? project.name
-          : workspacePath.split("/").pop() ||
-            workspacePath.split("\\").pop() ||
-            workspacePath;
-
-      const parentProjectId =
-        typeof project.parentProjectId === "string" &&
-        project.parentProjectId.trim().length > 0
-          ? project.parentProjectId
+      const state = JSON.parse(raw) as {
+        activeProjectId?: string | null;
+        sidebarCollapsed?: boolean;
+      };
+      this.activeProjectId =
+        typeof state.activeProjectId === "string"
+          ? state.activeProjectId
           : null;
-
-      projects.push({
-        id,
-        name,
-        workspacePath,
-        roots: normalizeRoots(project.roots),
-        conversationIds: [],
-        activeConversationId: null,
-        status: "idle",
-        parentProjectId,
-        workbenchKind: normalizeWorkbenchKind(project.workbenchKind),
-      });
+      this.sidebarCollapsed =
+        typeof state.sidebarCollapsed === "boolean"
+          ? state.sidebarCollapsed
+          : false;
+    } catch {
+      // Corrupted, ignore
     }
-
-    this.projects = projects;
-
-    const activeProjectId =
-      typeof parsed.activeProjectId === "string"
-        ? parsed.activeProjectId
-        : null;
-    this.activeProjectId =
-      activeProjectId && this.projects.some((p) => p.id === activeProjectId)
-        ? activeProjectId
-        : null;
-    this.sidebarCollapsed =
-      typeof parsed.sidebarCollapsed === "boolean"
-        ? parsed.sidebarCollapsed
-        : false;
   }
 }

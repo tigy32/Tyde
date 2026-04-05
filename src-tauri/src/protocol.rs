@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent_runtime::AgentInfo;
+use crate::project_store::ProjectRecord;
 use crate::session_store::SessionRecord;
 
 // ---------------------------------------------------------------------------
@@ -143,6 +144,8 @@ pub struct HandshakeResult {
     pub instance_id: Option<String>,
     #[serde(default)]
     pub session_records: Vec<SessionRecord>,
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

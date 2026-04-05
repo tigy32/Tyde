@@ -553,6 +553,78 @@ export function onDeleteWorkbench(
   );
 }
 
+// --- Project store ---
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  workspace_path: string;
+  roots: string[];
+  parent_project_id: string | null;
+  workbench_kind: string | null;
+}
+
+export function listProjects(host?: string): Promise<ProjectRecord[]> {
+  return invoke<ProjectRecord[]>("list_projects", { host });
+}
+
+export function addProject(
+  workspacePath: string,
+  name: string,
+  host?: string,
+): Promise<ProjectRecord> {
+  return invoke<ProjectRecord>("add_project", { workspacePath, name, host });
+}
+
+export function addProjectWorkbench(
+  parentProjectId: string,
+  workspacePath: string,
+  name: string,
+  kind: string,
+  host?: string,
+): Promise<ProjectRecord> {
+  return invoke<ProjectRecord>("add_project_workbench", {
+    parentProjectId,
+    workspacePath,
+    name,
+    kind,
+    host,
+  });
+}
+
+export function removeProject(id: string, host?: string): Promise<void> {
+  return invoke<void>("remove_project", { id, host });
+}
+
+export function renameProjectRecord(
+  id: string,
+  name: string,
+  host?: string,
+): Promise<void> {
+  return invoke<void>("rename_project", { id, name, host });
+}
+
+export function updateProjectRoots(
+  id: string,
+  roots: string[],
+  host?: string,
+): Promise<void> {
+  return invoke<void>("update_project_roots", { id, roots, host });
+}
+
+export interface ProjectsChangedPayload {
+  projects: ProjectRecord[];
+  host?: string;
+}
+
+export function onProjectsChanged(
+  callback: (payload: ProjectsChangedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ProjectsChangedPayload>("tyde-projects-changed", (event) => {
+    callback(event.payload);
+  });
+}
+
 // --- Agent change events ---
 
 export function onAgentChanged(

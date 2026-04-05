@@ -5,7 +5,6 @@ import type {
   AdminEventPayload,
   ChatEventPayload,
   ConversationRegisteredPayload,
-  CreateWorkbenchEventPayload,
   DeleteWorkbenchEventPayload,
   Host,
   McpHttpServerSettings,
@@ -26,8 +25,8 @@ import {
   onAdminEvent,
   onAgentChanged,
   onChatEvent,
-  onCreateWorkbench,
   onDeleteWorkbench,
+  onProjectsChanged,
   onTydeServerConnectionState,
   openWorkspaceDialog,
   pickSubRootDialog,
@@ -112,9 +111,6 @@ export class AppController {
     );
     await onAdminEvent((payload) => this.routeAdminEvent(payload));
     await registerDebugUiBridge();
-    await onCreateWorkbench((payload) => {
-      this.handleCreateWorkbench(payload);
-    });
     await onDeleteWorkbench((payload) => {
       void this.handleDeleteWorkbench(payload);
     });
@@ -130,6 +126,19 @@ export class AppController {
     document
       .getElementById("header-settings-btn")!
       .addEventListener("click", () => this.openSettings());
+
+    // Migrate legacy localStorage projects to server store, then load
+    await this.projectState.migrateFromLocalStorage();
+    await this.projectState.loadFromServer();
+    this.projectSidebar?.render();
+    this.homeView?.render();
+
+    // Listen for server-side project store changes
+    await onProjectsChanged((payload) => {
+      this.projectState.applyServerRecords(payload);
+      this.projectSidebar?.render();
+      this.homeView?.render();
+    });
 
     await initializeBackendDependencies();
     this.refreshAllBackendMenus();
@@ -512,7 +521,7 @@ export class AppController {
       (id: string) => this.switchToWorkspace(id),
       () => this.switchToHome(),
       () => this.handleAddProject(),
-      (id) => this.handleRemoveProject(id),
+      (id) => void this.handleRemoveProject(id),
     );
     this.projectSidebar = sidebar;
     sidebar.onCreateWorkbench = (parentId) => {
@@ -1141,10 +1150,10 @@ export class AppController {
       }
 
       // Connection succeeded — persist
-      this.projectState.commitProject(project);
+      await this.projectState.commitProject(project);
     } else {
       if (!project) {
-        project = this.projectState.addProject(dir);
+        project = await this.projectState.addProject(dir);
         project.name = displayName;
       }
 
@@ -1172,6 +1181,12 @@ export class AppController {
       if (state === "connected") {
         this.notifications.success("Connected to remote Tyde server");
         void this.refreshRuntimeAgentsSnapshot();
+        void this.projectState
+          .loadFromRemoteServer(payload.host_id)
+          .then(() => {
+            this.projectSidebar?.render();
+            this.homeView?.render();
+          });
       }
     } else if ("reconnecting" in state) {
       if (state.reconnecting.attempt === 1) {
@@ -1263,7 +1278,7 @@ export class AppController {
     await this.openWorkspacePath(dir);
   }
 
-  private handleRemoveProject(projectId: string): void {
+  private async handleRemoveProject(projectId: string): Promise<void> {
     const project = this.projectState.projects.find((p) => p.id === projectId);
     if (!project) return;
 
@@ -1288,7 +1303,7 @@ export class AppController {
       this.workspaceViews.delete(projectId);
     }
 
-    this.projectState.removeProject(projectId);
+    await this.projectState.removeProject(projectId);
     this.settingsPanel.notifySelectedHostChanged();
 
     const active = this.projectState.getActiveProject();
@@ -1335,31 +1350,13 @@ export class AppController {
       return;
     }
 
-    const project = this.projectState.addWorkbench(
+    const project = await this.projectState.addWorkbench(
       parentProjectId,
       worktreePath,
       branch,
       "git-worktree",
     );
     this.switchToWorkspace(project.id);
-  }
-
-  private handleCreateWorkbench(payload: CreateWorkbenchEventPayload): void {
-    const parent = this.projectState.projects.find(
-      (p) => p.workspacePath === payload.parent_workspace_path,
-    );
-    if (!parent) {
-      this.notifications.error(
-        `No project found for workspace path: ${payload.parent_workspace_path}`,
-      );
-      return;
-    }
-    this.projectState.addWorkbench(
-      parent.id,
-      payload.worktree_path,
-      payload.branch,
-      "git-worktree",
-    );
   }
 
   private async handleDeleteWorkbench(
@@ -1412,7 +1409,7 @@ export class AppController {
       );
     }
 
-    this.projectState.removeProject(projectId);
+    await this.projectState.removeProject(projectId);
     this.settingsPanel.notifySelectedHostChanged();
 
     const active = this.projectState.getActiveProject();
@@ -1479,9 +1476,12 @@ export class AppController {
           removeBtn.className = "manage-roots-remove";
           removeBtn.textContent = "Remove";
           removeBtn.addEventListener("click", () => {
-            this.projectState.removeProjectRoot(projectId, root);
-            syncView();
-            renderList();
+            void this.projectState
+              .removeProjectRoot(projectId, root)
+              .then(() => {
+                syncView();
+                renderList();
+              });
           });
           row.appendChild(removeBtn);
           listContainer.appendChild(row);
@@ -1507,7 +1507,7 @@ export class AppController {
         return;
       }
       if (!selected) return;
-      this.projectState.addProjectRoot(projectId, selected);
+      await this.projectState.addProjectRoot(projectId, selected);
       syncView();
       renderList();
     });

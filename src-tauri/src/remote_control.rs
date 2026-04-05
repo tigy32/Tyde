@@ -324,6 +324,8 @@ async fn handle_client(
     let session_records = state.session_store.lock().list()
         .map_err(|e| format!("Failed to read session store: {e}"))?;
 
+    let projects = state.project_store.lock().list()
+        .map_err(|e| format!("Failed to read project store: {e}"))?;
 
     send(
         &writer,
@@ -335,6 +337,7 @@ async fn handle_client(
                 conversations,
                 instance_id: Some(instance_id),
                 session_records,
+                projects,
             })
             .unwrap_or_default(),
         },
@@ -926,6 +929,76 @@ async fn dispatch_invoke(
 
             // Delete from store
             state.session_store.lock().delete(&p.id)?;
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        "list_projects" => {
+            let mut store = state.project_store.lock();
+            let records = store.list()?;
+            serde_json::to_value(records).map_err(|e| e.to_string())
+        }
+
+        "add_project" => {
+            #[derive(Deserialize)]
+            struct P {
+                workspace_path: String,
+                name: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            let record = state.project_store.lock().add(&p.workspace_path, &p.name)?;
+            crate::emit_projects_changed(app, &state);
+            serde_json::to_value(record).map_err(|e| e.to_string())
+        }
+
+        "add_project_workbench" => {
+            #[derive(Deserialize)]
+            struct P {
+                parent_project_id: String,
+                workspace_path: String,
+                name: String,
+                kind: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            let record = state
+                .project_store
+                .lock()
+                .add_workbench(&p.parent_project_id, &p.workspace_path, &p.name, &p.kind)?;
+            crate::emit_projects_changed(app, &state);
+            serde_json::to_value(record).map_err(|e| e.to_string())
+        }
+
+        "remove_project" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            state.project_store.lock().remove(&p.id)?;
+            crate::emit_projects_changed(app, &state);
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        "rename_project" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                name: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            state.project_store.lock().rename(&p.id, &p.name)?;
+            crate::emit_projects_changed(app, &state);
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        "update_project_roots" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: String,
+                roots: Vec<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+            state.project_store.lock().update_roots(&p.id, p.roots)?;
+            crate::emit_projects_changed(app, &state);
             Ok(serde_json::json!({"ok": true}))
         }
 

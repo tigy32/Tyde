@@ -158,7 +158,24 @@ pub(crate) async fn route_agent(state: &AppState, agent_id: &str) -> Result<Agen
     }
 }
 
-async fn get_or_create_server_connection(
+pub(crate) async fn get_server_connection_by_id(
+    app: &AppHandle,
+    state: &AppState,
+    host_id: &str,
+) -> Result<Arc<TydeServerConnection>, String> {
+    if host_id == "local" {
+        return Err("Cannot get server connection for local host".to_string());
+    }
+    let host = state
+        .host_store
+        .lock()
+        .get(host_id)
+        .cloned()
+        .ok_or_else(|| format!("Host ID '{host_id}' not found"))?;
+    get_or_create_server_connection(app, state, &host).await
+}
+
+pub(crate) async fn get_or_create_server_connection(
     app: &AppHandle,
     state: &AppState,
     host: &Host,

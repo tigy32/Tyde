@@ -112,35 +112,29 @@ let nextMockRecordId = 100;
 const mockSessionRecords = new Map<string, MockSessionRecord>();
 const conversationToRecordId = new Map<number, string>();
 
-// Seed store records that match the default backend sessions so they survive
-// the showNonTydeSessions filter (which hides sessions with tydeSessionId===null).
-{
-  const now = Date.now();
-  mockSessionRecords.set('rec-tycode-1', {
-    id: 'rec-tycode-1',
-    backend_session_id: 'tycode-session-1',
-    backend_kind: 'tycode',
-    alias: 'Tycode Session 1',
-    user_alias: null,
-    parent_id: null,
-    workspace_root: '/mock/workspace',
-    created_at_ms: now - 30_000,
-    updated_at_ms: now - 10_000,
-    message_count: 5,
-  });
-  mockSessionRecords.set('rec-codex-1', {
-    id: 'rec-codex-1',
-    backend_session_id: 'codex-session-1',
-    backend_kind: 'codex',
-    alias: 'Codex Session 1',
-    user_alias: null,
-    parent_id: null,
-    workspace_root: '/mock/workspace',
-    created_at_ms: now - 25_000,
-    updated_at_ms: now - 8_000,
-    message_count: 3,
-  });
+// Pre-populate records that match the default admin sessions so the sessions
+// panel (which filters out records without a tydeSessionId) can display them.
+function seedDefaultSessionRecords(): void {
+  const defaults = defaultMockSessionsByBackend();
+  for (const [backendKind, sessions] of Object.entries(defaults)) {
+    for (const session of sessions) {
+      const recordId = `mock-record-${nextMockRecordId++}`;
+      mockSessionRecords.set(recordId, {
+        id: recordId,
+        backend_session_id: session.id,
+        backend_kind: backendKind,
+        alias: session.title,
+        user_alias: null,
+        parent_id: null,
+        workspace_root: session.workspace_root,
+        created_at_ms: session.created_at,
+        updated_at_ms: session.last_modified,
+        message_count: session.message_count,
+      });
+    }
+  }
 }
+seedDefaultSessionRecords();
 
 let nextTerminalId = 70_000;
 const terminalWorkspaceById = new Map<number, string>();
@@ -416,8 +410,83 @@ async function runMockResponse(conversationId: number, userMessage: string, turn
   });
 }
 
+interface MockProject {
+  id: string;
+  name: string;
+  workspace_path: string;
+  roots: string[];
+  parent_project_id: string | null;
+  workbench_kind: string | null;
+}
+
+const mockProjects: MockProject[] = [];
+
 export async function invoke(cmd: string, args?: any): Promise<any> {
   switch (cmd) {
+    case "list_projects":
+      return [...mockProjects];
+
+    case "add_project": {
+      const workspacePath = args?.workspace_path || args?.workspacePath;
+      const name = args?.name || "New Project";
+      const project: MockProject = {
+        id: `mock-proj-${Date.now()}`,
+        name,
+        workspace_path: workspacePath,
+        roots: [],
+        parent_project_id: null,
+        workbench_kind: null,
+      };
+      mockProjects.push(project);
+      return project;
+    }
+
+    case "add_project_workbench": {
+      const parentProjectId = args?.parent_project_id || args?.parentProjectId;
+      const workspacePath = args?.workspace_path || args?.workspacePath;
+      const name = args?.name || "New Workbench";
+      const kind = args?.kind || "git-worktree";
+      const project: MockProject = {
+        id: `mock-wb-${Date.now()}`,
+        name,
+        workspace_path: workspacePath,
+        roots: [],
+        parent_project_id: parentProjectId,
+        workbench_kind: kind,
+      };
+      mockProjects.push(project);
+      return project;
+    }
+
+    case "remove_project": {
+      const id = args?.id;
+      const idx = mockProjects.findIndex((p) => p.id === id);
+      if (idx >= 0) {
+        mockProjects.splice(idx, 1);
+      }
+      return null;
+    }
+
+    case "rename_project": {
+      const id = args?.id;
+      const name = args?.name;
+      const project = mockProjects.find((p) => p.id === id);
+      if (project) {
+        project.name = name;
+      }
+      return null;
+    }
+
+    case "update_project_roots": {
+      const id = args?.id;
+      const roots = args?.roots;
+      const project = mockProjects.find((p) => p.id === id);
+      if (project) {
+        project.roots = roots;
+      }
+      return null;
+    }
+
     case 'create_conversation': {
       const id = nextConversationId++;
       const workspaceRoots = Array.isArray(args?.workspaceRoots)
@@ -985,13 +1054,16 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         if (rec) {
           rec.backend_session_id = resumeSessionId;
           rec.updated_at_ms = Date.now();
-          // Absorb metadata from the prior record (if any)
-          for (const [otherId, otherRec] of mockSessionRecords) {
-            if (otherId !== resumeRecordId && otherRec.backend_session_id === resumeSessionId) {
-              rec.alias = otherRec.alias;
-              rec.message_count = otherRec.message_count;
-              rec.created_at_ms = otherRec.created_at_ms;
-              mockSessionRecords.delete(otherId);
+          // If a seed record already owns this backend session, absorb its
+          // data into the new record (which keeps the id that create_conversation
+          // returned) and delete the seed so there's no duplicate.
+          for (const [id, seed] of mockSessionRecords) {
+            if (id !== resumeRecordId && seed.backend_session_id === resumeSessionId
+              && seed.backend_kind === rec.backend_kind) {
+              rec.alias = seed.alias;
+              rec.message_count = seed.message_count;
+              rec.created_at_ms = seed.created_at_ms;
+              mockSessionRecords.delete(id);
               break;
             }
           }

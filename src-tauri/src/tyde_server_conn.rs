@@ -54,6 +54,8 @@ pub struct TydeServerConnection {
     pub remote_conversations: Mutex<Vec<ConversationSnapshot>>,
     /// Server-authoritative session records, synced from handshake.
     pub remote_session_records: Mutex<Vec<crate::session_store::SessionRecord>>,
+    /// Server-authoritative project records, synced from handshake.
+    pub remote_projects: Mutex<Vec<crate::project_store::ProjectRecord>>,
     /// Maps server-side conversation IDs to local conversation IDs.
     server_to_local_conv: Mutex<HashMap<u64, u64>>,
     /// Agent IDs known to be managed by this remote server.
@@ -87,6 +89,7 @@ impl TydeServerConnection {
             tunnel_socket_path: Mutex::new(None),
             remote_conversations: Mutex::new(Vec::new()),
             remote_session_records: Mutex::new(Vec::new()),
+            remote_projects: Mutex::new(Vec::new()),
             server_to_local_conv: Mutex::new(HashMap::new()),
             remote_agent_ids: Mutex::new(std::collections::HashSet::new()),
             agent_to_server_conversation: Mutex::new(HashMap::new()),
@@ -153,11 +156,20 @@ impl TydeServerConnection {
         }
     }
 
-    fn normalize_workspace_roots(&self, roots: &[String]) -> Vec<String> {
+    pub fn normalize_workspace_roots(&self, roots: &[String]) -> Vec<String> {
         roots
             .iter()
             .map(|root| self.normalize_workspace_root(root))
             .collect()
+    }
+
+    pub fn normalize_project_record(
+        &self,
+        mut record: crate::project_store::ProjectRecord,
+    ) -> crate::project_store::ProjectRecord {
+        record.workspace_path = self.normalize_workspace_root(&record.workspace_path);
+        record.roots = self.normalize_workspace_roots(&record.roots);
+        record
     }
 
     fn normalize_workspace_roots_json_array(
@@ -374,6 +386,21 @@ impl TydeServerConnection {
                             }
                         }
                     }
+                } else if event == "tyde-projects-changed" {
+                    let projects: Vec<crate::project_store::ProjectRecord> =
+                        serde_json::from_value(translated.get("projects").cloned().unwrap_or_default())
+                            .unwrap_or_default();
+                    let normalized: Vec<_> = projects
+                        .into_iter()
+                        .map(|r| self.normalize_project_record(r))
+                        .collect();
+                    let _ = self.app.emit(
+                        "tyde-projects-changed",
+                        serde_json::json!({
+                            "host": self.host_id,
+                            "projects": normalized
+                        }),
+                    );
                 } else {
                     let _ = self.app.emit(&event, &translated);
                 }
@@ -447,6 +474,19 @@ impl TydeServerConnection {
             .await
             .iter()
             .any(|r| r.id == id)
+    }
+
+    #[allow(dead_code)]
+    pub async fn fetch_projects(
+        &self,
+    ) -> Result<Vec<crate::project_store::ProjectRecord>, String> {
+        let resp = self
+            .invoke("list_projects", serde_json::json!({}))
+            .await?;
+        let records: Vec<crate::project_store::ProjectRecord> = serde_json::from_value(resp)
+            .map_err(|e| format!("Failed to parse remote projects: {e}"))?;
+        *self.remote_projects.lock().await = records.clone();
+        Ok(records)
     }
 
     pub async fn fetch_remote_agents(
@@ -709,6 +749,7 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
             }
             *this.remote_conversations.lock().await = result.conversations;
             *this.remote_session_records.lock().await = result.session_records;
+            *this.remote_projects.lock().await = result.projects;
         }
         ServerFrame::Error { error, .. } => {
             return Err(format!("Handshake rejected: {error}"));

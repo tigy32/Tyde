@@ -22,6 +22,7 @@ mod kiro;
 mod protocol;
 mod remote;
 mod remote_control;
+mod project_store;
 mod session_store;
 mod steering;
 mod subprocess;
@@ -62,6 +63,7 @@ use crate::remote::{
     connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots, to_remote_uri,
     validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
+use crate::project_store::ProjectStore;
 use crate::session_store::SessionStore;
 use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
@@ -386,6 +388,7 @@ pub(crate) struct AppState {
     agent_runtime: Arc<Mutex<AgentRuntime>>,
     agent_runtime_notify: Arc<Notify>,
     session_store: Arc<SyncMutex<SessionStore>>,
+    project_store: Arc<SyncMutex<ProjectStore>>,
     host_store: SyncMutex<host::HostStore>,
     conversation_to_session: Arc<SyncMutex<HashMap<u64, String>>>,
     /// Senders for forwarding remote TydeServer chat events through
@@ -1226,6 +1229,40 @@ pub(crate) async fn create_workbench_internal(
 ) -> Result<String, String> {
     let worktree_path = format!("{parent_workspace_path}--{branch}");
     git_service::git_worktree_add(&parent_workspace_path, &worktree_path, &branch).await?;
+
+    // Register the new workbench in the project store.
+    // If the parent workspace isn't tracked yet, add it first.
+    let state = app.state::<AppState>();
+    let mut store = state.project_store.lock();
+    let parent_id = match store
+        .get_by_workspace_path(&parent_workspace_path)
+        .map(|r| r.id.clone())
+    {
+        Some(id) => id,
+        None => {
+            let parent_name = parent_workspace_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&parent_workspace_path);
+            match store.add(&parent_workspace_path, parent_name) {
+                Ok(record) => record.id,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to auto-add parent project for workbench: {err}"
+                    );
+                    drop(store);
+                    emit_projects_changed(app, &state);
+                    return Ok(worktree_path);
+                }
+            }
+        }
+    };
+    if let Err(err) = store.add_workbench(&parent_id, &worktree_path, &branch, "git-worktree") {
+        tracing::warn!("Failed to register workbench in project store: {err}");
+    }
+    drop(store);
+    emit_projects_changed(app, &state);
+
     app.emit(
         "tyde-create-workbench",
         &CreateWorkbenchEventPayload {
@@ -1242,6 +1279,20 @@ pub(crate) async fn delete_workbench_internal(
     app: &tauri::AppHandle,
     workspace_path: String,
 ) -> Result<(), String> {
+    // Remove the workbench from the project store
+    let state = app.state::<AppState>();
+    let mut store = state.project_store.lock();
+    let project_id = store
+        .get_by_workspace_path(&workspace_path)
+        .map(|r| r.id.clone());
+    if let Some(project_id) = project_id {
+        if let Err(err) = store.remove(&project_id) {
+            tracing::warn!("Failed to remove workbench from project store: {err}");
+        }
+    }
+    drop(store);
+    emit_projects_changed(app, &state);
+
     app.emit(
         "tyde-delete-workbench",
         &DeleteWorkbenchEventPayload { workspace_path },
@@ -4377,6 +4428,173 @@ async fn delete_session_record(
     state.session_store.lock().delete(&id)
 }
 
+// ---------------------------------------------------------------------------
+// Project store commands
+// ---------------------------------------------------------------------------
+
+pub(crate) fn emit_projects_changed(app: &tauri::AppHandle, state: &AppState) {
+    let projects = match state.project_store.lock().list() {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!("Failed to read project store for change event: {err}");
+            return;
+        }
+    };
+    let payload = serde_json::json!({ "projects": projects });
+    let _ = app.emit("tyde-projects-changed", &payload);
+    // Also push through the remote control broadcast channel so remote clients
+    // receive the update.
+    if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+        let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+            event: "tyde-projects-changed".into(),
+            seq: None,
+            payload,
+        });
+    }
+}
+
+#[tauri::command]
+async fn list_projects(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host: Option<String>,
+) -> Result<Vec<project_store::ProjectRecord>, String> {
+    if let Some(host_id) = host {
+        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        let records = conn.fetch_projects().await?;
+        Ok(records
+            .into_iter()
+            .map(|r| conn.normalize_project_record(r))
+            .collect())
+    } else {
+        state.project_store.lock().list()
+    }
+}
+
+#[tauri::command]
+async fn add_project(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host: Option<String>,
+    workspace_path: String,
+    name: String,
+) -> Result<project_store::ProjectRecord, String> {
+    if let Some(host_id) = host {
+        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        let resp = conn
+            .invoke(
+                "add_project",
+                serde_json::json!({ "workspace_path": workspace_path, "name": name }),
+            )
+            .await?;
+        let record: project_store::ProjectRecord = serde_json::from_value(resp)
+            .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
+        Ok(conn.normalize_project_record(record))
+    } else {
+        let record = state.project_store.lock().add(&workspace_path, &name)?;
+        emit_projects_changed(&app, &state);
+        Ok(record)
+    }
+}
+
+#[tauri::command]
+async fn add_project_workbench(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host: Option<String>,
+    parent_project_id: String,
+    workspace_path: String,
+    name: String,
+    kind: String,
+) -> Result<project_store::ProjectRecord, String> {
+    if let Some(host_id) = host {
+        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        let resp = conn
+            .invoke(
+                "add_project_workbench",
+                serde_json::json!({
+                    "parent_project_id": parent_project_id,
+                    "workspace_path": workspace_path,
+                    "name": name,
+                    "kind": kind
+                }),
+            )
+            .await?;
+        let record: project_store::ProjectRecord = serde_json::from_value(resp)
+            .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
+        Ok(conn.normalize_project_record(record))
+    } else {
+        let record = state
+            .project_store
+            .lock()
+            .add_workbench(&parent_project_id, &workspace_path, &name, &kind)?;
+        emit_projects_changed(&app, &state);
+        Ok(record)
+    }
+}
+
+#[tauri::command]
+async fn remove_project(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host: Option<String>,
+    id: String,
+) -> Result<(), String> {
+    if let Some(host_id) = host {
+        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        conn.invoke("remove_project", serde_json::json!({ "id": id }))
+            .await?;
+        Ok(())
+    } else {
+        state.project_store.lock().remove(&id)?;
+        emit_projects_changed(&app, &state);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn rename_project(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host: Option<String>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    if let Some(host_id) = host {
+        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        conn.invoke("rename_project", serde_json::json!({ "id": id, "name": name }))
+            .await?;
+        Ok(())
+    } else {
+        state.project_store.lock().rename(&id, &name)?;
+        emit_projects_changed(&app, &state);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn update_project_roots(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host: Option<String>,
+    id: String,
+    roots: Vec<String>,
+) -> Result<(), String> {
+    if let Some(host_id) = host {
+        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        conn.invoke(
+            "update_project_roots",
+            serde_json::json!({ "id": id, "roots": host_router::strip_ssh_roots(&roots) }),
+        )
+        .await?;
+        Ok(())
+    } else {
+        state.project_store.lock().update_roots(&id, roots)?;
+        emit_projects_changed(&app, &state);
+        Ok(())
+    }
+}
+
 #[tauri::command]
 async fn discover_git_repos(workspace_dir: String) -> Result<Vec<String>, String> {
     if parse_remote_path(&workspace_dir).is_some() {
@@ -5120,6 +5338,12 @@ pub fn run_with_options(headless: bool) {
                     .unwrap_or_else(|_| PathBuf::from("session-store.json"));
                 SessionStore::load(path).expect("failed to load session store")
             })),
+            project_store: Arc::new(SyncMutex::new({
+                let path = resolve_tyde_app_settings_path()
+                    .map(|p| p.parent().unwrap().join("projects.json"))
+                    .unwrap_or_else(|_| PathBuf::from("projects.json"));
+                ProjectStore::load(path).expect("failed to load project store")
+            })),
             host_store: SyncMutex::new({
                 let path = resolve_tyde_app_settings_path()
                     .map(|p| p.parent().unwrap().join("hosts.json"))
@@ -5269,6 +5493,12 @@ pub fn run_with_options(headless: bool) {
             admin_get_module_schemas,
             admin_delete_session,
             delete_session_record,
+            list_projects,
+            add_project,
+            add_project_workbench,
+            remove_project,
+            rename_project,
+            update_project_roots,
             discover_git_repos,
             git_current_branch,
             git_status,

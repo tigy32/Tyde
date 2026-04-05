@@ -281,7 +281,7 @@ export class ProjectSidebar {
       if (name === null) return;
       const trimmed = name.trim();
       if (!trimmed) return;
-      this.stateManager.renameProject(project.id, trimmed);
+      void this.stateManager.renameProject(project.id, trimmed);
     });
 
     const newWorkbenchItem = document.createElement("div");
@@ -350,7 +350,7 @@ export class ProjectSidebar {
       if (name === null) return;
       const trimmed = name.trim();
       if (!trimmed) return;
-      this.stateManager.renameProject(project.id, trimmed);
+      void this.stateManager.renameProject(project.id, trimmed);
     });
 
     const removeItem = document.createElement("div");
