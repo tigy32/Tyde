@@ -1133,7 +1133,11 @@ export class WorkspaceView {
 
   focusFindInActiveFileViewer(): boolean {
     const active = this.tabManager.getActiveTab();
-    if (!active || active.kind !== "file" || active.fileView !== "file")
+    if (
+      !active ||
+      active.kind !== "file" ||
+      (active.fileView !== "file" && active.fileView !== "diff")
+    )
       return false;
     this.layout.switchTab("diff");
     return this.diffPanel.focusFind();

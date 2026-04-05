@@ -325,7 +325,7 @@ export class DiffPanel {
 
   focusFind(): boolean {
     const tab = this.getActiveTab();
-    if (!tab || tab.type !== "file") return false;
+    if (!tab) return false;
 
     this.fileSearchOpen = true;
     this.pendingFindFocus = true;
@@ -834,6 +834,21 @@ export class DiffPanel {
     return tab.cachedLines;
   }
 
+  private getDiffSearchableLines(tab: DiffTab): string[] {
+    const parsed = this.getRenderedDiff(tab);
+    const lines: string[] = [];
+    for (const line of parsed.lines) {
+      if (line.type === "file-header") continue;
+      lines.push(line.text);
+    }
+    return lines;
+  }
+
+  private getSearchableLines(tab: DiffTab): string[] {
+    if (tab.type === "diff") return this.getDiffSearchableLines(tab);
+    return this.getFileLines(tab);
+  }
+
   private invalidateFileCaches(tab: DiffTab): void {
     tab.cachedLines = undefined;
     tab.highlightCache = undefined;
@@ -984,6 +999,28 @@ export class DiffPanel {
       controls.appendChild(nextBtn);
     }
 
+    const searchBtn = document.createElement("button");
+    searchBtn.type = "button";
+    searchBtn.className = "diff-panel-icon-btn";
+    if (this.fileSearchOpen) searchBtn.classList.add("active");
+    searchBtn.title = "Find in diff (Ctrl/Cmd+F)";
+    searchBtn.setAttribute("aria-label", "Find in diff");
+    searchBtn.textContent = "⌕";
+    searchBtn.addEventListener("click", () => {
+      this.fileSearchOpen = true;
+      this.pendingFindFocus = true;
+      this.pendingFindSelectAll = true;
+      this.renderPreservingScroll();
+    });
+    controls.appendChild(searchBtn);
+
+    if (this.fileSearchOpen) {
+      this.updateFileSearchResults(this.getDiffSearchableLines(tab));
+    }
+
+    const searchBar = this.renderSearchBar();
+    if (searchBar) controls.appendChild(searchBar);
+
     header.appendChild(controls);
     return header;
   }
@@ -1050,125 +1087,8 @@ export class DiffPanel {
       controls.appendChild(goWrap);
     }
 
-    if (this.fileSearchOpen) {
-      const findWrap = document.createElement("div");
-      findWrap.className = "diff-panel-find-wrap";
-
-      const input = document.createElement("input");
-      input.type = "text";
-      input.className = "diff-panel-find-input";
-      input.placeholder = "Find in file";
-      input.value = this.fileSearchQuery;
-      input.setAttribute("aria-label", "Find in file");
-      input.addEventListener("input", () =>
-        this.updateFileSearchQuery(input.value),
-      );
-      input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") {
-          e.preventDefault();
-          this.navigateFileSearch(e.shiftKey ? -1 : 1);
-          return;
-        }
-        if (e.key === "Escape") {
-          e.preventDefault();
-          this.closeFileSearch();
-        }
-      });
-      findWrap.appendChild(input);
-
-      const caseBtn = document.createElement("button");
-      caseBtn.type = "button";
-      caseBtn.className = "diff-panel-find-toggle-btn";
-      if (this.fileSearchCaseSensitive) caseBtn.classList.add("active");
-      caseBtn.title = "Match case";
-      caseBtn.setAttribute("aria-label", "Match case");
-      caseBtn.textContent = "Aa";
-      caseBtn.addEventListener("click", () =>
-        this.toggleFileSearchOption("case"),
-      );
-      findWrap.appendChild(caseBtn);
-
-      const wholeBtn = document.createElement("button");
-      wholeBtn.type = "button";
-      wholeBtn.className = "diff-panel-find-toggle-btn";
-      if (this.fileSearchWholeWord) wholeBtn.classList.add("active");
-      wholeBtn.title = "Whole word";
-      wholeBtn.setAttribute("aria-label", "Whole word");
-      wholeBtn.textContent = "W";
-      wholeBtn.addEventListener("click", () =>
-        this.toggleFileSearchOption("whole"),
-      );
-      findWrap.appendChild(wholeBtn);
-
-      const regexBtn = document.createElement("button");
-      regexBtn.type = "button";
-      regexBtn.className = "diff-panel-find-toggle-btn";
-      if (this.fileSearchRegex) regexBtn.classList.add("active");
-      regexBtn.title = "Regex";
-      regexBtn.setAttribute("aria-label", "Regex");
-      regexBtn.textContent = ".*";
-      regexBtn.addEventListener("click", () =>
-        this.toggleFileSearchOption("regex"),
-      );
-      findWrap.appendChild(regexBtn);
-
-      const count = document.createElement("span");
-      count.className = "diff-panel-find-count";
-      if (this.fileSearchError) {
-        count.classList.add("diff-panel-find-count-error");
-        count.title = this.fileSearchError;
-        count.textContent = "ERR";
-      } else if (
-        this.fileSearchMatchLineIndexes.length > 0 &&
-        this.fileSearchActiveIndex >= 0
-      ) {
-        count.textContent = `${this.fileSearchActiveIndex + 1}/${this.fileSearchMatchLineIndexes.length}`;
-      } else if (this.fileSearchQuery.trim()) {
-        count.textContent = "0/0";
-      } else {
-        count.textContent = "";
-      }
-      findWrap.appendChild(count);
-
-      const prevBtn = document.createElement("button");
-      prevBtn.type = "button";
-      prevBtn.className = "diff-panel-nav-btn";
-      prevBtn.title = "Previous match";
-      prevBtn.setAttribute("aria-label", "Previous match");
-      prevBtn.textContent = "↑";
-      prevBtn.addEventListener("click", () => this.navigateFileSearch(-1));
-      if (
-        this.fileSearchMatchLineIndexes.length === 0 ||
-        this.fileSearchError !== null
-      )
-        prevBtn.disabled = true;
-      findWrap.appendChild(prevBtn);
-
-      const nextBtn = document.createElement("button");
-      nextBtn.type = "button";
-      nextBtn.className = "diff-panel-nav-btn";
-      nextBtn.title = "Next match";
-      nextBtn.setAttribute("aria-label", "Next match");
-      nextBtn.textContent = "↓";
-      nextBtn.addEventListener("click", () => this.navigateFileSearch(1));
-      if (
-        this.fileSearchMatchLineIndexes.length === 0 ||
-        this.fileSearchError !== null
-      )
-        nextBtn.disabled = true;
-      findWrap.appendChild(nextBtn);
-
-      const closeBtn = document.createElement("button");
-      closeBtn.type = "button";
-      closeBtn.className = "diff-panel-icon-btn";
-      closeBtn.title = "Close find";
-      closeBtn.setAttribute("aria-label", "Close find");
-      closeBtn.textContent = "×";
-      closeBtn.addEventListener("click", () => this.closeFileSearch());
-      findWrap.appendChild(closeBtn);
-
-      controls.appendChild(findWrap);
-    }
+    const searchBar = this.renderSearchBar();
+    if (searchBar) controls.appendChild(searchBar);
 
     const actions = document.createElement("div");
     actions.className = "diff-panel-file-actions";
@@ -1238,6 +1158,128 @@ export class DiffPanel {
     return controls;
   }
 
+  private renderSearchBar(): HTMLElement | null {
+    if (!this.fileSearchOpen) return null;
+
+    const findWrap = document.createElement("div");
+    findWrap.className = "diff-panel-find-wrap";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "diff-panel-find-input";
+    input.placeholder = "Find";
+    input.value = this.fileSearchQuery;
+    input.setAttribute("aria-label", "Find");
+    input.addEventListener("input", () =>
+      this.updateFileSearchQuery(input.value),
+    );
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        this.navigateFileSearch(e.shiftKey ? -1 : 1);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeFileSearch();
+      }
+    });
+    findWrap.appendChild(input);
+
+    const caseBtn = document.createElement("button");
+    caseBtn.type = "button";
+    caseBtn.className = "diff-panel-find-toggle-btn";
+    if (this.fileSearchCaseSensitive) caseBtn.classList.add("active");
+    caseBtn.title = "Match case";
+    caseBtn.setAttribute("aria-label", "Match case");
+    caseBtn.textContent = "Aa";
+    caseBtn.addEventListener("click", () =>
+      this.toggleFileSearchOption("case"),
+    );
+    findWrap.appendChild(caseBtn);
+
+    const wholeBtn = document.createElement("button");
+    wholeBtn.type = "button";
+    wholeBtn.className = "diff-panel-find-toggle-btn";
+    if (this.fileSearchWholeWord) wholeBtn.classList.add("active");
+    wholeBtn.title = "Whole word";
+    wholeBtn.setAttribute("aria-label", "Whole word");
+    wholeBtn.textContent = "W";
+    wholeBtn.addEventListener("click", () =>
+      this.toggleFileSearchOption("whole"),
+    );
+    findWrap.appendChild(wholeBtn);
+
+    const regexBtn = document.createElement("button");
+    regexBtn.type = "button";
+    regexBtn.className = "diff-panel-find-toggle-btn";
+    if (this.fileSearchRegex) regexBtn.classList.add("active");
+    regexBtn.title = "Regex";
+    regexBtn.setAttribute("aria-label", "Regex");
+    regexBtn.textContent = ".*";
+    regexBtn.addEventListener("click", () =>
+      this.toggleFileSearchOption("regex"),
+    );
+    findWrap.appendChild(regexBtn);
+
+    const count = document.createElement("span");
+    count.className = "diff-panel-find-count";
+    if (this.fileSearchError) {
+      count.classList.add("diff-panel-find-count-error");
+      count.title = this.fileSearchError;
+      count.textContent = "ERR";
+    } else if (
+      this.fileSearchMatchLineIndexes.length > 0 &&
+      this.fileSearchActiveIndex >= 0
+    ) {
+      count.textContent = `${this.fileSearchActiveIndex + 1}/${this.fileSearchMatchLineIndexes.length}`;
+    } else if (this.fileSearchQuery.trim()) {
+      count.textContent = "0/0";
+    } else {
+      count.textContent = "";
+    }
+    findWrap.appendChild(count);
+
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "diff-panel-nav-btn";
+    prevBtn.title = "Previous match";
+    prevBtn.setAttribute("aria-label", "Previous match");
+    prevBtn.textContent = "↑";
+    prevBtn.addEventListener("click", () => this.navigateFileSearch(-1));
+    if (
+      this.fileSearchMatchLineIndexes.length === 0 ||
+      this.fileSearchError !== null
+    )
+      prevBtn.disabled = true;
+    findWrap.appendChild(prevBtn);
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "diff-panel-nav-btn";
+    nextBtn.title = "Next match";
+    nextBtn.setAttribute("aria-label", "Next match");
+    nextBtn.textContent = "↓";
+    nextBtn.addEventListener("click", () => this.navigateFileSearch(1));
+    if (
+      this.fileSearchMatchLineIndexes.length === 0 ||
+      this.fileSearchError !== null
+    )
+      nextBtn.disabled = true;
+    findWrap.appendChild(nextBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "diff-panel-icon-btn";
+    closeBtn.title = "Close find";
+    closeBtn.setAttribute("aria-label", "Close find");
+    closeBtn.textContent = "×";
+    closeBtn.addEventListener("click", () => this.closeFileSearch());
+    findWrap.appendChild(closeBtn);
+
+    return findWrap;
+  }
+
   private scrollToFileLine(
     lineIndex: number,
     behavior: "auto" | "smooth",
@@ -1253,23 +1295,16 @@ export class DiffPanel {
       return;
     }
 
-    const lineEl = this.container.querySelector<HTMLElement>(
-      `.diff-panel-file-line[data-line-index="${lineIndex}"]`,
-    );
+    const tab = this.getActiveTab();
+    const selector =
+      tab?.type === "diff"
+        ? `[data-search-line-index="${lineIndex}"]`
+        : `.diff-panel-file-line[data-line-index="${lineIndex}"]`;
+    const lineEl = this.container.querySelector<HTMLElement>(selector);
     lineEl?.scrollIntoView({ behavior, block: "center" });
   }
 
-  private applyPostRenderActions(tab: DiffTab): void {
-    if (tab.type !== "file") {
-      this.pendingFindFocus = false;
-      this.pendingFindSelectAll = false;
-      this.pendingGoToLineFocus = false;
-      this.pendingGoToLineSelectAll = false;
-      this.pendingGoToLineTarget = null;
-      this.pendingScrollToSearchMatch = false;
-      return;
-    }
-
+  private applyPostRenderActions(_tab: DiffTab): void {
     if (this.pendingGoToLineFocus) {
       const goInput = this.container.querySelector<HTMLInputElement>(
         ".diff-panel-goto-input",
@@ -1334,8 +1369,8 @@ export class DiffPanel {
 
   private navigateFileSearch(direction: 1 | -1): void {
     const tab = this.getActiveTab();
-    if (!tab || tab.type !== "file") return;
-    this.updateFileSearchResults(this.getFileLines(tab));
+    if (!tab) return;
+    this.updateFileSearchResults(this.getSearchableLines(tab));
     if (this.fileSearchError) return;
     const matches = this.fileSearchMatchLineIndexes;
     if (matches.length === 0) return;
@@ -1366,14 +1401,14 @@ export class DiffPanel {
     // For virtualized views, scrollToFileLine triggers a forced viewport
     // re-render which applies the class via createFileLineElement.
     if (!this.virtualizedFileView) {
-      const oldActive = this.container.querySelector(
-        ".diff-panel-search-hit-active",
-      );
-      if (oldActive) oldActive.classList.remove("diff-panel-search-hit-active");
-      const newActive = this.container.querySelector(
-        `[data-search-match-index="${this.fileSearchActiveIndex}"]`,
-      );
-      if (newActive) newActive.classList.add("diff-panel-search-hit-active");
+      this.container
+        .querySelectorAll(".diff-panel-search-hit-active")
+        .forEach((el) => el.classList.remove("diff-panel-search-hit-active"));
+      this.container
+        .querySelectorAll(
+          `[data-search-match-index="${this.fileSearchActiveIndex}"]`,
+        )
+        .forEach((el) => el.classList.add("diff-panel-search-hit-active"));
     }
 
     this.scrollToFileLine(lineIndex, "smooth");
@@ -1751,6 +1786,28 @@ export class DiffPanel {
     return this.renderUnified(tab);
   }
 
+  private applyDiffLineSearch(
+    lineEl: HTMLElement,
+    searchableLineIndex: number,
+    matchOrderByLine: Map<number, number>,
+  ): void {
+    lineEl.setAttribute("data-search-line-index", String(searchableLineIndex));
+    const matchIndex = matchOrderByLine.get(searchableLineIndex);
+    if (matchIndex === undefined) return;
+    lineEl.classList.add("diff-panel-search-hit");
+    lineEl.setAttribute("data-search-match-index", String(matchIndex));
+    if (matchIndex === this.fileSearchActiveIndex) {
+      lineEl.classList.add("diff-panel-search-hit-active");
+    }
+    const ranges = this.fileSearchMatchRangesByLine.get(searchableLineIndex);
+    if (ranges && ranges.length > 0) {
+      const textSpan = lineEl.querySelector<HTMLElement>(
+        ".diff-panel-line-text",
+      );
+      if (textSpan) this.applyInlineSearchHighlights(textSpan, ranges);
+    }
+  }
+
   private renderHunkHeaderLine(
     tab: DiffTab,
     hunkIdx: number,
@@ -1764,7 +1821,10 @@ export class DiffPanel {
     }
 
     if (!this.canExpandInlineHunkContext(tab)) {
-      lineEl.textContent = text;
+      const textSpan = document.createElement("span");
+      textSpan.className = "diff-panel-line-text";
+      textSpan.textContent = text;
+      lineEl.appendChild(textSpan);
       return lineEl;
     }
 
@@ -1788,7 +1848,7 @@ export class DiffPanel {
     lineEl.appendChild(expandBtn);
 
     const label = document.createElement("span");
-    label.className = "diff-panel-hunk-header-label";
+    label.className = "diff-panel-hunk-header-label diff-panel-line-text";
     label.textContent = text;
     lineEl.appendChild(label);
     return lineEl;
@@ -1804,22 +1864,31 @@ export class DiffPanel {
     const parsed = this.getRenderedDiff(tab);
     const lang = detectLanguage(tab.filePath);
 
+    const matchOrderByLine = new Map<number, number>();
+    this.fileSearchMatchLineIndexes.forEach((lineIdx, order) => {
+      matchOrderByLine.set(lineIdx, order);
+    });
+
     let hunkIdx = -1;
     let fallbackLineIndex = 0;
+    let searchableLineIndex = 0;
 
     for (const line of parsed.lines) {
       if (line.type === "file-header") {
         continue;
       }
 
-      const lineEl = document.createElement("div");
-      lineEl.className = "diff-panel-line";
-
       if (line.type === "hunk-header") {
         hunkIdx++;
-        wrapper.appendChild(this.renderHunkHeaderLine(tab, hunkIdx, line.text));
+        const hunkEl = this.renderHunkHeaderLine(tab, hunkIdx, line.text);
+        this.applyDiffLineSearch(hunkEl, searchableLineIndex, matchOrderByLine);
+        searchableLineIndex++;
+        wrapper.appendChild(hunkEl);
         continue;
       }
+
+      const lineEl = document.createElement("div");
+      lineEl.className = "diff-panel-line";
 
       const oldNum = document.createElement("span");
       oldNum.className = "diff-panel-linenum";
@@ -1862,6 +1931,8 @@ export class DiffPanel {
       lineEl.appendChild(newNum);
       lineEl.appendChild(marker);
       lineEl.appendChild(textSpan);
+      this.applyDiffLineSearch(lineEl, searchableLineIndex, matchOrderByLine);
+      searchableLineIndex++;
       wrapper.appendChild(lineEl);
     }
 
@@ -1888,20 +1959,35 @@ export class DiffPanel {
     const parsed = this.getRenderedDiff(tab);
     const lang = detectLanguage(tab.filePath);
 
+    const matchOrderByLine = new Map<number, number>();
+    this.fileSearchMatchLineIndexes.forEach((lineIdx, order) => {
+      matchOrderByLine.set(lineIdx, order);
+    });
+
     let hunkIdx = -1;
     let fallbackLineIndex = 0;
+    let searchableLineIndex = 0;
 
     for (const line of parsed.lines) {
       if (line.type === "file-header") continue;
 
       if (line.type === "hunk-header") {
         hunkIdx++;
-        leftWrapper.appendChild(
-          this.renderHunkHeaderLine(tab, hunkIdx, line.text),
+        const leftHunk = this.renderHunkHeaderLine(tab, hunkIdx, line.text);
+        const rightHunk = this.renderHunkHeaderLine(tab, hunkIdx, line.text);
+        this.applyDiffLineSearch(
+          leftHunk,
+          searchableLineIndex,
+          matchOrderByLine,
         );
-        rightWrapper.appendChild(
-          this.renderHunkHeaderLine(tab, hunkIdx, line.text),
+        this.applyDiffLineSearch(
+          rightHunk,
+          searchableLineIndex,
+          matchOrderByLine,
         );
+        searchableLineIndex++;
+        leftWrapper.appendChild(leftHunk);
+        rightWrapper.appendChild(rightHunk);
         continue;
       }
 
@@ -1912,27 +1998,58 @@ export class DiffPanel {
       fallbackLineIndex += 1;
 
       if (line.type === "removed") {
-        leftWrapper.appendChild(
-          this.buildSbsLine(line, lang, "removed", "left", feedbackLineIndex),
+        const leftEl = this.buildSbsLine(
+          line,
+          lang,
+          "removed",
+          "left",
+          feedbackLineIndex,
         );
+        this.applyDiffLineSearch(leftEl, searchableLineIndex, matchOrderByLine);
+        leftWrapper.appendChild(leftEl);
         rightWrapper.appendChild(this.buildSbsEmptyLine());
+        searchableLineIndex++;
         continue;
       }
 
       if (line.type === "added") {
-        leftWrapper.appendChild(this.buildSbsEmptyLine());
-        rightWrapper.appendChild(
-          this.buildSbsLine(line, lang, "added", "right", feedbackLineIndex),
+        const rightEl = this.buildSbsLine(
+          line,
+          lang,
+          "added",
+          "right",
+          feedbackLineIndex,
         );
+        this.applyDiffLineSearch(
+          rightEl,
+          searchableLineIndex,
+          matchOrderByLine,
+        );
+        leftWrapper.appendChild(this.buildSbsEmptyLine());
+        rightWrapper.appendChild(rightEl);
+        searchableLineIndex++;
         continue;
       }
 
-      leftWrapper.appendChild(
-        this.buildSbsLine(line, lang, "context", "left", feedbackLineIndex),
+      const leftEl = this.buildSbsLine(
+        line,
+        lang,
+        "context",
+        "left",
+        feedbackLineIndex,
       );
-      rightWrapper.appendChild(
-        this.buildSbsLine(line, lang, "context", "right", feedbackLineIndex),
+      const rightEl = this.buildSbsLine(
+        line,
+        lang,
+        "context",
+        "right",
+        feedbackLineIndex,
       );
+      this.applyDiffLineSearch(leftEl, searchableLineIndex, matchOrderByLine);
+      this.applyDiffLineSearch(rightEl, searchableLineIndex, matchOrderByLine);
+      searchableLineIndex++;
+      leftWrapper.appendChild(leftEl);
+      rightWrapper.appendChild(rightEl);
     }
 
     leftPane.appendChild(leftWrapper);
