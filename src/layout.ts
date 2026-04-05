@@ -1149,15 +1149,15 @@ export class Layout {
     const full = this.state.fullScreenChat;
     const home = this.homeMode;
 
-    const leftHidden = full || home || !this.state.leftVisible;
+    const leftHidden = full || !this.state.leftVisible;
     this.leftZone.el.classList.toggle("dock-zone-hidden", leftHidden);
     this.leftHandle.classList.toggle("dock-zone-hidden", leftHidden);
 
-    const rightHidden = full || home || !this.state.rightVisible;
+    const rightHidden = full || !this.state.rightVisible;
     this.rightZone.el.classList.toggle("dock-zone-hidden", rightHidden);
     this.rightHandle.classList.toggle("dock-zone-hidden", rightHidden);
 
-    const bottomHidden = full || home || !this.state.bottomVisible;
+    const bottomHidden = full || !this.state.bottomVisible;
     this.bottomZone.el.classList.toggle("dock-zone-hidden", bottomHidden);
     this.bottomHandle.classList.toggle("dock-zone-hidden", bottomHidden);
     this.bottomZone.el.classList.remove("dock-zone-collapsed");

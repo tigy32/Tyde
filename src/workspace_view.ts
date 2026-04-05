@@ -168,6 +168,7 @@ export class WorkspaceView {
   private hostSettingsReady: Promise<void> = Promise.resolve();
   onConversationIdsChange: ((conversationIds: number[]) => void) | null = null;
   onAgentsChange: ((agents: AgentInfo[]) => void) | null = null;
+  onRequestHome: (() => void) | null = null;
   onRuntimeAgentAction:
     | ((agent: AgentInfo, action: AgentCardAction) => void)
     | null = null;
@@ -811,6 +812,7 @@ export class WorkspaceView {
     }
     this.workflowBuilder.destroy();
     this.terminalService.destroy();
+    this.diffPanel.dispose();
     for (const cleanup of this.uiCleanupFns) {
       cleanup();
     }
@@ -1037,8 +1039,7 @@ export class WorkspaceView {
       this.layout.setHomeMode(true);
       return;
     }
-    this.layout.switchTab("chat");
-    this.chatPanel.showWelcome();
+    this.onRequestHome?.();
   }
 
   focusConversation(conversationId: number, title?: string): boolean {

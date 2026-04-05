@@ -37,6 +37,7 @@ import {
 import { CommandPalette } from "./command_palette";
 import { ConnectionDialog } from "./connection_dialog";
 import { registerDebugUiBridge } from "./debug_ui_bridge";
+import { initDiffSettings } from "./diff_settings";
 import { showFeedbackDialog } from "./feedback_dialog";
 import { HomeView } from "./home_view";
 import {
@@ -95,6 +96,7 @@ export class AppController {
   private settingsHostSyncSeq = 0;
 
   constructor() {
+    initDiffSettings();
     this.initializeTheme();
     this.buildSharedComponents();
   }
@@ -588,6 +590,7 @@ export class AppController {
     view.onRuntimeAgentAction = (agent, action) => {
       void this.handleRuntimeAgentAction(agent, action);
     };
+    view.onRequestHome = () => this.switchToHome();
     view.onWorkflowsChanged = () => {
       this.registerWorkflowCommands(view);
     };
@@ -823,6 +826,7 @@ export class AppController {
   }
 
   private switchToHome(): void {
+    if (this.activeWorkspaceId === HOME_BRIDGE_VIEW_ID) return;
     if (this.activeWorkspaceId) {
       const current = this.workspaceViews.get(this.activeWorkspaceId);
       current?.hide();

@@ -14,14 +14,20 @@ const DEFAULT_CONTEXT_MODE: DiffContextMode = "hunks";
 
 const diffSettingsUpdateCallbacks = new Set<(settings: DiffSettings) => void>();
 
-export function getDiffSettings(): DiffSettings {
-  const viewMode = (localStorage.getItem(VIEW_MODE_KEY) as DiffViewMode) || DEFAULT_VIEW_MODE;
-  const contextMode = (localStorage.getItem(CONTEXT_MODE_KEY) as DiffContextMode) || DEFAULT_CONTEXT_MODE;
+export function initDiffSettings(): void {
+  if (localStorage.getItem(VIEW_MODE_KEY) === null) {
+    localStorage.setItem(VIEW_MODE_KEY, DEFAULT_VIEW_MODE);
+  }
+  if (localStorage.getItem(CONTEXT_MODE_KEY) === null) {
+    localStorage.setItem(CONTEXT_MODE_KEY, DEFAULT_CONTEXT_MODE);
+  }
+}
 
-  return {
-    viewMode: viewMode === "unified" || viewMode === "side-by-side" ? viewMode : DEFAULT_VIEW_MODE,
-    contextMode: contextMode === "hunks" || contextMode === "full" ? contextMode : DEFAULT_CONTEXT_MODE,
-  };
+export function getDiffSettings(): DiffSettings {
+  const viewMode = localStorage.getItem(VIEW_MODE_KEY) as DiffViewMode;
+  const contextMode = localStorage.getItem(CONTEXT_MODE_KEY) as DiffContextMode;
+
+  return { viewMode, contextMode };
 }
 
 export function setDiffSettings(settings: Partial<DiffSettings>): void {
@@ -41,7 +47,9 @@ export function broadcastDiffSettings(): void {
   }
 }
 
-export function onDiffSettingsChange(cb: (settings: DiffSettings) => void): () => void {
+export function onDiffSettingsChange(
+  cb: (settings: DiffSettings) => void,
+): () => void {
   diffSettingsUpdateCallbacks.add(cb);
   return () => {
     diffSettingsUpdateCallbacks.delete(cb);

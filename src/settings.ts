@@ -39,6 +39,8 @@ import {
   type ToolOutputMode,
 } from "./chat/tools";
 import {
+  type DiffContextMode,
+  type DiffViewMode,
   getDiffSettings,
   onDiffSettingsChange,
   setDiffSettings,
@@ -502,6 +504,7 @@ export class SettingsPanel {
   private agentDefinitionStore: AgentDefinitionStore | null = null;
   private agentDefinitionUnavailableReason: string | null = null;
   private _adminId: number | null = null;
+  private unsubDiffSettings: (() => void) | null = null;
 
   get adminId(): number | null {
     return this._adminId;
@@ -1365,7 +1368,7 @@ export class SettingsPanel {
         label,
       );
       btn.addEventListener("click", () => {
-        setDiffSettings({ viewMode: v as any });
+        setDiffSettings({ viewMode: v as DiffViewMode });
         this.setActiveSegment(layoutControl, v);
       });
       layoutControl.appendChild(btn);
@@ -1410,7 +1413,7 @@ export class SettingsPanel {
         label,
       );
       btn.addEventListener("click", () => {
-        setDiffSettings({ contextMode: v as any });
+        setDiffSettings({ contextMode: v as DiffContextMode });
         this.setActiveSegment(contextControl, v);
       });
       contextControl.appendChild(btn);
@@ -1418,7 +1421,8 @@ export class SettingsPanel {
     contextField.appendChild(contextControl);
     diffSection.appendChild(contextField);
 
-    onDiffSettingsChange((settings) => {
+    this.unsubDiffSettings?.();
+    this.unsubDiffSettings = onDiffSettingsChange((settings) => {
       this.setActiveSegment(layoutControl, settings.viewMode);
       this.setActiveSegment(contextControl, settings.contextMode);
     });

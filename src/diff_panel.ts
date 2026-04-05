@@ -300,6 +300,7 @@ export class DiffPanel {
   private fileWordWrap = false;
   private nativeSelectionTimerId: number | null = null;
   private virtualizedFileView: VirtualizedFileViewState | null = null;
+  private unsubDiffSettings: () => void;
 
   onViewDiff: ((filePath: string, diffContent: string) => void) | null = null;
   onFeedbackSubmit:
@@ -323,7 +324,7 @@ export class DiffPanel {
       { signal: this.abortController.signal },
     );
 
-    onDiffSettingsChange((settings) => {
+    this.unsubDiffSettings = onDiffSettingsChange((settings) => {
       let needsRerender = false;
       if (this.viewMode !== settings.viewMode) {
         this.viewMode = settings.viewMode;
@@ -345,6 +346,7 @@ export class DiffPanel {
   }
 
   dispose(): void {
+    this.unsubDiffSettings();
     this.abortController.abort();
   }
 
