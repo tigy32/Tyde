@@ -287,6 +287,42 @@ pub(crate) fn tyde_install_path_from_home(home: &str, version: &str, target: &st
     }
 }
 
+fn parse_numeric_version_parts(version: &str) -> Option<Vec<u64>> {
+    let mut parts = Vec::new();
+    for part in version.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part.parse::<u64>().ok()?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts)
+}
+
+fn compare_numeric_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let mut left_parts = parse_numeric_version_parts(left)?;
+    let mut right_parts = parse_numeric_version_parts(right)?;
+    let width = left_parts.len().max(right_parts.len());
+    left_parts.resize(width, 0);
+    right_parts.resize(width, 0);
+    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
+        let cmp = left_part.cmp(right_part);
+        if cmp != std::cmp::Ordering::Equal {
+            return Some(cmp);
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
+fn is_safe_release_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
 pub(crate) async fn resolve_remote_tyde_install_path(
     host: &str,
     version: &str,
@@ -325,7 +361,10 @@ pub(crate) async fn detect_remote_tyde_target(host: &str) -> Result<String, Stri
 
     match (os, arch) {
         ("Linux", "x86_64") => Ok("x86_64-unknown-linux-gnu".to_string()),
-        ("Linux", "aarch64") => Ok("aarch64-unknown-linux-gnu".to_string()),
+        ("Linux", "aarch64") => Err(
+            "Unsupported remote platform: Linux aarch64 (ARM64 Linux remote installs are not available yet)"
+                .to_string(),
+        ),
         ("Darwin", "x86_64") => Ok("x86_64-apple-darwin".to_string()),
         ("Darwin", "arm64") => Ok("aarch64-apple-darwin".to_string()),
         _ => Err(format!("Unsupported remote platform: {os} {arch}")),
@@ -350,9 +389,11 @@ pub(crate) async fn list_remote_tyde_installed_versions(host: &str) -> Result<Ve
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
-    versions.sort();
+    versions.sort_by(|left, right| match compare_numeric_versions(left, right) {
+        Some(cmp) => cmp.reverse(),
+        None => right.cmp(left),
+    });
     versions.dedup();
-    versions.reverse();
     Ok(versions)
 }
 
@@ -403,23 +444,41 @@ pub(crate) async fn install_remote_tyde_binary(
     version: &str,
 ) -> Result<String, String> {
     let target = detect_remote_tyde_target(host).await?;
+    if !is_safe_release_component(version) {
+        return Err(format!(
+            "Invalid Tyde version for remote install: '{version}'"
+        ));
+    }
+    if !is_safe_release_component(&target) {
+        return Err(format!(
+            "Invalid remote target for install command: '{target}'"
+        ));
+    }
     let archive = format!("{TYDE_BINARY_NAME}-{target}.tar.xz");
     let url = format!(
         "{repo}/releases/download/v{version}/{archive}",
         repo = TYDE_GIT_REPO
     );
+    let quoted_url = shell_quote_arg(&url);
+    let quoted_version = shell_quote_arg(version);
+    let quoted_target = shell_quote_arg(&target);
 
     let cmd = format!(
-        "TMP=$(mktemp -d) && \
-         curl -sSfL \"{url}\" | tar -xJ -C \"$TMP\" && \
+        "VERSION={version} && \
+         TARGET={target} && \
+         TMP=$(mktemp -d) && \
+         curl -sSfL {url} | tar -xJ -C \"$TMP\" && \
          BIN=$(find \"$TMP\" -type f -name \"{bin}\" | head -n 1) && \
          test -n \"$BIN\" && \
-         INSTALL_DIR=\"$HOME/{installs}/v{version}/{target}\" && \
+         INSTALL_DIR=\"$HOME/{installs}/v$VERSION/$TARGET\" && \
          mkdir -p \"$INSTALL_DIR\" && \
          mv \"$BIN\" \"$INSTALL_DIR/{bin}\" && \
          chmod +x \"$INSTALL_DIR/{bin}\" && \
          rm -rf \"$TMP\" && \
          printf '%s' \"$INSTALL_DIR/{bin}\"",
+        version = quoted_version,
+        target = quoted_target,
+        url = quoted_url,
         bin = TYDE_BINARY_NAME,
         installs = TYDE_REMOTE_INSTALLS_SUFFIX,
     );
@@ -456,6 +515,16 @@ pub(crate) async fn launch_remote_tyde_headless(
              if [ -S \"$SOCKET\" ]; then \
                printf '%s' \"already-running\"; \
                exit 0; \
+             fi; \
+             kill \"$PID\" 2>/dev/null || true; \
+             i=0; \
+             while [ \"$i\" -lt 50 ]; do \
+               if ! kill -0 \"$PID\" 2>/dev/null; then break; fi; \
+               sleep 0.1; \
+               i=$((i+1)); \
+             done; \
+             if kill -0 \"$PID\" 2>/dev/null; then \
+               kill -9 \"$PID\" 2>/dev/null || true; \
              fi; \
            fi; \
            rm -f \"$PIDFILE\"; \
@@ -522,10 +591,6 @@ pub(crate) async fn stop_remote_tyde_headless(host: &str) -> Result<(), String> 
            fi; \
            rm -f \"$PIDFILE\"; \
          fi && \
-         if command -v pgrep >/dev/null 2>&1; then \
-           PIDS=$(pgrep -f 'tyde.*--headless' || true); \
-           if [ -n \"$PIDS\" ]; then kill $PIDS 2>/dev/null || true; fi; \
-         fi && \
          if [ -S \"$SOCKET\" ]; then rm -f \"$SOCKET\" 2>/dev/null || true; fi && \
          printf '%s' \"stopped\"",
         pid = TYDE_REMOTE_HEADLESS_PID_SUFFIX,
@@ -567,7 +632,9 @@ pub(crate) async fn query_remote_tyde_server_version(
         status = shell_quote_arg(&server_status),
         binary = shell_quote_arg(connect_binary),
     );
-    let output = run_ssh_raw(host, &cmd).await?;
+    let output = tokio::time::timeout(Duration::from_secs(15), run_ssh_raw(host, &cmd))
+        .await
+        .map_err(|_| format!("Timed out querying remote server version on '{host}'"))??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Failed to query remote server version: {stderr}"));
@@ -1274,6 +1341,35 @@ mod tests {
     #[test]
     fn quote_empty_string() {
         assert_eq!(shell_quote_arg(""), "''");
+    }
+
+    #[test]
+    fn compare_numeric_versions_handles_semver_ordering() {
+        assert_eq!(
+            compare_numeric_versions("0.10.0", "0.9.0"),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_numeric_versions("1.2", "1.2.0"),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            compare_numeric_versions("1.2.3", "1.2.3.1"),
+            Some(std::cmp::Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn compare_numeric_versions_rejects_non_numeric() {
+        assert_eq!(compare_numeric_versions("1.2.x", "1.2.3"), None);
+    }
+
+    #[test]
+    fn safe_release_component_validation() {
+        assert!(is_safe_release_component("0.7.0"));
+        assert!(is_safe_release_component("x86_64-unknown-linux-gnu"));
+        assert!(!is_safe_release_component("1.0$(rm -rf ~)"));
+        assert!(!is_safe_release_component(""));
     }
 
     // -- Round-trip tests through real shells --

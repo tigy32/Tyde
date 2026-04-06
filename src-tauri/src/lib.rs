@@ -4016,6 +4016,43 @@ fn remote_tyde_state_for_status(status: &RemoteTydeServerStatus) -> RemoteTydeSe
     }
 }
 
+fn parse_numeric_version_parts(version: &str) -> Option<Vec<u64>> {
+    let mut parts = Vec::new();
+    for part in version.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part.parse::<u64>().ok()?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts)
+}
+
+fn should_upgrade_remote_tyde(
+    local_version: &str,
+    remote_version: Option<&str>,
+    installed_client_version: bool,
+) -> bool {
+    if !installed_client_version {
+        return true;
+    }
+    let Some(remote) = remote_version else {
+        return false;
+    };
+    let (Some(mut remote_parts), Some(mut local_parts)) = (
+        parse_numeric_version_parts(remote),
+        parse_numeric_version_parts(local_version),
+    ) else {
+        return remote != local_version;
+    };
+    let width = remote_parts.len().max(local_parts.len());
+    remote_parts.resize(width, 0);
+    local_parts.resize(width, 0);
+    remote_parts < local_parts
+}
+
 async fn collect_remote_tyde_server_status(host: &host::Host) -> RemoteTydeServerStatus {
     let local_version = crate::protocol::TYDE_VERSION.to_string();
 
@@ -4118,11 +4155,11 @@ async fn collect_remote_tyde_server_status(host: &host::Host) -> RemoteTydeServe
         }
     }
 
-    status.needs_upgrade = !status.installed_client_version
-        || status
-            .remote_version
-            .as_ref()
-            .is_some_and(|remote| remote != &status.local_version);
+    status.needs_upgrade = should_upgrade_remote_tyde(
+        &status.local_version,
+        status.remote_version.as_deref(),
+        status.installed_client_version,
+    );
     status.state = remote_tyde_state_for_status(&status);
     status
 }
@@ -6362,6 +6399,24 @@ mod tests {
             path.contains("/usr/bin"),
             "resolved PATH missing /usr/bin: {path}"
         );
+    }
+
+    #[test]
+    fn should_upgrade_remote_tyde_when_not_installed() {
+        assert!(should_upgrade_remote_tyde("0.7.0", None, false));
+    }
+
+    #[test]
+    fn should_upgrade_remote_tyde_only_when_remote_is_older() {
+        assert!(should_upgrade_remote_tyde("0.7.0", Some("0.6.9"), true));
+        assert!(!should_upgrade_remote_tyde("0.7.0", Some("0.7.0"), true));
+        assert!(!should_upgrade_remote_tyde("0.7.0", Some("0.8.0"), true));
+    }
+
+    #[test]
+    fn should_upgrade_remote_tyde_falls_back_for_non_numeric_versions() {
+        assert!(should_upgrade_remote_tyde("0.7.0", Some("dev-build"), true));
+        assert!(!should_upgrade_remote_tyde("0.7.0", Some("0.7.0"), true));
     }
 
     #[test]

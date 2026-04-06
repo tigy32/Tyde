@@ -511,12 +511,10 @@ export class SettingsPanel {
   private remoteTydeServerStatusLoading = false;
   private remoteTydeServerStatusError: string | null = null;
   private remoteTydeServerStatusSeq = 0;
-  private remoteTydeServerActionLoading:
-    | "install"
-    | "launch"
-    | "install_launch"
-    | "upgrade"
-    | null = null;
+  private remoteTydeServerActionLoading: {
+    hostId: string;
+    action: "install" | "launch" | "install_launch" | "upgrade";
+  } | null = null;
   private hosts: Host[] = [];
   private hostsLoading = false;
   private selectedHostId: string | null = loadSelectedHostId();
@@ -783,8 +781,9 @@ export class SettingsPanel {
   ): void {
     const selectedHost = this.getSelectedHost();
     if (!this.hostUsesRemoteTydeServer(selectedHost)) return;
+    const hostId = selectedHost.id;
 
-    this.remoteTydeServerActionLoading = action;
+    this.remoteTydeServerActionLoading = { hostId, action };
     this.remoteTydeServerStatusError = null;
     this.rerenderPanelContent("tyde", () => this.buildTydeContent());
 
@@ -803,14 +802,22 @@ export class SettingsPanel {
 
     run()
       .then((status) => {
+        if (this.getSelectedHost()?.id !== hostId) return;
         this.remoteTydeServerStatus = status;
       })
       .catch((err) => {
+        if (this.getSelectedHost()?.id !== hostId) return;
         const detail = err instanceof Error ? err.message : String(err);
         this.remoteTydeServerStatusError = detail;
       })
       .finally(() => {
-        this.remoteTydeServerActionLoading = null;
+        if (
+          this.remoteTydeServerActionLoading?.hostId === hostId &&
+          this.remoteTydeServerActionLoading.action === action
+        ) {
+          this.remoteTydeServerActionLoading = null;
+        }
+        if (this.getSelectedHost()?.id !== hostId) return;
         this.refreshRemoteTydeServerStatusForSelectedHost();
       });
   }
@@ -4062,22 +4069,26 @@ export class SettingsPanel {
     const actionRow = el("div", {
       style: "display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;",
     });
-    const busy = this.remoteTydeServerActionLoading !== null;
+    const actionLoading = this.remoteTydeServerActionLoading;
+    const busy =
+      actionLoading !== null && actionLoading.hostId === selectedHost.id;
 
     const makeActionButton = (
       label: string,
       action: "install" | "launch" | "install_launch" | "upgrade" | "refresh",
       disabled: boolean,
     ) => {
-      const actionLoading =
-        action !== "refresh" && this.remoteTydeServerActionLoading === action;
+      const isActionLoading =
+        action !== "refresh" &&
+        actionLoading?.hostId === selectedHost.id &&
+        actionLoading.action === action;
       const button = el(
         "button",
         {
           class: "settings-action-btn",
           type: "button",
         },
-        actionLoading ? "Working..." : label,
+        isActionLoading ? "Working..." : label,
       ) as HTMLButtonElement;
       button.disabled = disabled || busy || this.remoteTydeServerStatusLoading;
       button.addEventListener("click", () => {
