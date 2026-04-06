@@ -24,6 +24,8 @@ interface NotificationItem {
   timestamp: Date;
   element: HTMLElement | null;
   dismissTimer: number | null;
+  count: number;
+  countEl: HTMLElement | null;
 }
 
 const TYPE_ICONS: Record<NotificationType, string> = {
@@ -35,21 +37,31 @@ const TYPE_ICONS: Record<NotificationType, string> = {
 
 const MAX_VISIBLE = 5;
 const MAX_HISTORY = 50;
+const MAX_QUEUE = 20;
 const DEFAULT_TIMEOUT = 5000;
 const ERROR_TIMEOUT = 10000;
+const POPUPS_ENABLED_KEY = "tyde-notifications-popups";
 
 export class NotificationManager {
-  private enabled: boolean = true;
+  private enabled: boolean;
   private soundEnabled: boolean = false;
   private container: HTMLElement | null = null;
   private historyPanelEl: HTMLElement | null = null;
   private idCounter = 0;
   private updateBadge: (() => void) | null = null;
+  private dismissAllEl: HTMLElement | null = null;
 
   private visible: NotificationItem[] = [];
   private queue: NotificationItem[] = [];
   private history: NotificationItem[] = [];
   private unreadCount = 0;
+
+  onEnabledChange: ((enabled: boolean) => void) | null = null;
+
+  constructor() {
+    const stored = localStorage.getItem(POPUPS_ENABLED_KEY);
+    this.enabled = stored === null ? true : stored === "true";
+  }
 
   async requestPermission(): Promise<void> {
     if (!("Notification" in window)) return;
@@ -72,8 +84,17 @@ export class NotificationManager {
     this.systemNotify("Error", message);
   }
 
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
+    localStorage.setItem(POPUPS_ENABLED_KEY, String(enabled));
+    if (!enabled) {
+      this.dismissAll();
+    }
+    this.onEnabledChange?.(enabled);
   }
 
   setSoundEnabled(enabled: boolean): void {
@@ -93,6 +114,8 @@ export class NotificationManager {
       timestamp: new Date(),
       element: null,
       dismissTimer: null,
+      count: 1,
+      countEl: null,
     };
 
     this.addToHistory(item);
@@ -105,8 +128,29 @@ export class NotificationManager {
       this.playErrorSound();
     }
 
+    // Grouping: merge into existing visible/queued notification with same message+type
+    const existingVisible = this.visible.find(
+      (n) => n.message === options.message && n.type === type,
+    );
+    if (existingVisible) {
+      existingVisible.count++;
+      this.updateCountBadge(existingVisible);
+      this.resetDismissTimer(existingVisible, options);
+      return existingVisible.id;
+    }
+
+    const existingQueued = this.queue.find(
+      (n) => n.message === options.message && n.type === type,
+    );
+    if (existingQueued) {
+      existingQueued.count++;
+      return existingQueued.id;
+    }
+
     if (this.visible.length >= MAX_VISIBLE) {
-      this.queue.push(item);
+      if (this.queue.length < MAX_QUEUE) {
+        this.queue.push(item);
+      }
       return id;
     }
 
@@ -123,6 +167,13 @@ export class NotificationManager {
     const queueIdx = this.queue.findIndex((n) => n.id === id);
     if (queueIdx !== -1) {
       this.queue.splice(queueIdx, 1);
+    }
+  }
+
+  dismissAll(): void {
+    this.queue = [];
+    for (const item of [...this.visible]) {
+      this.removeToast(item);
     }
   }
 
@@ -348,6 +399,9 @@ export class NotificationManager {
     toast.dataset.testid =
       item.type === "error" ? "notification-error" : "notification";
 
+    // Click anywhere on toast to dismiss
+    toast.addEventListener("click", () => this.removeToast(item));
+
     const iconEl = document.createElement("div");
     iconEl.className = "toast-icon";
     iconEl.textContent = TYPE_ICONS[item.type];
@@ -357,23 +411,40 @@ export class NotificationManager {
 
     const msgEl = document.createElement("div");
     msgEl.className = "toast-message";
-    msgEl.textContent = item.message;
+    const msgText = document.createTextNode(item.message);
+    msgEl.appendChild(msgText);
+
+    const countEl = document.createElement("span");
+    countEl.className = "toast-count";
+    if (item.count > 1) countEl.textContent = ` \u00d7${item.count}`;
+    msgEl.appendChild(countEl);
+    item.countEl = countEl;
+
     body.appendChild(msgEl);
 
-    if (item.actions.length > 0) {
-      const actionsEl = document.createElement("div");
-      actionsEl.className = "toast-actions";
-      for (const action of item.actions) {
-        actionsEl.appendChild(this.createActionButton(action, item));
-      }
-      body.appendChild(actionsEl);
+    const actionsEl = document.createElement("div");
+    actionsEl.className = "toast-actions";
+    for (const action of item.actions) {
+      actionsEl.appendChild(this.createActionButton(action, item));
     }
+    const muteBtn = document.createElement("button");
+    muteBtn.className = "toast-action-btn toast-mute-btn";
+    muteBtn.textContent = "Mute popups";
+    muteBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.setEnabled(false);
+    });
+    actionsEl.appendChild(muteBtn);
+    body.appendChild(actionsEl);
 
     const closeBtn = document.createElement("button");
     closeBtn.className = "toast-close";
-    closeBtn.textContent = "×";
+    closeBtn.textContent = "\u00d7";
     closeBtn.setAttribute("aria-label", "Dismiss notification");
-    closeBtn.addEventListener("click", () => this.removeToast(item));
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.removeToast(item);
+    });
 
     toast.appendChild(iconEl);
     toast.appendChild(body);
@@ -401,6 +472,8 @@ export class NotificationManager {
         timeout,
       );
     }
+
+    this.updateDismissAllButton();
   }
 
   private createActionButton(
@@ -410,7 +483,8 @@ export class NotificationManager {
     const btn = document.createElement("button");
     btn.className = "toast-action-btn";
     btn.textContent = action.label;
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
       action.callback();
       this.removeToast(item);
     });
@@ -433,12 +507,14 @@ export class NotificationManager {
     }, 300);
 
     item.element = null;
+    item.countEl = null;
     const idx = this.visible.indexOf(item);
     if (idx !== -1) {
       this.visible.splice(idx, 1);
     }
 
     this.showNextQueued();
+    this.updateDismissAllButton();
   }
 
   private showNextQueued(): void {
@@ -459,6 +535,57 @@ export class NotificationManager {
     if (this.history.length > MAX_HISTORY) {
       this.history.pop();
     }
+  }
+
+  private updateCountBadge(item: NotificationItem): void {
+    if (!item.countEl) return;
+    item.countEl.textContent = item.count > 1 ? ` \u00d7${item.count}` : "";
+  }
+
+  private resetDismissTimer(
+    item: NotificationItem,
+    options: NotificationOptions,
+  ): void {
+    if (item.dismissTimer !== null) {
+      clearTimeout(item.dismissTimer);
+      item.dismissTimer = null;
+    }
+    if (!item.persistent && !options.persistent) {
+      const timeout =
+        options.timeout ??
+        (item.type === "error" ? ERROR_TIMEOUT : DEFAULT_TIMEOUT);
+      item.dismissTimer = window.setTimeout(
+        () => this.removeToast(item),
+        timeout,
+      );
+    }
+  }
+
+  private updateDismissAllButton(): void {
+    const shouldShow = this.visible.length >= 2 || this.queue.length > 0;
+
+    if (!shouldShow) {
+      if (this.dismissAllEl) {
+        this.dismissAllEl.remove();
+        this.dismissAllEl = null;
+      }
+      return;
+    }
+
+    const container = this.ensureContainer();
+
+    if (!this.dismissAllEl) {
+      this.dismissAllEl = document.createElement("button");
+      this.dismissAllEl.className = "toast-dismiss-all";
+      this.dismissAllEl.addEventListener("click", () => this.dismissAll());
+    }
+
+    const total = this.visible.length + this.queue.length;
+    this.dismissAllEl.textContent =
+      this.queue.length > 0 ? `Dismiss All (${total})` : "Dismiss All";
+
+    // Keep as last child so it appears at top of stack (column-reverse)
+    container.appendChild(this.dismissAllEl);
   }
 
   private systemNotify(title: string, body: string): void {

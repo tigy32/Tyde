@@ -373,6 +373,7 @@ export class AppController {
     settingsTabViewEl.dataset.testid = "settings-tab-view";
     this.settingsTabViewEl = settingsTabViewEl;
     this.settingsPanel = new SettingsPanel(settingsTabViewEl);
+    this.settingsPanel.setNotificationManager(this.notifications);
     this.settingsPanel.onClose = () => this.closeSettings();
     this.settingsPanel.onBackendsChanged = () => {
       const hostRefreshes = Array.from(this.workspaceViews.values()).map(

@@ -6408,6 +6408,7 @@ body {
   min-width: 300px;
   max-width: 380px;
   font-size: calc(var(--base-font-size) * 0.9286);
+  cursor: pointer;
   transition:
     transform 0.3s ease,
     opacity 0.3s ease;
@@ -6513,6 +6514,47 @@ body {
 }
 
 .toast-close:hover {
+  color: var(--text-primary);
+}
+
+/* Toast count badge for grouped notifications */
+.toast-count {
+  color: var(--text-tertiary);
+  font-size: calc(var(--base-font-size) * 0.8571);
+  margin-left: 4px;
+}
+
+/* Mute popups button - subtler than regular action buttons */
+.toast-mute-btn {
+  color: var(--text-tertiary) !important;
+  border-color: transparent !important;
+  padding: 2px 6px !important;
+  font-size: calc(var(--base-font-size) * 0.7143) !important;
+}
+
+.toast-mute-btn:hover {
+  color: var(--text-secondary) !important;
+  background: var(--bg-tertiary) !important;
+}
+
+/* Dismiss All button */
+.toast-dismiss-all {
+  pointer-events: auto;
+  align-self: flex-end;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: calc(var(--base-font-size) * 0.7857);
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.toast-dismiss-all:hover {
+  background: var(--bg-tertiary);
   color: var(--text-primary);
 }
 

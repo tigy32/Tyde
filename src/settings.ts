@@ -46,6 +46,7 @@ import {
   onDiffSettingsChange,
   setDiffSettings,
 } from "./diff_settings";
+import type { NotificationManager } from "./notifications";
 
 const APPEARANCE_STORAGE_KEY = "tyde-appearance";
 const ACTIVE_SETTINGS_TAB_KEY = "tyde-settings-active-tab";
@@ -119,6 +120,7 @@ function applyAppearanceToDocument(a: AppearanceSettings): void {
 type SettingsTabId = string;
 const VALID_SETTINGS_TABS = new Set<SettingsTabId>([
   "appearance",
+  "notifications",
   "backends",
   "agents",
   "tyde",
@@ -504,6 +506,7 @@ export class SettingsPanel {
   private selectedHostId: string | null = loadSelectedHostId();
   private agentDefinitionStore: AgentDefinitionStore | null = null;
   private agentDefinitionUnavailableReason: string | null = null;
+  private notificationManager: NotificationManager | null = null;
   private _adminId: number | null = null;
   private unsubDiffSettings: (() => void) | null = null;
 
@@ -552,6 +555,16 @@ export class SettingsPanel {
     this.agentDefinitionStore = store;
     this.agentDefinitionUnavailableReason = unavailableReason;
     this.rerenderPanelContent("agents", () => this.buildAgentsContent());
+  }
+
+  setNotificationManager(manager: NotificationManager): void {
+    this.notificationManager = manager;
+    manager.onEnabledChange = (enabled) => {
+      const input = this.container.querySelector(
+        '[data-testid="settings-notifications-enabled"]',
+      ) as HTMLInputElement | null;
+      if (input) input.checked = enabled;
+    };
   }
 
   // --- Public handlers called by event_router.ts ---
@@ -845,6 +858,7 @@ export class SettingsPanel {
 
     const uiExpanded =
       this.activeTab === "appearance" ||
+      this.activeTab === "notifications" ||
       this.activeTab === "backends" ||
       this.activeTab === "agents" ||
       this.activeTab === "tyde";
@@ -865,6 +879,20 @@ export class SettingsPanel {
     );
     appearanceBtn.addEventListener("click", () => this.switchTab("appearance"));
     uiItems.appendChild(appearanceBtn);
+    const notificationsBtn = el(
+      "button",
+      {
+        class: "nav-item",
+        "data-tab": "notifications",
+        role: "tab",
+        "data-testid": "settings-nav-item",
+      },
+      "Notifications",
+    );
+    notificationsBtn.addEventListener("click", () =>
+      this.switchTab("notifications"),
+    );
+    uiItems.appendChild(notificationsBtn);
     const backendsBtn = el(
       "button",
       {
@@ -932,6 +960,7 @@ export class SettingsPanel {
 
     // Tab panels
     content.appendChild(this.buildAppearancePanel());
+    content.appendChild(this.buildNotificationsPanel());
     content.appendChild(this.buildBackendsPanel());
     content.appendChild(this.buildAgentsPanel());
     content.appendChild(this.buildTydePanel());
@@ -1748,6 +1777,61 @@ export class SettingsPanel {
     }
 
     return null;
+  }
+
+  // ========== NOTIFICATIONS TAB ==========
+
+  private buildNotificationsPanel(): HTMLElement {
+    const section = el("section", {
+      class: "tab-panel",
+      "data-panel": "notifications",
+      role: "tabpanel",
+      "data-testid": "settings-tab-panel",
+    });
+    section.appendChild(el("h2", { class: "tab-title" }, "Notifications"));
+
+    const popupSection = el("div", { class: "settings-section" });
+    popupSection.appendChild(
+      el("h3", { class: "settings-section-header" }, "Popup Notifications"),
+    );
+
+    const field = el("div", { class: "settings-field" });
+    const row = el("div", { class: "settings-toggle-row" });
+    const labelCol = el("div", { class: "settings-toggle-label-col" });
+    labelCol.appendChild(
+      el(
+        "label",
+        { class: "settings-label", "data-testid": "settings-label" },
+        "Show popup notifications",
+      ),
+    );
+    labelCol.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "When disabled, notifications are still available via the bell icon in the toolbar.",
+      ),
+    );
+    row.appendChild(labelCol);
+
+    const toggle = el("label", { class: "settings-toggle" });
+    const input = el("input", {
+      type: "checkbox",
+      "data-testid": "settings-notifications-enabled",
+    }) as HTMLInputElement;
+    input.checked = this.notificationManager?.isEnabled() ?? true;
+    input.addEventListener("change", () => {
+      this.notificationManager?.setEnabled(input.checked);
+    });
+    toggle.appendChild(input);
+    toggle.appendChild(el("span", { class: "settings-toggle-slider" }));
+    row.appendChild(toggle);
+
+    field.appendChild(row);
+    popupSection.appendChild(field);
+    section.appendChild(popupSection);
+
+    return section;
   }
 
   // ========== BACKENDS TAB ==========
