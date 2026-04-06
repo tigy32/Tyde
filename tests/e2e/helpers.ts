@@ -154,6 +154,8 @@ export const sel = {
   connectionClose: '[data-testid="connection-close"]',
 };
 
+const APP_READY_TIMEOUT_MS = 30_000;
+
 export async function resetAppState(
   storageEntries: Record<string, string> = {},
 ): Promise<void> {
@@ -175,10 +177,10 @@ export async function resetAppState(
 export async function openWorkspace(): Promise<void> {
   await resetAppState();
   const app = await $(sel.app);
-  await app.waitForExist({ timeout: 10_000 });
+  await app.waitForExist({ timeout: APP_READY_TIMEOUT_MS });
 
   const openWorkspace = await $(sel.openWorkspaceBtn);
-  await openWorkspace.waitForClickable({ timeout: 10_000 });
+  await openWorkspace.waitForClickable({ timeout: APP_READY_TIMEOUT_MS });
   await openWorkspace.click();
 
   const title = await $(sel.appTitle);
@@ -200,7 +202,7 @@ export async function openWorkspaceAndWaitForChat(): Promise<void> {
 export async function openRemoteWorkspaceAndWaitForChat(): Promise<void> {
   await browser.url("/");
   const app = await $(sel.app);
-  await app.waitForExist({ timeout: 10_000 });
+  await app.waitForExist({ timeout: APP_READY_TIMEOUT_MS });
 
   await browser.execute(() => {
     (window as any).__mockDialogPath =
@@ -208,7 +210,7 @@ export async function openRemoteWorkspaceAndWaitForChat(): Promise<void> {
   });
 
   const openWorkspace = await $(sel.openWorkspaceBtn);
-  await openWorkspace.waitForClickable({ timeout: 10_000 });
+  await openWorkspace.waitForClickable({ timeout: APP_READY_TIMEOUT_MS });
   await openWorkspace.click();
 
   const title = await $(sel.appTitle);

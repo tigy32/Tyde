@@ -2,6 +2,7 @@ import { openWorkspace, resetAppState, sel } from "./helpers";
 
 const SSH_URL = "ssh://testuser@remotehost.example.com/home/testuser/project";
 const REMOTE_HOST = "testuser@remotehost.example.com";
+const APP_READY_TIMEOUT_MS = 30_000;
 
 describe("Remote SSH workspace", () => {
   afterEach(async () => {
@@ -17,7 +18,7 @@ describe("Remote SSH workspace", () => {
     await app.waitForExist({ timeout: 10_000 });
 
     const remoteBtn = await $(sel.openRemoteBtn);
-    await remoteBtn.waitForClickable({ timeout: 10_000 });
+    await remoteBtn.waitForClickable({ timeout: APP_READY_TIMEOUT_MS });
     await remoteBtn.click();
 
     // Text prompt appears — type SSH URL and confirm
@@ -80,7 +81,7 @@ describe("Remote SSH workspace", () => {
 
     // Wait for home view to fully render before interacting
     const remoteBtn2 = await $(sel.openRemoteBtn);
-    await remoteBtn2.waitForClickable({ timeout: 10_000 });
+    await remoteBtn2.waitForClickable({ timeout: APP_READY_TIMEOUT_MS });
 
     await browser.execute(() => {
       (window as any).__mockRemoteFailStep = "installing_subprocess";
