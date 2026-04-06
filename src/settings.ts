@@ -130,6 +130,7 @@ const VALID_SETTINGS_TABS = new Set<SettingsTabId>([
   "backends",
   "agents",
   "tyde",
+  "remote-server",
   "general",
   "providers",
   "mcp",
@@ -658,7 +659,9 @@ export class SettingsPanel {
       })
       .finally(() => {
         this.remoteControlLoading = false;
-        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+        this.rerenderPanelContent("remote-server", () =>
+          this.buildRemoteServerContent(),
+        );
       });
   }
 
@@ -714,7 +717,9 @@ export class SettingsPanel {
     this.remoteTydeServerStatusError = null;
     this.rerenderHostToolbar();
     this.rerenderPanelContent("backends", () => this.buildBackendsContent());
-    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.rerenderPanelContent("remote-server", () =>
+      this.buildRemoteServerContent(),
+    );
     this.refreshRemoteTydeServerStatusForSelectedHost();
     this.syncProfileDropdown();
     if (notify) this.notifySelectedHostChanged();
@@ -750,14 +755,18 @@ export class SettingsPanel {
       this.remoteTydeServerStatusError = null;
       this.remoteTydeServerStatusLoading = false;
       this.remoteTydeServerActionLoading = null;
-      this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+      this.rerenderPanelContent("remote-server", () =>
+        this.buildRemoteServerContent(),
+      );
       return;
     }
 
     const seq = ++this.remoteTydeServerStatusSeq;
     this.remoteTydeServerStatusLoading = true;
     this.remoteTydeServerStatusError = null;
-    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.rerenderPanelContent("remote-server", () =>
+      this.buildRemoteServerContent(),
+    );
 
     getRemoteTydeServerStatusBridge(selectedHost.id)
       .then((status) => {
@@ -772,7 +781,9 @@ export class SettingsPanel {
       .finally(() => {
         if (seq !== this.remoteTydeServerStatusSeq) return;
         this.remoteTydeServerStatusLoading = false;
-        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+        this.rerenderPanelContent("remote-server", () =>
+          this.buildRemoteServerContent(),
+        );
       });
   }
 
@@ -785,7 +796,9 @@ export class SettingsPanel {
 
     this.remoteTydeServerActionLoading = { hostId, action };
     this.remoteTydeServerStatusError = null;
-    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.rerenderPanelContent("remote-server", () =>
+      this.buildRemoteServerContent(),
+    );
 
     const run = () => {
       switch (action) {
@@ -964,7 +977,8 @@ export class SettingsPanel {
       this.activeTab === "notifications" ||
       this.activeTab === "backends" ||
       this.activeTab === "agents" ||
-      this.activeTab === "tyde";
+      this.activeTab === "tyde" ||
+      this.activeTab === "remote-server";
     const aiExpanded = !uiExpanded;
 
     // Tyde Settings collapsible group
@@ -1032,6 +1046,20 @@ export class SettingsPanel {
     );
     tydeBtn.addEventListener("click", () => this.switchTab("tyde"));
     uiItems.appendChild(tydeBtn);
+    const remoteServerBtn = el(
+      "button",
+      {
+        class: "nav-item",
+        "data-tab": "remote-server",
+        role: "tab",
+        "data-testid": "settings-nav-item",
+      },
+      "Remote Server",
+    );
+    remoteServerBtn.addEventListener("click", () =>
+      this.switchTab("remote-server"),
+    );
+    uiItems.appendChild(remoteServerBtn);
     nav.appendChild(uiGroup);
 
     // Tycode Settings collapsible group
@@ -1067,6 +1095,7 @@ export class SettingsPanel {
     content.appendChild(this.buildBackendsPanel());
     content.appendChild(this.buildAgentsPanel());
     content.appendChild(this.buildTydePanel());
+    content.appendChild(this.buildRemoteServerPanel());
     content.appendChild(this.buildGeneralPanel());
     content.appendChild(this.buildProvidersPanel());
     content.appendChild(this.buildMcpPanel());
@@ -1141,7 +1170,8 @@ export class SettingsPanel {
       this.activeTab === "notifications" ||
       this.activeTab === "backends" ||
       this.activeTab === "agents" ||
-      this.activeTab === "tyde";
+      this.activeTab === "tyde" ||
+      this.activeTab === "remote-server";
     this.setNavGroupExpanded("ui", uiActive);
     this.setNavGroupExpanded("ai", !uiActive);
   }
@@ -1267,6 +1297,9 @@ export class SettingsPanel {
 
   private rerenderBackendTabs(): void {
     this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.rerenderPanelContent("remote-server", () =>
+      this.buildRemoteServerContent(),
+    );
     this.rerenderPanelContent("general", () => this.buildGeneralContent());
     this.rerenderPanelContent("providers", () => this.buildProvidersContent());
     this.rerenderPanelContent("mcp", () => this.buildMcpContent());
@@ -2147,7 +2180,9 @@ export class SettingsPanel {
         this.rerenderPanelContent("backends", () =>
           this.buildBackendsContent(),
         );
-        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+        this.rerenderPanelContent("remote-server", () =>
+          this.buildRemoteServerContent(),
+        );
         this.syncProfileDropdown();
         this.onHostsUpdated?.();
       });
@@ -3960,15 +3995,39 @@ export class SettingsPanel {
     const frag = document.createDocumentFragment();
     frag.appendChild(this.buildMcpRuntimeControl());
     frag.appendChild(this.buildDriverMcpRuntimeControl());
-    frag.appendChild(this.buildRemoteTydeServerSection());
+    return frag;
+  }
+
+  private buildRemoteServerPanel(): HTMLElement {
+    const section = el("section", {
+      class: "tab-panel",
+      "data-panel": "remote-server",
+      role: "tabpanel",
+      "data-testid": "settings-tab-panel",
+    });
+    section.appendChild(el("h2", { class: "tab-title" }, "Remote Server"));
+    section.appendChild(this.buildRemoteServerContent());
+    return section;
+  }
+
+  private buildRemoteServerContent(): DocumentFragment {
+    const frag = document.createDocumentFragment();
     frag.appendChild(this.buildRemoteControlSection());
+    frag.appendChild(this.buildRemoteTydeServerSection());
     return frag;
   }
 
   private buildRemoteTydeServerSection(): HTMLElement {
     const section = el("div", { class: "settings-section" });
     section.appendChild(
-      el("h3", { class: "settings-section-header" }, "Remote Tyde Server"),
+      el("h3", { class: "settings-section-header" }, "Install & Manage"),
+    );
+    section.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Install, launch, and upgrade the Tyde server on the selected remote host.",
+      ),
     );
 
     const selectedHost = this.getSelectedHost();
@@ -3983,93 +4042,124 @@ export class SettingsPanel {
       return section;
     }
 
-    section.appendChild(
-      el(
-        "p",
-        { class: "settings-description" },
-        `${selectedHost.hostname} · local v${this.remoteTydeServerStatus?.local_version ?? "?"}`,
-      ),
-    );
-
-    if (this.remoteTydeServerStatusLoading) {
-      section.appendChild(
-        el(
-          "p",
-          { class: "settings-description" },
-          "Checking remote Tyde server status...",
-        ),
-      );
-    } else if (this.remoteTydeServerStatusError) {
-      section.appendChild(
-        el(
-          "p",
-          { class: "settings-description settings-backend-warning" },
-          this.remoteTydeServerStatusError,
-        ),
-      );
-    }
-
+    const clientVersion = this.remoteTydeServerStatus?.local_version ?? "?";
     const status =
       this.remoteTydeServerStatus?.host_id === selectedHost.id
         ? this.remoteTydeServerStatus
         : null;
 
+    // Status card
+    const card = el("div", { class: "remote-server-status-card" });
+    const cardHeader = el("div", { class: "remote-server-status-header" });
+    cardHeader.appendChild(
+      el("span", { class: "remote-server-host-label" }, selectedHost.hostname),
+    );
+    cardHeader.appendChild(
+      el(
+        "span",
+        { class: "remote-server-version-badge" },
+        `client v${clientVersion}`,
+      ),
+    );
+    card.appendChild(cardHeader);
+
+    if (this.remoteTydeServerStatusLoading) {
+      card.appendChild(
+        el(
+          "p",
+          { class: "remote-server-status-text" },
+          "Checking remote server status...",
+        ),
+      );
+    } else if (this.remoteTydeServerStatusError) {
+      card.appendChild(
+        el(
+          "p",
+          { class: "remote-server-status-text remote-server-error" },
+          this.remoteTydeServerStatusError,
+        ),
+      );
+    }
+
     if (status) {
-      const lines: string[] = [];
+      let stateLabel: string;
+      let stateClass: string;
       switch (status.state) {
         case "not_installed":
-          lines.push("Client-matching Tyde is not installed.");
+          stateLabel = "Not installed";
+          stateClass = "remote-server-state-warn";
           break;
         case "stopped":
-          lines.push("Tyde is installed but not running.");
+          stateLabel = "Stopped";
+          stateClass = "remote-server-state-warn";
           break;
         case "running_current":
-          lines.push("Tyde server is running and matches this client.");
+          stateLabel = "Running";
+          stateClass = "remote-server-state-ok";
           break;
         case "running_stale":
-          lines.push("Tyde server is running but version differs from client.");
+          stateLabel = "Running (outdated)";
+          stateClass = "remote-server-state-warn";
           break;
         case "running_unknown":
-          lines.push("Tyde server is running; version could not be verified.");
+          stateLabel = "Running (unverified)";
+          stateClass = "remote-server-state-warn";
           break;
         case "error":
-          lines.push("Could not fully inspect remote Tyde server.");
+          stateLabel = "Error";
+          stateClass = "remote-server-state-error";
           break;
       }
-      if (status.target) lines.push(`Target: ${status.target}`);
-      if (status.install_path)
-        lines.push(`Install path: ${status.install_path}`);
-      if (status.socket_path) lines.push(`Socket: ${status.socket_path}`);
-      if (status.remote_version) {
-        lines.push(`Remote version: v${status.remote_version}`);
-      }
-      if (
-        !status.installed_client_version &&
-        status.installed_versions.length > 0
-      ) {
-        lines.push(
-          `Installed versions: ${status.installed_versions
-            .map((v) => `v${v}`)
-            .join(", ")}`,
-        );
-      }
+      card.appendChild(
+        el("div", { class: `remote-server-state ${stateClass}` }, stateLabel),
+      );
+
       if (status.error) {
-        section.appendChild(
+        card.appendChild(
           el(
             "p",
-            { class: "settings-description settings-backend-warning" },
+            { class: "remote-server-status-text remote-server-error" },
             status.error,
           ),
         );
       }
-      for (const line of lines) {
-        section.appendChild(el("p", { class: "settings-description" }, line));
+
+      const details: [string, string][] = [];
+      if (status.target) details.push(["Target", status.target]);
+      if (status.remote_version)
+        details.push(["Remote version", `v${status.remote_version}`]);
+      if (status.install_path)
+        details.push(["Install path", status.install_path]);
+      if (status.socket_path) details.push(["Socket", status.socket_path]);
+      if (
+        !status.installed_client_version &&
+        status.installed_versions.length > 0
+      ) {
+        details.push([
+          "Installed versions",
+          status.installed_versions.map((v) => `v${v}`).join(", "),
+        ]);
+      }
+
+      if (details.length > 0) {
+        const detailsList = el("div", { class: "remote-server-details" });
+        for (const [key, value] of details) {
+          const row = el("div", { class: "remote-server-detail-row" });
+          row.appendChild(
+            el("span", { class: "remote-server-detail-key" }, key),
+          );
+          row.appendChild(
+            el("span", { class: "remote-server-detail-value" }, value),
+          );
+          detailsList.appendChild(row);
+        }
+        card.appendChild(detailsList);
       }
     }
+    section.appendChild(card);
 
-    const actionRow = el("div", {
-      style: "display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;",
-    });
+    // Action buttons
+    const actionRow = el("div", { class: "remote-server-actions" });
     const actionLoading = this.remoteTydeServerActionLoading;
     const busy =
       actionLoading !== null && actionLoading.hostId === selectedHost.id;
@@ -4078,17 +4168,18 @@ export class SettingsPanel {
       label: string,
       action: "install" | "launch" | "install_launch" | "upgrade" | "refresh",
       disabled: boolean,
+      primary: boolean,
     ) => {
       const isActionLoading =
         action !== "refresh" &&
         actionLoading?.hostId === selectedHost.id &&
         actionLoading.action === action;
+      const cls = primary
+        ? "remote-server-btn remote-server-btn-primary"
+        : "remote-server-btn";
       const button = el(
         "button",
-        {
-          class: "settings-action-btn",
-          type: "button",
-        },
+        { class: cls, type: "button" },
         isActionLoading ? "Working..." : label,
       ) as HTMLButtonElement;
       button.disabled = disabled || busy || this.remoteTydeServerStatusLoading;
@@ -4112,19 +4203,23 @@ export class SettingsPanel {
 
     if (canInstallAndLaunch) {
       actionRow.appendChild(
-        makeActionButton("Install & Launch", "install_launch", false),
+        makeActionButton("Install & Launch", "install_launch", false, true),
       );
     }
     if (canLaunch) {
-      actionRow.appendChild(makeActionButton("Launch", "launch", false));
+      actionRow.appendChild(makeActionButton("Launch", "launch", false, true));
     }
     if (canInstall) {
-      actionRow.appendChild(makeActionButton("Install", "install", false));
+      actionRow.appendChild(
+        makeActionButton("Install", "install", false, false),
+      );
     }
     if (canUpgrade) {
-      actionRow.appendChild(makeActionButton("Upgrade", "upgrade", false));
+      actionRow.appendChild(
+        makeActionButton("Upgrade", "upgrade", false, false),
+      );
     }
-    actionRow.appendChild(makeActionButton("Refresh", "refresh", false));
+    actionRow.appendChild(makeActionButton("Refresh", "refresh", false, false));
 
     section.appendChild(actionRow);
     return section;
@@ -4133,14 +4228,21 @@ export class SettingsPanel {
   private buildRemoteControlSection(): HTMLElement {
     const section = el("div", { class: "settings-section" });
     section.appendChild(
-      el("h3", { class: "settings-section-header" }, "Remote Control"),
+      el("h3", { class: "settings-section-header" }, "SSH Remote Control"),
+    );
+    section.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        "Allow this Tyde instance to act as a server that remote Tyde clients can connect to over SSH.",
+      ),
     );
 
     const field = el("div", { class: "settings-field" });
     const row = el("div", { class: "settings-toggle-row" });
     const labelCol = el("div", { class: "settings-toggle-label-col" });
     labelCol.appendChild(
-      el("label", { class: "settings-label" }, "Allow Remote Control over SSH"),
+      el("label", { class: "settings-label" }, "Enable SSH Remote Control"),
     );
 
     const statusText = this.remoteControlLoading
@@ -4186,7 +4288,9 @@ export class SettingsPanel {
 
   private setRemoteControlEnabled(enabled: boolean): void {
     this.remoteControlLoading = true;
-    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.rerenderPanelContent("remote-server", () =>
+      this.buildRemoteServerContent(),
+    );
     setRemoteControlEnabledBridge(enabled)
       .then((settings) => {
         this.remoteControlSettings = settings;
@@ -4196,7 +4300,9 @@ export class SettingsPanel {
       })
       .finally(() => {
         this.remoteControlLoading = false;
-        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+        this.rerenderPanelContent("remote-server", () =>
+          this.buildRemoteServerContent(),
+        );
       });
   }
 

@@ -362,10 +362,7 @@ pub(crate) async fn detect_remote_tyde_target(host: &str) -> Result<String, Stri
 
     match (os, arch) {
         ("Linux", "x86_64") => Ok("x86_64-unknown-linux-gnu".to_string()),
-        ("Linux", "aarch64") => Err(
-            "Unsupported remote platform: Linux aarch64 (ARM64 Linux remote installs are not available yet)"
-                .to_string(),
-        ),
+        ("Linux", "aarch64") => Ok("aarch64-unknown-linux-gnu".to_string()),
         ("Darwin", "x86_64") => Ok("x86_64-apple-darwin".to_string()),
         ("Darwin", "arm64") => Ok("aarch64-apple-darwin".to_string()),
         _ => Err(format!("Unsupported remote platform: {os} {arch}")),
@@ -1141,7 +1138,7 @@ pub async fn connect_tyde_server_with_progress(
     if !is_remote_tyde_server_running(host, &remote_socket_path).await? {
         let msg = format!(
             "Tyde server is not running on '{host}' (missing {remote_socket_path}). \
-Open Settings → Agent Control → Remote Tyde Server to install/launch it, or \
+Open Settings → Remote Server → Install & Manage to install/launch it, or \
 start Tyde on the remote host with '--headless' and retry."
         );
         emit_progress("checking_server", "failed", &msg);

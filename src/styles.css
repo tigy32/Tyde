@@ -5685,6 +5685,144 @@ body {
   font-weight: 600;
 }
 
+/* Remote Server tab — status card */
+.remote-server-status-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remote-server-status-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.remote-server-host-label {
+  font-weight: 600;
+  font-size: var(--text-base);
+  color: var(--text-bright);
+}
+
+.remote-server-version-badge {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  background: var(--surface-3);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 1px 7px;
+}
+
+.remote-server-status-text {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.remote-server-error {
+  color: var(--color-error);
+}
+
+.remote-server-state {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  display: inline-block;
+  width: fit-content;
+}
+
+.remote-server-state-ok {
+  color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+}
+
+.remote-server-state-warn {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+}
+
+.remote-server-state-error {
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+}
+
+.remote-server-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.remote-server-detail-row {
+  display: flex;
+  gap: 8px;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
+.remote-server-detail-key {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  min-width: 110px;
+}
+
+.remote-server-detail-value {
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+/* Remote Server tab — action buttons */
+.remote-server-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.remote-server-btn {
+  padding: 7px 16px;
+  border-radius: 6px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border-secondary);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s;
+}
+
+.remote-server-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--accent-primary);
+  color: var(--text-bright);
+}
+
+.remote-server-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.remote-server-btn-primary {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: var(--text-white);
+}
+
+.remote-server-btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--text-white);
+}
+
 .settings-modal-delete {
   background: var(--color-error);
   border-color: var(--color-error);
