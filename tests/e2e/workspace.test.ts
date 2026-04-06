@@ -1,6 +1,42 @@
 import { openWorkspace, resetAppState, sel } from "./helpers";
 
 describe("Multi-workspace management", () => {
+  it("keeps the active project selected when the last tab closes", async () => {
+    await openWorkspace();
+
+    await browser.keys(["Control", "n"]);
+    const input = await $(sel.messageInput);
+    await input.waitForDisplayed({ timeout: 10_000 });
+
+    await browser.keys(["Control", "w"]);
+
+    await browser.waitUntil(
+      async () => (await (await $$(sel.convTab)).length) === 0,
+      { timeout: 5000, timeoutMsg: "Expected the last tab to close" },
+    );
+
+    const welcome = await $(sel.welcomeScreen);
+    await welcome.waitForDisplayed({ timeout: 5000 });
+
+    const title = await $(sel.appTitle);
+    const titleText = await title.getText();
+    expect(titleText.toLowerCase()).toContain("workspace");
+    expect(titleText).not.toBe("Tyde");
+
+    const homeIsActive = await browser.execute((homeSel: string) => {
+      const homeItem = document.querySelector(homeSel) as HTMLElement | null;
+      return homeItem?.classList.contains("active") ?? false;
+    }, sel.railHomeItem);
+    expect(homeIsActive).toBe(false);
+
+    const projectIsActive = await browser.execute((projectSel: string) => {
+      return Array.from(document.querySelectorAll(projectSel)).some((el) =>
+        (el as HTMLElement).classList.contains("active"),
+      );
+    }, sel.railProjectItem);
+    expect(projectIsActive).toBe(true);
+  });
+
   it("comprehensive workspace flow: welcome → tab isolation → settings overlay", async () => {
     // --- 1. Welcome screen on first workspace ---
     await openWorkspace();

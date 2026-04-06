@@ -1034,13 +1034,15 @@ export class WorkspaceView {
   }
 
   showEmptyState(): void {
-    this.chatPanel.clear();
     this.diffPanel.clear();
     if (this.mode === "orchestrator") {
+      this.chatPanel.clear();
       this.layout.setHomeMode(true);
       return;
     }
-    this.onRequestHome?.();
+    this.layout.setHomeMode(false);
+    this.layout.switchTab("chat");
+    this.chatPanel.showWelcome();
   }
 
   focusConversation(conversationId: number, title?: string): boolean {
