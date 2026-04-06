@@ -1,7 +1,7 @@
 {
   "productName": "Tyde",
   "mainBinaryName": "tyde",
-  "version": "0.2.0",
+  "version": "0.7.0",
   "identifier": "com.tyde.app",
   "build": {
     "beforeDevCommand": "npm run dev",
