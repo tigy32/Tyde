@@ -328,11 +328,20 @@ impl KiroInner {
                     Err(err) => {
                         // CancelConversation sets `cancelled = true` before sending
                         // session/cancel. If the prompt error is just the stale
-                        // rejection of a cancelled request, swallow it — the cancel
-                        // handler already emitted OperationCancelled + TypingStatusChanged.
+                        // rejection of a cancelled request, surface it as a normal
+                        // cancellation instead of a hard backend failure.
                         let mut state = self.state.lock().await;
                         if state.cancelled {
                             state.cancelled = false;
+                            drop(state);
+                            self.clear_active_stream().await;
+                            self.emit_event(
+                                json!({ "kind": "TypingStatusChanged", "data": false }),
+                            );
+                            self.emit_event(json!({
+                                "kind": "OperationCancelled",
+                                "data": { "message": "Operation cancelled" }
+                            }));
                             return Ok(());
                         }
                         drop(state);
@@ -360,6 +369,11 @@ impl KiroInner {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_ascii_lowercase();
+
+                {
+                    let mut state = self.state.lock().await;
+                    state.cancelled = false;
+                }
 
                 if stop_reason == "cancelled" {
                     self.clear_active_stream().await;
@@ -397,12 +411,6 @@ impl KiroInner {
                 self.bridge
                     .notify("session/cancel", json!({ "sessionId": session_id }))
                     .await?;
-                self.clear_active_stream().await;
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-                self.emit_event(json!({
-                    "kind": "OperationCancelled",
-                    "data": { "message": "Operation cancelled" }
-                }));
                 Ok(())
             }
             SessionCommand::GetSettings => {
