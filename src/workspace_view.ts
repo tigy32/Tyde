@@ -1106,7 +1106,7 @@ export class WorkspaceView {
       const existing = this.agentsPanel.getAgentByConversationId(
         agent.conversation_id,
       );
-      if (existing?.name && (name === "Bridge" || name === "Conversation")) {
+      if (existing?.name && isGenericAgentName(name)) {
         name = existing.name;
         void renameAgent(agent.agent_id, name);
       }
@@ -2591,7 +2591,7 @@ export class WorkspaceView {
     const existing = this.agentsPanel.getAgentByConversationId(
       agent.conversation_id,
     );
-    if (existing?.name && (name === "Bridge" || name === "Conversation")) {
+    if (existing?.name && isGenericAgentName(name)) {
       name = existing.name;
       void renameAgent(agent.agent_id, name);
     }
@@ -2750,4 +2750,15 @@ export class WorkspaceView {
       el.textContent = "Disconnected";
     }
   }
+}
+
+/** Mirrors the Rust-side `is_generic_agent_name` so the TS check stays in sync. */
+function isGenericAgentName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower === "conversation" ||
+    lower === "bridge" ||
+    lower === "sub-agent" ||
+    lower.startsWith("agent ")
+  );
 }
