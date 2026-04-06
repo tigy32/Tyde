@@ -60,7 +60,8 @@ pub(crate) fn list_available_skills() -> Result<Vec<String>, String> {
 /// Skill discovery subdir inside the temp/workspace root for each backend.
 fn skill_subdir(kind: BackendKind) -> &'static str {
     match kind {
-        BackendKind::Claude | BackendKind::Tycode => ".claude/skills",
+        BackendKind::Claude => ".claude/skills",
+        BackendKind::Tycode => ".tycode/skills",
         BackendKind::Codex => ".agents/skills",
         BackendKind::Kiro => ".kiro/skills",
         BackendKind::Gemini => ".gemini/skills",
@@ -69,7 +70,8 @@ fn skill_subdir(kind: BackendKind) -> &'static str {
 
 /// Inject skills for a backend. Resolves skill names from `~/.tyde/skills/`.
 ///
-/// - **Claude/Tycode**: Creates a per-agent temp directory with `.claude/skills/`
+/// - **Claude/Tycode**: Creates a per-agent temp directory with backend-native skill
+///   subdirs (`.claude/skills/` for Claude, `.tycode/skills/` for Tycode)
 ///   structure and returns `skill_dir` for `--add-dir` / extra workspace root.
 /// - **Codex/Kiro/Gemini**: Symlinks into workspace skill directory (e.g.
 ///   `.agents/skills/tyde-{name}/`). Returns `skill_dir = None`.
@@ -453,6 +455,42 @@ mod tests {
 
         // Verify skill is accessible through the temp dir.
         let link = Path::new(&sd).join(".claude/skills/my-skill");
+        assert!(link.join("SKILL.md").exists());
+        assert!(link.join("helper.sh").exists());
+
+        // Cleanup.
+        let _ = fs::remove_dir_all(&sd);
+    }
+
+    #[test]
+    fn test_inject_tycode_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_skills_dir(tmp.path(), &["my-skill"]);
+
+        // Temporarily override HOME so resolve_skills_dir() finds our test dir.
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+
+        let result = inject_skills_local(
+            BackendKind::Tycode,
+            "/workspace",
+            "test-agent",
+            &["my-skill".to_string()],
+        );
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let result = result.unwrap();
+        assert!(result.skill_dir.is_some());
+        let sd = result.skill_dir.unwrap();
+        assert!(sd.contains("tyde-agent-skills-test-agent"));
+
+        // Verify skill is accessible through the temp dir.
+        let link = Path::new(&sd).join(".tycode/skills/my-skill");
         assert!(link.join("SKILL.md").exists());
         assert!(link.join("helper.sh").exists());
 
