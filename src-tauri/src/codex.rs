@@ -159,6 +159,7 @@ impl CodexSession {
             .and_then(Value::as_str)
             .ok_or("Codex thread/start response missing thread.id")?
             .to_string();
+        let session_id = thread_id.clone();
 
         let model = thread_started
             .get("model")
@@ -196,6 +197,11 @@ impl CodexSession {
                 forward_inner.handle_inbound(msg).await;
             }
         });
+
+        inner.emit_event(json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": session_id }
+        }));
 
         Ok((Self { inner }, event_rx))
     }
@@ -555,7 +561,7 @@ impl CodexInner {
 
         {
             let mut state = self.state.lock().await;
-            state.thread_id = resumed_thread_id;
+            state.thread_id = resumed_thread_id.clone();
             if let Some(model) = resumed_model.clone() {
                 state.model = Some(model);
             }
@@ -568,6 +574,11 @@ impl CodexInner {
             state.pending_user_input_bytes = 0;
             state.conversation_bytes_total = 0;
         }
+
+        self.emit_event(json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": resumed_thread_id }
+        }));
 
         self.emit_event(json!({ "kind": "ConversationCleared" }));
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
