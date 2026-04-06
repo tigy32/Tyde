@@ -24,9 +24,9 @@ use tauri::Manager;
 
 use crate::{
     agent_defs_io::ToolPolicy, await_agents_internal, cancel_agent_internal,
-    create_workbench_internal, delete_workbench_internal, list_agents_internal, run_agent_internal,
-    send_agent_message_internal, spawn_agent_internal, AgentIdRequest, AppState,
-    AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
+    create_workbench_internal, delete_workbench_internal, list_child_agents_internal,
+    run_agent_internal, send_agent_message_internal, spawn_agent_internal, AgentIdRequest,
+    AppState, AwaitAgentsRequest, SendAgentMessageRequest, SpawnAgentRequest,
 };
 
 const MCP_HTTP_BIND_ENV: &str = "TYDE_AGENT_MCP_HTTP_BIND_ADDR";
@@ -124,6 +124,14 @@ struct CreateWorkbenchToolInput {
 struct DeleteWorkbenchToolInput {
     /// The workspace path of the workbench to delete.
     workspace_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+struct ChildAgentToolOutput {
+    /// Child agent ID.
+    agent_id: String,
+    /// Task name assigned when the parent spawned the agent.
+    name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +285,8 @@ impl TydeAgentMcpServer {
             agent_ids: input.agent_ids,
             timeout_ms: input.timeout_ms,
         };
-        match await_agents_internal(app_state.inner(), request).await {
+        let caller_agent_id = caller_agent_id_from_parts(&parts);
+        match await_agents_internal(app_state.inner(), request, caller_agent_id.as_deref()).await {
             Ok(value) => ok_json(value),
             Err(err) => Ok(err_text(err)),
         }
@@ -329,7 +338,7 @@ impl TydeAgentMcpServer {
     }
 
     #[tool(
-        description = "List all Tyde agents with their running state, last message, and metadata."
+        description = "List direct child agents spawned by the calling agent. Returns only each child agent_id and name."
     )]
     async fn tyde_list_agents(
         &self,
@@ -340,8 +349,22 @@ impl TydeAgentMcpServer {
         {
             return Ok(denied);
         }
-        match list_agents_internal(app_state.inner()).await {
-            Ok(value) => ok_json(value),
+        let Some(caller_agent_id) = caller_agent_id_from_parts(&parts) else {
+            return Ok(err_text(
+                "tyde_list_agents requires a caller agent identity",
+            ));
+        };
+        match list_child_agents_internal(app_state.inner(), &caller_agent_id).await {
+            Ok(children) => {
+                let output = children
+                    .into_iter()
+                    .map(|agent| ChildAgentToolOutput {
+                        agent_id: agent.agent_id,
+                        name: agent.name,
+                    })
+                    .collect::<Vec<_>>();
+                ok_json(output)
+            }
             Err(err) => Ok(err_text(err)),
         }
     }

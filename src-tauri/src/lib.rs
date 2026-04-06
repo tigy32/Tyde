@@ -3144,6 +3144,19 @@ pub(crate) async fn list_agents_internal(state: &AppState) -> Result<Vec<AgentIn
     Ok(merged)
 }
 
+pub(crate) async fn list_child_agents_internal(
+    state: &AppState,
+    parent_agent_id: &str,
+) -> Result<Vec<AgentInfo>, String> {
+    let mut children = list_agents_internal(state)
+        .await?
+        .into_iter()
+        .filter(|agent| agent.parent_agent_id.as_deref() == Some(parent_agent_id))
+        .collect::<Vec<_>>();
+    children.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+    Ok(children)
+}
+
 pub(crate) async fn wait_for_agent_internal(
     state: &AppState,
     request: WaitForAgentRequest,
@@ -3365,15 +3378,58 @@ pub(crate) async fn run_query_screenshot_agent(
 pub(crate) async fn await_agents_internal(
     state: &AppState,
     request: AwaitAgentsRequest,
+    caller_agent_id: Option<&str>,
 ) -> Result<AwaitAgentsResponse, String> {
-    if request.agent_ids.is_empty() {
+    let AwaitAgentsRequest {
+        agent_ids,
+        timeout_ms,
+    } = request;
+
+    if agent_ids.is_empty() {
         return Err("No agents to watch".to_string());
     }
 
-    let idle_timeout = request
-        .timeout_ms
-        .unwrap_or(60_000)
-        .clamp(1, 30 * 60 * 1000);
+    let mut watched_agent_ids = Vec::with_capacity(agent_ids.len());
+    let mut seen_ids = HashSet::new();
+    for raw_id in agent_ids {
+        let id = raw_id.trim();
+        if id.is_empty() {
+            return Err("agent_ids cannot contain an empty value".to_string());
+        }
+        if !seen_ids.insert(id.to_string()) {
+            return Err(format!("Duplicate agent id in watch list: {id}"));
+        }
+        watched_agent_ids.push(id.to_string());
+    }
+
+    let all_agents = list_agents_internal(state).await?;
+    let mut by_id = HashMap::with_capacity(all_agents.len());
+    for agent in all_agents {
+        by_id.insert(agent.agent_id.clone(), agent);
+    }
+
+    if let Some(caller_id) = caller_agent_id {
+        if !by_id.contains_key(caller_id) {
+            return Err(format!("Caller agent {caller_id} not found"));
+        }
+        if watched_agent_ids.iter().any(|id| id == caller_id) {
+            return Err(format!("Agent {caller_id} cannot await itself"));
+        }
+    }
+    for watched_id in &watched_agent_ids {
+        let watched = by_id
+            .get(watched_id)
+            .ok_or_else(|| format!("Agent {watched_id} not found"))?;
+        if let Some(caller_id) = caller_agent_id {
+            if watched.parent_agent_id.as_deref() != Some(caller_id) {
+                return Err(format!(
+                    "Agent {watched_id} is not a direct child of caller agent {caller_id}"
+                ));
+            }
+        }
+    }
+
+    let idle_timeout = timeout_ms.unwrap_or(60_000).clamp(1, 30 * 60 * 1000);
     let idle_duration = tokio::time::Duration::from_millis(idle_timeout);
     let max_wall = idle_duration.saturating_mul(10);
     let wall_deadline = tokio::time::Instant::now() + max_wall;
@@ -3397,7 +3453,7 @@ pub(crate) async fn await_agents_internal(
         let mut ready = Vec::new();
         let mut still_running = Vec::new();
         let mut newest_updated_at: u64 = 0;
-        for id in &request.agent_ids {
+        for id in &watched_agent_ids {
             let info = by_id
                 .get(id.as_str())
                 .ok_or(format!("Agent {id} not found"))?;
@@ -5855,6 +5911,133 @@ mod tests {
         let (result, _) = tokio::join!(wait_fut, notifier);
         let agent = result.expect("wait_for_agent should return once agent stops running");
         assert!(!agent.is_running);
+    }
+
+    #[tokio::test]
+    async fn await_agents_rejects_self_wait() {
+        let state = test_app_state();
+        let caller_agent_id = {
+            let mut runtime = state.agent_runtime.lock().await;
+            runtime
+                .register_agent(
+                    9101,
+                    vec!["/tmp".into()],
+                    "tycode".into(),
+                    None,
+                    "parent".into(),
+                )
+                .agent_id
+        };
+
+        let result = await_agents_internal(
+            &state,
+            AwaitAgentsRequest {
+                agent_ids: vec![caller_agent_id.clone()],
+                timeout_ms: Some(10),
+            },
+            Some(&caller_agent_id),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("awaiting self should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("cannot await itself"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_agents_rejects_non_child_watch_targets() {
+        let state = test_app_state();
+        let (caller_agent_id, unrelated_agent_id) = {
+            let mut runtime = state.agent_runtime.lock().await;
+            let caller = runtime.register_agent(
+                9201,
+                vec!["/tmp".into()],
+                "tycode".into(),
+                None,
+                "parent".into(),
+            );
+            let unrelated = runtime.register_agent(
+                9202,
+                vec!["/tmp".into()],
+                "tycode".into(),
+                None,
+                "other".into(),
+            );
+            (caller.agent_id, unrelated.agent_id)
+        };
+
+        let result = await_agents_internal(
+            &state,
+            AwaitAgentsRequest {
+                agent_ids: vec![unrelated_agent_id.clone()],
+                timeout_ms: Some(10),
+            },
+            Some(&caller_agent_id),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("awaiting non-child should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("is not a direct child"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_child_agents_filters_by_parent() {
+        let state = test_app_state();
+        let (parent_id, child_a_id, child_b_id) = {
+            let mut runtime = state.agent_runtime.lock().await;
+            let parent = runtime.register_agent(
+                9301,
+                vec!["/tmp".into()],
+                "tycode".into(),
+                None,
+                "parent".into(),
+            );
+            let child_a = runtime.register_agent(
+                9302,
+                vec!["/tmp".into()],
+                "tycode".into(),
+                Some(parent.agent_id.clone()),
+                "child-a".into(),
+            );
+            let child_b = runtime.register_agent(
+                9303,
+                vec!["/tmp".into()],
+                "tycode".into(),
+                Some(parent.agent_id.clone()),
+                "child-b".into(),
+            );
+            let _other = runtime.register_agent(
+                9304,
+                vec!["/tmp".into()],
+                "tycode".into(),
+                None,
+                "other".into(),
+            );
+            (parent.agent_id, child_a.agent_id, child_b.agent_id)
+        };
+
+        let children = list_child_agents_internal(&state, &parent_id)
+            .await
+            .expect("list children");
+        let child_ids = children
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(children.len(), 2);
+        assert!(child_ids.contains(child_a_id.as_str()));
+        assert!(child_ids.contains(child_b_id.as_str()));
     }
 
     #[test]
