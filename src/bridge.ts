@@ -71,6 +71,30 @@ const VALID_BACKEND_KINDS = new Set<BackendKind>([
   "gemini",
 ]);
 
+export type RemoteTydeServerState =
+  | "not_installed"
+  | "stopped"
+  | "running_current"
+  | "running_stale"
+  | "running_unknown"
+  | "error";
+
+export interface RemoteTydeServerStatus {
+  host_id: string;
+  host: string;
+  state: RemoteTydeServerState;
+  local_version: string;
+  remote_version: string | null;
+  target: string | null;
+  socket_path: string | null;
+  install_path: string | null;
+  installed_versions: string[];
+  installed_client_version: boolean;
+  running: boolean;
+  needs_upgrade: boolean;
+  error: string | null;
+}
+
 export function normalizeBackendKind(
   value: string | null | undefined,
 ): BackendKind {
@@ -432,6 +456,49 @@ export function getRemoteControlSettings() {
 
 export function setRemoteControlEnabled(enabled: boolean) {
   return execute("set_remote_control_enabled", { enabled });
+}
+
+export function getRemoteTydeServerStatus(
+  hostId: string,
+): Promise<RemoteTydeServerStatus> {
+  return invoke<RemoteTydeServerStatus>("get_remote_tyde_server_status", {
+    host_id: hostId,
+  });
+}
+
+export function installRemoteTydeServer(
+  hostId: string,
+): Promise<RemoteTydeServerStatus> {
+  return invoke<RemoteTydeServerStatus>("install_remote_tyde_server", {
+    host_id: hostId,
+  });
+}
+
+export function launchRemoteTydeServer(
+  hostId: string,
+): Promise<RemoteTydeServerStatus> {
+  return invoke<RemoteTydeServerStatus>("launch_remote_tyde_server", {
+    host_id: hostId,
+  });
+}
+
+export function installAndLaunchRemoteTydeServer(
+  hostId: string,
+): Promise<RemoteTydeServerStatus> {
+  return invoke<RemoteTydeServerStatus>(
+    "install_and_launch_remote_tyde_server",
+    {
+      host_id: hostId,
+    },
+  );
+}
+
+export function upgradeRemoteTydeServer(
+  hostId: string,
+): Promise<RemoteTydeServerStatus> {
+  return invoke<RemoteTydeServerStatus>("upgrade_remote_tyde_server", {
+    host_id: hostId,
+  });
 }
 
 export function setDefaultBackend(backend: string) {

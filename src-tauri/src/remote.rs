@@ -110,7 +110,12 @@ pub fn shell_quote_command(args: &[String]) -> String {
 pub(crate) const SUBPROCESS_VERSION: &str = env!("SUBPROCESS_VERSION");
 pub(crate) const SUBPROCESS_GIT_REPO: &str = "https://github.com/tigy32/Tycode";
 pub(crate) const SUBPROCESS_CRATE_NAME: &str = "tycode-subprocess";
+pub(crate) const TYDE_GIT_REPO: &str = "https://github.com/tigy32/Tyde";
+pub(crate) const TYDE_BINARY_NAME: &str = "tyde";
 pub(crate) const TYDE_REMOTE_SOCKET_SUFFIX: &str = ".tyde/tyde.sock";
+pub(crate) const TYDE_REMOTE_INSTALLS_SUFFIX: &str = ".tyde/installs";
+pub(crate) const TYDE_REMOTE_HEADLESS_PID_SUFFIX: &str = ".tyde/run/tyde-headless.pid";
+pub(crate) const TYDE_REMOTE_HEADLESS_LOG_SUFFIX: &str = ".tyde/logs/tyde-headless.log";
 #[cfg(unix)]
 static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -245,7 +250,7 @@ pub async fn run_ssh_raw(host: &str, raw_cmd: &str) -> Result<std::process::Outp
     Ok(output)
 }
 
-async fn resolve_remote_home_dir(host: &str) -> Result<String, String> {
+pub(crate) async fn resolve_remote_home_dir(host: &str) -> Result<String, String> {
     let output = run_ssh_raw(host, "printf '%s' \"$HOME\"").await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -267,13 +272,334 @@ pub(crate) fn tyde_socket_path_from_home(home: &str) -> String {
     }
 }
 
-async fn is_remote_tyde_server_running(
+pub(crate) fn tyde_install_path_from_home(home: &str, version: &str, target: &str) -> String {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        format!(
+            "/{}/v{version}/{target}/{TYDE_BINARY_NAME}",
+            TYDE_REMOTE_INSTALLS_SUFFIX
+        )
+    } else {
+        format!(
+            "{home}/{}/v{version}/{target}/{TYDE_BINARY_NAME}",
+            TYDE_REMOTE_INSTALLS_SUFFIX
+        )
+    }
+}
+
+pub(crate) async fn resolve_remote_tyde_install_path(
+    host: &str,
+    version: &str,
+    target: &str,
+) -> Result<String, String> {
+    let home = resolve_remote_home_dir(host).await?;
+    Ok(tyde_install_path_from_home(&home, version, target))
+}
+
+pub(crate) async fn is_remote_tyde_server_running(
     host: &str,
     remote_socket_path: &str,
 ) -> Result<bool, String> {
     let socket_check = format!("test -S {}", shell_quote_arg(remote_socket_path));
     let socket_output = run_ssh_raw(host, &socket_check).await?;
     Ok(socket_output.status.success())
+}
+
+/// Detects the remote host's target triple for Tyde server binary downloads.
+pub(crate) async fn detect_remote_tyde_target(host: &str) -> Result<String, String> {
+    let output = run_ssh_raw(host, "uname -s && uname -m").await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to detect remote platform: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    if lines.len() < 2 {
+        return Err(format!("Unexpected uname output: {stdout}"));
+    }
+
+    let os = lines[0].trim();
+    let arch = lines[1].trim();
+
+    match (os, arch) {
+        ("Linux", "x86_64") => Ok("x86_64-unknown-linux-gnu".to_string()),
+        ("Linux", "aarch64") => Ok("aarch64-unknown-linux-gnu".to_string()),
+        ("Darwin", "x86_64") => Ok("x86_64-apple-darwin".to_string()),
+        ("Darwin", "arm64") => Ok("aarch64-apple-darwin".to_string()),
+        _ => Err(format!("Unsupported remote platform: {os} {arch}")),
+    }
+}
+
+pub(crate) async fn list_remote_tyde_installed_versions(host: &str) -> Result<Vec<String>, String> {
+    let cmd = format!(
+        "if [ -d \"$HOME/{installs}\" ]; then \
+            ls -1 \"$HOME/{installs}\" | sed -n 's/^v//p'; \
+         fi",
+        installs = TYDE_REMOTE_INSTALLS_SUFFIX,
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to list remote Tyde installs: {stderr}"));
+    }
+    let mut versions: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    versions.sort();
+    versions.dedup();
+    versions.reverse();
+    Ok(versions)
+}
+
+pub(crate) async fn check_remote_tyde_install(
+    host: &str,
+    version: &str,
+    target: &str,
+) -> Result<Option<String>, String> {
+    let path = resolve_remote_tyde_install_path(host, version, target).await?;
+    let cmd = format!(
+        "test -x {path} && printf '%s' {path}",
+        path = shell_quote_arg(&path),
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if resolved.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(resolved))
+}
+
+/// Resolve the `tyde` executable from the remote login shell PATH.
+pub(crate) async fn resolve_remote_tyde_from_path(host: &str) -> Result<Option<String>, String> {
+    let remote_path = resolve_remote_shell_path(host).await?;
+    let cmd = format!(
+        "PATH={} command -v {}",
+        shell_quote_arg(&remote_path),
+        shell_quote_arg(TYDE_BINARY_NAME)
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+/// Downloads a pre-built Tyde binary from GitHub releases.
+/// Returns the resolved absolute binary path on success.
+pub(crate) async fn install_remote_tyde_binary(
+    host: &str,
+    version: &str,
+) -> Result<String, String> {
+    let target = detect_remote_tyde_target(host).await?;
+    let archive = format!("{TYDE_BINARY_NAME}-{target}.tar.xz");
+    let url = format!(
+        "{repo}/releases/download/v{version}/{archive}",
+        repo = TYDE_GIT_REPO
+    );
+
+    let cmd = format!(
+        "TMP=$(mktemp -d) && \
+         curl -sSfL \"{url}\" | tar -xJ -C \"$TMP\" && \
+         BIN=$(find \"$TMP\" -type f -name \"{bin}\" | head -n 1) && \
+         test -n \"$BIN\" && \
+         INSTALL_DIR=\"$HOME/{installs}/v{version}/{target}\" && \
+         mkdir -p \"$INSTALL_DIR\" && \
+         mv \"$BIN\" \"$INSTALL_DIR/{bin}\" && \
+         chmod +x \"$INSTALL_DIR/{bin}\" && \
+         rm -rf \"$TMP\" && \
+         printf '%s' \"$INSTALL_DIR/{bin}\"",
+        bin = TYDE_BINARY_NAME,
+        installs = TYDE_REMOTE_INSTALLS_SUFFIX,
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Failed to install Tyde v{version} ({target}) on '{host}': {stderr}"
+        ));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(format!(
+            "Tyde v{version} install completed but no binary path was returned"
+        ));
+    }
+    Ok(path)
+}
+
+/// Starts Tyde in headless mode on the remote host and waits for the socket.
+pub(crate) async fn launch_remote_tyde_headless(
+    host: &str,
+    binary_path: &str,
+) -> Result<(), String> {
+    let cmd = format!(
+        "BIN={bin} && \
+         PIDFILE=\"$HOME/{pid}\" && \
+         LOGFILE=\"$HOME/{log}\" && \
+         SOCKET=\"$HOME/{socket}\" && \
+         mkdir -p \"$(dirname \"$PIDFILE\")\" \"$(dirname \"$LOGFILE\")\" && \
+         if [ -f \"$PIDFILE\" ]; then \
+           PID=$(cat \"$PIDFILE\" 2>/dev/null || true); \
+           if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then \
+             if [ -S \"$SOCKET\" ]; then \
+               printf '%s' \"already-running\"; \
+               exit 0; \
+             fi; \
+           fi; \
+           rm -f \"$PIDFILE\"; \
+         fi && \
+         nohup \"$BIN\" --headless >>\"$LOGFILE\" 2>&1 < /dev/null & \
+         PID=$! && \
+         printf '%s' \"$PID\" > \"$PIDFILE\" && \
+         i=0; \
+         while [ \"$i\" -lt 120 ]; do \
+           if [ -S \"$SOCKET\" ]; then \
+             printf '%s' \"started\"; \
+             exit 0; \
+           fi; \
+           if ! kill -0 \"$PID\" 2>/dev/null; then \
+             printf '%s' \"Tyde headless process exited early\"; \
+             exit 1; \
+           fi; \
+           sleep 0.1; \
+           i=$((i+1)); \
+         done; \
+         printf '%s' \"Timed out waiting for Tyde socket\"; \
+         exit 1",
+        bin = shell_quote_arg(binary_path),
+        pid = TYDE_REMOTE_HEADLESS_PID_SUFFIX,
+        log = TYDE_REMOTE_HEADLESS_LOG_SUFFIX,
+        socket = TYDE_REMOTE_SOCKET_SUFFIX,
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "unknown error".to_string()
+    };
+    Err(format!(
+        "Failed to launch Tyde headless on '{host}': {detail}"
+    ))
+}
+
+/// Stops Tyde headless on the remote host.
+pub(crate) async fn stop_remote_tyde_headless(host: &str) -> Result<(), String> {
+    let cmd = format!(
+        "PIDFILE=\"$HOME/{pid}\" && \
+         SOCKET=\"$HOME/{socket}\" && \
+         if [ -f \"$PIDFILE\" ]; then \
+           PID=$(cat \"$PIDFILE\" 2>/dev/null || true); \
+           if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null; then \
+             kill \"$PID\" 2>/dev/null || true; \
+             i=0; \
+             while [ \"$i\" -lt 50 ]; do \
+               if ! kill -0 \"$PID\" 2>/dev/null; then break; fi; \
+               sleep 0.1; \
+               i=$((i+1)); \
+             done; \
+             if kill -0 \"$PID\" 2>/dev/null; then \
+               kill -9 \"$PID\" 2>/dev/null || true; \
+             fi; \
+           fi; \
+           rm -f \"$PIDFILE\"; \
+         fi && \
+         if command -v pgrep >/dev/null 2>&1; then \
+           PIDS=$(pgrep -f 'tyde.*--headless' || true); \
+           if [ -n \"$PIDS\" ]; then kill $PIDS 2>/dev/null || true; fi; \
+         fi && \
+         if [ -S \"$SOCKET\" ]; then rm -f \"$SOCKET\" 2>/dev/null || true; fi && \
+         printf '%s' \"stopped\"",
+        pid = TYDE_REMOTE_HEADLESS_PID_SUFFIX,
+        socket = TYDE_REMOTE_SOCKET_SUFFIX,
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("Failed to stop remote Tyde headless: {stderr}"))
+}
+
+/// Queries the running remote Tyde server version using `tyde connect`.
+pub(crate) async fn query_remote_tyde_server_version(
+    host: &str,
+    connect_binary: &str,
+    client_tyde_version: &str,
+) -> Result<String, String> {
+    let handshake = serde_json::json!({
+        "type": "Handshake",
+        "req_id": 0,
+        "protocol_version": crate::protocol::PROTOCOL_VERSION,
+        "tyde_version": client_tyde_version,
+        "last_agent_event_seq": 0,
+        "last_chat_event_seqs": {},
+    })
+    .to_string();
+    let server_status = serde_json::json!({
+        "type": "Invoke",
+        "req_id": 1,
+        "command": "server_status",
+        "params": {},
+    })
+    .to_string();
+    let cmd = format!(
+        "printf '%s\\n%s\\n' {handshake} {status} | {binary} connect",
+        handshake = shell_quote_arg(&handshake),
+        status = shell_quote_arg(&server_status),
+        binary = shell_quote_arg(connect_binary),
+    );
+    let output = run_ssh_raw(host, &cmd).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to query remote server version: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parsed: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let req_id = parsed.get("req_id").and_then(|v| v.as_u64());
+        let frame_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if frame_type == "Error" && req_id == Some(1) {
+            let error = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Remote server status query failed: {error}"));
+        }
+        if frame_type == "Result" && req_id == Some(1) {
+            let version = parsed
+                .get("data")
+                .and_then(|data| data.get("tyde_version"))
+                .and_then(|v| v.as_str())
+                .ok_or("Remote server_status response missing tyde_version")?;
+            return Ok(version.to_string());
+        }
+    }
+
+    Err("Did not receive server_status response from remote Tyde server".to_string())
 }
 
 #[cfg(unix)]
@@ -747,7 +1073,8 @@ pub async fn connect_tyde_server_with_progress(
     if !is_remote_tyde_server_running(host, &remote_socket_path).await? {
         let msg = format!(
             "Tyde server is not running on '{host}' (missing {remote_socket_path}). \
-Start Tyde on the remote host with '--headless' and retry."
+Open Settings → Agent Control → Remote Tyde Server to install/launch it, or \
+start Tyde on the remote host with '--headless' and retry."
         );
         emit_progress("checking_server", "failed", &msg);
         return Err(msg);

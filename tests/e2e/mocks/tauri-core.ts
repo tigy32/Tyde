@@ -155,6 +155,18 @@ interface MockHost {
   remote_kind: "ssh_pipe" | "tyde_server";
 }
 
+interface MockRemoteTydeServerState {
+  installed_client_version: boolean;
+  running: boolean;
+  remote_version: string | null;
+  installed_versions: string[];
+  target: string;
+  error: string | null;
+}
+
+const MOCK_TYDE_VERSION = "0.7.0";
+const mockRemoteTydeServers = new Map<string, MockRemoteTydeServerState>();
+
 const mockHosts: MockHost[] = [
   {
     id: "local",
@@ -166,6 +178,56 @@ const mockHosts: MockHost[] = [
     remote_kind: "ssh_pipe",
   },
 ];
+
+function ensureMockRemoteTydeServer(hostId: string): MockRemoteTydeServerState {
+  let state = mockRemoteTydeServers.get(hostId);
+  if (!state) {
+    state = {
+      installed_client_version: false,
+      running: false,
+      remote_version: null,
+      installed_versions: [],
+      target: "x86_64-unknown-linux-gnu",
+      error: null,
+    };
+    mockRemoteTydeServers.set(hostId, state);
+  }
+  return state;
+}
+
+function buildMockRemoteTydeStatus(host: MockHost) {
+  const state = ensureMockRemoteTydeServer(host.id);
+  const status =
+    state.running && state.remote_version === MOCK_TYDE_VERSION
+      ? "running_current"
+      : state.running && state.remote_version !== null
+        ? "running_stale"
+        : state.running
+          ? "running_unknown"
+          : state.installed_client_version
+            ? "stopped"
+            : "not_installed";
+  return {
+    host_id: host.id,
+    host: host.hostname,
+    state: status,
+    local_version: MOCK_TYDE_VERSION,
+    remote_version: state.remote_version,
+    target: state.target,
+    socket_path: state.running
+      ? `/home/mock/.tyde/tyde.sock`
+      : `/home/mock/.tyde/tyde.sock`,
+    install_path: `/home/mock/.tyde/installs/v${MOCK_TYDE_VERSION}/${state.target}/tyde`,
+    installed_versions: [...state.installed_versions],
+    installed_client_version: state.installed_client_version,
+    running: state.running,
+    needs_upgrade:
+      !state.installed_client_version ||
+      (state.remote_version !== null &&
+        state.remote_version !== MOCK_TYDE_VERSION),
+    error: state.error,
+  };
+}
 
 function syncMockMcpSettingsFromStorage(): void {
   try {
@@ -925,6 +987,73 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
+    case "get_remote_tyde_server_status": {
+      const hostId = typeof args?.host_id === "string" ? args.host_id : "";
+      const host = mockHosts.find((h) => h.id === hostId || h.hostname === hostId);
+      if (!host) throw new Error(`Host '${hostId}' not found`);
+      if (host.is_local || host.remote_kind !== "tyde_server") {
+        throw new Error("Host is not configured as a Tyde Server");
+      }
+      return buildMockRemoteTydeStatus(host);
+    }
+
+    case "install_remote_tyde_server": {
+      const hostId = typeof args?.host_id === "string" ? args.host_id : "";
+      const host = mockHosts.find((h) => h.id === hostId || h.hostname === hostId);
+      if (!host) throw new Error(`Host '${hostId}' not found`);
+      const state = ensureMockRemoteTydeServer(host.id);
+      state.installed_client_version = true;
+      if (!state.installed_versions.includes(MOCK_TYDE_VERSION)) {
+        state.installed_versions.unshift(MOCK_TYDE_VERSION);
+      }
+      state.error = null;
+      return buildMockRemoteTydeStatus(host);
+    }
+
+    case "launch_remote_tyde_server": {
+      const hostId = typeof args?.host_id === "string" ? args.host_id : "";
+      const host = mockHosts.find((h) => h.id === hostId || h.hostname === hostId);
+      if (!host) throw new Error(`Host '${hostId}' not found`);
+      const state = ensureMockRemoteTydeServer(host.id);
+      if (!state.installed_client_version) {
+        throw new Error("Install Tyde on the remote host first");
+      }
+      state.running = true;
+      state.remote_version = MOCK_TYDE_VERSION;
+      state.error = null;
+      return buildMockRemoteTydeStatus(host);
+    }
+
+    case "install_and_launch_remote_tyde_server": {
+      const hostId = typeof args?.host_id === "string" ? args.host_id : "";
+      const host = mockHosts.find((h) => h.id === hostId || h.hostname === hostId);
+      if (!host) throw new Error(`Host '${hostId}' not found`);
+      const state = ensureMockRemoteTydeServer(host.id);
+      state.installed_client_version = true;
+      if (!state.installed_versions.includes(MOCK_TYDE_VERSION)) {
+        state.installed_versions.unshift(MOCK_TYDE_VERSION);
+      }
+      state.running = true;
+      state.remote_version = MOCK_TYDE_VERSION;
+      state.error = null;
+      return buildMockRemoteTydeStatus(host);
+    }
+
+    case "upgrade_remote_tyde_server": {
+      const hostId = typeof args?.host_id === "string" ? args.host_id : "";
+      const host = mockHosts.find((h) => h.id === hostId || h.hostname === hostId);
+      if (!host) throw new Error(`Host '${hostId}' not found`);
+      const state = ensureMockRemoteTydeServer(host.id);
+      state.installed_client_version = true;
+      if (!state.installed_versions.includes(MOCK_TYDE_VERSION)) {
+        state.installed_versions.unshift(MOCK_TYDE_VERSION);
+      }
+      state.running = true;
+      state.remote_version = MOCK_TYDE_VERSION;
+      state.error = null;
+      return buildMockRemoteTydeStatus(host);
+    }
+
     case "list_hosts":
       return mockHosts.map((h) => ({ ...h }));
 
@@ -943,6 +1072,9 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         remote_kind: remoteKind,
       };
       mockHosts.push(newHost);
+      if (remoteKind === "tyde_server") {
+        ensureMockRemoteTydeServer(newHost.id);
+      }
       return { ...newHost };
     }
 
@@ -950,6 +1082,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       const id = typeof args?.id === "string" ? args.id : "";
       const idx = mockHosts.findIndex((h) => h.id === id);
       if (idx >= 0 && !mockHosts[idx].is_local) {
+        mockRemoteTydeServers.delete(mockHosts[idx].id);
         mockHosts.splice(idx, 1);
       }
       return null;

@@ -18,12 +18,17 @@ import {
   getDriverMcpHttpServerSettings as getDriverMcpHttpServerSettingsBridge,
   getMcpHttpServerSettings as getMcpHttpServerSettingsBridge,
   getRemoteControlSettings as getRemoteControlSettingsBridge,
+  getRemoteTydeServerStatus as getRemoteTydeServerStatusBridge,
   type Host,
+  installAndLaunchRemoteTydeServer as installAndLaunchRemoteTydeServerBridge,
   installBackendDependency as installBackendDependencyBridge,
+  installRemoteTydeServer as installRemoteTydeServerBridge,
+  launchRemoteTydeServer as launchRemoteTydeServerBridge,
   listHosts as listHostsBridge,
   type McpHttpServerSettings,
   normalizeBackendKind,
   queryBackendUsage as queryBackendUsageBridge,
+  type RemoteTydeServerStatus,
   removeHost as removeHostBridge,
   setDriverMcpHttpServerAutoloadEnabled as setDriverMcpHttpServerAutoloadEnabledBridge,
   setDriverMcpHttpServerEnabled as setDriverMcpHttpServerEnabledBridge,
@@ -31,6 +36,7 @@ import {
   setRemoteControlEnabled as setRemoteControlEnabledBridge,
   updateHostDefaultBackend as updateHostDefaultBackendsBridge,
   updateHostEnabledBackends as updateHostEnabledBackendsBridge,
+  upgradeRemoteTydeServer as upgradeRemoteTydeServerBridge,
 } from "./bridge";
 import {
   broadcastToolOutputMode,
@@ -501,6 +507,16 @@ export class SettingsPanel {
     connected_clients: 0,
   };
   private remoteControlLoading = false;
+  private remoteTydeServerStatus: RemoteTydeServerStatus | null = null;
+  private remoteTydeServerStatusLoading = false;
+  private remoteTydeServerStatusError: string | null = null;
+  private remoteTydeServerStatusSeq = 0;
+  private remoteTydeServerActionLoading:
+    | "install"
+    | "launch"
+    | "install_launch"
+    | "upgrade"
+    | null = null;
   private hosts: Host[] = [];
   private hostsLoading = false;
   private selectedHostId: string | null = loadSelectedHostId();
@@ -696,9 +712,12 @@ export class SettingsPanel {
     this.backendUsage = {};
     this.backendUsageError.clear();
     this.backendUsageLoading.clear();
+    this.remoteTydeServerStatus = null;
+    this.remoteTydeServerStatusError = null;
     this.rerenderHostToolbar();
     this.rerenderPanelContent("backends", () => this.buildBackendsContent());
     this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+    this.refreshRemoteTydeServerStatusForSelectedHost();
     this.syncProfileDropdown();
     if (notify) this.notifySelectedHostChanged();
   }
@@ -710,6 +729,9 @@ export class SettingsPanel {
     if (changed) {
       this.selectedHostId = selected.id;
       saveSelectedHostId(selected.id);
+      this.remoteTydeServerStatus = null;
+      this.remoteTydeServerStatusError = null;
+      this.refreshRemoteTydeServerStatusForSelectedHost();
     }
     if (notify && changed) this.notifySelectedHostChanged();
   }
@@ -717,6 +739,80 @@ export class SettingsPanel {
   notifySelectedHostChanged(): void {
     const host = this.getSelectedHost();
     this.onHostChange?.(host);
+  }
+
+  private hostUsesRemoteTydeServer(host: Host | null): host is Host {
+    return !!host && !host.is_local && host.remote_kind === "tyde_server";
+  }
+
+  private refreshRemoteTydeServerStatusForSelectedHost(): void {
+    const selectedHost = this.getSelectedHost();
+    if (!this.hostUsesRemoteTydeServer(selectedHost)) {
+      this.remoteTydeServerStatus = null;
+      this.remoteTydeServerStatusError = null;
+      this.remoteTydeServerStatusLoading = false;
+      this.remoteTydeServerActionLoading = null;
+      this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+      return;
+    }
+
+    const seq = ++this.remoteTydeServerStatusSeq;
+    this.remoteTydeServerStatusLoading = true;
+    this.remoteTydeServerStatusError = null;
+    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+
+    getRemoteTydeServerStatusBridge(selectedHost.id)
+      .then((status) => {
+        if (seq !== this.remoteTydeServerStatusSeq) return;
+        this.remoteTydeServerStatus = status;
+      })
+      .catch((err) => {
+        if (seq !== this.remoteTydeServerStatusSeq) return;
+        this.remoteTydeServerStatusError =
+          err instanceof Error ? err.message : String(err);
+      })
+      .finally(() => {
+        if (seq !== this.remoteTydeServerStatusSeq) return;
+        this.remoteTydeServerStatusLoading = false;
+        this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+      });
+  }
+
+  private runRemoteTydeServerAction(
+    action: "install" | "launch" | "install_launch" | "upgrade",
+  ): void {
+    const selectedHost = this.getSelectedHost();
+    if (!this.hostUsesRemoteTydeServer(selectedHost)) return;
+
+    this.remoteTydeServerActionLoading = action;
+    this.remoteTydeServerStatusError = null;
+    this.rerenderPanelContent("tyde", () => this.buildTydeContent());
+
+    const run = () => {
+      switch (action) {
+        case "install":
+          return installRemoteTydeServerBridge(selectedHost.id);
+        case "launch":
+          return launchRemoteTydeServerBridge(selectedHost.id);
+        case "install_launch":
+          return installAndLaunchRemoteTydeServerBridge(selectedHost.id);
+        case "upgrade":
+          return upgradeRemoteTydeServerBridge(selectedHost.id);
+      }
+    };
+
+    run()
+      .then((status) => {
+        this.remoteTydeServerStatus = status;
+      })
+      .catch((err) => {
+        const detail = err instanceof Error ? err.message : String(err);
+        this.remoteTydeServerStatusError = detail;
+      })
+      .finally(() => {
+        this.remoteTydeServerActionLoading = null;
+        this.refreshRemoteTydeServerStatusForSelectedHost();
+      });
   }
 
   private buildHostToolbar(): HTMLElement {
@@ -2032,6 +2128,7 @@ export class SettingsPanel {
       .then((hosts) => {
         this.hosts = hosts;
         this.ensureSelectedHost(true);
+        this.refreshRemoteTydeServerStatusForSelectedHost();
       })
       .catch((err) => {
         console.error("Failed to load hosts:", err);
@@ -3855,8 +3952,170 @@ export class SettingsPanel {
     const frag = document.createDocumentFragment();
     frag.appendChild(this.buildMcpRuntimeControl());
     frag.appendChild(this.buildDriverMcpRuntimeControl());
+    frag.appendChild(this.buildRemoteTydeServerSection());
     frag.appendChild(this.buildRemoteControlSection());
     return frag;
+  }
+
+  private buildRemoteTydeServerSection(): HTMLElement {
+    const section = el("div", { class: "settings-section" });
+    section.appendChild(
+      el("h3", { class: "settings-section-header" }, "Remote Tyde Server"),
+    );
+
+    const selectedHost = this.getSelectedHost();
+    if (!this.hostUsesRemoteTydeServer(selectedHost)) {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Select a Tyde Server host to manage remote install and runtime.",
+        ),
+      );
+      return section;
+    }
+
+    section.appendChild(
+      el(
+        "p",
+        { class: "settings-description" },
+        `${selectedHost.hostname} · local v${this.remoteTydeServerStatus?.local_version ?? "?"}`,
+      ),
+    );
+
+    if (this.remoteTydeServerStatusLoading) {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description" },
+          "Checking remote Tyde server status...",
+        ),
+      );
+    } else if (this.remoteTydeServerStatusError) {
+      section.appendChild(
+        el(
+          "p",
+          { class: "settings-description settings-backend-warning" },
+          this.remoteTydeServerStatusError,
+        ),
+      );
+    }
+
+    const status =
+      this.remoteTydeServerStatus?.host_id === selectedHost.id
+        ? this.remoteTydeServerStatus
+        : null;
+
+    if (status) {
+      const lines: string[] = [];
+      switch (status.state) {
+        case "not_installed":
+          lines.push("Client-matching Tyde is not installed.");
+          break;
+        case "stopped":
+          lines.push("Tyde is installed but not running.");
+          break;
+        case "running_current":
+          lines.push("Tyde server is running and matches this client.");
+          break;
+        case "running_stale":
+          lines.push("Tyde server is running but version differs from client.");
+          break;
+        case "running_unknown":
+          lines.push("Tyde server is running; version could not be verified.");
+          break;
+        case "error":
+          lines.push("Could not fully inspect remote Tyde server.");
+          break;
+      }
+      if (status.target) lines.push(`Target: ${status.target}`);
+      if (status.install_path)
+        lines.push(`Install path: ${status.install_path}`);
+      if (status.socket_path) lines.push(`Socket: ${status.socket_path}`);
+      if (status.remote_version) {
+        lines.push(`Remote version: v${status.remote_version}`);
+      }
+      if (
+        !status.installed_client_version &&
+        status.installed_versions.length > 0
+      ) {
+        lines.push(
+          `Installed versions: ${status.installed_versions
+            .map((v) => `v${v}`)
+            .join(", ")}`,
+        );
+      }
+      if (status.error) {
+        section.appendChild(
+          el(
+            "p",
+            { class: "settings-description settings-backend-warning" },
+            status.error,
+          ),
+        );
+      }
+      for (const line of lines) {
+        section.appendChild(el("p", { class: "settings-description" }, line));
+      }
+    }
+
+    const actionRow = el("div", {
+      style: "display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;",
+    });
+    const busy = this.remoteTydeServerActionLoading !== null;
+
+    const makeActionButton = (
+      label: string,
+      action: "install" | "launch" | "install_launch" | "upgrade" | "refresh",
+      disabled: boolean,
+    ) => {
+      const actionLoading =
+        action !== "refresh" && this.remoteTydeServerActionLoading === action;
+      const button = el(
+        "button",
+        {
+          class: "settings-action-btn",
+          type: "button",
+        },
+        actionLoading ? "Working..." : label,
+      ) as HTMLButtonElement;
+      button.disabled = disabled || busy || this.remoteTydeServerStatusLoading;
+      button.addEventListener("click", () => {
+        if (action === "refresh") {
+          this.refreshRemoteTydeServerStatusForSelectedHost();
+          return;
+        }
+        this.runRemoteTydeServerAction(action);
+      });
+      return button;
+    };
+
+    const statusState = status?.state ?? "error";
+    const canInstallAndLaunch =
+      statusState === "not_installed" || statusState === "error" || !status;
+    const canLaunch =
+      !!status && status.installed_client_version && !status.running;
+    const canInstall = !status || !status.installed_client_version;
+    const canUpgrade = !!status && status.needs_upgrade;
+
+    if (canInstallAndLaunch) {
+      actionRow.appendChild(
+        makeActionButton("Install & Launch", "install_launch", false),
+      );
+    }
+    if (canLaunch) {
+      actionRow.appendChild(makeActionButton("Launch", "launch", false));
+    }
+    if (canInstall) {
+      actionRow.appendChild(makeActionButton("Install", "install", false));
+    }
+    if (canUpgrade) {
+      actionRow.appendChild(makeActionButton("Upgrade", "upgrade", false));
+    }
+    actionRow.appendChild(makeActionButton("Refresh", "refresh", false));
+
+    section.appendChild(actionRow);
+    return section;
   }
 
   private buildRemoteControlSection(): HTMLElement {

@@ -128,6 +128,27 @@ jobs:
           args: --target ${{ matrix.rust-target }}
           tauriScript: npx tauri
 
+      - name: Package headless Tyde server binary
+        if: matrix.platform != 'windows-latest'
+        run: |
+          BIN_DIR="src-tauri/target/${{ matrix.rust-target }}/release"
+          BIN_NAME="tyde"
+          BIN_PATH="$BIN_DIR/$BIN_NAME"
+          if [[ ! -x "$BIN_PATH" ]]; then
+            echo "Expected executable not found at $BIN_PATH"
+            exit 1
+          fi
+          ARCHIVE="$RUNNER_TEMP/tyde-${{ matrix.rust-target }}.tar.xz"
+          tar -cJf "$ARCHIVE" -C "$BIN_DIR" "$BIN_NAME"
+          echo "HEADLESS_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload headless Tyde server binary
+        if: matrix.platform != 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.inputs.version || github.ref_name }} "$HEADLESS_ARCHIVE" --clobber
+
       # ---- macOS: Rebuild DMG with drag-to-Applications ----
       - name: Rebuild macOS DMG
         if: startsWith(matrix.platform, 'macos')

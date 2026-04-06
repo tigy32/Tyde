@@ -62,8 +62,12 @@ use crate::file_watch::FileWatchManager;
 use crate::git_service::GitFileStatus;
 use crate::project_store::ProjectStore;
 use crate::remote::{
-    connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots, to_remote_uri,
-    validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
+    check_remote_tyde_install, connect_remote_with_progress, detect_remote_tyde_target,
+    install_remote_tyde_binary, is_remote_tyde_server_running, launch_remote_tyde_headless,
+    list_remote_tyde_installed_versions, parse_remote_path, parse_remote_workspace_roots,
+    query_remote_tyde_server_version, resolve_remote_home_dir, resolve_remote_tyde_from_path,
+    stop_remote_tyde_headless, to_remote_uri, tyde_socket_path_from_home, validate_remote_cli,
+    SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
 use crate::session_store::SessionStore;
 use crate::subprocess::ImageAttachment;
@@ -3927,6 +3931,270 @@ async fn set_remote_control_enabled(
     get_remote_control_settings(app, state).await
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteTydeServerState {
+    NotInstalled,
+    Stopped,
+    RunningCurrent,
+    RunningStale,
+    RunningUnknown,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct RemoteTydeServerStatus {
+    host_id: String,
+    host: String,
+    state: RemoteTydeServerState,
+    local_version: String,
+    remote_version: Option<String>,
+    target: Option<String>,
+    socket_path: Option<String>,
+    install_path: Option<String>,
+    installed_versions: Vec<String>,
+    installed_client_version: bool,
+    running: bool,
+    needs_upgrade: bool,
+    error: Option<String>,
+}
+
+fn resolve_remote_tyde_server_host(state: &AppState, host_id: &str) -> Result<host::Host, String> {
+    let store = state.host_store.lock();
+    let host = store.get(host_id).cloned().or_else(|| {
+        store
+            .list()
+            .into_iter()
+            .find(|entry| !entry.is_local && entry.hostname == host_id)
+    });
+    let host = host.ok_or_else(|| format!("Host '{host_id}' not found"))?;
+    if host.is_local {
+        return Err("Remote Tyde server actions are not valid for the local host".to_string());
+    }
+    if host.remote_kind != host::RemoteKind::TydeServer {
+        return Err(format!(
+            "Host '{}' is configured for SSH Pipe, not Tyde Server",
+            host.hostname
+        ));
+    }
+    Ok(host)
+}
+
+fn remote_tyde_error_status(host: &host::Host, error: String) -> RemoteTydeServerStatus {
+    RemoteTydeServerStatus {
+        host_id: host.id.clone(),
+        host: host.hostname.clone(),
+        state: RemoteTydeServerState::Error,
+        local_version: crate::protocol::TYDE_VERSION.to_string(),
+        remote_version: None,
+        target: None,
+        socket_path: None,
+        install_path: None,
+        installed_versions: Vec::new(),
+        installed_client_version: false,
+        running: false,
+        needs_upgrade: false,
+        error: Some(error),
+    }
+}
+
+fn remote_tyde_state_for_status(status: &RemoteTydeServerStatus) -> RemoteTydeServerState {
+    if status.running {
+        if let Some(remote) = &status.remote_version {
+            if remote == &status.local_version {
+                return RemoteTydeServerState::RunningCurrent;
+            }
+            return RemoteTydeServerState::RunningStale;
+        }
+        return RemoteTydeServerState::RunningUnknown;
+    }
+    if status.installed_client_version {
+        RemoteTydeServerState::Stopped
+    } else {
+        RemoteTydeServerState::NotInstalled
+    }
+}
+
+async fn collect_remote_tyde_server_status(host: &host::Host) -> RemoteTydeServerStatus {
+    let local_version = crate::protocol::TYDE_VERSION.to_string();
+
+    let home = match resolve_remote_home_dir(&host.hostname).await {
+        Ok(home) => home,
+        Err(err) => {
+            return remote_tyde_error_status(
+                host,
+                format!("Failed to resolve remote home directory: {err}"),
+            );
+        }
+    };
+
+    let socket_path = tyde_socket_path_from_home(&home);
+    let target = match detect_remote_tyde_target(&host.hostname).await {
+        Ok(target) => target,
+        Err(err) => {
+            return remote_tyde_error_status(
+                host,
+                format!("Failed to detect remote target: {err}"),
+            );
+        }
+    };
+
+    let install_path = crate::remote::tyde_install_path_from_home(&home, &local_version, &target);
+    let installed_versions = match list_remote_tyde_installed_versions(&host.hostname).await {
+        Ok(versions) => versions,
+        Err(err) => {
+            return remote_tyde_error_status(
+                host,
+                format!("Failed to read remote Tyde installs: {err}"),
+            );
+        }
+    };
+
+    let installed_client_version =
+        match check_remote_tyde_install(&host.hostname, &local_version, &target).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                return remote_tyde_error_status(
+                    host,
+                    format!("Failed to check client Tyde install on remote host: {err}"),
+                );
+            }
+        };
+
+    let running = match is_remote_tyde_server_running(&host.hostname, &socket_path).await {
+        Ok(running) => running,
+        Err(err) => {
+            return remote_tyde_error_status(
+                host,
+                format!("Failed to check remote Tyde socket status: {err}"),
+            );
+        }
+    };
+
+    let mut status = RemoteTydeServerStatus {
+        host_id: host.id.clone(),
+        host: host.hostname.clone(),
+        state: RemoteTydeServerState::Error,
+        local_version: local_version.clone(),
+        remote_version: None,
+        target: Some(target.clone()),
+        socket_path: Some(socket_path),
+        install_path: Some(install_path.clone()),
+        installed_versions,
+        installed_client_version,
+        running,
+        needs_upgrade: false,
+        error: None,
+    };
+
+    if running {
+        let connect_binary = if installed_client_version {
+            Some(install_path)
+        } else {
+            match resolve_remote_tyde_from_path(&host.hostname).await {
+                Ok(path) => path,
+                Err(err) => {
+                    status.error = Some(format!(
+                        "Could not resolve remote Tyde binary in PATH: {err}"
+                    ));
+                    None
+                }
+            }
+        };
+        if let Some(binary) = connect_binary {
+            match query_remote_tyde_server_version(&host.hostname, &binary, &local_version).await {
+                Ok(version) => status.remote_version = Some(version),
+                Err(err) => {
+                    status.error = Some(format!(
+                        "Could not query running remote Tyde version: {err}"
+                    ))
+                }
+            }
+        } else if status.error.is_none() {
+            status.error =
+                Some("Could not find a Tyde binary to query running server version".to_string());
+        }
+    }
+
+    status.needs_upgrade = !status.installed_client_version
+        || status
+            .remote_version
+            .as_ref()
+            .is_some_and(|remote| remote != &status.local_version);
+    status.state = remote_tyde_state_for_status(&status);
+    status
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_remote_tyde_server_status(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> Result<RemoteTydeServerStatus, String> {
+    let host = resolve_remote_tyde_server_host(state.inner(), &host_id)?;
+    Ok(collect_remote_tyde_server_status(&host).await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn install_remote_tyde_server(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> Result<RemoteTydeServerStatus, String> {
+    let host = resolve_remote_tyde_server_host(state.inner(), &host_id)?;
+    install_remote_tyde_binary(&host.hostname, crate::protocol::TYDE_VERSION).await?;
+    Ok(collect_remote_tyde_server_status(&host).await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn launch_remote_tyde_server(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> Result<RemoteTydeServerStatus, String> {
+    let host = resolve_remote_tyde_server_host(state.inner(), &host_id)?;
+    let target = detect_remote_tyde_target(&host.hostname).await?;
+    let install_path =
+        check_remote_tyde_install(&host.hostname, crate::protocol::TYDE_VERSION, &target)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "Tyde v{} is not installed on '{}'. Install it first.",
+                    crate::protocol::TYDE_VERSION,
+                    host.hostname
+                )
+            })?;
+    launch_remote_tyde_headless(&host.hostname, &install_path).await?;
+    state.tyde_server_connections.lock().remove(&host.id);
+    Ok(collect_remote_tyde_server_status(&host).await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn install_and_launch_remote_tyde_server(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> Result<RemoteTydeServerStatus, String> {
+    let host = resolve_remote_tyde_server_host(state.inner(), &host_id)?;
+    let install_path =
+        install_remote_tyde_binary(&host.hostname, crate::protocol::TYDE_VERSION).await?;
+    launch_remote_tyde_headless(&host.hostname, &install_path).await?;
+    state.tyde_server_connections.lock().remove(&host.id);
+    Ok(collect_remote_tyde_server_status(&host).await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn upgrade_remote_tyde_server(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+) -> Result<RemoteTydeServerStatus, String> {
+    let host = resolve_remote_tyde_server_host(state.inner(), &host_id)?;
+    let install_path =
+        install_remote_tyde_binary(&host.hostname, crate::protocol::TYDE_VERSION).await?;
+    stop_remote_tyde_headless(&host.hostname).await?;
+    launch_remote_tyde_headless(&host.hostname, &install_path).await?;
+    state.tyde_server_connections.lock().remove(&host.id);
+    Ok(collect_remote_tyde_server_status(&host).await)
+}
+
 #[tauri::command]
 fn list_hosts(state: tauri::State<'_, AppState>) -> Result<Vec<host::Host>, String> {
     let store = state.host_store.lock();
@@ -5686,6 +5954,11 @@ pub fn run_with_options(headless: bool) {
             set_mcp_control_enabled,
             get_remote_control_settings,
             set_remote_control_enabled,
+            get_remote_tyde_server_status,
+            install_remote_tyde_server,
+            launch_remote_tyde_server,
+            install_and_launch_remote_tyde_server,
+            upgrade_remote_tyde_server,
             list_hosts,
             add_host,
             remove_host,
