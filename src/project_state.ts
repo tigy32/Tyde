@@ -46,6 +46,34 @@ function projectFromRecord(record: ProjectRecord): Project {
   };
 }
 
+function mergeProjectServerData(existing: Project, incoming: Project): Project {
+  return {
+    ...incoming,
+    conversationIds: existing.conversationIds,
+    activeConversationId: existing.activeConversationId,
+    status: existing.status,
+  };
+}
+
+function dedupeProjectsById(projects: Project[]): Project[] {
+  const deduped: Project[] = [];
+  const indexById = new Map<string, number>();
+
+  for (const project of projects) {
+    const existingIndex = indexById.get(project.id);
+    if (existingIndex === undefined) {
+      indexById.set(project.id, deduped.length);
+      deduped.push(project);
+      continue;
+    }
+
+    const existing = deduped[existingIndex];
+    deduped[existingIndex] = mergeProjectServerData(existing, project);
+  }
+
+  return deduped;
+}
+
 export class ProjectStateManager {
   projects: Project[] = [];
   activeProjectId: string | null = null;
@@ -213,7 +241,7 @@ export class ProjectStateManager {
       updatedProjects.push(projectFromRecord(record));
     }
 
-    this.projects = updatedProjects;
+    this.projects = dedupeProjectsById(updatedProjects);
 
     // Validate activeProjectId
     if (

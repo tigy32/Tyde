@@ -1138,6 +1138,7 @@ export class SettingsPanel {
   private syncNavGroupsForActiveTab(): void {
     const uiActive =
       this.activeTab === "appearance" ||
+      this.activeTab === "notifications" ||
       this.activeTab === "backends" ||
       this.activeTab === "agents" ||
       this.activeTab === "tyde";
