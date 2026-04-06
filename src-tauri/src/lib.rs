@@ -1509,6 +1509,12 @@ async fn create_conversation_via_server(
     )
     .await?;
 
+    // Sync the cached remote_session_records so that owns_session_record()
+    // will recognise this newly-created session (needed for rename, delete, etc.)
+    conn.fetch_session_records().await.map_err(|err| {
+        format!("Created conversation but failed to refresh remote session cache: {err}")
+    })?;
+
     Ok(CreateConversationResponse {
         conversation_id: local_id,
         session_id,
@@ -1560,12 +1566,18 @@ async fn spawn_agent_via_server(
     let local_conversation_id = materialize_remote_conversation(
         app,
         state,
-        conn,
+        conn.clone(),
         conversation_id,
         &backend_kind_str,
         &request.workspace_roots,
     )
     .await?;
+
+    // Sync the cached remote_session_records so that owns_session_record()
+    // will recognise this newly-created session (needed for rename, delete, etc.)
+    conn.fetch_session_records().await.map_err(|err| {
+        format!("Spawned agent but failed to refresh remote session cache: {err}")
+    })?;
 
     Ok(SpawnAgentResponse {
         agent_id,
@@ -3599,11 +3611,13 @@ pub(crate) async fn rename_agent_tauri_free(
         let mut runtime = state.agent_runtime.lock().await;
         runtime.rename_agent(&agent_id, name.clone());
     }
-    // Update session store alias
-    if let Some(cid) = conversation_id {
-        let tyde_session_id = state.conversation_to_session.lock().get(&cid).cloned();
-        if let Some(sid) = tyde_session_id {
-            state.session_store.lock().set_alias(&sid, &name)?;
+    // Update session store alias (skip generic names so auto-titling can fire)
+    if !is_generic_agent_name(&name) {
+        if let Some(cid) = conversation_id {
+            let tyde_session_id = state.conversation_to_session.lock().get(&cid).cloned();
+            if let Some(sid) = tyde_session_id {
+                state.session_store.lock().set_alias(&sid, &name)?;
+            }
         }
     }
     Ok(())
