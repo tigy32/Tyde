@@ -4941,21 +4941,101 @@ pub(crate) fn emit_projects_changed(app: &tauri::AppHandle, state: &AppState) {
     }
 }
 
+fn emit_projects_changed_for_host(app: &tauri::AppHandle, state: &AppState, host: &host::Host) {
+    let projects = match state.project_store.lock().list() {
+        Ok(records) => filter_local_project_records_for_host(records, host),
+        Err(err) => {
+            tracing::error!("Failed to read project store for host-scoped change event: {err}");
+            return;
+        }
+    };
+    let payload = if host.is_local {
+        serde_json::json!({ "projects": projects })
+    } else {
+        serde_json::json!({ "host": host.hostname, "projects": projects })
+    };
+    let _ = app.emit("tyde-projects-changed", &payload);
+    if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+        let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+            event: "tyde-projects-changed".into(),
+            seq: None,
+            payload,
+        });
+    }
+}
+
+enum ProjectStoreRoute {
+    Local {
+        host: Option<host::Host>,
+    },
+    TydeServer {
+        connection: Arc<tyde_server_conn::TydeServerConnection>,
+    },
+}
+
+fn filter_local_project_records_for_host(
+    records: Vec<project_store::ProjectRecord>,
+    host: &host::Host,
+) -> Vec<project_store::ProjectRecord> {
+    if host.is_local {
+        return records
+            .into_iter()
+            .filter(|record| parse_remote_path(&record.workspace_path).is_none())
+            .collect();
+    }
+
+    records
+        .into_iter()
+        .filter(|record| {
+            parse_remote_path(&record.workspace_path)
+                .map(|remote| remote.host == host.hostname)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+async fn route_project_store(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    host: Option<&str>,
+) -> Result<ProjectStoreRoute, String> {
+    let Some(host_id) = host else {
+        return Ok(ProjectStoreRoute::Local { host: None });
+    };
+
+    let resolved = host_router::resolve_host_by_id_or_hostname(state, host_id)?;
+    if !resolved.is_local && resolved.remote_kind == host::RemoteKind::TydeServer {
+        let connection =
+            host_router::get_or_create_server_connection(app, state, &resolved).await?;
+        return Ok(ProjectStoreRoute::TydeServer { connection });
+    }
+
+    Ok(ProjectStoreRoute::Local {
+        host: Some(resolved),
+    })
+}
+
 #[tauri::command]
 async fn list_projects(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     host: Option<String>,
 ) -> Result<Vec<project_store::ProjectRecord>, String> {
-    if let Some(host_id) = host {
-        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        let records = conn.fetch_projects().await?;
-        Ok(records
-            .into_iter()
-            .map(|r| conn.normalize_project_record(r))
-            .collect())
-    } else {
-        state.project_store.lock().list()
+    match route_project_store(&app, state.inner(), host.as_deref()).await? {
+        ProjectStoreRoute::TydeServer { connection } => {
+            let records = connection.fetch_projects().await?;
+            Ok(records
+                .into_iter()
+                .map(|record| connection.normalize_project_record(record))
+                .collect())
+        }
+        ProjectStoreRoute::Local { host } => {
+            let records = state.project_store.lock().list()?;
+            if let Some(host) = host {
+                return Ok(filter_local_project_records_for_host(records, &host));
+            }
+            Ok(records)
+        }
     }
 }
 
@@ -4967,29 +5047,35 @@ async fn add_project(
     workspace_path: String,
     name: String,
 ) -> Result<project_store::ProjectRecord, String> {
-    if let Some(host_id) = host {
-        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        let remote_workspace_path =
-            host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
-                .into_iter()
-                .next()
-                .ok_or("Failed to resolve remote workspace path")?;
-        let resp = conn
-            .invoke(
-                "add_project",
-                serde_json::json!({
-                    "workspace_path": remote_workspace_path,
-                    "name": name
-                }),
-            )
-            .await?;
-        let record: project_store::ProjectRecord = serde_json::from_value(resp)
-            .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
-        Ok(conn.normalize_project_record(record))
-    } else {
-        let record = state.project_store.lock().add(&workspace_path, &name)?;
-        emit_projects_changed(&app, &state);
-        Ok(record)
+    match route_project_store(&app, state.inner(), host.as_deref()).await? {
+        ProjectStoreRoute::TydeServer { connection } => {
+            let remote_workspace_path =
+                host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
+                    .into_iter()
+                    .next()
+                    .ok_or("Failed to resolve remote workspace path")?;
+            let resp = connection
+                .invoke(
+                    "add_project",
+                    serde_json::json!({
+                        "workspace_path": remote_workspace_path,
+                        "name": name
+                    }),
+                )
+                .await?;
+            let record: project_store::ProjectRecord = serde_json::from_value(resp)
+                .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
+            Ok(connection.normalize_project_record(record))
+        }
+        ProjectStoreRoute::Local { host } => {
+            let record = state.project_store.lock().add(&workspace_path, &name)?;
+            if let Some(host) = host {
+                emit_projects_changed_for_host(&app, &state, &host);
+            } else {
+                emit_projects_changed(&app, &state);
+            }
+            Ok(record)
+        }
     }
 }
 
@@ -5003,36 +5089,42 @@ async fn add_project_workbench(
     name: String,
     kind: String,
 ) -> Result<project_store::ProjectRecord, String> {
-    if let Some(host_id) = host {
-        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        let remote_workspace_path =
-            host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
-                .into_iter()
-                .next()
-                .ok_or("Failed to resolve remote workspace path")?;
-        let resp = conn
-            .invoke(
-                "add_project_workbench",
-                serde_json::json!({
-                    "parent_project_id": parent_project_id,
-                    "workspace_path": remote_workspace_path,
-                    "name": name,
-                    "kind": kind
-                }),
-            )
-            .await?;
-        let record: project_store::ProjectRecord = serde_json::from_value(resp)
-            .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
-        Ok(conn.normalize_project_record(record))
-    } else {
-        let record = state.project_store.lock().add_workbench(
-            &parent_project_id,
-            &workspace_path,
-            &name,
-            &kind,
-        )?;
-        emit_projects_changed(&app, &state);
-        Ok(record)
+    match route_project_store(&app, state.inner(), host.as_deref()).await? {
+        ProjectStoreRoute::TydeServer { connection } => {
+            let remote_workspace_path =
+                host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
+                    .into_iter()
+                    .next()
+                    .ok_or("Failed to resolve remote workspace path")?;
+            let resp = connection
+                .invoke(
+                    "add_project_workbench",
+                    serde_json::json!({
+                        "parent_project_id": parent_project_id,
+                        "workspace_path": remote_workspace_path,
+                        "name": name,
+                        "kind": kind
+                    }),
+                )
+                .await?;
+            let record: project_store::ProjectRecord = serde_json::from_value(resp)
+                .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
+            Ok(connection.normalize_project_record(record))
+        }
+        ProjectStoreRoute::Local { host } => {
+            let record = state.project_store.lock().add_workbench(
+                &parent_project_id,
+                &workspace_path,
+                &name,
+                &kind,
+            )?;
+            if let Some(host) = host {
+                emit_projects_changed_for_host(&app, &state, &host);
+            } else {
+                emit_projects_changed(&app, &state);
+            }
+            Ok(record)
+        }
     }
 }
 
@@ -5043,15 +5135,22 @@ async fn remove_project(
     host: Option<String>,
     id: String,
 ) -> Result<(), String> {
-    if let Some(host_id) = host {
-        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        conn.invoke("remove_project", serde_json::json!({ "id": id }))
-            .await?;
-        Ok(())
-    } else {
-        state.project_store.lock().remove(&id)?;
-        emit_projects_changed(&app, &state);
-        Ok(())
+    match route_project_store(&app, state.inner(), host.as_deref()).await? {
+        ProjectStoreRoute::TydeServer { connection } => {
+            connection
+                .invoke("remove_project", serde_json::json!({ "id": id }))
+                .await?;
+            Ok(())
+        }
+        ProjectStoreRoute::Local { host } => {
+            state.project_store.lock().remove(&id)?;
+            if let Some(host) = host {
+                emit_projects_changed_for_host(&app, &state, &host);
+            } else {
+                emit_projects_changed(&app, &state);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -5063,18 +5162,25 @@ async fn rename_project(
     id: String,
     name: String,
 ) -> Result<(), String> {
-    if let Some(host_id) = host {
-        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        conn.invoke(
-            "rename_project",
-            serde_json::json!({ "id": id, "name": name }),
-        )
-        .await?;
-        Ok(())
-    } else {
-        state.project_store.lock().rename(&id, &name)?;
-        emit_projects_changed(&app, &state);
-        Ok(())
+    match route_project_store(&app, state.inner(), host.as_deref()).await? {
+        ProjectStoreRoute::TydeServer { connection } => {
+            connection
+                .invoke(
+                    "rename_project",
+                    serde_json::json!({ "id": id, "name": name }),
+                )
+                .await?;
+            Ok(())
+        }
+        ProjectStoreRoute::Local { host } => {
+            state.project_store.lock().rename(&id, &name)?;
+            if let Some(host) = host {
+                emit_projects_changed_for_host(&app, &state, &host);
+            } else {
+                emit_projects_changed(&app, &state);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -5086,18 +5192,25 @@ async fn update_project_roots(
     id: String,
     roots: Vec<String>,
 ) -> Result<(), String> {
-    if let Some(host_id) = host {
-        let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        conn.invoke(
-            "update_project_roots",
-            serde_json::json!({ "id": id, "roots": host_router::strip_ssh_roots(&roots) }),
-        )
-        .await?;
-        Ok(())
-    } else {
-        state.project_store.lock().update_roots(&id, roots)?;
-        emit_projects_changed(&app, &state);
-        Ok(())
+    match route_project_store(&app, state.inner(), host.as_deref()).await? {
+        ProjectStoreRoute::TydeServer { connection } => {
+            connection
+                .invoke(
+                    "update_project_roots",
+                    serde_json::json!({ "id": id, "roots": host_router::strip_ssh_roots(&roots) }),
+                )
+                .await?;
+            Ok(())
+        }
+        ProjectStoreRoute::Local { host } => {
+            state.project_store.lock().update_roots(&id, roots)?;
+            if let Some(host) = host {
+                emit_projects_changed_for_host(&app, &state, &host);
+            } else {
+                emit_projects_changed(&app, &state);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -6507,6 +6620,81 @@ mod tests {
         let state = test_app_state();
         let err = usage_transport_for_host_id(&state, Some("missing-host")).unwrap_err();
         assert!(err.contains("Host 'missing-host' not found"));
+    }
+
+    #[test]
+    fn resolve_host_by_id_or_hostname_accepts_hostname_alias() {
+        let state = test_app_state();
+        let remote = {
+            let mut store = state.host_store.lock();
+            store
+                .add(
+                    "Remote".into(),
+                    "alice@remote.example.com".into(),
+                    host::RemoteKind::SshPipe,
+                )
+                .expect("failed to add test host")
+        };
+
+        let by_id =
+            host_router::resolve_host_by_id_or_hostname(&state, &remote.id).expect("resolve by id");
+        assert_eq!(by_id.id, remote.id);
+
+        let by_hostname = host_router::resolve_host_by_id_or_hostname(&state, &remote.hostname)
+            .expect("resolve by hostname");
+        assert_eq!(by_hostname.id, remote.id);
+    }
+
+    #[test]
+    fn filter_local_project_records_for_host_matches_requested_scope() {
+        let state = test_app_state();
+        let (local_host, remote_host) = {
+            let mut store = state.host_store.lock();
+            let remote = store
+                .add(
+                    "Remote".into(),
+                    "alice@remote.example.com".into(),
+                    host::RemoteKind::SshPipe,
+                )
+                .expect("failed to add test host");
+            let local = store.get("local").cloned().expect("missing local host");
+            (local, remote)
+        };
+
+        let records = vec![
+            project_store::ProjectRecord {
+                id: "local-project".into(),
+                name: "Local".into(),
+                workspace_path: "/tmp/local".into(),
+                roots: vec![],
+                parent_project_id: None,
+                workbench_kind: None,
+            },
+            project_store::ProjectRecord {
+                id: "remote-project".into(),
+                name: "Remote".into(),
+                workspace_path: "ssh://alice@remote.example.com/home/alice/work".into(),
+                roots: vec![],
+                parent_project_id: None,
+                workbench_kind: None,
+            },
+            project_store::ProjectRecord {
+                id: "other-remote-project".into(),
+                name: "Other".into(),
+                workspace_path: "ssh://bob@other.example.com/home/bob/work".into(),
+                roots: vec![],
+                parent_project_id: None,
+                workbench_kind: None,
+            },
+        ];
+
+        let local_records = filter_local_project_records_for_host(records.clone(), &local_host);
+        assert_eq!(local_records.len(), 1);
+        assert_eq!(local_records[0].id, "local-project");
+
+        let remote_records = filter_local_project_records_for_host(records, &remote_host);
+        assert_eq!(remote_records.len(), 1);
+        assert_eq!(remote_records[0].id, "remote-project");
     }
 }
 

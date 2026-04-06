@@ -158,29 +158,21 @@ pub(crate) async fn route_agent(state: &AppState, agent_id: &str) -> Result<Agen
     }
 }
 
-pub(crate) async fn get_server_connection_by_id(
-    app: &AppHandle,
+pub(crate) fn resolve_host_by_id_or_hostname(
     state: &AppState,
     host_id: &str,
-) -> Result<Arc<TydeServerConnection>, String> {
-    if host_id == "local" {
-        return Err("Cannot get server connection for local host".to_string());
-    }
-
-    // Accept either a host ID or a hostname for compatibility with older
-    // frontend callers that routed project operations by SSH hostname.
-    let host = {
-        let store = state.host_store.lock();
-        store.get(host_id).cloned().or_else(|| {
+) -> Result<Host, String> {
+    let store = state.host_store.lock();
+    store
+        .get(host_id)
+        .cloned()
+        .or_else(|| {
             store
                 .list()
                 .into_iter()
                 .find(|host| !host.is_local && host.hostname == host_id)
         })
-    }
-    .ok_or_else(|| format!("Host '{host_id}' not found"))?;
-
-    get_or_create_server_connection(app, state, &host).await
+        .ok_or_else(|| format!("Host '{host_id}' not found"))
 }
 
 pub(crate) async fn get_or_create_server_connection(
@@ -188,6 +180,16 @@ pub(crate) async fn get_or_create_server_connection(
     state: &AppState,
     host: &Host,
 ) -> Result<Arc<TydeServerConnection>, String> {
+    if host.is_local {
+        return Err("Cannot get server connection for local host".to_string());
+    }
+    if host.remote_kind != RemoteKind::TydeServer {
+        return Err(format!(
+            "Host '{}' is configured for SSH Pipe, not Tyde Server",
+            host.hostname
+        ));
+    }
+
     // Check for existing healthy connection.
     let existing = {
         let conns = state.tyde_server_connections.lock();
