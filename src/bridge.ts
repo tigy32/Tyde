@@ -104,13 +104,15 @@ export function createConversation(
   backendKind?: BackendKind,
   ephemeral?: boolean,
   agentDefinitionId?: string,
+  uiOwnerProjectId?: string | null,
 ) {
   return execute("create_conversation", {
     workspaceRoots,
     backendKind,
     ephemeral,
     agentDefinitionId,
-  });
+    uiOwnerProjectId,
+  } as unknown as CommandParams<"create_conversation">);
 }
 
 export function sendMessage(
@@ -206,15 +208,17 @@ export function spawnAgent(
   parentAgentId?: string,
   name?: string,
   ephemeral?: boolean,
+  uiOwnerProjectId?: string | null,
 ) {
   return execute("spawn_agent", {
     workspaceRoots,
     prompt,
     backendKind,
     parentAgentId,
+    uiOwnerProjectId,
     name,
     ephemeral,
-  });
+  } as unknown as CommandParams<"spawn_agent">);
 }
 
 export function sendAgentMessage(agentId: string, message: string) {

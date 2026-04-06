@@ -120,6 +120,7 @@ impl BackendSubAgentEmitter {
                             self.backend_kind.clone(),
                             None,
                             "Conversation".to_string(),
+                            None,
                         )
                         .agent_id,
                     true,
@@ -176,6 +177,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                     self.backend_kind.clone(),
                     parent_agent_id.clone(),
                     display_name,
+                    None,
                 );
                 info.agent_type = if agent_type.is_empty() {
                     None
@@ -245,6 +247,7 @@ impl SubAgentEmitter for BackendSubAgentEmitter {
                     "name": &agent_info.name,
                     "agent_type": &agent_info.agent_type,
                     "parent_agent_id": parent_agent_id,
+                    "ui_owner_project_id": &agent_info.ui_owner_project_id,
                 }
             });
             let (settings_tx, _) = watch::channel(Value::Null);
@@ -615,6 +618,7 @@ pub(crate) struct SpawnAgentRequest {
     pub(crate) prompt: String,
     pub(crate) backend_kind: Option<String>,
     pub(crate) parent_agent_id: Option<AgentId>,
+    pub(crate) ui_owner_project_id: Option<String>,
     pub(crate) name: String,
     pub(crate) ephemeral: Option<bool>,
     /// Images to attach to the initial message sent to the agent.
@@ -1429,6 +1433,7 @@ async fn ensure_conversation_agent_registered(
     workspace_roots: &[String],
     backend_kind: &str,
     name: &str,
+    ui_owner_project_id: Option<String>,
 ) -> AgentInfo {
     if let Some(existing) = {
         let runtime = state.agent_runtime.lock().await;
@@ -1445,6 +1450,7 @@ async fn ensure_conversation_agent_registered(
             backend_kind.to_string(),
             None,
             name.to_string(),
+            ui_owner_project_id,
         )
     };
     state.agent_runtime_notify.notify_waiters();
@@ -1460,6 +1466,7 @@ async fn create_conversation_via_server(
     backend_kind: Option<String>,
     ephemeral: Option<bool>,
     agent_definition_id: Option<String>,
+    ui_owner_project_id: Option<String>,
 ) -> Result<CreateConversationResponse, String> {
     let remote_roots = host_router::strip_ssh_roots(&workspace_roots);
 
@@ -1471,6 +1478,7 @@ async fn create_conversation_via_server(
                 "backend_kind": backend_kind,
                 "ephemeral": ephemeral,
                 "agent_definition_id": agent_definition_id,
+                "ui_owner_project_id": ui_owner_project_id,
             }),
         )
         .await?;
@@ -1533,6 +1541,7 @@ async fn spawn_agent_via_server(
                 "prompt": request.prompt,
                 "backend_kind": request.backend_kind,
                 "parent_agent_id": request.parent_agent_id,
+                "ui_owner_project_id": request.ui_owner_project_id,
                 "name": request.name,
                 "ephemeral": request.ephemeral,
                 "agent_definition_id": request.agent_definition_id,
@@ -1886,6 +1895,7 @@ async fn create_conversation(
     backend_kind: Option<String>,
     ephemeral: Option<bool>,
     agent_definition_id: Option<String>,
+    ui_owner_project_id: Option<String>,
 ) -> Result<CreateConversationResponse, String> {
     create_conversation_tauri_free(
         &app,
@@ -1894,6 +1904,7 @@ async fn create_conversation(
         backend_kind,
         ephemeral,
         agent_definition_id,
+        ui_owner_project_id,
     )
     .await
 }
@@ -1905,6 +1916,7 @@ pub(crate) async fn create_conversation_tauri_free(
     backend_kind: Option<String>,
     ephemeral: Option<bool>,
     agent_definition_id: Option<String>,
+    ui_owner_project_id: Option<String>,
 ) -> Result<CreateConversationResponse, String> {
     // Route through TydeServer if the host is configured for it.
     match host_router::route_workspace(app, state, &workspace_roots).await? {
@@ -1917,6 +1929,7 @@ pub(crate) async fn create_conversation_tauri_free(
                 backend_kind,
                 ephemeral,
                 agent_definition_id,
+                ui_owner_project_id,
             )
             .await;
         }
@@ -2074,6 +2087,7 @@ pub(crate) async fn create_conversation_tauri_free(
             backend_kind.as_str().to_string(),
             None,
             def_name.clone(),
+            ui_owner_project_id.clone(),
         );
         runtime.update_agent_type(agent_id, agent_definition_id.clone());
         runtime.set_agent_definition(
@@ -2093,6 +2107,7 @@ pub(crate) async fn create_conversation_tauri_free(
             &workspace_roots,
             backend_kind.as_str(),
             &def_name,
+            ui_owner_project_id.clone(),
         )
         .await;
         if agent_definition_id.is_some() {
@@ -2145,6 +2160,7 @@ pub(crate) async fn create_conversation_tauri_free(
             "backend_kind": backend_kind.as_str(),
             "name": &root_agent.name,
             "parent_agent_id": null,
+            "ui_owner_project_id": root_agent.ui_owner_project_id,
         }
     });
 
@@ -2559,6 +2575,7 @@ pub(crate) async fn spawn_agent_internal(
         prompt,
         backend_kind,
         parent_agent_id,
+        ui_owner_project_id,
         name,
         ephemeral,
         images,
@@ -2715,6 +2732,7 @@ pub(crate) async fn spawn_agent_internal(
             backend_kind.as_str().to_string(),
             parent_agent_id.clone(),
             display_name.clone(),
+            ui_owner_project_id,
         );
         if agent_definition_id.is_some() {
             runtime.update_agent_type(&info.agent_id, agent_definition_id.clone());
@@ -2798,6 +2816,7 @@ pub(crate) async fn spawn_agent_internal(
             "backend_kind": backend_kind.as_str(),
             "name": &info.name,
             "parent_agent_id": parent_agent_id,
+            "ui_owner_project_id": info.ui_owner_project_id,
         }
     });
 
@@ -3336,6 +3355,7 @@ pub(crate) async fn run_query_screenshot_agent(
         prompt,
         backend_kind: None,
         parent_agent_id: None,
+        ui_owner_project_id: None,
         name: "__internal_query_screenshot__".to_string(),
         ephemeral: Some(true),
         images: Some(vec![image]),
@@ -3589,6 +3609,7 @@ async fn spawn_agent(
     prompt: String,
     backend_kind: Option<String>,
     parent_agent_id: Option<AgentId>,
+    ui_owner_project_id: Option<String>,
     name: String,
     ephemeral: Option<bool>,
 ) -> Result<SpawnAgentResponse, String> {
@@ -3600,6 +3621,7 @@ async fn spawn_agent(
             prompt,
             backend_kind,
             parent_agent_id,
+            ui_owner_project_id,
             name,
             ephemeral,
             images: None,
@@ -5029,6 +5051,7 @@ async fn restart_subprocess(
         &workspace_roots,
         backend_kind.as_str(),
         "Conversation",
+        None,
     )
     .await;
 
@@ -5040,6 +5063,7 @@ async fn restart_subprocess(
             "backend_kind": backend_kind.as_str(),
             "name": &root_agent.name,
             "parent_agent_id": null,
+            "ui_owner_project_id": root_agent.ui_owner_project_id,
         }
     });
 
@@ -5134,6 +5158,7 @@ async fn relaunch_conversation(
         &workspace_roots,
         backend_kind.as_str(),
         "Conversation",
+        None,
     )
     .await;
 
@@ -5145,6 +5170,7 @@ async fn relaunch_conversation(
             "backend_kind": backend_kind.as_str(),
             "name": &root_agent.name,
             "parent_agent_id": null,
+            "ui_owner_project_id": root_agent.ui_owner_project_id,
         }
     });
 
@@ -5891,6 +5917,7 @@ mod tests {
                 "tycode".into(),
                 None,
                 "test".into(),
+                None,
             );
             info.agent_id
         };
@@ -5925,6 +5952,7 @@ mod tests {
                     "tycode".into(),
                     None,
                     "parent".into(),
+                    None,
                 )
                 .agent_id
         };
@@ -5960,6 +5988,7 @@ mod tests {
                 "tycode".into(),
                 None,
                 "parent".into(),
+                None,
             );
             let unrelated = runtime.register_agent(
                 9202,
@@ -5967,6 +5996,7 @@ mod tests {
                 "tycode".into(),
                 None,
                 "other".into(),
+                None,
             );
             (caller.agent_id, unrelated.agent_id)
         };
@@ -6002,6 +6032,7 @@ mod tests {
                 "tycode".into(),
                 None,
                 "parent".into(),
+                None,
             );
             let child_a = runtime.register_agent(
                 9302,
@@ -6009,6 +6040,7 @@ mod tests {
                 "tycode".into(),
                 Some(parent.agent_id.clone()),
                 "child-a".into(),
+                None,
             );
             let child_b = runtime.register_agent(
                 9303,
@@ -6016,6 +6048,7 @@ mod tests {
                 "tycode".into(),
                 Some(parent.agent_id.clone()),
                 "child-b".into(),
+                None,
             );
             let _other = runtime.register_agent(
                 9304,
@@ -6023,6 +6056,7 @@ mod tests {
                 "tycode".into(),
                 None,
                 "other".into(),
+                None,
             );
             (parent.agent_id, child_a.agent_id, child_b.agent_id)
         };

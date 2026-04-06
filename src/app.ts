@@ -69,6 +69,16 @@ import { WorkspaceView } from "./workspace_view";
 const HOME_BRIDGE_VIEW_ID = "__home_bridge__";
 const HOME_BRIDGE_LABEL = "Bridge";
 const INTERNAL_AGENT_PREFIX = "__internal_";
+const HOME_OWNER_ID = HOME_BRIDGE_VIEW_ID;
+
+type RuntimeAgentWithOwner = RuntimeAgent & {
+  ui_owner_project_id?: string | null;
+};
+
+type ConversationRegisteredDataWithOwner =
+  ConversationRegisteredPayload["data"] & {
+    ui_owner_project_id?: string | null;
+  };
 
 export class AppController {
   private notifications!: NotificationManager;
@@ -85,6 +95,7 @@ export class AppController {
   private runtimeAgents = new Map<string, RuntimeAgent>();
   private runtimeAgentsByProjectId = new Map<string, RuntimeAgent[]>();
   private hiddenRuntimeAgentIds = new Set<string>();
+  private conversationOwnerProjectIds = new Map<number, string>();
   private registeredWorkflowCommandIds: string[] = [];
 
   private workspaceViews = new Map<string, WorkspaceView>();
@@ -167,6 +178,7 @@ export class AppController {
     }
 
     await onAgentChanged((agent) => {
+      this.recordConversationOwner(agent);
       this.runtimeAgents.set(agent.agent_id, agent);
       this.applyRuntimeAgents(Array.from(this.runtimeAgents.values()));
     });
@@ -650,6 +662,7 @@ export class AppController {
   }
 
   private applyRuntimeAgents(agents: RuntimeAgent[]): void {
+    this.syncConversationOwnersFromAgents(agents);
     const visibleAgents = agents.filter(
       (agent) =>
         !this.isInternalAgent(agent) &&
@@ -695,6 +708,18 @@ export class AppController {
   private resolveProjectForRuntimeAgent(
     agent: RuntimeAgent,
   ): { id: string; workspacePath: string } | null {
+    const explicitOwner = this.resolveConversationOwnerProjectId(
+      agent.conversation_id,
+      this.extractOwnerProjectIdFromRuntimeAgent(agent),
+    );
+    if (explicitOwner === HOME_OWNER_ID) return null;
+    if (explicitOwner) {
+      const ownedProject = this.projectState.projects.find(
+        (project) => project.id === explicitOwner,
+      );
+      if (ownedProject) return ownedProject;
+    }
+
     for (const [projectId, view] of this.workspaceViews) {
       if (projectId === HOME_BRIDGE_VIEW_ID) {
         // If the bridge view owns this conversation, it should stay there —
@@ -874,6 +899,14 @@ export class AppController {
   private handleConversationRegistered(
     payload: ConversationRegisteredPayload,
   ): void {
+    const ownerFromPayload = this.extractOwnerProjectIdFromConversationPayload(
+      payload.data,
+    );
+    const explicitOwner = this.resolveConversationOwnerProjectId(
+      payload.conversation_id,
+      ownerFromPayload,
+    );
+
     // If a view already owns this conversation (e.g. createNewConversationTab
     // registered it before this event arrived), route to that view to avoid
     // dual-ownership that sends events to a hidden workspace view.
@@ -886,19 +919,24 @@ export class AppController {
     }
 
     if (!view) {
-      // Top-level conversations created while the bridge view is active belong
-      // to the bridge view.  Resolve early to avoid getOrCreateWorkspaceView
-      // side-effects (e.g. syncing agents onto a project view, causing
-      // dual-ownership).
-      if (
-        payload.data.parent_agent_id == null &&
-        this.activeWorkspaceId === HOME_BRIDGE_VIEW_ID
-      ) {
+      if (explicitOwner === HOME_OWNER_ID) {
         view = this.homeBridgeView;
       } else {
-        let project = this.resolveProjectForWorkspaceRoots(
-          payload.data.workspace_roots,
-        );
+        let project: {
+          id: string;
+          workspacePath: string;
+          name: string;
+        } | null =
+          explicitOwner != null
+            ? (this.projectState.projects.find(
+                (entry) => entry.id === explicitOwner,
+              ) ?? null)
+            : null;
+        if (!project) {
+          project = this.resolveProjectForWorkspaceRoots(
+            payload.data.workspace_roots,
+          );
+        }
         if (!project) {
           project = this.resolveProjectByParentAgent(
             payload.data.parent_agent_id,
@@ -931,9 +969,10 @@ export class AppController {
       return;
     }
 
-    const agent: RuntimeAgent = {
+    const agent: RuntimeAgentWithOwner = {
       agent_id: agentId,
       conversation_id: payload.conversation_id,
+      ui_owner_project_id: explicitOwner,
       workspace_roots: payload.data.workspace_roots,
       backend_kind: payload.data.backend_kind,
       parent_agent_id: payload.data.parent_agent_id,
@@ -1015,6 +1054,64 @@ export class AppController {
 
   private normalizeWorkspacePath(path: string): string {
     return path.replace(/\\/g, "/").replace(/\/+$/, "");
+  }
+
+  private normalizeOwnerProjectId(
+    value: string | null | undefined,
+  ): string | null {
+    const trimmed = value?.trim();
+    if (!trimmed) return null;
+    return trimmed;
+  }
+
+  private extractOwnerProjectIdFromRuntimeAgent(
+    agent: RuntimeAgent,
+  ): string | null {
+    const withOwner = agent as RuntimeAgentWithOwner;
+    return this.normalizeOwnerProjectId(withOwner.ui_owner_project_id);
+  }
+
+  private extractOwnerProjectIdFromConversationPayload(
+    data: ConversationRegisteredPayload["data"],
+  ): string | null {
+    const withOwner = data as ConversationRegisteredDataWithOwner;
+    return this.normalizeOwnerProjectId(withOwner.ui_owner_project_id);
+  }
+
+  private resolveConversationOwnerProjectId(
+    conversationId: number,
+    candidateOwner: string | null | undefined,
+  ): string | null {
+    const normalized = this.normalizeOwnerProjectId(candidateOwner);
+    if (normalized) {
+      this.conversationOwnerProjectIds.set(conversationId, normalized);
+      return normalized;
+    }
+    return this.conversationOwnerProjectIds.get(conversationId) ?? null;
+  }
+
+  private recordConversationOwner(agent: RuntimeAgent): void {
+    const owner = this.extractOwnerProjectIdFromRuntimeAgent(agent);
+    if (!owner) return;
+    this.conversationOwnerProjectIds.set(agent.conversation_id, owner);
+  }
+
+  private syncConversationOwnersFromAgents(agents: RuntimeAgent[]): void {
+    const activeConversationIds = new Set<number>();
+    for (const agent of agents) {
+      activeConversationIds.add(agent.conversation_id);
+      this.recordConversationOwner(agent);
+    }
+
+    for (const conversationId of this.conversationOwnerProjectIds.keys()) {
+      if (activeConversationIds.has(conversationId)) continue;
+      const ownedByAnyView = Array.from(this.workspaceViews.values()).some(
+        (view) => view.ownsConversation(conversationId),
+      );
+      if (!ownedByAnyView) {
+        this.conversationOwnerProjectIds.delete(conversationId);
+      }
+    }
   }
 
   private routeChatEvent(payload: ChatEventPayload): void {
@@ -1209,6 +1306,7 @@ export class AppController {
   private async refreshRuntimeAgentsSnapshot(): Promise<void> {
     try {
       const agents = await listAgents();
+      this.syncConversationOwnersFromAgents(agents);
       this.runtimeAgents = new Map(
         agents.map((agent) => [agent.agent_id, agent]),
       );

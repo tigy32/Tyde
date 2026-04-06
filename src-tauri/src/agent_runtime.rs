@@ -15,6 +15,7 @@ const DEFAULT_EVENT_LOG_LIMIT: usize = 5_000;
 pub struct AgentInfo {
     pub agent_id: AgentId,
     pub conversation_id: u64,
+    pub ui_owner_project_id: Option<String>,
     pub workspace_roots: Vec<String>,
     pub backend_kind: String,
     pub parent_agent_id: Option<AgentId>,
@@ -128,6 +129,7 @@ impl AgentRuntime {
         backend_kind: String,
         parent_agent_id: Option<AgentId>,
         name: String,
+        ui_owner_project_id: Option<String>,
     ) -> AgentInfo {
         let agent_id = self.reserve_agent_id();
         self.register_agent_with_id(
@@ -137,6 +139,7 @@ impl AgentRuntime {
             backend_kind,
             parent_agent_id,
             name,
+            ui_owner_project_id,
         )
     }
 
@@ -148,12 +151,22 @@ impl AgentRuntime {
         backend_kind: String,
         parent_agent_id: Option<AgentId>,
         name: String,
+        ui_owner_project_id: Option<String>,
     ) -> AgentInfo {
         let now = now_ms();
+        let explicit_owner = ui_owner_project_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let inherited_owner = parent_agent_id
+            .as_ref()
+            .and_then(|parent_id| self.agents.get(parent_id))
+            .and_then(|parent| parent.ui_owner_project_id.clone());
+        let owner_project_id = explicit_owner.or(inherited_owner);
 
         let info = AgentInfo {
             agent_id: agent_id.clone(),
             conversation_id,
+            ui_owner_project_id: owner_project_id,
             workspace_roots,
             backend_kind,
             parent_agent_id,
@@ -605,6 +618,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
         let agent_id = info.agent_id;
 
@@ -632,6 +646,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
         assert!(rt.get_agent(&info.agent_id).unwrap().is_running);
 
@@ -656,6 +671,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
 
         rt.record_chat_event(100, &json!({ "kind": "TypingStatusChanged", "data": true }));
@@ -693,6 +709,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
         let result = rt.collect_result(&info.agent_id);
         assert!(result.is_err());
@@ -716,6 +733,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
 
         rt.record_chat_event(300, &json!({ "kind": "TypingStatusChanged", "data": true }));
@@ -739,6 +757,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
 
         rt.record_chat_event(400, &json!({ "kind": "TypingStatusChanged", "data": true }));
@@ -761,6 +780,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
 
         rt.record_chat_event(500, &json!({ "kind": "TypingStatusChanged", "data": true }));
@@ -783,6 +803,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
 
         rt.record_chat_event(
@@ -803,6 +824,7 @@ mod tests {
             "tycode".into(),
             None,
             "test".into(),
+            None,
         );
         let changed = rt.mark_conversation_closed(700, Some("Terminated".to_string()));
         assert!(changed);
@@ -810,5 +832,32 @@ mod tests {
         let agent = rt.get_agent(&info.agent_id).unwrap();
         assert!(!agent.is_running);
         assert!(agent.ended_at_ms.is_some());
+    }
+
+    #[test]
+    fn child_agent_inherits_ui_owner_from_parent() {
+        let mut rt = AgentRuntime::new();
+        let parent = rt.register_agent(
+            800,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            None,
+            "parent".into(),
+            Some("project-a".into()),
+        );
+        let child = rt.register_agent(
+            801,
+            vec!["/tmp".into()],
+            "tycode".into(),
+            Some(parent.agent_id.clone()),
+            "child".into(),
+            None,
+        );
+
+        assert_eq!(
+            rt.get_agent(&child.agent_id)
+                .and_then(|agent| agent.ui_owner_project_id),
+            Some("project-a".to_string()),
+        );
     }
 }

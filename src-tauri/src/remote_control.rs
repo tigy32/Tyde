@@ -680,6 +680,7 @@ async fn dispatch_invoke(
                 backend_kind: Option<String>,
                 ephemeral: Option<bool>,
                 agent_definition_id: Option<String>,
+                ui_owner_project_id: Option<String>,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
             let resp = crate::create_conversation(
@@ -689,6 +690,7 @@ async fn dispatch_invoke(
                 p.backend_kind,
                 p.ephemeral,
                 p.agent_definition_id,
+                p.ui_owner_project_id,
             )
             .await?;
             let backend_kind = {
@@ -757,6 +759,7 @@ async fn dispatch_invoke(
                 prompt: String,
                 backend_kind: Option<String>,
                 parent_agent_id: Option<String>,
+                ui_owner_project_id: Option<String>,
                 name: String,
                 ephemeral: Option<bool>,
                 agent_definition_id: Option<String>,
@@ -770,6 +773,7 @@ async fn dispatch_invoke(
                     prompt: p.prompt,
                     backend_kind: p.backend_kind,
                     parent_agent_id: p.parent_agent_id,
+                    ui_owner_project_id: p.ui_owner_project_id,
                     name: p.name,
                     ephemeral: p.ephemeral,
                     images: None,

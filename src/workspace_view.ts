@@ -1312,6 +1312,7 @@ export class WorkspaceView {
         undefined,
         `${INTERNAL_TITLE_AGENT_PREFIX}${conversationId}`,
         true,
+        this.projectId,
       );
       titleAgentId = spawned.agent_id;
       await waitForAgent(titleAgentId);
@@ -1521,6 +1522,7 @@ export class WorkspaceView {
         backendKind,
         options?.ephemeral,
         effectiveDefinitionId,
+        this.projectId,
       );
       id = result.conversation_id;
       tydeSessionId = result.session_id;
@@ -2225,6 +2227,8 @@ export class WorkspaceView {
         this.resolveWorkspaceRootsForBackend(backendKind),
         backendKind,
         true,
+        undefined,
+        this.projectId,
       );
       const id = result.conversation_id;
       this.conversationTydeSessionMap.set(id, result.session_id);
@@ -2309,6 +2313,8 @@ export class WorkspaceView {
         this.resolveWorkspaceRootsForBackend(backendKind),
         backendKind,
         true,
+        undefined,
+        this.projectId,
       );
       const id = result.conversation_id;
       this.conversationTydeSessionMap.set(id, result.session_id);
