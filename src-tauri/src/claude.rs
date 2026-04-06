@@ -948,10 +948,7 @@ impl ClaudeInner {
 
         let process_exited_cleanly = if matches!(wait_result, WaitResult::Cancelled) {
             let _ = child.kill().await;
-            child
-                .wait()
-                .await
-                .is_ok_and(|status| status.success())
+            child.wait().await.is_ok_and(|status| status.success())
         } else {
             false
         };
@@ -5024,10 +5021,9 @@ mod tests {
 
     #[test]
     fn parse_remote_claude_session_header_keeps_epoch_millis() {
-        let (name, message_count, created_at, last_modified) = parse_remote_claude_session_header(
-            "session-b.jsonl\t5\t1710000000123\t1710009999123",
-        )
-        .expect("header should parse");
+        let (name, message_count, created_at, last_modified) =
+            parse_remote_claude_session_header("session-b.jsonl\t5\t1710000000123\t1710009999123")
+                .expect("header should parse");
 
         assert_eq!(name, "session-b.jsonl");
         assert_eq!(message_count, 5);
@@ -5050,16 +5046,14 @@ mod tests {
         let contents = r#"{"type":"user","timestamp":"2026-04-02T18:17:22.438Z","message":{"content":[{"type":"text","text":"first"}]}}
 {"type":"assistant","timestamp":"2026-04-02T19:20:23.100Z","message":{"content":[{"type":"text","text":"second"}]}}"#;
 
-        let parsed = inspect_claude_session_contents(
-            "session-d.jsonl",
-            contents,
-            "/tmp/workspace",
-            0,
-            0,
-        )
-        .expect("session should parse");
+        let parsed =
+            inspect_claude_session_contents("session-d.jsonl", contents, "/tmp/workspace", 0, 0)
+                .expect("session should parse");
 
-        let created_at = parsed.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+        let created_at = parsed
+            .get("created_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let last_modified = parsed
             .get("last_modified")
             .and_then(Value::as_u64)

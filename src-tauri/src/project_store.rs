@@ -133,16 +133,16 @@ impl ProjectStore {
         self.records.values().find(|r| r.workspace_path == path)
     }
 
-    pub fn add(
-        &mut self,
-        workspace_path: &str,
-        name: &str,
-    ) -> Result<ProjectRecord, String> {
+    pub fn add(&mut self, workspace_path: &str, name: &str) -> Result<ProjectRecord, String> {
         // Check for duplicate workspace_path
         if let Ok(fresh) = Self::read_from_disk(&self.path) {
             self.records = fresh;
         }
-        if let Some(existing) = self.records.values().find(|r| r.workspace_path == workspace_path) {
+        if let Some(existing) = self
+            .records
+            .values()
+            .find(|r| r.workspace_path == workspace_path)
+        {
             return Ok(existing.clone());
         }
 
@@ -173,19 +173,18 @@ impl ProjectStore {
         if let Ok(fresh) = Self::read_from_disk(&self.path) {
             self.records = fresh;
         }
-        if let Some(existing) = self.records.values().find(|r| r.workspace_path == workspace_path) {
+        if let Some(existing) = self
+            .records
+            .values()
+            .find(|r| r.workspace_path == workspace_path)
+        {
             return Ok(existing.clone());
         }
 
         // Copy roots from parent — parent must exist
-        let parent = self
-            .records
-            .get(parent_project_id)
-            .ok_or_else(|| {
-                format!(
-                    "Parent project '{parent_project_id}' not found in project store"
-                )
-            })?;
+        let parent = self.records.get(parent_project_id).ok_or_else(|| {
+            format!("Parent project '{parent_project_id}' not found in project store")
+        })?;
         let parent_roots = parent.roots.clone();
 
         let id = uuid::Uuid::new_v4().to_string();

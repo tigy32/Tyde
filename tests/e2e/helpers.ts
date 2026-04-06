@@ -1,9 +1,9 @@
 export const sel = {
   // App chrome
-  app: '#app',
+  app: "#app",
   appTitle: '[data-testid="app-title"]',
-  openWorkspaceBtn: '#open-workspace-btn',
-  openRemoteBtn: '#open-remote-workspace-btn',
+  openWorkspaceBtn: "#open-workspace-btn",
+  openRemoteBtn: "#open-remote-workspace-btn",
 
   // Chat
   chatContainer: '[data-testid="chat-container"]',
@@ -55,10 +55,10 @@ export const sel = {
   sessionCard: '[data-testid="session-card"]',
 
   // Agents
-  agentsPanel: '.agents-panel',
-  agentCard: '.agent-card',
-  agentCardTitle: '.agent-card-title',
-  agentCardRunning: '.agent-card.agent-card-running',
+  agentsPanel: ".agents-panel",
+  agentCard: ".agent-card",
+  agentCardTitle: ".agent-card-title",
+  agentCardRunning: ".agent-card.agent-card-running",
   agentCardInterrupt: '[data-testid="agent-card-interrupt"]',
   agentCardTerminate: '[data-testid="agent-card-terminate"]',
   agentCardRemove: '[data-testid="agent-card-remove"]',
@@ -139,7 +139,8 @@ export const sel = {
   dockWidgetTab: '[data-testid="dock-widget-tab"]',
   dockConversationTab: '[data-testid="dock-conversation-tab"]',
   dockedConversation: '[data-testid="docked-conversation"]',
-  dockConversationTabActive: '[data-testid="dock-conversation-tab"].dock-widget-tab-active',
+  dockConversationTabActive:
+    '[data-testid="dock-conversation-tab"].dock-widget-tab-active',
 
   // Text prompt dialog
   textPrompt: '[data-testid="text-prompt"]',
@@ -153,20 +154,22 @@ export const sel = {
   connectionClose: '[data-testid="connection-close"]',
 };
 
-export async function resetAppState(storageEntries: Record<string, string> = {}): Promise<void> {
-  await browser.url('/');
+export async function resetAppState(
+  storageEntries: Record<string, string> = {},
+): Promise<void> {
+  await browser.url("/");
   await browser.execute((entries: Record<string, string>) => {
     window.localStorage.clear();
     const defaults: Record<string, string> = {
-      'mock-mcp-http-enabled': 'true',
-      'tyde-onboarding-complete': 'true',
+      "mock-mcp-http-enabled": "true",
+      "tyde-onboarding-complete": "true",
     };
     const merged = { ...defaults, ...entries };
     for (const [key, value] of Object.entries(merged)) {
       window.localStorage.setItem(key, value);
     }
   }, storageEntries);
-  await browser.url('/');
+  await browser.url("/");
 }
 
 export async function openWorkspace(): Promise<void> {
@@ -180,27 +183,28 @@ export async function openWorkspace(): Promise<void> {
 
   const title = await $(sel.appTitle);
   await browser.waitUntil(
-    async () => (await title.getText()).includes('workspace'),
-    { timeout: 10_000, timeoutMsg: 'Workspace did not load' },
+    async () => (await title.getText()).includes("workspace"),
+    { timeout: 10_000, timeoutMsg: "Workspace did not load" },
   );
 }
 
 export async function openWorkspaceAndWaitForChat(): Promise<void> {
   await openWorkspace();
 
-  await browser.keys(['Control', 'n']);
+  await browser.keys(["Control", "n"]);
 
   const input = await $(sel.messageInput);
   await input.waitForDisplayed({ timeout: 10_000 });
 }
 
 export async function openRemoteWorkspaceAndWaitForChat(): Promise<void> {
-  await browser.url('/');
+  await browser.url("/");
   const app = await $(sel.app);
   await app.waitForExist({ timeout: 10_000 });
 
   await browser.execute(() => {
-    (window as any).__mockDialogPath = 'ssh://testuser@remotehost.example.com/home/testuser/project';
+    (window as any).__mockDialogPath =
+      "ssh://testuser@remotehost.example.com/home/testuser/project";
   });
 
   const openWorkspace = await $(sel.openWorkspaceBtn);
@@ -209,17 +213,19 @@ export async function openRemoteWorkspaceAndWaitForChat(): Promise<void> {
 
   const title = await $(sel.appTitle);
   await browser.waitUntil(
-    async () => (await title.getText()).includes('remotehost'),
-    { timeout: 15_000, timeoutMsg: 'Remote workspace did not load' },
+    async () => (await title.getText()).includes("remotehost"),
+    { timeout: 15_000, timeoutMsg: "Remote workspace did not load" },
   );
 
-  await browser.keys(['Control', 'n']);
+  await browser.keys(["Control", "n"]);
 
   const input = await $(sel.messageInput);
   await input.waitForDisplayed({ timeout: 10_000 });
 }
 
-export async function sendPromptAndWaitForAssistant(prompt: string): Promise<void> {
+export async function sendPromptAndWaitForAssistant(
+  prompt: string,
+): Promise<void> {
   const countBefore = await browser.execute(
     (s: string) => document.querySelectorAll(s).length,
     sel.assistantMessage,
@@ -231,7 +237,7 @@ export async function sendPromptAndWaitForAssistant(prompt: string): Promise<voi
     (el: HTMLElement, text: string) => {
       const inputEl = el as HTMLTextAreaElement;
       inputEl.value = text;
-      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      inputEl.dispatchEvent(new Event("input", { bubbles: true }));
     },
     input,
     prompt,
@@ -246,13 +252,17 @@ export async function sendPromptAndWaitForAssistant(prompt: string): Promise<voi
 
   await browser.waitUntil(
     async () => {
-      return browser.execute((prevCount: number, s: string) => {
-        const messages = Array.from(document.querySelectorAll(s));
-        if (messages.length <= prevCount) return false;
-        const last = messages[messages.length - 1];
-        return !last.classList.contains('streaming');
-      }, countBefore, sel.assistantMessage);
+      return browser.execute(
+        (prevCount: number, s: string) => {
+          const messages = Array.from(document.querySelectorAll(s));
+          if (messages.length <= prevCount) return false;
+          const last = messages[messages.length - 1];
+          return !last.classList.contains("streaming");
+        },
+        countBefore,
+        sel.assistantMessage,
+      );
     },
-    { timeout: 10_000, timeoutMsg: 'Assistant response did not complete' },
+    { timeout: 10_000, timeoutMsg: "Assistant response did not complete" },
   );
 }

@@ -1,4 +1,4 @@
-import { emit } from '@tauri-apps/api/event';
+import { emit } from "@tauri-apps/api/event";
 
 interface ConversationState {
   workspaceRoots: string[];
@@ -67,33 +67,34 @@ function defaultMockSessionsByBackend(): Record<string, MockSessionState[]> {
   return {
     tycode: [
       {
-        id: 'tycode-session-1',
-        title: 'Tycode Session 1',
+        id: "tycode-session-1",
+        title: "Tycode Session 1",
         created_at: now - 30_000,
         last_modified: now - 10_000,
         message_count: 5,
-        last_message_preview: 'Tycode Session 1',
-        workspace_root: '/mock/workspace',
-        backend_kind: 'tycode',
+        last_message_preview: "Tycode Session 1",
+        workspace_root: "/mock/workspace",
+        backend_kind: "tycode",
       },
     ],
     codex: [
       {
-        id: 'codex-session-1',
-        title: 'Codex Session 1',
+        id: "codex-session-1",
+        title: "Codex Session 1",
         created_at: now - 25_000,
         last_modified: now - 8_000,
         message_count: 3,
-        last_message_preview: 'Codex Session 1',
-        workspace_root: '/mock/workspace',
-        backend_kind: 'codex',
+        last_message_preview: "Codex Session 1",
+        workspace_root: "/mock/workspace",
+        backend_kind: "codex",
       },
     ],
     claude: [],
   };
 }
 
-let mockSessionsByBackend: Record<string, MockSessionState[]> = defaultMockSessionsByBackend();
+const mockSessionsByBackend: Record<string, MockSessionState[]> =
+  defaultMockSessionsByBackend();
 
 interface MockSessionRecord {
   id: string;
@@ -139,10 +140,10 @@ seedDefaultSessionRecords();
 let nextTerminalId = 70_000;
 const terminalWorkspaceById = new Map<number, string>();
 let mockMcpHttpServerEnabled = true;
-const mockMcpHttpServerUrl = 'http://127.0.0.1:47771/mcp';
+const mockMcpHttpServerUrl = "http://127.0.0.1:47771/mcp";
 let mockDriverMcpHttpServerEnabled = false;
 let mockDriverMcpHttpServerAutoload = false;
-const mockDriverMcpHttpServerUrl = 'http://127.0.0.1:47772/mcp';
+const mockDriverMcpHttpServerUrl = "http://127.0.0.1:47772/mcp";
 
 interface MockHost {
   id: string;
@@ -151,26 +152,26 @@ interface MockHost {
   is_local: boolean;
   enabled_backends: string[];
   default_backend: string;
-  remote_kind: 'ssh_pipe' | 'tyde_server';
+  remote_kind: "ssh_pipe" | "tyde_server";
 }
 
 const mockHosts: MockHost[] = [
   {
-    id: 'local',
-    label: 'Local',
-    hostname: '',
+    id: "local",
+    label: "Local",
+    hostname: "",
     is_local: true,
-    enabled_backends: ['tycode', 'codex', 'claude', 'kiro', 'gemini'],
-    default_backend: 'tycode',
-    remote_kind: 'ssh_pipe',
+    enabled_backends: ["tycode", "codex", "claude", "kiro", "gemini"],
+    default_backend: "tycode",
+    remote_kind: "ssh_pipe",
   },
 ];
 
 function syncMockMcpSettingsFromStorage(): void {
   try {
-    const raw = window.localStorage.getItem('mock-mcp-http-enabled');
-    if (raw === 'true') mockMcpHttpServerEnabled = true;
-    if (raw === 'false') mockMcpHttpServerEnabled = false;
+    const raw = window.localStorage.getItem("mock-mcp-http-enabled");
+    if (raw === "true") mockMcpHttpServerEnabled = true;
+    if (raw === "false") mockMcpHttpServerEnabled = false;
   } catch {
     // Ignore storage access failures in tests.
   }
@@ -182,7 +183,11 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function pushRuntimeEvent(agent: MockRuntimeAgent, kind: string, message: string | null): void {
+function pushRuntimeEvent(
+  agent: MockRuntimeAgent,
+  kind: string,
+  message: string | null,
+): void {
   runtimeEvents.push({
     seq: nextRuntimeEventSeq++,
     agent_id: agent.agent_id,
@@ -213,45 +218,84 @@ function updateRuntimeAgent(
   agent.last_error = options?.lastError ?? agent.last_error;
   agent.ended_at_ms = isRunning ? null : Date.now();
   pushRuntimeEvent(agent, kind, summary);
-  emit('agent-changed', { ...agent, workspace_roots: [...agent.workspace_roots] });
+  emit("agent-changed", {
+    ...agent,
+    workspace_roots: [...agent.workspace_roots],
+  });
 }
 
 function sortedRuntimeAgents(): MockRuntimeAgent[] {
   return Array.from(runtimeAgents.values())
     .sort((a, b) => b.updated_at_ms - a.updated_at_ms)
-    .map((agent) => ({ ...agent, workspace_roots: [...agent.workspace_roots] }));
+    .map((agent) => ({
+      ...agent,
+      workspace_roots: [...agent.workspace_roots],
+    }));
 }
 
-async function emitRemoteProgress(host: string, failAtStep?: string): Promise<boolean> {
+async function emitRemoteProgress(
+  host: string,
+  failAtStep?: string,
+): Promise<boolean> {
   const steps = [
-    { step: 'validating_connection', inMsg: 'Testing SSH connection...', doneMsg: 'SSH connection established' },
-    { step: 'checking_environment', inMsg: 'Checking remote environment...', doneMsg: 'tycode-subprocess not installed' },
-    { step: 'installing_subprocess', inMsg: 'Building tycode-subprocess...', doneMsg: 'tycode-subprocess installed' },
-    { step: 'ready', inMsg: 'Finalizing...', doneMsg: `Connected to ${host}` },
+    {
+      step: "validating_connection",
+      inMsg: "Testing SSH connection...",
+      doneMsg: "SSH connection established",
+    },
+    {
+      step: "checking_environment",
+      inMsg: "Checking remote environment...",
+      doneMsg: "tycode-subprocess not installed",
+    },
+    {
+      step: "installing_subprocess",
+      inMsg: "Building tycode-subprocess...",
+      doneMsg: "tycode-subprocess installed",
+    },
+    { step: "ready", inMsg: "Finalizing...", doneMsg: `Connected to ${host}` },
   ];
 
   for (const s of steps) {
     if (failAtStep === s.step) {
-      await emit('remote-connection-progress', { host, step: s.step, status: 'failed', message: `Failed at ${s.step}` });
+      await emit("remote-connection-progress", {
+        host,
+        step: s.step,
+        status: "failed",
+        message: `Failed at ${s.step}`,
+      });
       return false;
     }
-    await emit('remote-connection-progress', { host, step: s.step, status: 'in_progress', message: s.inMsg });
+    await emit("remote-connection-progress", {
+      host,
+      step: s.step,
+      status: "in_progress",
+      message: s.inMsg,
+    });
     await sleep(15);
-    await emit('remote-connection-progress', { host, step: s.step, status: 'completed', message: s.doneMsg });
+    await emit("remote-connection-progress", {
+      host,
+      step: s.step,
+      status: "completed",
+      message: s.doneMsg,
+    });
     await sleep(15);
   }
   return true;
 }
 
-async function emitChatEvent(conversationId: number, event: unknown): Promise<void> {
-  await emit('chat-event', {
+async function emitChatEvent(
+  conversationId: number,
+  event: unknown,
+): Promise<void> {
+  await emit("chat-event", {
     conversation_id: conversationId,
     event,
   });
 }
 
 async function emitAdminEvent(adminId: number, event: unknown): Promise<void> {
-  await emit('admin-event', {
+  await emit("admin-event", {
     admin_id: adminId,
     event,
   });
@@ -269,14 +313,17 @@ function makeContextBreakdown(inputTokens: number): Record<string, number> {
   };
 }
 
-function makeAssistantMessage(content: string, inputTokens: number): Record<string, unknown> {
+function makeAssistantMessage(
+  content: string,
+  inputTokens: number,
+): Record<string, unknown> {
   return {
     timestamp: Date.now(),
-    sender: { Assistant: { agent: 'tycode' } },
+    sender: { Assistant: { agent: "tycode" } },
     content,
     reasoning: null,
     tool_calls: [],
-    model_info: { model: 'MockModel' },
+    model_info: { model: "MockModel" },
     token_usage: {
       input_tokens: inputTokens,
       output_tokens: 1_000,
@@ -290,35 +337,41 @@ function makeAssistantMessage(content: string, inputTokens: number): Record<stri
   };
 }
 
-async function runMockResponse(conversationId: number, userMessage: string, turnCount: number): Promise<void> {
+async function runMockResponse(
+  conversationId: number,
+  userMessage: string,
+  turnCount: number,
+): Promise<void> {
   const inputTokens = Math.min(turnCount * 50_000, 180_000);
-  const response = `Mock response to: ${userMessage || '(empty message)'}`;
-  const finalTypingDelayMsRaw = Number((window as any).__mockFinalTypingDelayMs);
+  const response = `Mock response to: ${userMessage || "(empty message)"}`;
+  const finalTypingDelayMsRaw = Number(
+    (window as any).__mockFinalTypingDelayMs,
+  );
   const finalTypingDelayMs = Number.isFinite(finalTypingDelayMsRaw)
     ? Math.max(0, Math.min(5_000, finalTypingDelayMsRaw))
     : 0;
 
   await emitChatEvent(conversationId, {
-    kind: 'TypingStatusChanged',
+    kind: "TypingStatusChanged",
     data: true,
   });
 
   await emitChatEvent(conversationId, {
-    kind: 'StreamStart',
+    kind: "StreamStart",
     data: {
-      agent: 'tycode',
-      model: 'mock-model',
+      agent: "tycode",
+      model: "mock-model",
     },
   });
 
   const mid = Math.max(1, Math.floor(response.length / 2));
   await emitChatEvent(conversationId, {
-    kind: 'StreamDelta',
+    kind: "StreamDelta",
     data: { text: response.slice(0, mid) },
   });
   await sleep(25);
   await emitChatEvent(conversationId, {
-    kind: 'StreamDelta',
+    kind: "StreamDelta",
     data: { text: response.slice(mid) },
   });
   await sleep(25);
@@ -329,42 +382,57 @@ async function runMockResponse(conversationId: number, userMessage: string, turn
   const failedToolId = `mock-tool-fail-${conversationId}-${turnCount}`;
 
   if (includeTools) {
-    const toolCalls: Array<{id: string, name: string, arguments: Record<string, unknown>}> = [
-      { id: toolCallId, name: 'ReadFiles', arguments: { file_paths: ['/mock/workspace/README.md'] } },
+    const toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: Record<string, unknown>;
+    }> = [
+      {
+        id: toolCallId,
+        name: "ReadFiles",
+        arguments: { file_paths: ["/mock/workspace/README.md"] },
+      },
     ];
     if ((window as any).__mockToolCallFailure) {
-      toolCalls.push({ id: failedToolId, name: 'ModifyFile', arguments: { file_path: '/mock/workspace/broken.ts', description: 'Fix syntax error' } });
+      toolCalls.push({
+        id: failedToolId,
+        name: "ModifyFile",
+        arguments: {
+          file_path: "/mock/workspace/broken.ts",
+          description: "Fix syntax error",
+        },
+      });
     }
     message.tool_calls = toolCalls;
   }
 
   await emitChatEvent(conversationId, {
-    kind: 'StreamEnd',
+    kind: "StreamEnd",
     data: { message },
   });
 
   if (includeTools) {
     await sleep(50);
     await emitChatEvent(conversationId, {
-      kind: 'ToolRequest',
+      kind: "ToolRequest",
       data: {
         tool_call_id: toolCallId,
-        tool_name: 'ReadFiles',
+        tool_name: "ReadFiles",
         tool_type: {
-          kind: 'ReadFiles',
-          file_paths: ['/mock/workspace/README.md'],
+          kind: "ReadFiles",
+          file_paths: ["/mock/workspace/README.md"],
         },
       },
     });
     await sleep(10);
     await emitChatEvent(conversationId, {
-      kind: 'ToolExecutionCompleted',
+      kind: "ToolExecutionCompleted",
       data: {
         tool_call_id: toolCallId,
-        tool_name: 'ReadFiles',
+        tool_name: "ReadFiles",
         tool_result: {
-          kind: 'ReadFiles',
-          files: [{ path: '/mock/workspace/README.md', bytes: 12 }],
+          kind: "ReadFiles",
+          files: [{ path: "/mock/workspace/README.md", bytes: 12 }],
         },
         success: true,
       },
@@ -372,27 +440,27 @@ async function runMockResponse(conversationId: number, userMessage: string, turn
 
     if ((window as any).__mockToolCallFailure) {
       await emitChatEvent(conversationId, {
-        kind: 'ToolRequest',
+        kind: "ToolRequest",
         data: {
           tool_call_id: failedToolId,
-          tool_name: 'ModifyFile',
+          tool_name: "ModifyFile",
           tool_type: {
-            kind: 'ModifyFile',
-            file_path: '/mock/workspace/broken.ts',
-            before: 'old code',
-            after: 'new code',
+            kind: "ModifyFile",
+            file_path: "/mock/workspace/broken.ts",
+            before: "old code",
+            after: "new code",
           },
         },
       });
       await sleep(10);
       await emitChatEvent(conversationId, {
-        kind: 'ToolExecutionCompleted',
+        kind: "ToolExecutionCompleted",
         data: {
           tool_call_id: failedToolId,
-          tool_name: 'ModifyFile',
+          tool_name: "ModifyFile",
           tool_result: {
-            kind: 'Error',
-            short_message: 'File not found: /mock/workspace/broken.ts',
+            kind: "Error",
+            short_message: "File not found: /mock/workspace/broken.ts",
             detailed_message: null,
           },
           success: false,
@@ -405,7 +473,7 @@ async function runMockResponse(conversationId: number, userMessage: string, turn
     await sleep(finalTypingDelayMs);
   }
   await emitChatEvent(conversationId, {
-    kind: 'TypingStatusChanged',
+    kind: "TypingStatusChanged",
     data: false,
   });
 }
@@ -487,21 +555,26 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'create_conversation': {
+    case "create_conversation": {
       const id = nextConversationId++;
       const workspaceRoots = Array.isArray(args?.workspaceRoots)
-        ? args.workspaceRoots.filter((v: unknown) => typeof v === 'string')
+        ? args.workspaceRoots.filter((v: unknown) => typeof v === "string")
         : [];
-      const backendKind = typeof args?.backendKind === 'string' ? args.backendKind : 'tycode';
+      const backendKind =
+        typeof args?.backendKind === "string" ? args.backendKind : "tycode";
       conversations.set(id, { workspaceRoots, turnCount: 0, backendKind });
 
-      const sshRoot = workspaceRoots.find((r: string) => r.startsWith('ssh://'));
+      const sshRoot = workspaceRoots.find((r: string) =>
+        r.startsWith("ssh://"),
+      );
       if (sshRoot) {
-        const host = sshRoot.slice('ssh://'.length).split('/')[0];
-        const failStep = (window as any).__mockRemoteFailStep as string | undefined;
+        const host = sshRoot.slice("ssh://".length).split("/")[0];
+        const failStep = (window as any).__mockRemoteFailStep as
+          | string
+          | undefined;
         const success = await emitRemoteProgress(host, failStep);
         if (!success) {
-          throw new Error('Remote connection failed');
+          throw new Error("Remote connection failed");
         }
       }
 
@@ -523,12 +596,12 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       conversationToRecordId.set(id, recordId);
 
       await emitChatEvent(id, {
-        kind: 'ConversationRegistered',
+        kind: "ConversationRegistered",
         data: {
           agent_id: null,
           workspace_roots: workspaceRoots,
           backend_kind: backendKind,
-          name: 'Conversation',
+          name: "Conversation",
           parent_agent_id: null,
         },
       });
@@ -536,22 +609,22 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return { conversation_id: id, session_id: recordId };
     }
 
-    case 'send_message': {
+    case "send_message": {
       const conversationId = Number(args?.conversationId);
       if (!Number.isFinite(conversationId)) {
-        throw new Error('Invalid conversation id');
+        throw new Error("Invalid conversation id");
       }
       const state = conversations.get(conversationId);
       if (!state) {
-        throw new Error('No conversation found');
+        throw new Error("No conversation found");
       }
       state.turnCount += 1;
-      const text = typeof args?.message === 'string' ? args.message : '';
+      const text = typeof args?.message === "string" ? args.message : "";
       await runMockResponse(conversationId, text, state.turnCount);
       return null;
     }
 
-    case 'close_conversation': {
+    case "close_conversation": {
       const conversationId = Number(args?.conversationId);
       if (Number.isFinite(conversationId)) {
         conversations.delete(conversationId);
@@ -559,32 +632,40 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'spawn_agent': {
+    case "spawn_agent": {
       const workspaceRoots = Array.isArray(args?.workspaceRoots)
-        ? args.workspaceRoots.filter((v: unknown) => typeof v === 'string')
+        ? args.workspaceRoots.filter((v: unknown) => typeof v === "string")
         : [];
-      const prompt = typeof args?.prompt === 'string' ? args.prompt.trim() : '';
+      const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
       if (workspaceRoots.length === 0) {
-        throw new Error('spawn_agent requires at least one workspace root');
+        throw new Error("spawn_agent requires at least one workspace root");
       }
       if (!prompt) {
-        throw new Error('spawn_agent requires a non-empty prompt');
+        throw new Error("spawn_agent requires a non-empty prompt");
       }
-      const backendKind = typeof args?.backendKind === 'string' && args.backendKind.trim()
-        ? args.backendKind.trim().toLowerCase()
-        : 'tycode';
-      const keepAliveWithoutTab = typeof args?.keepAliveWithoutTab === 'boolean'
-        ? args.keepAliveWithoutTab
-        : true;
+      const backendKind =
+        typeof args?.backendKind === "string" && args.backendKind.trim()
+          ? args.backendKind.trim().toLowerCase()
+          : "tycode";
+      const keepAliveWithoutTab =
+        typeof args?.keepAliveWithoutTab === "boolean"
+          ? args.keepAliveWithoutTab
+          : true;
       const parentAgentId = Number.isFinite(Number(args?.parentAgentId))
         ? Number(args?.parentAgentId)
         : null;
-      const completionDelayMs = Number.isFinite(Number(args?.mockCompletionDelayMs))
+      const completionDelayMs = Number.isFinite(
+        Number(args?.mockCompletionDelayMs),
+      )
         ? Math.max(0, Number(args?.mockCompletionDelayMs))
         : 70;
 
       const conversationId = nextConversationId++;
-      conversations.set(conversationId, { workspaceRoots, turnCount: 0, backendKind });
+      conversations.set(conversationId, {
+        workspaceRoots,
+        turnCount: 0,
+        backendKind,
+      });
 
       const now = Date.now();
       const agentId = nextRuntimeAgentId++;
@@ -595,11 +676,14 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         backend_kind: backendKind,
         parent_agent_id: parentAgentId,
         keep_alive_without_tab: keepAliveWithoutTab,
-        name: typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : `Agent ${agentId}`,
+        name:
+          typeof args?.name === "string" && args.name.trim()
+            ? args.name.trim()
+            : `Agent ${agentId}`,
         agent_type: null,
         agent_definition_id: null,
         is_running: false,
-        summary: 'Queued',
+        summary: "Queued",
         created_at_ms: now,
         updated_at_ms: now,
         ended_at_ms: null,
@@ -607,64 +691,77 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         last_message: null,
       };
       runtimeAgents.set(agentId, agent);
-      pushRuntimeEvent(agent, 'agent_spawned', 'Queued');
+      pushRuntimeEvent(agent, "agent_spawned", "Queued");
 
       void (async () => {
         await sleep(20);
-        updateRuntimeAgent(agentId, true, 'Running...', 'stream_start');
+        updateRuntimeAgent(agentId, true, "Running...", "stream_start");
         if (completionDelayMs === 0) return;
         await sleep(completionDelayMs);
         const finalMessage = `Mock runtime agent response: ${prompt}`;
-        updateRuntimeAgent(agentId, false, finalMessage, 'typing_stopped', { lastMessage: finalMessage });
+        updateRuntimeAgent(agentId, false, finalMessage, "typing_stopped", {
+          lastMessage: finalMessage,
+        });
       })();
 
       return { agent_id: agentId, conversation_id: conversationId };
     }
 
-    case 'send_agent_message': {
+    case "send_agent_message": {
       const agentId = Number(args?.agentId);
-      const message = typeof args?.message === 'string' ? args.message.trim() : '';
-      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
-      if (!message) throw new Error('send_agent_message requires a non-empty message');
+      const message =
+        typeof args?.message === "string" ? args.message.trim() : "";
+      if (!Number.isFinite(agentId)) throw new Error("Invalid agent id");
+      if (!message)
+        throw new Error("send_agent_message requires a non-empty message");
       const agent = runtimeAgents.get(agentId);
       if (!agent) throw new Error(`Agent ${agentId} not found`);
 
-      updateRuntimeAgent(agentId, true, 'Running...', 'typing_started');
+      updateRuntimeAgent(agentId, true, "Running...", "typing_started");
       void (async () => {
         await sleep(60);
         const finalMessage = `Mock runtime follow-up: ${message}`;
-        updateRuntimeAgent(agentId, false, finalMessage, 'typing_stopped', { lastMessage: finalMessage });
+        updateRuntimeAgent(agentId, false, finalMessage, "typing_stopped", {
+          lastMessage: finalMessage,
+        });
       })();
       return null;
     }
 
-    case 'interrupt_agent': {
+    case "interrupt_agent": {
       const agentId = Number(args?.agentId);
-      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
-      if (!runtimeAgents.has(agentId)) throw new Error(`Agent ${agentId} not found`);
-      updateRuntimeAgent(agentId, false, 'Operation cancelled', 'operation_cancelled');
+      if (!Number.isFinite(agentId)) throw new Error("Invalid agent id");
+      if (!runtimeAgents.has(agentId))
+        throw new Error(`Agent ${agentId} not found`);
+      updateRuntimeAgent(
+        agentId,
+        false,
+        "Operation cancelled",
+        "operation_cancelled",
+      );
       return null;
     }
 
-    case 'terminate_agent': {
+    case "terminate_agent": {
       const agentId = Number(args?.agentId);
-      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
-      if (!runtimeAgents.has(agentId)) throw new Error(`Agent ${agentId} not found`);
-      updateRuntimeAgent(agentId, false, 'Terminated', 'agent_closed');
+      if (!Number.isFinite(agentId)) throw new Error("Invalid agent id");
+      if (!runtimeAgents.has(agentId))
+        throw new Error(`Agent ${agentId} not found`);
+      updateRuntimeAgent(agentId, false, "Terminated", "agent_closed");
       return null;
     }
 
-    case 'rename_agent': {
+    case "rename_agent": {
       const agentId = Number(args?.agentId);
-      const name = typeof args?.name === 'string' ? args.name.trim() : '';
-      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
+      const name = typeof args?.name === "string" ? args.name.trim() : "";
+      if (!Number.isFinite(agentId)) throw new Error("Invalid agent id");
       const agent = runtimeAgents.get(agentId);
       if (!agent) throw new Error(`Agent ${agentId} not found`);
       if (name) agent.name = name;
       return null;
     }
 
-    case 'get_agent': {
+    case "get_agent": {
       const agentId = Number(args?.agentId);
       if (!Number.isFinite(agentId)) return null;
       const agent = runtimeAgents.get(agentId);
@@ -672,12 +769,12 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return { ...agent, workspace_roots: [...agent.workspace_roots] };
     }
 
-    case 'list_agents':
+    case "list_agents":
       return sortedRuntimeAgents();
 
-    case 'wait_for_agent': {
+    case "wait_for_agent": {
       const agentId = Number(args?.agentId);
-      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
+      if (!Number.isFinite(agentId)) throw new Error("Invalid agent id");
 
       // No timeout — mirrors the real backend which waits indefinitely,
       // relying on the notification system to wake up when agent state changes.
@@ -691,8 +788,10 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       }
     }
 
-    case 'agent_events_since': {
-      const sinceSeq = Number.isFinite(Number(args?.sinceSeq)) ? Number(args?.sinceSeq) : 0;
+    case "agent_events_since": {
+      const sinceSeq = Number.isFinite(Number(args?.sinceSeq))
+        ? Number(args?.sinceSeq)
+        : 0;
       const limit = Number.isFinite(Number(args?.limit))
         ? Math.max(1, Math.min(1000, Number(args?.limit)))
         : 200;
@@ -700,18 +799,19 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         .filter((event) => event.seq > sinceSeq)
         .slice(0, limit)
         .map((event) => ({ ...event }));
-      const latestSeq = runtimeEvents.length > 0
-        ? runtimeEvents[runtimeEvents.length - 1].seq
-        : 0;
+      const latestSeq =
+        runtimeEvents.length > 0
+          ? runtimeEvents[runtimeEvents.length - 1].seq
+          : 0;
       return {
         events,
         latest_seq: latestSeq,
       };
     }
 
-    case 'collect_agent_result': {
+    case "collect_agent_result": {
       const agentId = Number(args?.agentId);
-      if (!Number.isFinite(agentId)) throw new Error('Invalid agent id');
+      if (!Number.isFinite(agentId)) throw new Error("Invalid agent id");
       const agent = runtimeAgents.get(agentId);
       if (!agent) throw new Error(`Agent ${agentId} not found`);
       return {
@@ -722,7 +822,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'get_mcp_http_server_settings':
+    case "get_mcp_http_server_settings":
       syncMockMcpSettingsFromStorage();
       return {
         enabled: mockMcpHttpServerEnabled,
@@ -730,13 +830,16 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         url: mockMcpHttpServerEnabled ? mockMcpHttpServerUrl : null,
       };
 
-    case 'set_mcp_http_server_enabled': {
-      if (typeof args?.enabled !== 'boolean') {
-        throw new Error('set_mcp_http_server_enabled requires boolean enabled');
+    case "set_mcp_http_server_enabled": {
+      if (typeof args?.enabled !== "boolean") {
+        throw new Error("set_mcp_http_server_enabled requires boolean enabled");
       }
       mockMcpHttpServerEnabled = args.enabled;
       try {
-        window.localStorage.setItem('mock-mcp-http-enabled', String(mockMcpHttpServerEnabled));
+        window.localStorage.setItem(
+          "mock-mcp-http-enabled",
+          String(mockMcpHttpServerEnabled),
+        );
       } catch {
         // Ignore storage access failures in tests.
       }
@@ -747,7 +850,7 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'get_driver_mcp_http_server_settings':
+    case "get_driver_mcp_http_server_settings":
       return {
         enabled: mockDriverMcpHttpServerEnabled,
         autoload: mockDriverMcpHttpServerAutoload,
@@ -755,9 +858,11 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
         url: mockDriverMcpHttpServerEnabled ? mockDriverMcpHttpServerUrl : null,
       };
 
-    case 'set_driver_mcp_http_server_enabled': {
-      if (typeof args?.enabled !== 'boolean') {
-        throw new Error('set_driver_mcp_http_server_enabled requires boolean enabled');
+    case "set_driver_mcp_http_server_enabled": {
+      if (typeof args?.enabled !== "boolean") {
+        throw new Error(
+          "set_driver_mcp_http_server_enabled requires boolean enabled",
+        );
       }
       mockDriverMcpHttpServerEnabled = args.enabled;
       if (!mockDriverMcpHttpServerEnabled) {
@@ -771,14 +876,17 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'set_driver_mcp_http_server_autoload_enabled': {
-      if (typeof args?.enabled !== 'boolean') {
-        throw new Error('set_driver_mcp_http_server_autoload_enabled requires boolean enabled');
+    case "set_driver_mcp_http_server_autoload_enabled": {
+      if (typeof args?.enabled !== "boolean") {
+        throw new Error(
+          "set_driver_mcp_http_server_autoload_enabled requires boolean enabled",
+        );
       }
       if (args.enabled && !mockDriverMcpHttpServerEnabled) {
-        throw new Error('Enable driver MCP server before enabling auto-load');
+        throw new Error("Enable driver MCP server before enabling auto-load");
       }
-      mockDriverMcpHttpServerAutoload = args.enabled && mockDriverMcpHttpServerEnabled;
+      mockDriverMcpHttpServerAutoload =
+        args.enabled && mockDriverMcpHttpServerEnabled;
       return {
         enabled: mockDriverMcpHttpServerEnabled,
         autoload: mockDriverMcpHttpServerAutoload,
@@ -787,26 +895,27 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'submit_debug_ui_response':
+    case "submit_debug_ui_response":
       return null;
 
-    case 'set_default_backend':
+    case "set_default_backend":
       return null;
 
-    case 'query_backend_usage': {
-      const backendKind = typeof args?.backendKind === 'string' ? args.backendKind : 'codex';
-      const hostId = typeof args?.hostId === 'string' ? args.hostId : 'local';
+    case "query_backend_usage": {
+      const backendKind =
+        typeof args?.backendKind === "string" ? args.backendKind : "codex";
+      const hostId = typeof args?.hostId === "string" ? args.hostId : "local";
       return {
         backend_kind: backendKind,
-        source: hostId === 'local' ? 'local' : `remote:${hostId}`,
+        source: hostId === "local" ? "local" : `remote:${hostId}`,
         captured_at_ms: Date.now(),
-        plan: hostId === 'local' ? 'Personal' : 'Work',
+        plan: hostId === "local" ? "Personal" : "Work",
         status: null,
         windows: [
           {
-            id: 'primary',
-            label: '5-hour',
-            used_percent: hostId === 'local' ? 35 : 62,
+            id: "primary",
+            label: "5-hour",
+            used_percent: hostId === "local" ? 35 : 62,
             reset_at_text: null,
             reset_at_unix: null,
             window_minutes: 300,
@@ -816,28 +925,29 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'list_hosts':
+    case "list_hosts":
       return mockHosts.map((h) => ({ ...h }));
 
-    case 'add_host': {
-      const label = typeof args?.label === 'string' ? args.label : '';
-      const hostname = typeof args?.hostname === 'string' ? args.hostname : '';
-      const remoteKind = args?.remote_kind === 'tyde_server' ? 'tyde_server' : 'ssh_pipe';
+    case "add_host": {
+      const label = typeof args?.label === "string" ? args.label : "";
+      const hostname = typeof args?.hostname === "string" ? args.hostname : "";
+      const remoteKind =
+        args?.remote_kind === "tyde_server" ? "tyde_server" : "ssh_pipe";
       const newHost: MockHost = {
         id: `mock-host-${Date.now()}`,
         label,
         hostname,
         is_local: false,
-        enabled_backends: ['tycode', 'codex', 'claude', 'kiro', 'gemini'],
-        default_backend: 'tycode',
+        enabled_backends: ["tycode", "codex", "claude", "kiro", "gemini"],
+        default_backend: "tycode",
         remote_kind: remoteKind,
       };
       mockHosts.push(newHost);
       return { ...newHost };
     }
 
-    case 'remove_host': {
-      const id = typeof args?.id === 'string' ? args.id : '';
+    case "remove_host": {
+      const id = typeof args?.id === "string" ? args.id : "";
       const idx = mockHosts.findIndex((h) => h.id === id);
       if (idx >= 0 && !mockHosts[idx].is_local) {
         mockHosts.splice(idx, 1);
@@ -845,55 +955,57 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'update_host_label': {
-      const id = typeof args?.id === 'string' ? args.id : '';
-      const label = typeof args?.label === 'string' ? args.label : '';
+    case "update_host_label": {
+      const id = typeof args?.id === "string" ? args.id : "";
+      const label = typeof args?.label === "string" ? args.label : "";
       const host = mockHosts.find((h) => h.id === id);
       if (host) host.label = label;
       return null;
     }
 
-    case 'update_host_enabled_backends': {
-      const id = typeof args?.id === 'string' ? args.id : '';
+    case "update_host_enabled_backends": {
+      const id = typeof args?.id === "string" ? args.id : "";
       const backends = Array.isArray(args?.backends) ? args.backends : [];
       const host = mockHosts.find((h) => h.id === id);
       if (host) host.enabled_backends = backends;
       return null;
     }
 
-    case 'update_host_default_backend': {
-      const id = typeof args?.id === 'string' ? args.id : '';
-      const backend = typeof args?.backend === 'string' ? args.backend : '';
+    case "update_host_default_backend": {
+      const id = typeof args?.id === "string" ? args.id : "";
+      const backend = typeof args?.backend === "string" ? args.backend : "";
       const host = mockHosts.find((h) => h.id === id);
       if (host) host.default_backend = backend;
       return null;
     }
 
-    case 'set_mcp_control_enabled':
+    case "set_mcp_control_enabled":
       return null;
 
-    case 'get_host_for_workspace': {
-      const workspacePath = typeof args?.workspacePath === 'string' ? args.workspacePath : '';
-      if (workspacePath.startsWith('ssh://')) {
-        const hostname = workspacePath.slice('ssh://'.length).split('/')[0];
+    case "get_host_for_workspace": {
+      const workspacePath =
+        typeof args?.workspacePath === "string" ? args.workspacePath : "";
+      if (workspacePath.startsWith("ssh://")) {
+        const hostname = workspacePath.slice("ssh://".length).split("/")[0];
         const found = mockHosts.find((h) => h.hostname === hostname);
         if (found) return { ...found };
       }
       return { ...mockHosts[0] };
     }
 
-    case 'create_terminal': {
-      const workspacePath = typeof args?.workspacePath === 'string' ? args.workspacePath : '';
+    case "create_terminal": {
+      const workspacePath =
+        typeof args?.workspacePath === "string" ? args.workspacePath : "";
       const id = nextTerminalId++;
       terminalWorkspaceById.set(id, workspacePath);
       return id;
     }
 
-    case 'write_terminal':
-    case 'resize_terminal':
+    case "write_terminal":
+    case "resize_terminal":
       return null;
 
-    case 'close_terminal': {
+    case "close_terminal": {
       const terminalId = Number(args?.terminalId);
       if (Number.isFinite(terminalId)) {
         terminalWorkspaceById.delete(terminalId);
@@ -901,31 +1013,31 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'list_active_conversations':
+    case "list_active_conversations":
       return Array.from(conversations.keys());
 
-    case 'get_settings': {
+    case "get_settings": {
       const cid = Number(args?.conversationId);
       if (Number.isFinite(cid)) {
         await emitChatEvent(cid, {
-          kind: 'Settings',
+          kind: "Settings",
           data: {
-            model_quality: 'unlimited',
-            review_level: 'Task',
-            default_agent: 'one_shot',
-            communication_tone: 'concise_and_logical',
-            reasoning_effort: 'Medium',
-            autonomy_level: 'plan_approval_required',
+            model_quality: "unlimited",
+            review_level: "Task",
+            default_agent: "one_shot",
+            communication_tone: "concise_and_logical",
+            reasoning_effort: "Medium",
+            autonomy_level: "plan_approval_required",
             enable_type_analyzer: true,
-            spawn_context_mode: 'Fork',
-            run_build_test_output_mode: 'ToolResponse',
+            spawn_context_mode: "Fork",
+            run_build_test_output_mode: "ToolResponse",
             disable_custom_steering: false,
             disable_streaming: false,
-            active_provider: 'MockProvider',
+            active_provider: "MockProvider",
             providers: {
               MockProvider: {
-                type: 'openrouter',
-                api_key: 'sk-mock',
+                type: "openrouter",
+                api_key: "sk-mock",
               },
             },
             mcp_servers: {},
@@ -937,29 +1049,29 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return {};
     }
 
-    case 'list_profiles': {
+    case "list_profiles": {
       const cid = Number(args?.conversationId);
       if (Number.isFinite(cid)) {
         await emitChatEvent(cid, {
-          kind: 'ProfilesList',
+          kind: "ProfilesList",
           data: {
-            profiles: ['default', 'work'],
-            active_profile: 'default',
+            profiles: ["default", "work"],
+            active_profile: "default",
           },
         });
       }
       return [];
     }
 
-    case 'list_sessions':
+    case "list_sessions":
       return [];
 
-    case 'list_session_records':
+    case "list_session_records":
       return Array.from(mockSessionRecords.values()).map((r) => ({ ...r }));
 
-    case 'rename_session': {
-      const recordId = typeof args?.id === 'string' ? args.id : '';
-      const newName = typeof args?.name === 'string' ? args.name : '';
+    case "rename_session": {
+      const recordId = typeof args?.id === "string" ? args.id : "";
+      const newName = typeof args?.name === "string" ? args.name : "";
       const rec = mockSessionRecords.get(recordId);
       if (rec) {
         rec.user_alias = newName || null;
@@ -968,24 +1080,32 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'list_directory': {
-      const path = typeof args?.path === 'string' ? args.path : '';
+    case "list_directory": {
+      const path = typeof args?.path === "string" ? args.path : "";
       if (!path) return [];
       return [
         {
-          name: 'README.md',
-          path: `${path.replace(/\/$/, '')}/README.md`,
+          name: "README.md",
+          path: `${path.replace(/\/$/, "")}/README.md`,
           is_directory: false,
           size: 512,
         },
       ];
     }
 
-    case 'read_file_content': {
-      const path = typeof args?.path === 'string' ? args.path : '/mock/workspace/README.md';
-      const overrides = (window as any).__mockReadFileContentByPath as Record<string, string> | undefined;
+    case "read_file_content": {
+      const path =
+        typeof args?.path === "string"
+          ? args.path
+          : "/mock/workspace/README.md";
+      const overrides = (window as any).__mockReadFileContentByPath as
+        | Record<string, string>
+        | undefined;
       const overriddenContent = overrides?.[path];
-      const content = typeof overriddenContent === 'string' ? overriddenContent : '# Mock file\n';
+      const content =
+        typeof overriddenContent === "string"
+          ? overriddenContent
+          : "# Mock file\n";
       return {
         path,
         content,
@@ -994,36 +1114,41 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       };
     }
 
-    case 'discover_git_repos': {
-      const workspaceDir = typeof args?.workspaceDir === 'string' ? args.workspaceDir : '';
+    case "discover_git_repos": {
+      const workspaceDir =
+        typeof args?.workspaceDir === "string" ? args.workspaceDir : "";
       if ((window as any).__mockGitNotRepo) {
         return [];
       }
       return workspaceDir ? [workspaceDir] : [];
     }
 
-    case 'git_current_branch':
+    case "git_current_branch":
       if ((window as any).__mockGitNotRepo) {
-        throw new Error('git rev-parse --abbrev-ref HEAD: fatal: not a git repository (or any of the parent directories): .git');
+        throw new Error(
+          "git rev-parse --abbrev-ref HEAD: fatal: not a git repository (or any of the parent directories): .git",
+        );
       }
-      return 'main';
+      return "main";
 
-    case 'git_status':
+    case "git_status":
       if ((window as any).__mockGitNotRepo) {
-        throw new Error('git status: fatal: not a git repository (or any of the parent directories): .git');
+        throw new Error(
+          "git status: fatal: not a git repository (or any of the parent directories): .git",
+        );
       }
       return [];
 
-    case 'git_worktree_add':
-    case 'git_worktree_remove':
+    case "git_worktree_add":
+    case "git_worktree_remove":
       return null;
 
-    case 'git_stage':
-    case 'git_unstage':
-    case 'git_commit':
-    case 'git_diff':
-    case 'git_discard':
-    case 'get_session_id': {
+    case "git_stage":
+    case "git_unstage":
+    case "git_commit":
+    case "git_diff":
+    case "git_discard":
+    case "get_session_id": {
       const cid = Number(args?.conversationId);
       const conv = conversations.get(cid);
       if (!conv) return null;
@@ -1041,9 +1166,10 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return backendSessionId;
     }
 
-    case 'resume_session': {
+    case "resume_session": {
       const resumeCid = Number(args?.conversationId);
-      const resumeSessionId = typeof args?.sessionId === 'string' ? args.sessionId : '';
+      const resumeSessionId =
+        typeof args?.sessionId === "string" ? args.sessionId : "";
       // Mirror real backend: set backend_session_id on the placeholder record
       // created by create_conversation, absorb metadata from any prior record
       // that tracked this backend session, then remove the prior record so
@@ -1058,8 +1184,11 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
           // data into the new record (which keeps the id that create_conversation
           // returned) and delete the seed so there's no duplicate.
           for (const [id, seed] of mockSessionRecords) {
-            if (id !== resumeRecordId && seed.backend_session_id === resumeSessionId
-              && seed.backend_kind === rec.backend_kind) {
+            if (
+              id !== resumeRecordId &&
+              seed.backend_session_id === resumeSessionId &&
+              seed.backend_kind === rec.backend_kind
+            ) {
               rec.alias = seed.alias;
               rec.message_count = seed.message_count;
               rec.created_at_ms = seed.created_at_ms;
@@ -1072,30 +1201,30 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'cancel_conversation':
-    case 'delete_session':
-    case 'get_module_schemas': {
+    case "cancel_conversation":
+    case "delete_session":
+    case "get_module_schemas": {
       const cid = Number(args?.conversationId);
       if (Number.isFinite(cid)) {
         await emitChatEvent(cid, {
-          kind: 'ModuleSchemas',
+          kind: "ModuleSchemas",
           data: {
             schemas: [
               {
-                namespace: 'execution',
+                namespace: "execution",
                 schema: {
-                  title: 'Execution',
-                  description: 'Execution module settings',
-                  type: 'object',
+                  title: "Execution",
+                  description: "Execution module settings",
+                  type: "object",
                   properties: {
                     timeout_seconds: {
-                      type: 'integer',
-                      description: 'Command timeout in seconds',
+                      type: "integer",
+                      description: "Command timeout in seconds",
                       default: 300,
                     },
                     sandbox_enabled: {
-                      type: 'boolean',
-                      description: 'Enable sandboxed execution',
+                      type: "boolean",
+                      description: "Enable sandboxed execution",
                       default: false,
                     },
                   },
@@ -1107,40 +1236,43 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       }
       return null;
     }
-    case 'switch_profile':
-    case 'update_settings':
-    case 'restart_subprocess':
-    case 'relaunch_conversation':
-    case 'plugin:opener|reveal_item_in_dir':
-    case 'plugin:shell|open':
+    case "switch_profile":
+    case "update_settings":
+    case "restart_subprocess":
+    case "relaunch_conversation":
+    case "plugin:opener|reveal_item_in_dir":
+    case "plugin:shell|open":
       return null;
 
-    case 'create_admin_subprocess': {
+    case "create_admin_subprocess": {
       const id = nextAdminId++;
       const workspaceRoots = Array.isArray(args?.workspaceRoots)
-        ? args.workspaceRoots.filter((v: unknown) => typeof v === 'string')
+        ? args.workspaceRoots.filter((v: unknown) => typeof v === "string")
         : [];
-      const backendKind = typeof args?.backendKind === 'string' && args.backendKind.trim()
-        ? args.backendKind.trim().toLowerCase()
-        : 'tycode';
+      const backendKind =
+        typeof args?.backendKind === "string" && args.backendKind.trim()
+          ? args.backendKind.trim().toLowerCase()
+          : "tycode";
       adminSubprocesses.set(id, { workspaceRoots, backendKind });
       return id;
     }
 
-    case 'close_admin_subprocess': {
+    case "close_admin_subprocess": {
       const adminId = Number(args?.adminId);
       if (Number.isFinite(adminId)) adminSubprocesses.delete(adminId);
       return null;
     }
 
-    case 'admin_list_sessions': {
+    case "admin_list_sessions": {
       const adminId = Number(args?.adminId);
       if (Number.isFinite(adminId)) {
         const adminState = adminSubprocesses.get(adminId);
-        const backendKind = adminState?.backendKind ?? 'tycode';
-        const sessions = (mockSessionsByBackend[backendKind] ?? []).map((session) => ({ ...session }));
+        const backendKind = adminState?.backendKind ?? "tycode";
+        const sessions = (mockSessionsByBackend[backendKind] ?? []).map(
+          (session) => ({ ...session }),
+        );
         await emitAdminEvent(adminId, {
-          kind: 'SessionsList',
+          kind: "SessionsList",
           data: {
             sessions,
           },
@@ -1149,28 +1281,28 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'admin_get_settings': {
+    case "admin_get_settings": {
       const adminId = Number(args?.adminId);
       if (Number.isFinite(adminId)) {
         await emitAdminEvent(adminId, {
-          kind: 'Settings',
+          kind: "Settings",
           data: {
-            model_quality: 'unlimited',
-            review_level: 'Task',
-            default_agent: 'one_shot',
-            communication_tone: 'concise_and_logical',
-            reasoning_effort: 'Medium',
-            autonomy_level: 'plan_approval_required',
+            model_quality: "unlimited",
+            review_level: "Task",
+            default_agent: "one_shot",
+            communication_tone: "concise_and_logical",
+            reasoning_effort: "Medium",
+            autonomy_level: "plan_approval_required",
             enable_type_analyzer: true,
-            spawn_context_mode: 'Fork',
-            run_build_test_output_mode: 'ToolResponse',
+            spawn_context_mode: "Fork",
+            run_build_test_output_mode: "ToolResponse",
             disable_custom_steering: false,
             disable_streaming: false,
-            active_provider: 'MockProvider',
+            active_provider: "MockProvider",
             providers: {
               MockProvider: {
-                type: 'openrouter',
-                api_key: 'sk-mock',
+                type: "openrouter",
+                api_key: "sk-mock",
               },
             },
             mcp_servers: {},
@@ -1182,61 +1314,74 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'admin_list_profiles': {
+    case "admin_list_profiles": {
       const adminId = Number(args?.adminId);
       if (Number.isFinite(adminId)) {
         await emitAdminEvent(adminId, {
-          kind: 'ProfilesList',
-          data: { profiles: ['default', 'work'], active_profile: 'default' },
+          kind: "ProfilesList",
+          data: { profiles: ["default", "work"], active_profile: "default" },
         });
       }
       return null;
     }
 
-    case 'admin_get_module_schemas': {
+    case "admin_get_module_schemas": {
       const adminId = Number(args?.adminId);
       if (Number.isFinite(adminId)) {
         await emitAdminEvent(adminId, {
-          kind: 'ModuleSchemas',
+          kind: "ModuleSchemas",
           data: {
-            schemas: [{
-              namespace: 'execution',
-              schema: {
-                title: 'Execution',
-                description: 'Execution module settings',
-                type: 'object',
-                properties: {
-                  timeout_seconds: { type: 'integer', description: 'Command timeout in seconds', default: 300 },
-                  sandbox_enabled: { type: 'boolean', description: 'Enable sandboxed execution', default: false },
+            schemas: [
+              {
+                namespace: "execution",
+                schema: {
+                  title: "Execution",
+                  description: "Execution module settings",
+                  type: "object",
+                  properties: {
+                    timeout_seconds: {
+                      type: "integer",
+                      description: "Command timeout in seconds",
+                      default: 300,
+                    },
+                    sandbox_enabled: {
+                      type: "boolean",
+                      description: "Enable sandboxed execution",
+                      default: false,
+                    },
+                  },
                 },
               },
-            }],
+            ],
           },
         });
       }
       return null;
     }
 
-    case 'admin_update_settings':
-    case 'admin_switch_profile':
+    case "admin_update_settings":
+    case "admin_switch_profile":
       return null;
 
-    case 'admin_delete_session': {
+    case "admin_delete_session": {
       const adminId = Number(args?.adminId);
-      const sessionId = typeof args?.sessionId === 'string' ? args.sessionId : '';
+      const sessionId =
+        typeof args?.sessionId === "string" ? args.sessionId : "";
       if (Number.isFinite(adminId) && sessionId) {
         const adminState = adminSubprocesses.get(adminId);
-        const backendKind = adminState?.backendKind ?? 'tycode';
+        const backendKind = adminState?.backendKind ?? "tycode";
         const current = mockSessionsByBackend[backendKind] ?? [];
-        mockSessionsByBackend[backendKind] = current.filter((session) => session.id !== sessionId);
+        mockSessionsByBackend[backendKind] = current.filter(
+          (session) => session.id !== sessionId,
+        );
       }
       return null;
     }
 
-    case 'delete_session_record': {
-      const recordId = typeof args?.id === 'string' ? args.id : '';
+    case "delete_session_record": {
+      const recordId = typeof args?.id === "string" ? args.id : "";
       const rec = mockSessionRecords.get(recordId);
-      if (rec && rec.backend_session_id) {
+      if (rec?.backend_session_id) {
         const current = mockSessionsByBackend[rec.backend_kind] ?? [];
         mockSessionsByBackend[rec.backend_kind] = current.filter(
           (session) => session.id !== rec.backend_session_id,
@@ -1246,49 +1391,58 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'list_agent_definitions': {
+    case "list_agent_definitions": {
       return [
         {
-          id: 'bridge',
-          name: 'Bridge',
-          description: 'Default orchestrator agent that coordinates work between the human and other Tyde agents.',
+          id: "bridge",
+          name: "Bridge",
+          description:
+            "Default orchestrator agent that coordinates work between the human and other Tyde agents.",
           instructions: null,
           bootstrap_prompt: null,
           mcp_servers: [],
-          tool_policy: { mode: 'Unrestricted' },
+          tool_policy: { mode: "Unrestricted" },
           default_backend: null,
           include_agent_control: true,
           builtin: true,
-          scope: 'builtin',
+          scope: "builtin",
         },
       ];
     }
 
-    case 'save_agent_definition': {
+    case "save_agent_definition": {
       return null;
     }
 
-    case 'delete_agent_definition': {
+    case "delete_agent_definition": {
       return null;
     }
 
-    case 'list_workflows': {
-      const workflows = (window as any).__mockWorkflows as Array<{
-        id: string;
-        name: string;
-        description: string;
-        trigger: string;
-        steps: Array<{ name: string; actions: Array<Record<string, unknown>> }>;
-        scope: string;
-      }> | undefined;
+    case "list_workflows": {
+      const workflows = (window as any).__mockWorkflows as
+        | Array<{
+            id: string;
+            name: string;
+            description: string;
+            trigger: string;
+            steps: Array<{
+              name: string;
+              actions: Array<Record<string, unknown>>;
+            }>;
+            scope: string;
+          }>
+        | undefined;
       return workflows ?? [];
     }
 
-    case 'save_workflow': {
-      const json = typeof args?.workflowJson === 'string' ? args.workflowJson : '{}';
+    case "save_workflow": {
+      const json =
+        typeof args?.workflowJson === "string" ? args.workflowJson : "{}";
       const parsed = JSON.parse(json);
-      const scope = typeof args?.scope === 'string' ? args.scope : 'global';
-      const workflows = ((window as any).__mockWorkflows ?? []) as Array<Record<string, unknown>>;
+      const scope = typeof args?.scope === "string" ? args.scope : "global";
+      const workflows = ((window as any).__mockWorkflows ?? []) as Array<
+        Record<string, unknown>
+      >;
       const existing = workflows.findIndex((w) => w.id === parsed.id);
       if (existing >= 0) {
         workflows[existing] = { ...parsed, scope };
@@ -1299,48 +1453,71 @@ export async function invoke(cmd: string, args?: any): Promise<any> {
       return null;
     }
 
-    case 'delete_workflow': {
-      const id = typeof args?.id === 'string' ? args.id : '';
-      const workflows = ((window as any).__mockWorkflows ?? []) as Array<Record<string, unknown>>;
+    case "delete_workflow": {
+      const id = typeof args?.id === "string" ? args.id : "";
+      const workflows = ((window as any).__mockWorkflows ?? []) as Array<
+        Record<string, unknown>
+      >;
       (window as any).__mockWorkflows = workflows.filter((w) => w.id !== id);
       return null;
     }
 
-    case 'run_shell_command': {
-      const command = typeof args?.command === 'string' ? args.command : '';
+    case "run_shell_command": {
+      const command = typeof args?.command === "string" ? args.command : "";
       const mockShellHandler = (window as any).__mockShellCommandHandler as
-        | ((cmd: string) => { stdout: string; stderr: string; exit_code: number | null; success: boolean })
+        | ((cmd: string) => {
+            stdout: string;
+            stderr: string;
+            exit_code: number | null;
+            success: boolean;
+          })
         | undefined;
       if (mockShellHandler) {
         return mockShellHandler(command);
       }
       return {
         stdout: `mock output for: ${command}\n`,
-        stderr: '',
+        stderr: "",
         exit_code: 0,
         success: true,
       };
     }
 
-    case 'get_remote_control_settings':
-      return { enabled: false, running: false, socket_path: null, connected_clients: 0 };
+    case "get_remote_control_settings":
+      return {
+        enabled: false,
+        running: false,
+        socket_path: null,
+        connected_clients: 0,
+      };
 
-    case 'set_remote_control_enabled':
-      return { enabled: !!args?.enabled, running: false, socket_path: null, connected_clients: 0 };
+    case "set_remote_control_enabled":
+      return {
+        enabled: !!args?.enabled,
+        running: false,
+        socket_path: null,
+        connected_clients: 0,
+      };
 
     default:
       return null;
   }
 }
 
-export function transformCallback(_callback: Function, _once?: boolean): number {
+export function transformCallback(
+  _callback: Function,
+  _once?: boolean,
+): number {
   return 0;
 }
 
 // Expose a helper so E2E tests can inject/update mock runtime agents directly.
 (window as any).__mockSetRuntimeAgent = (agent: MockRuntimeAgent) => {
   runtimeAgents.set(agent.agent_id, agent);
-  emit('agent-changed', { ...agent, workspace_roots: [...agent.workspace_roots] });
+  emit("agent-changed", {
+    ...agent,
+    workspace_roots: [...agent.workspace_roots],
+  });
 };
 
 // Expose invoke on window so E2E tests can call it via browser.execute()

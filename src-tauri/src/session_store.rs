@@ -114,13 +114,14 @@ impl SessionStore {
         // and trigger the .corrupt rename — wiping the store.
         // tempfile::NamedTempFile::persist uses rename(2) on Unix and ReplaceFile
         // on Windows, so the swap is atomic on both platforms.
-        let dir = self.path.parent().ok_or("Session store path has no parent")?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|err| {
-            format!("Failed to create temp file in {}: {err}", dir.display())
-        })?;
-        tmp.write_all(json.as_bytes()).map_err(|err| {
-            format!("Failed to write session store temp file: {err}")
-        })?;
+        let dir = self
+            .path
+            .parent()
+            .ok_or("Session store path has no parent")?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|err| format!("Failed to create temp file in {}: {err}", dir.display()))?;
+        tmp.write_all(json.as_bytes())
+            .map_err(|err| format!("Failed to write session store temp file: {err}"))?;
         tmp.persist(&self.path).map_err(|err| {
             format!(
                 "Failed to persist session store to {}: {err}",

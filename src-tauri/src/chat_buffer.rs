@@ -45,10 +45,7 @@ impl ChatEventBuffer {
             timestamp_ms,
         };
 
-        let log = self
-            .conversations
-            .entry(conversation_id)
-            .or_default();
+        let log = self.conversations.entry(conversation_id).or_default();
         if log.len() >= self.limit_per_conversation {
             log.pop_front();
         }

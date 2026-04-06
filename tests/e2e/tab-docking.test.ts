@@ -1,15 +1,19 @@
-import { openWorkspace, sendPromptAndWaitForAssistant, sel } from './helpers';
+import { openWorkspace, sel, sendPromptAndWaitForAssistant } from "./helpers";
 
 const WORKSPACE_CONV_ID = 10000;
 
-async function emitChatEvent(conversationId: number, kind: string, data: unknown): Promise<void> {
+async function _emitChatEvent(
+  conversationId: number,
+  kind: string,
+  data: unknown,
+): Promise<void> {
   const payload = JSON.stringify({ conversationId, kind, data });
-  await (browser as any).execute(function (json: string) {
+  await (browser as any).execute((json: string) => {
     const parsed = JSON.parse(json);
-    const listeners = (window as any).__test_listeners?.['chat-event'] || [];
+    const listeners = (window as any).__test_listeners?.["chat-event"] || [];
     for (const h of listeners) {
       h({
-        event: 'chat-event',
+        event: "chat-event",
         id: 0,
         payload: {
           conversation_id: parsed.conversationId,
@@ -20,9 +24,9 @@ async function emitChatEvent(conversationId: number, kind: string, data: unknown
   }, payload);
 }
 
-function makeAssistantMessage(content: string): Record<string, unknown> {
+function _makeAssistantMessage(content: string): Record<string, unknown> {
   return {
-    sender: { Assistant: { agent: 'tycode' } },
+    sender: { Assistant: { agent: "tycode" } },
     content,
     timestamp: Date.now(),
     images: [],
@@ -33,9 +37,13 @@ function makeAssistantMessage(content: string): Record<string, unknown> {
   };
 }
 
-async function dockConversation(conversationId: number, zone: 'left' | 'right'): Promise<boolean> {
+async function dockConversation(
+  conversationId: number,
+  zone: "left" | "right",
+): Promise<boolean> {
   return browser.execute(
-    (id: number, z: string) => (window as any).__test_dockConversation?.(id, z) ?? false,
+    (id: number, z: string) =>
+      (window as any).__test_dockConversation?.(id, z) ?? false,
     conversationId,
     zone,
   );
@@ -52,52 +60,69 @@ async function getTabTitles(): Promise<string[]> {
   return browser.execute((tabSel: string) => {
     return Array.from(document.querySelectorAll(tabSel))
       .filter((el) => (el as HTMLElement).offsetParent !== null)
-      .map(el => el.querySelector('[data-testid="conv-tab-title"]')?.textContent ?? '');
+      .map(
+        (el) =>
+          el.querySelector('[data-testid="conv-tab-title"]')?.textContent ?? "",
+      );
   }, sel.convTab);
 }
 
 async function getDockedConversationTitle(): Promise<string | null> {
   return browser.execute(() => {
-    const el = document.querySelector('.docked-conversation-title');
+    const el = document.querySelector(".docked-conversation-title");
     return el?.textContent ?? null;
   });
 }
 
 async function isInputVisibleInDock(): Promise<boolean> {
   return browser.execute(() => {
-    const docked = document.querySelector('[data-testid="docked-conversation"]');
+    const docked = document.querySelector(
+      '[data-testid="docked-conversation"]',
+    );
     if (!docked) return false;
-    const textarea = docked.querySelector('textarea[aria-label="Message input"]') as HTMLTextAreaElement | null;
+    const textarea = docked.querySelector(
+      'textarea[aria-label="Message input"]',
+    ) as HTMLTextAreaElement | null;
     if (!textarea) return false;
     const rect = textarea.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
   });
 }
 
-async function typeInDockedInput(text: string): Promise<void> {
+async function _typeInDockedInput(text: string): Promise<void> {
   await browser.execute((t: string) => {
-    const docked = document.querySelector('[data-testid="docked-conversation"]');
-    if (!docked) throw new Error('No docked conversation found');
-    const textarea = docked.querySelector('textarea[aria-label="Message input"]') as HTMLTextAreaElement;
-    if (!textarea) throw new Error('No textarea in docked conversation');
+    const docked = document.querySelector(
+      '[data-testid="docked-conversation"]',
+    );
+    if (!docked) throw new Error("No docked conversation found");
+    const textarea = docked.querySelector(
+      'textarea[aria-label="Message input"]',
+    ) as HTMLTextAreaElement;
+    if (!textarea) throw new Error("No textarea in docked conversation");
     textarea.value = t;
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }, text);
 }
 
-async function clickDockedSendButton(): Promise<void> {
+async function _clickDockedSendButton(): Promise<void> {
   await browser.execute(() => {
-    const docked = document.querySelector('[data-testid="docked-conversation"]');
-    if (!docked) throw new Error('No docked conversation found');
-    const btn = docked.querySelector('[data-testid="send-btn"]') as HTMLButtonElement;
-    if (!btn) throw new Error('No send button in docked conversation');
+    const docked = document.querySelector(
+      '[data-testid="docked-conversation"]',
+    );
+    if (!docked) throw new Error("No docked conversation found");
+    const btn = docked.querySelector(
+      '[data-testid="send-btn"]',
+    ) as HTMLButtonElement;
+    if (!btn) throw new Error("No send button in docked conversation");
     btn.click();
   });
 }
 
 async function countMessagesInDock(): Promise<number> {
   return browser.execute((msgSel: string) => {
-    const docked = document.querySelector('[data-testid="docked-conversation"]');
+    const docked = document.querySelector(
+      '[data-testid="docked-conversation"]',
+    );
     if (!docked) return 0;
     return docked.querySelectorAll(msgSel).length;
   }, sel.assistantMessage);
@@ -114,17 +139,21 @@ async function countAssistantMessagesInCenter(): Promise<number> {
   }, sel.assistantMessage);
 }
 
-async function isSendButtonEnabledInDock(): Promise<boolean> {
+async function _isSendButtonEnabledInDock(): Promise<boolean> {
   return browser.execute(() => {
-    const docked = document.querySelector('[data-testid="docked-conversation"]');
+    const docked = document.querySelector(
+      '[data-testid="docked-conversation"]',
+    );
     if (!docked) return false;
-    const btn = docked.querySelector('[data-testid="send-btn"]') as HTMLButtonElement | null;
+    const btn = docked.querySelector(
+      '[data-testid="send-btn"]',
+    ) as HTMLButtonElement | null;
     return btn ? !btn.disabled : false;
   });
 }
 
-describe('Tab docking lifecycle', () => {
-  it('complete dock → chat → undock → chat journey with title preservation and multi-tab support', async () => {
+describe("Tab docking lifecycle", () => {
+  it("complete dock → chat → undock → chat journey with title preservation and multi-tab support", async () => {
     await openWorkspace();
 
     // --- Phase 1: Setup — create chat and send initial message ---
@@ -134,7 +163,7 @@ describe('Tab docking lifecycle', () => {
     const input = await $(sel.messageInput);
     await input.waitForDisplayed({ timeout: 5000 });
 
-    await sendPromptAndWaitForAssistant('Hello from docking test');
+    await sendPromptAndWaitForAssistant("Hello from docking test");
 
     // Capture initial state
     const titlesBeforeDock = await getTabTitles();
@@ -146,7 +175,7 @@ describe('Tab docking lifecycle', () => {
     expect(messagesBeforeDock).toBeGreaterThan(0);
 
     // --- Phase 2: Dock the conversation to the right zone ---
-    const dockResult = await dockConversation(WORKSPACE_CONV_ID, 'right');
+    const dockResult = await dockConversation(WORKSPACE_CONV_ID, "right");
     expect(dockResult).toBe(true);
     await browser.pause(300);
 
@@ -187,7 +216,7 @@ describe('Tab docking lifecycle', () => {
     // 4a. Use sendPromptAndWaitForAssistant — after docking, the dock's textarea is the only
     //     visible one, so the helper will find it. This proves the full send → EventRouter →
     //     detached view → response render cycle works.
-    await sendPromptAndWaitForAssistant('Message while docked');
+    await sendPromptAndWaitForAssistant("Message while docked");
 
     // 4b. Verify assistant message count increased in dock
     const msgCountAfterResponse = await countMessagesInDock();
@@ -227,16 +256,18 @@ describe('Tab docking lifecycle', () => {
 
     // --- Phase 7: Chat works after undocking ---
     // sendPromptAndWaitForAssistant will timeout if chat is broken — this IS the proof
-    await sendPromptAndWaitForAssistant('Message after undocking');
+    await sendPromptAndWaitForAssistant("Message after undocking");
 
     // Verify the new response rendered somewhere accessible
     const hasUndockResponse = await browser.execute(() => {
-      return document.body.textContent?.includes('Message after undocking') ?? false;
+      return (
+        document.body.textContent?.includes("Message after undocking") ?? false
+      );
     });
     expect(hasUndockResponse).toBe(true);
 
     // --- Phase 8: Re-dock cycle — dock again to verify re-docking works ---
-    const reDockResult = await dockConversation(WORKSPACE_CONV_ID, 'right');
+    const reDockResult = await dockConversation(WORKSPACE_CONV_ID, "right");
     expect(reDockResult).toBe(true);
     await browser.pause(300);
 
@@ -273,8 +304,11 @@ describe('Tab docking lifecycle', () => {
 
     // Create a second conversation tab
     await browser.execute(() => {
-      const btn = Array.from(document.querySelectorAll('#center-new-tab-btn'))
-        .find((el) => (el as HTMLElement).offsetParent !== null) as HTMLButtonElement | undefined;
+      const btn = Array.from(
+        document.querySelectorAll("#center-new-tab-btn"),
+      ).find((el) => (el as HTMLElement).offsetParent !== null) as
+        | HTMLButtonElement
+        | undefined;
       if (btn) btn.click();
     });
     await browser.pause(500);
@@ -284,7 +318,7 @@ describe('Tab docking lifecycle', () => {
     expect(tabsWithTwo.length).toBe(2);
 
     // Dock the first conversation
-    const multiDockResult = await dockConversation(WORKSPACE_CONV_ID, 'right');
+    const multiDockResult = await dockConversation(WORKSPACE_CONV_ID, "right");
     expect(multiDockResult).toBe(true);
     await browser.pause(300);
 
@@ -299,19 +333,32 @@ describe('Tab docking lifecycle', () => {
     }, sel.convTab);
 
     await browser.waitUntil(
-      async () => browser.execute((inputSel: string, dockSel: string) => {
-        const inputs = Array.from(document.querySelectorAll(inputSel)) as HTMLTextAreaElement[];
-        return inputs.some((input) => {
-          if (input.closest(dockSel)) return false;
-          const style = window.getComputedStyle(input);
-          const rect = input.getBoundingClientRect();
-          return style.display !== 'none'
-            && style.visibility !== 'hidden'
-            && rect.width > 0
-            && rect.height > 0;
-        });
-      }, sel.messageInput, sel.dockedConversation),
-      { timeout: 5000, timeoutMsg: 'Expected visible center chat input after docking first tab' },
+      async () =>
+        browser.execute(
+          (inputSel: string, dockSel: string) => {
+            const inputs = Array.from(
+              document.querySelectorAll(inputSel),
+            ) as HTMLTextAreaElement[];
+            return inputs.some((input) => {
+              if (input.closest(dockSel)) return false;
+              const style = window.getComputedStyle(input);
+              const rect = input.getBoundingClientRect();
+              return (
+                style.display !== "none" &&
+                style.visibility !== "hidden" &&
+                rect.width > 0 &&
+                rect.height > 0
+              );
+            });
+          },
+          sel.messageInput,
+          sel.dockedConversation,
+        ),
+      {
+        timeout: 5000,
+        timeoutMsg:
+          "Expected visible center chat input after docking first tab",
+      },
     );
 
     // Clean up: undock first conversation
@@ -319,12 +366,12 @@ describe('Tab docking lifecycle', () => {
     await browser.pause(300);
 
     // --- Phase 10: Double-dock prevention ---
-    const dockForDouble11 = await dockConversation(WORKSPACE_CONV_ID, 'right');
+    const dockForDouble11 = await dockConversation(WORKSPACE_CONV_ID, "right");
     expect(dockForDouble11).toBe(true);
     await browser.pause(200);
 
     // Docking same conversation again should fail
-    const doubleDockResult = await dockConversation(WORKSPACE_CONV_ID, 'left');
+    const doubleDockResult = await dockConversation(WORKSPACE_CONV_ID, "left");
     expect(doubleDockResult).toBe(false);
 
     // Clean up

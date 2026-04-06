@@ -57,7 +57,6 @@ pub(crate) fn list_available_skills() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-
 /// Skill discovery subdir inside the temp/workspace root for each backend.
 fn skill_subdir(kind: BackendKind) -> &'static str {
     match kind {
@@ -384,8 +383,8 @@ pub(crate) async fn cleanup_injected_skills(cleanup: SkillCleanup) {
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst)
         .map_err(|e| format!("Failed to create directory {}: {e}", dst.display()))?;
-    for entry in fs::read_dir(src)
-        .map_err(|e| format!("Failed to read directory {}: {e}", src.display()))?
+    for entry in
+        fs::read_dir(src).map_err(|e| format!("Failed to read directory {}: {e}", src.display()))?
     {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
         let path = entry.path();
@@ -415,7 +414,11 @@ mod tests {
         for name in names {
             let skill_dir = skills_dir.join(name);
             fs::create_dir_all(&skill_dir).unwrap();
-            fs::write(skill_dir.join("SKILL.md"), format!("# {name}\nDo {name} stuff.")).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("# {name}\nDo {name} stuff."),
+            )
+            .unwrap();
             fs::write(skill_dir.join("helper.sh"), "#!/bin/sh\necho hi").unwrap();
         }
         skills_dir
@@ -464,9 +467,13 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let skills_dir = setup_skills_dir(tmp.path(), &["my-skill"]);
 
-        let result =
-            inject_skills_local_workspace(BackendKind::Codex, &workspace.to_string_lossy(), &skills_dir, &["my-skill".to_string()])
-                .unwrap();
+        let result = inject_skills_local_workspace(
+            BackendKind::Codex,
+            &workspace.to_string_lossy(),
+            &skills_dir,
+            &["my-skill".to_string()],
+        )
+        .unwrap();
 
         assert!(result.skill_dir.is_none());
         assert_eq!(result.cleanup.workspace_paths.len(), 1);
@@ -482,9 +489,13 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         let skills_dir = setup_skills_dir(tmp.path(), &["review"]);
 
-        let result =
-            inject_skills_local_workspace(BackendKind::Kiro, &workspace.to_string_lossy(), &skills_dir, &["review".to_string()])
-                .unwrap();
+        let result = inject_skills_local_workspace(
+            BackendKind::Kiro,
+            &workspace.to_string_lossy(),
+            &skills_dir,
+            &["review".to_string()],
+        )
+        .unwrap();
 
         assert!(result.skill_dir.is_none());
         assert_eq!(result.cleanup.workspace_paths.len(), 1);

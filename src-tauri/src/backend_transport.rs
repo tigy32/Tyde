@@ -4,7 +4,9 @@ use tokio::process::Command;
 pub(crate) enum BackendTransport {
     #[default]
     Local,
-    Ssh { host: String },
+    Ssh {
+        host: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -56,7 +58,6 @@ impl BackendTransport {
         }
     }
 }
-
 
 impl BackendLaunchTarget {
     pub(crate) fn local(executable_path: impl Into<String>) -> Self {

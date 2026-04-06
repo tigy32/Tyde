@@ -388,8 +388,10 @@ impl TydeServerConnection {
                     }
                 } else if event == "tyde-projects-changed" {
                     let projects: Vec<crate::project_store::ProjectRecord> =
-                        serde_json::from_value(translated.get("projects").cloned().unwrap_or_default())
-                            .unwrap_or_default();
+                        serde_json::from_value(
+                            translated.get("projects").cloned().unwrap_or_default(),
+                        )
+                        .unwrap_or_default();
                     let normalized: Vec<_> = projects
                         .into_iter()
                         .map(|r| self.normalize_project_record(r))
@@ -477,12 +479,8 @@ impl TydeServerConnection {
     }
 
     #[allow(dead_code)]
-    pub async fn fetch_projects(
-        &self,
-    ) -> Result<Vec<crate::project_store::ProjectRecord>, String> {
-        let resp = self
-            .invoke("list_projects", serde_json::json!({}))
-            .await?;
+    pub async fn fetch_projects(&self) -> Result<Vec<crate::project_store::ProjectRecord>, String> {
+        let resp = self.invoke("list_projects", serde_json::json!({})).await?;
         let records: Vec<crate::project_store::ProjectRecord> = serde_json::from_value(resp)
             .map_err(|e| format!("Failed to parse remote projects: {e}"))?;
         *self.remote_projects.lock().await = records.clone();

@@ -14,7 +14,9 @@ fn main() {
 
 #[cfg(not(unix))]
 fn run_connect() {
-    eprintln!("The 'connect' subcommand requires Unix domain sockets and is not available on Windows.");
+    eprintln!(
+        "The 'connect' subcommand requires Unix domain sockets and is not available on Windows."
+    );
     std::process::exit(1);
 }
 

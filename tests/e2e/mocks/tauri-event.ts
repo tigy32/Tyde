@@ -1,6 +1,9 @@
 const listeners: Record<string, Array<(event: any) => void>> = {};
 
-export async function listen(eventName: string, callback: (event: any) => void): Promise<() => void> {
+export async function listen(
+  eventName: string,
+  callback: (event: any) => void,
+): Promise<() => void> {
   if (!listeners[eventName]) {
     listeners[eventName] = [];
   }

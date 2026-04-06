@@ -1,8 +1,8 @@
-import { sel } from './helpers';
+import { sel } from "./helpers";
 
-describe('Git panel - non-git project', () => {
-  it('shows clean message instead of error for non-git projects', async () => {
-    await browser.url('/');
+describe("Git panel - non-git project", () => {
+  it("shows clean message instead of error for non-git projects", async () => {
+    await browser.url("/");
     const app = await $(sel.app);
     await app.waitForExist({ timeout: 10_000 });
 
@@ -17,18 +17,18 @@ describe('Git panel - non-git project', () => {
 
     const title = await $(sel.appTitle);
     await browser.waitUntil(
-      async () => (await title.getText()).includes('workspace'),
-      { timeout: 10_000, timeoutMsg: 'Workspace did not load' },
+      async () => (await title.getText()).includes("workspace"),
+      { timeout: 10_000, timeoutMsg: "Workspace did not load" },
     );
 
     // Activate the git widget tab since 'files' is active by default
-    const gitTab = await $(sel.dockWidgetTab + '[data-widget="git"]');
+    const gitTab = await $(`${sel.dockWidgetTab}[data-widget="git"]`);
     await gitTab.waitForExist({ timeout: 5_000 });
     await gitTab.click();
 
     const gitEmpty = await $(sel.gitEmpty);
     await gitEmpty.waitForExist({ timeout: 5_000 });
-    expect(await gitEmpty.getText()).toBe('Not a git repository');
+    expect(await gitEmpty.getText()).toBe("Not a git repository");
 
     const errorNotification = await $(sel.notificationError);
     expect(await errorNotification.isExisting()).toBe(false);

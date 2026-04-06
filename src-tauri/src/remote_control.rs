@@ -22,12 +22,12 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::chat_buffer::ChatEventBuffer;
+#[cfg(not(unix))]
+use crate::protocol::ServerFrame;
 #[cfg(unix)]
 use crate::protocol::{
     ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION,
 };
-#[cfg(not(unix))]
-use crate::protocol::ServerFrame;
 
 /// Manages the UDS listener that accepts remote Tyde clients.
 /// Started when "Allow remote control" is enabled in settings.
@@ -311,7 +311,11 @@ async fn handle_client(
                 conversation_id: id,
                 // active_ids() returns keys from the same map, so these lookups
                 // cannot fail while we hold the lock.
-                backend_kind: mgr.backend_kind(id).expect("active conversation has backend_kind").as_str().to_string(),
+                backend_kind: mgr
+                    .backend_kind(id)
+                    .expect("active conversation has backend_kind")
+                    .as_str()
+                    .to_string(),
                 workspace_roots: mgr
                     .workspace_roots(id)
                     .expect("active conversation has workspace_roots")
@@ -321,10 +325,16 @@ async fn handle_client(
             .collect()
     };
 
-    let session_records = state.session_store.lock().list()
+    let session_records = state
+        .session_store
+        .lock()
+        .list()
         .map_err(|e| format!("Failed to read session store: {e}"))?;
 
-    let projects = state.project_store.lock().list()
+    let projects = state
+        .project_store
+        .lock()
+        .list()
         .map_err(|e| format!("Failed to read project store: {e}"))?;
 
     send(
@@ -904,11 +914,8 @@ async fn dispatch_invoke(
             // Delete from backend via temp admin subprocess if there's a backend session
             if let Some(ref bsid) = backend_session_id {
                 let roots: Vec<String> = workspace_root.iter().cloned().collect();
-                let backend_kind = crate::resolve_requested_backend_kind(
-                    &state,
-                    Some(backend_kind_str),
-                    &roots,
-                )?;
+                let backend_kind =
+                    crate::resolve_requested_backend_kind(&state, Some(backend_kind_str), &roots)?;
                 let launch_target =
                     crate::resolve_backend_launch_target(app, &roots, backend_kind).await?;
                 let (session, _rx) = crate::backend::BackendSession::spawn_admin(
@@ -959,10 +966,12 @@ async fn dispatch_invoke(
                 kind: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
-            let record = state
-                .project_store
-                .lock()
-                .add_workbench(&p.parent_project_id, &p.workspace_path, &p.name, &p.kind)?;
+            let record = state.project_store.lock().add_workbench(
+                &p.parent_project_id,
+                &p.workspace_path,
+                &p.name,
+                &p.kind,
+            )?;
             crate::emit_projects_changed(app, &state);
             serde_json::to_value(record).map_err(|e| e.to_string())
         }

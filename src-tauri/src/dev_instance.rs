@@ -712,10 +712,7 @@ pub(crate) async fn proxy_debug_tool_call(
 
 /// Stop all dev instances bound to a given agent.
 pub(crate) async fn stop_instances_for_agent(state: &AppState, agent_id: &str) -> Vec<u64> {
-    let ids = state
-        .dev_instances
-        .lock()
-        .instance_ids_for_agent(agent_id);
+    let ids = state.dev_instances.lock().instance_ids_for_agent(agent_id);
 
     let mut stopped = Vec::new();
     for id in ids {

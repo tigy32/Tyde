@@ -1,21 +1,21 @@
-import { openWorkspace, openWorkspaceAndWaitForChat, sel } from './helpers';
+import { openWorkspaceAndWaitForChat, sel } from "./helpers";
 
 async function openSettingsOverlay(): Promise<void> {
-  await browser.keys(['Control', ',']);
+  await browser.keys(["Control", ","]);
   await browser.pause(500);
 
   const settingsView = await $(sel.settingsTabView);
   await browser.waitUntil(
     async () => {
-      const cls = await settingsView.getAttribute('class');
-      return cls !== null && !cls.includes('hidden');
+      const cls = await settingsView.getAttribute("class");
+      return cls !== null && !cls.includes("hidden");
     },
-    { timeout: 5_000, timeoutMsg: 'Settings overlay did not become visible' },
+    { timeout: 5_000, timeoutMsg: "Settings overlay did not become visible" },
   );
 }
 
-describe('Settings panel', () => {
-  it('overlay opens/closes without creating tabs, backend data loads correctly', async () => {
+describe("Settings panel", () => {
+  it("overlay opens/closes without creating tabs, backend data loads correctly", async () => {
     await openWorkspaceAndWaitForChat();
 
     // --- Open settings overlay ---
@@ -23,18 +23,23 @@ describe('Settings panel', () => {
 
     // No settings tab is created in the tab bar
     const hasSettingsTab = await browser.execute((convTabSel: string) => {
-      return document.querySelector(convTabSel + '.conv-tab-settings') !== null;
+      return document.querySelector(`${convTabSel}.conv-tab-settings`) !== null;
     }, sel.convTab);
     expect(hasSettingsTab).toBe(false);
 
     // Settings view has nav and tab panels
-    const hasRenderedContent = await browser.execute((tabViewSel: string, navSel: string, panelSel: string) => {
-      const view = document.querySelector(tabViewSel + ':not(.hidden)');
-      if (!view) return { found: false, nav: false, panels: 0 };
-      const nav = view.querySelector(navSel) !== null;
-      const panels = view.querySelectorAll(panelSel).length;
-      return { found: true, nav, panels };
-    }, sel.settingsTabView, sel.settingsNav, sel.settingsTabPanel);
+    const hasRenderedContent = await browser.execute(
+      (tabViewSel: string, navSel: string, panelSel: string) => {
+        const view = document.querySelector(`${tabViewSel}:not(.hidden)`);
+        if (!view) return { found: false, nav: false, panels: 0 };
+        const nav = view.querySelector(navSel) !== null;
+        const panels = view.querySelectorAll(panelSel).length;
+        return { found: true, nav, panels };
+      },
+      sel.settingsTabView,
+      sel.settingsNav,
+      sel.settingsTabPanel,
+    );
     expect(hasRenderedContent.found).toBe(true);
     expect(hasRenderedContent.nav).toBe(true);
     expect(hasRenderedContent.panels).toBeGreaterThanOrEqual(1);
@@ -45,20 +50,21 @@ describe('Settings panel', () => {
     await closeBtn.click();
     await browser.pause(300);
 
-    let cls = await (await $(sel.settingsTabView)).getAttribute('class');
-    expect(cls).toContain('hidden');
+    let cls = await (await $(sel.settingsTabView)).getAttribute("class");
+    expect(cls).toContain("hidden");
 
     // --- Reopen and close with Escape ---
     await openSettingsOverlay();
-    await browser.keys(['Escape']);
+    await browser.keys(["Escape"]);
     await browser.pause(300);
 
-    cls = await (await $(sel.settingsTabView)).getAttribute('class');
-    expect(cls).toContain('hidden');
+    cls = await (await $(sel.settingsTabView)).getAttribute("class");
+    expect(cls).toContain("hidden");
 
     // No blank tab remains after closing
     const settingsTabCount = await browser.execute((convTabSel: string) => {
-      return document.querySelectorAll(convTabSel + '.conv-tab-settings').length;
+      return document.querySelectorAll(`${convTabSel}.conv-tab-settings`)
+        .length;
     }, sel.convTab);
     expect(settingsTabCount).toBe(0);
 
@@ -66,59 +72,90 @@ describe('Settings panel', () => {
     await openSettingsOverlay();
 
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="general"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="general"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
     await browser.waitUntil(
       async () => {
-        return browser.execute((panelSel: string, selectSel: string) => {
-          const panel = document.querySelector(panelSel + '[data-panel="general"]');
-          if (!panel) return false;
-          const first = panel.querySelector(selectSel) as HTMLSelectElement | null;
-          return first !== null && first.value === 'unlimited';
-        }, sel.settingsTabPanel, sel.settingsSelect);
+        return browser.execute(
+          (panelSel: string, selectSel: string) => {
+            const panel = document.querySelector(
+              `${panelSel}[data-panel="general"]`,
+            );
+            if (!panel) return false;
+            const first = panel.querySelector(
+              selectSel,
+            ) as HTMLSelectElement | null;
+            return first !== null && first.value === "unlimited";
+          },
+          sel.settingsTabPanel,
+          sel.settingsSelect,
+        );
       },
-      { timeout: 5_000, timeoutMsg: 'Settings data did not populate from backend' },
+      {
+        timeout: 5_000,
+        timeoutMsg: "Settings data did not populate from backend",
+      },
     );
 
-    const selectValues = await browser.execute((panelSel: string, selectSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="general"]');
-      if (!panel) return [];
-      const selects = panel.querySelectorAll(selectSel);
-      return Array.from(selects).map(s => (s as HTMLSelectElement).value);
-    }, sel.settingsTabPanel, sel.settingsSelect);
+    const selectValues = await browser.execute(
+      (panelSel: string, selectSel: string) => {
+        const panel = document.querySelector(
+          `${panelSel}[data-panel="general"]`,
+        );
+        if (!panel) return [];
+        const selects = panel.querySelectorAll(selectSel);
+        return Array.from(selects).map((s) => (s as HTMLSelectElement).value);
+      },
+      sel.settingsTabPanel,
+      sel.settingsSelect,
+    );
     expect(selectValues.length).toBeGreaterThanOrEqual(6);
-    expect(selectValues[0]).toBe('unlimited');
-    expect(selectValues[1]).toBe('Task');
+    expect(selectValues[0]).toBe("unlimited");
+    expect(selectValues[1]).toBe("Task");
 
     // --- Provider cards ---
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="providers"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="providers"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
-    const cardName = await browser.execute((panelSel: string, cardNameSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="providers"]');
-      if (!panel) return null;
-      const name = panel.querySelector(cardNameSel);
-      return name ? name.textContent : null;
-    }, sel.settingsTabPanel, sel.settingsCardName);
-    expect(cardName).toBe('MockProvider');
+    const cardName = await browser.execute(
+      (panelSel: string, cardNameSel: string) => {
+        const panel = document.querySelector(
+          `${panelSel}[data-panel="providers"]`,
+        );
+        if (!panel) return null;
+        const name = panel.querySelector(cardNameSel);
+        return name ? name.textContent : null;
+      },
+      sel.settingsTabPanel,
+      sel.settingsCardName,
+    );
+    expect(cardName).toBe("MockProvider");
 
     // --- Tyde MCP control server toggle ---
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="tyde"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="tyde"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
     const mcpToggle = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
       if (!panel) return { exists: false, checked: false };
-      const input = panel.querySelector('[data-testid="settings-mcp-http-enabled"]') as HTMLInputElement | null;
+      const input = panel.querySelector(
+        '[data-testid="settings-mcp-http-enabled"]',
+      ) as HTMLInputElement | null;
       if (!input) return { exists: false, checked: false };
       return { exists: true, checked: input.checked };
     }, sel.settingsTabPanel);
@@ -128,78 +165,109 @@ describe('Settings panel', () => {
     // WebDriver cannot reliably click label-wrapped checkboxes (double-toggle),
     // so toggle via the change event which is how the production handler fires
     await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-mcp-http-enabled"]') as HTMLInputElement;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-mcp-http-enabled"]',
+      ) as HTMLInputElement;
       input.checked = !input.checked;
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
     }, sel.settingsTabPanel);
     await browser.pause(200);
 
     const mcpToggleAfter = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-mcp-http-enabled"]') as HTMLInputElement | null;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-mcp-http-enabled"]',
+      ) as HTMLInputElement | null;
       return input?.checked ?? true;
     }, sel.settingsTabPanel);
     expect(mcpToggleAfter).toBe(false);
 
     const debugMcpToggle = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
       if (!panel) return { exists: false, checked: true };
-      const input = panel.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
+      const input = panel.querySelector(
+        '[data-testid="settings-driver-mcp-http-enabled"]',
+      ) as HTMLInputElement | null;
       if (!input) return { exists: false, checked: true };
       return { exists: true, checked: input.checked };
     }, sel.settingsTabPanel);
     expect(debugMcpToggle.exists).toBe(true);
     expect(debugMcpToggle.checked).toBe(false);
 
-    const debugMcpAutoloadInitial = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      if (!panel) return { exists: false, checked: true, disabled: false };
-      const input = panel.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
-      if (!input) return { exists: false, checked: true, disabled: false };
-      return { exists: true, checked: input.checked, disabled: input.disabled };
-    }, sel.settingsTabPanel);
+    const debugMcpAutoloadInitial = await browser.execute(
+      (panelSel: string) => {
+        const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+        if (!panel) return { exists: false, checked: true, disabled: false };
+        const input = panel.querySelector(
+          '[data-testid="settings-driver-mcp-http-autoload"]',
+        ) as HTMLInputElement | null;
+        if (!input) return { exists: false, checked: true, disabled: false };
+        return {
+          exists: true,
+          checked: input.checked,
+          disabled: input.disabled,
+        };
+      },
+      sel.settingsTabPanel,
+    );
     expect(debugMcpAutoloadInitial.exists).toBe(true);
     expect(debugMcpAutoloadInitial.checked).toBe(false);
     expect(debugMcpAutoloadInitial.disabled).toBe(true);
 
     await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-driver-mcp-http-enabled"]',
+      ) as HTMLInputElement;
       input.checked = !input.checked;
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
     }, sel.settingsTabPanel);
     await browser.pause(200);
 
     const debugMcpToggleAfter = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-driver-mcp-http-enabled"]',
+      ) as HTMLInputElement | null;
       return input?.checked ?? false;
     }, sel.settingsTabPanel);
     expect(debugMcpToggleAfter).toBe(true);
 
-    const debugMcpAutoloadAfterEnable = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
-      if (!input) return { checked: true, disabled: true };
-      return { checked: input.checked, disabled: input.disabled };
-    }, sel.settingsTabPanel);
+    const debugMcpAutoloadAfterEnable = await browser.execute(
+      (panelSel: string) => {
+        const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+        const input = panel?.querySelector(
+          '[data-testid="settings-driver-mcp-http-autoload"]',
+        ) as HTMLInputElement | null;
+        if (!input) return { checked: true, disabled: true };
+        return { checked: input.checked, disabled: input.disabled };
+      },
+      sel.settingsTabPanel,
+    );
     expect(debugMcpAutoloadAfterEnable.checked).toBe(false);
     expect(debugMcpAutoloadAfterEnable.disabled).toBe(false);
 
     await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-driver-mcp-http-autoload"]',
+      ) as HTMLInputElement;
       input.checked = !input.checked;
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
     }, sel.settingsTabPanel);
     await browser.pause(200);
 
-    const debugMcpAutoloadAfterToggle = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
-      return input?.checked ?? false;
-    }, sel.settingsTabPanel);
+    const debugMcpAutoloadAfterToggle = await browser.execute(
+      (panelSel: string) => {
+        const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+        const input = panel?.querySelector(
+          '[data-testid="settings-driver-mcp-http-autoload"]',
+        ) as HTMLInputElement | null;
+        return input?.checked ?? false;
+      },
+      sel.settingsTabPanel,
+    );
     expect(debugMcpAutoloadAfterToggle).toBe(true);
 
     // --- Regression: driver toggle state survives saving from another tab ---
@@ -207,166 +275,220 @@ describe('Settings panel', () => {
     // setting triggered save_app_settings. Verify that switching to "general",
     // changing a setting there, and coming back preserves the driver toggle.
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="general"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="general"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
     // Change a general setting (default backend dropdown) to trigger a save
     await browser.execute(() => {
-      const select = document.querySelector('[data-testid="default-backend-select"]') as HTMLSelectElement | null;
+      const select = document.querySelector(
+        '[data-testid="default-backend-select"]',
+      ) as HTMLSelectElement | null;
       if (select && select.options.length > 1) {
         select.value = select.options[1].value;
-        select.dispatchEvent(new Event('change', { bubbles: true }));
+        select.dispatchEvent(new Event("change", { bubbles: true }));
       }
     });
     await browser.pause(200);
 
     // Navigate back to tyde tab
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="tyde"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="tyde"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
     // Driver toggle must still be enabled (was toggled on above)
     const driverAfterOtherSave = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-enabled"]') as HTMLInputElement | null;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-driver-mcp-http-enabled"]',
+      ) as HTMLInputElement | null;
       return input?.checked ?? false;
     }, sel.settingsTabPanel);
     expect(driverAfterOtherSave).toBe(true);
 
     // Autoload toggle must still be enabled
     const autoloadAfterOtherSave = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-driver-mcp-http-autoload"]') as HTMLInputElement | null;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-driver-mcp-http-autoload"]',
+      ) as HTMLInputElement | null;
       return input?.checked ?? false;
     }, sel.settingsTabPanel);
     expect(autoloadAfterOtherSave).toBe(true);
 
     // --- Backends tab ---
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="backends"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="backends"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
     // Verify backends panel is visible with toggle controls
-    await browser.waitUntil(async () => {
-      const res = await browser.execute((panelSel: string) => {
-        const panel = document.querySelector(panelSel + '[data-panel="backends"]');
-        if (!panel) return 0;
-        return panel.querySelectorAll('input[type="checkbox"]').length;
-      }, sel.settingsTabPanel);
-      return res === 5;
-    }, { timeout: 5_000, timeoutMsg: 'Expected 5 backend toggles' });
+    await browser.waitUntil(
+      async () => {
+        const res = await browser.execute((panelSel: string) => {
+          const panel = document.querySelector(
+            `${panelSel}[data-panel="backends"]`,
+          );
+          if (!panel) return 0;
+          return panel.querySelectorAll('input[type="checkbox"]').length;
+        }, sel.settingsTabPanel);
+        return res === 5;
+      },
+      { timeout: 5_000, timeoutMsg: "Expected 5 backend toggles" },
+    );
 
     // All backends should be enabled by default (assuming deps are available)
     const allEnabled = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      const panel = document.querySelector(
+        `${panelSel}[data-panel="backends"]`,
+      );
       if (!panel) return false;
-      const toggles = panel.querySelectorAll('input[type="checkbox"]:not(:disabled)');
-      return Array.from(toggles).every(t => (t as HTMLInputElement).checked);
+      const toggles = panel.querySelectorAll(
+        'input[type="checkbox"]:not(:disabled)',
+      );
+      return Array.from(toggles).every((t) => (t as HTMLInputElement).checked);
     }, sel.settingsTabPanel);
     expect(allEnabled).toBe(true);
 
     // Disable codex backend via change event
     await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
-      const input = panel?.querySelector('[data-testid="settings-backend-codex-enabled"]') as HTMLInputElement;
+      const panel = document.querySelector(
+        `${panelSel}[data-panel="backends"]`,
+      );
+      const input = panel?.querySelector(
+        '[data-testid="settings-backend-codex-enabled"]',
+      ) as HTMLInputElement;
       if (input && !input.disabled) {
         input.checked = false;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
       }
     }, sel.settingsTabPanel);
     await browser.pause(200);
 
     // Verify codex toggle is now unchecked
     const codexAfter = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
-      const input = panel?.querySelector('[data-testid="settings-backend-codex-enabled"]') as HTMLInputElement | null;
+      const panel = document.querySelector(
+        `${panelSel}[data-panel="backends"]`,
+      );
+      const input = panel?.querySelector(
+        '[data-testid="settings-backend-codex-enabled"]',
+      ) as HTMLInputElement | null;
       return input?.checked ?? true;
     }, sel.settingsTabPanel);
     expect(codexAfter).toBe(false);
 
     // Verify default backend dropdown no longer shows codex
     const backendOptions = await browser.execute(() => {
-      const select = document.querySelector('[data-testid="default-backend-select"]') as HTMLSelectElement | null;
+      const select = document.querySelector(
+        '[data-testid="default-backend-select"]',
+      ) as HTMLSelectElement | null;
       if (!select) return [];
-      return Array.from(select.options).map(o => o.value);
+      return Array.from(select.options).map((o) => o.value);
     });
-    expect(backendOptions).not.toContain('codex');
-    expect(backendOptions).toContain('tycode');
+    expect(backendOptions).not.toContain("codex");
+    expect(backendOptions).toContain("tycode");
 
     // No install buttons should be visible when all deps are available
     const installBtnCount = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
+      const panel = document.querySelector(
+        `${panelSel}[data-panel="backends"]`,
+      );
       if (!panel) return -1;
-      return panel.querySelectorAll('.settings-install-btn').length;
+      return panel.querySelectorAll(".settings-install-btn").length;
     }, sel.settingsTabPanel);
     expect(installBtnCount).toBe(0);
 
     // Re-enable codex to avoid affecting later tests
     await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="backends"]');
-      const input = panel?.querySelector('[data-testid="settings-backend-codex-enabled"]') as HTMLInputElement;
+      const panel = document.querySelector(
+        `${panelSel}[data-panel="backends"]`,
+      );
+      const input = panel?.querySelector(
+        '[data-testid="settings-backend-codex-enabled"]',
+      ) as HTMLInputElement;
       if (input && !input.disabled) {
         input.checked = true;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
       }
     }, sel.settingsTabPanel);
     await browser.pause(200);
 
     // --- Profiles dropdown ---
     const profileOptions = await browser.execute((profileSel: string) => {
-      const select = document.querySelector(profileSel) as HTMLSelectElement | null;
+      const select = document.querySelector(
+        profileSel,
+      ) as HTMLSelectElement | null;
       if (!select) return [];
-      return Array.from(select.options).map(o => o.value);
+      return Array.from(select.options).map((o) => o.value);
     }, sel.profileSelect);
-    expect(profileOptions).toContain('default');
-    expect(profileOptions).toContain('work');
+    expect(profileOptions).toContain("default");
+    expect(profileOptions).toContain("work");
 
     // Verify a profile is actually selected (not empty/defaulting to first alphabetically)
     const selectedProfile = await browser.execute((profileSel: string) => {
-      const select = document.querySelector(profileSel) as HTMLSelectElement | null;
+      const select = document.querySelector(
+        profileSel,
+      ) as HTMLSelectElement | null;
       return select?.value ?? null;
     }, sel.profileSelect);
     // Assert on the EXACT active profile - should be 'default' for a fresh workspace
-    expect(selectedProfile).toBe('default');
+    expect(selectedProfile).toBe("default");
 
     // --- Dynamic module tabs from schemas ---
     const moduleTabExists = await browser.execute((navItemSel: string) => {
-      return document.querySelector(navItemSel + '[data-tab="module-execution"]') !== null;
+      return (
+        document.querySelector(`${navItemSel}[data-tab="module-execution"]`) !==
+        null
+      );
     }, sel.settingsNavItem);
     expect(moduleTabExists).toBe(true);
 
     // --- Module schema fields ---
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="module-execution"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="module-execution"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
-    const fieldLabels = await browser.execute((panelSel: string, labelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="module-execution"]');
-      if (!panel) return [];
-      const labels = panel.querySelectorAll(labelSel);
-      return Array.from(labels).map(l => l.textContent);
-    }, sel.settingsTabPanel, sel.settingsLabel);
-    expect(fieldLabels).toContain('Timeout Seconds');
-    expect(fieldLabels).toContain('Sandbox Enabled');
+    const fieldLabels = await browser.execute(
+      (panelSel: string, labelSel: string) => {
+        const panel = document.querySelector(
+          `${panelSel}[data-panel="module-execution"]`,
+        );
+        if (!panel) return [];
+        const labels = panel.querySelectorAll(labelSel);
+        return Array.from(labels).map((l) => l.textContent);
+      },
+      sel.settingsTabPanel,
+      sel.settingsLabel,
+    );
+    expect(fieldLabels).toContain("Timeout Seconds");
+    expect(fieldLabels).toContain("Sandbox Enabled");
   });
 
-  it('host selector supports add/remove and applies settings per selected host', async () => {
+  it("host selector supports add/remove and applies settings per selected host", async () => {
     await openWorkspaceAndWaitForChat();
     await openSettingsOverlay();
 
     const initialHost = await browser.execute((hostSel: string) => {
-      const select = document.querySelector(hostSel) as HTMLSelectElement | null;
+      const select = document.querySelector(
+        hostSel,
+      ) as HTMLSelectElement | null;
       return select?.value ?? null;
     }, sel.settingsHostSelect);
-    expect(initialHost).toBe('local');
+    expect(initialHost).toBe("local");
 
     await browser.execute((addSel: string) => {
       const btn = document.querySelector(addSel) as HTMLButtonElement | null;
@@ -375,34 +497,43 @@ describe('Settings panel', () => {
     await browser.pause(300);
 
     const modalVisible = await browser.execute(() => {
-      const overlay = document.querySelector('.settings-modal-overlay');
+      const overlay = document.querySelector(".settings-modal-overlay");
       return overlay !== null;
     });
     expect(modalVisible).toBe(true);
 
     await browser.execute(() => {
-      const inputs = document.querySelectorAll('.settings-modal-overlay input') as NodeListOf<HTMLInputElement>;
+      const inputs = document.querySelectorAll(
+        ".settings-modal-overlay input",
+      ) as NodeListOf<HTMLInputElement>;
       if (inputs.length >= 2) {
-        inputs[0].value = 'Test Server';
-        inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-        inputs[1].value = 'user@testserver.com';
-        inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+        inputs[0].value = "Test Server";
+        inputs[0].dispatchEvent(new Event("input", { bubbles: true }));
+        inputs[1].value = "user@testserver.com";
+        inputs[1].dispatchEvent(new Event("input", { bubbles: true }));
       }
     });
     await browser.pause(100);
 
     await browser.execute(() => {
-      const btns = document.querySelectorAll('.settings-modal-overlay button');
-      const saveBtn = Array.from(btns).find((b) => b.textContent?.includes('Save') || b.textContent?.includes('Add') || b.textContent?.includes('OK'));
+      const btns = document.querySelectorAll(".settings-modal-overlay button");
+      const saveBtn = Array.from(btns).find(
+        (b) =>
+          b.textContent?.includes("Save") ||
+          b.textContent?.includes("Add") ||
+          b.textContent?.includes("OK"),
+      );
       if (saveBtn) (saveBtn as HTMLButtonElement).click();
     });
     await browser.pause(500);
 
     const selectedAfterAdd = await browser.execute((hostSel: string) => {
-      const select = document.querySelector(hostSel) as HTMLSelectElement | null;
+      const select = document.querySelector(
+        hostSel,
+      ) as HTMLSelectElement | null;
       return select?.value ?? null;
     }, sel.settingsHostSelect);
-    expect(selectedAfterAdd).not.toBe('local');
+    expect(selectedAfterAdd).not.toBe("local");
 
     const removeVisible = await browser.execute((removeSel: string) => {
       return document.querySelector(removeSel) !== null;
@@ -410,15 +541,19 @@ describe('Settings panel', () => {
     expect(removeVisible).toBe(true);
 
     await browser.execute((navItemSel: string) => {
-      const btn = document.querySelector(navItemSel + '[data-tab="tyde"]') as HTMLButtonElement | null;
+      const btn = document.querySelector(
+        `${navItemSel}[data-tab="tyde"]`,
+      ) as HTMLButtonElement | null;
       btn?.click();
     }, sel.settingsNavItem);
     await browser.pause(300);
 
     // MCP is a global setting — verify toggle exists on the tyde tab
     const mcpToggleExists = await browser.execute((panelSel: string) => {
-      const panel = document.querySelector(panelSel + '[data-panel="tyde"]');
-      const input = panel?.querySelector('[data-testid="settings-mcp-http-enabled"]') as HTMLInputElement | null;
+      const panel = document.querySelector(`${panelSel}[data-panel="tyde"]`);
+      const input = panel?.querySelector(
+        '[data-testid="settings-mcp-http-enabled"]',
+      ) as HTMLInputElement | null;
       return input !== null;
     }, sel.settingsTabPanel);
     expect(mcpToggleExists).toBe(true);
@@ -430,9 +565,11 @@ describe('Settings panel', () => {
     await browser.pause(500);
 
     const selectedAfterRemove = await browser.execute((hostSel: string) => {
-      const select = document.querySelector(hostSel) as HTMLSelectElement | null;
+      const select = document.querySelector(
+        hostSel,
+      ) as HTMLSelectElement | null;
       return select?.value ?? null;
     }, sel.settingsHostSelect);
-    expect(selectedAfterRemove).toBe('local');
+    expect(selectedAfterRemove).toBe("local");
   });
 });

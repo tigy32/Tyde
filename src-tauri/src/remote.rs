@@ -313,8 +313,10 @@ pub(crate) async fn open_ssh_unix_socket_tunnel(
     _host: &str,
     _remote_socket_path: &str,
 ) -> Result<(tokio::process::Child, PathBuf, IpcStream), String> {
-    Err("SSH Unix socket tunnels require Unix domain sockets (not available on this platform)"
-        .into())
+    Err(
+        "SSH Unix socket tunnels require Unix domain sockets (not available on this platform)"
+            .into(),
+    )
 }
 
 #[cfg(unix)]

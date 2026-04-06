@@ -1,16 +1,16 @@
-import { openWorkspace, resetAppState, sel } from './helpers';
+import { openWorkspace, resetAppState, sel } from "./helpers";
 
-const SSH_URL = 'ssh://testuser@remotehost.example.com/home/testuser/project';
-const REMOTE_HOST = 'testuser@remotehost.example.com';
+const SSH_URL = "ssh://testuser@remotehost.example.com/home/testuser/project";
+const REMOTE_HOST = "testuser@remotehost.example.com";
 
-describe('Remote SSH workspace', () => {
+describe("Remote SSH workspace", () => {
   afterEach(async () => {
     await browser.execute(() => {
       delete (window as any).__mockRemoteFailStep;
     });
   });
 
-  it('full remote connection flow: dialog, completion, failure, and local bypass', async () => {
+  it("full remote connection flow: dialog, completion, failure, and local bypass", async () => {
     // --- Phase 1: SSH success path ---
     await resetAppState();
     const app = await $(sel.app);
@@ -34,12 +34,12 @@ describe('Remote SSH workspace', () => {
     await dialog.waitForExist({ timeout: 5_000 });
 
     const hostText = await browser.execute((s: string) => {
-      return document.querySelector(s)?.textContent ?? '';
+      return document.querySelector(s)?.textContent ?? "";
     }, sel.connectionHost);
     expect(hostText).toContain(REMOTE_HOST);
 
     const stepCount = await browser.execute(() => {
-      return document.querySelectorAll('[data-step]').length;
+      return document.querySelectorAll("[data-step]").length;
     });
     expect(Number(stepCount)).toBe(4);
 
@@ -49,14 +49,14 @@ describe('Remote SSH workspace', () => {
     await browser.waitUntil(
       async () => {
         return browser.execute(() => {
-          const steps = document.querySelectorAll('[data-step]');
+          const steps = document.querySelectorAll("[data-step]");
           return Array.from(steps).some((s) => {
-            const indicator = s.querySelector('div:first-child');
-            return indicator?.classList.contains('completed') ?? false;
+            const indicator = s.querySelector("div:first-child");
+            return indicator?.classList.contains("completed") ?? false;
           });
         });
       },
-      { timeout: 5_000, timeoutMsg: 'No completed step indicators found' },
+      { timeout: 5_000, timeoutMsg: "No completed step indicators found" },
     );
 
     // Dialog auto-dismisses after ready step completes
@@ -66,7 +66,7 @@ describe('Remote SSH workspace', () => {
           return document.querySelector(s) === null;
         }, sel.connectionDialog);
       },
-      { timeout: 8_000, timeoutMsg: 'Dialog did not auto-dismiss' },
+      { timeout: 8_000, timeoutMsg: "Dialog did not auto-dismiss" },
     );
 
     // Chat textarea available after dialog dismisses
@@ -83,7 +83,7 @@ describe('Remote SSH workspace', () => {
     await remoteBtn2.waitForClickable({ timeout: 10_000 });
 
     await browser.execute(() => {
-      (window as any).__mockRemoteFailStep = 'installing_subprocess';
+      (window as any).__mockRemoteFailStep = "installing_subprocess";
     });
 
     await remoteBtn2.click();
@@ -101,26 +101,29 @@ describe('Remote SSH workspace', () => {
     // Connection attempt should start automatically (will fail at installing_subprocess)
 
     // Failed indicator appears on the subprocess step
-    const failStepSel = sel.connectionStep('installing_subprocess');
+    const failStepSel = sel.connectionStep("installing_subprocess");
     await browser.waitUntil(
       async () => {
         return browser.execute((s: string) => {
           const step = document.querySelector(s);
-          const indicator = step?.querySelector('div:first-child');
-          return indicator?.classList.contains('failed') ?? false;
+          const indicator = step?.querySelector("div:first-child");
+          return indicator?.classList.contains("failed") ?? false;
         }, failStepSel);
       },
-      { timeout: 5_000, timeoutMsg: 'Failed indicator not shown on subprocess step' },
+      {
+        timeout: 5_000,
+        timeoutMsg: "Failed indicator not shown on subprocess step",
+      },
     );
 
     // Close button becomes visible on failure
     const closeBtn = await $(sel.connectionClose);
     await browser.waitUntil(
       async () => {
-        const cls = await closeBtn.getAttribute('class');
-        return !cls?.includes('hidden');
+        const cls = await closeBtn.getAttribute("class");
+        return !cls?.includes("hidden");
       },
-      { timeout: 3_000, timeoutMsg: 'Close button not shown on failure' },
+      { timeout: 3_000, timeoutMsg: "Close button not shown on failure" },
     );
 
     // Clicking close dismisses the dialog
@@ -131,7 +134,10 @@ describe('Remote SSH workspace', () => {
           return document.querySelector(s) === null;
         }, sel.connectionDialog);
       },
-      { timeout: 3_000, timeoutMsg: 'Dialog did not dismiss after clicking close' },
+      {
+        timeout: 3_000,
+        timeoutMsg: "Dialog did not dismiss after clicking close",
+      },
     );
 
     // --- Phase 3: Local workspace has no connection dialog ---

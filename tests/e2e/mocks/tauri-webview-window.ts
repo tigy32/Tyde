@@ -1,5 +1,5 @@
 const mockWindow = {
-  label: 'main',
+  label: "main",
   listen: async (_event: string, _handler: Function) => () => {},
   emit: async (_event: string, _payload?: any) => {},
   onCloseRequested: async (_handler: Function) => () => {},
@@ -11,5 +11,7 @@ export function getCurrentWebviewWindow() {
 
 export class WebviewWindow {
   label: string;
-  constructor(label: string) { this.label = label; }
+  constructor(label: string) {
+    this.label = label;
+  }
 }
