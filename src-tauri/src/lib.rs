@@ -4604,10 +4604,17 @@ async fn add_project(
 ) -> Result<project_store::ProjectRecord, String> {
     if let Some(host_id) = host {
         let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        let remote_workspace_path = host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
+            .into_iter()
+            .next()
+            .ok_or("Failed to resolve remote workspace path")?;
         let resp = conn
             .invoke(
                 "add_project",
-                serde_json::json!({ "workspace_path": workspace_path, "name": name }),
+                serde_json::json!({
+                    "workspace_path": remote_workspace_path,
+                    "name": name
+                }),
             )
             .await?;
         let record: project_store::ProjectRecord = serde_json::from_value(resp)
@@ -4632,12 +4639,16 @@ async fn add_project_workbench(
 ) -> Result<project_store::ProjectRecord, String> {
     if let Some(host_id) = host {
         let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
+        let remote_workspace_path = host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
+            .into_iter()
+            .next()
+            .ok_or("Failed to resolve remote workspace path")?;
         let resp = conn
             .invoke(
                 "add_project_workbench",
                 serde_json::json!({
                     "parent_project_id": parent_project_id,
-                    "workspace_path": workspace_path,
+                    "workspace_path": remote_workspace_path,
                     "name": name,
                     "kind": kind
                 }),

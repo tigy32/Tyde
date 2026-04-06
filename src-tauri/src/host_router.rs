@@ -166,12 +166,20 @@ pub(crate) async fn get_server_connection_by_id(
     if host_id == "local" {
         return Err("Cannot get server connection for local host".to_string());
     }
-    let host = state
-        .host_store
-        .lock()
-        .get(host_id)
-        .cloned()
-        .ok_or_else(|| format!("Host ID '{host_id}' not found"))?;
+
+    // Accept either a host ID or a hostname for compatibility with older
+    // frontend callers that routed project operations by SSH hostname.
+    let host = {
+        let store = state.host_store.lock();
+        store.get(host_id).cloned().or_else(|| {
+            store
+                .list()
+                .into_iter()
+                .find(|host| !host.is_local && host.hostname == host_id)
+        })
+    }
+    .ok_or_else(|| format!("Host '{host_id}' not found"))?;
+
     get_or_create_server_connection(app, state, &host).await
 }
 

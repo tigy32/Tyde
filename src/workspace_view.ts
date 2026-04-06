@@ -1083,6 +1083,36 @@ export class WorkspaceView {
     this.registerConversation(this.runtimeAgentToPanelInfo(agent));
   }
 
+  registerConversationPlaceholder(
+    conversationId: number,
+    name: string,
+    backendKindRaw: string,
+  ): void {
+    try {
+      const backendKind = normalizeBackendKind(backendKindRaw);
+      const currentBackendKind =
+        this.conversationBackendKindMap.get(conversationId);
+      if (currentBackendKind !== backendKind) {
+        this.chatPanel.setConversationBackendKind(conversationId, backendKind);
+        this.conversationBackendKindMap.set(conversationId, backendKind);
+      }
+    } catch (err) {
+      console.warn(
+        `registerConversationPlaceholder: unknown backend "${backendKindRaw}"`,
+        err,
+      );
+    }
+
+    this.registerConversation({
+      conversationId,
+      name: name.trim() || "Conversation",
+      summary: "Ready",
+      isTyping: false,
+      createdAt: Date.now(),
+      projectId: this.projectId,
+    });
+  }
+
   syncRuntimeAgents(agents: RuntimeAgent[]): void {
     const nextConversationIds = new Set<number>();
     for (const agent of agents) {

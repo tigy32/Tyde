@@ -8,6 +8,7 @@ import type {
   DeleteWorkbenchEventPayload,
   Host,
   McpHttpServerSettings,
+  ProjectsChangedPayload,
   RuntimeAgent,
 } from "./bridge";
 import {
@@ -22,6 +23,7 @@ import {
   interruptAgent,
   listAgents,
   listHosts,
+  listProjects,
   onAdminEvent,
   onAgentChanged,
   onChatEvent,
@@ -135,9 +137,7 @@ export class AppController {
 
     // Listen for server-side project store changes
     await onProjectsChanged((payload) => {
-      this.projectState.applyServerRecords(payload);
-      this.projectSidebar?.render();
-      this.homeView?.render();
+      void this.handleProjectsChanged(payload);
     });
 
     await initializeBackendDependencies();
@@ -922,8 +922,12 @@ export class AppController {
     const agentId = payload.data.agent_id;
     if (agentId == null || agentId.trim().length === 0) {
       // Some ConversationRegistered events can arrive before an agent id exists.
-      // Wait for the subsequent agent-changed event instead of creating a
-      // synthetic agent_id=0 entry that breaks agent routing/actions.
+      // Still claim the conversation so chat events are routed to a view.
+      view.registerConversationPlaceholder(
+        payload.conversation_id,
+        payload.data.name,
+        payload.data.backend_kind,
+      );
       return;
     }
 
@@ -1151,7 +1155,7 @@ export class AppController {
       }
 
       // Connection succeeded — persist
-      await this.projectState.commitProject(project);
+      await this.projectState.commitProject(project, remote.host);
     } else {
       if (!project) {
         project = await this.projectState.addProject(dir);
@@ -1182,12 +1186,7 @@ export class AppController {
       if (state === "connected") {
         this.notifications.success("Connected to remote Tyde server");
         void this.refreshRuntimeAgentsSnapshot();
-        void this.projectState
-          .loadFromRemoteServer(payload.host_id)
-          .then(() => {
-            this.projectSidebar?.render();
-            this.homeView?.render();
-          });
+        void this.loadRemoteProjectsForHost(payload.host_id);
       }
     } else if ("reconnecting" in state) {
       if (state.reconnecting.attempt === 1) {
@@ -1216,6 +1215,47 @@ export class AppController {
       this.applyRuntimeAgents(agents);
     } catch (err) {
       console.error("Failed to refresh runtime agents:", err);
+    }
+  }
+
+  private async normalizeProjectsPayloadHost(
+    payload: ProjectsChangedPayload,
+  ): Promise<ProjectsChangedPayload> {
+    if (!payload.host) return payload;
+    const hosts = await listHosts();
+    const host = hosts.find((entry) => entry.id === payload.host);
+    if (!host) return payload;
+    return { ...payload, host: host.hostname };
+  }
+
+  private async handleProjectsChanged(
+    payload: ProjectsChangedPayload,
+  ): Promise<void> {
+    try {
+      const normalized = await this.normalizeProjectsPayloadHost(payload);
+      this.projectState.applyServerRecords(normalized);
+      this.projectSidebar?.render();
+      this.homeView?.render();
+    } catch (err) {
+      console.error("Failed to apply projects changed payload:", err);
+    }
+  }
+
+  private async loadRemoteProjectsForHost(hostId: string): Promise<void> {
+    try {
+      const records = await listProjects(hostId);
+      const normalized = await this.normalizeProjectsPayloadHost({
+        host: hostId,
+        projects: records,
+      });
+      this.projectState.applyServerRecords(normalized);
+      this.projectSidebar?.render();
+      this.homeView?.render();
+    } catch (err) {
+      console.error(
+        `Failed to load remote projects for host "${hostId}":`,
+        err,
+      );
     }
   }
 
@@ -1351,11 +1391,13 @@ export class AppController {
       return;
     }
 
+    const remoteParent = parseRemoteWorkspaceUri(parent.workspacePath);
     const project = await this.projectState.addWorkbench(
       parentProjectId,
       worktreePath,
       branch,
       "git-worktree",
+      remoteParent?.host,
     );
     this.switchToWorkspace(project.id);
   }

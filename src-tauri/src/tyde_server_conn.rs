@@ -399,7 +399,7 @@ impl TydeServerConnection {
                     let _ = self.app.emit(
                         "tyde-projects-changed",
                         serde_json::json!({
-                            "host": self.host_id,
+                            "host": self.ssh_host(),
                             "projects": normalized
                         }),
                     );
