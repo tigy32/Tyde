@@ -6,6 +6,13 @@ These rules apply to all code changes across Rust, TypeScript, CSS, and tests.
 
 - Validate the build compiles, formatting and checks pass, and tests pass before
   committing.
+- Required verification commands before commit, unless the user explicitly
+  waives one: `npm run lint`, `npm run build`, `npm run check`,
+  `npm run test:e2e`.
+- Do not commit if any required verification command fails, including
+  pre-existing unrelated failures. Stop and ask for guidance.
+- Treat every commit as blocked until verification has been run in the current
+  working tree after the final edits.
 - If anything fails and the fix is relatively simple, fix it directly.
 - If a fix is complicated, changes logic, or should get human approval, stop
   and fail instead of pushing a risky fix.
@@ -14,6 +21,9 @@ These rules apply to all code changes across Rust, TypeScript, CSS, and tests.
 - Do not use lists in commit messages.
 - Do not include co-author lines for Claude.
 - Wrap commit message text at 80 characters.
+- Verify commit message limits mechanically before finishing:
+  summary line <= 50 chars and every line <= 80 chars.
+- In handoff, report each verification command and pass/fail status.
 - Commit changes locally to the current branch.
 
 ## 2) How to Develop
