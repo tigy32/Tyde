@@ -1458,7 +1458,11 @@ export class WorkspaceView {
   async createNewConversationTab(
     tabLabel?: string,
     backendOverride?: BackendKind,
-    options?: { bootstrap?: boolean; agentDefinitionId?: string },
+    options?: {
+      bootstrap?: boolean;
+      agentDefinitionId?: string;
+      ephemeral?: boolean;
+    },
   ): Promise<number> {
     this.ensureConversationCreationAllowed();
     await this.hostSettingsReady;
@@ -1483,7 +1487,7 @@ export class WorkspaceView {
       const result = await createConversation(
         conversationRoots,
         backendKind,
-        undefined,
+        options?.ephemeral,
         effectiveDefinitionId,
       );
       id = result.conversation_id;
@@ -1960,6 +1964,7 @@ export class WorkspaceView {
         );
         cid = await this.createNewConversationTab(savedAlias, backendKind, {
           bootstrap: false,
+          ephemeral: true,
         });
         this.chatPanel.setHistoryLoading(cid, true);
         await resumeSession(cid, sessionId);

@@ -3992,6 +3992,37 @@ async fn resume_session(
     conversation_id: u64,
     session_id: String,
 ) -> Result<(), String> {
+    // Map conversation_to_session BEFORE sending the command so that
+    // forward_events can route session store updates to the right record.
+    // The conversation was created with ephemeral=true so no duplicate
+    // record exists.
+    let (backend_kind, workspace_root) = {
+        let mgr = state.manager.lock().await;
+        (
+            mgr.backend_kind(conversation_id)
+                .map(|k| k.as_str().to_string()),
+            mgr.workspace_roots(conversation_id)
+                .and_then(|r| r.first())
+                .map(|s| s.to_string()),
+        )
+    };
+    if let Some(ref bk) = backend_kind {
+        let mut store = state.session_store.lock();
+        let tyde_id = if let Some(existing) = store.get_by_backend_session(bk, &session_id) {
+            existing.id.clone()
+        } else {
+            // External session being resumed for the first time — create the record
+            // with the correct backend_session_id upfront.
+            let record = store.create(bk, workspace_root.as_deref())?;
+            store.set_backend_session_id(&record.id, &session_id)?;
+            record.id
+        };
+        state
+            .conversation_to_session
+            .lock()
+            .insert(conversation_id, tyde_id);
+    }
+
     execute_conversation_command(
         &app,
         &state,
@@ -4000,46 +4031,7 @@ async fn resume_session(
             session_id: session_id.clone(),
         },
     )
-    .await?;
-
-    // Deduplicate session store records: create_conversation eagerly created a
-    // new record, but resume reuses an existing backend session. Find the
-    // original record and point conversation_to_session at it, then delete the
-    // duplicate.
-    let backend_kind = {
-        let mgr = state.manager.lock().await;
-        mgr.backend_kind(conversation_id)
-            .map(|k| k.as_str().to_string())
-    };
-    if let Some(bk) = backend_kind {
-        let duplicate_tyde_id = state
-            .conversation_to_session
-            .lock()
-            .get(&conversation_id)
-            .cloned();
-        let mut store = state.session_store.lock();
-        if let Some(existing) = store.get_by_backend_session(&bk, &session_id) {
-            let existing_id = existing.id.clone();
-            // Only deduplicate if the conversation is currently mapped to a different record
-            if duplicate_tyde_id.as_deref() != Some(&existing_id) {
-                // Point the conversation at the original record
-                state
-                    .conversation_to_session
-                    .lock()
-                    .insert(conversation_id, existing_id);
-                // Delete the duplicate record created by create_conversation
-                if let Some(dup_id) = duplicate_tyde_id {
-                    store.delete(&dup_id)?;
-                }
-            }
-        } else if let Some(ref dup_id) = duplicate_tyde_id {
-            // No existing record found — this is a first-time resume. Set the
-            // backend_session_id on the record that create_conversation made.
-            store.set_backend_session_id(dup_id, &session_id)?;
-        }
-    }
-
-    Ok(())
+    .await
 }
 
 #[tauri::command]

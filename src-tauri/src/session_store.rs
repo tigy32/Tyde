@@ -182,6 +182,23 @@ impl SessionStore {
         id: &str,
         backend_session_id: &str,
     ) -> Result<(), String> {
+        // Enforce uniqueness: (backend_kind, backend_session_id) must not
+        // already belong to a different record.
+        self.records = Self::read_from_disk(&self.path)?;
+        if let Some(record) = self.records.get(id) {
+            let dominated = self.records.values().any(|r| {
+                r.id != id
+                    && r.backend_kind == record.backend_kind
+                    && r.backend_session_id.as_deref() == Some(backend_session_id)
+            });
+            if dominated {
+                return Err(format!(
+                    "Duplicate backend session: another record already owns \
+                     ({}, {})",
+                    record.backend_kind, backend_session_id,
+                ));
+            }
+        }
         let id = id.to_string();
         let backend_session_id = backend_session_id.to_string();
         self.read_modify_write(|records| {
