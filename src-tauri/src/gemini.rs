@@ -45,6 +45,7 @@ impl GeminiSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
+            false,
             transport,
             startup_mcp_servers,
             steering_content,
@@ -60,6 +61,7 @@ impl GeminiSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
+            true,
             transport,
             startup_mcp_servers,
             steering_content,
@@ -75,6 +77,7 @@ impl GeminiSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
+            true,
             transport,
             startup_mcp_servers,
             steering_content,
@@ -84,6 +87,7 @@ impl GeminiSession {
 
     async fn spawn_with_mode(
         workspace_roots: &[String],
+        ephemeral: bool,
         transport: BackendTransport,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
@@ -106,6 +110,8 @@ impl GeminiSession {
             state: Mutex::new(GeminiState {
                 workspace_root,
                 transport,
+                ephemeral,
+                session_id: None,
                 model: None,
                 permission_mode: None,
                 steering_content: steering_content
@@ -139,6 +145,8 @@ struct ActiveTurn {
 struct GeminiState {
     workspace_root: String,
     transport: BackendTransport,
+    ephemeral: bool,
+    session_id: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     steering_content: Option<String>,
@@ -155,6 +163,7 @@ struct GeminiInner {
 struct GeminiStdoutSummary {
     streamed_text: String,
     streamed_reasoning: String,
+    session_id: Option<String>,
     model: Option<String>,
     usage: Option<Value>,
     errors: Vec<String>,
@@ -251,15 +260,9 @@ impl GeminiInner {
                 this.emit_settings().await;
                 Ok(())
             }
-            SessionCommand::ListSessions => {
-                this.emit_event(json!({
-                    "kind": "SessionsList",
-                    "data": { "sessions": [] }
-                }));
-                Ok(())
-            }
-            SessionCommand::ResumeSession { session_id: _ } => Ok(()),
-            SessionCommand::DeleteSession { session_id: _ } => Ok(()),
+            SessionCommand::ListSessions => this.list_sessions().await,
+            SessionCommand::ResumeSession { session_id } => this.resume_session(session_id).await,
+            SessionCommand::DeleteSession { session_id } => this.delete_session(session_id).await,
             SessionCommand::ListProfiles => {
                 this.emit_event(json!({
                     "kind": "ProfilesList",
@@ -288,6 +291,8 @@ impl GeminiInner {
             turn_id,
             workspace_root,
             transport,
+            ephemeral,
+            session_id,
             model,
             permission_mode,
             steering_content,
@@ -311,6 +316,8 @@ impl GeminiInner {
                 turn_id,
                 state.workspace_root.clone(),
                 state.transport.clone(),
+                state.ephemeral,
+                state.session_id.clone(),
                 state.model.clone(),
                 state.permission_mode.clone(),
                 state.steering_content.clone(),
@@ -330,6 +337,7 @@ impl GeminiInner {
                     &workspace_root,
                     &transport,
                     &message,
+                    session_id,
                     model,
                     permission_mode.as_deref(),
                     steering_content.as_deref(),
@@ -340,6 +348,15 @@ impl GeminiInner {
 
             match outcome {
                 TurnOutcome::Completed { mut summary } => {
+                    if let Some(session_id) = summary.session_id.clone() {
+                        self.set_session_id(session_id.clone()).await;
+                        if !ephemeral {
+                            self.emit_event(json!({
+                                "kind": "SessionStarted",
+                                "data": { "session_id": session_id }
+                            }));
+                        }
+                    }
                     if !self.emit_summary_and_tool_requests(&mut summary) {
                         let error = summary
                             .error_message()
@@ -348,7 +365,18 @@ impl GeminiInner {
                     }
                 }
                 TurnOutcome::Cancelled { mut summary } => {
-                    self.emit_summary_and_tool_requests(&mut summary);
+                    if let Some(session_id) = summary.session_id.clone() {
+                        self.set_session_id(session_id.clone()).await;
+                        if !ephemeral {
+                            self.emit_event(json!({
+                                "kind": "SessionStarted",
+                                "data": { "session_id": session_id }
+                            }));
+                        }
+                    }
+                    if !self.emit_summary_and_tool_requests(&mut summary) {
+                        self.emit_error("Gemini turn cancelled.");
+                    }
                     self.emit_operation_cancelled("Gemini turn cancelled.");
                 }
                 TurnOutcome::Failed { summary, error } => {
@@ -369,6 +397,7 @@ impl GeminiInner {
         workspace_root: &str,
         transport: &BackendTransport,
         prompt: &str,
+        session_id: Option<String>,
         model: Option<String>,
         _permission_mode: Option<&str>,
         steering_content: Option<&str>,
@@ -387,6 +416,14 @@ impl GeminiInner {
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
+
+        if let Some(existing_session) = session_id {
+            let trimmed = existing_session.trim();
+            if !trimmed.is_empty() {
+                cli_args.push("--resume".to_string());
+                cli_args.push(trimmed.to_string());
+            }
+        }
 
         if let Some(model_name) = model.as_deref().filter(|m| !m.trim().is_empty()) {
             cli_args.push("--model".to_string());
@@ -560,16 +597,98 @@ impl GeminiInner {
         }
     }
 
-    async fn emit_settings(&self) {
-        let (model, permission_mode) = {
+    async fn set_session_id(&self, session_id: String) {
+        let mut state = self.state.lock().await;
+        state.session_id = Some(session_id);
+    }
+
+    async fn list_sessions(&self) -> Result<(), String> {
+        let (workspace_root, transport) = {
             let state = self.state.lock().await;
-            (state.model.clone(), state.permission_mode.clone())
+            (state.workspace_root.clone(), state.transport.clone())
+        };
+
+        let entries = list_gemini_sessions_for_transport(&transport, &workspace_root).await?;
+        let sessions: Vec<Value> = entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "id": &entry.session_id,
+                    "session_id": &entry.session_id,
+                    "title": &entry.title,
+                    "created_at": entry.last_modified_ms,
+                    "last_modified": entry.last_modified_ms,
+                    "last_message_preview": &entry.preview,
+                    "workspace_root": &workspace_root,
+                    "message_count": Value::Null,
+                    "backend_kind": "gemini",
+                })
+            })
+            .collect();
+
+        self.emit_event(json!({
+            "kind": "SessionsList",
+            "data": { "sessions": sessions }
+        }));
+        Ok(())
+    }
+
+    async fn resume_session(&self, session_id: String) -> Result<(), String> {
+        let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
+
+        {
+            let mut state = self.state.lock().await;
+            state.session_id = Some(normalized.clone());
+        }
+
+        self.emit_event(json!({ "kind": "ConversationCleared" }));
+        self.emit_event(json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": normalized }
+        }));
+        Ok(())
+    }
+
+    async fn delete_session(&self, session_id: String) -> Result<(), String> {
+        let normalized = normalize_nonempty(&session_id).ok_or("Invalid session id")?;
+        let (workspace_root, transport) = {
+            let state = self.state.lock().await;
+            (state.workspace_root.clone(), state.transport.clone())
+        };
+
+        let entries = list_gemini_sessions_for_transport(&transport, &workspace_root).await?;
+        let entry = entries
+            .iter()
+            .find(|candidate| candidate.session_id.as_str() == normalized.as_str())
+            .ok_or_else(|| format!("Gemini session not found: {normalized}"))?;
+
+        delete_gemini_session_for_transport(&transport, &workspace_root, &entry.index).await?;
+
+        {
+            let mut state = self.state.lock().await;
+            if state.session_id.as_deref() == Some(normalized.as_str()) {
+                state.session_id = None;
+            }
+        }
+
+        self.list_sessions().await
+    }
+
+    async fn emit_settings(&self) {
+        let (model, permission_mode, session_id) = {
+            let state = self.state.lock().await;
+            (
+                state.model.clone(),
+                state.permission_mode.clone(),
+                state.session_id.clone(),
+            )
         };
         self.emit_event(json!({
             "kind": "Settings",
             "data": {
                 "model": model,
                 "permission_mode": permission_mode,
+                "session_id": session_id,
             }
         }));
     }
@@ -679,11 +798,15 @@ impl GeminiInner {
         reasoning: Option<String>,
         tool_calls: Vec<Value>,
     ) {
+        let model_hint = model.clone();
         let model_info = model
             .filter(|m| !m.trim().is_empty())
             .map(|m| json!({ "model": m }))
             .unwrap_or(Value::Null);
         let usage_value = usage.unwrap_or(Value::Null);
+        let context_breakdown_value =
+            estimate_gemini_context_breakdown(Some(&usage_value), model_hint.as_deref())
+                .unwrap_or(Value::Null);
         let reasoning_value = reasoning
             .filter(|v| !v.trim().is_empty())
             .map(|text| json!({ "text": text }))
@@ -700,7 +823,7 @@ impl GeminiInner {
                     "tool_calls": tool_calls,
                     "model_info": model_info,
                     "token_usage": usage_value,
-                    "context_breakdown": Value::Null,
+                    "context_breakdown": context_breakdown_value,
                     "images": [],
                 }
             }
@@ -829,6 +952,16 @@ fn consume_gemini_event(
         "init" => {
             if let Some(model) = value.get("model").and_then(Value::as_str) {
                 summary.model = Some(model.to_string());
+            }
+            if let Some(session_id) = value
+                .get("session_id")
+                .or_else(|| value.get("sessionId"))
+                .and_then(Value::as_str)
+            {
+                let normalized = session_id.trim();
+                if !normalized.is_empty() {
+                    summary.session_id = Some(normalized.to_string());
+                }
             }
         }
         "message" => {
@@ -1197,48 +1330,339 @@ fn gemini_known_models() -> Vec<Value> {
 fn parse_gemini_usage(raw: Option<&Value>) -> Option<Value> {
     let stats = raw?.as_object()?;
 
-    let input_tokens = stats
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = stats
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total_tokens = stats
-        .get("total_tokens")
-        .and_then(Value::as_u64)
+    let raw_input_tokens = usage_u64(
+        stats,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let cached_prompt_tokens = usage_u64(
+        stats,
+        &[
+            "cached",
+            "cached_tokens",
+            "cached_prompt_tokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let cache_creation_input_tokens = usage_u64(
+        stats,
+        &[
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let input_tokens = usage_u64(
+        stats,
+        &[
+            "input",
+            "input_non_cached",
+            "input_non_cached_tokens",
+            "inputNonCachedTokens",
+        ],
+    )
+    .unwrap_or_else(|| {
+        raw_input_tokens
+            .saturating_sub(cached_prompt_tokens)
+            .saturating_sub(cache_creation_input_tokens)
+    });
+    let output_tokens = usage_u64(
+        stats,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let total_tokens = usage_u64(stats, &["total_tokens", "totalTokens", "total"])
         .unwrap_or(input_tokens.saturating_add(output_tokens));
-    let cached_tokens = stats
-        .get("cached_tokens")
-        .or_else(|| stats.get("cached_prompt_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let reasoning_tokens = stats
-        .get("reasoning_tokens")
-        .or_else(|| stats.get("thoughts_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let duration_ms = stats
-        .get("duration_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let tool_call_count = stats.get("tool_calls").and_then(Value::as_u64).unwrap_or(0);
+    let reasoning_tokens = usage_u64(
+        stats,
+        &[
+            "reasoning_tokens",
+            "reasoningTokens",
+            "thoughts_tokens",
+            "thoughtsTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let duration_ms = usage_u64(stats, &["duration_ms", "durationMs"]).unwrap_or(0);
+    let tool_call_count = usage_u64(stats, &["tool_calls", "toolCalls"]).unwrap_or(0);
+    let context_window = usage_u64(
+        stats,
+        &[
+            "context_window",
+            "contextWindow",
+            "max_input_tokens",
+            "maxInputTokens",
+        ],
+    );
 
-    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+    if input_tokens == 0
+        && output_tokens == 0
+        && total_tokens == 0
+        && cached_prompt_tokens == 0
+        && cache_creation_input_tokens == 0
+    {
         return None;
     }
 
-    Some(json!({
+    let mut usage = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
-        "cached_prompt_tokens": cached_tokens,
-        "cache_creation_input_tokens": 0,
+        "cached_prompt_tokens": cached_prompt_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
         "reasoning_tokens": reasoning_tokens,
         "duration_ms": duration_ms,
         "tool_calls": tool_call_count,
+    });
+    if let Some(window) = context_window {
+        usage["context_window"] = json!(window);
+    }
+    Some(usage)
+}
+
+fn usage_u64(source: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Some(value) = source.get(*key) {
+            if let Some(num) = value.as_u64() {
+                return Some(num);
+            }
+            if let Some(str_value) = value.as_str() {
+                if let Ok(num) = str_value.trim().parse::<u64>() {
+                    return Some(num);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn estimate_gemini_context_breakdown(
+    token_usage: Option<&Value>,
+    model_hint: Option<&str>,
+) -> Option<Value> {
+    let usage = token_usage?;
+    let base_input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_prompt_tokens = usage
+        .get("cached_prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let input_tokens = base_input_tokens
+        .saturating_add(cached_prompt_tokens)
+        .saturating_add(cache_creation_input_tokens);
+    if input_tokens == 0 {
+        return None;
+    }
+
+    let context_window = usage
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            std::cmp::max(
+                gemini_estimated_context_window_for_model(model_hint),
+                input_tokens.max(1),
+            )
+        });
+
+    Some(json!({
+        "system_prompt_bytes": 0,
+        "tool_io_bytes": 0,
+        "conversation_history_bytes": 0,
+        "reasoning_bytes": reasoning_tokens.saturating_mul(4),
+        "context_injection_bytes": input_tokens.saturating_mul(4),
+        "input_tokens": input_tokens,
+        "context_window": context_window,
     }))
+}
+
+fn gemini_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
+    let normalized = model_hint.unwrap_or_default().trim().to_ascii_lowercase();
+    if normalized.contains("flash-lite") {
+        return 1_048_576;
+    }
+    if normalized.contains("flash") {
+        return 1_048_576;
+    }
+    if normalized.contains("pro") {
+        return 1_048_576;
+    }
+    if normalized.contains("gemini-3") || normalized.contains("gemini-2.5") {
+        return 1_048_576;
+    }
+    1_048_576
+}
+
+#[derive(Debug, Clone)]
+struct GeminiSessionListEntry {
+    index: String,
+    session_id: String,
+    title: String,
+    preview: String,
+    last_modified_ms: u64,
+}
+
+async fn list_gemini_sessions_for_transport(
+    transport: &BackendTransport,
+    workspace_root: &str,
+) -> Result<Vec<GeminiSessionListEntry>, String> {
+    let output =
+        run_gemini_cli_command_output(transport, workspace_root, &["--list-sessions"]).await?;
+    let text = combine_process_output(&output);
+    let sessions = parse_gemini_session_entries(&text);
+
+    if sessions.is_empty() && !output.status.success() {
+        let detail = first_nonempty_line(&text).unwrap_or("Gemini --list-sessions failed");
+        return Err(detail.to_string());
+    }
+
+    Ok(sessions)
+}
+
+async fn delete_gemini_session_for_transport(
+    transport: &BackendTransport,
+    workspace_root: &str,
+    index: &str,
+) -> Result<(), String> {
+    let output =
+        run_gemini_cli_command_output(transport, workspace_root, &["--delete-session", index])
+            .await?;
+    let text = combine_process_output(&output);
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("invalid session identifier")
+        || lowered.contains("session not found")
+        || lowered.contains("unknown session")
+    {
+        let detail = first_nonempty_line(&text).unwrap_or("Gemini session not found");
+        return Err(detail.to_string());
+    }
+    if !output.status.success() {
+        let detail = first_nonempty_line(&text).unwrap_or("Gemini --delete-session failed");
+        return Err(detail.to_string());
+    }
+    Ok(())
+}
+
+async fn run_gemini_cli_command_output(
+    transport: &BackendTransport,
+    workspace_root: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let mut cli_args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    if cli_args.is_empty() {
+        cli_args.push("--help".to_string());
+    }
+    let shell_command = format!(
+        "cd {} && PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\" gemini {}",
+        shell_quote_arg(workspace_root),
+        shell_quote_command(&cli_args)
+    );
+    transport.run_shell_command(&shell_command).await
+}
+
+fn combine_process_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn parse_gemini_session_entries(text: &str) -> Vec<GeminiSessionListEntry> {
+    let mut raw_entries: Vec<(String, String, String)> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((index_part, rest)) = trimmed.split_once(". ") else {
+            continue;
+        };
+        if index_part.is_empty() || !index_part.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let Some((before_id, id_part)) = rest.rsplit_once(" [") else {
+            continue;
+        };
+        if !id_part.ends_with(']') {
+            continue;
+        }
+        let session_id = id_part[..id_part.len() - 1].trim();
+        if session_id.is_empty() {
+            continue;
+        }
+
+        let preview_with_age = before_id.trim();
+        let preview = if let Some((head, tail)) = preview_with_age.rsplit_once(" (") {
+            if tail.ends_with(')') {
+                head.trim()
+            } else {
+                preview_with_age
+            }
+        } else {
+            preview_with_age
+        };
+        if preview.is_empty() {
+            continue;
+        }
+
+        raw_entries.push((
+            index_part.to_string(),
+            session_id.to_string(),
+            preview.to_string(),
+        ));
+    }
+
+    let now = unix_now_ms();
+    let total = raw_entries.len();
+    raw_entries
+        .into_iter()
+        .enumerate()
+        .map(|(pos, (index, session_id, preview))| {
+            let age_slots = (total.saturating_sub(pos + 1)) as u64;
+            let last_modified_ms = now.saturating_sub(age_slots.saturating_mul(1_000));
+            GeminiSessionListEntry {
+                index,
+                session_id,
+                title: preview.clone(),
+                preview,
+                last_modified_ms,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,4 +1852,357 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn normalize_nonempty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    fn event_kind(event: &Value) -> Option<&str> {
+        event.get("kind").and_then(Value::as_str)
+    }
+
+    fn format_live_events(events: &[Value]) -> String {
+        serde_json::to_string_pretty(&Value::Array(events.to_vec()))
+            .unwrap_or_else(|_| format!("{events:?}"))
+    }
+
+    fn live_test_workspace_root() -> String {
+        std::env::var("TYDE_GEMINI_TEST_WORKSPACE")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
+    }
+
+    fn make_live_test_inner(
+        workspace_root: String,
+        ephemeral: bool,
+    ) -> (Arc<GeminiInner>, mpsc::UnboundedReceiver<Value>) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(GeminiInner {
+                event_tx,
+                state: Mutex::new(GeminiState {
+                    workspace_root,
+                    transport: BackendTransport::Local,
+                    ephemeral,
+                    session_id: None,
+                    model: Some("gemini-2.5-flash-lite".to_string()),
+                    permission_mode: None,
+                    steering_content: None,
+                    startup_mcp_servers: Vec::new(),
+                    active_turn: None,
+                }),
+            }),
+            event_rx,
+        )
+    }
+
+    async fn collect_live_gemini_events(
+        prompt: &str,
+        workspace_root: String,
+        ephemeral: bool,
+        session_id: Option<String>,
+    ) -> Vec<Value> {
+        let (inner, mut rx) = make_live_test_inner(workspace_root, ephemeral);
+        if let Some(existing_session_id) = session_id {
+            let mut state = inner.state.lock().await;
+            state.session_id = Some(existing_session_id);
+        }
+        inner.clone().start_turn(prompt.to_string(), None).await;
+
+        let mut events = Vec::new();
+        loop {
+            let event = timeout(Duration::from_secs(180), rx.recv())
+                .await
+                .expect("timed out waiting for live Gemini event")
+                .expect("live Gemini event channel closed");
+            let is_done = event_kind(&event) == Some("TypingStatusChanged")
+                && event.get("data").and_then(Value::as_bool) == Some(false);
+            events.push(event);
+            if is_done {
+                break;
+            }
+        }
+
+        events
+    }
+
+    #[test]
+    fn parse_gemini_usage_supports_cached_and_non_cached_input_fields() {
+        let raw = json!({
+            "total_tokens": 11050,
+            "input_tokens": 10856,
+            "input": 8970,
+            "output_tokens": 38,
+            "cached": 1886,
+            "duration_ms": 8500,
+            "tool_calls": 0
+        });
+
+        let usage = parse_gemini_usage(Some(&raw)).expect("usage should parse");
+        assert_eq!(
+            usage.get("input_tokens").and_then(Value::as_u64),
+            Some(8970)
+        );
+        assert_eq!(
+            usage.get("cached_prompt_tokens").and_then(Value::as_u64),
+            Some(1886)
+        );
+        assert_eq!(usage.get("output_tokens").and_then(Value::as_u64), Some(38));
+    }
+
+    #[test]
+    fn parse_gemini_session_entries_parses_cli_list_output() {
+        let output = r#"
+Keychain initialization encountered an error: An unknown error occurred.
+Using FileKeychain fallback for secure storage.
+
+Available sessions for this project (2):
+  1. old prompt (3 days ago) [11111111-1111-1111-1111-111111111111]
+  2. latest prompt (Just now) [22222222-2222-2222-2222-222222222222]
+"#;
+
+        let sessions = parse_gemini_session_entries(output);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].index, "1");
+        assert_eq!(
+            sessions[0].session_id,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(sessions[0].preview, "old prompt");
+        assert_eq!(sessions[1].index, "2");
+        assert_eq!(
+            sessions[1].session_id,
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(sessions[1].preview, "latest prompt");
+        assert!(sessions[1].last_modified_ms >= sessions[0].last_modified_ms);
+    }
+
+    #[test]
+    fn estimate_gemini_context_breakdown_returns_context_window() {
+        let usage = json!({
+            "input_tokens": 9000,
+            "cached_prompt_tokens": 1000,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 120
+        });
+        let breakdown =
+            estimate_gemini_context_breakdown(Some(&usage), Some("gemini-2.5-flash-lite"))
+                .expect("breakdown should be present");
+        assert_eq!(
+            breakdown.get("input_tokens").and_then(Value::as_u64),
+            Some(10_000)
+        );
+        assert!(
+            breakdown
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                >= 10_000
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Gemini CLI auth and network; set TYDE_RUN_GEMINI_INTEGRATION=1"]
+    async fn live_gemini_stream_end_includes_usage_and_context_breakdown() {
+        if std::env::var("TYDE_RUN_GEMINI_INTEGRATION").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Gemini integration test; set TYDE_RUN_GEMINI_INTEGRATION=1");
+            return;
+        }
+
+        let marker = format!("LIVE_GEMINI_PARSING_{}", unix_now_ms());
+        let prompt = format!("Respond with exactly: {marker}");
+        let events =
+            collect_live_gemini_events(&prompt, live_test_workspace_root(), true, None).await;
+        let events_dump = format_live_events(&events);
+
+        let stream_end = events
+            .iter()
+            .find(|event| event_kind(event) == Some("StreamEnd"))
+            .unwrap_or_else(|| panic!("Expected StreamEnd event. Events:\n{events_dump}"));
+
+        let message = stream_end
+            .get("data")
+            .and_then(|v| v.get("message"))
+            .unwrap_or_else(|| panic!("StreamEnd missing data.message. Events:\n{events_dump}"));
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            content.contains(&marker),
+            "Expected StreamEnd content to contain marker {marker}. content={content:?}\nEvents:\n{events_dump}"
+        );
+
+        let usage = message
+            .get("token_usage")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| {
+                panic!("Expected token_usage object in StreamEnd. Events:\n{events_dump}")
+            });
+
+        assert!(
+            usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
+            "Expected input_tokens > 0 in token_usage. token_usage={usage:?}"
+        );
+        assert!(
+            usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
+            "Expected output_tokens > 0 in token_usage. token_usage={usage:?}"
+        );
+        assert!(
+            usage
+                .get("cached_prompt_tokens")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "Expected cached_prompt_tokens field in token_usage. token_usage={usage:?}"
+        );
+
+        let context_breakdown = message
+            .get("context_breakdown")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| {
+                panic!("Expected context_breakdown object in StreamEnd. Events:\n{events_dump}")
+            });
+        assert!(
+            context_breakdown
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
+            "Expected context_window > 0 in context_breakdown. context_breakdown={context_breakdown:?}"
+        );
+        assert!(
+            context_breakdown
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
+            "Expected input_tokens > 0 in context_breakdown. context_breakdown={context_breakdown:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Gemini CLI auth and network; set TYDE_RUN_GEMINI_INTEGRATION=1"]
+    async fn live_gemini_resume_reuses_session_id_and_keeps_usage_fields() {
+        if std::env::var("TYDE_RUN_GEMINI_INTEGRATION").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Gemini integration test; set TYDE_RUN_GEMINI_INTEGRATION=1");
+            return;
+        }
+
+        let workspace_root = live_test_workspace_root();
+        let marker = format!("LIVE_GEMINI_RESUME_{}", unix_now_ms());
+        let first_prompt = format!("Respond with exactly: {marker}");
+        let first_events =
+            collect_live_gemini_events(&first_prompt, workspace_root.clone(), false, None).await;
+        let first_events_dump = format_live_events(&first_events);
+        let session_id = first_events
+            .iter()
+            .find_map(|event| {
+                if event_kind(event) != Some("SessionStarted") {
+                    return None;
+                }
+                event.get("data")
+                    .and_then(|v| v.get("session_id"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            })
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                panic!("Expected SessionStarted with non-empty session_id. Events:\n{first_events_dump}")
+            });
+
+        let second_prompt =
+            "What exact token did I ask you to output in the previous message? Reply with one token only.";
+        let second_events = collect_live_gemini_events(
+            second_prompt,
+            workspace_root,
+            false,
+            Some(session_id.clone()),
+        )
+        .await;
+        let second_events_dump = format_live_events(&second_events);
+
+        let resumed_session_id = second_events
+            .iter()
+            .find_map(|event| {
+                if event_kind(event) != Some("SessionStarted") {
+                    return None;
+                }
+                event
+                    .get("data")
+                    .and_then(|v| v.get("session_id"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| {
+                panic!("Expected SessionStarted in resumed turn. Events:\n{second_events_dump}")
+            });
+        assert_eq!(
+            resumed_session_id, session_id,
+            "Expected resumed turn to keep Gemini session id"
+        );
+
+        let stream_end = second_events
+            .iter()
+            .find(|event| event_kind(event) == Some("StreamEnd"))
+            .unwrap_or_else(|| {
+                panic!("Expected StreamEnd in resumed turn. Events:\n{second_events_dump}")
+            });
+        let message = stream_end
+            .get("data")
+            .and_then(|v| v.get("message"))
+            .unwrap_or_else(|| {
+                panic!("StreamEnd missing data.message. Events:\n{second_events_dump}")
+            });
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            content.contains(&marker),
+            "Expected resumed answer to include marker {marker}. content={content:?}\nEvents:\n{second_events_dump}"
+        );
+
+        let usage = message
+            .get("token_usage")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("Expected token_usage object in resumed StreamEnd. Events:\n{second_events_dump}"));
+        assert!(
+            usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
+            "Expected input_tokens > 0 in resumed token_usage. token_usage={usage:?}"
+        );
+        assert!(
+            usage
+                .get("cached_prompt_tokens")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "Expected cached_prompt_tokens field in resumed token_usage. token_usage={usage:?}"
+        );
+    }
 }

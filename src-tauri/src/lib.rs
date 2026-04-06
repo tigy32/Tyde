@@ -4604,10 +4604,11 @@ async fn add_project(
 ) -> Result<project_store::ProjectRecord, String> {
     if let Some(host_id) = host {
         let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        let remote_workspace_path = host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
-            .into_iter()
-            .next()
-            .ok_or("Failed to resolve remote workspace path")?;
+        let remote_workspace_path =
+            host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
+                .into_iter()
+                .next()
+                .ok_or("Failed to resolve remote workspace path")?;
         let resp = conn
             .invoke(
                 "add_project",
@@ -4639,10 +4640,11 @@ async fn add_project_workbench(
 ) -> Result<project_store::ProjectRecord, String> {
     if let Some(host_id) = host {
         let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        let remote_workspace_path = host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
-            .into_iter()
-            .next()
-            .ok_or("Failed to resolve remote workspace path")?;
+        let remote_workspace_path =
+            host_router::strip_ssh_roots(std::slice::from_ref(&workspace_path))
+                .into_iter()
+                .next()
+                .ok_or("Failed to resolve remote workspace path")?;
         let resp = conn
             .invoke(
                 "add_project_workbench",
