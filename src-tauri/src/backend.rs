@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -8,11 +9,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::backend_transport::BackendLaunchTarget;
+use crate::backend_transport::{BackendLaunchTarget, BackendTransport};
 use crate::claude::{ClaudeCommandHandle, ClaudeSession, SubAgentEmitter};
 use crate::codex::{CodexCommandHandle, CodexSession};
 use crate::gemini::{GeminiCommandHandle, GeminiSession};
 use crate::kiro::{KiroCommandHandle, KiroSession};
+use crate::remote::{shell_quote_arg, to_remote_uri};
 use crate::subprocess::{ImageAttachment, SubprocessBridge};
 use crate::tyde_server_conn::TydeServerConnection;
 
@@ -341,12 +343,118 @@ fn session_command_to_json(conversation_id: u64, command: &SessionCommand) -> Va
 }
 
 pub enum BackendSession {
-    Tycode(SubprocessBridge),
+    Tycode(TycodeSession),
     Codex(CodexSession),
     Claude(ClaudeSession),
     Kiro(KiroSession),
     Gemini(GeminiSession),
     TydeServer(TydeServerProxySession),
+}
+
+pub struct TycodeSession {
+    bridge: SubprocessBridge,
+    steering_root: Option<TycodeSteeringRoot>,
+}
+
+impl TycodeSession {
+    fn command_handle(&self) -> Arc<Mutex<ChildStdin>> {
+        self.bridge.stdin()
+    }
+
+    async fn shutdown(self) {
+        self.bridge.shutdown().await;
+        if let Some(steering_root) = self.steering_root {
+            steering_root.cleanup().await;
+        }
+    }
+}
+
+struct TycodeSteeringRoot {
+    transport: BackendTransport,
+    path: String,
+}
+
+impl TycodeSteeringRoot {
+    async fn create(transport: &BackendTransport, content: &str) -> Result<Self, String> {
+        match transport {
+            BackendTransport::Local => {
+                let root = crate::steering::write_tycode_steering_root(content)?;
+                Ok(Self {
+                    transport: transport.clone(),
+                    path: root.to_string_lossy().to_string(),
+                })
+            }
+            BackendTransport::Ssh { .. } => {
+                let id = std::process::id();
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let root = format!("/tmp/tyde-tycode-steering-{id}-{ts}");
+                let dir = format!("{root}/.tycode");
+                let file = format!("{dir}/tyde_steering.md");
+                let cmd = format!(
+                    "mkdir -p {} && printf '%s' {} > {}",
+                    shell_quote_arg(&dir),
+                    shell_quote_arg(content),
+                    shell_quote_arg(&file),
+                );
+                let output = transport.run_shell_command(&cmd).await?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "Failed to write remote Tycode steering root: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                Ok(Self {
+                    transport: transport.clone(),
+                    path: root,
+                })
+            }
+        }
+    }
+
+    fn workspace_root(&self) -> String {
+        match &self.transport {
+            BackendTransport::Local => self.path.clone(),
+            BackendTransport::Ssh { host } => to_remote_uri(host, &self.path),
+        }
+    }
+
+    async fn cleanup(self) {
+        match self.transport {
+            BackendTransport::Local => {
+                let path = PathBuf::from(&self.path);
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            "Failed to remove Tycode steering root {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            transport @ BackendTransport::Ssh { .. } => {
+                let cmd = format!("rm -rf {}", shell_quote_arg(&self.path));
+                match transport.run_shell_command(&cmd).await {
+                    Ok(output) if !output.status.success() => {
+                        tracing::warn!(
+                            "Failed to remove remote Tycode steering root {}: {}",
+                            self.path,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to remove remote Tycode steering root {}: {e}",
+                            self.path
+                        );
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
 }
 
 impl BackendSession {
@@ -382,27 +490,36 @@ impl BackendSession {
 
         match kind {
             BackendKind::Tycode => {
-                // Tycode treats extra workspace roots as additional scan dirs,
-                // so append the skill temp dir as an extra root.
-                let effective_roots;
-                let roots = if let Some(dir) = skill_dir {
-                    effective_roots = workspace_roots
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once(dir.to_string()))
-                        .collect::<Vec<_>>();
-                    &effective_roots[..]
-                } else {
-                    workspace_roots
+                // Tycode reads steering from `.tycode/*.md` in workspace roots.
+                // Inject Tyde steering into a temp workspace root and append it.
+                let mut roots = workspace_roots.to_vec();
+                if let Some(dir) = skill_dir {
+                    roots.push(dir.to_string());
+                }
+                let steering_root = match effective_steering
+                    .filter(|content| !content.trim().is_empty())
+                {
+                    Some(content) => {
+                        let root = TycodeSteeringRoot::create(&launch.transport, content).await?;
+                        roots.push(root.workspace_root());
+                        Some(root)
+                    }
+                    None => None,
                 };
                 let (bridge, rx) = SubprocessBridge::spawn(
                     &launch.executable_path,
-                    roots,
+                    &roots,
                     tycode_mcp_servers_json(startup_mcp_servers)?.as_deref(),
                     ephemeral,
                 )
                 .await?;
-                Ok((Self::Tycode(bridge), rx))
+                Ok((
+                    Self::Tycode(TycodeSession {
+                        bridge,
+                        steering_root,
+                    }),
+                    rx,
+                ))
             }
             BackendKind::Codex => {
                 let (session, rx) = if ephemeral {
@@ -501,7 +618,13 @@ impl BackendSession {
                 let (bridge, rx) =
                     SubprocessBridge::spawn(&launch.executable_path, workspace_roots, None, true)
                         .await?;
-                Ok((Self::Tycode(bridge), rx))
+                Ok((
+                    Self::Tycode(TycodeSession {
+                        bridge,
+                        steering_root: None,
+                    }),
+                    rx,
+                ))
             }
             BackendKind::Codex => {
                 let (session, rx) =
@@ -553,7 +676,7 @@ impl BackendSession {
 
     pub fn command_handle(&self) -> BackendCommandHandle {
         match self {
-            Self::Tycode(bridge) => BackendCommandHandle::Tycode(bridge.stdin()),
+            Self::Tycode(session) => BackendCommandHandle::Tycode(session.command_handle()),
             Self::Codex(session) => BackendCommandHandle::Codex(session.command_handle()),
             Self::Claude(session) => BackendCommandHandle::Claude(session.command_handle()),
             Self::Kiro(session) => BackendCommandHandle::Kiro(session.command_handle()),
@@ -577,7 +700,7 @@ impl BackendSession {
 
     pub async fn shutdown(self) {
         match self {
-            Self::Tycode(bridge) => bridge.shutdown().await,
+            Self::Tycode(session) => session.shutdown().await,
             Self::Codex(session) => session.shutdown().await,
             Self::Claude(session) => session.shutdown().await,
             Self::Kiro(session) => session.shutdown().await,

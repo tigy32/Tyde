@@ -4347,7 +4347,7 @@ export class SettingsPanel {
       [
         "disable_custom_steering",
         "Disable Custom Steering",
-        "Ignore custom steering docs from .tycode and external agent configs.",
+        "Ignore custom steering docs from .tyde and external agent configs.",
       ],
     ];
     for (const [key, label, description] of toggleDefinitions) {

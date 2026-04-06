@@ -1,20 +1,20 @@
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-/// Read steering docs from `~/.tycode/steering/*.md` (global) then
-/// `{workspace_root}/.tycode/steering/*.md` (per-workspace), concatenated
+/// Read steering docs from `~/.tyde/steering/*.md` (global) then
+/// `{workspace_root}/.tyde/steering/*.md` (per-workspace), concatenated
 /// with blank-line separators.  Returns `Ok(None)` if no steering files exist.
 pub async fn read_steering(workspace_root: &str) -> Result<Option<String>, String> {
     let mut parts: Vec<String> = Vec::new();
 
-    // Global steering: ~/.tycode/steering/*.md
+    // Global steering: ~/.tyde/steering/*.md
     if let Ok(home) = std::env::var("HOME") {
-        let global_dir = Path::new(&home).join(".tycode").join("steering");
+        let global_dir = Path::new(&home).join(".tyde").join("steering");
         collect_md_files(&global_dir, &mut parts).await?;
     }
 
-    // Per-workspace steering: {workspace_root}/.tycode/steering/*.md
-    let workspace_dir = Path::new(workspace_root).join(".tycode").join("steering");
+    // Per-workspace steering: {workspace_root}/.tyde/steering/*.md
+    let workspace_dir = Path::new(workspace_root).join(".tyde").join("steering");
     collect_md_files(&workspace_dir, &mut parts).await?;
 
     if parts.is_empty() {
@@ -50,6 +50,24 @@ pub fn write_codex_steering_tempfile(content: &str) -> Result<PathBuf, String> {
     std::fs::write(&path, content)
         .map_err(|e| format!("Failed to write steering temp file: {e}"))?;
     Ok(path)
+}
+
+/// Create a temporary workspace root containing `.tycode/*.md` steering so the
+/// Tycode subprocess can ingest Tyde steering content through its native loader.
+pub fn write_tycode_steering_root(content: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir();
+    let id = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = dir.join(format!("tyde-tycode-steering-{id}-{ts}"));
+    let tycode_dir = root.join(".tycode");
+    std::fs::create_dir_all(&tycode_dir)
+        .map_err(|e| format!("Failed to create Tycode steering dir: {e}"))?;
+    let path = tycode_dir.join("tyde_steering.md");
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write Tycode steering: {e}"))?;
+    Ok(root)
 }
 
 async fn collect_md_files(dir: &Path, parts: &mut Vec<String>) -> Result<(), String> {
