@@ -766,6 +766,24 @@ export function onTydeServerConnectionState(
   );
 }
 
+export interface TydeServerVersionWarning {
+  host_id: string;
+  host: string;
+  local_version: string;
+  remote_version: string;
+}
+
+export function onTydeServerVersionWarning(
+  callback: (payload: TydeServerVersionWarning) => void,
+): Promise<UnlistenFn> {
+  return listen<TydeServerVersionWarning>(
+    "tyde-server-version-warning",
+    (event) => {
+      callback(event.payload);
+    },
+  );
+}
+
 // --- Desktop-only utilities ---
 
 const RECENT_WORKSPACES_KEY = "tyde-recent-workspaces";

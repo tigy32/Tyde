@@ -12,7 +12,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION,
+    ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION, TYDE_VERSION,
 };
 use crate::remote::{open_ssh_unix_socket_tunnel, parse_remote_path, to_remote_uri};
 
@@ -29,6 +29,14 @@ pub enum ConnectionState {
 struct ConnectionStateEvent {
     host_id: String,
     state: ConnectionState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VersionWarningEvent {
+    host_id: String,
+    host: String,
+    local_version: String,
+    remote_version: String,
 }
 
 struct PendingRequest {
@@ -625,6 +633,7 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
     let handshake = ClientFrame::Handshake {
         req_id: 0,
         protocol_version: PROTOCOL_VERSION,
+        tyde_version: TYDE_VERSION.to_string(),
         last_agent_event_seq: this.last_agent_event_seq.load(Ordering::Relaxed),
         last_chat_event_seqs: this
             .last_chat_event_seqs
@@ -655,6 +664,29 @@ async fn establish_connection_inner(this: Arc<TydeServerConnection>) -> Result<(
         ServerFrame::Result { data, .. } => {
             let result: HandshakeResult = serde_json::from_value(data)
                 .map_err(|e| format!("Invalid handshake result: {e}"))?;
+            if result.protocol_version != PROTOCOL_VERSION {
+                return Err(format!(
+                    "Protocol mismatch for host {}: local={} remote={}",
+                    this.ssh_host, PROTOCOL_VERSION, result.protocol_version
+                ));
+            }
+            if result.tyde_version != TYDE_VERSION {
+                tracing::warn!(
+                    "Tyde client/server version mismatch for host {}: local={} remote={}",
+                    this.ssh_host,
+                    TYDE_VERSION,
+                    result.tyde_version
+                );
+                let _ = this.app.emit(
+                    "tyde-server-version-warning",
+                    VersionWarningEvent {
+                        host_id: this.host_id.clone(),
+                        host: this.ssh_host.clone(),
+                        local_version: TYDE_VERSION.to_string(),
+                        remote_version: result.tyde_version.clone(),
+                    },
+                );
+            }
             let instance_changed = {
                 let mut current = this.remote_instance_id.lock().await;
                 let changed = match (&*current, &result.instance_id) {

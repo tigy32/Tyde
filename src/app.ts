@@ -30,9 +30,11 @@ import {
   onDeleteWorkbench,
   onProjectsChanged,
   onTydeServerConnectionState,
+  onTydeServerVersionWarning,
   openWorkspaceDialog,
   pickSubRootDialog,
   type TydeServerConnectionState,
+  type TydeServerVersionWarning,
   terminateAgent,
 } from "./bridge";
 import { CommandPalette } from "./command_palette";
@@ -96,6 +98,7 @@ export class AppController {
   private runtimeAgentsByProjectId = new Map<string, RuntimeAgent[]>();
   private hiddenRuntimeAgentIds = new Set<string>();
   private conversationOwnerProjectIds = new Map<number, string>();
+  private warnedVersionMismatches = new Set<string>();
   private registeredWorkflowCommandIds: string[] = [];
 
   private workspaceViews = new Map<string, WorkspaceView>();
@@ -185,6 +188,9 @@ export class AppController {
 
     await onTydeServerConnectionState((payload) => {
       this.handleTydeServerConnectionState(payload);
+    });
+    await onTydeServerVersionWarning((payload) => {
+      this.handleTydeServerVersionWarning(payload);
     });
 
     // Seed agent map with current state at startup
@@ -1301,6 +1307,17 @@ export class AppController {
     for (const [, view] of this.workspaceViews) {
       view.updateServerConnectionState?.(payload);
     }
+  }
+
+  private handleTydeServerVersionWarning(
+    payload: TydeServerVersionWarning,
+  ): void {
+    const key = `${payload.host_id}:${payload.local_version}:${payload.remote_version}`;
+    if (this.warnedVersionMismatches.has(key)) return;
+    this.warnedVersionMismatches.add(key);
+    this.notifications.warning(
+      `Remote Tyde version differs for ${payload.host}: local ${payload.local_version}, remote ${payload.remote_version}.`,
+    );
   }
 
   private async refreshRuntimeAgentsSnapshot(): Promise<void> {

@@ -30,7 +30,7 @@ use crate::chat_buffer::ChatEventBuffer;
 use crate::protocol::ServerFrame;
 #[cfg(unix)]
 use crate::protocol::{
-    ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION,
+    ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION, TYDE_VERSION,
 };
 
 #[cfg(unix)]
@@ -370,10 +370,11 @@ async fn handle_client(
     let handshake: ClientFrame =
         serde_json::from_str(line.trim()).map_err(|e| format!("Invalid handshake: {e}"))?;
 
-    let (req_id, last_agent_seq, last_chat_seqs_raw) = match handshake {
+    let (req_id, client_tyde_version, last_agent_seq, last_chat_seqs_raw) = match handshake {
         ClientFrame::Handshake {
             req_id,
             protocol_version,
+            tyde_version,
             last_agent_event_seq,
             last_chat_event_seqs,
         } => {
@@ -390,10 +391,22 @@ async fn handle_client(
                 .await?;
                 return Err("Protocol version mismatch".into());
             }
-            (req_id, last_agent_event_seq, last_chat_event_seqs)
+            (
+                req_id,
+                tyde_version,
+                last_agent_event_seq,
+                last_chat_event_seqs,
+            )
         }
         _ => return Err("First message must be Handshake".into()),
     };
+    if client_tyde_version != TYDE_VERSION {
+        tracing::warn!(
+            "Tyde client/server version mismatch: client={} server={}",
+            client_tyde_version,
+            TYDE_VERSION
+        );
+    }
     let mut last_chat_seqs = HashMap::new();
     for (raw_conversation_id, seq) in last_chat_seqs_raw {
         match raw_conversation_id.parse::<u64>() {
@@ -453,6 +466,7 @@ async fn handle_client(
             req_id,
             data: serde_json::to_value(HandshakeResult {
                 protocol_version: PROTOCOL_VERSION,
+                tyde_version: TYDE_VERSION.to_string(),
                 agents,
                 conversations,
                 instance_id: Some(instance_id),
@@ -1220,6 +1234,7 @@ async fn dispatch_invoke(
         "server_status" => Ok(serde_json::json!({
             "status": "running",
             "protocol_version": PROTOCOL_VERSION,
+            "tyde_version": TYDE_VERSION,
             "pid": std::process::id(),
         })),
 

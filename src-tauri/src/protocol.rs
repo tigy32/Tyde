@@ -18,7 +18,8 @@ use crate::session_store::SessionRecord;
 // Event names and payload shapes match existing Tauri events exactly.
 // ---------------------------------------------------------------------------
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const TYDE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn deserialize_u64_from_number_or_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
@@ -92,6 +93,8 @@ pub enum ClientFrame {
         #[serde(deserialize_with = "deserialize_u64_from_number_or_string")]
         req_id: u64,
         protocol_version: u32,
+        #[serde(default)]
+        tyde_version: String,
         last_agent_event_seq: u64,
         last_chat_event_seqs: HashMap<String, u64>,
     },
@@ -138,6 +141,8 @@ pub enum ServerFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeResult {
     pub protocol_version: u32,
+    #[serde(default)]
+    pub tyde_version: String,
     pub agents: Vec<AgentInfo>,
     pub conversations: Vec<ConversationSnapshot>,
     #[serde(default)]
@@ -160,7 +165,7 @@ pub struct ConversationSnapshot {
 mod tests {
     use std::collections::HashMap;
 
-    use super::ClientFrame;
+    use super::{ClientFrame, HandshakeResult};
 
     #[test]
     fn handshake_roundtrips_chat_cursor_map() {
@@ -169,6 +174,7 @@ mod tests {
         let frame = ClientFrame::Handshake {
             req_id: 0,
             protocol_version: super::PROTOCOL_VERSION,
+            tyde_version: super::TYDE_VERSION.to_string(),
             last_agent_event_seq: 3,
             last_chat_event_seqs: cursors.clone(),
         };
@@ -179,11 +185,13 @@ mod tests {
             ClientFrame::Handshake {
                 req_id,
                 protocol_version,
+                tyde_version,
                 last_agent_event_seq,
                 last_chat_event_seqs,
             } => {
                 assert_eq!(req_id, 0);
                 assert_eq!(protocol_version, super::PROTOCOL_VERSION);
+                assert_eq!(tyde_version, super::TYDE_VERSION);
                 assert_eq!(last_agent_event_seq, 3);
                 assert_eq!(last_chat_event_seqs, cursors);
             }
@@ -206,5 +214,38 @@ mod tests {
             ClientFrame::Invoke { req_id, .. } => assert_eq!(req_id, 2),
             _ => panic!("expected invoke frame"),
         }
+    }
+
+    #[test]
+    fn handshake_backfills_missing_tyde_version() {
+        let json = r#"{
+            "type":"Handshake",
+            "req_id":0,
+            "protocol_version":1,
+            "last_agent_event_seq":0,
+            "last_chat_event_seqs":{}
+        }"#;
+
+        let parsed: ClientFrame =
+            serde_json::from_str(json).expect("deserialize handshake without tyde_version");
+
+        match parsed {
+            ClientFrame::Handshake { tyde_version, .. } => assert!(tyde_version.is_empty()),
+            _ => panic!("expected handshake frame"),
+        }
+    }
+
+    #[test]
+    fn handshake_result_backfills_missing_tyde_version() {
+        let json = r#"{
+            "protocol_version":1,
+            "agents":[],
+            "conversations":[]
+        }"#;
+
+        let parsed: HandshakeResult =
+            serde_json::from_str(json).expect("deserialize handshake result without tyde_version");
+
+        assert!(parsed.tyde_version.is_empty());
     }
 }
