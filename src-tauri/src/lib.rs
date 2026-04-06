@@ -62,12 +62,13 @@ use crate::file_watch::FileWatchManager;
 use crate::git_service::GitFileStatus;
 use crate::project_store::ProjectStore;
 use crate::remote::{
-    check_remote_tyde_install, connect_remote_with_progress, detect_remote_tyde_target,
-    install_remote_tyde_binary, is_remote_tyde_server_running, launch_remote_tyde_headless,
-    list_remote_tyde_installed_versions, parse_remote_path, parse_remote_workspace_roots,
-    query_remote_tyde_server_version, resolve_remote_home_dir, resolve_remote_tyde_from_path,
-    stop_remote_tyde_headless, to_remote_uri, tyde_socket_path_from_home, validate_remote_cli,
-    SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
+    check_remote_tyde_install, compare_numeric_versions, connect_remote_with_progress,
+    detect_remote_tyde_target, install_remote_tyde_binary, is_remote_tyde_server_running,
+    launch_remote_tyde_headless, list_remote_tyde_installed_versions, parse_remote_path,
+    parse_remote_workspace_roots, query_remote_tyde_server_version, resolve_remote_home_dir,
+    resolve_remote_tyde_from_path, stop_remote_tyde_headless, to_remote_uri,
+    tyde_socket_path_from_home, validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO,
+    SUBPROCESS_VERSION,
 };
 use crate::session_store::SessionStore;
 use crate::subprocess::ImageAttachment;
@@ -4016,20 +4017,6 @@ fn remote_tyde_state_for_status(status: &RemoteTydeServerStatus) -> RemoteTydeSe
     }
 }
 
-fn parse_numeric_version_parts(version: &str) -> Option<Vec<u64>> {
-    let mut parts = Vec::new();
-    for part in version.split('.') {
-        if part.is_empty() {
-            return None;
-        }
-        parts.push(part.parse::<u64>().ok()?);
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(parts)
-}
-
 fn should_upgrade_remote_tyde(
     local_version: &str,
     remote_version: Option<&str>,
@@ -4041,16 +4028,11 @@ fn should_upgrade_remote_tyde(
     let Some(remote) = remote_version else {
         return false;
     };
-    let (Some(mut remote_parts), Some(mut local_parts)) = (
-        parse_numeric_version_parts(remote),
-        parse_numeric_version_parts(local_version),
-    ) else {
-        return remote != local_version;
-    };
-    let width = remote_parts.len().max(local_parts.len());
-    remote_parts.resize(width, 0);
-    local_parts.resize(width, 0);
-    remote_parts < local_parts
+    match compare_numeric_versions(remote, local_version) {
+        Some(std::cmp::Ordering::Less) => true,
+        Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => false,
+        None => remote != local_version,
+    }
 }
 
 async fn collect_remote_tyde_server_status(host: &host::Host) -> RemoteTydeServerStatus {

@@ -1,3 +1,4 @@
+use std::cmp::Ordering as CmpOrdering;
 use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(unix)]
@@ -301,7 +302,7 @@ fn parse_numeric_version_parts(version: &str) -> Option<Vec<u64>> {
     Some(parts)
 }
 
-fn compare_numeric_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+pub(crate) fn compare_numeric_versions(left: &str, right: &str) -> Option<CmpOrdering> {
     let mut left_parts = parse_numeric_version_parts(left)?;
     let mut right_parts = parse_numeric_version_parts(right)?;
     let width = left_parts.len().max(right_parts.len());
@@ -309,11 +310,11 @@ fn compare_numeric_versions(left: &str, right: &str) -> Option<std::cmp::Orderin
     right_parts.resize(width, 0);
     for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
         let cmp = left_part.cmp(right_part);
-        if cmp != std::cmp::Ordering::Equal {
+        if cmp != CmpOrdering::Equal {
             return Some(cmp);
         }
     }
-    Some(std::cmp::Ordering::Equal)
+    Some(CmpOrdering::Equal)
 }
 
 fn is_safe_release_component(value: &str) -> bool {
