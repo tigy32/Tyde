@@ -20,6 +20,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, Mutex};
+#[cfg(unix)]
+use tokio::sync::{mpsc, Semaphore};
+#[cfg(unix)]
+use tokio::task::JoinSet;
 
 use crate::chat_buffer::ChatEventBuffer;
 #[cfg(not(unix))]
@@ -28,6 +32,9 @@ use crate::protocol::ServerFrame;
 use crate::protocol::{
     ClientFrame, ConversationSnapshot, HandshakeResult, ServerFrame, PROTOCOL_VERSION,
 };
+
+#[cfg(unix)]
+const MAX_IN_FLIGHT_INVOKES: usize = 1024;
 
 /// Manages the UDS listener that accepts remote Tyde clients.
 /// Started when "Allow remote control" is enabled in settings.
@@ -238,6 +245,109 @@ async fn accept_loop(
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InvokeLaneKey {
+    Conversation(u64),
+    Agent(String),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct LaneInvoke {
+    req_id: u64,
+    command: String,
+    params: Value,
+}
+
+#[cfg(unix)]
+struct LaneWorker {
+    tx: mpsc::UnboundedSender<LaneInvoke>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+fn parse_conversation_lane(command: &str, params: &Value) -> Option<InvokeLaneKey> {
+    const CONVERSATION_MUTATING_COMMANDS: &[&str] = &[
+        "send_message",
+        "cancel_conversation",
+        "close_conversation",
+        "resume_session",
+        "delete_session",
+        "switch_profile",
+        "update_settings",
+    ];
+    if !CONVERSATION_MUTATING_COMMANDS.contains(&command) {
+        return None;
+    }
+    let conversation_id = params.get("conversation_id")?.as_u64()?;
+    Some(InvokeLaneKey::Conversation(conversation_id))
+}
+
+#[cfg(unix)]
+fn parse_agent_lane(command: &str, params: &Value) -> Option<InvokeLaneKey> {
+    const AGENT_MUTATING_COMMANDS: &[&str] = &[
+        "send_agent_message",
+        "interrupt_agent",
+        "terminate_agent",
+        "cancel_agent",
+        "rename_agent",
+    ];
+    if !AGENT_MUTATING_COMMANDS.contains(&command) {
+        return None;
+    }
+    let agent_id = params.get("agent_id")?.as_str()?.trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    Some(InvokeLaneKey::Agent(agent_id.to_string()))
+}
+
+#[cfg(unix)]
+fn invoke_lane_key(command: &str, params: &Value) -> Option<InvokeLaneKey> {
+    parse_conversation_lane(command, params).or_else(|| parse_agent_lane(command, params))
+}
+
+#[cfg(unix)]
+fn spawn_lane_worker(
+    app: tauri::AppHandle,
+    writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    client_id: u64,
+    lane: InvokeLaneKey,
+    invoke_permits: Arc<Semaphore>,
+) -> LaneWorker {
+    let (tx, mut rx) = mpsc::unbounded_channel::<LaneInvoke>();
+    let handle = tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let permit = match invoke_permits.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let _permit = permit;
+
+            let response = dispatch(
+                &app,
+                ClientFrame::Invoke {
+                    req_id: job.req_id,
+                    command: job.command,
+                    params: job.params,
+                },
+            )
+            .await;
+
+            if let Err(err) = send(&writer, &response).await {
+                tracing::debug!(
+                    "Client {client_id}: failed to send response from lane {:?}: {}",
+                    lane,
+                    err
+                );
+                break;
+            }
+        }
+    });
+    LaneWorker { tx, handle }
+}
+
+#[cfg(unix)]
 async fn handle_client(
     app: tauri::AppHandle,
     stream: tokio::net::UnixStream,
@@ -412,8 +522,18 @@ async fn handle_client(
         }
     });
 
+    let invoke_permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_INVOKES));
+    let mut lane_workers: HashMap<InvokeLaneKey, LaneWorker> = HashMap::new();
+    let mut direct_invoke_tasks: JoinSet<()> = JoinSet::new();
+
     let mut buf = String::new();
     loop {
+        while let Some(joined) = direct_invoke_tasks.try_join_next() {
+            if let Err(err) = joined {
+                tracing::warn!("Client {client_id}: direct invoke task failed: {err}");
+            }
+        }
+
         buf.clear();
         let n = reader
             .read_line(&mut buf)
@@ -431,10 +551,92 @@ async fn handle_client(
             }
         };
 
-        let response = dispatch(&app, frame).await;
-        send(&writer, &response).await?;
+        match frame {
+            ClientFrame::Handshake { req_id, .. } => {
+                send(
+                    &writer,
+                    &ServerFrame::Error {
+                        req_id,
+                        error: "Handshake already completed".into(),
+                    },
+                )
+                .await?;
+            }
+            ClientFrame::Invoke {
+                req_id,
+                command,
+                params,
+            } => {
+                if let Some(lane) = invoke_lane_key(&command, &params) {
+                    let job = LaneInvoke {
+                        req_id,
+                        command,
+                        params,
+                    };
+
+                    let mut sent = false;
+                    if let Some(existing) = lane_workers.get(&lane) {
+                        if existing.tx.send(job.clone()).is_ok() {
+                            sent = true;
+                        } else {
+                            tracing::debug!(
+                                "Client {client_id}: lane {:?} worker channel closed; recreating",
+                                lane
+                            );
+                        }
+                    }
+                    if !sent {
+                        let worker = spawn_lane_worker(
+                            app.clone(),
+                            writer.clone(),
+                            client_id,
+                            lane.clone(),
+                            invoke_permits.clone(),
+                        );
+                        if worker.tx.send(job).is_err() {
+                            return Err(format!(
+                                "Client {client_id}: failed to enqueue invoke in lane {:?}",
+                                lane
+                            ));
+                        }
+                        lane_workers.insert(lane, worker);
+                    }
+                    continue;
+                }
+
+                let app_for_invoke = app.clone();
+                let writer_for_invoke = writer.clone();
+                let permits_for_invoke = invoke_permits.clone();
+                direct_invoke_tasks.spawn(async move {
+                    let permit = match permits_for_invoke.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    let _permit = permit;
+                    let response = dispatch(
+                        &app_for_invoke,
+                        ClientFrame::Invoke {
+                            req_id,
+                            command,
+                            params,
+                        },
+                    )
+                    .await;
+                    let _ = send(&writer_for_invoke, &response).await;
+                });
+            }
+        }
     }
 
+    direct_invoke_tasks.abort_all();
+    while let Some(joined) = direct_invoke_tasks.join_next().await {
+        if let Err(err) = joined {
+            tracing::debug!("Client {client_id}: direct invoke task join error: {err}");
+        }
+    }
+    for (_, worker) in lane_workers.drain() {
+        worker.handle.abort();
+    }
     forwarder.abort();
     Ok(())
 }
@@ -1038,4 +1240,50 @@ async fn send(
         .map_err(|e| format!("Write: {e}"))?;
     w.flush().await.map_err(|e| format!("Flush: {e}"))?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn invoke_lane_key_routes_conversation_mutations() {
+        let lane = invoke_lane_key(
+            "send_message",
+            &json!({
+                "conversation_id": 42,
+                "message": "hello",
+            }),
+        );
+        assert_eq!(lane, Some(InvokeLaneKey::Conversation(42)));
+    }
+
+    #[test]
+    fn invoke_lane_key_routes_agent_mutations() {
+        let lane = invoke_lane_key(
+            "interrupt_agent",
+            &json!({
+                "agent_id": "agent-123",
+            }),
+        );
+        assert_eq!(lane, Some(InvokeLaneKey::Agent("agent-123".to_string())));
+    }
+
+    #[test]
+    fn invoke_lane_key_does_not_lane_wait_calls() {
+        let lane = invoke_lane_key(
+            "wait_for_agent",
+            &json!({
+                "agent_id": "agent-123",
+            }),
+        );
+        assert_eq!(lane, None);
+    }
+
+    #[test]
+    fn invoke_lane_key_returns_none_for_invalid_params() {
+        let lane = invoke_lane_key("send_message", &json!({ "message": "missing id" }));
+        assert_eq!(lane, None);
+    }
 }

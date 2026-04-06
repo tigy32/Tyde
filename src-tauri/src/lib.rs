@@ -19,10 +19,10 @@ mod git_service;
 pub mod host;
 mod host_router;
 mod kiro;
+mod project_store;
 mod protocol;
 mod remote;
 mod remote_control;
-mod project_store;
 mod session_store;
 mod skill_injection;
 mod steering;
@@ -60,11 +60,11 @@ use crate::conversation::ConversationManager;
 use crate::file_service::{FileContent, FileEntry};
 use crate::file_watch::FileWatchManager;
 use crate::git_service::GitFileStatus;
+use crate::project_store::ProjectStore;
 use crate::remote::{
     connect_remote_with_progress, parse_remote_path, parse_remote_workspace_roots, to_remote_uri,
     validate_remote_cli, SUBPROCESS_CRATE_NAME, SUBPROCESS_GIT_REPO, SUBPROCESS_VERSION,
 };
-use crate::project_store::ProjectStore;
 use crate::session_store::SessionStore;
 use crate::subprocess::ImageAttachment;
 use crate::terminal::TerminalManager;
@@ -1041,7 +1041,6 @@ fn definition_mcp_servers_to_startup(
         .collect()
 }
 
-
 /// Compose steering content from definition instructions, tool policy, skills, and workspace steering.
 fn compose_steering(
     instructions: Option<&str>,
@@ -1251,9 +1250,7 @@ pub(crate) async fn create_workbench_internal(
             match store.add(&parent_workspace_path, parent_name) {
                 Ok(record) => record.id,
                 Err(err) => {
-                    tracing::warn!(
-                        "Failed to auto-add parent project for workbench: {err}"
-                    );
+                    tracing::warn!("Failed to auto-add parent project for workbench: {err}");
                     drop(store);
                     emit_projects_changed(app, &state);
                     return Ok(worktree_path);
@@ -1350,14 +1347,12 @@ pub(crate) async fn materialize_remote_conversation(
         }
     }
 
-    let backend_kind = backend_kind_str
-        .parse::<BackendKind>()
-        .map_err(|err| {
-            format!(
-                "Unknown backend kind '{}' for remote conversation {}: {}",
-                backend_kind_str, server_cid, err
-            )
-        })?;
+    let backend_kind = backend_kind_str.parse::<BackendKind>().map_err(|err| {
+        format!(
+            "Unknown backend kind '{}' for remote conversation {}: {}",
+            backend_kind_str, server_cid, err
+        )
+    })?;
 
     let normalized_workspace_roots: Vec<String> = workspace_roots
         .iter()
@@ -1999,7 +1994,10 @@ pub(crate) async fn create_conversation_tauri_free(
             .first()
             .map(|s| s.as_str())
             .ok_or("Skill injection requires a workspace root")?;
-        let agent_id = definition.as_ref().map(|d| d.id.as_str()).unwrap_or("unknown");
+        let agent_id = definition
+            .as_ref()
+            .map(|d| d.id.as_str())
+            .unwrap_or("unknown");
         Some(
             skill_injection::inject_skills_for_backend(
                 backend_kind,
@@ -2013,7 +2011,9 @@ pub(crate) async fn create_conversation_tauri_free(
     } else {
         None
     };
-    let skill_dir = skill_injection.as_ref().and_then(|r| r.skill_dir.as_deref());
+    let skill_dir = skill_injection
+        .as_ref()
+        .and_then(|r| r.skill_dir.as_deref());
 
     // Build agent identity for backends that support native agent flags.
     // Instructions go through --agents/--agent (Claude) rather than
@@ -2527,10 +2527,7 @@ async fn cleanup_conversation_runtime_state(
         .conversation_to_session
         .lock()
         .remove(&conversation_id);
-    state
-        .remote_chat_senders
-        .lock()
-        .remove(&conversation_id);
+    state.remote_chat_senders.lock().remove(&conversation_id);
 
     // Clean up remote control chat buffer for this conversation.
     if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
@@ -2643,7 +2640,10 @@ pub(crate) async fn spawn_agent_internal(
             .first()
             .map(|s| s.as_str())
             .ok_or("Skill injection requires a workspace root")?;
-        let agent_id = definition.as_ref().map(|d| d.id.as_str()).unwrap_or("unknown");
+        let agent_id = definition
+            .as_ref()
+            .map(|d| d.id.as_str())
+            .unwrap_or("unknown");
         Some(
             skill_injection::inject_skills_for_backend(
                 backend_kind,
@@ -2657,7 +2657,9 @@ pub(crate) async fn spawn_agent_internal(
     } else {
         None
     };
-    let skill_dir = skill_injection.as_ref().and_then(|r| r.skill_dir.as_deref());
+    let skill_dir = skill_injection
+        .as_ref()
+        .and_then(|r| r.skill_dir.as_deref());
 
     let agent_identity = definition.as_ref().and_then(|d| {
         let instr = d.instructions.as_deref().unwrap_or("").trim();
@@ -2699,7 +2701,10 @@ pub(crate) async fn spawn_agent_internal(
 
     // Store skill cleanup handle for this conversation.
     if let Some(injection) = skill_injection {
-        state.skill_cleanups.lock().insert(conversation_id, injection.cleanup);
+        state
+            .skill_cleanups
+            .lock()
+            .insert(conversation_id, injection.cleanup);
     }
 
     let info = {
@@ -3162,7 +3167,9 @@ pub(crate) async fn wait_for_agent_internal(
         info.conversation_id = connection
             .to_local_conversation_id(info.conversation_id)
             .await?;
-        connection.register_remote_agent_id(info.agent_id.clone()).await;
+        connection
+            .register_remote_agent_id(info.agent_id.clone())
+            .await;
         return Ok(info);
     }
 
@@ -3325,10 +3332,22 @@ pub(crate) async fn run_query_screenshot_agent(
     let spawn_resp = spawn_agent_internal(app, state, request).await?;
     let agent_id = spawn_resp.agent_id;
 
-    let wait_result = wait_for_agent_internal(state, WaitForAgentRequest { agent_id: agent_id.clone() }).await;
+    let wait_result = wait_for_agent_internal(
+        state,
+        WaitForAgentRequest {
+            agent_id: agent_id.clone(),
+        },
+    )
+    .await;
 
     // Collect result and terminate regardless of wait outcome.
-    let result = collect_agent_result_internal(state, AgentIdRequest { agent_id: agent_id.clone() }).await;
+    let result = collect_agent_result_internal(
+        state,
+        AgentIdRequest {
+            agent_id: agent_id.clone(),
+        },
+    )
+    .await;
 
     let _ = terminate_agent_internal(app, state, AgentIdRequest { agent_id }).await;
 
@@ -3379,7 +3398,9 @@ pub(crate) async fn await_agents_internal(
         let mut still_running = Vec::new();
         let mut newest_updated_at: u64 = 0;
         for id in &request.agent_ids {
-            let info = by_id.get(id.as_str()).ok_or(format!("Agent {id} not found"))?;
+            let info = by_id
+                .get(id.as_str())
+                .ok_or(format!("Agent {id} not found"))?;
             if info.updated_at_ms > newest_updated_at {
                 newest_updated_at = info.updated_at_ms;
             }
@@ -4388,8 +4409,12 @@ async fn list_session_records(
     // If the workspace is remote, return only the remote server's records.
     if let Some(ref root) = workspace_root {
         if let Some(remote) = parse_remote_path(root) {
-            let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
-                state.tyde_server_connections.lock().values().cloned().collect();
+            let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> = state
+                .tyde_server_connections
+                .lock()
+                .values()
+                .cloned()
+                .collect();
             for conn in &conns {
                 if conn.ssh_host() == remote.host {
                     return conn.fetch_session_records().await.map_err(|err| {
@@ -4417,11 +4442,19 @@ async fn rename_session(
     name: String,
 ) -> Result<(), String> {
     // Route to TydeServer if the session belongs to a remote connection
-    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
-        state.tyde_server_connections.lock().values().cloned().collect();
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> = state
+        .tyde_server_connections
+        .lock()
+        .values()
+        .cloned()
+        .collect();
     for conn in &conns {
         if conn.owns_session_record(&id).await {
-            conn.invoke("rename_session", serde_json::json!({ "id": id, "name": name })).await?;
+            conn.invoke(
+                "rename_session",
+                serde_json::json!({ "id": id, "name": name }),
+            )
+            .await?;
             conn.fetch_session_records().await.map_err(|err| {
                 format!("Renamed session but failed to refresh cached records: {err}")
             })?;
@@ -4438,14 +4471,22 @@ async fn set_session_alias(
     id: String,
     alias: String,
 ) -> Result<(), String> {
-    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
-        state.tyde_server_connections.lock().values().cloned().collect();
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> = state
+        .tyde_server_connections
+        .lock()
+        .values()
+        .cloned()
+        .collect();
     for conn in &conns {
         if conn.owns_session_record(&id).await {
-            conn.invoke("set_session_alias", serde_json::json!({ "id": id, "alias": alias })).await?;
-            conn.fetch_session_records().await.map_err(|err| {
-                format!("Set alias but failed to refresh cached records: {err}")
-            })?;
+            conn.invoke(
+                "set_session_alias",
+                serde_json::json!({ "id": id, "alias": alias }),
+            )
+            .await?;
+            conn.fetch_session_records()
+                .await
+                .map_err(|err| format!("Set alias but failed to refresh cached records: {err}"))?;
             return Ok(());
         }
     }
@@ -4460,8 +4501,12 @@ async fn delete_session_record(
     id: String,
 ) -> Result<(), String> {
     // Route to TydeServer if the session belongs to a remote connection
-    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> =
-        state.tyde_server_connections.lock().values().cloned().collect();
+    let conns: Vec<Arc<tyde_server_conn::TydeServerConnection>> = state
+        .tyde_server_connections
+        .lock()
+        .values()
+        .cloned()
+        .collect();
     for conn in &conns {
         if conn.owns_session_record(&id).await {
             conn.invoke("delete_session_record", serde_json::json!({ "id": id }))
@@ -4489,10 +4534,8 @@ async fn delete_session_record(
 
     if let Some(ref bsid) = backend_session_id {
         let roots: Vec<String> = workspace_root.iter().cloned().collect();
-        let backend_kind =
-            resolve_requested_backend_kind(&state, Some(backend_kind_str), &roots)?;
-        let launch_target =
-            resolve_backend_launch_target(&app, &roots, backend_kind).await?;
+        let backend_kind = resolve_requested_backend_kind(&state, Some(backend_kind_str), &roots)?;
+        let launch_target = resolve_backend_launch_target(&app, &roots, backend_kind).await?;
         let (session, _rx) =
             BackendSession::spawn_admin(backend_kind, &launch_target, &roots).await?;
         let handle = session.command_handle();
@@ -4604,10 +4647,12 @@ async fn add_project_workbench(
             .map_err(|e| format!("Failed to parse remote project record: {e}"))?;
         Ok(conn.normalize_project_record(record))
     } else {
-        let record = state
-            .project_store
-            .lock()
-            .add_workbench(&parent_project_id, &workspace_path, &name, &kind)?;
+        let record = state.project_store.lock().add_workbench(
+            &parent_project_id,
+            &workspace_path,
+            &name,
+            &kind,
+        )?;
         emit_projects_changed(&app, &state);
         Ok(record)
     }
@@ -4642,8 +4687,11 @@ async fn rename_project(
 ) -> Result<(), String> {
     if let Some(host_id) = host {
         let conn = host_router::get_server_connection_by_id(&app, &state, &host_id).await?;
-        conn.invoke("rename_project", serde_json::json!({ "id": id, "name": name }))
-            .await?;
+        conn.invoke(
+            "rename_project",
+            serde_json::json!({ "id": id, "name": name }),
+        )
+        .await?;
         Ok(())
     } else {
         state.project_store.lock().rename(&id, &name)?;
@@ -4964,9 +5012,7 @@ async fn relaunch_conversation(
             .cloned();
         tyde_session_id.and_then(|sid| {
             let mut store = state.session_store.lock();
-            store
-                .get(&sid)
-                .and_then(|r| r.backend_session_id.clone())
+            store.get(&sid).and_then(|r| r.backend_session_id.clone())
         })
     };
 
@@ -4989,8 +5035,7 @@ async fn relaunch_conversation(
     old_session.shutdown().await;
 
     // 3. Spawn a fresh backend process.
-    let launch_target =
-        resolve_backend_launch_target(&app, &workspace_roots, backend_kind).await?;
+    let launch_target = resolve_backend_launch_target(&app, &workspace_roots, backend_kind).await?;
     let startup_mcp_servers =
         startup_mcp_servers_for_new_sessions(state.inner(), false, &workspace_roots)?;
     let steering = steering::read_steering_from_roots(&workspace_roots).await?;
@@ -5718,6 +5763,13 @@ mod tests {
             session_store: Arc::new(SyncMutex::new(
                 SessionStore::load(tmp_path).expect("failed to create test session store"),
             )),
+            project_store: Arc::new(SyncMutex::new({
+                let tmp_project_path = std::env::temp_dir().join(format!(
+                    "tyde-test-project-store-{}.json",
+                    uuid::Uuid::new_v4()
+                ));
+                ProjectStore::load(tmp_project_path).expect("failed to create test project store")
+            })),
             host_store: SyncMutex::new({
                 let tmp_host_path = std::env::temp_dir().join(format!(
                     "tyde-test-host-store-{}.json",
