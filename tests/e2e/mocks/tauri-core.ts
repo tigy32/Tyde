@@ -164,7 +164,7 @@ interface MockRemoteTydeServerState {
   error: string | null;
 }
 
-const MOCK_TYDE_VERSION = "0.7.0";
+const MOCK_TYDE_VERSION = "0.7.1";
 const mockRemoteTydeServers = new Map<string, MockRemoteTydeServerState>();
 
 const mockHosts: MockHost[] = [
