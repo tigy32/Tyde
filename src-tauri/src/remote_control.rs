@@ -1015,15 +1015,7 @@ async fn dispatch_invoke(
                 session_id: String,
             }
             let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
-            crate::execute_conversation_command(
-                app,
-                &state,
-                p.conversation_id,
-                crate::backend::SessionCommand::ResumeSession {
-                    session_id: p.session_id,
-                },
-            )
-            .await?;
+            crate::resume_session_internal(app, &state, p.conversation_id, p.session_id).await?;
             Ok(serde_json::json!({"ok": true}))
         }
 
@@ -1087,8 +1079,27 @@ async fn dispatch_invoke(
         }
 
         "list_session_records" => {
+            #[derive(Deserialize)]
+            struct P {
+                workspace_root: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| e.to_string())?;
+
             let mut store = state.session_store.lock();
-            let records = store.list()?;
+            let mut records = store.list()?;
+            if let Some(workspace_root) = p.workspace_root.as_deref() {
+                let key = crate::workspace_root_compare_key(workspace_root);
+                if !key.is_empty() {
+                    records.retain(|record| {
+                        record
+                            .workspace_root
+                            .as_deref()
+                            .map(crate::workspace_root_compare_key)
+                            .as_deref()
+                            == Some(key.as_str())
+                    });
+                }
+            }
             serde_json::to_value(records).map_err(|e| e.to_string())
         }
 

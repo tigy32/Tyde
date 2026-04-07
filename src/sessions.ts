@@ -96,7 +96,12 @@ export class SessionsPanel {
     }
 
     const normalized: NormalizedSession[] = records
-      .filter((r) => r.message_count > 0 || r.backend_session_id)
+      .filter((r) => {
+        if (r.message_count > 0) return true;
+        if (!r.backend_session_id) return false;
+        const title = (r.user_alias ?? r.alias ?? "").trim();
+        return title.length > 0;
+      })
       .map((r) => this.recordToSession(r));
 
     normalized.sort((a, b) => b.timestampMs - a.timestampMs);

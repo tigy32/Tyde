@@ -173,6 +173,7 @@ impl CodexSession {
             event_tx,
             state: Mutex::new(CodexState {
                 thread_id,
+                workspace_root: cwd,
                 model,
                 reasoning_effort: Some("xhigh".to_string()),
                 approval_policy: None,
@@ -310,6 +311,7 @@ struct CodexWaitAgentCompletion {
 
 struct CodexState {
     thread_id: String,
+    workspace_root: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
     approval_policy: Option<String>,
@@ -478,6 +480,10 @@ impl CodexInner {
     }
 
     async fn list_sessions(&self) -> Result<(), String> {
+        let workspace_root = {
+            let state = self.state.lock().await;
+            state.workspace_root.clone()
+        };
         let mut cursor: Option<String> = None;
         let mut sessions: Vec<Value> = Vec::new();
 
@@ -500,6 +506,17 @@ impl CodexInner {
 
             for thread in page {
                 if let Some(metadata) = codex_thread_to_session_metadata(&thread) {
+                    if !workspace_root.is_empty() {
+                        let session_root = metadata
+                            .get("workspace_root")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if session_root.is_empty()
+                            || !codex_workspace_root_matches(&workspace_root, session_root)
+                        {
+                            continue;
+                        }
+                    }
                     sessions.push(metadata);
                 }
             }
@@ -2808,6 +2825,18 @@ fn codex_thread_to_session_metadata(thread: &Value) -> Option<Value> {
     }))
 }
 
+fn codex_workspace_root_matches(expected: &str, candidate: &str) -> bool {
+    fn normalize(root: &str) -> String {
+        let mut out = root.trim().replace('\\', "/");
+        while out.len() > 1 && out.ends_with('/') {
+            out.pop();
+        }
+        out
+    }
+
+    normalize(expected) == normalize(candidate)
+}
+
 fn codex_item_success(item: &Value) -> bool {
     if let Some(success) = item.get("success").and_then(Value::as_bool) {
         return success;
@@ -4603,6 +4632,7 @@ mod tests {
     fn test_codex_state() -> CodexState {
         CodexState {
             thread_id: "thread-test".to_string(),
+            workspace_root: "/mock/workspace".to_string(),
             model: Some("codex".to_string()),
             reasoning_effort: Some("xhigh".to_string()),
             approval_policy: None,

@@ -4402,6 +4402,15 @@ async fn resume_session(
     conversation_id: u64,
     session_id: String,
 ) -> Result<(), String> {
+    resume_session_internal(&app, &state, conversation_id, session_id).await
+}
+
+pub(crate) async fn resume_session_internal(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    conversation_id: u64,
+    session_id: String,
+) -> Result<(), String> {
     // Map conversation_to_session BEFORE sending the command so that
     // forward_events can route session store updates to the right record.
     // The conversation was created with ephemeral=true so no duplicate
@@ -4416,6 +4425,7 @@ async fn resume_session(
                 .map(|s| s.to_string()),
         )
     };
+    let mut created_record_id = None::<String>;
     if let Some(ref bk) = backend_kind {
         let mut store = state.session_store.lock();
         let tyde_id = if let Some(existing) = store.get_by_backend_session(bk, &session_id) {
@@ -4425,6 +4435,7 @@ async fn resume_session(
             // with the correct backend_session_id upfront.
             let record = store.create(bk, workspace_root.as_deref())?;
             store.set_backend_session_id(&record.id, &session_id)?;
+            created_record_id = Some(record.id.clone());
             record.id
         };
         state
@@ -4433,15 +4444,27 @@ async fn resume_session(
             .insert(conversation_id, tyde_id);
     }
 
-    execute_conversation_command(
-        &app,
-        &state,
+    let result = execute_conversation_command(
+        app,
+        state,
         conversation_id,
-        SessionCommand::ResumeSession {
-            session_id: session_id.clone(),
-        },
+        SessionCommand::ResumeSession { session_id },
     )
-    .await
+    .await;
+    if result.is_ok() {
+        return Ok(());
+    }
+
+    state.conversation_to_session.lock().remove(&conversation_id);
+    if let Some(record_id) = created_record_id {
+        if let Err(err) = state.session_store.lock().delete(&record_id) {
+            tracing::error!(
+                "Failed to clean up failed-resume session record '{}': {err}",
+                record_id
+            );
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -4795,6 +4818,11 @@ async fn list_session_records(
     state: tauri::State<'_, AppState>,
     workspace_root: Option<String>,
 ) -> Result<Vec<session_store::SessionRecord>, String> {
+    let requested_workspace_key = workspace_root
+        .as_deref()
+        .map(workspace_root_compare_key)
+        .filter(|key| !key.is_empty());
+
     // If the workspace is remote, return only the remote server's records.
     if let Some(ref root) = workspace_root {
         if let Some(remote) = parse_remote_path(root) {
@@ -4806,12 +4834,23 @@ async fn list_session_records(
                 .collect();
             for conn in &conns {
                 if conn.ssh_host() == remote.host {
-                    return conn.fetch_session_records().await.map_err(|err| {
+                    let mut records = conn.fetch_session_records().await.map_err(|err| {
                         format!(
                             "Failed to fetch session records from {}: {err}",
                             conn.host_id
                         )
-                    });
+                    })?;
+                    if let Some(ref workspace_key) = requested_workspace_key {
+                        records.retain(|record| {
+                            record
+                                .workspace_root
+                                .as_deref()
+                                .map(workspace_root_compare_key)
+                                .as_deref()
+                                == Some(workspace_key.as_str())
+                        });
+                    }
+                    return Ok(records);
                 }
             }
             return Err(format!(
@@ -4821,7 +4860,34 @@ async fn list_session_records(
         }
     }
     // Local workspace: return only local store records.
-    state.session_store.lock().list()
+    let mut records = state.session_store.lock().list()?;
+    if let Some(ref workspace_key) = requested_workspace_key {
+        records.retain(|record| {
+            record
+                .workspace_root
+                .as_deref()
+                .map(workspace_root_compare_key)
+                .as_deref()
+                == Some(workspace_key.as_str())
+        });
+    }
+    Ok(records)
+}
+
+pub(crate) fn workspace_root_compare_key(root: &str) -> String {
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(remote) = parse_remote_path(trimmed) {
+        return remote.path;
+    }
+
+    let mut normalized = trimmed.replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
 }
 
 #[tauri::command]
@@ -6584,6 +6650,26 @@ mod tests {
         assert!(
             path_line.contains(':'),
             "PATH has no colon separators: {path_line}"
+        );
+    }
+
+    #[test]
+    fn workspace_root_compare_key_normalizes_trailing_slashes() {
+        assert_eq!(
+            workspace_root_compare_key("/Users/mike/Tyde/"),
+            "/Users/mike/Tyde"
+        );
+        assert_eq!(
+            workspace_root_compare_key("C:\\work\\repo\\"),
+            "C:/work/repo"
+        );
+    }
+
+    #[test]
+    fn workspace_root_compare_key_strips_remote_host_prefix() {
+        assert_eq!(
+            workspace_root_compare_key("ssh://alice@devbox/home/alice/work"),
+            "/home/alice/work"
         );
     }
 
