@@ -1413,7 +1413,17 @@ pub(crate) async fn materialize_remote_conversation(
         rx,
         state.agent_runtime.clone(),
         state.agent_runtime_notify.clone(),
-        Value::Null, // remote — server sends ConversationRegistered via replay
+        serde_json::json!({
+            "kind": "ConversationRegistered",
+            "data": {
+                "agent_id": serde_json::Value::Null,
+                "workspace_roots": normalized_workspace_roots,
+                "backend_kind": backend_kind.as_str(),
+                "name": "Conversation",
+                "parent_agent_id": serde_json::Value::Null,
+                "ui_owner_project_id": serde_json::Value::Null,
+            }
+        }),
         settings_tx,
         state.session_store.clone(),
         state.conversation_to_session.clone(),
@@ -2233,6 +2243,20 @@ async fn forward_events(
         }
         if let Err(e) = app.emit("chat-event", &reg_payload) {
             tracing::warn!("Failed to emit ConversationRegistered event: {e:?}");
+        }
+        if let Some(rc) = app.try_state::<remote_control::RemoteControlServer>() {
+            let entry = rc
+                .chat_buffer
+                .lock()
+                .push(conversation_id, reg_payload.event.clone());
+            let _ = rc.event_broadcast.send(protocol::ServerFrame::Event {
+                event: "chat-event".into(),
+                seq: Some(entry.seq),
+                payload: serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "event": reg_payload.event,
+                }),
+            });
         }
     }
 
