@@ -32,6 +32,10 @@ declare module "@tyde/protocol" {
       params: { conversationId: number };
       response: undefined;
     };
+    list_available_skills: {
+      params: { workspacePath?: string };
+      response: string[];
+    };
   }
 }
 
@@ -976,4 +980,8 @@ export function deleteAgentDefinition(
   workspacePath?: string,
 ) {
   return execute("delete_agent_definition", { id, scope, workspacePath });
+}
+
+export function listAvailableSkills(workspacePath?: string): Promise<string[]> {
+  return execute("list_available_skills", { workspacePath });
 }

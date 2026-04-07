@@ -1138,7 +1138,7 @@ pub async fn connect_tyde_server_with_progress(
     if !is_remote_tyde_server_running(host, &remote_socket_path).await? {
         let msg = format!(
             "Tyde server is not running on '{host}' (missing {remote_socket_path}). \
-Open Settings → Remote Server → Install & Manage to install/launch it, or \
+Open Settings → Remote Server → Remote Host to install/launch it, or \
 start Tyde on the remote host with '--headless' and retry."
         );
         emit_progress("checking_server", "failed", &msg);

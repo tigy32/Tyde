@@ -4401,6 +4401,7 @@ body {
   font-size: calc(var(--base-font-size) * 1.2857);
   font-weight: 600;
   margin: 0 0 18px;
+  padding-top: 4px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border-primary);
   letter-spacing: 0;
@@ -9553,7 +9554,7 @@ body {
 
 .settings-host-toolbar {
   margin: 8px 24px 0;
-  padding: 12px 0 10px;
+  padding: 12px 48px 10px 0;
   border-bottom: 1px solid
     color-mix(in srgb, var(--border-primary) 65%, transparent);
   display: flex;

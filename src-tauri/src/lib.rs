@@ -5913,8 +5913,21 @@ async fn delete_agent_definition(
 }
 
 #[tauri::command]
-async fn list_available_skills() -> Result<Vec<String>, String> {
-    skill_injection::list_available_skills()
+async fn list_available_skills(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    workspace_path: Option<String>,
+) -> Result<Vec<String>, String> {
+    match route_agent_definition_command(&app, state.inner(), workspace_path).await? {
+        AgentDefinitionRoute::Local => skill_injection::list_available_skills(),
+        AgentDefinitionRoute::TydeServer { connection, .. } => {
+            let response = connection
+                .invoke("list_available_skills", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(response)
+                .map_err(|e| format!("Failed to parse remote skills list: {e}"))
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import type { AgentDefinitionStore } from "./agent_defs/store";
 import type { AgentDefinitionEntry, AgentMcpServer } from "./agent_defs/types";
 import {
@@ -24,6 +23,7 @@ import {
   installBackendDependency as installBackendDependencyBridge,
   installRemoteTydeServer as installRemoteTydeServerBridge,
   launchRemoteTydeServer as launchRemoteTydeServerBridge,
+  listAvailableSkills as listAvailableSkillsBridge,
   listHosts as listHostsBridge,
   type McpHttpServerSettings,
   normalizeBackendKind,
@@ -3618,7 +3618,9 @@ export class SettingsPanel {
       let availableSkills: string[] = [];
       let loadError: string | null = null;
       try {
-        availableSkills = await invoke("list_available_skills");
+        availableSkills = await listAvailableSkillsBridge(
+          this.agentDefinitionStore?.contextWorkspacePath || undefined,
+        );
       } catch (err) {
         loadError = String(err);
         console.error("Failed to list available skills:", err);
@@ -3641,7 +3643,7 @@ export class SettingsPanel {
           el(
             "p",
             { class: "settings-description" },
-            "No skills found in ~/.tyde/skills/",
+            "No skills found in ~/.tyde/skills/ on the current host",
           ),
         );
       }
@@ -4020,13 +4022,13 @@ export class SettingsPanel {
   private buildRemoteTydeServerSection(): HTMLElement {
     const section = el("div", { class: "settings-section" });
     section.appendChild(
-      el("h3", { class: "settings-section-header" }, "Install & Manage"),
+      el("h3", { class: "settings-section-header" }, "Remote Host"),
     );
     section.appendChild(
       el(
         "p",
         { class: "settings-description" },
-        "Install, launch, and upgrade the Tyde server on the selected remote host.",
+        "Manage the Tyde server installed on the selected remote host.",
       ),
     );
 
@@ -4227,14 +4229,15 @@ export class SettingsPanel {
 
   private buildRemoteControlSection(): HTMLElement {
     const section = el("div", { class: "settings-section" });
+
     section.appendChild(
-      el("h3", { class: "settings-section-header" }, "SSH Remote Control"),
+      el("h3", { class: "settings-section-header" }, "Incoming Connections"),
     );
     section.appendChild(
       el(
         "p",
         { class: "settings-description" },
-        "Allow this Tyde instance to act as a server that remote Tyde clients can connect to over SSH.",
+        "Allow remote Tyde clients to connect to this instance over SSH.",
       ),
     );
 
@@ -4242,7 +4245,7 @@ export class SettingsPanel {
     const row = el("div", { class: "settings-toggle-row" });
     const labelCol = el("div", { class: "settings-toggle-label-col" });
     labelCol.appendChild(
-      el("label", { class: "settings-label" }, "Enable SSH Remote Control"),
+      el("label", { class: "settings-label" }, "Accept Connections"),
     );
 
     const statusText = this.remoteControlLoading

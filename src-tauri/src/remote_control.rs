@@ -983,6 +983,11 @@ async fn dispatch_invoke(
             Ok(serde_json::json!({"ok": true}))
         }
 
+        "list_available_skills" => {
+            let names = crate::skill_injection::list_available_skills()?;
+            serde_json::to_value(&names).map_err(|e| e.to_string())
+        }
+
         // Session-level commands forwarded to the backend via execute_conversation_command
         "get_settings" | "list_sessions" | "get_module_schemas" | "list_models"
         | "list_profiles" => {
