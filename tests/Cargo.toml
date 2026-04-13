@@ -1,0 +1,16 @@
+[package]
+name = "tests"
+edition.workspace = true
+
+[dependencies]
+client = { path = "../client" }
+protocol = { path = "../protocol" }
+server = { path = "../server" }
+paste = "1"
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

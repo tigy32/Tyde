@@ -1,0 +1,19 @@
+[package]
+name = "tauri-shell"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "tauri_shell"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+tauri = { version = "2.10.3", features = [] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+server = { path = "../../server" }

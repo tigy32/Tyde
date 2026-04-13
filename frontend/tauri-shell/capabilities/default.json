@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Default desktop shell capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

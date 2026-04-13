@@ -1,0 +1,627 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use protocol::{
+    Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
+    ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile, ProjectGitDiffHunk,
+    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
+    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+};
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
+
+use crate::store::project::ProjectStore;
+use crate::stream::Stream;
+
+const PROJECT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Default)]
+pub(crate) struct ProjectSnapshotState {
+    pub file_list: Option<Value>,
+    pub git_status: Option<Value>,
+}
+
+pub(crate) struct ProjectStreamSubscription {
+    pub task: JoinHandle<()>,
+    pub state: Arc<Mutex<ProjectSnapshotState>>,
+}
+
+pub(crate) fn spawn_project_subscription(
+    project_store: Arc<Mutex<ProjectStore>>,
+    project_id: ProjectId,
+    stream: Stream,
+    state: Arc<Mutex<ProjectSnapshotState>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let project = project_store
+                .lock()
+                .await
+                .get(&project_id)
+                .unwrap_or_else(|| {
+                    panic!("project {} disappeared while stream was active", project_id)
+                });
+
+            let file_list = build_file_list(&project)
+                .unwrap_or_else(|err| panic!("failed to build project file list: {err}"));
+            let git_status = build_git_status(&project)
+                .unwrap_or_else(|err| panic!("failed to build project git status: {err}"));
+
+            let file_json = serde_json::to_value(&file_list)
+                .expect("failed to serialize project file list snapshot");
+            let git_json = serde_json::to_value(&git_status)
+                .expect("failed to serialize project git status snapshot");
+
+            let mut snapshot = state.lock().await;
+            let file_changed = snapshot.file_list.as_ref() != Some(&file_json);
+            let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
+
+            if file_changed {
+                snapshot.file_list = Some(file_json.clone());
+                drop(snapshot);
+                if stream
+                    .send_value(protocol::FrameKind::ProjectFileList, file_json)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                snapshot = state.lock().await;
+            }
+
+            if git_changed {
+                snapshot.git_status = Some(git_json.clone());
+                drop(snapshot);
+                if stream
+                    .send_value(protocol::FrameKind::ProjectGitStatus, git_json)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            sleep(PROJECT_POLL_INTERVAL).await;
+        }
+    })
+}
+
+pub(crate) fn build_file_list(project: &Project) -> Result<ProjectFileListPayload, String> {
+    let mut roots = Vec::with_capacity(project.roots.len());
+
+    for root in &project.roots {
+        let root_path = Path::new(root);
+        let metadata = fs::metadata(root_path)
+            .map_err(|err| format!("Failed to stat project root '{}': {err}", root))?;
+        if !metadata.is_dir() {
+            return Err(format!("Project root '{}' is not a directory", root));
+        }
+
+        let mut entries = Vec::new();
+        collect_entries(root_path, root_path, &mut entries)?;
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
+        roots.push(ProjectRootListing {
+            root: ProjectRootPath(root.clone()),
+            entries,
+        });
+    }
+
+    Ok(ProjectFileListPayload { roots })
+}
+
+pub(crate) fn build_git_status(project: &Project) -> Result<ProjectGitStatusPayload, String> {
+    let mut roots = Vec::with_capacity(project.roots.len());
+
+    for root in &project.roots {
+        let output = run_git(root, &["status", "--porcelain=v2", "--branch"])?;
+        let mut branch = None;
+        let mut ahead = 0;
+        let mut behind = 0;
+        let mut files = BTreeMap::<String, ProjectGitFileStatus>::new();
+
+        for line in output.lines() {
+            if let Some(head) = line.strip_prefix("# branch.head ") {
+                if head != "(detached)" {
+                    branch = Some(head.to_owned());
+                }
+                continue;
+            }
+
+            if let Some(ab) = line.strip_prefix("# branch.ab ") {
+                let parts: Vec<&str> = ab.split_whitespace().collect();
+                assert_eq!(parts.len(), 2, "invalid branch.ab line: {}", line);
+                ahead = parts[0]
+                    .trim_start_matches('+')
+                    .parse()
+                    .unwrap_or_else(|err| panic!("invalid ahead count in '{}': {}", line, err));
+                behind = parts[1]
+                    .trim_start_matches('-')
+                    .parse()
+                    .unwrap_or_else(|err| panic!("invalid behind count in '{}': {}", line, err));
+                continue;
+            }
+
+            if let Some(path) = line.strip_prefix("? ") {
+                files.insert(
+                    path.to_owned(),
+                    ProjectGitFileStatus {
+                        relative_path: path.to_owned(),
+                        staged: None,
+                        unstaged: None,
+                        untracked: true,
+                    },
+                );
+                continue;
+            }
+
+            if line.starts_with("1 ") || line.starts_with("2 ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                assert!(parts.len() >= 9, "invalid porcelain status line '{}'", line);
+                let xy = parts[1];
+                assert_eq!(xy.len(), 2, "invalid XY status '{}'", xy);
+                let path = line
+                    .rsplit_once(' ')
+                    .map(|(_, path)| path)
+                    .unwrap_or_else(|| panic!("missing path in status line '{}'", line))
+                    .split('\t')
+                    .next()
+                    .unwrap_or_else(|| panic!("missing path segment in status line '{}'", line))
+                    .to_owned();
+                files.insert(
+                    path.clone(),
+                    ProjectGitFileStatus {
+                        relative_path: path,
+                        staged: parse_change_kind(xy.as_bytes()[0] as char),
+                        unstaged: parse_change_kind(xy.as_bytes()[1] as char),
+                        untracked: false,
+                    },
+                );
+            }
+        }
+
+        roots.push(ProjectRootGitStatus {
+            root: ProjectRootPath(root.clone()),
+            branch,
+            ahead,
+            behind,
+            clean: files.is_empty(),
+            files: files.into_values().collect(),
+        });
+    }
+
+    Ok(ProjectGitStatusPayload { roots })
+}
+
+pub(crate) fn read_file(
+    project: &Project,
+    payload: ProjectReadFilePayload,
+) -> Result<ProjectFileContentsPayload, String> {
+    validate_project_path(project, &payload.path)?;
+    let absolute = absolute_project_path(&payload.path)?;
+    let bytes = fs::read(&absolute)
+        .map_err(|err| format!("Failed to read file '{}': {err}", absolute.display()))?;
+    match String::from_utf8(bytes) {
+        Ok(contents) => Ok(ProjectFileContentsPayload {
+            path: payload.path,
+            contents: Some(contents),
+            is_binary: false,
+        }),
+        Err(_) => Ok(ProjectFileContentsPayload {
+            path: payload.path,
+            contents: None,
+            is_binary: true,
+        }),
+    }
+}
+
+pub(crate) fn read_diff(
+    project: &Project,
+    payload: ProjectReadDiffPayload,
+) -> Result<ProjectGitDiffPayload, String> {
+    validate_root(project, &payload.root)?;
+    if let Some(path) = &payload.path {
+        validate_relative_path(path)?;
+    }
+
+    let mut args = vec!["diff"];
+    if matches!(payload.scope, ProjectDiffScope::Staged) {
+        args.push("--cached");
+    }
+    if let Some(path) = &payload.path {
+        args.push("--");
+        args.push(path);
+    }
+
+    let raw = run_git(&payload.root.0, &args)?;
+    Ok(ProjectGitDiffPayload {
+        root: payload.root,
+        scope: payload.scope,
+        path: payload.path,
+        files: parse_git_diff(&raw),
+    })
+}
+
+pub(crate) fn stage_file(project: &Project, path: &ProjectPath) -> Result<(), String> {
+    validate_project_path(project, path)?;
+    run_git(&path.root.0, &["add", "--", &path.relative_path])?;
+    Ok(())
+}
+
+pub(crate) fn stage_hunk(
+    project: &Project,
+    path: &ProjectPath,
+    hunk_id: &str,
+) -> Result<(), String> {
+    validate_project_path(project, path)?;
+    assert!(
+        !hunk_id.trim().is_empty(),
+        "project_stage_hunk hunk_id must not be empty"
+    );
+
+    let raw = run_git(&path.root.0, &["diff", "--", &path.relative_path])?;
+    let parsed = parse_raw_git_diff(&raw);
+    let Some(file) = parsed
+        .iter()
+        .find(|file| file.relative_path == path.relative_path)
+    else {
+        return Err(format!(
+            "No unstaged diff exists for '{}'",
+            path.relative_path
+        ));
+    };
+
+    let Some((_, hunk)) = file
+        .hunks
+        .iter()
+        .enumerate()
+        .find(|(index, _)| build_hunk_id(&file.relative_path, *index) == hunk_id)
+    else {
+        return Err(format!(
+            "Unknown hunk id '{}' for '{}'",
+            hunk_id, path.relative_path
+        ));
+    };
+
+    let mut patch = String::new();
+    for line in &file.header_lines {
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    patch.push_str(&hunk.header);
+    patch.push('\n');
+    for line in &hunk.lines {
+        patch.push_str(line);
+        patch.push('\n');
+    }
+
+    run_git_with_stdin(
+        &path.root.0,
+        &["apply", "--cached", "--recount", "--whitespace=nowarn", "-"],
+        &patch,
+    )?;
+    Ok(())
+}
+
+pub(crate) async fn sync_snapshot_state(
+    state: &Arc<Mutex<ProjectSnapshotState>>,
+    file_list: &ProjectFileListPayload,
+    git_status: &ProjectGitStatusPayload,
+) {
+    let mut snapshot = state.lock().await;
+    snapshot.file_list = Some(
+        serde_json::to_value(file_list).expect("failed to serialize project file list snapshot"),
+    );
+    snapshot.git_status = Some(
+        serde_json::to_value(git_status).expect("failed to serialize project git status snapshot"),
+    );
+}
+
+fn collect_entries(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<ProjectFileEntry>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|err| format!("Failed to read directory '{}': {err}", current.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to iterate directory '{}': {err}", current.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        if file_name == ".git" {
+            continue;
+        }
+
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to stat path '{}': {err}", path.display()))?;
+        let relative_path = path
+            .strip_prefix(root)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to strip root prefix from '{}': {}",
+                    path.display(),
+                    err
+                )
+            })
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let kind = if metadata.file_type().is_symlink() {
+            ProjectFileKind::Symlink
+        } else if metadata.is_dir() {
+            ProjectFileKind::Directory
+        } else {
+            ProjectFileKind::File
+        };
+
+        out.push(ProjectFileEntry {
+            relative_path,
+            kind,
+        });
+
+        if metadata.is_dir() {
+            collect_entries(root, &path, out)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_root(project: &Project, root: &ProjectRootPath) -> Result<(), String> {
+    if project.roots.iter().any(|candidate| candidate == &root.0) {
+        return Ok(());
+    }
+    Err(format!(
+        "Root '{}' does not belong to project {}",
+        root, project.id
+    ))
+}
+
+fn validate_project_path(project: &Project, path: &ProjectPath) -> Result<(), String> {
+    validate_root(project, &path.root)?;
+    validate_relative_path(&path.relative_path)
+}
+
+fn validate_relative_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("relative path must not be empty".to_owned());
+    }
+
+    let relative = Path::new(path);
+    assert!(
+        relative.is_relative(),
+        "project relative path must be relative: {}",
+        path
+    );
+
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "project relative path must not contain '..': {}",
+                    path
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("project relative path must be relative: {}", path));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn absolute_project_path(path: &ProjectPath) -> Result<PathBuf, String> {
+    validate_relative_path(&path.relative_path)?;
+    Ok(Path::new(&path.root.0).join(&path.relative_path))
+}
+
+fn run_git(root: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {:?} failed in '{}': {}",
+            args,
+            root,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|err| format!("git output was not valid UTF-8 in '{}': {err}", root))
+}
+
+fn run_git_with_stdin(root: &str, args: &[&str], stdin: &str) -> Result<String, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Failed to start git in '{}': {err}", root))?;
+
+    use std::io::Write;
+    let mut stdin_pipe = child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("git stdin pipe missing for args {:?}", args));
+    stdin_pipe
+        .write_all(stdin.as_bytes())
+        .map_err(|err| format!("Failed to write git stdin in '{}': {err}", root))?;
+    drop(stdin_pipe);
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("Failed to wait for git in '{}': {err}", root))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {:?} failed in '{}': {}",
+            args,
+            root,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|err| format!("git output was not valid UTF-8 in '{}': {err}", root))
+}
+
+fn parse_change_kind(status: char) -> Option<ProjectGitChangeKind> {
+    match status {
+        '.' | ' ' => None,
+        'A' => Some(ProjectGitChangeKind::Added),
+        'M' => Some(ProjectGitChangeKind::Modified),
+        'D' => Some(ProjectGitChangeKind::Deleted),
+        'R' => Some(ProjectGitChangeKind::Renamed),
+        'C' => Some(ProjectGitChangeKind::Copied),
+        'T' => Some(ProjectGitChangeKind::TypeChanged),
+        other => panic!("unsupported git change kind '{}'", other),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedGitDiffFile {
+    relative_path: String,
+    header_lines: Vec<String>,
+    hunks: Vec<ParsedGitDiffHunk>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedGitDiffHunk {
+    header: String,
+    lines: Vec<String>,
+}
+
+fn parse_git_diff(raw: &str) -> Vec<ProjectGitDiffFile> {
+    parse_raw_git_diff(raw)
+        .into_iter()
+        .map(|file| {
+            let relative_path = file.relative_path.clone();
+            ProjectGitDiffFile {
+                relative_path: relative_path.clone(),
+                hunks: file
+                    .hunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, hunk)| ProjectGitDiffHunk {
+                        hunk_id: build_hunk_id(&relative_path, index),
+                        header: hunk.header,
+                        lines: hunk
+                            .lines
+                            .into_iter()
+                            .map(|line| ProjectGitDiffLine {
+                                kind: classify_diff_line(&line),
+                                text: line,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn parse_raw_git_diff(raw: &str) -> Vec<ParsedGitDiffFile> {
+    let mut files = Vec::new();
+    let mut current_file: Option<ParsedGitDiffFile> = None;
+    let mut current_hunk: Option<ParsedGitDiffHunk> = None;
+
+    for line in raw.lines() {
+        if let Some(diff_line) = line.strip_prefix("diff --git ") {
+            if let Some(hunk) = current_hunk.take() {
+                current_file
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("hunk appeared before file in git diff"))
+                    .hunks
+                    .push(hunk);
+            }
+            if let Some(file) = current_file.take() {
+                files.push(file);
+            }
+
+            let parts: Vec<&str> = diff_line.split_whitespace().collect();
+            assert_eq!(parts.len(), 2, "invalid diff header '{}'", line);
+            current_file = Some(ParsedGitDiffFile {
+                relative_path: parse_diff_path(parts[0], parts[1]),
+                header_lines: vec![line.to_owned()],
+                hunks: Vec::new(),
+            });
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            if let Some(hunk) = current_hunk.take() {
+                current_file
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("hunk appeared before file in git diff"))
+                    .hunks
+                    .push(hunk);
+            }
+            current_hunk = Some(ParsedGitDiffHunk {
+                header: line.to_owned(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(hunk) = current_hunk.as_mut() {
+            hunk.lines.push(line.to_owned());
+            continue;
+        }
+
+        if let Some(file) = current_file.as_mut() {
+            file.header_lines.push(line.to_owned());
+        }
+    }
+
+    if let Some(hunk) = current_hunk.take() {
+        current_file
+            .as_mut()
+            .unwrap_or_else(|| panic!("trailing hunk appeared before file in git diff"))
+            .hunks
+            .push(hunk);
+    }
+    if let Some(file) = current_file.take() {
+        files.push(file);
+    }
+
+    files
+}
+
+fn parse_diff_path(a_path: &str, b_path: &str) -> String {
+    if let Some(path) = b_path.strip_prefix("b/") {
+        if path != "dev/null" {
+            return path.to_owned();
+        }
+    }
+    a_path.strip_prefix("a/").unwrap_or(a_path).to_owned()
+}
+
+fn build_hunk_id(relative_path: &str, index: usize) -> String {
+    format!("{}::{}", relative_path, index)
+}
+
+fn classify_diff_line(line: &str) -> ProjectGitDiffLineKind {
+    match line.chars().next() {
+        Some('+') => ProjectGitDiffLineKind::Added,
+        Some('-') => ProjectGitDiffLineKind::Removed,
+        _ => ProjectGitDiffLineKind::Context,
+    }
+}

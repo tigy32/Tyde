@@ -1,0 +1,25 @@
+{
+  "productName": "Tyde",
+  "mainBinaryName": "tauri-shell",
+  "version": "0.1.0",
+  "identifier": "com.tyde.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:1420"
+  },
+  "bundle": {
+    "active": false
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tyde",
+        "width": 1280,
+        "height": 860,
+        "resizable": true
+      }
+    ]
+  }
+}

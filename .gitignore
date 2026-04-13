@@ -1,0 +1,14 @@
+/target
+/old
+/build
+
+# Frontend build artifacts
+frontend/dist/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~

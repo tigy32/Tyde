@@ -1,0 +1,12 @@
+[package]
+name = "protocol"
+edition.workspace = true
+
+[features]
+default = ["framing"]
+framing = ["dep:tokio"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, optional = true }
