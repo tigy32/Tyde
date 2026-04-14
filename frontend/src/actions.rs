@@ -49,7 +49,13 @@ pub fn spawn_new_chat(state: &AppState) {
         return;
     }
 
-    let backend_kind = state.default_backend.get_untracked();
+    let backend_kind = match state.host_settings.get_untracked() {
+        Some(settings) => settings.default_backend,
+        None => {
+            log::error!("spawn_new_chat: host settings not loaded");
+            return;
+        }
+    };
     let project_id = Some(project.id);
     let name = format!("Chat");
 

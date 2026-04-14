@@ -1,9 +1,13 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
+use crate::send::send_frame;
 use crate::state::AppState;
 
-use protocol::BackendKind;
+use protocol::{
+    BackendKind, DumpSettingsPayload, FrameKind, HostSettingValue, SetSettingPayload,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SettingsTab {
@@ -16,6 +20,13 @@ enum SettingsTab {
 pub fn SettingsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let active_tab = RwSignal::new(SettingsTab::Appearance);
+
+    let state_for_refresh = state.clone();
+    Effect::new(move |_| {
+        if state_for_refresh.settings_open.get() {
+            request_host_settings(&state_for_refresh);
+        }
+    });
 
     let on_close = move |_| {
         state.settings_open.set(false);
@@ -79,7 +90,6 @@ fn AppearanceTab() -> impl IntoView {
         let el: web_sys::HtmlInputElement = target.unchecked_into();
         if let Ok(v) = el.value().parse::<u32>() {
             state.font_size.set(v);
-            // Apply to CSS custom property
             if let Some(doc) = web_sys::window()
                 .and_then(|w| w.document())
                 .and_then(|d| d.document_element())
@@ -131,42 +141,7 @@ fn AppearanceTab() -> impl IntoView {
 
 #[component]
 fn GeneralTab() -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    let on_backend_change = move |ev: web_sys::Event| {
-        let target = ev.target().unwrap();
-        let el: web_sys::HtmlSelectElement = target.unchecked_into();
-        let backend = match el.value().as_str() {
-            "claude" => BackendKind::Claude,
-            "codex" => BackendKind::Codex,
-            "gemini" => BackendKind::Gemini,
-            _ => return,
-        };
-        state.default_backend.set(backend);
-    };
-
-    let current_backend_value = move || match state.default_backend.get() {
-        BackendKind::Claude => "claude",
-        BackendKind::Codex => "codex",
-        BackendKind::Gemini => "gemini",
-    };
-
     view! {
-        <div class="sp-section">
-            <h3 class="sp-section-title">"Default Backend"</h3>
-            <div class="sp-row">
-                <span class="sp-label">"Agent backend"</span>
-                <select
-                    class="sp-select"
-                    on:change=on_backend_change
-                    prop:value=current_backend_value
-                >
-                    <option value="claude">"Claude"</option>
-                    <option value="codex">"Codex"</option>
-                    <option value="gemini">"Gemini"</option>
-                </select>
-            </div>
-        </div>
         <div class="sp-section">
             <h3 class="sp-section-title">"Connection"</h3>
             <div class="sp-row">
@@ -180,60 +155,238 @@ fn GeneralTab() -> impl IntoView {
     }
 }
 
-#[derive(Clone)]
-struct BackendInfo {
-    name: &'static str,
-    kind: BackendKind,
-    description: &'static str,
-    enabled: bool,
-}
-
-const BACKENDS: &[BackendInfo] = &[
-    BackendInfo {
-        name: "Claude",
-        kind: BackendKind::Claude,
-        description: "Anthropic Claude — advanced reasoning and coding",
-        enabled: true,
-    },
-    BackendInfo {
-        name: "Codex",
-        kind: BackendKind::Codex,
-        description: "OpenAI Codex — code completion and generation",
-        enabled: true,
-    },
-    BackendInfo {
-        name: "Gemini",
-        kind: BackendKind::Gemini,
-        description: "Google Gemini — multimodal AI assistant",
-        enabled: true,
-    },
-];
-
 #[component]
 fn BackendsTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let default_backend_value = move || {
+        state
+            .host_settings
+            .get()
+            .map(|settings| backend_value(settings.default_backend).to_owned())
+            .unwrap_or_default()
+    };
+
     view! {
         <div class="sp-section">
-            <h3 class="sp-section-title">"Available Backends"</h3>
-            <div class="sp-backend-list">
-                {BACKENDS.iter().map(|b| {
-                    let badge_class = match b.kind {
-                        BackendKind::Claude => "backend-badge claude",
-                        BackendKind::Codex => "backend-badge codex",
-                        BackendKind::Gemini => "backend-badge gemini",
-                    };
-                    let status_class = if b.enabled { "sp-status-badge enabled" } else { "sp-status-badge disabled" };
-                    let status_text = if b.enabled { "Enabled" } else { "Disabled" };
+            <h3 class="sp-section-title">"Backend Settings"</h3>
+            {move || match state.host_settings.get() {
+                Some(settings) => {
+                    let state_for_default_backend_change = state.clone();
+                    let options = settings
+                        .enabled_backends
+                        .into_iter()
+                        .map(|backend| {
+                            view! {
+                                <option value=backend_value(backend)>{backend_label(backend)}</option>
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
                     view! {
-                        <div class="sp-backend-card">
-                            <div class="sp-backend-header">
-                                <span class=badge_class>{b.name}</span>
-                                <span class=status_class>{status_text}</span>
-                            </div>
-                            <p class="sp-backend-desc">{b.description}</p>
+                        <div class="sp-row">
+                            <span class="sp-label">"Default backend"</span>
+                            <select
+                                class="sp-select"
+                                prop:value=default_backend_value
+                                on:change=move |ev: web_sys::Event| {
+                                    let target = ev.target().unwrap();
+                                    let el: web_sys::HtmlSelectElement = target.unchecked_into();
+                                    let Some(default_backend) = parse_backend_kind(&el.value()) else {
+                                        log::error!("unknown backend value {}", el.value());
+                                        return;
+                                    };
+                                    send_host_setting(
+                                        &state_for_default_backend_change,
+                                        HostSettingValue::DefaultBackend { default_backend },
+                                    );
+                                }
+                            >
+                                {options}
+                            </select>
                         </div>
                     }
-                }).collect::<Vec<_>>()}
+                    .into_any()
+                }
+                None => view! { <div class="panel-empty">"Host settings not loaded"</div> }.into_any(),
+            }}
+            <div class="sp-backend-list">
+                {all_backends()
+                    .into_iter()
+                    .map(|kind| view! { <BackendCard kind /> })
+                    .collect::<Vec<_>>()}
             </div>
         </div>
+    }
+}
+
+#[component]
+fn BackendCard(kind: BackendKind) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let name = backend_label(kind);
+    let description = backend_description(kind);
+    let badge_class = backend_badge_class(kind);
+
+    let checked = move || {
+        state
+            .host_settings
+            .get()
+            .is_some_and(|settings| settings.enabled_backends.contains(&kind))
+    };
+    let disable_toggle = move || {
+        state.host_settings.get().is_none_or(|settings| {
+            settings.enabled_backends.len() == 1 && settings.enabled_backends.contains(&kind)
+        })
+    };
+    let status_class = move || {
+        if checked() {
+            "sp-status-badge enabled"
+        } else {
+            "sp-status-badge disabled"
+        }
+    };
+    let status_text = move || {
+        if checked() { "Enabled" } else { "Disabled" }
+    };
+
+    let on_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            let Some(settings) = state.host_settings.get_untracked() else {
+                log::error!("backend toggle requested before host settings loaded");
+                return;
+            };
+
+            let enabled_backends = all_backends()
+                .into_iter()
+                .filter(|candidate| {
+                    if *candidate == kind {
+                        input.checked()
+                    } else {
+                        settings.enabled_backends.contains(candidate)
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            send_host_setting(
+                &state,
+                HostSettingValue::EnabledBackends { enabled_backends },
+            );
+        }
+    };
+
+    view! {
+        <div class="sp-backend-card">
+            <div class="sp-backend-header">
+                <span class=badge_class>{name}</span>
+                <span class=status_class>{status_text}</span>
+            </div>
+            <p class="sp-backend-desc">{description}</p>
+            <label class="sp-checkbox-label">
+                <input
+                    type="checkbox"
+                    class="sp-checkbox"
+                    prop:checked=checked
+                    disabled=disable_toggle
+                    on:change=on_toggle
+                />
+                <span>"Enabled for this host"</span>
+            </label>
+        </div>
+    }
+}
+
+fn request_host_settings(state: &AppState) {
+    let Some(host_id) = state.host_id.get_untracked() else {
+        log::error!("request_host_settings: not connected");
+        return;
+    };
+    let Some(host_stream) = state.host_stream.get_untracked() else {
+        log::error!("request_host_settings: no host stream");
+        return;
+    };
+
+    spawn_local(async move {
+        if let Err(e) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::DumpSettings,
+            &DumpSettingsPayload {},
+        )
+        .await
+        {
+            log::error!("failed to send DumpSettings: {e}");
+        }
+    });
+}
+
+fn send_host_setting(state: &AppState, setting: HostSettingValue) {
+    let Some(host_id) = state.host_id.get_untracked() else {
+        log::error!("send_host_setting: not connected");
+        return;
+    };
+    let Some(host_stream) = state.host_stream.get_untracked() else {
+        log::error!("send_host_setting: no host stream");
+        return;
+    };
+
+    spawn_local(async move {
+        if let Err(e) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::SetSetting,
+            &SetSettingPayload { setting },
+        )
+        .await
+        {
+            log::error!("failed to send SetSetting: {e}");
+        }
+    });
+}
+
+fn all_backends() -> [BackendKind; 3] {
+    [BackendKind::Claude, BackendKind::Codex, BackendKind::Gemini]
+}
+
+fn parse_backend_kind(value: &str) -> Option<BackendKind> {
+    match value {
+        "claude" => Some(BackendKind::Claude),
+        "codex" => Some(BackendKind::Codex),
+        "gemini" => Some(BackendKind::Gemini),
+        _ => None,
+    }
+}
+
+fn backend_value(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Claude => "claude",
+        BackendKind::Codex => "codex",
+        BackendKind::Gemini => "gemini",
+    }
+}
+
+fn backend_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Claude => "Claude",
+        BackendKind::Codex => "Codex",
+        BackendKind::Gemini => "Gemini",
+    }
+}
+
+fn backend_description(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
+        BackendKind::Codex => "OpenAI Codex — code completion and generation",
+        BackendKind::Gemini => "Google Gemini — multimodal AI assistant",
+    }
+}
+
+fn backend_badge_class(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Claude => "backend-badge claude",
+        BackendKind::Codex => "backend-badge codex",
+        BackendKind::Gemini => "backend-badge gemini",
     }
 }

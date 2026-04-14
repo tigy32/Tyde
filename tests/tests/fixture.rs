@@ -22,7 +22,8 @@ impl Fixture {
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
-        let host = server::spawn_host_with_mock_backend(session_path, project_path)
+        let settings_path = session_store_dir.path().join("settings.json");
+        let host = server::spawn_host_with_mock_backend(session_path, project_path, settings_path)
             .expect("initialize host with mock backend");
         let client = connect_client(host.clone()).await;
 
@@ -43,6 +44,7 @@ impl Fixture {
         let host = server::spawn_host_with_mock_backend(
             self.session_store_path(),
             self.project_store_path(),
+            self.settings_store_path(),
         )
         .expect("initialize fresh host with existing stores");
         connect_client(host).await
@@ -54,6 +56,10 @@ impl Fixture {
 
     fn project_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("projects.json")
+    }
+
+    fn settings_store_path(&self) -> PathBuf {
+        self.session_store_dir.path().join("settings.json")
     }
 }
 

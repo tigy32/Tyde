@@ -38,8 +38,9 @@ impl RealBackendFixture {
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
+        let settings_path = session_store_dir.path().join("settings.json");
         // Real backends — NOT mock
-        let host = server::spawn_host_with_store_paths(session_path, project_path)
+        let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
             .expect("initialize host with real backends");
 
         let (client_stream, server_stream) = tokio::io::duplex(8192);

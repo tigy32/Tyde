@@ -33,6 +33,30 @@ pub fn ChatView() -> impl IntoView {
         map.get(&agent_id).cloned()
     };
 
+    let context_breakdown = move || {
+        let mut latest_breakdown = None;
+        for entry in messages().into_iter().rev() {
+            let is_assistant = matches!(
+                entry.message.sender,
+                protocol::MessageSender::Assistant { .. }
+            );
+            if !is_assistant {
+                continue;
+            }
+
+            if let Some(breakdown) = entry.message.context_breakdown.clone() {
+                latest_breakdown = Some(breakdown);
+                break;
+            }
+
+            if entry.message.tool_calls.is_empty() {
+                latest_breakdown = None;
+                break;
+            }
+        }
+        latest_breakdown
+    };
+
     let transient_events = move || {
         let agent_id = state.active_agent_id.get()?;
         let map = state.transient_events.get();
@@ -80,6 +104,14 @@ pub fn ChatView() -> impl IntoView {
                 <div class="chat-agent-header">
                     <span class="chat-agent-name">{agent_name}</span>
                 </div>
+                {move || {
+                    view! {
+                        <TaskListView
+                            task_list=task_list()
+                            context_breakdown=context_breakdown()
+                        />
+                    }
+                }}
                 <div class="chat-messages" node_ref=scroll_ref>
                     {move || {
                         messages().into_iter().map(|entry| {
@@ -105,10 +137,6 @@ pub fn ChatView() -> impl IntoView {
 
                     {move || {
                         streaming().map(|ss| view! { <ChatStreamingView streaming=ss /> })
-                    }}
-
-                    {move || {
-                        task_list().map(|tl| view! { <TaskListView task_list=tl /> })
                     }}
                 </div>
                 <ChatInput />

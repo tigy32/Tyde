@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use leptos::prelude::{Get, Set, Update};
 use protocol::{
     AgentErrorPayload, AgentId, AgentStartPayload, ChatEvent, Envelope, FrameKind,
-    NewAgentPayload, NewTerminalPayload, Project, ProjectFileContentsPayload,
+    HostSettingsPayload, NewAgentPayload, NewTerminalPayload, Project, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
     ProjectNotifyPayload, RejectPayload, SessionListPayload, StreamPath, TerminalErrorPayload,
     TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
@@ -71,6 +71,14 @@ pub fn dispatch_envelope(state: &AppState, envelope: Envelope) {
                         .connection_status
                         .set(ConnectionStatus::Error("rejected".into()));
                 }
+            }
+        }
+        FrameKind::HostSettings => {
+            match envelope.parse_payload::<HostSettingsPayload>() {
+                Ok(p) => {
+                    state.host_settings.set(Some(p.settings));
+                }
+                Err(e) => log::error!("failed to parse host_settings payload: {e}"),
             }
         }
         FrameKind::NewAgent => {

@@ -96,6 +96,8 @@ pub enum FrameKind {
     Reject,
 
     // Input events (client -> server)
+    DumpSettings,
+    SetSetting,
     SpawnAgent,
     ListSessions,
     SendMessage,
@@ -114,6 +116,7 @@ pub enum FrameKind {
     TerminalClose,
 
     // Output events (server -> client)
+    HostSettings,
     NewAgent,
     AgentStart,
     ChatEvent,
@@ -137,6 +140,8 @@ impl fmt::Display for FrameKind {
             Self::Hello => f.write_str("hello"),
             Self::Welcome => f.write_str("welcome"),
             Self::Reject => f.write_str("reject"),
+            Self::DumpSettings => f.write_str("dump_settings"),
+            Self::SetSetting => f.write_str("set_setting"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
             Self::SendMessage => f.write_str("send_message"),
@@ -153,6 +158,7 @@ impl fmt::Display for FrameKind {
             Self::TerminalSend => f.write_str("terminal_send"),
             Self::TerminalResize => f.write_str("terminal_resize"),
             Self::TerminalClose => f.write_str("terminal_close"),
+            Self::HostSettings => f.write_str("host_settings"),
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::ChatEvent => f.write_str("chat_event"),
@@ -217,6 +223,45 @@ pub struct WelcomePayload {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapData {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSettings {
+    pub enabled_backends: Vec<BackendKind>,
+    pub default_backend: BackendKind,
+}
+
+impl Default for HostSettings {
+    fn default() -> Self {
+        Self {
+            enabled_backends: vec![
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Gemini,
+            ],
+            default_backend: BackendKind::Claude,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpSettingsPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSettingPayload {
+    pub setting: HostSettingValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostSettingValue {
+    EnabledBackends { enabled_backends: Vec<BackendKind> },
+    DefaultBackend { default_backend: BackendKind },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSettingsPayload {
+    pub settings: HostSettings,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RejectPayload {

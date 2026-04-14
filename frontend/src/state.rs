@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use leptos::prelude::*;
 use protocol::{
-    AgentId, BackendKind, ChatMessage, ProjectDiffScope, ProjectFileEntry, ProjectGitDiffFile,
-    ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootPath, Project, SessionSummary,
-    StreamPath, TaskList, TerminalId, ToolExecutionCompletedData, ToolRequest,
+    AgentId, BackendKind, ChatMessage, HostSettings, Project, ProjectDiffScope, ProjectFileEntry,
+    ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootPath,
+    SessionSummary, StreamPath, TaskList, TerminalId, ToolExecutionCompletedData, ToolRequest,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +132,7 @@ pub struct AppState {
     pub adding_project: RwSignal<bool>,
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
-    pub default_backend: RwSignal<BackendKind>,
+    pub host_settings: RwSignal<Option<HostSettings>>,
     pub font_size: RwSignal<u32>,
 }
 
@@ -165,7 +165,7 @@ impl AppState {
             adding_project: RwSignal::new(false),
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
-            default_backend: RwSignal::new(BackendKind::Claude),
+            host_settings: RwSignal::new(None),
             font_size: RwSignal::new(14),
         }
     }

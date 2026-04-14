@@ -3,12 +3,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use protocol::{
-    AgentId, AgentStartPayload, FrameKind, NewAgentPayload, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectFileListPayload, ProjectGitStatusPayload,
-    ProjectId, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRefreshPayload, ProjectRenamePayload, ProjectRootPath, ProjectStageFilePayload,
-    ProjectStageHunkPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath, TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
+    AgentId, AgentStartPayload, FrameKind, HostSettingsPayload, NewAgentPayload,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectFileListPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
+    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, SessionId,
+    SessionListPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
     TerminalSendPayload,
 };
 use tokio::sync::Mutex;
@@ -22,6 +23,7 @@ use crate::project_stream::{
     read_file, spawn_project_subscription, stage_file, stage_hunk, sync_snapshot_state,
 };
 use crate::store::project::ProjectStore;
+use crate::store::settings::HostSettingsStore;
 use crate::store::session::SessionStore;
 use crate::stream::{Stream, StreamClosed};
 use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal};
@@ -33,6 +35,7 @@ struct HostSubscriber {
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
     pub project_store: Arc<Mutex<ProjectStore>>,
+    pub settings_store: Arc<Mutex<HostSettingsStore>>,
     pub session_store: Arc<Mutex<SessionStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pub use_mock_backend: bool,
@@ -62,6 +65,26 @@ impl HostHandle {
             "duplicate host stream registration for {}",
             host_path
         );
+
+        let settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .unwrap_or_else(|err| panic!("failed to load host settings for registration: {err}"));
+        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+            panic!(
+                "host stream {} disappeared during settings replay",
+                host_path
+            );
+        };
+        if emit_host_settings_for_subscriber(&settings, subscriber)
+            .await
+            .is_err()
+        {
+            state.host_streams.remove(&host_path);
+            return;
+        }
 
         let projects = state
             .project_store
@@ -361,6 +384,35 @@ impl HostHandle {
             .await;
     }
 
+    pub(crate) async fn dump_settings(&self, host_output_stream: &Stream) {
+        let settings = {
+            let state = self.state.lock().await;
+            state
+                .settings_store
+                .lock()
+                .await
+                .get()
+                .unwrap_or_else(|err| panic!("failed to load host settings: {err}"))
+        };
+
+        let payload = serde_json::to_value(HostSettingsPayload { settings })
+            .expect("failed to serialize HostSettings payload for host stream");
+        let _ = host_output_stream
+            .send_value(FrameKind::HostSettings, payload)
+            .await;
+    }
+
+    pub(crate) async fn set_setting(&self, payload: SetSettingPayload) {
+        let mut state = self.state.lock().await;
+        let settings = state
+            .settings_store
+            .lock()
+            .await
+            .apply(payload.setting)
+            .unwrap_or_else(|err| panic!("failed to apply host setting: {err}"));
+        fan_out_host_settings(&mut state, settings).await;
+    }
+
     pub(crate) async fn create_terminal(
         &self,
         connection_host_stream: &StreamPath,
@@ -621,44 +673,52 @@ pub fn spawn_host() -> HostHandle {
         .unwrap_or_else(|err| panic!("failed to resolve default session store path: {err}"));
     let project_path = ProjectStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default project store path: {err}"));
-    spawn_host_with_store_paths(session_path, project_path)
+    let settings_path = HostSettingsStore::default_path()
+        .unwrap_or_else(|err| panic!("failed to resolve default settings store path: {err}"));
+    spawn_host_with_store_paths(session_path, project_path, settings_path)
         .unwrap_or_else(|err| panic!("failed to initialize host stores: {err}"))
 }
 
 pub fn spawn_host_with_session_store(path: PathBuf) -> Result<HostHandle, String> {
-    let project_path = path
+    let parent = path
         .parent()
-        .ok_or_else(|| format!("Session store path has no parent: {}", path.display()))?
-        .join("projects.json");
-    spawn_host_with_store_paths(path, project_path)
+        .ok_or_else(|| format!("Session store path has no parent: {}", path.display()))?;
+    let project_path = parent.join("projects.json");
+    let settings_path = parent.join("settings.json");
+    spawn_host_with_store_paths(path, project_path, settings_path)
 }
 
 pub fn spawn_host_with_store_paths(
     session_path: PathBuf,
     project_path: PathBuf,
+    settings_path: PathBuf,
 ) -> Result<HostHandle, String> {
-    spawn_host_inner(session_path, project_path, false)
+    spawn_host_inner(session_path, project_path, settings_path, false)
 }
 
 /// Spawn a host that uses MockBackend for all agent spawns (for tests).
 pub fn spawn_host_with_mock_backend(
     session_path: PathBuf,
     project_path: PathBuf,
+    settings_path: PathBuf,
 ) -> Result<HostHandle, String> {
-    spawn_host_inner(session_path, project_path, true)
+    spawn_host_inner(session_path, project_path, settings_path, true)
 }
 
 fn spawn_host_inner(
     session_path: PathBuf,
     project_path: PathBuf,
+    settings_path: PathBuf,
     use_mock_backend: bool,
 ) -> Result<HostHandle, String> {
     let session_store = SessionStore::load(session_path)?;
     let project_store = ProjectStore::load(project_path)?;
+    let settings_store = HostSettingsStore::load(settings_path)?;
     Ok(HostHandle {
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
             project_store: Arc::new(Mutex::new(project_store)),
+            settings_store: Arc::new(Mutex::new(settings_store)),
             session_store: Arc::new(Mutex::new(session_store)),
             agent_sessions: HashMap::new(),
             use_mock_backend,
@@ -726,6 +786,27 @@ async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPay
     }
 }
 
+async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_host_settings_for_subscriber(&settings, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
 async fn emit_project_notify_for_subscriber(
     payload: &ProjectNotifyPayload,
     subscriber: &mut HostSubscriber,
@@ -735,6 +816,20 @@ async fn emit_project_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::ProjectNotify, payload)
+        .await
+}
+
+async fn emit_host_settings_for_subscriber(
+    settings: &protocol::HostSettings,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(HostSettingsPayload {
+        settings: settings.clone(),
+    })
+    .expect("failed to serialize HostSettings payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::HostSettings, payload)
         .await
 }
 

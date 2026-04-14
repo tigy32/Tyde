@@ -1,10 +1,11 @@
 use protocol::{
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, Envelope, FrameKind,
-    ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectId, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload,
-    ProjectRenamePayload, ProjectStageFilePayload, ProjectStageHunkPayload, SendMessagePayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload,
-    TerminalId, TerminalResizePayload, TerminalSendPayload,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, DumpSettingsPayload, Envelope,
+    FrameKind, ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectId, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRefreshPayload, ProjectRenamePayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, SendMessagePayload, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
+    TerminalResizePayload, TerminalSendPayload,
 };
 use uuid::Uuid;
 
@@ -19,6 +20,18 @@ pub(crate) async fn route_client_envelope(
 ) {
     if envelope.stream == *connection_host_stream {
         match envelope.kind {
+            FrameKind::DumpSettings => {
+                let _: DumpSettingsPayload = envelope
+                    .parse_payload()
+                    .expect("invalid dump_settings payload");
+                host.dump_settings(host_output_stream).await;
+            }
+            FrameKind::SetSetting => {
+                let payload: SetSettingPayload = envelope
+                    .parse_payload()
+                    .expect("invalid set_setting payload");
+                host.set_setting(payload).await;
+            }
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = envelope
                     .parse_payload()
