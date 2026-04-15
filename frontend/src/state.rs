@@ -16,14 +16,6 @@ pub enum ConnectionStatus {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AgentStatus {
-    Starting,
-    Running,
-    Completed,
-    Error(String),
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
     pub agent_id: AgentId,
     pub name: String,
@@ -33,7 +25,9 @@ pub struct AgentInfo {
     pub parent_agent_id: Option<AgentId>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
-    pub status: AgentStatus,
+    /// Set when a fatal `AgentError` arrives. The agent is terminated and no
+    /// further events will arrive on its stream.
+    pub fatal_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,8 +73,9 @@ pub struct DiffViewState {
 pub struct StreamingState {
     pub agent_name: String,
     pub model: Option<String>,
-    pub text: String,
-    pub reasoning: String,
+    pub text: ArcRwSignal<String>,
+    pub reasoning: ArcRwSignal<String>,
+    pub tool_requests: ArcRwSignal<Vec<ToolRequestEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,8 +95,15 @@ pub struct TerminalInfo {
 
 #[derive(Clone, Debug)]
 pub enum TransientEvent {
-    OperationCancelled { message: String },
-    RetryAttempt { attempt: u64, max_retries: u64, error: String, backoff_ms: u64 },
+    OperationCancelled {
+        message: String,
+    },
+    RetryAttempt {
+        attempt: u64,
+        max_retries: u64,
+        error: String,
+        backoff_ms: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -133,7 +135,12 @@ pub struct AppState {
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
     pub host_settings: RwSignal<Option<HostSettings>>,
+    pub agent_initializing: RwSignal<bool>,
+    pub agent_turn_active: RwSignal<HashMap<AgentId, bool>>,
+    pub draft_backend_override: RwSignal<Option<BackendKind>>,
     pub font_size: RwSignal<u32>,
+    pub theme: RwSignal<String>,
+    pub font_family: RwSignal<String>,
 }
 
 impl AppState {
@@ -153,7 +160,7 @@ impl AppState {
             task_lists: RwSignal::new(HashMap::new()),
             center_view: RwSignal::new(CenterView::Home),
             left_dock: RwSignal::new(DockVisibility::Visible),
-            right_dock: RwSignal::new(DockVisibility::Hidden),
+            right_dock: RwSignal::new(DockVisibility::Visible),
             bottom_dock: RwSignal::new(DockVisibility::Hidden),
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
@@ -166,7 +173,12 @@ impl AppState {
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
             host_settings: RwSignal::new(None),
-            font_size: RwSignal::new(14),
+            agent_initializing: RwSignal::new(false),
+            agent_turn_active: RwSignal::new(HashMap::new()),
+            draft_backend_override: RwSignal::new(None),
+            font_size: RwSignal::new(13),
+            theme: RwSignal::new("dark".to_owned()),
+            font_family: RwSignal::new("system".to_owned()),
         }
     }
 }

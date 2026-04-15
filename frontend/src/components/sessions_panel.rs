@@ -11,6 +11,8 @@ use crate::state::{AppState, ConnectionStatus};
 
 fn backend_class(kind: BackendKind) -> &'static str {
     match kind {
+        BackendKind::Tycode => "backend-badge tycode",
+        BackendKind::Kiro => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Gemini => "backend-badge gemini",
@@ -19,6 +21,8 @@ fn backend_class(kind: BackendKind) -> &'static str {
 
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Gemini => "Gemini",
@@ -41,15 +45,15 @@ fn last_path_component(path: &str) -> &str {
 }
 
 fn session_title(s: &SessionSummary) -> String {
-    if let Some(ref ua) = s.user_alias {
-        if !ua.is_empty() {
-            return ua.clone();
-        }
+    if let Some(ref ua) = s.user_alias
+        && !ua.is_empty()
+    {
+        return ua.clone();
     }
-    if let Some(ref a) = s.alias {
-        if !a.is_empty() {
-            return a.clone();
-        }
+    if let Some(ref a) = s.alias
+        && !a.is_empty()
+    {
+        return a.clone();
     }
     let id_str = s.id.0.clone();
     id_str.chars().take(50).collect()
@@ -65,9 +69,8 @@ pub fn SessionsPanel() -> impl IntoView {
     let search = RwSignal::new(String::new());
     let hide_child_sessions = RwSignal::new(false);
 
-    let is_connected = Memo::new(move |_| {
-        state.connection_status.get() == ConnectionStatus::Connected
-    });
+    let is_connected =
+        Memo::new(move |_| state.connection_status.get() == ConnectionStatus::Connected);
 
     let filtered_sessions = Memo::new(move |_| {
         let sessions = state.sessions.get();
@@ -86,7 +89,9 @@ pub fn SessionsPanel() -> impl IntoView {
                         .workspace_roots
                         .iter()
                         .any(|w| w.to_lowercase().contains(&query));
-                    let backend_match = backend_label(s.backend_kind).to_lowercase().contains(&query);
+                    let backend_match = backend_label(s.backend_kind)
+                        .to_lowercase()
+                        .contains(&query);
                     if !title.contains(&query) && !workspace_match && !backend_match {
                         return false;
                     }
@@ -111,17 +116,11 @@ pub fn SessionsPanel() -> impl IntoView {
         spawn_local(async move {
             let host_id = state.host_id.get();
             let host_stream = state.host_stream.get();
-            if let (Some(hid), Some(hs)) = (host_id, host_stream) {
-                if let Err(e) = send_frame(
-                    &hid,
-                    hs,
-                    FrameKind::ListSessions,
-                    &ListSessionsPayload {},
-                )
-                .await
-                {
-                    log::error!("failed to send ListSessions: {e}");
-                }
+            if let (Some(hid), Some(hs)) = (host_id, host_stream)
+                && let Err(e) =
+                    send_frame(&hid, hs, FrameKind::ListSessions, &ListSessionsPayload {}).await
+            {
+                log::error!("failed to send ListSessions: {e}");
             }
         });
     };
@@ -213,9 +212,7 @@ fn session_card(
                         prompt: None,
                     },
                 };
-                if let Err(e) =
-                    send_frame(&hid, hs, FrameKind::SpawnAgent, &payload).await
-                {
+                if let Err(e) = send_frame(&hid, hs, FrameKind::SpawnAgent, &payload).await {
                     log::error!("failed to send SpawnAgent (resume): {e}");
                 }
             }

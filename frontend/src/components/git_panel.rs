@@ -5,9 +5,9 @@ use crate::send::send_frame;
 use crate::state::{AppState, CenterView};
 
 use protocol::{
-    FrameKind, ProjectDiffScope, ProjectGitChangeKind, ProjectGitFileStatus,
-    ProjectReadDiffPayload, ProjectRefreshPayload, ProjectRootGitStatus,
-    ProjectRootPath, ProjectStageFilePayload, ProjectPath, StreamPath,
+    FrameKind, ProjectDiffScope, ProjectGitChangeKind, ProjectGitFileStatus, ProjectPath,
+    ProjectReadDiffPayload, ProjectRefreshPayload, ProjectRootGitStatus, ProjectRootPath,
+    ProjectStageFilePayload, StreamPath,
 };
 
 #[component]
@@ -83,12 +83,7 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
         .filter(|f| f.unstaged.is_some() && !f.untracked)
         .cloned()
         .collect();
-    let untracked: Vec<_> = root
-        .files
-        .iter()
-        .filter(|f| f.untracked)
-        .cloned()
-        .collect();
+    let untracked: Vec<_> = root.files.iter().filter(|f| f.untracked).cloned().collect();
 
     let root_path = root.root.clone();
     let staged_expanded = RwSignal::new(true);

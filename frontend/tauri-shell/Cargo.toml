@@ -11,6 +11,8 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
+devtools-protocol = { path = "../../devtools-protocol" }
+serde_json.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tauri = { version = "2.10.3", features = [] }

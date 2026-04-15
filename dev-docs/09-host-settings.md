@@ -58,7 +58,7 @@ Host settings are strongly typed in `protocol/src/types.rs`.
 ```rust
 pub struct HostSettings {
     pub enabled_backends: Vec<BackendKind>,
-    pub default_backend: BackendKind,
+    pub default_backend: Option<BackendKind>,
 }
 ```
 
@@ -85,7 +85,7 @@ pub struct SetSettingPayload {
 
 pub enum HostSettingValue {
     EnabledBackends { enabled_backends: Vec<BackendKind> },
-    DefaultBackend { default_backend: BackendKind },
+    DefaultBackend { default_backend: Option<BackendKind> },
 }
 ```
 
@@ -147,24 +147,21 @@ previous frontend state.
 
 The server enforces:
 
-- `enabled_backends` must not be empty
-- `default_backend` must be present in `enabled_backends`
+- `enabled_backends` may be empty
+- if `default_backend` is set, it must be present in `enabled_backends`
 
 Normalization rules:
 
 - backend lists are canonicalized in fixed enum order
 - duplicate/unknown values are not preserved
-- if persisted data is missing or invalid, defaults are normalized to a valid
-  snapshot
+- if the store file is missing, the server returns an empty settings snapshot
+- invalid persisted settings fail load instead of being silently repaired
 
-Defaults for this slice:
-
-- enabled: `claude`, `codex`, `gemini`
-- default: `claude`
+There is no protocol-level backend default in this slice.
 
 If `enabled_backends` is changed such that the current `default_backend` is no
-longer enabled, the host automatically selects the first enabled backend as the
-new default and emits that updated snapshot.
+longer enabled, the host clears `default_backend` to `null` and emits that
+updated snapshot.
 
 ---
 
@@ -183,8 +180,8 @@ Current store shape:
 ```json
 {
   "settings": {
-    "enabled_backends": ["claude", "codex", "gemini"],
-    "default_backend": "claude"
+    "enabled_backends": [],
+    "default_backend": null
   }
 }
 ```
@@ -245,8 +242,7 @@ stream. The Backends tab renders from `host_settings` and sends typed
 ### Runtime Behavior
 
 `spawn_new_chat` reads `host_settings.default_backend` when creating a new
-agent. This is the first place where host settings directly affect runtime
-behavior in the rewrite.
+agent. If no default is configured, the frontend does not invent one.
 
 That is the intended direction: settings should affect runtime via server-owned
 state, not isolated frontend preferences.

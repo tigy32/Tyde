@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 
 use leptos::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::open_file;
+use crate::send::send_frame;
 use crate::state::AppState;
 
-use protocol::{ProjectFileEntry, ProjectFileKind};
+use protocol::{
+    FrameKind, ProjectFileEntry, ProjectFileKind, ProjectListDirPayload, ProjectRootPath,
+    StreamPath,
+};
 
 /// A node in the file tree built from the flat entry list.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,7 +69,9 @@ fn build_tree(entries: &[ProjectFileEntry]) -> Vec<TreeNode> {
         nodes.sort_by(|a, b| {
             let a_dir = matches!(a.kind, ProjectFileKind::Directory);
             let b_dir = matches!(b.kind, ProjectFileKind::Directory);
-            b_dir.cmp(&a_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            b_dir
+                .cmp(&a_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         nodes
     }
@@ -166,6 +173,38 @@ pub fn FileExplorer() -> impl IntoView {
     }
 }
 
+/// Send a ProjectListDir request so the server returns 2 levels of entries under `dir_path`.
+fn request_dir_listing(state: &AppState, dir_relative_path: &str) {
+    let host_id = match state.host_id.get_untracked() {
+        Some(id) => id,
+        None => return,
+    };
+    let project_id = match state.active_project_id.get_untracked() {
+        Some(pid) => pid,
+        None => return,
+    };
+    let root = {
+        let projects = state.projects.get_untracked();
+        match projects.iter().find(|p| p.id == project_id) {
+            Some(p) => match p.roots.first() {
+                Some(r) => ProjectRootPath(r.clone()),
+                None => return,
+            },
+            None => return,
+        }
+    };
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let payload = ProjectListDirPayload {
+        root,
+        path: dir_relative_path.to_owned(),
+    };
+    spawn_local(async move {
+        if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectListDir, &payload).await {
+            log::error!("failed to send ProjectListDir: {e}");
+        }
+    });
+}
+
 fn render_nodes(
     nodes: Vec<TreeNode>,
     depth: usize,
@@ -192,8 +231,9 @@ fn render_nodes(
             match node.kind {
                 ProjectFileKind::Directory => {
                     let name = node.name.clone();
+                    let dir_path = node.relative_path.clone();
                     let children = node.children.clone();
-                    let expanded = RwSignal::new(depth == 0);
+                    let expanded = RwSignal::new(false);
                     let filter_owned = filter.to_owned();
 
                     view! {
@@ -201,7 +241,17 @@ fn render_nodes(
                             <button
                                 class="fe-item fe-dir"
                                 style=format!("padding-left: {}px", indent + 4)
-                                on:click=move |_| expanded.update(|v| *v = !*v)
+                                on:click={
+                                    let dir_path = dir_path.clone();
+                                    move |_| {
+                                        let opening = !expanded.get_untracked();
+                                        expanded.set(opening);
+                                        if opening {
+                                            let state = expect_context::<AppState>();
+                                            request_dir_listing(&state, &dir_path);
+                                        }
+                                    }
+                                }
                             >
                                 <span class="fe-chevron">{move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
                                 <span class="fe-icon fe-folder-icon">{move || if expanded.get() { "\u{1f4c2}" } else { "\u{1f4c1}" }}</span>

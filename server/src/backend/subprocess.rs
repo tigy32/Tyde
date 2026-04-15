@@ -180,10 +180,10 @@ impl Drop for SubprocessBridge {
             );
             return;
         };
-        if let Some(child) = guard.as_mut() {
-            if let Err(err) = child.start_kill() {
-                tracing::warn!("SubprocessBridge::drop: failed to kill child: {err}");
-            }
+        if let Some(child) = guard.as_mut()
+            && let Err(err) = child.start_kill()
+        {
+            tracing::warn!("SubprocessBridge::drop: failed to kill child: {err}");
         }
     }
 }

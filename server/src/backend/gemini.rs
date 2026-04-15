@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, from_str, json, to_value};
 use tokio::io::AsyncBufReadExt;
@@ -108,6 +108,7 @@ impl GeminiSession {
             state: Mutex::new(GeminiState {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
+                session_id: None,
                 model: None,
                 permission_mode: None,
                 steering_content: steering_content
@@ -141,6 +142,7 @@ struct ActiveTurn {
 struct GeminiState {
     workspace_root: String,
     ssh_host: Option<String>,
+    session_id: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     steering_content: Option<String>,
@@ -157,6 +159,7 @@ struct GeminiInner {
 struct GeminiStdoutSummary {
     streamed_text: String,
     streamed_reasoning: String,
+    session_id: Option<String>,
     model: Option<String>,
     usage: Option<Value>,
     errors: Vec<String>,
@@ -260,8 +263,28 @@ impl GeminiInner {
                 }));
                 Ok(())
             }
-            SessionCommand::ResumeSession { session_id: _ } => Ok(()),
-            SessionCommand::DeleteSession { session_id: _ } => Ok(()),
+            SessionCommand::ResumeSession { session_id } => {
+                let normalized = normalize_optional_string(&Value::String(session_id))
+                    .ok_or("Invalid session id")?;
+                {
+                    let mut state = this.state.lock().await;
+                    state.session_id = Some(normalized.clone());
+                }
+                this.emit_event(json!({
+                    "kind": "SessionStarted",
+                    "data": { "session_id": normalized }
+                }));
+                Ok(())
+            }
+            SessionCommand::DeleteSession { session_id } => {
+                let normalized = normalize_optional_string(&Value::String(session_id))
+                    .ok_or("Invalid session id")?;
+                let mut state = this.state.lock().await;
+                if state.session_id.as_deref() == Some(normalized.as_str()) {
+                    state.session_id = None;
+                }
+                Ok(())
+            }
             SessionCommand::ListProfiles => {
                 this.emit_event(json!({
                     "kind": "ProfilesList",
@@ -290,6 +313,7 @@ impl GeminiInner {
             turn_id,
             workspace_root,
             ssh_host,
+            session_id,
             model,
             permission_mode,
             steering_content,
@@ -313,6 +337,7 @@ impl GeminiInner {
                 turn_id,
                 state.workspace_root.clone(),
                 state.ssh_host.clone(),
+                state.session_id.clone(),
                 state.model.clone(),
                 state.permission_mode.clone(),
                 state.steering_content.clone(),
@@ -332,6 +357,7 @@ impl GeminiInner {
                     &workspace_root,
                     ssh_host.as_deref(),
                     &message,
+                    session_id,
                     model,
                     permission_mode.as_deref(),
                     steering_content.as_deref(),
@@ -342,6 +368,13 @@ impl GeminiInner {
 
             match outcome {
                 TurnOutcome::Completed { mut summary } => {
+                    if let Some(session_id) = summary.session_id.clone() {
+                        self.set_session_id(turn_id, session_id.clone()).await;
+                        self.emit_event(json!({
+                            "kind": "SessionStarted",
+                            "data": { "session_id": session_id }
+                        }));
+                    }
                     if !self.emit_summary_and_tool_requests(&mut summary) {
                         let error = summary
                             .error_message()
@@ -350,6 +383,9 @@ impl GeminiInner {
                     }
                 }
                 TurnOutcome::Cancelled { mut summary } => {
+                    if let Some(session_id) = summary.session_id.clone() {
+                        self.set_session_id(turn_id, session_id).await;
+                    }
                     self.emit_summary_and_tool_requests(&mut summary);
                     self.emit_operation_cancelled("Gemini turn cancelled.");
                 }
@@ -371,6 +407,7 @@ impl GeminiInner {
         workspace_root: &str,
         ssh_host: Option<&str>,
         prompt: &str,
+        session_id: Option<String>,
         model: Option<String>,
         _permission_mode: Option<&str>,
         steering_content: Option<&str>,
@@ -394,22 +431,26 @@ impl GeminiInner {
             cli_args.push("--model".to_string());
             cli_args.push(model_name.to_string());
         }
+        if let Some(session_id) = session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            cli_args.push("--resume".to_string());
+            cli_args.push(session_id.to_string());
+        }
 
         // Gemini CLI reads MCP config from {workspace_root}/.gemini/settings.json.
         // Inject startup MCP servers by writing that file, restoring original after.
         let mcp_settings_json = build_gemini_settings_json(startup_mcp_servers);
         let mut mcp_cleanup: Option<GeminiMcpCleanup> = None;
 
-        if let Some(ref json) = mcp_settings_json {
-            if ssh_host.is_none() {
-                match inject_gemini_mcp_settings(workspace_root, json) {
-                    Ok(cleanup) => mcp_cleanup = Some(cleanup),
-                    Err(err) => {
-                        return TurnOutcome::Failed {
-                            summary: GeminiStdoutSummary::default(),
-                            error: format!("Failed to write Gemini MCP settings: {err}"),
-                        };
-                    }
+        if let Some(ref json) = mcp_settings_json
+            && ssh_host.is_none()
+        {
+            match inject_gemini_mcp_settings(workspace_root, json) {
+                Ok(cleanup) => mcp_cleanup = Some(cleanup),
+                Err(err) => {
+                    return TurnOutcome::Failed {
+                        summary: GeminiStdoutSummary::default(),
+                        error: format!("Failed to write Gemini MCP settings: {err}"),
+                    };
                 }
             }
         }
@@ -576,6 +617,17 @@ impl GeminiInner {
         };
         if let Some(cancel_tx) = cancel_tx {
             let _ = cancel_tx.send(());
+        }
+    }
+
+    async fn set_session_id(&self, turn_id: u64, session_id: String) {
+        let mut state = self.state.lock().await;
+        if state
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.id == turn_id)
+        {
+            state.session_id = Some(session_id);
         }
     }
 
@@ -850,6 +902,21 @@ fn consume_gemini_event(
     base_message_id: &str,
     current_message_id: &mut String,
 ) {
+    if let Some(session_id) = value
+        .get("session_id")
+        .or_else(|| value.get("sessionId"))
+        .and_then(Value::as_str)
+    {
+        let is_new_session = summary.session_id.as_deref() != Some(session_id);
+        summary.session_id = Some(session_id.to_string());
+        if is_new_session {
+            inner.emit_event(json!({
+                "kind": "SessionStarted",
+                "data": { "session_id": session_id }
+            }));
+        }
+    }
+
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -941,6 +1008,13 @@ fn consume_gemini_event(
             summary.errors.push(message);
         }
         "result" => {
+            if let Some(session_id) = value
+                .get("session_id")
+                .or_else(|| value.get("sessionId"))
+                .and_then(Value::as_str)
+            {
+                summary.session_id = Some(session_id.to_string());
+            }
             if let Some(usage) = value.get("stats").and_then(|v| parse_gemini_usage(Some(v))) {
                 summary.usage = Some(usage);
             }
@@ -1464,20 +1538,21 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
 // Backend trait implementation
 // ===========================================================================
 
-use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SpawnCostHint, StreamEndData,
-    StreamStartData, StreamTextDeltaData,
+use protocol::{AgentInput, ChatEvent, ChatMessage, MessageSender, SessionId, SpawnCostHint};
+
+use super::{
+    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
 };
 
-use super::{Backend, BackendSpawnConfig, EventStream};
-
 const EVENT_BUFFER: usize = 256;
+const GEMINI_SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
+
+type GeminiReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<SessionId, String>>>>>;
 
 pub struct GeminiBackend {
-    /// Each `send` spawns a new gemini process, so we just need the events_tx
-    /// to feed new turn output into the same EventStream.
-    events_tx: mpsc::Sender<ChatEvent>,
-    model: Option<String>,
+    input_tx: mpsc::Sender<AgentInput>,
+    interrupt_tx: mpsc::Sender<()>,
+    session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
 fn gemini_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
@@ -1489,167 +1564,365 @@ fn gemini_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str
     }
 }
 
-impl Backend for GeminiBackend {
-    async fn spawn(
-        _workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-    ) -> Result<(Self, EventStream), String> {
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
-        let model = gemini_backend_model(config.cost_hint).map(str::to_string);
-        Ok((Self { events_tx, model }, EventStream::new(events_rx)))
-    }
-
-    async fn send(&self, input: AgentInput) -> bool {
-        match input {
-            AgentInput::SendMessage(payload) => {
-                let tx = self.events_tx.clone();
-                let model = self.model.clone();
-                tokio::spawn(async move {
-                    run_gemini_turn(&tx, &payload.message, model.as_deref()).await;
-                });
-                true
-            }
-        }
-    }
-}
-
-/// Spawn a single `gemini` CLI process for one turn, read its stream-json
-/// stdout, and emit ChatEvents through `tx`.
-async fn run_gemini_turn(tx: &mpsc::Sender<ChatEvent>, prompt: &str, model: Option<&str>) {
-    let turn_id = GEMINI_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let message_id = format!("gemini-msg-{turn_id}");
-
-    // Emit StreamStart
-    if tx
-        .send(ChatEvent::StreamStart(StreamStartData {
-            message_id: Some(message_id.clone()),
-            agent: GEMINI_AGENT_NAME.to_owned(),
-            model: model.map(str::to_string),
-        }))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let mut cmd = Command::new("gemini");
-    cmd.arg("-y")
-        .arg("-p")
-        .arg(prompt)
-        .arg("--output-format")
-        .arg("stream-json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    if let Some(model_name) = model {
-        cmd.arg("--model").arg(model_name);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            tracing::error!("Failed to spawn gemini CLI: {err:?}");
-            // Emit an empty StreamEnd so the receiver knows the turn is done.
-            let _ = tx
-                .send(ChatEvent::StreamEnd(StreamEndData {
-                    message: make_error_message(&format!("Failed to start gemini: {err}")),
-                }))
-                .await;
-            return;
-        }
-    };
-
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => return,
-    };
-
-    let mut accumulated_text = String::new();
-    let mut model: Option<String> = None;
-    let mut lines = BufReader::new(stdout).lines();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let value: Value = match from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let event_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        match event_type {
-            "init" => {
-                if let Some(m) = value.get("model").and_then(Value::as_str) {
-                    model = Some(m.to_string());
-                }
-            }
-            "message" => {
-                let role = value.get("role").and_then(Value::as_str).unwrap_or("");
-                if role == "user" {
-                    continue;
-                }
-                if let Some(text) = value
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                {
-                    accumulated_text.push_str(text);
-                    if tx
-                        .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                            message_id: Some(message_id.clone()),
-                            text: text.to_string(),
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Wait for the child to finish.
-    let _ = child.wait().await;
-
-    // Emit StreamEnd with the full accumulated message.
-    let _ = tx
-        .send(ChatEvent::StreamEnd(StreamEndData {
-            message: ChatMessage {
-                timestamp: unix_now_ms(),
-                sender: MessageSender::Assistant {
-                    agent: GEMINI_AGENT_NAME.to_owned(),
-                },
-                content: accumulated_text,
-                reasoning: None,
-                tool_calls: Vec::new(),
-                model_info: model.map(|m| ModelInfo { model: m }),
-                token_usage: None,
-                context_breakdown: None,
-                images: None,
-            },
-        }))
-        .await;
-}
-
-fn make_error_message(error: &str) -> ChatMessage {
-    ChatMessage {
+fn backend_error_message(content: String) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
         timestamp: unix_now_ms(),
         sender: MessageSender::Error,
-        content: error.to_string(),
+        content,
         reasoning: None,
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
         context_breakdown: None,
         images: None,
+    })
+}
+
+async fn forward_gemini_backend_event(
+    raw: Value,
+    events_tx: &mpsc::Sender<ChatEvent>,
+    session_id_sink: &Arc<std::sync::Mutex<Option<SessionId>>>,
+    ready_tx: Option<&GeminiReadyTx>,
+) -> bool {
+    if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
+        return events_tx.send(event).await.is_ok();
+    }
+
+    match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+        "SessionStarted" => {
+            if let Some(session_id) = raw
+                .get("data")
+                .and_then(|data| data.get("session_id"))
+                .and_then(Value::as_str)
+            {
+                let session = SessionId(session_id.to_string());
+                *session_id_sink
+                    .lock()
+                    .expect("gemini session_id mutex poisoned") = Some(session.clone());
+                if let Some(ready_tx) = ready_tx {
+                    let mut ready_tx = ready_tx.lock().await;
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Ok(session));
+                    }
+                }
+            }
+        }
+        "Error" => {
+            let message = raw
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("Gemini backend error")
+                .to_string();
+            if events_tx
+                .send(backend_error_message(message.clone()))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        _ => {}
+    }
+
+    true
+}
+
+impl Backend for GeminiBackend {
+    async fn spawn(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), String> {
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(EVENT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(EVENT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let session_id_task = Arc::clone(&session_id);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
+
+        tokio::spawn(async move {
+            let roots = if workspace_roots.is_empty() {
+                vec!["/tmp".to_string()]
+            } else {
+                workspace_roots
+            };
+            let (session, mut raw_events) = match GeminiSession::spawn(&roots, None, &[], None)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Gemini session: {err}");
+                    let _ = ready_tx.send(Err(format!("Failed to spawn Gemini session: {err}")));
+                    return;
+                }
+            };
+
+            let handle = session.command_handle();
+            let model_override = gemini_backend_model(config.cost_hint).map(str::to_string);
+            if model_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure Gemini session: {err}");
+                    let _ =
+                        ready_tx.send(Err(format!("Failed to configure Gemini session: {err}")));
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
+            let ready_tx: GeminiReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
+            let ready_tx_forward = Arc::clone(&ready_tx);
+            let session_id_forward = Arc::clone(&session_id_task);
+            let events_tx_forward = events_tx.clone();
+            let forward_task = tokio::spawn(async move {
+                while let Some(raw) = raw_events.recv().await {
+                    if !forward_gemini_backend_event(
+                        raw,
+                        &events_tx_forward,
+                        &session_id_forward,
+                        Some(&ready_tx_forward),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                let mut ready_tx = ready_tx_forward.lock().await;
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(
+                        "Gemini session ended before reporting a session_id".to_string()
+                    ));
+                }
+            });
+
+            if let Err(err) = handle
+                .execute(SessionCommand::SendMessage {
+                    message: initial_input.message,
+                    images: protocol_images_to_attachments(initial_input.images),
+                })
+                .await
+            {
+                tracing::error!("Failed to send initial Gemini prompt: {err}");
+                let mut ready_tx = ready_tx.lock().await;
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!("Failed to send initial Gemini prompt: {err}")));
+                }
+                session.shutdown().await;
+                let _ = forward_task.await;
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = input_rx.recv() => {
+                        let Some(input) = incoming else {
+                            break;
+                        };
+                        let AgentInput::SendMessage(payload) = input;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message: payload.message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send Gemini follow-up: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else {
+                            break;
+                        };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt Gemini turn: {err}");
+                            break;
+                        }
+                        if events_tx
+                            .send(ChatEvent::OperationCancelled(
+                                protocol::OperationCancelledData {
+                                    message: "Gemini turn cancelled.".to_string(),
+                                },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+            let _ = forward_task.await;
+        });
+
+        match tokio::time::timeout(GEMINI_SPAWN_TIMEOUT, ready_rx).await {
+            Ok(Ok(Ok(session))) => {
+                *session_id.lock().expect("gemini session_id mutex poisoned") = Some(session);
+            }
+            Ok(Ok(Err(err))) => return Err(err),
+            Ok(Err(_)) => {
+                return Err("Gemini spawn initialization task ended early".to_string());
+            }
+            Err(_) => return Err("Timed out waiting for Gemini session_id".to_string()),
+        }
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: SessionId,
+    ) -> Result<(Self, EventStream), String> {
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(EVENT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(EVENT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
+        let roots = if workspace_roots.is_empty() {
+            vec!["/tmp".to_string()]
+        } else {
+            workspace_roots
+        };
+        let backend_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
+        let backend_session_id_task = Arc::clone(&backend_session_id);
+
+        tokio::spawn(async move {
+            let (session, mut raw_events) =
+                match GeminiSession::spawn(&roots, None, &[], None).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Gemini resume session: {err}");
+                        return;
+                    }
+                };
+
+            let handle = session.command_handle();
+            let model_override = gemini_backend_model(config.cost_hint).map(str::to_string);
+            if model_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure resumed Gemini session: {err}");
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
+            if let Err(err) = handle
+                .execute(SessionCommand::ResumeSession {
+                    session_id: session_id.0,
+                })
+                .await
+            {
+                tracing::error!("Failed to resume Gemini session: {err}");
+                session.shutdown().await;
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if !forward_gemini_backend_event(raw, &events_tx, &backend_session_id_task, None).await {
+                            break;
+                        }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else {
+                            break;
+                        };
+                        let AgentInput::SendMessage(payload) = input;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message: payload.message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send Gemini resume follow-up: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else {
+                            break;
+                        };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt resumed Gemini turn: {err}");
+                            break;
+                        }
+                        if events_tx
+                            .send(ChatEvent::OperationCancelled(
+                                protocol::OperationCancelledData {
+                                    message: "Gemini turn cancelled.".to_string(),
+                                },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id: backend_session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+        Err("GeminiBackend::list_sessions is not supported without workspace context".to_string())
+    }
+
+    async fn send(&self, input: AgentInput) -> bool {
+        self.input_tx.send(input).await.is_ok()
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.session_id
+            .lock()
+            .expect("gemini session_id mutex poisoned")
+            .clone()
+            .expect("gemini session_id not initialized")
+    }
+
+    async fn interrupt(&self) -> bool {
+        self.interrupt_tx.send(()).await.is_ok()
     }
 }

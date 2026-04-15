@@ -1,0 +1,11 @@
+{
+  "name": "tyde2",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "tauri": "cargo tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

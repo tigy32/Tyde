@@ -5,9 +5,108 @@ use wasm_bindgen_futures::spawn_local;
 use crate::send::send_frame;
 use crate::state::AppState;
 
-use protocol::{
-    BackendKind, DumpSettingsPayload, FrameKind, HostSettingValue, SetSettingPayload,
-};
+use protocol::{BackendKind, DumpSettingsPayload, FrameKind, HostSettingValue, SetSettingPayload};
+
+const STORAGE_THEME: &str = "tyde-theme";
+const STORAGE_FONT_SIZE: &str = "tyde-font-size";
+const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
+
+const FONT_FAMILIES: &[(&str, &str, &str)] = &[
+    (
+        "system",
+        "System Default",
+        "system-ui, -apple-system, sans-serif",
+    ),
+    (
+        "mono",
+        "Monospace",
+        "\"Cascadia Code\", \"Fira Code\", Consolas, monospace",
+    ),
+    ("inter", "Inter", "\"Inter\", system-ui, sans-serif"),
+    (
+        "sf",
+        "SF Pro",
+        "\"-apple-system\", \"SF Pro Text\", system-ui, sans-serif",
+    ),
+];
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
+}
+
+fn document_element() -> Option<web_sys::HtmlElement> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .map(|el| {
+            let el: web_sys::HtmlElement = el.unchecked_into();
+            el
+        })
+}
+
+/// Apply theme to the DOM and persist to localStorage.
+fn apply_theme(theme: &str) {
+    if let Some(el) = document_element() {
+        let _ = el.set_attribute("data-theme", theme);
+    }
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_THEME, theme);
+    }
+}
+
+/// Apply font size to the DOM and persist to localStorage.
+fn apply_font_size(size: u32) {
+    if let Some(el) = document_element() {
+        let _ = el
+            .style()
+            .set_property("--base-font-size", &format!("{size}px"));
+    }
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_FONT_SIZE, &size.to_string());
+    }
+}
+
+/// Apply font family to the DOM and persist to localStorage.
+fn apply_font_family(key: &str) {
+    let css_value = FONT_FAMILIES
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, _, css)| *css)
+        .unwrap_or("system-ui, -apple-system, sans-serif");
+
+    if let Some(el) = document_element() {
+        let _ = el.style().set_property("--font-sans", css_value);
+    }
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_FONT_FAMILY, key);
+    }
+}
+
+/// Restore appearance settings from localStorage into AppState and apply to DOM.
+/// Called once at startup.
+pub fn restore_appearance(state: &AppState) {
+    let storage = match local_storage() {
+        Some(s) => s,
+        None => return,
+    };
+
+    if let Ok(Some(theme)) = storage.get_item(STORAGE_THEME) {
+        apply_theme(&theme);
+        state.theme.set(theme);
+    }
+
+    if let Ok(Some(size_str)) = storage.get_item(STORAGE_FONT_SIZE)
+        && let Ok(size) = size_str.parse::<u32>()
+    {
+        apply_font_size(size);
+        state.font_size.set(size);
+    }
+
+    if let Ok(Some(family)) = storage.get_item(STORAGE_FONT_FAMILY) {
+        apply_font_family(&family);
+        state.font_family.set(family);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SettingsTab {
@@ -16,10 +115,77 @@ enum SettingsTab {
     Backends,
 }
 
+impl SettingsTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::General => "General",
+            Self::Backends => "Backends",
+        }
+    }
+
+    /// All searchable text for this tab: labels, descriptions, option names.
+    fn search_text(self) -> &'static [&'static str] {
+        match self {
+            Self::Appearance => &[
+                "Appearance",
+                "Color Theme",
+                "Choose the color scheme for the interface",
+                "Dark",
+                "Light",
+                "System",
+                "Font Size",
+                "Adjust the base font size used throughout the interface",
+                "Font Family",
+                "Select the font family for UI text",
+                "Monospace",
+            ],
+            Self::General => &[
+                "General",
+                "Auto-connect on Launch",
+                "Automatically connect to the host server when the application starts",
+                "Connection",
+            ],
+            Self::Backends => &[
+                "Backends",
+                "Default Backend",
+                "The backend to use by default when creating new agents",
+                "Enabled Backends",
+                "Toggle which backends are available for creating agents",
+                "Tycode",
+                "Kiro",
+                "Claude",
+                "Codex",
+                "Gemini",
+                "Anthropic",
+                "OpenAI",
+                "Google",
+            ],
+        }
+    }
+
+    fn matches_query(self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let q = query.to_lowercase();
+        self.search_text()
+            .iter()
+            .any(|text| text.to_lowercase().contains(&q))
+    }
+}
+
+const ALL_TABS: [SettingsTab; 3] = [
+    SettingsTab::Appearance,
+    SettingsTab::General,
+    SettingsTab::Backends,
+];
+
 #[component]
 pub fn SettingsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let active_tab = RwSignal::new(SettingsTab::Appearance);
+    let search_query = RwSignal::new(String::new());
 
     let state_for_refresh = state.clone();
     Effect::new(move |_| {
@@ -32,48 +198,60 @@ pub fn SettingsPanel() -> impl IntoView {
         state.settings_open.set(false);
     };
 
-    let on_backdrop = move |_| {
-        state.settings_open.set(false);
-    };
-
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.key() == "Escape" {
-            ev.prevent_default();
-            state.settings_open.set(false);
-        }
+    let on_search = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let el: web_sys::HtmlInputElement = target.unchecked_into();
+        search_query.set(el.value());
     };
 
     view! {
         <Show when=move || state.settings_open.get()>
-            <div class="sp-overlay" on:click=on_backdrop on:keydown=on_keydown>
-                <div class="sp-panel" on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()>
-                    <div class="sp-header">
-                        <span class="sp-title">"Settings"</span>
-                        <button class="sp-close" on:click=on_close title="Close">"×"</button>
-                    </div>
-                    <div class="sp-tabs">
-                        <button
-                            class="sp-tab"
-                            class:active=move || active_tab.get() == SettingsTab::Appearance
-                            on:click=move |_| active_tab.set(SettingsTab::Appearance)
-                        >"Appearance"</button>
-                        <button
-                            class="sp-tab"
-                            class:active=move || active_tab.get() == SettingsTab::General
-                            on:click=move |_| active_tab.set(SettingsTab::General)
-                        >"General"</button>
-                        <button
-                            class="sp-tab"
-                            class:active=move || active_tab.get() == SettingsTab::Backends
-                            on:click=move |_| active_tab.set(SettingsTab::Backends)
-                        >"Backends"</button>
-                    </div>
-                    <div class="sp-content">
-                        {move || match active_tab.get() {
-                            SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
-                            SettingsTab::General => view! { <GeneralTab /> }.into_any(),
-                            SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
-                        }}
+            <div class="settings-overlay">
+                <div class="settings-root">
+                    <button class="settings-close-btn" on:click=on_close title="Close settings">"×"</button>
+
+                    <div class="settings-layout">
+                        <nav class="settings-nav">
+                            <div class="settings-search-wrap">
+                                <input
+                                    class="settings-search-input"
+                                    type="text"
+                                    placeholder="Search settings..."
+                                    prop:value=move || search_query.get()
+                                    on:input=on_search
+                                />
+                            </div>
+                            <div class="settings-nav-group">
+                                <div class="settings-nav-group-title">"Settings"</div>
+                                <div class="settings-nav-group-items">
+                                    {ALL_TABS.map(|tab| {
+                                        let is_active = move || active_tab.get() == tab;
+                                        let matches_search = move || {
+                                            tab.matches_query(&search_query.get())
+                                        };
+                                        view! {
+                                            <Show when=matches_search>
+                                                <button
+                                                    class="settings-nav-item"
+                                                    class:active=is_active
+                                                    on:click=move |_| active_tab.set(tab)
+                                                >
+                                                    {tab.label()}
+                                                </button>
+                                            </Show>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            </div>
+                        </nav>
+
+                        <div class="settings-content">
+                            {move || match active_tab.get() {
+                                SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
+                                SettingsTab::General => view! { <GeneralTab /> }.into_any(),
+                                SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
+                            }}
+                        </div>
                     </div>
                 </div>
             </div>
@@ -85,56 +263,80 @@ pub fn SettingsPanel() -> impl IntoView {
 fn AppearanceTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
+    let set_theme = move |theme: &'static str| {
+        move |_| {
+            state.theme.set(theme.to_owned());
+            apply_theme(theme);
+        }
+    };
+
+    let theme_class = move |target: &'static str| {
+        move || {
+            if state.theme.get() == target {
+                "segment active"
+            } else {
+                "segment"
+            }
+        }
+    };
+
     let on_font_size = move |ev: web_sys::Event| {
         let target = ev.target().unwrap();
         let el: web_sys::HtmlInputElement = target.unchecked_into();
         if let Ok(v) = el.value().parse::<u32>() {
             state.font_size.set(v);
-            if let Some(doc) = web_sys::window()
-                .and_then(|w| w.document())
-                .and_then(|d| d.document_element())
-            {
-                let style: web_sys::HtmlElement = doc.unchecked_into();
-                let _ = style.style().set_property("--base-font-size", &format!("{v}px"));
-            }
+            apply_font_size(v);
         }
     };
 
+    let on_font_family = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let el: web_sys::HtmlSelectElement = target.unchecked_into();
+        let key = el.value();
+        state.font_family.set(key.clone());
+        apply_font_family(&key);
+    };
+
     view! {
-        <div class="sp-section">
-            <h3 class="sp-section-title">"Theme"</h3>
-            <div class="sp-row">
-                <span class="sp-label">"Color theme"</span>
-                <div class="sp-toggle-group">
-                    <button class="sp-toggle active">"Dark"</button>
-                    <button class="sp-toggle" disabled=true title="Not yet available">"Light"</button>
-                    <button class="sp-toggle" disabled=true title="Not yet available">"System"</button>
-                </div>
+        <h2 class="settings-panel-title">"Appearance"</h2>
+
+        <div class="settings-field">
+            <label class="settings-label">"Color Theme"</label>
+            <p class="settings-description">"Choose the color scheme for the interface."</p>
+            <div class="settings-segmented-control">
+                <button class=theme_class("dark") on:click=set_theme("dark")>"Dark"</button>
+                <button class=theme_class("light") on:click=set_theme("light")>"Light"</button>
             </div>
         </div>
-        <div class="sp-section">
-            <h3 class="sp-section-title">"Font"</h3>
-            <div class="sp-row">
-                <span class="sp-label">"Font size"</span>
-                <div class="sp-slider-group">
-                    <input
-                        type="range"
-                        class="sp-slider"
-                        min="11"
-                        max="20"
-                        prop:value=move || state.font_size.get().to_string()
-                        on:input=on_font_size
-                    />
-                    <span class="sp-slider-value">{move || format!("{}px", state.font_size.get())}</span>
-                </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Font Size"</label>
+            <p class="settings-description">"Adjust the base font size used throughout the interface."</p>
+            <div class="settings-inline-control">
+                <input
+                    type="range"
+                    class="settings-slider"
+                    min="11"
+                    max="20"
+                    prop:value=move || state.font_size.get().to_string()
+                    on:input=on_font_size
+                />
+                <span class="settings-slider-value">{move || format!("{}px", state.font_size.get())}</span>
             </div>
-            <div class="sp-row">
-                <span class="sp-label">"Font family"</span>
-                <select class="sp-select" disabled=true>
-                    <option>"System"</option>
-                    <option>"Monospace"</option>
-                </select>
-            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Font Family"</label>
+            <p class="settings-description">"Select the font family for UI text."</p>
+            <select
+                class="settings-select"
+                prop:value=move || state.font_family.get()
+                on:change=on_font_family
+            >
+                {FONT_FAMILIES.iter().map(|(key, label, _)| {
+                    view! { <option value=*key>{*label}</option> }
+                }).collect::<Vec<_>>()}
+            </select>
         </div>
     }
 }
@@ -142,13 +344,17 @@ fn AppearanceTab() -> impl IntoView {
 #[component]
 fn GeneralTab() -> impl IntoView {
     view! {
-        <div class="sp-section">
-            <h3 class="sp-section-title">"Connection"</h3>
-            <div class="sp-row">
-                <span class="sp-label">"Auto-connect on launch"</span>
-                <label class="sp-checkbox-label">
-                    <input type="checkbox" class="sp-checkbox" checked=true disabled=true />
-                    <span>"Enabled"</span>
+        <h2 class="settings-panel-title">"General"</h2>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Auto-connect on Launch"</label>
+                    <p class="settings-description">"Automatically connect to the host server when the application starts."</p>
+                </div>
+                <label class="settings-toggle">
+                    <input type="checkbox" checked=true disabled=true />
+                    <span class="settings-toggle-slider"></span>
                 </label>
             </div>
         </div>
@@ -163,16 +369,21 @@ fn BackendsTab() -> impl IntoView {
         state
             .host_settings
             .get()
-            .map(|settings| backend_value(settings.default_backend).to_owned())
-            .unwrap_or_default()
+            .and_then(|settings| settings.default_backend.map(backend_value))
+            .unwrap_or("")
+            .to_owned()
     };
 
     view! {
-        <div class="sp-section">
-            <h3 class="sp-section-title">"Backend Settings"</h3>
+        <h2 class="settings-panel-title">"Backends"</h2>
+
+        <div class="settings-field">
+            <label class="settings-label">"Default Backend"</label>
+            <p class="settings-description">"The backend to use by default when creating new agents."</p>
             {move || match state.host_settings.get() {
                 Some(settings) => {
-                    let state_for_default_backend_change = state.clone();
+                    let state_for_change = state.clone();
+                    let has_enabled = !settings.enabled_backends.is_empty();
                     let options = settings
                         .enabled_backends
                         .into_iter()
@@ -184,33 +395,42 @@ fn BackendsTab() -> impl IntoView {
                         .collect::<Vec<_>>();
 
                     view! {
-                        <div class="sp-row">
-                            <span class="sp-label">"Default backend"</span>
-                            <select
-                                class="sp-select"
-                                prop:value=default_backend_value
-                                on:change=move |ev: web_sys::Event| {
-                                    let target = ev.target().unwrap();
-                                    let el: web_sys::HtmlSelectElement = target.unchecked_into();
-                                    let Some(default_backend) = parse_backend_kind(&el.value()) else {
+                        <select
+                            class="settings-select"
+                            prop:value=default_backend_value
+                            disabled=!has_enabled
+                            on:change=move |ev: web_sys::Event| {
+                                let target = ev.target().unwrap();
+                                let el: web_sys::HtmlSelectElement = target.unchecked_into();
+                                let default_backend = if el.value().is_empty() {
+                                    None
+                                } else {
+                                    let Some(kind) = parse_backend_kind(&el.value()) else {
                                         log::error!("unknown backend value {}", el.value());
                                         return;
                                     };
-                                    send_host_setting(
-                                        &state_for_default_backend_change,
-                                        HostSettingValue::DefaultBackend { default_backend },
-                                    );
-                                }
-                            >
-                                {options}
-                            </select>
-                        </div>
+                                    Some(kind)
+                                };
+                                send_host_setting(
+                                    &state_for_change,
+                                    HostSettingValue::DefaultBackend { default_backend },
+                                );
+                            }
+                        >
+                            <option value="">"No default backend"</option>
+                            {options}
+                        </select>
                     }
                     .into_any()
                 }
-                None => view! { <div class="panel-empty">"Host settings not loaded"</div> }.into_any(),
+                None => view! { <p class="settings-description">"Host settings not loaded."</p> }.into_any(),
             }}
-            <div class="sp-backend-list">
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Enabled Backends"</label>
+            <p class="settings-description">"Toggle which backends are available for creating agents."</p>
+            <div class="settings-backend-list">
                 {all_backends()
                     .into_iter()
                     .map(|kind| view! { <BackendCard kind /> })
@@ -233,21 +453,7 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
             .get()
             .is_some_and(|settings| settings.enabled_backends.contains(&kind))
     };
-    let disable_toggle = move || {
-        state.host_settings.get().is_none_or(|settings| {
-            settings.enabled_backends.len() == 1 && settings.enabled_backends.contains(&kind)
-        })
-    };
-    let status_class = move || {
-        if checked() {
-            "sp-status-badge enabled"
-        } else {
-            "sp-status-badge disabled"
-        }
-    };
-    let status_text = move || {
-        if checked() { "Enabled" } else { "Disabled" }
-    };
+    let disable_toggle = move || state.host_settings.get().is_none();
 
     let on_toggle = {
         let state = state.clone();
@@ -278,22 +484,20 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
     };
 
     view! {
-        <div class="sp-backend-card">
-            <div class="sp-backend-header">
+        <div class="settings-backend-card">
+            <div class="settings-backend-header">
                 <span class=badge_class>{name}</span>
-                <span class=status_class>{status_text}</span>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=checked
+                        disabled=disable_toggle
+                        on:change=on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
             </div>
-            <p class="sp-backend-desc">{description}</p>
-            <label class="sp-checkbox-label">
-                <input
-                    type="checkbox"
-                    class="sp-checkbox"
-                    prop:checked=checked
-                    disabled=disable_toggle
-                    on:change=on_toggle
-                />
-                <span>"Enabled for this host"</span>
-            </label>
+            <p class="settings-backend-desc">{description}</p>
         </div>
     }
 }
@@ -346,12 +550,20 @@ fn send_host_setting(state: &AppState, setting: HostSettingValue) {
     });
 }
 
-fn all_backends() -> [BackendKind; 3] {
-    [BackendKind::Claude, BackendKind::Codex, BackendKind::Gemini]
+fn all_backends() -> [BackendKind; 5] {
+    [
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Gemini,
+    ]
 }
 
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     match value {
+        "tycode" => Some(BackendKind::Tycode),
+        "kiro" => Some(BackendKind::Kiro),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "gemini" => Some(BackendKind::Gemini),
@@ -361,6 +573,8 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
 
 fn backend_value(kind: BackendKind) -> &'static str {
     match kind {
+        BackendKind::Tycode => "tycode",
+        BackendKind::Kiro => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Gemini => "gemini",
@@ -369,6 +583,8 @@ fn backend_value(kind: BackendKind) -> &'static str {
 
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Gemini => "Gemini",
@@ -377,6 +593,8 @@ fn backend_label(kind: BackendKind) -> &'static str {
 
 fn backend_description(kind: BackendKind) -> &'static str {
     match kind {
+        BackendKind::Tycode => "Tycode subprocess backend",
+        BackendKind::Kiro => "Kiro ACP backend",
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
         BackendKind::Gemini => "Google Gemini — multimodal AI assistant",
@@ -385,6 +603,8 @@ fn backend_description(kind: BackendKind) -> &'static str {
 
 fn backend_badge_class(kind: BackendKind) -> &'static str {
     match kind {
+        BackendKind::Tycode => "backend-badge tycode",
+        BackendKind::Kiro => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Gemini => "backend-badge gemini",

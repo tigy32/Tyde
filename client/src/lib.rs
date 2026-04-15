@@ -4,11 +4,14 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
+mod runtime;
+
 use protocol::{
     AgentErrorPayload, AgentId, AgentStartPayload, Envelope, FrameError, FrameKind, HelloPayload,
-    ListSessionsPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    HostSettingsPayload, InterruptPayload, ListSessionsPayload, NewAgentPayload,
+    NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
     ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload,
     ProjectRenamePayload, ProjectStageFilePayload, ProjectStageHunkPayload, RejectPayload,
     SendMessagePayload, SeqValidator, SessionListPayload, SpawnAgentPayload, StreamPath,
@@ -21,6 +24,13 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+pub use runtime::{
+    AgentCommands, AgentEndpoint, AgentEvent, AgentEvents, ClientError, HostCommands, HostEndpoint,
+    HostEvent, HostEvents, ProjectCommands, ProjectEndpoint, ProjectEvent, ProjectEvents,
+    TerminalCommands, TerminalEndpoint, TerminalEvent, TerminalEvents, connect_host_endpoint,
+    connect_uds_host_endpoint,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -47,6 +57,14 @@ pub struct Connection {
     pub writer: Box<dyn AsyncWrite + Unpin + Send>,
     pub incoming_seq: SeqValidator,
     pub outgoing_seq: HashMap<StreamPath, u64>,
+}
+
+pub(crate) struct ConnectedParts {
+    pub(crate) reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    pub(crate) writer: Box<dyn AsyncWrite + Unpin + Send>,
+    pub(crate) incoming_seq: SeqValidator,
+    pub(crate) outgoing_seq: HashMap<StreamPath, u64>,
+    pub(crate) host_stream: StreamPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -181,6 +199,15 @@ impl Connection {
             .await
     }
 
+    pub async fn project_list_dir(
+        &mut self,
+        project_id: &ProjectId,
+        payload: ProjectListDirPayload,
+    ) -> Result<(), FrameError> {
+        self.send_project_payload(project_id, FrameKind::ProjectListDir, &payload)
+            .await
+    }
+
     pub async fn terminal_create(
         &mut self,
         payload: TerminalCreatePayload,
@@ -221,7 +248,22 @@ impl Connection {
         stream: &StreamPath,
         message: String,
     ) -> Result<(), FrameError> {
-        self.send_message_stream(&Stream::from_path(stream.clone()), message)
+        self.send_message_payload(
+            stream,
+            SendMessagePayload {
+                message,
+                images: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn send_message_payload(
+        &mut self,
+        stream: &StreamPath,
+        payload: SendMessagePayload,
+    ) -> Result<(), FrameError> {
+        self.send_message_stream_payload(&Stream::from_path(stream.clone()), payload)
             .await
     }
 
@@ -230,7 +272,21 @@ impl Connection {
         stream: &Stream,
         message: String,
     ) -> Result<(), FrameError> {
-        let payload = SendMessagePayload { message };
+        self.send_message_stream_payload(
+            stream,
+            SendMessagePayload {
+                message,
+                images: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn send_message_stream_payload(
+        &mut self,
+        stream: &Stream,
+        payload: SendMessagePayload,
+    ) -> Result<(), FrameError> {
         let seq = self
             .outgoing_seq
             .get(stream.path())
@@ -238,6 +294,25 @@ impl Connection {
             .expect("send_message on unknown stream — AgentStart must be received first");
         let envelope =
             Envelope::from_payload(stream.path().clone(), FrameKind::SendMessage, seq, &payload)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.path().clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn interrupt(&mut self, stream: &StreamPath) -> Result<(), FrameError> {
+        self.interrupt_stream(&Stream::from_path(stream.clone()))
+            .await
+    }
+
+    pub async fn interrupt_stream(&mut self, stream: &Stream) -> Result<(), FrameError> {
+        let payload = InterruptPayload::default();
+        let seq = self
+            .outgoing_seq
+            .get(stream.path())
+            .copied()
+            .expect("interrupt on unknown stream — AgentStart must be received first");
+        let envelope =
+            Envelope::from_payload(stream.path().clone(), FrameKind::Interrupt, seq, &payload)
                 .map_err(FrameError::Json)?;
         self.outgoing_seq.insert(stream.path().clone(), seq + 1);
         write_envelope(&mut self.writer, &envelope).await
@@ -291,6 +366,10 @@ impl Connection {
                 }
                 FrameKind::ProjectNotify => {
                     let _: ProjectNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::HostSettings => {
+                    let _: HostSettingsPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 other => {
@@ -352,11 +431,9 @@ impl Connection {
                 }
             }
         } else if envelope.stream.0.starts_with("/project/") {
-            assert!(
-                self.outgoing_seq.contains_key(&envelope.stream),
-                "server emitted project event on unknown stream {}",
-                envelope.stream
-            );
+            // The server proactively pushes project file list and git status
+            // when projects are created, so the stream may not have been
+            // initiated by the client yet.
             match envelope.kind {
                 FrameKind::ProjectFileList => {
                     let _: ProjectFileListPayload =
@@ -515,11 +592,11 @@ impl Connection {
 }
 
 #[derive(Debug)]
-struct AgentStreamParts {
+pub(crate) struct AgentStreamParts {
     agent_id: AgentId,
 }
 
-fn parse_agent_stream(stream: &StreamPath) -> AgentStreamParts {
+pub(crate) fn parse_agent_stream(stream: &StreamPath) -> AgentStreamParts {
     let segments: Vec<&str> = stream.0.split('/').collect();
     assert_eq!(
         segments.len(),
@@ -557,11 +634,11 @@ fn parse_agent_stream(stream: &StreamPath) -> AgentStreamParts {
 }
 
 #[derive(Debug)]
-struct TerminalStreamParts {
+pub(crate) struct TerminalStreamParts {
     terminal_id: TerminalId,
 }
 
-fn parse_terminal_stream(stream: &StreamPath) -> TerminalStreamParts {
+pub(crate) fn parse_terminal_stream(stream: &StreamPath) -> TerminalStreamParts {
     let segments: Vec<&str> = stream.0.split('/').collect();
     assert_eq!(
         segments.len(),
@@ -622,6 +699,33 @@ pub async fn connect<S>(config: &ClientConfig, stream: S) -> Result<Connection, 
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let parts = connect_parts(config, stream).await?;
+
+    Ok(Connection {
+        reader: parts.reader,
+        writer: parts.writer,
+        incoming_seq: parts.incoming_seq,
+        outgoing_seq: parts.outgoing_seq,
+    })
+}
+
+pub async fn connect_uds(
+    path: impl AsRef<Path>,
+    config: &ClientConfig,
+) -> Result<Connection, HandshakeError> {
+    let stream = UnixStream::connect(path)
+        .await
+        .map_err(|err| HandshakeError::Frame(FrameError::Io(err)))?;
+    connect(config, stream).await
+}
+
+pub(crate) async fn connect_parts<S>(
+    config: &ClientConfig,
+    stream: S,
+) -> Result<ConnectedParts, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
@@ -668,13 +772,14 @@ where
                 .map_err(HandshakeError::InvalidPayload)?;
 
             let mut outgoing_seq = HashMap::new();
-            outgoing_seq.insert(stream_path, 1);
+            outgoing_seq.insert(stream_path.clone(), 1);
 
-            Ok(Connection {
+            Ok(ConnectedParts {
                 reader: Box::new(reader),
                 writer: Box::new(write_half),
                 incoming_seq,
                 outgoing_seq,
+                host_stream: stream_path,
             })
         }
         FrameKind::Reject => {
@@ -688,14 +793,4 @@ where
             got,
         }),
     }
-}
-
-pub async fn connect_uds(
-    path: impl AsRef<Path>,
-    config: &ClientConfig,
-) -> Result<Connection, HandshakeError> {
-    let stream = UnixStream::connect(path)
-        .await
-        .map_err(|err| HandshakeError::Frame(FrameError::Io(err)))?;
-    connect(config, stream).await
 }

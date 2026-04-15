@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::actions::spawn_new_chat;
+use crate::actions::begin_new_chat;
 use crate::state::{AgentInfo, AppState};
 
 use protocol::{BackendKind, Project};
@@ -16,20 +16,21 @@ pub fn HomeView() -> impl IntoView {
 
     let state_for_chat = state.clone();
     let new_chat = move |_| {
-        spawn_new_chat(&state_for_chat);
+        begin_new_chat(&state_for_chat, None);
     };
 
     view! {
         <div class="home-view">
             <div class="home-hero">
+                <img class="home-logo" src="icon.png" alt="Tyde" />
                 <h1 class="home-title">"Tyde"</h1>
                 <p class="home-tagline">"Coding Agent Studio"</p>
             </div>
 
             <div class="home-hints">
-                <span class="kbd-hint"><kbd>"Ctrl+K"</kbd>" Palette"</span>
-                <span class="kbd-hint"><kbd>"Ctrl+N"</kbd>" New Chat"</span>
-                <span class="kbd-hint"><kbd>"Ctrl+,"</kbd>" Settings"</span>
+                <span class="kbd-hint"><kbd>"⌘ K"</kbd>" Palette"</span>
+                <span class="kbd-hint"><kbd>"⌘ N"</kbd>" New Chat"</span>
+                <span class="kbd-hint"><kbd>"⌘ ,"</kbd>" Settings"</span>
             </div>
 
             <div class="home-actions">
@@ -123,18 +124,26 @@ fn ProjectCard(
 #[component]
 fn AgentRow(agent: AgentInfo) -> impl IntoView {
     let backend_class = match agent.backend_kind {
+        BackendKind::Tycode => "backend-badge tycode",
+        BackendKind::Kiro => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Gemini => "backend-badge gemini",
     };
 
     let backend_label = match agent.backend_kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Gemini => "Gemini",
     };
 
-    let status_text = format!("{:?}", agent.status);
+    let status_text = if agent.fatal_error.is_some() {
+        "Terminated".to_string()
+    } else {
+        "Idle".to_string()
+    };
 
     view! {
         <div class="agent-row">

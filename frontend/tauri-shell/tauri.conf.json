@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.tyde.desktop",
   "build": {
+    "beforeDevCommand": "trunk serve --port 1420 --config frontend/Trunk.toml",
+    "beforeBuildCommand": "trunk build --release --config frontend/Trunk.toml",
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:1420"
   },

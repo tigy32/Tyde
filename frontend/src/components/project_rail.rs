@@ -150,18 +150,16 @@ fn AddProjectInput(
         }
     });
 
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        match ev.key().as_str() {
-            "Enter" => {
-                if let Some(el) = input_ref.get_untracked() {
-                    on_submit(el.value());
-                }
+    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+        "Enter" => {
+            if let Some(el) = input_ref.get_untracked() {
+                on_submit(el.value());
             }
-            "Escape" => {
-                on_cancel();
-            }
-            _ => {}
         }
+        "Escape" => {
+            on_cancel();
+        }
+        _ => {}
     };
 
     view! {
@@ -179,6 +177,8 @@ fn AddProjectInput(
 
 /// Derive a stable hue (0..360) from a project name for the avatar color.
 fn name_to_hue(name: &str) -> u32 {
-    let hash: u32 = name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let hash: u32 = name
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     hash % 360
 }

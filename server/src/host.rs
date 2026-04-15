@@ -5,7 +5,7 @@ use std::sync::Arc;
 use protocol::{
     AgentId, AgentStartPayload, FrameKind, HostSettingsPayload, NewAgentPayload,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectFileListPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
+    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload, ProjectPath,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
     ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, SessionId,
     SessionListPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
@@ -19,12 +19,13 @@ use crate::agent::AgentHandle;
 use crate::agent::registry::{AgentRegistry, ResolvedSpawnRequest};
 use crate::backend::BackendSession;
 use crate::project_stream::{
-    ProjectSnapshotState, ProjectStreamSubscription, build_file_list, build_git_status, read_diff,
-    read_file, spawn_project_subscription, stage_file, stage_hunk, sync_snapshot_state,
+    ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing, build_file_list,
+    build_git_status, read_diff, read_file, scan_raw_entries, spawn_project_subscription,
+    stage_file, stage_hunk, sync_snapshot_state,
 };
 use crate::store::project::ProjectStore;
-use crate::store::settings::HostSettingsStore;
 use crate::store::session::SessionStore;
+use crate::store::settings::HostSettingsStore;
 use crate::stream::{Stream, StreamClosed};
 use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal};
 
@@ -92,6 +93,7 @@ impl HostHandle {
             .await
             .list()
             .unwrap_or_else(|err| panic!("failed to list projects for host registration: {err}"));
+        let project_ids: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
         for project in projects {
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
@@ -109,6 +111,11 @@ impl HostHandle {
                 state.host_streams.remove(&host_path);
                 return;
             }
+        }
+
+        // Start project subscriptions for all projects on this new host stream
+        for project_id in project_ids {
+            start_project_subscription_for_host(&mut state, &host_path, project_id).await;
         }
 
         let starts = state.registry.list_agents();
@@ -181,15 +188,17 @@ impl HostHandle {
         let session_store = Arc::clone(&state.session_store);
         let project_store = Arc::clone(&state.project_store);
         let use_mock_backend = state.use_mock_backend;
-        let parent_session_id = payload
-            .parent_agent_id
-            .as_ref()
-            .and_then(|agent_id| state.agent_sessions.get(agent_id).cloned());
+        let parent_session_id = if let Some(agent_id) = payload.parent_agent_id.as_ref() {
+            state.agent_sessions.get(agent_id).cloned()
+        } else {
+            None
+        };
 
         let request = match payload.params {
             SpawnAgentParams::New {
                 workspace_roots,
                 prompt,
+                images,
                 backend_kind,
                 cost_hint,
             } => {
@@ -202,17 +211,16 @@ impl HostHandle {
                             panic!("cannot spawn agent in missing project {}", project_id)
                         });
                 }
-                assert!(
-                    !workspace_roots.is_empty(),
-                    "spawn_agent requires at least one workspace root"
-                );
                 ResolvedSpawnRequest {
                     name: payload.name,
                     parent_agent_id: payload.parent_agent_id,
                     project_id: payload.project_id,
                     backend_kind,
                     workspace_roots,
-                    initial_prompt: prompt,
+                    initial_input: Some(protocol::SendMessagePayload {
+                        message: prompt,
+                        images,
+                    }),
                     cost_hint,
                     resume_session_id: None,
                     use_mock_backend,
@@ -240,7 +248,10 @@ impl HostHandle {
                     project_id,
                     backend_kind: record.backend_kind,
                     workspace_roots: record.workspace_roots,
-                    initial_prompt: prompt,
+                    initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
+                        message: prompt,
+                        images: None,
+                    }),
                     cost_hint: None,
                     resume_session_id: Some(session_id),
                     use_mock_backend,
@@ -313,7 +324,9 @@ impl HostHandle {
             .await
             .create(payload.name, payload.roots)
             .unwrap_or_else(|err| panic!("failed to create project: {err}"));
+        let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        start_project_subscriptions_for_all_hosts(&mut state, project_id).await;
     }
 
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) {
@@ -335,7 +348,9 @@ impl HostHandle {
             .await
             .add_root(&payload.id, payload.root)
             .unwrap_or_else(|err| panic!("failed to add root to project {}: {err}", payload.id));
+        let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        start_project_subscriptions_for_all_hosts(&mut state, project_id).await;
     }
 
     pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) {
@@ -539,11 +554,13 @@ impl HostHandle {
             .await
             .get(&project_id)
             .unwrap_or_else(|| panic!("cannot refresh missing project {}", project_id));
+        let raw_entries = scan_raw_entries(&project)
+            .unwrap_or_else(|err| panic!("failed to scan project entries: {err}"));
         let file_list = build_file_list(&project)
             .unwrap_or_else(|err| panic!("failed to build project file list: {err}"));
         let git_status = build_git_status(&project)
             .unwrap_or_else(|err| panic!("failed to build project git status: {err}"));
-        sync_snapshot_state(&subscription_state, &file_list, &git_status).await;
+        sync_snapshot_state(&subscription_state, &raw_entries, &git_status).await;
         if emit_project_file_list(&project_output_stream, &file_list)
             .await
             .is_err()
@@ -584,6 +601,30 @@ impl HostHandle {
             .expect("failed to serialize project file contents payload");
         let _ = project_output_stream
             .send_value(FrameKind::ProjectFileContents, payload)
+            .await;
+    }
+
+    pub(crate) async fn list_project_dir(
+        &self,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: ProjectListDirPayload,
+    ) {
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+        let project = project_store
+            .lock()
+            .await
+            .get(&project_id)
+            .unwrap_or_else(|| panic!("cannot list dir in missing project {}", project_id));
+        let listing = build_dir_listing(&project, &payload.root, &payload.path)
+            .unwrap_or_else(|err| panic!("failed to list project directory: {err}"));
+        let payload = serde_json::to_value(&listing)
+            .expect("failed to serialize project dir listing payload");
+        let _ = project_output_stream
+            .send_value(FrameKind::ProjectFileList, payload)
             .await;
     }
 
@@ -784,6 +825,103 @@ async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPay
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+/// Start project subscriptions for a project across all connected host streams.
+/// Performs the initial filesystem walk and sends the first file list + git status.
+async fn start_project_subscriptions_for_all_hosts(state: &mut HostState, project_id: ProjectId) {
+    let host_paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    for host_path in host_paths {
+        start_project_subscription_for_host(state, &host_path, project_id.clone()).await;
+    }
+}
+
+/// Start a project subscription for a single host stream (if one doesn't already exist).
+/// Sends the initial file list + git status immediately.
+async fn start_project_subscription_for_host(
+    state: &mut HostState,
+    host_path: &StreamPath,
+    project_id: ProjectId,
+) {
+    let project_stream_path = StreamPath(format!("/project/{}", project_id.0));
+    let key = (host_path.clone(), project_stream_path.clone());
+
+    if state.project_streams.contains_key(&key) {
+        return;
+    }
+
+    let Some(subscriber) = state.host_streams.get(host_path) else {
+        return;
+    };
+    let project_output_stream = subscriber.stream.with_path(project_stream_path);
+
+    let project_store = Arc::clone(&state.project_store);
+    let project = match project_store.lock().await.get(&project_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let subscription_state = Arc::new(Mutex::new(ProjectSnapshotState::default()));
+
+    let raw_entries = match scan_raw_entries(&project) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "failed to scan initial file entries for project {}: {err}",
+                project_id
+            );
+            return;
+        }
+    };
+    let file_list = match build_file_list(&project) {
+        Ok(fl) => fl,
+        Err(err) => {
+            eprintln!(
+                "failed to build initial file list for project {}: {err}",
+                project_id
+            );
+            return;
+        }
+    };
+    let git_status = match build_git_status(&project) {
+        Ok(gs) => gs,
+        Err(err) => {
+            eprintln!(
+                "failed to build initial git status for project {}: {err}",
+                project_id
+            );
+            return;
+        }
+    };
+
+    sync_snapshot_state(&subscription_state, &raw_entries, &git_status).await;
+
+    if emit_project_file_list(&project_output_stream, &file_list)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if emit_project_git_status(&project_output_stream, &git_status)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let task = spawn_project_subscription(
+        project_store,
+        project_id,
+        project_output_stream,
+        Arc::clone(&subscription_state),
+    );
+    state.project_streams.insert(
+        key,
+        ProjectStreamSubscription {
+            task,
+            state: subscription_state,
+        },
+    );
 }
 
 async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {

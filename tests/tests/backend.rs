@@ -1,13 +1,27 @@
-mod fixture;
-
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::ToSocketAddrs;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use protocol::{
-    BackendKind, ChatEvent, Envelope, FrameKind, NewAgentPayload, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint,
+    BackendKind, ChatEvent, Envelope, FrameKind, ImageData, ListSessionsPayload, MessageSender,
+    NewAgentPayload, ProtocolValidator, SessionListPayload, SessionSummary, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData, ToolRequest,
+    ToolRequestType,
 };
+use server::backend::Backend;
 
 const REAL_BACKEND_TIMEOUT: Duration = Duration::from_secs(60);
+const REAL_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const SOLID_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+}
 
 fn binary_available(name: &str) -> bool {
     std::process::Command::new("which")
@@ -17,6 +31,172 @@ fn binary_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn backend_binary_available(backend_kind: BackendKind) -> bool {
+    match backend_kind {
+        BackendKind::Claude => binary_available("claude"),
+        BackendKind::Codex => binary_available("codex"),
+        BackendKind::Gemini => binary_available("gemini"),
+        BackendKind::Tycode => binary_available("tycode-subprocess"),
+        BackendKind::Kiro => binary_available("kiro-cli-chat") || binary_available("kiro-cli"),
+    }
+}
+
+fn home_is_writable() -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let probe = PathBuf::from(home).join(format!(
+        ".tyde-backend-probe-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("thread")
+    ));
+
+    let created = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+        .is_ok();
+    if created {
+        let _ = std::fs::remove_file(&probe);
+    }
+    created
+}
+
+fn remote_network_is_available() -> bool {
+    "example.com:443".to_socket_addrs().is_ok()
+}
+
+fn backend_runtime_available(backend_kind: BackendKind) -> bool {
+    if !backend_binary_available(backend_kind) {
+        return false;
+    }
+
+    match backend_kind {
+        BackendKind::Tycode => home_is_writable(),
+        BackendKind::Claude | BackendKind::Gemini | BackendKind::Kiro => {
+            home_is_writable() && remote_network_is_available()
+        }
+        BackendKind::Codex => remote_network_is_available(),
+    }
+}
+
+async fn run_shell_probe(script: &str, timeout: Duration) -> Result<String, String> {
+    let child = tokio::process::Command::new("zsh")
+        .arg("-lc")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|err| format!("failed to spawn probe: {err}"))?;
+
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| format!("probe timed out after {:?}", timeout))?
+        .map_err(|err| format!("failed to wait for probe: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(format!("{stdout}{stderr}"))
+    } else {
+        Err(format!(
+            "probe exited with {}: {}{}",
+            output.status, stdout, stderr
+        ))
+    }
+}
+
+async fn probe_backend_runtime(backend_kind: BackendKind) -> Result<(), String> {
+    if !backend_binary_available(backend_kind) {
+        return Err("backend binary not installed".to_string());
+    }
+    if !backend_runtime_available(backend_kind) {
+        return Err("basic runtime prerequisites unavailable".to_string());
+    }
+
+    match backend_kind {
+        BackendKind::Claude => {
+            let script = r#"
+tmpdir=$(mktemp -d)
+cd "$tmpdir" || exit 1
+printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Reply exactly with ok"}]}}\n' \
+  | claude --print --verbose --output-format stream-json --input-format stream-json --include-partial-messages --dangerously-skip-permissions --model haiku --effort low
+"#;
+            let output = run_shell_probe(script, REAL_BACKEND_PROBE_TIMEOUT).await?;
+            if output.contains("\"session_id\"") && output.contains("\"result\"") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Claude probe did not emit expected session output: {output}"
+                ))
+            }
+        }
+        BackendKind::Codex => Ok(()),
+        BackendKind::Gemini => {
+            let script = r#"
+tmpdir=$(mktemp -d)
+cd "$tmpdir" || exit 1
+gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-format stream-json
+"#;
+            let output = run_shell_probe(script, REAL_BACKEND_PROBE_TIMEOUT).await?;
+            if output.contains("\"type\":\"message\"") || output.contains("\"type\": \"message\"") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Gemini probe did not emit a message event: {output}"
+                ))
+            }
+        }
+        BackendKind::Tycode => {
+            let workspace = tempfile::tempdir().map_err(|err| format!("{err}"))?;
+            std::fs::write(workspace.path().join("README.txt"), "probe workspace")
+                .map_err(|err| format!("failed to seed Tycode probe workspace: {err}"))?;
+            let result = tokio::time::timeout(
+                REAL_BACKEND_PROBE_TIMEOUT,
+                <server::backend::tycode::TycodeBackend as Backend>::spawn(
+                    vec![workspace.path().to_string_lossy().to_string()],
+                    server::backend::BackendSpawnConfig {
+                        cost_hint: cost_hint_for(BackendKind::Tycode),
+                    },
+                    protocol::SendMessagePayload {
+                        message: "Reply exactly with ok".to_owned(),
+                        images: None,
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| "Tycode spawn timed out".to_string())?
+            .map_err(|err| format!("Tycode spawn failed: {err}"))?;
+            let (_backend, _events) = result;
+            Ok(())
+        }
+        BackendKind::Kiro => {
+            let workspace = tempfile::tempdir().map_err(|err| format!("{err}"))?;
+            std::fs::write(workspace.path().join("README.txt"), "probe workspace")
+                .map_err(|err| format!("failed to seed Kiro probe workspace: {err}"))?;
+            let result = tokio::time::timeout(
+                REAL_BACKEND_PROBE_TIMEOUT,
+                <server::backend::kiro::KiroBackend as Backend>::spawn(
+                    vec![workspace.path().to_string_lossy().to_string()],
+                    server::backend::BackendSpawnConfig {
+                        cost_hint: cost_hint_for(BackendKind::Kiro),
+                    },
+                    protocol::SendMessagePayload {
+                        message: "Reply exactly with ok".to_owned(),
+                        images: None,
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| "Kiro ACP spawn timed out".to_string())?
+            .map_err(|err| format!("Kiro ACP spawn failed: {err}"))?;
+            let (_backend, _events) = result;
+            Ok(())
+        }
+    }
+}
+
 fn cost_hint_for(backend_kind: BackendKind) -> Option<SpawnCostHint> {
     match backend_kind {
         BackendKind::Codex => Some(SpawnCostHint::Medium),
@@ -24,18 +204,72 @@ fn cost_hint_for(backend_kind: BackendKind) -> Option<SpawnCostHint> {
     }
 }
 
+fn backend_label(backend_kind: BackendKind) -> &'static str {
+    match backend_kind {
+        BackendKind::Claude => "claude",
+        BackendKind::Codex => "codex",
+        BackendKind::Gemini => "gemini",
+        BackendKind::Tycode => "tycode",
+        BackendKind::Kiro => "kiro",
+    }
+}
+
 /// Fixture that uses real backends (not mock) so backend_kind dispatch is tested.
 struct RealBackendFixture {
-    client: client::Connection,
+    client: ValidatedConnection,
     #[allow(dead_code)]
     session_store_dir: tempfile::TempDir,
+    workspace_dir: tempfile::TempDir,
+}
+
+struct ValidatedConnection {
+    inner: client::Connection,
+    validator: ProtocolValidator,
+}
+
+impl ValidatedConnection {
+    async fn spawn_agent(
+        &mut self,
+        payload: SpawnAgentPayload,
+    ) -> Result<(), protocol::FrameError> {
+        self.inner.spawn_agent(payload).await
+    }
+
+    async fn list_sessions(
+        &mut self,
+        payload: ListSessionsPayload,
+    ) -> Result<(), protocol::FrameError> {
+        self.inner.list_sessions(payload).await
+    }
+
+    async fn next_event(&mut self) -> Result<Option<Envelope>, protocol::FrameError> {
+        let Some(envelope) = self.inner.next_event().await? else {
+            return Ok(None);
+        };
+
+        if let Err(error) = self.validator.validate_envelope(&envelope) {
+            panic!("protocol violation while reading backend events: {error}");
+        }
+
+        Ok(Some(envelope))
+    }
+
+    async fn interrupt(&mut self, stream: &StreamPath) -> Result<(), protocol::FrameError> {
+        self.inner.interrupt(stream).await
+    }
 }
 
 impl RealBackendFixture {
     async fn new() -> Self {
-        fixture::init_tracing();
+        init_tracing();
 
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
+        let workspace_dir = tempfile::tempdir().expect("create workspace tempdir");
+        std::fs::write(
+            workspace_dir.path().join("README.txt"),
+            "real backend test workspace",
+        )
+        .expect("seed workspace tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
         let settings_path = session_store_dir.path().join("settings.json");
@@ -61,13 +295,21 @@ impl RealBackendFixture {
             .expect("client handshake failed");
 
         Self {
-            client,
+            client: ValidatedConnection {
+                inner: client,
+                validator: ProtocolValidator::new(),
+            },
             session_store_dir,
+            workspace_dir,
         }
+    }
+
+    fn workspace_roots(&self) -> Vec<String> {
+        vec![self.workspace_dir.path().to_string_lossy().to_string()]
     }
 }
 
-async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
+async fn expect_next_event(client: &mut ValidatedConnection, context: &str) -> Envelope {
     match tokio::time::timeout(REAL_BACKEND_TIMEOUT, client.next_event()).await {
         Ok(Ok(Some(env))) => env,
         Ok(Ok(None)) => panic!("connection closed before {context}"),
@@ -76,17 +318,56 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
     }
 }
 
-/// Spawn an agent through the protocol and consume events until the first turn completes.
-/// Asserts NewAgent, AgentStart, and at least one StreamStart..StreamEnd cycle with text.
-async fn say_hi_via_protocol(client: &mut client::Connection, backend_kind: BackendKind) {
+async fn expect_next_event_kind(
+    client: &mut ValidatedConnection,
+    expected_kind: FrameKind,
+    context: &str,
+) -> Envelope {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == expected_kind {
+            return env;
+        }
+
+        if env.stream.0.starts_with("/host/") && env.kind == FrameKind::HostSettings {
+            continue;
+        }
+
+        panic!(
+            "expected {expected_kind} before {context}, got kind={} stream={}",
+            env.kind, env.stream
+        );
+    }
+}
+
+async fn spawn_agent_via_protocol(
+    client: &mut ValidatedConnection,
+    workspace_roots: Vec<String>,
+    backend_kind: BackendKind,
+    name: &str,
+    prompt: &str,
+) -> protocol::StreamPath {
+    spawn_agent_via_protocol_with_images(client, workspace_roots, backend_kind, name, prompt, None)
+        .await
+}
+
+async fn spawn_agent_via_protocol_with_images(
+    client: &mut ValidatedConnection,
+    workspace_roots: Vec<String>,
+    backend_kind: BackendKind,
+    name: &str,
+    prompt: &str,
+    images: Option<Vec<ImageData>>,
+) -> protocol::StreamPath {
     client
         .spawn_agent(SpawnAgentPayload {
-            name: "say-hi".to_owned(),
+            name: name.to_owned(),
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp".to_owned()],
-                prompt: Some("Say hi! Reply with a short greeting.".to_owned()),
+                workspace_roots,
+                prompt: prompt.to_owned(),
+                images,
                 backend_kind,
                 cost_hint: cost_hint_for(backend_kind),
             },
@@ -94,79 +375,1035 @@ async fn say_hi_via_protocol(client: &mut client::Connection, backend_kind: Back
         .await
         .expect("spawn_agent failed");
 
-    // NewAgent on host stream
-    let env = expect_next_event(client, "NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent_context = format!("{backend_kind:?} NewAgent");
+    let env = expect_next_event_kind(client, FrameKind::NewAgent, &new_agent_context).await;
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
     assert_eq!(new_agent.backend_kind, backend_kind);
     let agent_stream = new_agent.instance_stream;
 
-    // AgentStart on agent stream
-    let env = expect_next_event(client, "AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
+    let agent_start_context = format!("{backend_kind:?} AgentStart");
+    let env = expect_next_event_kind(client, FrameKind::AgentStart, &agent_start_context).await;
     assert_eq!(env.stream, agent_stream);
 
-    // Consume ChatEvents until first StreamEnd. Real backends may emit
-    // TaskUpdate, ToolRequest, etc. before/between stream events.
+    agent_stream
+}
+
+async fn resume_agent_via_protocol(
+    client: &mut ValidatedConnection,
+    name: &str,
+    session_id: protocol::SessionId,
+    prompt: &str,
+) -> StreamPath {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: name.to_owned(),
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: Some(prompt.to_owned()),
+            },
+        })
+        .await
+        .expect("resume spawn_agent failed");
+
+    let env = expect_next_event_kind(client, FrameKind::NewAgent, "resumed NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse resumed NewAgent");
+    let agent_stream = new_agent.instance_stream;
+
+    let env = expect_next_event_kind(client, FrameKind::AgentStart, "resumed AgentStart").await;
+    assert_eq!(env.stream, agent_stream);
+
+    agent_stream
+}
+
+async fn list_sessions_via_protocol(client: &mut ValidatedConnection) -> SessionListPayload {
+    client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions failed");
+
+    let env = expect_next_event_kind(client, FrameKind::SessionList, "SessionList").await;
+    env.parse_payload().expect("parse SessionList")
+}
+
+async fn expect_assistant_turn_after_user_echo(
+    client: &mut ValidatedConnection,
+    agent_stream: &StreamPath,
+    prompt: &str,
+) -> AssistantTurn {
+    let mut got_user_message_echo = false;
     let mut got_stream_start = false;
-    let mut got_text = false;
+    let mut streamed_text = String::new();
+    let mut delta_count = 0usize;
+
     loop {
         let env = expect_next_event(client, "ChatEvent").await;
         assert_eq!(env.kind, FrameKind::ChatEvent);
+        assert_eq!(env.stream, *agent_stream);
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                    got_user_message_echo = true;
+                }
+            }
             ChatEvent::StreamStart(_) => {
+                if !got_user_message_echo {
+                    continue;
+                }
+                assert!(
+                    got_user_message_echo,
+                    "received StreamStart before MessageAdded(User) for prompt {prompt:?}"
+                );
                 got_stream_start = true;
             }
             ChatEvent::StreamDelta(delta) => {
-                if !delta.text.is_empty() {
-                    got_text = true;
+                if got_stream_start {
+                    delta_count += 1;
+                    streamed_text.push_str(&delta.text);
                 }
             }
             ChatEvent::StreamEnd(data) => {
-                if !data.message.content.trim().is_empty() {
-                    got_text = true;
+                if !got_user_message_echo {
+                    continue;
                 }
+                assert!(
+                    got_user_message_echo,
+                    "never received MessageAdded(User) echo"
+                );
                 assert!(got_stream_start, "received StreamEnd before StreamStart");
-                break;
+                assert!(
+                    delta_count > 0,
+                    "assistant turn for prompt {prompt:?} completed without any StreamDelta events"
+                );
+                let final_text = if data.message.content.trim().is_empty() {
+                    streamed_text
+                } else {
+                    data.message.content
+                };
+                return AssistantTurn {
+                    final_text,
+                    delta_count,
+                };
             }
-            _ => {} // TaskUpdate, ToolRequest, etc. are fine
+            _ => {}
         }
     }
-    assert!(got_stream_start, "never received StreamStart");
-    assert!(got_text, "never received any text from backend");
+}
+
+async fn expect_assistant_turn_after_user_echo_with_images(
+    client: &mut ValidatedConnection,
+    agent_stream: &StreamPath,
+    prompt: &str,
+    expected_images: &[ImageData],
+) -> AssistantTurn {
+    let mut got_user_message_echo = false;
+    let mut got_stream_start = false;
+    let mut streamed_text = String::new();
+    let mut delta_count = 0usize;
+
+    loop {
+        let env = expect_next_event(client, "ChatEvent with image echo").await;
+        assert_eq!(env.kind, FrameKind::ChatEvent);
+        assert_eq!(env.stream, *agent_stream);
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User)
+                    && message.content == prompt
+                    && message.images.as_deref() == Some(expected_images)
+                {
+                    got_user_message_echo = true;
+                }
+            }
+            ChatEvent::StreamStart(_) => {
+                if !got_user_message_echo {
+                    continue;
+                }
+                got_stream_start = true;
+            }
+            ChatEvent::StreamDelta(delta) => {
+                if got_stream_start {
+                    delta_count += 1;
+                    streamed_text.push_str(&delta.text);
+                }
+            }
+            ChatEvent::StreamEnd(data) => {
+                if !got_user_message_echo {
+                    continue;
+                }
+                assert!(got_stream_start, "received StreamEnd before StreamStart");
+                assert!(
+                    delta_count > 0,
+                    "assistant turn for image prompt {prompt:?} completed without any StreamDelta events"
+                );
+                let final_text = if data.message.content.trim().is_empty() {
+                    streamed_text
+                } else {
+                    data.message.content
+                };
+                return AssistantTurn {
+                    final_text,
+                    delta_count,
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+struct AssistantTurn {
+    final_text: String,
+    delta_count: usize,
+}
+
+struct ToolTurn {
+    final_text: String,
+    tool_requests: Vec<ToolRequest>,
+    tool_completions: Vec<ToolExecutionCompletedData>,
+}
+
+fn unique_secret() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    format!("TYDE-SECRET-{now}")
+}
+
+fn only_session_for_backend(
+    sessions: &[SessionSummary],
+    backend_kind: BackendKind,
+) -> &SessionSummary {
+    let matching: Vec<_> = sessions
+        .iter()
+        .filter(|session| session.backend_kind == backend_kind)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one {backend_kind:?} session, got {matching:?}"
+    );
+    matching[0]
+}
+
+async fn resume_secret_via_protocol(fixture: &mut RealBackendFixture, backend_kind: BackendKind) {
+    let secret = unique_secret();
+    let remember_prompt = format!(
+        "For the rest of this conversation, the project codename is {secret}. Reply exactly with: noted"
+    );
+    let workspace_roots = fixture.workspace_roots();
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "remember-secret",
+        &remember_prompt,
+    )
+    .await;
+    let first_response =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &agent_stream, &remember_prompt)
+            .await;
+    assert!(
+        !first_response.final_text.trim().is_empty(),
+        "expected non-empty initial response before resume"
+    );
+
+    let list = list_sessions_via_protocol(&mut fixture.client).await;
+    let session = only_session_for_backend(&list.sessions, backend_kind);
+    assert!(session.resumable, "expected stored session to be resumable");
+    assert_eq!(
+        session.message_count, 1,
+        "expected one completed turn before resume"
+    );
+
+    let recall_prompt =
+        "What is the project codename for this conversation? Reply with only the codename.";
+    let resumed_stream = resume_agent_via_protocol(
+        &mut fixture.client,
+        "resume-secret",
+        session.id.clone(),
+        recall_prompt,
+    )
+    .await;
+    let resumed_response =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &resumed_stream, recall_prompt)
+            .await;
+    assert!(
+        resumed_response.final_text.contains(&secret),
+        "expected resumed response to contain secret {secret:?}, got {:?}",
+        resumed_response.final_text
+    );
+
+    let list_after_resume = list_sessions_via_protocol(&mut fixture.client).await;
+    let resumed_session = only_session_for_backend(&list_after_resume.sessions, backend_kind);
+    assert_eq!(resumed_session.id, session.id);
+    assert_eq!(
+        resumed_session.message_count, 2,
+        "resume should reuse the same stored session"
+    );
+}
+
+async fn assert_backend_emits_stream_deltas(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let prompt = "Count from 1 to 20, one number per line, and nothing else.";
+    let workspace_roots = fixture.workspace_roots();
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "stream-deltas",
+        prompt,
+    )
+    .await;
+    let response =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &agent_stream, prompt).await;
+
+    assert!(
+        !response.final_text.trim().is_empty(),
+        "expected non-empty streamed response for {backend_kind:?}"
+    );
+    assert!(
+        response.delta_count > 0,
+        "expected at least one StreamDelta for {backend_kind:?}"
+    );
+}
+
+async fn assert_backend_emits_typing_status(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let prompt = "Reply with a single word: hello";
+    let workspace_roots = fixture.workspace_roots();
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "typing-status",
+        prompt,
+    )
+    .await;
+
+    let mut got_user_message_echo = false;
+    let mut saw_typing_true = false;
+    let mut saw_stream_start = false;
+    let mut saw_stream_end = false;
+    let mut saw_typing_false = false;
+
+    // TypingStatusChanged(true) must arrive before StreamStart, and both StreamEnd and
+    // TypingStatusChanged(false) must arrive after StreamStart.  However the relative
+    // order of StreamEnd vs TypingStatusChanged(false) is backend-dependent (e.g. Codex
+    // may emit TypingStatusChanged(false) before StreamEnd), so we wait until we have
+    // seen *both* before breaking.
+    loop {
+        let env = expect_next_event(&mut fixture.client, "typing status ChatEvent").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                    got_user_message_echo = true;
+                }
+            }
+            ChatEvent::TypingStatusChanged(true) => {
+                if got_user_message_echo && !saw_typing_true {
+                    saw_typing_true = true;
+                }
+            }
+            ChatEvent::StreamStart(_) => {
+                if got_user_message_echo {
+                    assert!(
+                        saw_typing_true,
+                        "StreamStart arrived before TypingStatusChanged(true) for {backend_kind:?}"
+                    );
+                    saw_stream_start = true;
+                }
+            }
+            ChatEvent::StreamEnd(_) => {
+                if got_user_message_echo && saw_stream_start {
+                    saw_stream_end = true;
+                    if saw_typing_false {
+                        break;
+                    }
+                }
+            }
+            ChatEvent::TypingStatusChanged(false) => {
+                if got_user_message_echo && saw_typing_true {
+                    saw_typing_false = true;
+                    if saw_stream_end {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_typing_true,
+        "expected TypingStatusChanged(true) for {backend_kind:?}"
+    );
+    assert!(
+        saw_stream_start,
+        "expected StreamStart for {backend_kind:?}"
+    );
+    assert!(
+        saw_stream_end,
+        "expected StreamEnd for {backend_kind:?}"
+    );
+    assert!(
+        saw_typing_false,
+        "expected TypingStatusChanged(false) for {backend_kind:?}"
+    );
+}
+
+async fn assert_backend_describes_image_input(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let workspace_roots = fixture.workspace_roots();
+    let images = vec![ImageData {
+        media_type: "image/png".to_string(),
+        data: SOLID_RED_PNG_BASE64.to_string(),
+    }];
+    let image_prompt =
+        "Describe the attached image in one or two words. Reply with only the description.";
+    let agent_stream = spawn_agent_via_protocol_with_images(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "image-input",
+        image_prompt,
+        Some(images.clone()),
+    )
+    .await;
+    let response = expect_assistant_turn_after_user_echo_with_images(
+        &mut fixture.client,
+        &agent_stream,
+        image_prompt,
+        &images,
+    )
+    .await;
+    let normalized = response.final_text.to_lowercase();
+    assert!(
+        normalized.contains("red"),
+        "expected image description to mention red for {backend_kind:?}, got {:?}",
+        response.final_text
+    );
+    assert!(
+        response.delta_count > 0,
+        "expected streamed image-description response for {backend_kind:?}"
+    );
+}
+
+async fn expect_tool_turn_after_user_echo(
+    client: &mut ValidatedConnection,
+    agent_stream: &StreamPath,
+    prompt: &str,
+) -> ToolTurn {
+    let mut got_user_message_echo = false;
+    let mut final_text: Option<String> = None;
+    let mut saw_stream_end = false;
+    let mut tool_requests: HashMap<String, ToolRequest> = HashMap::new();
+    let mut tool_completions: HashMap<String, ToolExecutionCompletedData> = HashMap::new();
+
+    loop {
+        let env = expect_next_event(client, "tool-assisted ChatEvent").await;
+        assert_eq!(env.kind, FrameKind::ChatEvent);
+        assert_eq!(env.stream, *agent_stream);
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                    got_user_message_echo = true;
+                }
+            }
+            ChatEvent::StreamEnd(data) => {
+                if !got_user_message_echo {
+                    continue;
+                }
+                saw_stream_end = true;
+                final_text = Some(data.message.content);
+            }
+            ChatEvent::ToolRequest(request) => {
+                if got_user_message_echo {
+                    tool_requests.insert(request.tool_call_id.clone(), request);
+                }
+            }
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                if got_user_message_echo {
+                    tool_completions.insert(completion.tool_call_id.clone(), completion);
+                }
+            }
+            _ => {}
+        }
+
+        if saw_stream_end
+            && !tool_requests.is_empty()
+            && tool_requests
+                .keys()
+                .all(|call_id| tool_completions.contains_key(call_id))
+        {
+            return ToolTurn {
+                final_text: final_text.unwrap_or_default(),
+                tool_requests: tool_requests.into_values().collect(),
+                tool_completions: tool_completions.into_values().collect(),
+            };
+        }
+    }
+}
+
+async fn expect_tool_turn_until_output_exists(
+    client: &mut ValidatedConnection,
+    agent_stream: &StreamPath,
+    prompt: &str,
+    output_path: &std::path::Path,
+) -> ToolTurn {
+    let mut turn = expect_tool_turn_after_user_echo(client, agent_stream, prompt).await;
+    if output_path.exists() {
+        return turn;
+    }
+
+    loop {
+        let maybe_env = tokio::time::timeout(Duration::from_secs(5), client.next_event()).await;
+        let env = match maybe_env {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => panic!("next_event failed while waiting for file output: {err:?}"),
+            Err(_) => break,
+        };
+
+        if env.kind != FrameKind::ChatEvent || env.stream != *agent_stream {
+            continue;
+        }
+
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::StreamEnd(data) => {
+                turn.final_text = data.message.content;
+            }
+            ChatEvent::ToolRequest(request) => {
+                if !turn
+                    .tool_requests
+                    .iter()
+                    .any(|existing| existing.tool_call_id == request.tool_call_id)
+                {
+                    turn.tool_requests.push(request);
+                }
+            }
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                if let Some(existing) = turn
+                    .tool_completions
+                    .iter_mut()
+                    .find(|existing| existing.tool_call_id == completion.tool_call_id)
+                {
+                    *existing = completion;
+                } else {
+                    turn.tool_completions.push(completion);
+                }
+            }
+            _ => {}
+        }
+
+        if output_path.exists()
+            && !turn.tool_requests.is_empty()
+            && turn.tool_requests.iter().all(|request| {
+                turn.tool_completions
+                    .iter()
+                    .any(|completion| completion.tool_call_id == request.tool_call_id)
+            })
+        {
+            break;
+        }
+    }
+
+    turn
+}
+
+async fn assert_backend_emits_tool_events_for_file_copy(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let input_contents = format!("TOOL-COPY-CONTENT-{}", unique_secret());
+    let input_path = fixture.workspace_dir.path().join("INPUT.txt");
+    let output_path = fixture.workspace_dir.path().join("OUTPUT.txt");
+    let workspace_roots = fixture.workspace_roots();
+    std::fs::write(&input_path, &input_contents).expect("seed input file");
+    let _ = std::fs::remove_file(&output_path);
+
+    let prompt = "Use the available tools to inspect INPUT.txt and create OUTPUT.txt in the workspace with exactly the same contents. Do not only describe a plan.";
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "tool-file-copy",
+        prompt,
+    )
+    .await;
+    let turn = expect_tool_turn_until_output_exists(
+        &mut fixture.client,
+        &agent_stream,
+        prompt,
+        &output_path,
+    )
+    .await;
+
+    assert!(
+        !turn.tool_requests.is_empty(),
+        "expected at least one ToolRequest for {backend_kind:?}"
+    );
+    assert_eq!(
+        turn.tool_requests.len(),
+        turn.tool_completions.len(),
+        "expected a matching ToolExecutionCompleted for every ToolRequest for {backend_kind:?}"
+    );
+    assert!(
+        turn.tool_completions
+            .iter()
+            .any(|completion| completion.success),
+        "expected at least one successful ToolExecutionCompleted for {backend_kind:?}; requests={:?} completions={:?} final_text={:?}",
+        turn.tool_requests,
+        turn.tool_completions,
+        turn.final_text
+    );
+    assert!(
+        output_path.exists(),
+        "expected OUTPUT.txt to exist after tool-assisted turn for {backend_kind:?}; requests={:?} completions={:?} final_text={:?}",
+        turn.tool_requests,
+        turn.tool_completions,
+        turn.final_text
+    );
+    let output_contents = std::fs::read_to_string(&output_path).expect("read OUTPUT.txt");
+    assert!(
+        output_contents == input_contents || output_contents == format!("{input_contents}\n"),
+        "expected OUTPUT.txt to match INPUT.txt for {backend_kind:?} (allowing one trailing newline); requests={:?} completions={:?} final_text={:?} output={:?} input={:?}",
+        turn.tool_requests,
+        turn.tool_completions,
+        turn.final_text,
+        output_contents,
+        input_contents
+    );
+    assert!(
+        !turn.final_text.trim().is_empty(),
+        "expected a non-empty assistant response for {backend_kind:?}; requests={:?} completions={:?} got {:?}",
+        turn.tool_requests,
+        turn.tool_completions,
+        turn.final_text
+    );
+}
+
+async fn assert_backend_interrupts_long_running_command(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let workspace_roots = fixture.workspace_roots();
+    let script_path = fixture.workspace_dir.path().join("interrupt_test.sh");
+    let output_path = fixture.workspace_dir.path().join("INTERRUPT_PROOF.txt");
+    let _ = std::fs::remove_file(&output_path);
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\nsleep 60\nprintf cancelled-proof > INTERRUPT_PROOF.txt\n",
+    )
+    .expect("write interrupt_test.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("stat interrupt_test.sh")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod interrupt_test.sh");
+    }
+
+    let prompt = match backend_kind {
+        BackendKind::Claude => {
+            "Use the Bash tool exactly once to execute exactly `./interrupt_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
+        }
+        BackendKind::Codex => {
+            "Immediately run the test harness `./interrupt_test.sh` in the current working directory using your command execution capability. Start it before any explanation, do not ask for confirmation, and do not use any other tools."
+        }
+        BackendKind::Gemini => {
+            "Use the run_shell_command tool exactly once to execute exactly `./interrupt_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
+        }
+        BackendKind::Kiro => {
+            "Use the available tools to run the test harness `./interrupt_test.sh` in the current working directory immediately. Do not ask for clarification, and do not only describe a plan."
+        }
+        BackendKind::Tycode => {
+            "Use the run_build_test tool exactly once to run the test harness `./interrupt_test.sh` in the current working directory. Start the test immediately. Do not use any other tools."
+        }
+    };
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "interrupt-long-command",
+        prompt,
+    )
+    .await;
+
+    let started_at = Instant::now();
+    let mut got_user_message_echo = false;
+    let tool_call_id = loop {
+        let context = format!("{backend_kind:?} long-running ToolRequest");
+        let env = expect_next_event(&mut fixture.client, &context).await;
+        assert_eq!(env.kind, FrameKind::ChatEvent);
+        assert_eq!(env.stream, agent_stream);
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                    got_user_message_echo = true;
+                }
+            }
+            ChatEvent::ToolRequest(request) if got_user_message_echo => {
+                let ToolRequestType::RunCommand { command, .. } = &request.tool_type else {
+                    continue;
+                };
+                if command.contains("interrupt_test.sh") {
+                    break request.tool_call_id;
+                }
+            }
+            _ => {}
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    fixture
+        .client
+        .interrupt(&agent_stream)
+        .await
+        .expect("interrupt failed");
+
+    let mut saw_operation_cancelled = false;
+    let mut saw_matching_tool_completion = false;
+    let cancel_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < cancel_deadline {
+        let context = format!("{backend_kind:?} interrupt outcome");
+        let env = expect_next_event(&mut fixture.client, &context).await;
+        assert_eq!(env.kind, FrameKind::ChatEvent);
+        assert_eq!(env.stream, agent_stream);
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::OperationCancelled(_) => {
+                saw_operation_cancelled = true;
+                break;
+            }
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                if completion.tool_call_id == tool_call_id {
+                    saw_matching_tool_completion = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_operation_cancelled,
+        "expected OperationCancelled for {backend_kind:?} interrupt test"
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_secs(20),
+        "interrupt test for {backend_kind:?} took too long: {:?}",
+        started_at.elapsed()
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !output_path.exists(),
+        "expected interrupted command to avoid writing {:?} for {:?}; saw_tool_completion={}",
+        output_path,
+        backend_kind,
+        saw_matching_tool_completion
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Real backend tests — skip if binary not installed, 60s timeout
+// Real backend tests — skip unavailable backends, 60s timeout per event
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn claude_say_hi() {
-    if !binary_available("claude") {
-        eprintln!("SKIPPED: claude not installed");
-        return;
+async fn resumable_real_backends_remember_secret() {
+    let backends = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Gemini,
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+    ];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        eprintln!("RUNNING interrupt test for {}", backend_label(backend_kind));
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            resume_secret_via_protocol(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
     }
-    let mut fixture = RealBackendFixture::new().await;
-    say_hi_via_protocol(&mut fixture.client, BackendKind::Claude).await;
+
+    assert!(
+        failures.is_empty(),
+        "real backend resume failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[tokio::test]
-async fn codex_say_hi() {
-    if !binary_available("codex") {
-        eprintln!("SKIPPED: codex not installed");
-        return;
+async fn real_backends_emit_stream_deltas() {
+    let backends = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Gemini,
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+    ];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            assert_backend_emits_stream_deltas(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
     }
-    let mut fixture = RealBackendFixture::new().await;
-    say_hi_via_protocol(&mut fixture.client, BackendKind::Codex).await;
+
+    assert!(
+        failures.is_empty(),
+        "real backend streaming failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[tokio::test]
-async fn gemini_say_hi() {
-    if !binary_available("gemini") {
-        eprintln!("SKIPPED: gemini not installed");
-        return;
+async fn real_backends_emit_typing_status() {
+    let backends = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Gemini,
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+    ];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            assert_backend_emits_typing_status(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
     }
-    let mut fixture = RealBackendFixture::new().await;
-    say_hi_via_protocol(&mut fixture.client, BackendKind::Gemini).await;
+
+    assert!(
+        failures.is_empty(),
+        "real backend typing status failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn real_codex_emits_tool_events_for_file_copy() {
+    let backends = [BackendKind::Codex];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            assert_backend_emits_tool_events_for_file_copy(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "real backend tool event failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn real_backends_interrupt_long_running_command() {
+    let backends = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Gemini,
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+    ];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            assert_backend_interrupts_long_running_command(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "real backend interrupt failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn real_codex_describes_image_input() {
+    let backends = [BackendKind::Codex];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            assert_backend_describes_image_input(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "real backend image input failures:\n{}",
+        failures.join("\n")
+    );
 }

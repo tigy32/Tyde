@@ -57,9 +57,9 @@ pub fn Header() -> impl IntoView {
                 </div>
             </div>
             <div class="header-right">
-                <button class="header-btn" title="Toggle Left Dock" on:click=toggle_left>"L"</button>
-                <button class="header-btn" title="Toggle Right Dock" on:click=toggle_right>"R"</button>
-                <button class="header-btn" title="Toggle Bottom Dock" on:click=toggle_bottom>"B"</button>
+                <button class="header-btn" title="Toggle Left Dock" on:click=toggle_left>"Left"</button>
+                <button class="header-btn" title="Toggle Bottom Dock" on:click=toggle_bottom>"Bottom"</button>
+                <button class="header-btn" title="Toggle Right Dock" on:click=toggle_right>"Right"</button>
             </div>
         </header>
     }

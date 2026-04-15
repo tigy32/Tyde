@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use protocol::FrameKind;
+use tyde_dev_driver::agent_control::AgentControlHandle;
+
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -40,6 +43,14 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn connect_agent_control(&self) -> AgentControlHandle {
+        let client = connect_raw_client(self.host.clone()).await;
+        AgentControlHandle::from_connection(client)
+            .await
+            .expect("agent-control connection should bootstrap")
+    }
+
+    #[allow(dead_code)]
     pub async fn connect_fresh_host(&self) -> client::Connection {
         let host = server::spawn_host_with_mock_backend(
             self.session_store_path(),
@@ -64,6 +75,23 @@ impl Fixture {
 }
 
 async fn connect_client(host: server::HostHandle) -> client::Connection {
+    let mut client = connect_raw_client(host).await;
+
+    let env = client
+        .next_event()
+        .await
+        .expect("initial host settings read failed")
+        .expect("connection closed before initial host settings");
+    assert_eq!(
+        env.kind,
+        FrameKind::HostSettings,
+        "first host event on connect must be HostSettings"
+    );
+
+    client
+}
+
+async fn connect_raw_client(host: server::HostHandle) -> client::Connection {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();
     let client_config = client::ClientConfig::current();

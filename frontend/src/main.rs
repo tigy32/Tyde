@@ -2,7 +2,9 @@ mod actions;
 mod app;
 mod bridge;
 mod components;
+mod devtools;
 mod dispatch;
+mod markdown;
 mod send;
 mod state;
 

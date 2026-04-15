@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo, SessionId,
-    StreamEndData, StreamStartData, StreamTextDeltaData,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -37,7 +37,9 @@ impl Backend for MockBackend {
     async fn spawn(
         workspace_roots: Vec<String>,
         _config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
+        let initial_message = initial_input.message;
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
 
@@ -61,14 +63,15 @@ impl Backend for MockBackend {
         let session_id_for_task = session_id.clone();
 
         tokio::spawn(async move {
+            record_prompt(&session_id_for_task, &initial_message);
+            if !emit_turn(&events_tx, &initial_message).await {
+                return;
+            }
             while let Some(input) = input_rx.recv().await {
-                match input {
-                    AgentInput::SendMessage(payload) => {
-                        record_prompt(&session_id_for_task, &payload.message);
-                        if !emit_turn(&events_tx, &payload.message).await {
-                            return;
-                        }
-                    }
+                let AgentInput::SendMessage(payload) = input;
+                record_prompt(&session_id_for_task, &payload.message);
+                if !emit_turn(&events_tx, &payload.message).await {
+                    return;
                 }
             }
         });
@@ -82,7 +85,11 @@ impl Backend for MockBackend {
         ))
     }
 
-    async fn resume(session_id: SessionId) -> Result<(Self, EventStream), String> {
+    async fn resume(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        session_id: SessionId,
+    ) -> Result<(Self, EventStream), String> {
         {
             let store = session_store()
                 .lock()
@@ -98,13 +105,10 @@ impl Backend for MockBackend {
 
         tokio::spawn(async move {
             while let Some(input) = input_rx.recv().await {
-                match input {
-                    AgentInput::SendMessage(payload) => {
-                        record_prompt(&session_id_for_task, &payload.message);
-                        if !emit_turn(&events_tx, &payload.message).await {
-                            return;
-                        }
-                    }
+                let AgentInput::SendMessage(payload) = input;
+                record_prompt(&session_id_for_task, &payload.message);
+                if !emit_turn(&events_tx, &payload.message).await {
+                    return;
                 }
             }
         });
@@ -146,6 +150,10 @@ impl Backend for MockBackend {
     async fn send(&self, input: AgentInput) -> bool {
         self.input_tx.send(input).await.is_ok()
     }
+
+    async fn interrupt(&self) -> bool {
+        true
+    }
 }
 
 fn record_prompt(session_id: &SessionId, prompt: &str) {
@@ -162,6 +170,14 @@ fn record_prompt(session_id: &SessionId, prompt: &str) {
 async fn emit_turn(events_tx: &mpsc::Sender<ChatEvent>, user_message: &str) -> bool {
     let message_id = Some(Uuid::new_v4().to_string());
     let response_text = format!("mock backend response to: {user_message}");
+
+    if events_tx
+        .send(ChatEvent::TypingStatusChanged(true))
+        .await
+        .is_err()
+    {
+        return false;
+    }
 
     if events_tx
         .send(ChatEvent::StreamStart(StreamStartData {
@@ -197,13 +213,28 @@ async fn emit_turn(events_tx: &mpsc::Sender<ChatEvent>, user_message: &str) -> b
         model_info: Some(ModelInfo {
             model: MOCK_MODEL.to_owned(),
         }),
-        token_usage: None,
+        token_usage: Some(TokenUsage {
+            input_tokens: 1250,
+            output_tokens: 340,
+            total_tokens: 1590,
+            cached_prompt_tokens: Some(800),
+            cache_creation_input_tokens: Some(50),
+            reasoning_tokens: Some(120),
+        }),
         context_breakdown: None,
         images: None,
     };
 
-    events_tx
+    if events_tx
         .send(ChatEvent::StreamEnd(StreamEndData { message }))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    events_tx
+        .send(ChatEvent::TypingStatusChanged(false))
         .await
         .is_ok()
 }

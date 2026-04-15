@@ -212,13 +212,13 @@ impl CodexSession {
 
     pub async fn shutdown(self) {
         self.inner.rpc.shutdown().await;
-        if let Some(path) = &self.inner.steering_tempfile {
-            if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!(
-                    "Failed to remove steering temp file {}: {e}",
-                    path.display()
-                );
-            }
+        if let Some(path) = &self.inner.steering_tempfile
+            && let Err(e) = std::fs::remove_file(path)
+        {
+            tracing::warn!(
+                "Failed to remove steering temp file {}: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -326,6 +326,26 @@ struct CodexInner {
 }
 
 impl CodexInner {
+    async fn ensure_active_stream_for_message(&self, message_id: &str) -> Option<(String, String)> {
+        let mut state = self.state.lock().await;
+        if state.active_stream.is_none() {
+            let turn_id = state
+                .active_turn_id
+                .clone()
+                .unwrap_or_else(|| message_id.to_string());
+            let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
+            state.active_stream = Some(ActiveStreamState {
+                turn_id,
+                message_id: message_id.to_string(),
+                text: String::new(),
+                reasoning: String::new(),
+            });
+            Some((message_id.to_string(), model))
+        } else {
+            None
+        }
+    }
+
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage { message, images } => {
@@ -908,6 +928,19 @@ impl CodexInner {
                     .to_string();
                 if delta.is_empty() {
                     return;
+                }
+                if let Some((stream_message_id, model)) =
+                    self.ensure_active_stream_for_message(&message_id).await
+                {
+                    self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
+                    self.emit_event(json!({
+                        "kind": "StreamStart",
+                        "data": {
+                            "message_id": stream_message_id,
+                            "agent": CODEX_AGENT_NAME,
+                            "model": model
+                        }
+                    }));
                 }
                 {
                     let mut state = self.state.lock().await;
@@ -1954,13 +1987,11 @@ impl CodexInner {
                             should_emit = true;
                         }
                     }
-                    if should_emit {
-                        if let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
-                            let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
-                            estimate.reasoning_bytes = estimate
-                                .reasoning_bytes
-                                .saturating_add(reasoning_text.len() as u64);
-                        }
+                    if should_emit && let Some(turn_id) = state.active_turn_id.as_ref().cloned() {
+                        let estimate = state.turn_context_by_turn.entry(turn_id).or_default();
+                        estimate.reasoning_bytes = estimate
+                            .reasoning_bytes
+                            .saturating_add(reasoning_text.len() as u64);
                     }
                 }
 
@@ -3196,10 +3227,9 @@ where
             if !trimmed.is_empty()
                 && (trimmed.starts_with('{') || trimmed.starts_with('['))
                 && trimmed.len() <= 2_000_000
+                && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
             {
-                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                    codex_visit_value_and_embedded_json(&parsed, depth - 1, visitor);
-                }
+                codex_visit_value_and_embedded_json(&parsed, depth - 1, visitor);
             }
         }
         _ => {}
@@ -3284,10 +3314,10 @@ fn codex_find_string(value: &Value, keys: &[&str], depth: usize) -> Option<Strin
 }
 
 fn extract_codex_item_text(item: &Value) -> String {
-    if let Some(text) = item.get("text").and_then(Value::as_str) {
-        if !text.trim().is_empty() {
-            return text.to_string();
-        }
+    if let Some(text) = item.get("text").and_then(Value::as_str)
+        && !text.trim().is_empty()
+    {
+        return text.to_string();
     }
 
     let mut chunks: Vec<String> = Vec::new();
@@ -3305,10 +3335,10 @@ fn extract_codex_item_text(item: &Value) -> String {
                 }
                 continue;
             }
-            if let Some(text) = part.get("value").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    chunks.push(text.to_string());
-                }
+            if let Some(text) = part.get("value").and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                chunks.push(text.to_string());
             }
         }
     }
@@ -3341,10 +3371,10 @@ fn extract_codex_reasoning_delta_text(params: &Value) -> Option<String> {
     }
 
     for nested in ["msg", "event", "payload"] {
-        if let Some(value) = params.get(nested) {
-            if let Some(text) = extract_codex_reasoning_delta_text(value) {
-                return Some(text);
-            }
+        if let Some(value) = params.get(nested)
+            && let Some(text) = extract_codex_reasoning_delta_text(value)
+        {
+            return Some(text);
         }
     }
 
@@ -4495,6 +4525,917 @@ impl CodexRpc {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backend trait implementation
+// ---------------------------------------------------------------------------
+
+use protocol::{
+    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SessionId, SpawnCostHint,
+    StreamEndData, StreamStartData, StreamTextDeltaData, ToolExecutionCompletedData,
+    ToolExecutionResult, ToolRequest, ToolRequestType,
+};
+
+use super::{
+    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+};
+
+const BACKEND_INPUT_BUFFER: usize = 64;
+const BACKEND_EVENT_BUFFER: usize = 256;
+
+pub struct CodexBackend {
+    input_tx: mpsc::Sender<AgentInput>,
+    interrupt_tx: mpsc::Sender<()>,
+    session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
+}
+
+fn codex_backend_defaults(cost_hint: Option<SpawnCostHint>) -> (Option<String>, Option<String>) {
+    match cost_hint {
+        Some(SpawnCostHint::Low) => (None, Some("minimal".to_string())),
+        Some(SpawnCostHint::Medium) => (None, Some("medium".to_string())),
+        Some(SpawnCostHint::High) => (None, Some("xhigh".to_string())),
+        None => (None, None),
+    }
+}
+
+fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        timestamp: unix_now_ms(),
+        sender: MessageSender::User,
+        content,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images,
+    })
+}
+
+fn raw_chat_event(value: &Value) -> Option<ChatEvent> {
+    serde_json::from_value::<ChatEvent>(value.clone()).ok()
+}
+
+impl Backend for CodexBackend {
+    async fn spawn(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), String> {
+        let initial_message = initial_input.message;
+        let initial_images = initial_input.images;
+        let roots = if workspace_roots.is_empty() {
+            vec!["/tmp".to_string()]
+        } else {
+            workspace_roots
+        };
+        let cwd = pick_workspace_root(&roots)?;
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let session_id_task = Arc::clone(&session_id);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+
+        tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            let (model_override, effort_override) = codex_backend_defaults(config.cost_hint);
+            // --- spawn codex CLI ------------------------------------------------
+            let mut child = match Command::new("codex")
+                .arg("app-server")
+                .arg("--listen")
+                .arg("stdio://")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to spawn codex app-server: {e}");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(format!("Failed to spawn codex app-server: {e}")));
+                    }
+                    return;
+                }
+            };
+
+            let stdin = child.stdin.take().expect("capture codex stdin");
+            let stdout = child.stdout.take().expect("capture codex stdout");
+
+            let stdin = Arc::new(Mutex::new(stdin));
+            let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
+            let next_id = Arc::new(AtomicU64::new(1));
+
+            // --- stdout reader task ---------------------------------------------
+            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<(String, Value)>();
+            {
+                let pending = Arc::clone(&pending);
+                let notif_tx = notif_tx.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let parsed: Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        // RPC response (has result/error, no method)
+                        if let Some(id) = parsed.get("id").and_then(Value::as_u64) {
+                            let has_result_or_error =
+                                parsed.get("result").is_some() || parsed.get("error").is_some();
+                            let has_method = parsed.get("method").is_some();
+                            if has_result_or_error && !has_method {
+                                let response = if let Some(result) = parsed.get("result") {
+                                    Ok(result.clone())
+                                } else {
+                                    let err_obj =
+                                        parsed.get("error").cloned().unwrap_or(Value::Null);
+                                    let msg = err_obj
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| {
+                                            format!("Codex JSON-RPC error: {err_obj}")
+                                        });
+                                    Err(msg)
+                                };
+                                if let Some(tx) = pending.lock().await.remove(&id) {
+                                    let _ = tx.send(response);
+                                }
+                                continue;
+                            }
+                        }
+
+                        // Notification (has method, no id or has id as server-request)
+                        if let Some(method) = parsed.get("method").and_then(Value::as_str) {
+                            let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+                            let _ = notif_tx.send((method.to_string(), params));
+                        }
+                    }
+                });
+            }
+
+            // --- helper: send a JSON-RPC request --------------------------------
+            async fn rpc_request(
+                stdin: &Arc<Mutex<ChildStdin>>,
+                pending: &PendingRpcMap,
+                next_id: &Arc<AtomicU64>,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, String> {
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                let payload = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params
+                });
+
+                let (tx, rx) = oneshot::channel();
+                pending.lock().await.insert(id, tx);
+
+                {
+                    let mut w = stdin.lock().await;
+                    let line = format!("{payload}\n");
+                    if let Err(e) = w.write_all(line.as_bytes()).await {
+                        pending.lock().await.remove(&id);
+                        return Err(format!("Failed to write to codex stdin: {e}"));
+                    }
+                }
+
+                match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err("Codex response channel closed".to_string()),
+                    Err(_) => {
+                        pending.lock().await.remove(&id);
+                        Err(format!("Codex request timed out for method '{method}'"))
+                    }
+                }
+            }
+
+            // --- initialize -----------------------------------------------------
+            if let Err(e) = rpc_request(
+                &stdin,
+                &pending,
+                &next_id,
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "tyde",
+                        "title": Value::Null,
+                        "version": "0.1"
+                    },
+                    "capabilities": {
+                        "experimentalApi": true
+                    }
+                }),
+            )
+            .await
+            {
+                tracing::error!("Codex initialize failed: {e}");
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!("Codex initialize failed: {e}")));
+                }
+                return;
+            }
+
+            // --- thread/start ---------------------------------------------------
+            let thread_result = rpc_request(
+                &stdin,
+                &pending,
+                &next_id,
+                "thread/start",
+                json!({
+                    "cwd": cwd,
+                    "sandbox": CODEX_FORCED_THREAD_SANDBOX,
+                    "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
+                }),
+            )
+            .await;
+
+            let thread_id = match &thread_result {
+                Ok(val) => val
+                    .get("thread")
+                    .and_then(|t| t.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("thread")
+                    .to_string(),
+                Err(e) => {
+                    tracing::error!("Codex thread/start failed: {e}");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(format!("Codex thread/start failed: {e}")));
+                    }
+                    return;
+                }
+            };
+            *session_id_task
+                .lock()
+                .expect("codex session_id mutex poisoned") = Some(SessionId(thread_id.clone()));
+
+            let model = thread_result
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("model"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+
+            // --- event loop: translate notifications -> ChatEvent ----------------
+            let model_name = model_override
+                .clone()
+                .or(model)
+                .unwrap_or_else(|| "codex".to_string());
+            let mut accumulated_text = String::new();
+            let mut current_message_id: Option<String> = None;
+            let mut active_turn_id: Option<String> = None;
+            let mut typing_status_active = false;
+            let mut file_change_call_ids: HashMap<String, Vec<String>> = HashMap::new();
+            let stdin_for_input = Arc::clone(&stdin);
+            let pending_for_input = Arc::clone(&pending);
+            let next_id_for_input = Arc::clone(&next_id);
+            let thread_id_for_input = thread_id.clone();
+            let model_for_input = model_override.clone();
+            let effort_for_input = effort_override.clone();
+
+            if events_tx
+                .send(backend_user_message(
+                    initial_message.clone(),
+                    initial_images.clone(),
+                ))
+                .await
+                .is_err()
+            {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err("codex event stream closed".to_string()));
+                }
+                return;
+            }
+            let mut initial_input_items = vec![json!({
+                "type": "text",
+                "text": initial_message,
+            })];
+            if let Some(imgs) = protocol_images_to_attachments(initial_images) {
+                for image in imgs {
+                    let path = match persist_temp_image(&image).await {
+                        Ok(path) => path,
+                        Err(err) => {
+                            tracing::error!(
+                                "Failed to persist Codex initial image attachment: {err}"
+                            );
+                            if let Some(tx) = ready_tx.take() {
+                                let _ = tx.send(Err(format!(
+                                    "Failed to persist Codex initial image attachment: {err}"
+                                )));
+                            }
+                            return;
+                        }
+                    };
+                    initial_input_items.push(json!({
+                        "type": "localImage",
+                        "path": path,
+                    }));
+                }
+            }
+            let mut initial_turn_params = json!({
+                "threadId": thread_id,
+                "input": initial_input_items,
+            });
+            if let Some(model) = model_override.clone() {
+                initial_turn_params["model"] = Value::String(model);
+            }
+            if let Some(effort) = effort_override.clone() {
+                initial_turn_params["effort"] = Value::String(effort);
+            }
+            if let Err(err) = rpc_request(
+                &stdin_for_input,
+                &pending_for_input,
+                &next_id_for_input,
+                "turn/start",
+                initial_turn_params,
+            )
+            .await
+            {
+                tracing::error!("Failed to send initial Codex prompt: {err}");
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!("Failed to send initial Codex prompt: {err}")));
+                }
+                return;
+            }
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Ok(()));
+            }
+
+            loop {
+                tokio::select! {
+                    notif = notif_rx.recv() => {
+                        let Some((method, params)) = notif else { break };
+
+                        match method.as_str() {
+                            "turn/started" => {
+                                let turn_id = params
+                                    .get("turn")
+                                    .and_then(|v| v.get("id"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("turn")
+                                    .to_string();
+                                active_turn_id = Some(turn_id.clone());
+                                current_message_id = Some(turn_id.clone());
+                                accumulated_text.clear();
+                                if !typing_status_active {
+                                    let _ = events_tx
+                                        .send(ChatEvent::TypingStatusChanged(true))
+                                        .await;
+                                    typing_status_active = true;
+                                }
+                                let _ = events_tx
+                                    .send(ChatEvent::StreamStart(StreamStartData {
+                                        message_id: Some(turn_id),
+                                        agent: CODEX_AGENT_NAME.to_owned(),
+                                        model: Some(model_name.clone()),
+                                    }))
+                                    .await;
+                            }
+                            "item/agentMessage/delta" => {
+                                let delta = params
+                                    .get("delta")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if delta.is_empty() {
+                                    continue;
+                                }
+                                let msg_id = params
+                                    .get("itemId")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string())
+                                    .or_else(|| current_message_id.clone());
+                                if current_message_id.is_none() {
+                                    let start_message_id =
+                                        msg_id.clone().unwrap_or_else(|| "assistant".to_string());
+                                    current_message_id = Some(start_message_id.clone());
+                                    accumulated_text.clear();
+                                    if !typing_status_active {
+                                        let _ = events_tx
+                                            .send(ChatEvent::TypingStatusChanged(true))
+                                            .await;
+                                        typing_status_active = true;
+                                    }
+                                    let _ = events_tx
+                                        .send(ChatEvent::StreamStart(StreamStartData {
+                                            message_id: Some(start_message_id),
+                                            agent: CODEX_AGENT_NAME.to_owned(),
+                                            model: Some(model_name.clone()),
+                                        }))
+                                        .await;
+                                }
+                                accumulated_text.push_str(&delta);
+                                let _ = events_tx
+                                    .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+                                        message_id: msg_id,
+                                        text: delta,
+                                    }))
+                                    .await;
+                            }
+                            "item/completed" => {
+                                let item_type = params
+                                    .get("item")
+                                    .and_then(|v| v.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                let item_id = item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("item")
+                                    .to_string();
+                                match item_type {
+                                    "agentMessage" => {
+                                        let text = item
+                                            .get("text")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let final_text = if text.is_empty() {
+                                            std::mem::take(&mut accumulated_text)
+                                        } else {
+                                            accumulated_text.clear();
+                                            text
+                                        };
+                                        let message = ChatMessage {
+                                            timestamp: unix_now_ms(),
+                                            sender: MessageSender::Assistant {
+                                                agent: CODEX_AGENT_NAME.to_owned(),
+                                            },
+                                            content: final_text,
+                                            reasoning: None,
+                                            tool_calls: Vec::new(),
+                                            model_info: Some(ModelInfo {
+                                                model: model_name.clone(),
+                                            }),
+                                            token_usage: None,
+                                            context_breakdown: None,
+                                            images: None,
+                                        };
+                                        let _ = events_tx
+                                            .send(ChatEvent::StreamEnd(StreamEndData { message }))
+                                            .await;
+                                        current_message_id = None;
+                                    }
+                                    "commandExecution" => {
+                                        let exit_code =
+                                            item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
+                                                as i32;
+                                        let output = item
+                                            .get("aggregatedOutput")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let success = exit_code == 0;
+                                        let _ = events_tx
+                                            .send(ChatEvent::ToolExecutionCompleted(
+                                                ToolExecutionCompletedData {
+                                                    tool_call_id: item_id,
+                                                    tool_name: "run_command".to_string(),
+                                                    tool_result: ToolExecutionResult::RunCommand {
+                                                        exit_code,
+                                                        stdout: output,
+                                                        stderr: String::new(),
+                                                    },
+                                                    success,
+                                                    error: if success {
+                                                        None
+                                                    } else {
+                                                        Some(format!(
+                                                            "Command failed with exit code {exit_code}"
+                                                        ))
+                                                    },
+                                                },
+                                            ))
+                                            .await;
+                                    }
+                                    "fileChange" => {
+                                        let file_changes = parse_codex_file_changes(&item);
+                                        let success =
+                                            item.get("status").and_then(Value::as_str) == Some("completed");
+                                        let known_call_ids =
+                                            file_change_call_ids.remove(&item_id).unwrap_or_default();
+                                        if !file_changes.is_empty() {
+                                            let total = file_changes.len();
+                                            for (idx, change) in file_changes.iter().enumerate() {
+                                                let call_id = known_call_ids
+                                                    .get(idx)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| {
+                                                        codex_file_change_call_id(&item_id, idx, total)
+                                                    });
+                                                let _ = events_tx
+                                                    .send(ChatEvent::ToolExecutionCompleted(
+                                                        ToolExecutionCompletedData {
+                                                            tool_call_id: call_id,
+                                                            tool_name: "modify_file".to_string(),
+                                                            tool_result:
+                                                                ToolExecutionResult::ModifyFile {
+                                                                    lines_added: change.lines_added,
+                                                                    lines_removed: change.lines_removed,
+                                                                },
+                                                            success,
+                                                            error: if success {
+                                                                None
+                                                            } else {
+                                                                Some(
+                                                                    "File changes were not applied"
+                                                                        .to_string(),
+                                                                )
+                                                            },
+                                                        },
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
+                                    | "dynamicToolCall" => {
+                                        let tool_name = item
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or(item_type)
+                                            .to_string();
+                                        let success =
+                                            item.get("status").and_then(Value::as_str) == Some("completed")
+                                                || item.get("success").and_then(Value::as_bool)
+                                                    == Some(true);
+                                        let _ = events_tx
+                                            .send(ChatEvent::ToolExecutionCompleted(
+                                                ToolExecutionCompletedData {
+                                                    tool_call_id: item_id,
+                                                    tool_name: tool_name.clone(),
+                                                    tool_result: ToolExecutionResult::Other {
+                                                        result: item,
+                                                    },
+                                                    success,
+                                                    error: if success {
+                                                        None
+                                                    } else {
+                                                        Some(format!("{tool_name} failed"))
+                                                    },
+                                                },
+                                            ))
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            "item/started" => {
+                                let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                let item_type = item
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                let item_id = item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool-call")
+                                    .to_string();
+                                match item_type {
+                                    "commandExecution" => {
+                                        let command = item
+                                            .get("command")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let cwd = item
+                                            .get("cwd")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let _ = events_tx
+                                            .send(ChatEvent::ToolRequest(ToolRequest {
+                                                tool_call_id: item_id,
+                                                tool_name: "run_command".to_string(),
+                                                tool_type: ToolRequestType::RunCommand {
+                                                    command,
+                                                    working_directory: cwd,
+                                                },
+                                            }))
+                                            .await;
+                                    }
+                                    "fileChange" => {
+                                        let file_changes = parse_codex_file_changes(&item);
+                                        if file_changes.is_empty() {
+                                            continue;
+                                        }
+                                        let total = file_changes.len();
+                                        let call_ids = file_changes
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(idx, _)| {
+                                                codex_file_change_call_id(&item_id, idx, total)
+                                            })
+                                            .collect::<Vec<_>>();
+                                        file_change_call_ids
+                                            .insert(item_id.clone(), call_ids.clone());
+                                        for (change, call_id) in
+                                            file_changes.into_iter().zip(call_ids.into_iter())
+                                        {
+                                            let _ = events_tx
+                                                .send(ChatEvent::ToolRequest(ToolRequest {
+                                                    tool_call_id: call_id,
+                                                    tool_name: "modify_file".to_string(),
+                                                    tool_type: ToolRequestType::ModifyFile {
+                                                        file_path: change.path,
+                                                        before: change.before,
+                                                        after: change.after,
+                                                    },
+                                                }))
+                                                .await;
+                                        }
+                                    }
+                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
+                                    | "dynamicToolCall" => {
+                                        let tool_name = item
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or(item_type)
+                                            .to_string();
+                                        let _ = events_tx
+                                            .send(ChatEvent::ToolRequest(ToolRequest {
+                                                tool_call_id: item_id,
+                                                tool_name,
+                                                tool_type: ToolRequestType::Other { args: item },
+                                            }))
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            "turn/completed" => {
+                                let turn_status = params
+                                    .get("turn")
+                                    .and_then(|v| v.get("status"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("completed");
+                                active_turn_id = None;
+                                // If we still have an open stream (no item/completed
+                                // for agentMessage was received), close it now.
+                                if current_message_id.is_some() {
+                                    let final_text = std::mem::take(&mut accumulated_text);
+                                    let message = ChatMessage {
+                                        timestamp: unix_now_ms(),
+                                        sender: MessageSender::Assistant {
+                                            agent: CODEX_AGENT_NAME.to_owned(),
+                                        },
+                                        content: final_text,
+                                        reasoning: None,
+                                        tool_calls: Vec::new(),
+                                        model_info: Some(ModelInfo {
+                                            model: model_name.clone(),
+                                        }),
+                                        token_usage: None,
+                                        context_breakdown: None,
+                                        images: None,
+                                    };
+                                    let _ = events_tx
+                                        .send(ChatEvent::StreamEnd(StreamEndData { message }))
+                                        .await;
+                                    current_message_id = None;
+                                }
+                                if turn_status == "interrupted" {
+                                    let _ = events_tx
+                                        .send(ChatEvent::OperationCancelled(
+                                            protocol::OperationCancelledData {
+                                                message: "Operation cancelled".to_string(),
+                                            },
+                                        ))
+                                        .await;
+                                }
+                                if typing_status_active {
+                                    let _ = events_tx
+                                        .send(ChatEvent::TypingStatusChanged(false))
+                                        .await;
+                                    typing_status_active = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else { break };
+                        let AgentInput::SendMessage(payload) = input;
+                        let backend_message = payload.message;
+                        let visible_message = backend_message.clone();
+                        let visible_images = payload.images.clone();
+                        let images = protocol_images_to_attachments(payload.images);
+                        if events_tx
+                            .send(backend_user_message(visible_message, visible_images))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let mut input_items = vec![json!({
+                            "type": "text",
+                            "text": backend_message,
+                        })];
+                        if let Some(imgs) = images {
+                            for image in imgs {
+                                let path = match persist_temp_image(&image).await {
+                                    Ok(path) => path,
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "Failed to persist Codex image attachment: {err}"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                input_items.push(json!({
+                                    "type": "localImage",
+                                    "path": path,
+                                }));
+                            }
+                        }
+                        let mut turn_params = json!({
+                            "threadId": thread_id_for_input,
+                            "input": input_items,
+                        });
+                        if let Some(model) = model_for_input.clone() {
+                            turn_params["model"] = Value::String(model);
+                        }
+                        if let Some(effort) = effort_for_input.clone() {
+                            turn_params["effort"] = Value::String(effort);
+                        }
+                        let _ = rpc_request(
+                            &stdin_for_input,
+                            &pending_for_input,
+                            &next_id_for_input,
+                            "turn/start",
+                            turn_params,
+                        )
+                        .await;
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break };
+                        let Some(turn_id) = active_turn_id.clone() else { continue };
+                        let _ = rpc_request(
+                            &stdin_for_input,
+                            &pending_for_input,
+                            &next_id_for_input,
+                            "turn/interrupt",
+                            json!({
+                                "threadId": thread_id_for_input,
+                                "turnId": turn_id,
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err("Codex spawn initialization task ended early".to_string()),
+        }
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: protocol::SessionId,
+    ) -> Result<(Self, EventStream), String> {
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+
+        let roots = if workspace_roots.is_empty() {
+            vec!["/tmp".to_string()]
+        } else {
+            workspace_roots
+        };
+        let session_id = session_id.0;
+        let backend_session_id =
+            Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
+
+        tokio::spawn(async move {
+            let (session, mut raw_events) = match CodexSession::spawn(&roots, None, &[], None).await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Codex resume session: {err}");
+                    return;
+                }
+            };
+
+            let handle = session.command_handle();
+            let (model_override, effort_override) = codex_backend_defaults(config.cost_hint);
+            if model_override.is_some() || effort_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                    "reasoning_effort": effort_override,
+                    "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure resumed Codex session: {err}");
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
+            if let Err(err) = handle
+                .execute(SessionCommand::ResumeSession { session_id })
+                .await
+            {
+                tracing::error!("Failed to resume Codex session: {err}");
+                session.shutdown().await;
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if let Some(event) = raw_chat_event(&raw)
+                            && events_tx.send(event).await.is_err() {
+                                break;
+                            }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else {
+                            break;
+                        };
+                        let AgentInput::SendMessage(payload) = input;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message: payload.message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send Codex resume follow-up: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt resumed Codex turn: {err}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id: backend_session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+        Err("CodexBackend::list_sessions requires a live Codex RPC session".to_string())
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.session_id
+            .lock()
+            .expect("codex session_id mutex poisoned")
+            .clone()
+            .expect("codex session_id not initialized")
+    }
+
+    async fn send(&self, input: AgentInput) -> bool {
+        self.input_tx.send(input).await.is_ok()
+    }
+
+    async fn interrupt(&self) -> bool {
+        self.interrupt_tx.send(()).await.is_ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4870,15 +5811,14 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                     live_test_log("completion callback observed; exiting wait loop");
                     break;
                 }
-                if let Some(idle_at) = idle_edge_at {
-                    if tokio::time::Instant::now().duration_since(idle_at) >= idle_grace {
+                if let Some(idle_at) = idle_edge_at
+                    && tokio::time::Instant::now().duration_since(idle_at) >= idle_grace {
                         live_test_log(&format!(
                             "idle edge grace elapsed ({:?}) with no completion callback; exiting wait loop",
                             idle_grace
                         ));
                         break;
                     }
-                }
 
                 match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
                     Ok(Some(event)) => {
@@ -4944,7 +5884,7 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                         break;
                     }
                     Err(_) => {
-                        if poll_ticks % 10 == 0 {
+                        if poll_ticks.is_multiple_of(10) {
                             live_test_log(&format!(
                                 "still waiting... elapsed={}s",
                                 poll_ticks.saturating_mul(2)
@@ -5222,10 +6162,7 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             .turn_context_by_turn
             .get("turn-test")
             .expect("turn context");
-        assert_eq!(
-            ctx.reasoning_bytes,
-            "Inspecting constraints.".as_bytes().len() as u64
-        );
+        assert_eq!(ctx.reasoning_bytes, "Inspecting constraints.".len() as u64);
     }
 
     #[test]
@@ -5781,377 +6718,5 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             policy.get("type").and_then(Value::as_str),
             Some("workspaceWrite")
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Backend trait implementation
-// ---------------------------------------------------------------------------
-
-use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SpawnCostHint, StreamEndData,
-    StreamStartData, StreamTextDeltaData,
-};
-
-use super::{Backend, BackendSpawnConfig, EventStream};
-
-const BACKEND_INPUT_BUFFER: usize = 64;
-const BACKEND_EVENT_BUFFER: usize = 256;
-
-pub struct CodexBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-}
-
-fn codex_backend_defaults(cost_hint: Option<SpawnCostHint>) -> (Option<String>, Option<String>) {
-    match cost_hint {
-        Some(SpawnCostHint::Low) => (None, Some("minimal".to_string())),
-        Some(SpawnCostHint::Medium) => (None, Some("medium".to_string())),
-        Some(SpawnCostHint::High) => (None, Some("xhigh".to_string())),
-        None => (None, None),
-    }
-}
-
-impl Backend for CodexBackend {
-    async fn spawn(
-        _workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-    ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
-
-        tokio::spawn(async move {
-            let (model_override, effort_override) = codex_backend_defaults(config.cost_hint);
-            // --- spawn codex CLI ------------------------------------------------
-            let mut child = match Command::new("codex")
-                .arg("app-server")
-                .arg("--listen")
-                .arg("stdio://")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to spawn codex app-server: {e}");
-                    return;
-                }
-            };
-
-            let stdin = child.stdin.take().expect("capture codex stdin");
-            let stdout = child.stdout.take().expect("capture codex stdout");
-
-            let stdin = Arc::new(Mutex::new(stdin));
-            let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
-            let next_id = Arc::new(AtomicU64::new(1));
-
-            // --- stdout reader task ---------------------------------------------
-            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<(String, Value)>();
-            {
-                let pending = Arc::clone(&pending);
-                let notif_tx = notif_tx.clone();
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let parsed: Value = match serde_json::from_str(&line) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-
-                        // RPC response (has result/error, no method)
-                        if let Some(id) = parsed.get("id").and_then(Value::as_u64) {
-                            let has_result_or_error =
-                                parsed.get("result").is_some() || parsed.get("error").is_some();
-                            let has_method = parsed.get("method").is_some();
-                            if has_result_or_error && !has_method {
-                                let response = if let Some(result) = parsed.get("result") {
-                                    Ok(result.clone())
-                                } else {
-                                    let err_obj =
-                                        parsed.get("error").cloned().unwrap_or(Value::Null);
-                                    let msg = err_obj
-                                        .get("message")
-                                        .and_then(Value::as_str)
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| {
-                                            format!("Codex JSON-RPC error: {err_obj}")
-                                        });
-                                    Err(msg)
-                                };
-                                if let Some(tx) = pending.lock().await.remove(&id) {
-                                    let _ = tx.send(response);
-                                }
-                                continue;
-                            }
-                        }
-
-                        // Notification (has method, no id or has id as server-request)
-                        if let Some(method) = parsed.get("method").and_then(Value::as_str) {
-                            let params = parsed.get("params").cloned().unwrap_or(Value::Null);
-                            let _ = notif_tx.send((method.to_string(), params));
-                        }
-                    }
-                });
-            }
-
-            // --- helper: send a JSON-RPC request --------------------------------
-            async fn rpc_request(
-                stdin: &Arc<Mutex<ChildStdin>>,
-                pending: &PendingRpcMap,
-                next_id: &Arc<AtomicU64>,
-                method: &str,
-                params: Value,
-            ) -> Result<Value, String> {
-                let id = next_id.fetch_add(1, Ordering::Relaxed);
-                let payload = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": method,
-                    "params": params
-                });
-
-                let (tx, rx) = oneshot::channel();
-                pending.lock().await.insert(id, tx);
-
-                {
-                    let mut w = stdin.lock().await;
-                    let line = format!("{payload}\n");
-                    if let Err(e) = w.write_all(line.as_bytes()).await {
-                        pending.lock().await.remove(&id);
-                        return Err(format!("Failed to write to codex stdin: {e}"));
-                    }
-                }
-
-                match tokio::time::timeout(CODEX_REQUEST_TIMEOUT, rx).await {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_)) => Err("Codex response channel closed".to_string()),
-                    Err(_) => {
-                        pending.lock().await.remove(&id);
-                        Err(format!("Codex request timed out for method '{method}'"))
-                    }
-                }
-            }
-
-            // --- initialize -----------------------------------------------------
-            if let Err(e) = rpc_request(
-                &stdin,
-                &pending,
-                &next_id,
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "tyde",
-                        "title": Value::Null,
-                        "version": "0.1"
-                    },
-                    "capabilities": {
-                        "experimentalApi": true
-                    }
-                }),
-            )
-            .await
-            {
-                tracing::error!("Codex initialize failed: {e}");
-                return;
-            }
-
-            // --- thread/start ---------------------------------------------------
-            let thread_result = rpc_request(
-                &stdin,
-                &pending,
-                &next_id,
-                "thread/start",
-                json!({
-                    "sandbox": CODEX_FORCED_THREAD_SANDBOX,
-                    "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
-                }),
-            )
-            .await;
-
-            let thread_id = match &thread_result {
-                Ok(val) => val
-                    .get("thread")
-                    .and_then(|t| t.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("thread")
-                    .to_string(),
-                Err(e) => {
-                    tracing::error!("Codex thread/start failed: {e}");
-                    return;
-                }
-            };
-
-            let model = thread_result
-                .as_ref()
-                .ok()
-                .and_then(|v| v.get("model"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
-
-            // --- event loop: translate notifications -> ChatEvent ----------------
-            let model_name = model_override
-                .clone()
-                .or(model)
-                .unwrap_or_else(|| "codex".to_string());
-            let mut accumulated_text = String::new();
-            let mut current_message_id: Option<String> = None;
-            let stdin_for_input = Arc::clone(&stdin);
-            let pending_for_input = Arc::clone(&pending);
-            let next_id_for_input = Arc::clone(&next_id);
-            let thread_id_for_input = thread_id.clone();
-            let model_for_input = model_override.clone();
-            let effort_for_input = effort_override.clone();
-
-            loop {
-                tokio::select! {
-                    notif = notif_rx.recv() => {
-                        let Some((method, params)) = notif else { break };
-
-                        match method.as_str() {
-                            "turn/started" => {
-                                let turn_id = params
-                                    .get("turn")
-                                    .and_then(|v| v.get("id"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("turn")
-                                    .to_string();
-                                current_message_id = Some(turn_id.clone());
-                                accumulated_text.clear();
-                                let _ = events_tx
-                                    .send(ChatEvent::StreamStart(StreamStartData {
-                                        message_id: Some(turn_id),
-                                        agent: CODEX_AGENT_NAME.to_owned(),
-                                        model: Some(model_name.clone()),
-                                    }))
-                                    .await;
-                            }
-                            "item/agentMessage/delta" => {
-                                let delta = params
-                                    .get("delta")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                if delta.is_empty() {
-                                    continue;
-                                }
-                                let msg_id = params
-                                    .get("itemId")
-                                    .and_then(Value::as_str)
-                                    .map(|s| s.to_string())
-                                    .or_else(|| current_message_id.clone());
-                                accumulated_text.push_str(&delta);
-                                let _ = events_tx
-                                    .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                                        message_id: msg_id,
-                                        text: delta,
-                                    }))
-                                    .await;
-                            }
-                            "item/completed" => {
-                                let item_type = params
-                                    .get("item")
-                                    .and_then(|v| v.get("type"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                if item_type == "agentMessage" {
-                                    let text = params
-                                        .get("item")
-                                        .and_then(|v| v.get("text"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let final_text = if text.is_empty() {
-                                        std::mem::take(&mut accumulated_text)
-                                    } else {
-                                        accumulated_text.clear();
-                                        text
-                                    };
-                                    let message = ChatMessage {
-                                        timestamp: unix_now_ms(),
-                                        sender: MessageSender::Assistant {
-                                            agent: CODEX_AGENT_NAME.to_owned(),
-                                        },
-                                        content: final_text,
-                                        reasoning: None,
-                                        tool_calls: Vec::new(),
-                                        model_info: Some(ModelInfo {
-                                            model: model_name.clone(),
-                                        }),
-                                        token_usage: None,
-                                        context_breakdown: None,
-                                        images: None,
-                                    };
-                                    let _ = events_tx
-                                        .send(ChatEvent::StreamEnd(StreamEndData { message }))
-                                        .await;
-                                    current_message_id = None;
-                                }
-                            }
-                            "turn/completed" => {
-                                // If we still have an open stream (no item/completed
-                                // for agentMessage was received), close it now.
-                                if current_message_id.is_some() {
-                                    let final_text = std::mem::take(&mut accumulated_text);
-                                    let message = ChatMessage {
-                                        timestamp: unix_now_ms(),
-                                        sender: MessageSender::Assistant {
-                                            agent: CODEX_AGENT_NAME.to_owned(),
-                                        },
-                                        content: final_text,
-                                        reasoning: None,
-                                        tool_calls: Vec::new(),
-                                        model_info: Some(ModelInfo {
-                                            model: model_name.clone(),
-                                        }),
-                                        token_usage: None,
-                                        context_breakdown: None,
-                                        images: None,
-                                    };
-                                    let _ = events_tx
-                                        .send(ChatEvent::StreamEnd(StreamEndData { message }))
-                                        .await;
-                                    current_message_id = None;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    input = input_rx.recv() => {
-                        let Some(input) = input else { break };
-                        match input {
-                            AgentInput::SendMessage(payload) => {
-                                let mut turn_params = json!({
-                                    "threadId": thread_id_for_input,
-                                    "input": [{
-                                        "type": "text",
-                                        "text": payload.message,
-                                    }],
-                                });
-                                if let Some(model) = model_for_input.clone() {
-                                    turn_params["model"] = Value::String(model);
-                                }
-                                if let Some(effort) = effort_for_input.clone() {
-                                    turn_params["effort"] = Value::String(effort);
-                                }
-                                let _ = rpc_request(
-                                    &stdin_for_input,
-                                    &pending_for_input,
-                                    &next_id_for_input,
-                                    "turn/start",
-                                    turn_params,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok((Self { input_tx }, EventStream::new(events_rx)))
-    }
-
-    async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).await.is_ok()
     }
 }

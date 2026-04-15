@@ -1,10 +1,13 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::task_list::TaskListView;
 use crate::state::{AppState, TransientEvent};
+
+use protocol::BackendKind;
 
 #[component]
 pub fn ChatView() -> impl IntoView {
@@ -14,7 +17,6 @@ pub fn ChatView() -> impl IntoView {
 
     let messages = move || -> Vec<crate::state::ChatMessageEntry> {
         let Some(agent_id) = state.active_agent_id.get() else {
-            log::error!("messages() called with no active_agent_id");
             return Vec::new();
         };
         let map = state.chat_messages.get();
@@ -70,39 +72,114 @@ pub fn ChatView() -> impl IntoView {
         let agents = state.agents.get();
         match agents.iter().find(|a| a.agent_id == agent_id) {
             Some(a) => a.name.clone(),
-            None => {
-                log::error!("active_agent_id {:?} not found in agents list", agent_id);
-                format!("[unknown agent {:?}]", agent_id)
-            }
+            None => "[unknown agent]".to_owned(),
         }
     };
 
+    let agent_backend = move || -> Option<BackendKind> {
+        let agent_id = state.active_agent_id.get()?;
+        let agents = state.agents.get();
+        agents
+            .iter()
+            .find(|a| a.agent_id == agent_id)
+            .map(|a| a.backend_kind)
+    };
+
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
+    let user_scrolled_up = RwSignal::new(false);
+    let show_scroll_btn = RwSignal::new(false);
+
+    // Track user scroll position to detect manual scroll-up
+    let scroll_ref_for_handler = scroll_ref;
+    Effect::new(move |_| {
+        if let Some(el) = scroll_ref_for_handler.get() {
+            let el_clone = el.clone();
+            let handler = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+                let scroll_height = el_clone.scroll_height();
+                let scroll_top = el_clone.scroll_top();
+                let client_height = el_clone.client_height();
+                let distance_from_bottom = scroll_height - scroll_top - client_height;
+                let is_near_bottom = distance_from_bottom < 80;
+                user_scrolled_up.set(!is_near_bottom);
+                show_scroll_btn.set(!is_near_bottom);
+            });
+            let _ = el.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
+            handler.forget(); // Leak — lives for app lifetime
+        }
+    });
 
     // Auto-scroll effect: whenever messages or streaming change, scroll to bottom
+    // (only if user hasn't scrolled up)
     Effect::new(move |_| {
         let _msgs = messages();
         let _stream = streaming();
+        if let Some(ss) = _stream.as_ref() {
+            let _ = ss.text.get();
+            let _ = ss.reasoning.get();
+        }
+        if user_scrolled_up.get_untracked() {
+            return;
+        }
         if let Some(el) = scroll_ref.get() {
-            // Use request_animation_frame to ensure DOM has updated
             request_animation_frame(move || {
                 el.set_scroll_top(el.scroll_height());
             });
         }
     });
 
+    let scroll_to_bottom = move |_| {
+        if let Some(el) = scroll_ref.get() {
+            el.set_scroll_top(el.scroll_height());
+            user_scrolled_up.set(false);
+            show_scroll_btn.set(false);
+        }
+    };
+
+    let has_messages = move || !messages().is_empty();
+
     view! {
         <div class="chat-view">
             <Show
                 when=has_agent
-                fallback=|| view! {
-                    <div class="chat-empty">
-                        <p class="chat-empty-text">"Select an agent to start chatting"</p>
-                    </div>
+                fallback=move || {
+                    let is_initializing = move || state.agent_initializing.get();
+                    view! {
+                        <div class="chat-welcome">
+                            <Show
+                                when=is_initializing
+                                fallback=move || view! {
+                                    <div class="chat-welcome-inner">
+                                        <img class="chat-welcome-icon" src="icon.png" alt="Tyde" />
+                                        <h2 class="chat-welcome-title">"Tyde"</h2>
+                                        <p class="chat-welcome-subtitle">"Send a message to start a conversation"</p>
+                                        <div class="chat-welcome-shortcuts">
+                                            <span class="chat-welcome-shortcut"><kbd>"Enter"</kbd>" Send Message"</span>
+                                            <span class="chat-welcome-shortcut"><kbd>"Ctrl+K"</kbd>" Command Palette"</span>
+                                        </div>
+                                    </div>
+                                }
+                            >
+                                <div class="chat-initializing-overlay">
+                                    <div class="chat-initializing-spinner"></div>
+                                    <p class="chat-initializing-text">"Initializing agent\u{2026}"</p>
+                                </div>
+                            </Show>
+                        </div>
+                    }
                 }
             >
                 <div class="chat-agent-header">
                     <span class="chat-agent-name">{agent_name}</span>
+                    {move || agent_backend().map(|kind| {
+                        let (badge_class, label) = match kind {
+                            BackendKind::Tycode => ("backend-badge tycode", "Tycode"),
+                            BackendKind::Kiro => ("backend-badge kiro", "Kiro"),
+                            BackendKind::Claude => ("backend-badge claude", "Claude"),
+                            BackendKind::Codex => ("backend-badge codex", "Codex"),
+                            BackendKind::Gemini => ("backend-badge gemini", "Gemini"),
+                        };
+                        view! { <span class=badge_class>{label}</span> }
+                    })}
                 </div>
                 {move || {
                     view! {
@@ -112,35 +189,84 @@ pub fn ChatView() -> impl IntoView {
                         />
                     }
                 }}
-                <div class="chat-messages" node_ref=scroll_ref>
-                    {move || {
-                        messages().into_iter().map(|entry| {
-                            view! { <ChatMessageView entry=entry /> }
-                        }).collect::<Vec<_>>()
-                    }}
+                <div class="chat-messages-wrapper">
+                    <div class="chat-messages" node_ref=scroll_ref>
+                        // Show welcome hint when chat is empty and no streaming
+                        {move || {
+                            if !has_messages() && streaming().is_none() {
+                                Some(view! {
+                                    <div class="chat-empty-hint">
+                                        <p>"Type a message to start the conversation"</p>
+                                    </div>
+                                })
+                            } else {
+                                None
+                            }
+                        }}
 
-                    {move || {
-                        transient_events().map(|events| {
-                            events.into_iter().map(|ev| {
-                                let (class, text) = match ev {
-                                    TransientEvent::OperationCancelled { message } => {
-                                        ("transient-notice transient-cancelled", format!("Operation cancelled: {message}"))
-                                    }
-                                    TransientEvent::RetryAttempt { attempt, max_retries, error, backoff_ms } => {
-                                        ("transient-notice transient-retry", format!("Retrying ({attempt}/{max_retries}): {error}. Waiting {backoff_ms}ms\u{2026}"))
-                                    }
-                                };
-                                view! { <div class=class>{text}</div> }
+                        {move || {
+                            messages().into_iter().map(|entry| {
+                                view! { <ChatMessageView entry=entry /> }
                             }).collect::<Vec<_>>()
-                        })
-                    }}
+                        }}
 
-                    {move || {
-                        streaming().map(|ss| view! { <ChatStreamingView streaming=ss /> })
-                    }}
+                        // Transient events (retry, cancel) rendered as cards
+                        {move || {
+                            transient_events().map(|events| {
+                                events.into_iter().map(|ev| {
+                                    match ev {
+                                        TransientEvent::OperationCancelled { message } => {
+                                            view! {
+                                                <div class="chat-card chat-card-system chat-card-cancelled">
+                                                    <div class="chat-card-header">
+                                                        <span class="chat-card-sender">"Cancelled"</span>
+                                                    </div>
+                                                    <div class="chat-card-body">
+                                                        <p class="md-paragraph">{message}</p>
+                                                    </div>
+                                                </div>
+                                            }.into_any()
+                                        }
+                                        TransientEvent::RetryAttempt { attempt, max_retries, error, backoff_ms } => {
+                                            view! {
+                                                <div class="chat-card chat-card-retry">
+                                                    <div class="retry-card-header">
+                                                        <span class="retry-card-icon">"⏳"</span>
+                                                        <span class="retry-card-title">"Rate Limited"</span>
+                                                        <span class="retry-card-attempt">{format!("Attempt {attempt} of {max_retries}")}</span>
+                                                    </div>
+                                                    <div class="retry-card-body">
+                                                        <p class="retry-card-error">{error}</p>
+                                                        <p class="retry-card-countdown">{format!("Retrying in {backoff_ms}ms\u{2026}")}</p>
+                                                    </div>
+                                                </div>
+                                            }.into_any()
+                                        }
+                                    }
+                                }).collect::<Vec<_>>()
+                            })
+                        }}
+
+                        {move || {
+                            streaming().map(|ss| view! { <ChatStreamingView streaming=ss /> })
+                        }}
+                    </div>
+
+                    // Scroll-to-bottom button
+                    <Show when=move || show_scroll_btn.get()>
+                        <button
+                            class="scroll-to-bottom-btn"
+                            on:click=scroll_to_bottom
+                            title="Scroll to bottom"
+                        >
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                                <path d="M8 3L8 13M8 13L3 8M8 13L13 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                    </Show>
                 </div>
-                <ChatInput />
             </Show>
+            <ChatInput />
         </div>
     }
 }

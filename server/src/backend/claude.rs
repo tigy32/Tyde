@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::fs as tokio_fs;
@@ -581,14 +581,12 @@ impl ClaudeInner {
                     model_hint,
                 } => {
                     let mut summary = summary;
-                    if !ephemeral {
-                        if let Some(session_id) = summary.session_id.clone() {
-                            self.set_session_id(turn_id, session_id.clone()).await;
-                            self.emit_event(json!({
-                                "kind": "SessionStarted",
-                                "data": { "session_id": session_id }
-                            }));
-                        }
+                    if !ephemeral && let Some(session_id) = summary.session_id.clone() {
+                        self.set_session_id(turn_id, session_id.clone()).await;
+                        self.emit_event(json!({
+                            "kind": "SessionStarted",
+                            "data": { "session_id": session_id }
+                        }));
                     }
 
                     // result_cumulative_usage holds cumulative session totals
@@ -758,11 +756,11 @@ impl ClaudeInner {
             cli_args.push(effort_level);
         }
 
-        if let Some(mcp_config_json) = startup_mcp_config_json {
-            if !mcp_config_json.trim().is_empty() {
-                cli_args.push("--mcp-config".to_string());
-                cli_args.push(mcp_config_json);
-            }
+        if let Some(mcp_config_json) = startup_mcp_config_json
+            && !mcp_config_json.trim().is_empty()
+        {
+            cli_args.push("--mcp-config".to_string());
+            cli_args.push(mcp_config_json);
         }
 
         // Use --agents/--agent for agent definition instructions (first-class agent
@@ -780,20 +778,18 @@ impl ClaudeInner {
             cli_args.push("--agent".to_string());
             cli_args.push(identity.id.clone());
         }
-        if let Some(steering) = steering_content {
-            if !steering.trim().is_empty() {
-                cli_args.push("--append-system-prompt".to_string());
-                cli_args.push(steering);
-            }
+        if let Some(steering) = steering_content
+            && !steering.trim().is_empty()
+        {
+            cli_args.push("--append-system-prompt".to_string());
+            cli_args.push(steering);
         }
 
-        if !ephemeral {
-            if let Some(existing_session) = session_id {
-                let trimmed = existing_session.trim();
-                if !trimmed.is_empty() {
-                    cli_args.push("--resume".to_string());
-                    cli_args.push(trimmed.to_string());
-                }
+        if !ephemeral && let Some(existing_session) = session_id {
+            let trimmed = existing_session.trim();
+            if !trimmed.is_empty() {
+                cli_args.push("--resume".to_string());
+                cli_args.push(trimmed.to_string());
             }
         }
 
@@ -1125,13 +1121,13 @@ impl ClaudeInner {
             delete_claude_session_remote(host, &workspace_root, &normalized).await?;
         } else {
             let session_file = claude_session_file_path(&workspace_root, &normalized)?;
-            if let Err(err) = tokio_fs::remove_file(&session_file).await {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(format!(
-                        "Failed to delete Claude session '{}': {err}",
-                        session_file.display()
-                    ));
-                }
+            if let Err(err) = tokio_fs::remove_file(&session_file).await
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(format!(
+                    "Failed to delete Claude session '{}': {err}",
+                    session_file.display()
+                ));
             }
         }
         self.list_sessions().await?;
@@ -1139,10 +1135,10 @@ impl ClaudeInner {
     }
 
     fn emit_tool_request(&self, tool_call: &ClaudeToolCall) {
-        if claude_is_todo_write_tool_name(&tool_call.name) {
-            if let Some(task_update) = claude_task_update_from_todo_write(&tool_call.arguments) {
-                self.emit_event(task_update);
-            }
+        if claude_is_todo_write_tool_name(&tool_call.name)
+            && let Some(task_update) = claude_task_update_from_todo_write(&tool_call.arguments)
+        {
+            self.emit_event(task_update);
         }
         self.emit_event(json!({
             "kind": "ToolRequest",
@@ -1803,12 +1799,11 @@ fn collect_tool_use_blocks(value: &Value) -> Vec<Value> {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if inner_type == "content_block_start" {
-            if let Some(block) = event.get("content_block") {
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    blocks.push(block.clone());
-                }
-            }
+        if inner_type == "content_block_start"
+            && let Some(block) = event.get("content_block")
+            && block.get("type").and_then(Value::as_str) == Some("tool_use")
+        {
+            blocks.push(block.clone());
         }
     }
 
@@ -1817,16 +1812,15 @@ fn collect_tool_use_blocks(value: &Value) -> Vec<Value> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if event_type == "assistant" {
-        if let Some(content) = value
+    if event_type == "assistant"
+        && let Some(content) = value
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(Value::as_array)
-        {
-            for block in content {
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    blocks.push(block.clone());
-                }
+    {
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                blocks.push(block.clone());
             }
         }
     }
@@ -1854,6 +1848,17 @@ fn consume_claude_stream_value(
     base_message_id: &str,
     current_message_id: &mut String,
 ) {
+    if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
+        let is_new_session = summary.session_id.as_deref() != Some(session_id);
+        summary.session_id = Some(session_id.to_string());
+        if is_new_session {
+            inner.emit_event(json!({
+                "kind": "SessionStarted",
+                "data": { "session_id": session_id }
+            }));
+        }
+    }
+
     let message_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -1880,9 +1885,6 @@ fn consume_claude_stream_value(
             );
         }
         "system" => {
-            if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
-                summary.session_id = Some(session_id.to_string());
-            }
             if let Some(model) = value.get("model").and_then(Value::as_str) {
                 summary.model = Some(model.to_string());
             }
@@ -2357,10 +2359,10 @@ fn maybe_emit_pending_tool_use(
         return;
     };
 
-    if !pending.partial_json.trim().is_empty() {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&pending.partial_json) {
-            pending.arguments = parsed;
-        }
+    if !pending.partial_json.trim().is_empty()
+        && let Ok(parsed) = serde_json::from_str::<Value>(&pending.partial_json)
+    {
+        pending.arguments = parsed;
     }
 
     if pending.request_emitted {
@@ -2489,38 +2491,38 @@ fn consume_stream_event(
                     segment.has_content = true;
                     inner.emit_stream_reasoning_delta(current_message_id, &text);
                 }
-            } else if block_type == "tool_use" {
-                if let Some(tool_call) = extract_tool_call_from_block(block) {
-                    maybe_emit_next_stream_start(
-                        segment,
-                        inner,
-                        base_message_id,
-                        current_message_id,
-                        summary.model.clone(),
-                    );
-                    let block_index = content_block_index(event);
-                    if !has_meaningful_tool_arguments(&tool_call.arguments) {
-                        if let Some(index) = block_index {
-                            summary
-                                .tool_name_by_id
-                                .insert(tool_call.id.clone(), tool_call.name.clone());
-                            segment.pending_tool_uses.insert(
-                                index,
-                                PendingClaudeToolUse {
-                                    id: tool_call.id,
-                                    name: tool_call.name,
-                                    arguments: tool_call.arguments,
-                                    partial_json: String::new(),
-                                    request_emitted: false,
-                                },
-                            );
-                            segment.has_content = true;
-                        } else {
-                            register_tool_call_for_phase(summary, segment, tool_call);
-                        }
+            } else if block_type == "tool_use"
+                && let Some(tool_call) = extract_tool_call_from_block(block)
+            {
+                maybe_emit_next_stream_start(
+                    segment,
+                    inner,
+                    base_message_id,
+                    current_message_id,
+                    summary.model.clone(),
+                );
+                let block_index = content_block_index(event);
+                if !has_meaningful_tool_arguments(&tool_call.arguments) {
+                    if let Some(index) = block_index {
+                        summary
+                            .tool_name_by_id
+                            .insert(tool_call.id.clone(), tool_call.name.clone());
+                        segment.pending_tool_uses.insert(
+                            index,
+                            PendingClaudeToolUse {
+                                id: tool_call.id,
+                                name: tool_call.name,
+                                arguments: tool_call.arguments,
+                                partial_json: String::new(),
+                                request_emitted: false,
+                            },
+                        );
+                        segment.has_content = true;
                     } else {
                         register_tool_call_for_phase(summary, segment, tool_call);
                     }
+                } else {
+                    register_tool_call_for_phase(summary, segment, tool_call);
                 }
             }
         }
@@ -2707,19 +2709,19 @@ fn extract_reasoning_from_result(value: &Value) -> Option<String> {
         "reasoningText",
         "reasoning_text",
     ] {
-        if let Some(text) = value.get(key).and_then(extract_reasoning_text) {
-            if !text.trim().is_empty() {
-                return Some(text.trim().to_string());
-            }
+        if let Some(text) = value.get(key).and_then(extract_reasoning_text)
+            && !text.trim().is_empty()
+        {
+            return Some(text.trim().to_string());
         }
     }
 
-    if let Some(message) = value.get("message") {
-        if let Some(reasoning) = extract_reasoning_from_message(message) {
-            let trimmed = reasoning.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+    if let Some(message) = value.get("message")
+        && let Some(reasoning) = extract_reasoning_from_message(message)
+    {
+        let trimmed = reasoning.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
         }
     }
 
@@ -3452,10 +3454,11 @@ fn extract_first_i32(text: &str) -> Option<i32> {
             token.push(ch);
             continue;
         }
-        if !token.is_empty() && token != "-" {
-            if let Ok(parsed) = token.parse::<i32>() {
-                return Some(parsed);
-            }
+        if !token.is_empty()
+            && token != "-"
+            && let Ok(parsed) = token.parse::<i32>()
+        {
+            return Some(parsed);
         }
         token.clear();
     }
@@ -3479,10 +3482,10 @@ fn run_command_failure_summary(result: &ClaudeRunCommandResult, fallback: &str) 
 
 fn claude_argument_string(arguments: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
-        if let Some(value) = arguments.get(*key).and_then(Value::as_str) {
-            if let Some(normalized) = normalize_nonempty(value) {
-                return Some(normalized);
-            }
+        if let Some(value) = arguments.get(*key).and_then(Value::as_str)
+            && let Some(normalized) = normalize_nonempty(value)
+        {
+            return Some(normalized);
         }
     }
     None
@@ -3512,10 +3515,10 @@ fn claude_argument_file_paths(arguments: &Value) -> Vec<String> {
             continue;
         };
         for value in values {
-            if let Some(path) = value.as_str().and_then(normalize_nonempty) {
-                if !paths.iter().any(|existing| existing == &path) {
-                    paths.push(path);
-                }
+            if let Some(path) = value.as_str().and_then(normalize_nonempty)
+                && !paths.iter().any(|existing| existing == &path)
+            {
+                paths.push(path);
             }
         }
     }
@@ -3707,7 +3710,7 @@ fn encode_workspace_root(workspace_root: &str) -> String {
     trimmed
         .chars()
         .map(|ch| {
-            if ch == '/' || ch == '\\' || ch == ':' {
+            if ch == '/' || ch == '\\' || ch == ':' || ch == '.' {
                 '-'
             } else {
                 ch
@@ -3716,11 +3719,21 @@ fn encode_workspace_root(workspace_root: &str) -> String {
         .collect::<String>()
 }
 
+fn normalize_claude_workspace_root(workspace_root: &str) -> String {
+    let path = Path::new(workspace_root);
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn claude_workspace_sessions_dir(workspace_root: &str) -> Result<PathBuf, String> {
     let claude_home = claude_home_dir()?;
     Ok(claude_home
         .join("projects")
-        .join(encode_workspace_root(workspace_root)))
+        .join(encode_workspace_root(&normalize_claude_workspace_root(
+            workspace_root,
+        ))))
 }
 
 fn claude_session_file_path(workspace_root: &str, session_id: &str) -> Result<PathBuf, String> {
@@ -3747,10 +3760,10 @@ async fn list_claude_sessions(workspace_root: &str) -> Result<Vec<Value>, String
         if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            if file_name.starts_with("agent-") {
-                continue;
-            }
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with("agent-")
+        {
+            continue;
         }
         if let Some(metadata) = inspect_claude_session_file(&path, workspace_root).await? {
             sessions.push(metadata);
@@ -3926,16 +3939,33 @@ async fn load_claude_session_history(
     session_id: &str,
 ) -> Result<ClaudeSessionReplay, String> {
     let session_file = claude_session_file_path(workspace_root, session_id)?;
-    let contents = tokio_fs::read_to_string(&session_file)
-        .await
-        .map_err(|err| {
-            format!(
-                "Failed to read Claude session '{}' for resume: {err}",
-                session_file.display()
-            )
-        })?;
+    let mut last_err = None;
+    for attempt in 0..20 {
+        match tokio_fs::read_to_string(&session_file).await {
+            Ok(contents) => return Ok(parse_claude_session_replay(&contents)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && attempt < 19 => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read Claude session '{}' for resume: {err}",
+                    session_file.display()
+                ));
+            }
+        }
+    }
 
-    Ok(parse_claude_session_replay(&contents))
+    let err = last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Claude session file did not appear in time",
+        )
+    });
+    Err(format!(
+        "Failed to read Claude session '{}' for resume: {err}",
+        session_file.display()
+    ))
 }
 
 #[cfg(test)]
@@ -4409,12 +4439,12 @@ fn extract_context_window_from_model_usage(
             return Some(window);
         }
 
-        if let Some(family) = claude_model_family_hint(model) {
-            if let Some((_, window)) = with_window.iter().copied().find(|(model_key, _)| {
+        if let Some(family) = claude_model_family_hint(model)
+            && let Some((_, window)) = with_window.iter().copied().find(|(model_key, _)| {
                 normalize_model_key_for_context_lookup(model_key).contains(family)
-            }) {
-                return Some(window);
-            }
+            })
+        {
+            return Some(window);
         }
     }
 
@@ -4652,16 +4682,16 @@ pub(crate) fn unix_now_ms() -> u64 {
 // Backend trait implementation
 // ---------------------------------------------------------------------------
 
-use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SpawnCostHint, StreamEndData,
-    StreamStartData, StreamTextDeltaData,
-};
+use protocol::{AgentInput, ChatEvent, ChatMessage, MessageSender, SessionId, SpawnCostHint};
 
-use super::{Backend, BackendSpawnConfig, EventStream};
+use super::{
+    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+};
 
 const BACKEND_EVENT_BUFFER: usize = 256;
 const BACKEND_INPUT_BUFFER: usize = 64;
-const BACKEND_AGENT_NAME: &str = "claude";
+
+type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 /// Minimal Backend-trait handle for the Claude CLI.
 ///
@@ -4669,6 +4699,8 @@ const BACKEND_AGENT_NAME: &str = "claude";
 /// the task writes stdin of the child process accordingly.
 pub struct ClaudeBackend {
     input_tx: mpsc::Sender<AgentInput>,
+    interrupt_tx: mpsc::Sender<()>,
+    session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
 fn claude_backend_defaults(
@@ -4682,312 +4714,350 @@ fn claude_backend_defaults(
     }
 }
 
+fn backend_error_message(content: String) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        timestamp: unix_now_ms(),
+        sender: MessageSender::Error,
+        content,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
+}
+
+async fn forward_claude_backend_event(
+    raw: Value,
+    events_tx: &mpsc::Sender<ChatEvent>,
+    session_id_sink: &Arc<std::sync::Mutex<Option<SessionId>>>,
+    ready_tx: Option<&ClaudeReadyTx>,
+) -> bool {
+    if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
+        return events_tx.send(event).await.is_ok();
+    }
+
+    match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+        "SessionStarted" => {
+            if let Some(session_id) = raw
+                .get("data")
+                .and_then(|data| data.get("session_id"))
+                .and_then(Value::as_str)
+            {
+                *session_id_sink
+                    .lock()
+                    .expect("claude session_id mutex poisoned") =
+                    Some(SessionId(session_id.to_string()));
+                if let Some(ready_tx) = ready_tx {
+                    signal_ready(ready_tx, Ok(())).await;
+                }
+            }
+        }
+        "Error" => {
+            let message = raw
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("Claude backend error")
+                .to_string();
+            if events_tx
+                .send(backend_error_message(message.clone()))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        _ => {}
+    }
+
+    true
+}
+
 impl Backend for ClaudeBackend {
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
         let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let session_id_task = Arc::clone(&session_id);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
         tokio::spawn(async move {
-            let workspace_root = workspace_roots
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "/tmp".to_string());
+            let roots = if workspace_roots.is_empty() {
+                vec!["/tmp".to_string()]
+            } else {
+                workspace_roots
+            };
+            let (session, mut raw_events) =
+                match ClaudeSession::spawn(&roots, None, &[], None, None).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Claude session: {err}");
+                        let _ =
+                            ready_tx.send(Err(format!("Failed to spawn Claude session: {err}")));
+                        return;
+                    }
+                };
+
+            let handle = session.command_handle();
             let (model_override, effort_override) = claude_backend_defaults(config.cost_hint);
-            // Build CLI arguments
-            let mut args = vec![
-                "--print",
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--input-format",
-                "stream-json",
-                "--include-partial-messages",
-                "--dangerously-skip-permissions",
-            ];
-            if let Some(model) = model_override {
-                args.push("--model");
-                args.push(model);
+            if model_override.is_some() || effort_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                    "effort": effort_override,
+                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure Claude session: {err}");
+                    let _ =
+                        ready_tx.send(Err(format!("Failed to configure Claude session: {err}")));
+                    session.shutdown().await;
+                    return;
+                }
             }
-            if let Some(effort) = effort_override {
-                args.push("--effort");
-                args.push(effort);
-            }
 
-            let mut child = match Command::new("claude")
-                .args(args)
-                .current_dir(workspace_root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(err) => {
-                    tracing::error!("Failed to spawn claude CLI: {err}");
-                    return;
-                }
-            };
-
-            let mut stdin = match child.stdin.take() {
-                Some(stdin) => stdin,
-                None => {
-                    tracing::error!("Failed to capture claude stdin");
-                    return;
-                }
-            };
-            let stdout = match child.stdout.take() {
-                Some(stdout) => stdout,
-                None => {
-                    tracing::error!("Failed to capture claude stdout");
-                    return;
-                }
-            };
-
-            // Spawn a task to forward follow-up messages to stdin
-            let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(BACKEND_INPUT_BUFFER);
-            tokio::spawn(async move {
-                let mut stdin = stdin;
-                while let Some(message) = stdin_rx.recv().await {
-                    if !write_user_message(&mut stdin, &message).await {
-                        break;
+            let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
+            let ready_tx_forward = Arc::clone(&ready_tx);
+            let session_id_forward = Arc::clone(&session_id_task);
+            let events_tx_forward = events_tx.clone();
+            let forward_task = tokio::spawn(async move {
+                while let Some(raw) = raw_events.recv().await {
+                    if !forward_claude_backend_event(
+                        raw,
+                        &events_tx_forward,
+                        &session_id_forward,
+                        Some(&ready_tx_forward),
+                    )
+                    .await
+                    {
+                        return;
                     }
                 }
+                signal_ready(
+                    &ready_tx_forward,
+                    Err("Claude session ended before reporting a session_id".to_string()),
+                )
+                .await;
             });
 
-            // Forward AgentInput from the input channel to the stdin writer
-            let stdin_tx_clone = stdin_tx.clone();
-            tokio::spawn(async move {
-                while let Some(input) = input_rx.recv().await {
-                    match input {
-                        AgentInput::SendMessage(payload) => {
-                            if stdin_tx_clone.send(payload.message).await.is_err() {
-                                break;
-                            }
+            if let Err(err) = handle
+                .execute(SessionCommand::SendMessage {
+                    message: initial_input.message,
+                    images: protocol_images_to_attachments(initial_input.images),
+                })
+                .await
+            {
+                tracing::error!("Failed to send initial Claude prompt: {err}");
+                signal_ready(
+                    &ready_tx,
+                    Err(format!("Failed to send initial Claude prompt: {err}")),
+                )
+                .await;
+                session.shutdown().await;
+                let _ = forward_task.await;
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = input_rx.recv() => {
+                        let Some(input) = incoming else {
+                            break;
+                        };
+                        let AgentInput::SendMessage(payload) = input;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message: payload.message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send Claude follow-up: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else {
+                            break;
+                        };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt Claude turn: {err}");
+                            break;
                         }
                     }
                 }
-            });
+            }
 
-            // Read stdout line by line, parse stream-json, emit ChatEvents
-            read_stdout_to_events(stdout, &events_tx).await;
+            session.shutdown().await;
+            let _ = forward_task.await;
         });
 
-        Ok((Self { input_tx }, EventStream::new(events_rx)))
+        match tokio::time::timeout(Duration::from_secs(120), ready_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err),
+            Ok(Err(_)) => return Err("Claude spawn initialization task ended early".to_string()),
+            Err(_) => return Err("Timed out waiting for Claude session_id".to_string()),
+        }
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: protocol::SessionId,
+    ) -> Result<(Self, EventStream), String> {
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+
+        let roots = if workspace_roots.is_empty() {
+            vec!["/tmp".to_string()]
+        } else {
+            workspace_roots
+        };
+        let session_id = session_id.0;
+        let backend_session_id =
+            Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
+        let backend_session_id_task = Arc::clone(&backend_session_id);
+
+        tokio::spawn(async move {
+            let (session, mut raw_events) =
+                match ClaudeSession::spawn(&roots, None, &[], None, None).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Claude resume session: {err}");
+                        return;
+                    }
+                };
+
+            let handle = session.command_handle();
+            let (model_override, effort_override) = claude_backend_defaults(config.cost_hint);
+            if model_override.is_some() || effort_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                    "effort": effort_override,
+                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure resumed Claude session: {err}");
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
+            if let Err(err) = handle
+                .execute(SessionCommand::ResumeSession { session_id })
+                .await
+            {
+                tracing::error!("Failed to resume Claude session: {err}");
+                session.shutdown().await;
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None).await {
+                            break;
+                        }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else {
+                            break;
+                        };
+                        let AgentInput::SendMessage(payload) = input;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message: payload.message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send Claude resume follow-up: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else {
+                            break;
+                        };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt resumed Claude turn: {err}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id: backend_session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+        Err("ClaudeBackend::list_sessions is not supported without workspace context".to_string())
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.session_id
+            .lock()
+            .expect("claude session_id mutex poisoned")
+            .clone()
+            .expect("claude session_id not initialized")
     }
 
     async fn send(&self, input: AgentInput) -> bool {
         self.input_tx.send(input).await.is_ok()
     }
+
+    async fn interrupt(&self) -> bool {
+        self.interrupt_tx.send(()).await.is_ok()
+    }
 }
 
 /// Write a user message to the claude CLI stdin in stream-json format.
-async fn write_user_message(stdin: &mut tokio::process::ChildStdin, message: &str) -> bool {
-    use tokio::io::AsyncWriteExt;
-
-    let payload = serde_json::json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": message,
-            }],
-        }
-    });
-
-    let line = match serde_json::to_string(&payload) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::error!("Failed to serialize stdin message: {err}");
-            return false;
-        }
-    };
-
-    if let Err(err) = stdin.write_all(line.as_bytes()).await {
-        tracing::error!("Failed to write to claude stdin: {err}");
-        return false;
-    }
-    if let Err(err) = stdin.write_all(b"\n").await {
-        tracing::error!("Failed to write newline to claude stdin: {err}");
-        return false;
-    }
-    if let Err(err) = stdin.flush().await {
-        tracing::error!("Failed to flush claude stdin: {err}");
-        return false;
-    }
-    true
-}
-
-/// Read claude CLI stdout line-by-line, parse stream-json events,
-/// and translate them into ChatEvent variants sent through the channel.
-///
-/// This is a simplified version of the existing `read_claude_stdout` that
-/// focuses on `assistant` type messages. It emits StreamStart → StreamDelta →
-/// StreamEnd for each assistant turn.
-async fn read_stdout_to_events(
-    stdout: tokio::process::ChildStdout,
-    events_tx: &mpsc::Sender<ChatEvent>,
-) {
-    let mut lines = BufReader::new(stdout).lines();
-    let mut current_message_id: Option<String> = None;
-    let mut current_model: Option<String> = None;
-    let mut accumulated_text = String::new();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::warn!("Non-JSON line from claude CLI: {trimmed}");
-                continue;
-            }
-        };
-
-        let message_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        match message_type {
-            "system" => {
-                // Extract model info from system message
-                if let Some(model) = value.get("model").and_then(Value::as_str) {
-                    current_model = Some(model.to_string());
-                }
-            }
-            "assistant" => {
-                // Extract text content from assistant message
-                let message = match value.get("message") {
-                    Some(m) => m,
-                    None => continue,
-                };
-
-                let msg_id = message
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string());
-                let model = message
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string())
-                    .or_else(|| current_model.clone());
-                let text = extract_text_from_message(message);
-
-                // Detect new message (new turn) → close previous, open new
-                let is_new_message = msg_id.as_ref().map_or(true, |id| {
-                    current_message_id.as_ref().map_or(true, |cur| cur != id)
-                });
-
-                if is_new_message {
-                    // Close previous turn if there was one
-                    if current_message_id.is_some() && !accumulated_text.is_empty() {
-                        let _ = events_tx
-                            .send(ChatEvent::StreamEnd(StreamEndData {
-                                message: ChatMessage {
-                                    timestamp: unix_now_ms(),
-                                    sender: MessageSender::Assistant {
-                                        agent: BACKEND_AGENT_NAME.to_owned(),
-                                    },
-                                    content: std::mem::take(&mut accumulated_text),
-                                    reasoning: None,
-                                    tool_calls: Vec::new(),
-                                    model_info: current_model
-                                        .clone()
-                                        .map(|m| ModelInfo { model: m }),
-                                    token_usage: None,
-                                    context_breakdown: None,
-                                    images: None,
-                                },
-                            }))
-                            .await;
-                    }
-
-                    current_message_id = msg_id.clone();
-
-                    // Emit StreamStart for the new turn
-                    let _ = events_tx
-                        .send(ChatEvent::StreamStart(StreamStartData {
-                            message_id: msg_id,
-                            agent: BACKEND_AGENT_NAME.to_owned(),
-                            model: model.clone(),
-                        }))
-                        .await;
-
-                    if let Some(m) = model {
-                        current_model = Some(m);
-                    }
-                }
-
-                // Emit delta for any text content
-                if let Some(text) = text {
-                    if !text.is_empty() {
-                        let _ = events_tx
-                            .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                                message_id: current_message_id.clone(),
-                                text: text.clone(),
-                            }))
-                            .await;
-                        // Replace accumulated text with latest snapshot
-                        // (assistant messages contain full text, not deltas)
-                        accumulated_text = text;
-                    }
-                }
-            }
-            "result" => {
-                // End of the turn — close any open stream
-                if current_message_id.is_some() {
-                    let _ = events_tx
-                        .send(ChatEvent::StreamEnd(StreamEndData {
-                            message: ChatMessage {
-                                timestamp: unix_now_ms(),
-                                sender: MessageSender::Assistant {
-                                    agent: BACKEND_AGENT_NAME.to_owned(),
-                                },
-                                content: std::mem::take(&mut accumulated_text),
-                                reasoning: None,
-                                tool_calls: Vec::new(),
-                                model_info: current_model.clone().map(|m| ModelInfo { model: m }),
-                                token_usage: None,
-                                context_breakdown: None,
-                                images: None,
-                            },
-                        }))
-                        .await;
-                    current_message_id = None;
-                }
-            }
-            _ => {
-                // Ignore other event types for now (stream_event, user, etc.)
-            }
-        }
-    }
-
-    // If the process exited while a message was still open, close it
-    if current_message_id.is_some() && !accumulated_text.is_empty() {
-        let _ = events_tx
-            .send(ChatEvent::StreamEnd(StreamEndData {
-                message: ChatMessage {
-                    timestamp: unix_now_ms(),
-                    sender: MessageSender::Assistant {
-                        agent: BACKEND_AGENT_NAME.to_owned(),
-                    },
-                    content: accumulated_text,
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    model_info: current_model.map(|m| ModelInfo { model: m }),
-                    token_usage: None,
-                    context_breakdown: None,
-                    images: None,
-                },
-            }))
-            .await;
+async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
+    let mut ready_tx = ready_tx.lock().await;
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(result);
     }
 }
 
@@ -6428,17 +6498,17 @@ mod tests {
         // 1. assistant message with per-API-call usage
         // 2. result event with cumulative usage
         // summary.usage should remain the per-API-call value.
-        let mut summary = ClaudeStdoutSummary::default();
-
-        // Simulate assistant message setting per-API-call usage
-        summary.usage = Some(json!({
-            "input_tokens": 1,
-            "output_tokens": 5,
-            "total_tokens": 6,
-            "cached_prompt_tokens": 20_000,
-            "cache_creation_input_tokens": 500,
-            "reasoning_tokens": 0
-        }));
+        let mut summary = ClaudeStdoutSummary {
+            usage: Some(json!({
+                "input_tokens": 1,
+                "output_tokens": 5,
+                "total_tokens": 6,
+                "cached_prompt_tokens": 20_000,
+                "cache_creation_input_tokens": 500,
+                "reasoning_tokens": 0
+            })),
+            ..Default::default()
+        };
 
         // Simulate consuming a result event — it should set
         // result_cumulative_usage, NOT overwrite usage.
@@ -6500,8 +6570,10 @@ mod tests {
 
     #[test]
     fn result_event_prefers_model_usage_entry_for_current_model() {
-        let mut summary = ClaudeStdoutSummary::default();
-        summary.model = Some("claude-haiku-4-5-20251001".to_string());
+        let mut summary = ClaudeStdoutSummary {
+            model: Some("claude-haiku-4-5-20251001".to_string()),
+            ..Default::default()
+        };
 
         let result_event = json!({
             "type": "result",

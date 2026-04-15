@@ -1,8 +1,8 @@
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, DumpSettingsPayload, Envelope,
-    FrameKind, ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectId, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRefreshPayload, ProjectRenamePayload, ProjectStageFilePayload,
+    FrameKind, InterruptPayload, ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectId, ProjectListDirPayload, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectStageFilePayload,
     ProjectStageHunkPayload, SendMessagePayload, SetSettingPayload, SpawnAgentParams,
     SpawnAgentPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
     TerminalResizePayload, TerminalSendPayload,
@@ -42,15 +42,19 @@ pub(crate) async fn route_client_envelope(
                 );
                 match &payload.params {
                     SpawnAgentParams::New {
-                        workspace_roots, ..
+                        workspace_roots,
+                        prompt,
+                        images,
+                        ..
                     } => {
-                        assert!(
-                            !workspace_roots.is_empty(),
-                            "spawn_agent requires at least one workspace root"
-                        );
                         assert!(
                             workspace_roots.iter().all(|root| !root.trim().is_empty()),
                             "spawn_agent workspace roots must not contain empty values"
+                        );
+                        assert!(
+                            !prompt.trim().is_empty()
+                                || images.as_ref().is_some_and(|images| !images.is_empty()),
+                            "spawn_agent new prompt must not be empty unless images are attached"
                         );
                     }
                     SpawnAgentParams::Resume { session_id, .. } => {
@@ -164,6 +168,23 @@ pub(crate) async fn route_client_envelope(
                     send_agent_not_running_error(stream, agent_id).await;
                 }
             }
+            FrameKind::Interrupt => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path);
+                let _: InterruptPayload =
+                    envelope.parse_payload().expect("invalid interrupt payload");
+
+                let interrupted = if let Some(agent) = host.agent_handle(&agent_id).await {
+                    agent.interrupt().await
+                } else {
+                    false
+                };
+
+                if !interrupted {
+                    let stream = host_output_stream.with_path(stream_path);
+                    send_agent_not_running_error(stream, agent_id).await;
+                }
+            }
             other => {
                 panic!(
                     "protocol violation: unexpected client frame kind {} on agent stream {}",
@@ -237,6 +258,17 @@ pub(crate) async fn route_client_envelope(
                     payload,
                 )
                 .await;
+            }
+            FrameKind::ProjectListDir => {
+                let payload: ProjectListDirPayload = envelope
+                    .parse_payload()
+                    .expect("invalid project_list_dir payload");
+                assert!(
+                    !payload.root.0.trim().is_empty(),
+                    "project_list_dir root must not be empty"
+                );
+                host.list_project_dir(&project_output_stream, project_id, payload)
+                    .await;
             }
             FrameKind::ProjectReadFile => {
                 let payload: ProjectReadFilePayload = envelope

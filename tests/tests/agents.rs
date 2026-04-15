@@ -7,6 +7,7 @@ use protocol::{
     ProjectNotifyPayload, ProjectRenamePayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use std::time::Duration;
+use tyde_dev_driver::agent_control::SpawnRequest;
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
@@ -18,6 +19,11 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
+    let env = expect_next_event(client, "TypingStatusChanged(true)").await;
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
     let env = expect_next_event(client, "StreamStart").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
@@ -41,6 +47,11 @@ async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
     assert_eq!(env.kind, FrameKind::ChatEvent);
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
+
+    let env = expect_next_event(client, "TypingStatusChanged(false)").await;
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
@@ -65,6 +76,21 @@ async fn expect_project_notify(
         .expect("failed to parse ProjectNotifyPayload")
 }
 
+fn assert_completed_agent_result(
+    result: &tyde_dev_driver::agent_control::AgentResult,
+    expected_text: &str,
+) {
+    assert_eq!(result.status, "idle");
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(expected_text)),
+        "expected completed result message to contain '{expected_text}', got {:?}",
+        result.message
+    );
+}
+
 #[tokio::test]
 async fn agent_lifecycle() {
     let mut fixture = Fixture::new().await;
@@ -78,7 +104,8 @@ async fn agent_lifecycle() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: Some("hello".to_owned()),
+                prompt: "hello".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -139,6 +166,96 @@ async fn agent_lifecycle() {
 }
 
 #[tokio::test]
+async fn agent_control_end_to_end_flow_uses_full_stack() {
+    let fixture = Fixture::new().await;
+    let control = fixture.connect_agent_control().await;
+
+    let spawned = control
+        .spawn_agent(SpawnRequest {
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            prompt: "agent control hello".to_owned(),
+            backend_kind: BackendKind::Claude,
+            parent_agent_id: None,
+            project_id: None,
+            name: "agent-control".to_owned(),
+            cost_hint: None,
+        })
+        .await
+        .expect("agent control spawn should succeed");
+
+    let listed_before_wait = control.list_agents().await;
+    assert_eq!(listed_before_wait.len(), 1);
+    assert_eq!(listed_before_wait[0].agent_id, spawned.agent_id);
+    assert_eq!(listed_before_wait[0].name, "agent-control");
+    assert_eq!(listed_before_wait[0].backend_kind, BackendKind::Claude);
+    assert_eq!(
+        listed_before_wait[0].workspace_roots,
+        vec!["/tmp/test".to_owned()]
+    );
+
+    let awaited = control
+        .await_agents(
+            Some(vec![protocol::AgentId(spawned.agent_id.clone())]),
+            Some(5_000),
+        )
+        .await
+        .expect("agent control await should succeed");
+    assert!(awaited.still_running.is_empty());
+    assert_eq!(awaited.ready.len(), 1);
+    assert_completed_agent_result(
+        &awaited.ready[0],
+        "mock backend response to: agent control hello",
+    );
+
+    let listed_after_wait = control.list_agents().await;
+    assert_eq!(listed_after_wait.len(), 1);
+    assert_eq!(listed_after_wait[0].status, "idle");
+    assert!(
+        listed_after_wait[0].last_message.as_deref().is_some_and(
+            |message| message.contains("mock backend response to: agent control hello")
+        )
+    );
+
+    control
+        .send_message(
+            protocol::AgentId(spawned.agent_id.clone()),
+            "agent control follow up".to_owned(),
+        )
+        .await
+        .expect("agent control send_message should succeed");
+
+    let awaited_follow_up = control
+        .await_agents(
+            Some(vec![protocol::AgentId(spawned.agent_id.clone())]),
+            Some(5_000),
+        )
+        .await
+        .expect("agent control follow-up await should succeed");
+    assert!(awaited_follow_up.still_running.is_empty());
+    assert_eq!(awaited_follow_up.ready.len(), 1);
+    assert_completed_agent_result(
+        &awaited_follow_up.ready[0],
+        "mock backend response to: agent control follow up",
+    );
+
+    let listed_after_follow_up = control.list_agents().await;
+    assert_eq!(listed_after_follow_up.len(), 1);
+    assert_eq!(listed_after_follow_up[0].status, "idle");
+    assert!(
+        listed_after_follow_up[0]
+            .last_message
+            .as_deref()
+            .is_some_and(
+                |message| message.contains("mock backend response to: agent control follow up")
+            )
+    );
+    assert!(
+        listed_after_follow_up[0].summary.is_some(),
+        "agent control list should surface a summary once a turn completes"
+    );
+}
+
+#[tokio::test]
 async fn multiple_agents() {
     let mut fixture = Fixture::new().await;
 
@@ -151,7 +268,8 @@ async fn multiple_agents() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: Some("agent one".to_owned()),
+                prompt: "agent one".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -167,7 +285,8 @@ async fn multiple_agents() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: Some("agent two".to_owned()),
+                prompt: "agent two".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -177,10 +296,10 @@ async fn multiple_agents() {
 
     // Collect all events from both agents.
     // Each agent produces:
-    //   NewAgent (host stream) + AgentStart + StreamStart + StreamDelta + StreamEnd
-    // Two agents = 10 events total.
+    //   NewAgent (host stream) + AgentStart + TypingStatusChanged(true) + StreamStart + StreamDelta + StreamEnd + TypingStatusChanged(false)
+    // Two agents = 14 events total.
     let mut events = Vec::new();
-    for _ in 0..10 {
+    for _ in 0..14 {
         let env = fixture
             .client
             .next_event()
@@ -221,35 +340,45 @@ async fn multiple_agents() {
 
         assert_eq!(
             stream_events.len(),
-            4,
-            "expected 4 events on stream {stream}",
+            6,
+            "expected 6 events on stream {stream}",
         );
 
         // First event must be AgentStart at seq 0
         assert_eq!(stream_events[0].kind, FrameKind::AgentStart);
         assert_eq!(stream_events[0].seq, 0);
 
-        // Remaining 3 must be ChatEvents with sequential seqs
+        // Remaining 5 must be ChatEvents with sequential seqs
         for (i, env) in stream_events[1..].iter().enumerate() {
             assert_eq!(env.kind, FrameKind::ChatEvent);
             assert_eq!(env.seq, (i + 1) as u64);
         }
 
-        // Parse the ChatEvents: StreamStart, StreamDelta, StreamEnd
+        // Parse the ChatEvents: TypingStatusChanged(true), StreamStart, StreamDelta, StreamEnd, TypingStatusChanged(false)
         let event: ChatEvent = stream_events[1]
+            .parse_payload()
+            .expect("failed to parse TypingStatusChanged(true)");
+        assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
+        let event: ChatEvent = stream_events[2]
             .parse_payload()
             .expect("failed to parse StreamStart");
         assert!(matches!(event, ChatEvent::StreamStart(..)));
 
-        let event: ChatEvent = stream_events[2]
+        let event: ChatEvent = stream_events[3]
             .parse_payload()
             .expect("failed to parse StreamDelta");
         assert!(matches!(event, ChatEvent::StreamDelta(..)));
 
-        let event: ChatEvent = stream_events[3]
+        let event: ChatEvent = stream_events[4]
             .parse_payload()
             .expect("failed to parse StreamEnd");
         assert!(matches!(event, ChatEvent::StreamEnd(..)));
+
+        let event: ChatEvent = stream_events[5]
+            .parse_payload()
+            .expect("failed to parse TypingStatusChanged(false)");
+        assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
     }
 }
 
@@ -265,7 +394,8 @@ async fn late_joining_client_gets_replay() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: Some("late join replay".to_owned()),
+                prompt: "late join replay".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -305,8 +435,21 @@ async fn late_joining_client_gets_replay() {
         .expect("failed to parse AgentStartPayload for client 1");
     assert_eq!(client1_start.agent_id, agent_id);
 
-    // Client 1: StreamStart -> StreamDelta -> StreamEnd.
+    // Client 1: TypingStatusChanged(true) -> StreamStart -> StreamDelta -> StreamEnd -> TypingStatusChanged(false).
     let mut client1_chat_payloads = Vec::new();
+
+    let env = fixture
+        .client
+        .next_event()
+        .await
+        .expect("next_event failed")
+        .expect("connection closed before TypingStatusChanged(true)");
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env
+        .parse_payload()
+        .expect("failed to parse TypingStatusChanged(true) for client 1");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    client1_chat_payloads.push(env.payload.clone());
 
     let env = fixture
         .client
@@ -361,6 +504,19 @@ async fn late_joining_client_gets_replay() {
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
     client1_chat_payloads.push(env.payload.clone());
 
+    let env = fixture
+        .client
+        .next_event()
+        .await
+        .expect("next_event failed")
+        .expect("connection closed before TypingStatusChanged(false)");
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env
+        .parse_payload()
+        .expect("failed to parse TypingStatusChanged(false) for client 1");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+    client1_chat_payloads.push(env.payload.clone());
+
     // Client 2 connects late and should receive NewAgent + full replay on its own instance stream.
     let mut client2 = fixture.connect().await;
 
@@ -394,6 +550,14 @@ async fn late_joining_client_gets_replay() {
     assert_eq!(client2_start.created_at_ms, client1_start.created_at_ms);
 
     let mut client2_chat_payloads = Vec::new();
+
+    let env = expect_next_event(&mut client2, "TypingStatusChanged(true) for client 2").await;
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env
+        .parse_payload()
+        .expect("failed to parse TypingStatusChanged(true) for client 2");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    client2_chat_payloads.push(env.payload.clone());
 
     let env = expect_next_event(&mut client2, "StreamStart for client 2").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
@@ -431,6 +595,14 @@ async fn late_joining_client_gets_replay() {
         .parse_payload()
         .expect("failed to parse StreamEnd for client 2");
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
+    client2_chat_payloads.push(env.payload.clone());
+
+    let env = expect_next_event(&mut client2, "TypingStatusChanged(false) for client 2").await;
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env
+        .parse_payload()
+        .expect("failed to parse TypingStatusChanged(false) for client 2");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
     client2_chat_payloads.push(env.payload.clone());
 
     assert_eq!(
@@ -569,7 +741,8 @@ async fn project_replay_happens_before_agent_replay() {
             project_id: Some(project.id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: project.roots.clone(),
-                prompt: Some("hello from project".to_owned()),
+                prompt: "hello from project".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -676,7 +849,8 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
             project_id: Some(project.id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: project.roots.clone(),
-                prompt: Some("hold project".to_owned()),
+                prompt: "hold project".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -761,7 +935,8 @@ async fn spawn_with_missing_project_id_closes_the_connection() {
             project_id: Some(ProjectId("11111111-1111-1111-1111-111111111111".to_owned())),
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/missing-project".to_owned()],
-                prompt: Some("hello".to_owned()),
+                prompt: "hello".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },

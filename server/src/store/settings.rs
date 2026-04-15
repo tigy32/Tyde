@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 use protocol::{BackendKind, HostSettingValue, HostSettings};
 use serde::{Deserialize, Serialize};
 
+const CANONICAL_BACKENDS: [BackendKind; 5] = [
+    BackendKind::Tycode,
+    BackendKind::Kiro,
+    BackendKind::Claude,
+    BackendKind::Codex,
+    BackendKind::Gemini,
+];
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
     settings: HostSettings,
@@ -45,10 +53,14 @@ impl HostSettingsStore {
 
     fn read_from_disk(path: &Path) -> Result<HostSettings, String> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str::<StoreFile>(&contents)
-                .map(|store| normalize_settings(store.settings))
-                .map_err(|err| format!("Failed to parse settings store {}: {err}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HostSettings::default()),
+            Ok(contents) => {
+                let store = serde_json::from_str::<StoreFile>(&contents).map_err(|err| {
+                    format!("Failed to parse settings store {}: {err}", path.display())
+                })?;
+                validate_settings(store.settings)
+                    .map_err(|err| format!("Invalid settings store {}: {err}", path.display()))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(empty_settings()),
             Err(err) => Err(format!(
                 "Failed to read settings store {}: {err}",
                 path.display()
@@ -88,17 +100,16 @@ impl HostSettingsStore {
 fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Result<(), String> {
     match setting {
         HostSettingValue::EnabledBackends { enabled_backends } => {
-            let enabled_backends = normalize_backend_list(enabled_backends);
-            if enabled_backends.is_empty() {
-                return Err("enabled_backends must not be empty".to_owned());
-            }
-            settings.enabled_backends = enabled_backends;
-            if !settings.enabled_backends.contains(&settings.default_backend) {
-                settings.default_backend = settings.enabled_backends[0];
+            settings.enabled_backends = normalize_backend_list(enabled_backends);
+            if settings
+                .default_backend
+                .is_some_and(|kind| !settings.enabled_backends.contains(&kind))
+            {
+                settings.default_backend = None;
             }
         }
         HostSettingValue::DefaultBackend { default_backend } => {
-            if !settings.enabled_backends.contains(&default_backend) {
+            if default_backend.is_some_and(|kind| !settings.enabled_backends.contains(&kind)) {
                 return Err(format!(
                     "default_backend {:?} must be present in enabled_backends",
                     default_backend
@@ -111,37 +122,33 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
     Ok(())
 }
 
-fn normalize_settings(settings: HostSettings) -> HostSettings {
-    let enabled_backends = normalize_backend_list(settings.enabled_backends);
-    let enabled_backends = if enabled_backends.is_empty() {
-        vec![
-            BackendKind::Claude,
-            BackendKind::Codex,
-            BackendKind::Gemini,
-        ]
-    } else {
-        enabled_backends
-    };
-    let default_backend = if enabled_backends.contains(&settings.default_backend) {
-        settings.default_backend
-    } else {
-        enabled_backends[0]
-    };
-
+fn empty_settings() -> HostSettings {
     HostSettings {
-        enabled_backends,
-        default_backend,
+        enabled_backends: Vec::new(),
+        default_backend: None,
     }
 }
 
-fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {
-    let canonical = [
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Gemini,
-    ];
+fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
+    let enabled_backends = normalize_backend_list(settings.enabled_backends);
+    if settings
+        .default_backend
+        .is_some_and(|kind| !enabled_backends.contains(&kind))
+    {
+        return Err(format!(
+            "default_backend {:?} must be present in enabled_backends",
+            settings.default_backend
+        ));
+    }
 
-    canonical
+    Ok(HostSettings {
+        enabled_backends,
+        default_backend: settings.default_backend,
+    })
+}
+
+fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {
+    CANONICAL_BACKENDS
         .into_iter()
         .filter(|kind| backends.contains(kind))
         .collect()

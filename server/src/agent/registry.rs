@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use protocol::{AgentId, AgentStartPayload, BackendKind, ProjectId, SessionId, SpawnCostHint};
+use protocol::{
+    AgentId, AgentStartPayload, BackendKind, ProjectId, SendMessagePayload, SessionId,
+    SpawnCostHint,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -18,7 +21,7 @@ pub(crate) struct ResolvedSpawnRequest {
     pub project_id: Option<ProjectId>,
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
-    pub initial_prompt: Option<String>,
+    pub initial_input: Option<SendMessagePayload>,
     pub cost_hint: Option<SpawnCostHint>,
     pub resume_session_id: Option<SessionId>,
     /// When true, all backend spawns use MockBackend regardless of backend_kind.

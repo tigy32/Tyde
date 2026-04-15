@@ -33,6 +33,10 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
 
     view! {
         <div class="diff-content">
+            <div class="diff-file-header">
+                <span class="diff-file-path">{diff.root.to_string()}</span>
+                <span class="diff-scope-badge">{scope_label}</span>
+            </div>
             {diff.files.into_iter().map(|file| {
                 view! { <DiffFileView file=file scope_label=scope_label /> }
             }).collect::<Vec<_>>()}
@@ -63,23 +67,21 @@ fn DiffHunkView(hunk: ProjectGitDiffHunk) -> impl IntoView {
     let mut new_line: u32 = 0;
 
     // Parse hunk header for starting line numbers (e.g., @@ -10,5 +10,7 @@)
-    if let Some(start) = hunk.header.find("@@") {
-        if let Some(rest) = hunk.header.get(start + 3..) {
-            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-            if let Some(old_part) = parts.first() {
-                if let Some(num) = old_part.strip_prefix('-') {
-                    if let Some(line_str) = num.split(',').next() {
-                        old_line = line_str.parse().unwrap_or(0);
-                    }
-                }
-            }
-            if parts.len() > 1 {
-                if let Some(num) = parts[1].strip_prefix('+') {
-                    if let Some(line_str) = num.split(',').next() {
-                        new_line = line_str.parse().unwrap_or(0);
-                    }
-                }
-            }
+    if let Some(start) = hunk.header.find("@@")
+        && let Some(rest) = hunk.header.get(start + 3..)
+    {
+        let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+        if let Some(old_part) = parts.first()
+            && let Some(num) = old_part.strip_prefix('-')
+            && let Some(line_str) = num.split(',').next()
+        {
+            old_line = line_str.parse().unwrap_or(0);
+        }
+        if parts.len() > 1
+            && let Some(num) = parts[1].strip_prefix('+')
+            && let Some(line_str) = num.split(',').next()
+        {
+            new_line = line_str.parse().unwrap_or(0);
         }
     }
 

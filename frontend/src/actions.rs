@@ -1,17 +1,52 @@
-use leptos::prelude::GetUntracked;
+use leptos::prelude::{GetUntracked, Set};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::AppState;
+use crate::state::{AppState, CenterView};
 
 use protocol::{
-    FrameKind, ProjectPath, ProjectReadFilePayload, ProjectRootPath, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath,
+    BackendKind, FrameKind, ImageData, ProjectPath, ProjectReadFilePayload, ProjectRootPath,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 
-/// Spawn a new chat agent for the currently active project.
-/// Requires an active project with workspace roots, a host connection, and a host stream.
-pub fn spawn_new_chat(state: &AppState) {
+/// Enter draft-chat mode without spawning a backend session yet.
+/// If `backend_override` is provided, the first message will use that backend
+/// instead of the default.
+pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
+    state.active_agent_id.set(None);
+    state.draft_backend_override.set(backend_override);
+    state.center_view.set(CenterView::Chat);
+}
+
+/// Resolve which backend to use for a new chat: explicit override first, then
+/// the host default, then the first enabled backend.
+pub fn resolve_backend(state: &AppState) -> Option<BackendKind> {
+    let draft = state.draft_backend_override.get_untracked();
+    draft.or_else(|| {
+        state.host_settings.get_untracked().and_then(|settings| {
+            settings
+                .default_backend
+                .or_else(|| settings.enabled_backends.first().copied())
+        })
+    })
+}
+
+/// Spawn a new chat agent for the currently active project using the first user message.
+pub fn spawn_new_chat(
+    state: &AppState,
+    initial_message: String,
+    initial_images: Option<Vec<ImageData>>,
+) {
+    let initial_message = initial_message.trim().to_owned();
+    if initial_message.is_empty()
+        && initial_images
+            .as_ref()
+            .is_none_or(|images| images.is_empty())
+    {
+        log::error!("spawn_new_chat: initial input must include text or images");
+        return;
+    }
+
     let host_id = match state.host_id.get_untracked() {
         Some(id) => id,
         None => {
@@ -26,38 +61,28 @@ pub fn spawn_new_chat(state: &AppState) {
             return;
         }
     };
-    let project = match state.active_project_id.get_untracked() {
+    let (project_id, roots) = match state.active_project_id.get_untracked() {
         Some(pid) => {
             let projects = state.projects.get_untracked();
             match projects.into_iter().find(|p| p.id == pid) {
-                Some(p) => p,
-                None => {
-                    log::error!("spawn_new_chat: active project not found");
-                    return;
-                }
+                Some(p) => (Some(p.id), p.roots.clone()),
+                None => (None, Vec::new()),
             }
         }
+        None => (None, Vec::new()),
+    };
+
+    let backend_kind = match resolve_backend(state) {
+        Some(kind) => kind,
         None => {
-            log::warn!("spawn_new_chat: no active project — select a project first");
+            log::error!("spawn_new_chat: no backend available — enable one in settings");
             return;
         }
     };
-
-    let roots = project.roots.clone();
-    if roots.is_empty() {
-        log::error!("spawn_new_chat: project has no workspace roots");
-        return;
-    }
-
-    let backend_kind = match state.host_settings.get_untracked() {
-        Some(settings) => settings.default_backend,
-        None => {
-            log::error!("spawn_new_chat: host settings not loaded");
-            return;
-        }
-    };
-    let project_id = Some(project.id);
-    let name = format!("Chat");
+    // Draft override consumed — clear it.
+    state.draft_backend_override.set(None);
+    state.agent_initializing.set(true);
+    let name = "Chat".to_string();
 
     spawn_local(async move {
         let payload = SpawnAgentPayload {
@@ -66,7 +91,8 @@ pub fn spawn_new_chat(state: &AppState) {
             project_id,
             params: SpawnAgentParams::New {
                 workspace_roots: roots,
-                prompt: None,
+                prompt: initial_message,
+                images: initial_images,
                 backend_kind,
                 cost_hint: None,
             },

@@ -5,11 +5,13 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::BTreeSet;
+
 use protocol::{
-    Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
-    ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
-    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    FileEntryOp, Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileEntry,
+    ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile,
+    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
 };
 use serde_json::Value;
@@ -22,9 +24,13 @@ use crate::stream::Stream;
 
 const PROJECT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// A (relative_path, kind) pair used for diffing file listings between polls.
+pub(crate) type RawFileEntry = (String, ProjectFileKind);
+
 #[derive(Debug, Default)]
 pub(crate) struct ProjectSnapshotState {
-    pub file_list: Option<Value>,
+    /// Previous file entries per root, used to compute diffs.
+    pub file_entries: BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
     pub git_status: Option<Value>,
 }
 
@@ -49,22 +55,21 @@ pub(crate) fn spawn_project_subscription(
                     panic!("project {} disappeared while stream was active", project_id)
                 });
 
-            let file_list = build_file_list(&project)
-                .unwrap_or_else(|err| panic!("failed to build project file list: {err}"));
+            let current_raw = scan_raw_entries(&project)
+                .unwrap_or_else(|err| panic!("failed to scan project entries: {err}"));
             let git_status = build_git_status(&project)
                 .unwrap_or_else(|err| panic!("failed to build project git status: {err}"));
 
-            let file_json = serde_json::to_value(&file_list)
-                .expect("failed to serialize project file list snapshot");
             let git_json = serde_json::to_value(&git_status)
                 .expect("failed to serialize project git status snapshot");
 
             let mut snapshot = state.lock().await;
-            let file_changed = snapshot.file_list.as_ref() != Some(&file_json);
-            let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
 
-            if file_changed {
-                snapshot.file_list = Some(file_json.clone());
+            let file_diff = diff_file_entries(&snapshot.file_entries, &current_raw);
+            if !file_diff.roots.is_empty() {
+                snapshot.file_entries = current_raw;
+                let file_json = serde_json::to_value(&file_diff)
+                    .expect("failed to serialize project file list diff");
                 drop(snapshot);
                 if stream
                     .send_value(protocol::FrameKind::ProjectFileList, file_json)
@@ -76,6 +81,7 @@ pub(crate) fn spawn_project_subscription(
                 snapshot = state.lock().await;
             }
 
+            let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
             if git_changed {
                 snapshot.git_status = Some(git_json.clone());
                 drop(snapshot);
@@ -93,9 +99,22 @@ pub(crate) fn spawn_project_subscription(
     })
 }
 
-pub(crate) fn build_file_list(project: &Project) -> Result<ProjectFileListPayload, String> {
-    let mut roots = Vec::with_capacity(project.roots.len());
+/// Default depth limit for initial file listings and polling.
+/// Directories at this depth are listed but not recursed into.
+const DEFAULT_FILE_LIST_DEPTH: usize = 2;
 
+/// Scan the filesystem and return raw (path, kind) entries per root at the default depth.
+pub(crate) fn scan_raw_entries(
+    project: &Project,
+) -> Result<BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>, String> {
+    scan_raw_entries_with_depth(project, DEFAULT_FILE_LIST_DEPTH)
+}
+
+fn scan_raw_entries_with_depth(
+    project: &Project,
+    max_depth: usize,
+) -> Result<BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>, String> {
+    let mut result = BTreeMap::new();
     for root in &project.roots {
         let root_path = Path::new(root);
         let metadata = fs::metadata(root_path)
@@ -103,18 +122,139 @@ pub(crate) fn build_file_list(project: &Project) -> Result<ProjectFileListPayloa
         if !metadata.is_dir() {
             return Err(format!("Project root '{}' is not a directory", root));
         }
+        let mut raw = Vec::new();
+        collect_raw_entries(root_path, root_path, &mut raw, 0, max_depth)?;
+        result.insert(ProjectRootPath(root.clone()), raw.into_iter().collect());
+    }
+    Ok(result)
+}
 
-        let mut entries = Vec::new();
-        collect_entries(root_path, root_path, &mut entries)?;
-        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-
+/// Build an all-Add file list payload, preserving project root order.
+pub(crate) fn build_file_list(project: &Project) -> Result<ProjectFileListPayload, String> {
+    let mut roots = Vec::with_capacity(project.roots.len());
+    for root in &project.roots {
+        let root_path = Path::new(root);
+        let metadata = fs::metadata(root_path)
+            .map_err(|err| format!("Failed to stat project root '{}': {err}", root))?;
+        if !metadata.is_dir() {
+            return Err(format!("Project root '{}' is not a directory", root));
+        }
+        let mut raw = Vec::new();
+        collect_raw_entries(root_path, root_path, &mut raw, 0, DEFAULT_FILE_LIST_DEPTH)?;
+        raw.sort();
+        let entries = raw
+            .into_iter()
+            .map(|(path, kind)| ProjectFileEntry {
+                relative_path: path,
+                kind,
+                op: FileEntryOp::Add,
+            })
+            .collect();
         roots.push(ProjectRootListing {
             root: ProjectRootPath(root.clone()),
             entries,
         });
     }
+    Ok(ProjectFileListPayload {
+        incremental: false,
+        roots,
+    })
+}
 
-    Ok(ProjectFileListPayload { roots })
+/// Diff previous vs current raw entries and produce a payload with Add/Remove ops.
+/// Returns a payload with empty roots if nothing changed.
+fn diff_file_entries(
+    previous: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
+    current: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
+) -> ProjectFileListPayload {
+    let mut roots = Vec::new();
+    // All roots that appear in either previous or current
+    let all_roots: BTreeSet<&ProjectRootPath> = previous.keys().chain(current.keys()).collect();
+
+    for root in all_roots {
+        let prev_entries = previous.get(root);
+        let curr_entries = current.get(root);
+        let empty = BTreeSet::new();
+        let prev = prev_entries.unwrap_or(&empty);
+        let curr = curr_entries.unwrap_or(&empty);
+
+        if prev == curr {
+            continue;
+        }
+
+        let mut entries = Vec::new();
+        // Removed entries: in previous but not in current
+        for (path, kind) in prev.difference(curr) {
+            entries.push(ProjectFileEntry {
+                relative_path: path.clone(),
+                kind: *kind,
+                op: FileEntryOp::Remove,
+            });
+        }
+        // Added entries: in current but not in previous
+        for (path, kind) in curr.difference(prev) {
+            entries.push(ProjectFileEntry {
+                relative_path: path.clone(),
+                kind: *kind,
+                op: FileEntryOp::Add,
+            });
+        }
+        entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        roots.push(ProjectRootListing {
+            root: root.clone(),
+            entries,
+        });
+    }
+
+    ProjectFileListPayload {
+        incremental: false,
+        roots,
+    }
+}
+
+/// List entries within a specific subdirectory of a root (all Add ops).
+pub(crate) fn build_dir_listing(
+    project: &Project,
+    root: &ProjectRootPath,
+    dir_relative_path: &str,
+) -> Result<ProjectFileListPayload, String> {
+    validate_root(project, root)?;
+    if !dir_relative_path.is_empty() {
+        validate_relative_path(dir_relative_path)?;
+    }
+
+    let root_path = Path::new(&root.0);
+    let dir_path = if dir_relative_path.is_empty() {
+        root_path.to_path_buf()
+    } else {
+        root_path.join(dir_relative_path)
+    };
+
+    let metadata = fs::metadata(&dir_path)
+        .map_err(|err| format!("Failed to stat directory '{}': {err}", dir_path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("'{}' is not a directory", dir_path.display()));
+    }
+
+    let mut raw = Vec::new();
+    collect_raw_entries(root_path, &dir_path, &mut raw, 0, DEFAULT_FILE_LIST_DEPTH)?;
+
+    let entries: Vec<ProjectFileEntry> = raw
+        .into_iter()
+        .map(|(path, kind)| ProjectFileEntry {
+            relative_path: path,
+            kind,
+            op: FileEntryOp::Add,
+        })
+        .collect();
+
+    Ok(ProjectFileListPayload {
+        incremental: true,
+        roots: vec![ProjectRootListing {
+            root: root.clone(),
+            entries,
+        }],
+    })
 }
 
 pub(crate) fn build_git_status(project: &Project) -> Result<ProjectGitStatusPayload, String> {
@@ -312,22 +452,22 @@ pub(crate) fn stage_hunk(
 
 pub(crate) async fn sync_snapshot_state(
     state: &Arc<Mutex<ProjectSnapshotState>>,
-    file_list: &ProjectFileListPayload,
+    raw_entries: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
     git_status: &ProjectGitStatusPayload,
 ) {
     let mut snapshot = state.lock().await;
-    snapshot.file_list = Some(
-        serde_json::to_value(file_list).expect("failed to serialize project file list snapshot"),
-    );
+    snapshot.file_entries = raw_entries.clone();
     snapshot.git_status = Some(
         serde_json::to_value(git_status).expect("failed to serialize project git status snapshot"),
     );
 }
 
-fn collect_entries(
+fn collect_raw_entries(
     root: &Path,
     current: &Path,
-    out: &mut Vec<ProjectFileEntry>,
+    out: &mut Vec<RawFileEntry>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<(), String> {
     let mut entries = fs::read_dir(current)
         .map_err(|err| format!("Failed to read directory '{}': {err}", current.display()))?
@@ -364,13 +504,11 @@ fn collect_entries(
             ProjectFileKind::File
         };
 
-        out.push(ProjectFileEntry {
-            relative_path,
-            kind,
-        });
+        out.push((relative_path, kind));
 
-        if metadata.is_dir() {
-            collect_entries(root, &path, out)?;
+        // Recurse into directories only if within depth limit
+        if metadata.is_dir() && depth < max_depth {
+            collect_raw_entries(root, &path, out, depth + 1, max_depth)?;
         }
     }
 
@@ -606,10 +744,10 @@ fn parse_raw_git_diff(raw: &str) -> Vec<ParsedGitDiffFile> {
 }
 
 fn parse_diff_path(a_path: &str, b_path: &str) -> String {
-    if let Some(path) = b_path.strip_prefix("b/") {
-        if path != "dev/null" {
-            return path.to_owned();
-        }
+    if let Some(path) = b_path.strip_prefix("b/")
+        && path != "dev/null"
+    {
+        return path.to_owned();
     }
     a_path.strip_prefix("a/").unwrap_or(a_path).to_owned()
 }

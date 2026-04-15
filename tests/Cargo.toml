@@ -6,6 +6,7 @@ edition.workspace = true
 client = { path = "../client" }
 protocol = { path = "../protocol" }
 server = { path = "../server" }
+tyde-dev-driver = { path = "../dev-driver" }
 paste = "1"
 serde_json.workspace = true
 tempfile = "3"

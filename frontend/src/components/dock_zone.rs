@@ -15,31 +15,10 @@ pub enum DockPosition {
 
 #[component]
 pub fn DockZone(position: DockPosition) -> impl IntoView {
-    let class = match position {
-        DockPosition::Left => "dock-zone dock-left",
-        DockPosition::Right => "dock-zone dock-right",
-        DockPosition::Bottom => "dock-zone dock-bottom",
-    };
-
     match position {
-        DockPosition::Right => view! {
-            <div class={class}>
-                <RightDock />
-            </div>
-        }
-        .into_any(),
-        DockPosition::Left => view! {
-            <div class={class}>
-                <LeftDock />
-            </div>
-        }
-        .into_any(),
-        DockPosition::Bottom => view! {
-            <div class={class}>
-                <TerminalView />
-            </div>
-        }
-        .into_any(),
+        DockPosition::Right => view! { <RightDock /> }.into_any(),
+        DockPosition::Left => view! { <LeftDock /> }.into_any(),
+        DockPosition::Bottom => view! { <TerminalView /> }.into_any(),
     }
 }
 

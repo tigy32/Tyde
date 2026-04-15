@@ -1,0 +1,8 @@
+[package]
+name = "devtools-protocol"
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+

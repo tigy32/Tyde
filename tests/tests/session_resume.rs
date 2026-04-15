@@ -9,15 +9,28 @@ use protocol::{
 use std::time::Duration;
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+
+        if env.stream.0.starts_with("/host/") && env.kind == FrameKind::HostSettings {
+            continue;
+        }
+
+        return env;
     }
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
+    let env = expect_next_event(client, "TypingStatusChanged(true)").await;
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
     let env = expect_next_event(client, "StreamStart").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
@@ -41,6 +54,11 @@ async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
     assert_eq!(env.kind, FrameKind::ChatEvent);
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
+
+    let env = expect_next_event(client, "TypingStatusChanged(false)").await;
+    assert_eq!(env.kind, FrameKind::ChatEvent);
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
@@ -77,7 +95,8 @@ async fn list_sessions_and_resume_agent() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: Some("hello".to_owned()),
+                prompt: "hello".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -177,7 +196,8 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/parent".to_owned()],
-                prompt: Some("parent hello".to_owned()),
+                prompt: "parent hello".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -202,7 +222,8 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/child".to_owned()],
-                prompt: Some("child hello".to_owned()),
+                prompt: "child hello".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },
@@ -314,7 +335,8 @@ async fn session_project_id_persists_and_resume_can_override_it() {
             project_id: Some(project_a.id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: project_a.roots.clone(),
-                prompt: Some("session project".to_owned()),
+                prompt: "session project".to_owned(),
+                images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
             },

@@ -9,11 +9,35 @@ pub mod tycode;
 
 use std::collections::HashMap;
 
-use protocol::{AgentInput, BackendKind, ChatEvent, SessionId, SpawnCostHint};
+use protocol::{
+    AgentInput, BackendKind, ChatEvent, ImageData, SendMessagePayload, SessionId, SpawnCostHint,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use self::subprocess::ImageAttachment;
+
+pub(crate) fn protocol_images_to_attachments(
+    images: Option<Vec<ImageData>>,
+) -> Option<Vec<ImageAttachment>> {
+    let attachments = images
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, image)| ImageAttachment {
+            data: image.data,
+            media_type: image.media_type,
+            name: format!("image-{}", index + 1),
+            size: 0,
+        })
+        .collect::<Vec<_>>();
+
+    if attachments.is_empty() {
+        None
+    } else {
+        Some(attachments)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
@@ -114,44 +138,39 @@ impl EventStream {
 pub trait Backend: Send + 'static {
     /// Create a new backend session.
     /// Returns a handle to send input and an EventStream to read output.
-    /// The backend starts idle — the caller sends the first message via `send()`.
+    /// The backend must start the session with `initial_input` and know its
+    /// native resumable session ID before returning.
     fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
+        initial_input: SendMessagePayload,
     ) -> impl std::future::Future<Output = Result<(Self, EventStream), String>> + Send
     where
         Self: Sized;
 
     /// Resume an existing backend session.
     fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> impl std::future::Future<Output = Result<(Self, EventStream), String>> + Send
     where
-        Self: Sized,
-    {
-        async move {
-            Err(format!(
-                "resume is not implemented for session {}",
-                session_id.0
-            ))
-        }
-    }
+        Self: Sized;
 
     /// Enumerate resumable sessions known to this backend.
     fn list_sessions()
     -> impl std::future::Future<Output = Result<Vec<BackendSession>, String>> + Send
     where
-        Self: Sized,
-    {
-        async { Ok(Vec::new()) }
-    }
+        Self: Sized;
 
     /// Return the backend-native session ID for this live handle.
-    fn session_id(&self) -> SessionId {
-        panic!("session_id is not implemented for this backend")
-    }
+    fn session_id(&self) -> SessionId;
 
     /// Send an input event to the backend.
     /// Returns false if the backend has terminated and can't accept input.
     fn send(&self, input: AgentInput) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Interrupt the currently active turn, if any.
+    /// Returns false if the backend has terminated or doesn't support interruption.
+    fn interrupt(&self) -> impl std::future::Future<Output = bool> + Send;
 }

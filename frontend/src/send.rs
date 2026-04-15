@@ -29,8 +29,7 @@ pub async fn send_frame<T: Serialize>(
     payload: &T,
 ) -> Result<(), String> {
     let seq = next_seq(&stream);
-    let envelope =
-        Envelope::from_payload(stream, kind, seq, payload).map_err(|e| e.to_string())?;
+    let envelope = Envelope::from_payload(stream, kind, seq, payload).map_err(|e| e.to_string())?;
     let line = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
     bridge::send_host_line(bridge::SendHostLineRequest {
         host_id: host_id.to_owned(),

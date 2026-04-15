@@ -131,7 +131,7 @@ fn TerminalTab(term: TerminalInfo) -> impl IntoView {
             .active_terminal_id
             .get()
             .as_ref()
-            .map_or(false, |id| *id == tid)
+            .is_some_and(|id| *id == tid)
     };
 
     let tab_class = move || {
@@ -143,9 +143,7 @@ fn TerminalTab(term: TerminalInfo) -> impl IntoView {
     };
 
     let on_click = move |_| {
-        state
-            .active_terminal_id
-            .set(Some(tid_for_click.clone()));
+        state.active_terminal_id.set(Some(tid_for_click.clone()));
     };
 
     let exited = term.exited;
@@ -205,7 +203,7 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
         terms
             .iter()
             .find(|t| t.terminal_id == tid)
-            .map_or(true, |t| t.exited)
+            .is_none_or(|t| t.exited)
     };
 
     let stored_stream = StoredValue::new(stream);
@@ -218,9 +216,7 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
         let stream = stored_stream.get_value();
         spawn_local(async move {
             let payload = TerminalSendPayload { data };
-            if let Err(e) =
-                send_frame(&host_id, stream, FrameKind::TerminalSend, &payload).await
-            {
+            if let Err(e) = send_frame(&host_id, stream, FrameKind::TerminalSend, &payload).await {
                 log::error!("failed to send terminal data: {e}");
             }
         });
@@ -283,9 +279,5 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
 
 fn short_id(id: &TerminalId) -> &str {
     let s = &id.0;
-    if s.len() > 8 {
-        &s[..8]
-    } else {
-        s
-    }
+    if s.len() > 8 { &s[..8] } else { s }
 }

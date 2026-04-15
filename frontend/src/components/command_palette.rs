@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::actions::spawn_new_chat;
+use crate::actions::begin_new_chat;
 use crate::send::send_frame;
 use crate::state::{AppState, CenterView, DockVisibility};
 
@@ -16,15 +16,51 @@ struct CommandEntry {
 }
 
 const COMMANDS: &[CommandEntry] = &[
-    CommandEntry { name: "New Chat", shortcut: Some("Ctrl+N"), id: "new_chat" },
-    CommandEntry { name: "Toggle Left Panel", shortcut: None, id: "toggle_left" },
-    CommandEntry { name: "Toggle Right Panel", shortcut: None, id: "toggle_right" },
-    CommandEntry { name: "Toggle Bottom Panel", shortcut: None, id: "toggle_bottom" },
-    CommandEntry { name: "Go to Home", shortcut: None, id: "go_home" },
-    CommandEntry { name: "Go to Chat", shortcut: None, id: "go_chat" },
-    CommandEntry { name: "Go to Editor", shortcut: None, id: "go_editor" },
-    CommandEntry { name: "Open Settings", shortcut: Some("Ctrl+,"), id: "open_settings" },
-    CommandEntry { name: "Refresh Project", shortcut: None, id: "refresh_project" },
+    CommandEntry {
+        name: "New Chat",
+        shortcut: Some("Ctrl+N"),
+        id: "new_chat",
+    },
+    CommandEntry {
+        name: "Toggle Left Panel",
+        shortcut: None,
+        id: "toggle_left",
+    },
+    CommandEntry {
+        name: "Toggle Right Panel",
+        shortcut: None,
+        id: "toggle_right",
+    },
+    CommandEntry {
+        name: "Toggle Bottom Panel",
+        shortcut: None,
+        id: "toggle_bottom",
+    },
+    CommandEntry {
+        name: "Go to Home",
+        shortcut: None,
+        id: "go_home",
+    },
+    CommandEntry {
+        name: "Go to Chat",
+        shortcut: None,
+        id: "go_chat",
+    },
+    CommandEntry {
+        name: "Go to Editor",
+        shortcut: None,
+        id: "go_editor",
+    },
+    CommandEntry {
+        name: "Open Settings",
+        shortcut: Some("Ctrl+,"),
+        id: "open_settings",
+    },
+    CommandEntry {
+        name: "Refresh Project",
+        shortcut: None,
+        id: "refresh_project",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,9 +80,7 @@ fn fuzzy_score(query: &str, target: &str) -> Option<u32> {
         return Some(100);
     }
 
-    let words: Vec<&str> = target_lower
-        .split(|c: char| c == '/' || c == '.' || c == '_' || c == '-' || c == ' ')
-        .collect();
+    let words: Vec<&str> = target_lower.split(['/', '.', '_', '-', ' ']).collect();
     for word in &words {
         if word.starts_with(&query_lower) {
             return Some(75);
@@ -72,7 +106,7 @@ fn toggle_dock(signal: RwSignal<DockVisibility>) {
 fn execute_command(state: &AppState, id: &str) {
     match id {
         "new_chat" => {
-            spawn_new_chat(state);
+            begin_new_chat(state, None);
         }
         "toggle_left" => toggle_dock(state.left_dock),
         "toggle_right" => toggle_dock(state.right_dock),
@@ -192,34 +226,32 @@ pub fn CommandPalette() -> impl IntoView {
 
     let result_count = Memo::new(move |_| results.get().len());
 
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        match ev.key().as_str() {
-            "Escape" => {
-                ev.prevent_default();
-                open.set(false);
-            }
-            "ArrowDown" => {
-                ev.prevent_default();
-                let count = result_count.get();
-                if count > 0 {
-                    selected_index.update(|i: &mut usize| *i = (*i + 1) % count);
-                }
-            }
-            "ArrowUp" => {
-                ev.prevent_default();
-                let count = result_count.get();
-                if count > 0 {
-                    selected_index.update(|i: &mut usize| {
-                        *i = if *i == 0 { count - 1 } else { *i - 1 };
-                    });
-                }
-            }
-            "Enter" => {
-                ev.prevent_default();
-                do_select(results, selected_index.get_untracked());
-            }
-            _ => {}
+    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+        "Escape" => {
+            ev.prevent_default();
+            open.set(false);
         }
+        "ArrowDown" => {
+            ev.prevent_default();
+            let count = result_count.get();
+            if count > 0 {
+                selected_index.update(|i: &mut usize| *i = (*i + 1) % count);
+            }
+        }
+        "ArrowUp" => {
+            ev.prevent_default();
+            let count = result_count.get();
+            if count > 0 {
+                selected_index.update(|i: &mut usize| {
+                    *i = if *i == 0 { count - 1 } else { *i - 1 };
+                });
+            }
+        }
+        "Enter" => {
+            ev.prevent_default();
+            do_select(results, selected_index.get_untracked());
+        }
+        _ => {}
     };
 
     let on_input = move |ev: web_sys::Event| {

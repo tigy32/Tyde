@@ -15,6 +15,7 @@ pub struct ProxyRouterHandle {
 }
 
 struct ConnectedHost {
+    connection_id: u64,
     tx: mpsc::Sender<ConnectionCommand>,
 }
 
@@ -36,6 +37,7 @@ enum RouterCommand {
     },
     ConnectionClosed {
         host_id: String,
+        connection_id: u64,
     },
 }
 
@@ -111,6 +113,7 @@ async fn router_actor(
     mut rx: mpsc::Receiver<RouterCommand>,
 ) {
     let mut hosts: HashMap<String, ConnectedHost> = HashMap::new();
+    let mut next_connection_id = 1_u64;
 
     while let Some(command) = rx.recv().await {
         match command {
@@ -121,11 +124,13 @@ async fn router_actor(
                 reply,
             } => {
                 tracing::info!(host_id, "connect_duplex requested");
-                if hosts.contains_key(&host_id) {
-                    tracing::warn!(host_id, "host already connected");
-                    let _ = reply.send(Err(format!("host {host_id} is already connected")));
-                    continue;
+                if let Some(existing) = hosts.remove(&host_id) {
+                    tracing::info!(host_id, "replacing existing host connection");
+                    let _ = existing.tx.send(ConnectionCommand::Disconnect).await;
                 }
+
+                let connection_id = next_connection_id;
+                next_connection_id += 1;
 
                 // Create an in-process duplex stream — one end for the shell,
                 // one end for the server. Exactly like the test fixture.
@@ -152,12 +157,19 @@ async fn router_actor(
                 tokio::spawn(connection_actor(
                     app,
                     host_id.clone(),
+                    connection_id,
                     BufReader::new(read_half),
                     write_half,
                     connection_rx,
                     router_tx.clone(),
                 ));
-                hosts.insert(host_id.clone(), ConnectedHost { tx: connection_tx });
+                hosts.insert(
+                    host_id.clone(),
+                    ConnectedHost {
+                        connection_id,
+                        tx: connection_tx,
+                    },
+                );
                 tracing::info!(host_id, "connected via duplex");
                 let _ = reply.send(Ok(()));
             }
@@ -190,9 +202,18 @@ async fn router_actor(
                     .send(ConnectionCommand::SendLine { line, reply })
                     .await;
             }
-            RouterCommand::ConnectionClosed { host_id } => {
-                tracing::info!(host_id, "connection closed");
-                hosts.remove(&host_id);
+            RouterCommand::ConnectionClosed {
+                host_id,
+                connection_id,
+            } => {
+                let should_remove = hosts
+                    .get(&host_id)
+                    .map(|connected| connected.connection_id == connection_id)
+                    .unwrap_or(false);
+                tracing::info!(host_id, connection_id, should_remove, "connection closed");
+                if should_remove {
+                    hosts.remove(&host_id);
+                }
             }
         }
     }
@@ -201,6 +222,7 @@ async fn router_actor(
 async fn connection_actor<R, W>(
     app: AppHandle,
     host_id: String,
+    connection_id: u64,
     mut reader: R,
     mut writer: W,
     mut rx: mpsc::Receiver<ConnectionCommand>,
@@ -252,7 +274,10 @@ async fn connection_actor<R, W>(
         },
     );
     let _ = router_tx
-        .send(RouterCommand::ConnectionClosed { host_id })
+        .send(RouterCommand::ConnectionClosed {
+            host_id,
+            connection_id,
+        })
         .await;
 }
 

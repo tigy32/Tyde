@@ -64,9 +64,20 @@ impl fmt::Display for ProjectId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    Tycode,
+    Kiro,
     Claude,
     Codex,
     Gemini,
+}
+
+impl BackendKind {
+    pub const fn supports_image_input(self) -> bool {
+        match self {
+            Self::Kiro | Self::Claude | Self::Codex => true,
+            Self::Tycode | Self::Gemini => false,
+        }
+    }
 }
 
 /// Backend-agnostic hint for picking a cheaper or more capable spawned agent.
@@ -101,6 +112,7 @@ pub enum FrameKind {
     SpawnAgent,
     ListSessions,
     SendMessage,
+    Interrupt,
     ProjectCreate,
     ProjectRename,
     ProjectAddRoot,
@@ -110,6 +122,7 @@ pub enum FrameKind {
     ProjectReadFile,
     ProjectStageFile,
     ProjectStageHunk,
+    ProjectListDir,
     TerminalCreate,
     TerminalSend,
     TerminalResize,
@@ -145,6 +158,7 @@ impl fmt::Display for FrameKind {
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
             Self::SendMessage => f.write_str("send_message"),
+            Self::Interrupt => f.write_str("interrupt"),
             Self::ProjectCreate => f.write_str("project_create"),
             Self::ProjectRename => f.write_str("project_rename"),
             Self::ProjectAddRoot => f.write_str("project_add_root"),
@@ -154,6 +168,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
             Self::ProjectStageHunk => f.write_str("project_stage_hunk"),
+            Self::ProjectListDir => f.write_str("project_list_dir"),
             Self::TerminalCreate => f.write_str("terminal_create"),
             Self::TerminalSend => f.write_str("terminal_send"),
             Self::TerminalResize => f.write_str("terminal_resize"),
@@ -226,21 +241,10 @@ pub struct BootstrapData {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSettings {
+    #[serde(default)]
     pub enabled_backends: Vec<BackendKind>,
-    pub default_backend: BackendKind,
-}
-
-impl Default for HostSettings {
-    fn default() -> Self {
-        Self {
-            enabled_backends: vec![
-                BackendKind::Claude,
-                BackendKind::Codex,
-                BackendKind::Gemini,
-            ],
-            default_backend: BackendKind::Claude,
-        }
-    }
+    #[serde(default)]
+    pub default_backend: Option<BackendKind>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,8 +258,12 @@ pub struct SetSettingPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostSettingValue {
-    EnabledBackends { enabled_backends: Vec<BackendKind> },
-    DefaultBackend { default_backend: BackendKind },
+    EnabledBackends {
+        enabled_backends: Vec<BackendKind>,
+    },
+    DefaultBackend {
+        default_backend: Option<BackendKind>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,7 +299,9 @@ pub struct SpawnAgentPayload {
 pub enum SpawnAgentParams {
     New {
         workspace_roots: Vec<String>,
-        prompt: Option<String>,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageData>>,
         backend_kind: BackendKind,
         cost_hint: Option<SpawnCostHint>,
     },
@@ -304,7 +314,12 @@ pub enum SpawnAgentParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessagePayload {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InterruptPayload {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListSessionsPayload {}
@@ -398,7 +413,7 @@ pub enum ProjectNotifyPayload {
     Delete { project: Project },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProjectRootPath(pub String);
 
@@ -448,7 +463,16 @@ pub struct ProjectStageHunkPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectListDirPayload {
+    pub root: ProjectRootPath,
+    /// Relative path of the directory to list. Empty string means root.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectFileListPayload {
+    #[serde(default)]
+    pub incremental: bool,
     pub roots: Vec<ProjectRootListing>,
 }
 
@@ -462,9 +486,17 @@ pub struct ProjectRootListing {
 pub struct ProjectFileEntry {
     pub relative_path: String,
     pub kind: ProjectFileKind,
+    pub op: FileEntryOp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryOp {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectFileKind {
     File,
@@ -647,6 +679,7 @@ pub struct AgentErrorPayload {
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
     MessageAdded(ChatMessage),
+    TypingStatusChanged(bool),
     StreamStart(StreamStartData),
     StreamDelta(StreamTextDeltaData),
     StreamReasoningDelta(StreamTextDeltaData),
@@ -721,7 +754,7 @@ pub struct ContextBreakdown {
     pub context_window: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageData {
     pub media_type: String,
     pub data: String,

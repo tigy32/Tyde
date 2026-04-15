@@ -293,10 +293,10 @@ impl AcpBridge {
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string());
 
-        if let Some(path) = cwd.as_ref() {
-            if !Path::new(path).is_absolute() {
-                return Err("terminal/create requires absolute 'cwd'".to_string());
-            }
+        if let Some(path) = cwd.as_ref()
+            && !Path::new(path).is_absolute()
+        {
+            return Err("terminal/create requires absolute 'cwd'".to_string());
         }
 
         let output_limit = params
@@ -527,10 +527,10 @@ fn normalize_tool_call_args(raw: Value) -> Value {
 fn decode_embedded_json(value: Value) -> Value {
     if let Value::String(text) = &value {
         let trimmed = text.trim();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                return parsed;
-            }
+        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+        {
+            return parsed;
         }
     }
     value
@@ -594,16 +594,16 @@ pub fn parse_tool_call_completion(
 }
 
 pub fn extract_text_from_update(update: &Value) -> String {
-    if let Some(text) = update.get("text").and_then(Value::as_str) {
-        if !text.is_empty() {
-            return text.to_string();
-        }
+    if let Some(text) = update.get("text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return text.to_string();
     }
 
-    if let Some(delta) = update.get("delta").and_then(Value::as_str) {
-        if !delta.is_empty() {
-            return delta.to_string();
-        }
+    if let Some(delta) = update.get("delta").and_then(Value::as_str)
+        && !delta.is_empty()
+    {
+        return delta.to_string();
     }
 
     if let Some(content) = update.get("content") {
@@ -622,12 +622,11 @@ fn extract_text_from_content(content: &Value) -> String {
         return text.to_string();
     }
 
-    if let Some(content_type) = content.get("type").and_then(Value::as_str) {
-        if content_type == "content" {
-            if let Some(inner) = content.get("content") {
-                return extract_text_from_content(inner);
-            }
-        }
+    if let Some(content_type) = content.get("type").and_then(Value::as_str)
+        && content_type == "content"
+        && let Some(inner) = content.get("content")
+    {
+        return extract_text_from_content(inner);
     }
 
     if let Some(array) = content.as_array() {

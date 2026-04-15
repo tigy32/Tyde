@@ -755,6 +755,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "devtools-protocol"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1103,7 @@ name = "frontend"
 version = "0.0.0"
 dependencies = [
  "console_log",
+ "devtools-protocol",
  "js-sys",
  "leptos",
  "log",
@@ -4527,7 +4536,9 @@ dependencies = [
 name = "tauri-shell"
 version = "0.1.0"
 dependencies = [
+ "devtools-protocol",
  "serde",
+ "serde_json",
  "server",
  "tauri",
  "tauri-build",
@@ -4640,6 +4651,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-subscriber",
+ "tyde-dev-driver",
  "uuid",
 ]
 
@@ -5033,6 +5045,22 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tyde-dev-driver"
+version = "0.0.0"
+dependencies = [
+ "client",
+ "devtools-protocol",
+ "protocol",
+ "serde",
+ "serde_json",
+ "server",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "typed-builder"

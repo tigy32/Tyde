@@ -44,7 +44,10 @@ pub fn TaskListView(
     });
 
     view! {
-        <div class="task-list-panel">
+        <div class=move || {
+            let show = has_context.get() || has_tasks.get();
+            if show { "task-list-panel" } else { "task-list-panel hidden" }
+        }>
             {move || {
                 let has_context_now = has_context.get();
                 let has_tasks_now = has_tasks.get();
@@ -76,24 +79,31 @@ fn render_context_view(
     active_view: RwSignal<SummaryView>,
 ) -> impl IntoView {
     let metrics = breakdown.as_ref().map(compute_context_metrics);
-    let has_detailed_breakdown = breakdown
-        .as_ref()
-        .is_some_and(has_detailed_breakdown);
+    let has_detailed_breakdown = breakdown.as_ref().is_some_and(has_detailed_breakdown);
 
     view! {
         <div class="summary-panel">
             <div class="summary-context-view">
                 <div class="summary-context-header">
                     <span class="summary-context-title">"Context Usage"</span>
-                    {metrics.as_ref().map(|m| view! {
-                        <span class="summary-context-usage" data-testid="context-usage">
-                            {format!(
-                                "{} / {} tokens ({:.1}%)",
-                                format_token_count(m.total_used),
-                                format_token_count(m.context_window),
-                                m.utilization_pct
-                            )}
-                        </span>
+                    {metrics.as_ref().map(|m| {
+                        let usage_class = if m.utilization_pct > 95.0 {
+                            "summary-context-usage context-danger"
+                        } else if m.utilization_pct > 80.0 {
+                            "summary-context-usage context-warning"
+                        } else {
+                            "summary-context-usage"
+                        };
+                        view! {
+                            <span class=usage_class data-testid="context-usage">
+                                {format!(
+                                    "{} / {} tokens ({:.1}%)",
+                                    format_token_count(m.total_used),
+                                    format_token_count(m.context_window),
+                                    m.utilization_pct
+                                )}
+                            </span>
+                        }
                     })}
                 </div>
                 <div
@@ -150,7 +160,10 @@ fn render_context_view(
                                 </button>
                             </div>
                         }.into_any(),
-                        _ => view! { <></> }.into_any(),
+                        _ => {
+                            let _: () = view! { <></> };
+                            ().into_any()
+                        },
                     }
                 }}
             </div>
@@ -283,7 +296,8 @@ fn task_rows_for_display(tasks: &[protocol::Task], collapsed: bool) -> Vec<TaskR
         }];
     }
 
-    tasks.first()
+    tasks
+        .first()
         .map(|task| {
             vec![TaskRow {
                 description: task.description.clone(),
@@ -311,16 +325,22 @@ fn build_task_hint_text(tasks: &[protocol::Task]) -> String {
 }
 
 fn render_context_legend(categories: &[ContextCategory]) -> impl IntoView {
-    let rows = categories.iter().map(|cat| {
-        view! {
-            <div class="context-breakdown-row">
-                <span class="context-breakdown-label">
-                    <span class=format!("context-breakdown-dot {}", cat.dot_class)></span>
-                    {cat.label}
-                </span>
-            </div>
-        }
-    }).collect::<Vec<_>>();
+    let rows = categories
+        .iter()
+        .filter(|cat| cat.percent > 0.5) // Only show categories that are meaningful
+        .map(|cat| {
+            let pct_display = format!("{:.0}%", cat.percent);
+            view! {
+                <div class="context-breakdown-row">
+                    <span class="context-breakdown-label">
+                        <span class=format!("context-breakdown-dot {}", cat.dot_class)></span>
+                        {cat.label}
+                    </span>
+                    <span class="context-breakdown-pct">{pct_display}</span>
+                </div>
+            }
+        })
+        .collect::<Vec<_>>();
 
     view! {
         <div class="summary-context-breakdown">
@@ -352,11 +372,9 @@ fn compute_context_metrics(bd: &ContextBreakdown) -> ContextMetrics {
     let history_bytes = bd.conversation_history_bytes;
     let reasoning_bytes = bd.reasoning_bytes;
     let context_bytes = bd.context_injection_bytes;
-    let total_bytes =
-        system_bytes + tool_bytes + history_bytes + reasoning_bytes + context_bytes;
+    let total_bytes = system_bytes + tool_bytes + history_bytes + reasoning_bytes + context_bytes;
     let context_window = bd.context_window.max(1);
-    let utilization_pct =
-        ((input_tokens as f64 / context_window as f64) * 100.0).clamp(0.0, 100.0);
+    let utilization_pct = ((input_tokens as f64 / context_window as f64) * 100.0).clamp(0.0, 100.0);
 
     let mut categories = vec![
         ContextCategory {

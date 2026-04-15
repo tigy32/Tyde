@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::acp::{
     AcpBridge, AcpInbound, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
@@ -37,6 +37,7 @@ pub struct KiroSession {
 impl KiroSession {
     pub async fn spawn(
         workspace_roots: &[String],
+        initial_model: Option<&str>,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
@@ -45,6 +46,7 @@ impl KiroSession {
             workspace_roots,
             false,
             false,
+            initial_model,
             ssh_host,
             startup_mcp_servers,
             steering_content,
@@ -54,6 +56,7 @@ impl KiroSession {
 
     pub async fn spawn_ephemeral(
         workspace_roots: &[String],
+        initial_model: Option<&str>,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
@@ -62,6 +65,7 @@ impl KiroSession {
             workspace_roots,
             true,
             false,
+            initial_model,
             ssh_host,
             startup_mcp_servers,
             steering_content,
@@ -71,6 +75,7 @@ impl KiroSession {
 
     pub async fn spawn_admin(
         workspace_roots: &[String],
+        initial_model: Option<&str>,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
@@ -79,6 +84,7 @@ impl KiroSession {
             workspace_roots,
             true,
             true,
+            initial_model,
             ssh_host,
             startup_mcp_servers,
             steering_content,
@@ -90,6 +96,7 @@ impl KiroSession {
         workspace_roots: &[String],
         ephemeral: bool,
         admin_session: bool,
+        initial_model: Option<&str>,
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
@@ -106,6 +113,15 @@ impl KiroSession {
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &acp_args)
             .with_local_cwd(roots.session_cwd.clone());
         spawn_spec.local_program = resolve_kiro_chat_binary();
+        if let Some(model) = initial_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            spawn_spec.local_args.push("--model".to_string());
+            spawn_spec.local_args.push(model.to_string());
+            spawn_spec.remote_args.push("--model".to_string());
+            spawn_spec.remote_args.push(model.to_string());
+        }
         if ssh_host.is_some() {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
@@ -138,10 +154,10 @@ impl KiroSession {
                 "cwd": roots.session_cwd,
                 "mcpServers": acp_mcp_servers_json(startup_mcp_servers)
             });
-            if let Some(content) = steering_content {
-                if !content.trim().is_empty() {
-                    session_params["systemPrompt"] = Value::String(content.to_string());
-                }
+            if let Some(content) = steering_content
+                && !content.trim().is_empty()
+            {
+                session_params["systemPrompt"] = Value::String(content.to_string());
             }
             let session_started = bridge.request("session/new", session_params).await?;
 
@@ -851,22 +867,22 @@ impl KiroInner {
             if state.replaying_history {
                 return;
             }
-            if let Some(id) = extract_kiro_message_id(params) {
-                if state.active_message_id.is_none() {
-                    state.active_message_id = Some(id.clone());
-                    state.active_stream_text.clear();
-                    state.active_stream_tool_calls.clear();
-                    let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
-                    self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
-                    self.emit_event(json!({
-                        "kind": "StreamStart",
-                        "data": {
-                            "message_id": id,
-                            "agent": KIRO_AGENT_NAME,
-                            "model": model
-                        }
-                    }));
-                }
+            if let Some(id) = extract_kiro_message_id(params)
+                && state.active_message_id.is_none()
+            {
+                state.active_message_id = Some(id.clone());
+                state.active_stream_text.clear();
+                state.active_stream_tool_calls.clear();
+                let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
+                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
+                self.emit_event(json!({
+                    "kind": "StreamStart",
+                    "data": {
+                        "message_id": id,
+                        "agent": KIRO_AGENT_NAME,
+                        "model": model
+                    }
+                }));
             }
             state
                 .active_message_id
@@ -944,20 +960,16 @@ impl KiroInner {
             let mut state = self.state.lock().await;
             let mut previous_stream: Option<(String, String, Vec<Value>)> = None;
 
-            if let Some(next_id) = chunk_message_id.clone() {
-                if let Some(active_id) = state.active_message_id.clone() {
-                    if active_id != next_id {
-                        let previous_text = std::mem::take(&mut state.active_stream_text);
-                        let previous_tool_calls =
-                            std::mem::take(&mut state.active_stream_tool_calls);
-                        if has_renderable_stream_text(&previous_text)
-                            || !previous_tool_calls.is_empty()
-                        {
-                            previous_stream = Some((active_id, previous_text, previous_tool_calls));
-                        }
-                        state.active_message_id = None;
-                    }
+            if let Some(next_id) = chunk_message_id.clone()
+                && let Some(active_id) = state.active_message_id.clone()
+                && active_id != next_id
+            {
+                let previous_text = std::mem::take(&mut state.active_stream_text);
+                let previous_tool_calls = std::mem::take(&mut state.active_stream_tool_calls);
+                if has_renderable_stream_text(&previous_text) || !previous_tool_calls.is_empty() {
+                    previous_stream = Some((active_id, previous_text, previous_tool_calls));
                 }
+                state.active_message_id = None;
             }
 
             let message_id = state.active_message_id.clone().unwrap_or_else(|| {
@@ -1031,20 +1043,16 @@ impl KiroInner {
         {
             let mut state = self.state.lock().await;
 
-            if let Some(next_id) = incoming_message_id.clone() {
-                if let Some(active_id) = state.active_message_id.clone() {
-                    if active_id != next_id {
-                        let previous_text = std::mem::take(&mut state.active_stream_text);
-                        let previous_tool_calls =
-                            std::mem::take(&mut state.active_stream_tool_calls);
-                        if has_renderable_stream_text(&previous_text)
-                            || !previous_tool_calls.is_empty()
-                        {
-                            previous_stream = Some((active_id, previous_text, previous_tool_calls));
-                        }
-                        state.active_message_id = None;
-                    }
+            if let Some(next_id) = incoming_message_id.clone()
+                && let Some(active_id) = state.active_message_id.clone()
+                && active_id != next_id
+            {
+                let previous_text = std::mem::take(&mut state.active_stream_text);
+                let previous_tool_calls = std::mem::take(&mut state.active_stream_tool_calls);
+                if has_renderable_stream_text(&previous_text) || !previous_tool_calls.is_empty() {
+                    previous_stream = Some((active_id, previous_text, previous_tool_calls));
                 }
+                state.active_message_id = None;
             }
 
             let stream_message_id = incoming_message_id
@@ -1853,10 +1861,9 @@ async fn map_tool_request_type(params: &Value, args: &Value, workspace_root: &st
             if before.is_empty()
                 && !resolved_file_path.is_empty()
                 && Path::new(&resolved_file_path).exists()
+                && let Ok(contents) = tokio::fs::read_to_string(&resolved_file_path).await
             {
-                if let Ok(contents) = tokio::fs::read_to_string(&resolved_file_path).await {
-                    before = contents;
-                }
+                before = contents;
             }
 
             json!({
@@ -2065,12 +2072,11 @@ fn extract_first_string_recursive(
     match value {
         Value::Object(map) => {
             for child in map.values() {
-                if let Some(parsed) = parse_json_value_from_string(child) {
-                    if let Some(found) =
+                if let Some(parsed) = parse_json_value_from_string(child)
+                    && let Some(found) =
                         extract_first_string_recursive(&parsed, keys, depth + 1, max_depth)
-                    {
-                        return Some(found);
-                    }
+                {
+                    return Some(found);
                 }
                 if let Some(found) =
                     extract_first_string_recursive(child, keys, depth + 1, max_depth)
@@ -2082,12 +2088,11 @@ fn extract_first_string_recursive(
         }
         Value::Array(items) => {
             for child in items {
-                if let Some(parsed) = parse_json_value_from_string(child) {
-                    if let Some(found) =
+                if let Some(parsed) = parse_json_value_from_string(child)
+                    && let Some(found) =
                         extract_first_string_recursive(&parsed, keys, depth + 1, max_depth)
-                    {
-                        return Some(found);
-                    }
+                {
+                    return Some(found);
                 }
                 if let Some(found) =
                     extract_first_string_recursive(child, keys, depth + 1, max_depth)
@@ -2267,15 +2272,15 @@ fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         if let Some(number) = raw.as_u64() {
             return Some(number);
         }
-        if let Some(number) = raw.as_i64() {
-            if number >= 0 {
-                return Some(number as u64);
-            }
+        if let Some(number) = raw.as_i64()
+            && number >= 0
+        {
+            return Some(number as u64);
         }
-        if let Some(text) = raw.as_str() {
-            if let Ok(parsed) = text.trim().parse::<u64>() {
-                return Some(parsed);
-            }
+        if let Some(text) = raw.as_str()
+            && let Ok(parsed) = text.trim().parse::<u64>()
+        {
+            return Some(parsed);
         }
     }
     None
@@ -2548,10 +2553,10 @@ async fn clear_local_kiro_session_lock(session_id: &str) -> Result<(), String> {
         Ok(c) => c,
         Err(_) => return Ok(()),
     };
-    if let Ok(pid) = content.trim().parse::<u32>() {
-        if is_pid_alive(pid) {
-            return Ok(());
-        }
+    if let Ok(pid) = content.trim().parse::<u32>()
+        && is_pid_alive(pid)
+    {
+        return Ok(());
     }
     tokio::fs::remove_file(&lock_path)
         .await
@@ -2676,18 +2681,18 @@ fn parse_remote_session_dump(dump: &str) -> Result<Vec<(String, Value)>, String>
 
     for line in dump.lines() {
         if let Some(id) = line.strip_prefix("TYDE_SID:") {
-            if let Some(prev_id) = current_id.take() {
-                if let Ok(metadata) = serde_json::from_str::<Value>(&current_content) {
-                    result.push((prev_id, metadata));
-                }
+            if let Some(prev_id) = current_id.take()
+                && let Ok(metadata) = serde_json::from_str::<Value>(&current_content)
+            {
+                result.push((prev_id, metadata));
             }
             current_id = Some(id.trim().to_string());
             current_content.clear();
         } else if line == "TYDE_SEND" {
-            if let Some(id) = current_id.take() {
-                if let Ok(metadata) = serde_json::from_str::<Value>(&current_content) {
-                    result.push((id, metadata));
-                }
+            if let Some(id) = current_id.take()
+                && let Ok(metadata) = serde_json::from_str::<Value>(&current_content)
+            {
+                result.push((id, metadata));
             }
             current_content.clear();
         } else if current_id.is_some() {
@@ -2697,10 +2702,10 @@ fn parse_remote_session_dump(dump: &str) -> Result<Vec<(String, Value)>, String>
             current_content.push_str(line);
         }
     }
-    if let Some(id) = current_id {
-        if let Ok(metadata) = serde_json::from_str::<Value>(&current_content) {
-            result.push((id, metadata));
-        }
+    if let Some(id) = current_id
+        && let Ok(metadata) = serde_json::from_str::<Value>(&current_content)
+    {
+        result.push((id, metadata));
     }
     Ok(result)
 }
@@ -2726,12 +2731,421 @@ fn extract_session_timestamp(metadata: &Value) -> u64 {
         .or_else(|| metadata.get("updated_at"))
         .or_else(|| metadata.get("createdAt"))
         .or_else(|| metadata.get("created_at"));
-    if let Some(s) = ts_field.and_then(Value::as_str) {
-        if let Some(ms) = parse_iso8601_to_unix_ms(s) {
-            return ms;
-        }
+    if let Some(s) = ts_field.and_then(Value::as_str)
+        && let Some(ms) = parse_iso8601_to_unix_ms(s)
+    {
+        return ms;
     }
     ts_field.and_then(Value::as_u64).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Backend trait implementation
+// ---------------------------------------------------------------------------
+
+use protocol::{
+    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo, SessionId,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+};
+
+use super::{
+    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+};
+
+const BACKEND_EVENT_BUFFER: usize = 256;
+const BACKEND_INPUT_BUFFER: usize = 64;
+const BACKEND_AGENT_NAME: &str = "kiro";
+
+pub struct KiroBackend {
+    input_tx: mpsc::Sender<AgentInput>,
+    interrupt_tx: mpsc::Sender<()>,
+    events_tx: mpsc::Sender<ChatEvent>,
+    session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
+}
+
+fn kiro_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
+    match cost_hint {
+        Some(SpawnCostHint::Low) => Some("claude-haiku-4.5"),
+        Some(SpawnCostHint::Medium) => Some("claude-sonnet-4"),
+        Some(SpawnCostHint::High) => Some("claude-sonnet-4.5"),
+        None => None,
+    }
+}
+
+fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        timestamp: unix_now_ms(),
+        sender: MessageSender::User,
+        content,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images,
+    })
+}
+
+impl Backend for KiroBackend {
+    async fn spawn(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), String> {
+        let initial_message = initial_input.message;
+        let initial_images = protocol_images_to_attachments(initial_input.images);
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let events_tx_task = events_tx.clone();
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let session_id_task = Arc::clone(&session_id);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+
+        tokio::spawn(async move {
+            let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
+            let roots = if workspace_roots.is_empty() {
+                vec!["/tmp".to_string()]
+            } else {
+                workspace_roots
+            };
+            let requested_model = kiro_backend_model(config.cost_hint);
+            let (session, mut raw_events) =
+                match KiroSession::spawn(&roots, requested_model, None, &[], None).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Kiro session: {err}");
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(Err(format!("Failed to spawn Kiro session: {err}")));
+                        }
+                        return;
+                    }
+                };
+            *session_id_task
+                .lock()
+                .expect("kiro session_id mutex poisoned") = Some(SessionId(
+                session.inner.state.lock().await.session_id.clone(),
+            ));
+
+            let handle = session.command_handle();
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Ok(()));
+            }
+
+            let initial_handle = handle.clone();
+            tokio::spawn(async move {
+                if let Err(err) = initial_handle
+                    .execute(SessionCommand::SendMessage {
+                        message: initial_message,
+                        images: initial_images,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to send initial Kiro prompt: {err}");
+                }
+            });
+
+            loop {
+                tokio::select! {
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                            && events_tx_task.send(event).await.is_err() {
+                                break;
+                            }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else { break };
+                        let AgentInput::SendMessage(payload) = input;
+                        let message = payload.message;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send Kiro follow-up prompt: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt Kiro turn: {err}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err("Kiro spawn initialization task ended early".to_string()),
+        }
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                events_tx: events_tx.clone(),
+                session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: SessionId,
+    ) -> Result<(Self, EventStream), String> {
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let events_tx_task = events_tx.clone();
+        let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
+        let known_session_id_task = Arc::clone(&known_session_id);
+
+        tokio::spawn(async move {
+            let roots = if workspace_roots.is_empty() {
+                vec!["/tmp".to_string()]
+            } else {
+                workspace_roots
+            };
+            let requested_model = kiro_backend_model(config.cost_hint);
+            let (session, mut raw_events) =
+                match KiroSession::spawn(&roots, requested_model, None, &[], None).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Kiro resume session: {err}");
+                        return;
+                    }
+                };
+
+            let handle = session.command_handle();
+            if let Err(err) = handle
+                .execute(SessionCommand::ResumeSession {
+                    session_id: session_id.0.clone(),
+                })
+                .await
+            {
+                tracing::error!("Failed to resume Kiro session: {err}");
+                session.shutdown().await;
+                return;
+            }
+            *known_session_id_task
+                .lock()
+                .expect("kiro session_id mutex poisoned") = Some(session_id);
+
+            loop {
+                tokio::select! {
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                            && events_tx_task.send(event).await.is_err() {
+                                break;
+                            }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else { break };
+                        let AgentInput::SendMessage(payload) = input;
+                        let images = protocol_images_to_attachments(payload.images);
+                        if let Err(err) = handle
+                            .execute(SessionCommand::SendMessage {
+                                message: payload.message,
+                                images,
+                            })
+                            .await
+                        {
+                            tracing::error!("Failed to send resumed Kiro follow-up prompt: {err}");
+                            break;
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt resumed Kiro turn: {err}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                events_tx: events_tx.clone(),
+                session_id: known_session_id,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+        let raw_sessions = load_local_kiro_sessions().await?;
+        let mut sessions = Vec::new();
+        for (session_id, metadata) in raw_sessions {
+            let cwd = metadata
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if cwd.contains(KIRO_ADMIN_SESSION_SUBDIR)
+                || cwd.contains(KIRO_EPHEMERAL_SESSION_SUBDIR)
+            {
+                continue;
+            }
+            sessions.push(BackendSession {
+                id: SessionId(session_id),
+                backend_kind: BackendKind::Kiro,
+                workspace_roots: if cwd.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![cwd]
+                },
+                title: Some(extract_session_title(&metadata)),
+                token_count: None,
+                created_at_ms: Some(extract_session_timestamp(&metadata)),
+                updated_at_ms: Some(extract_session_timestamp(&metadata)),
+                resumable: true,
+            });
+        }
+        sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        Ok(sessions)
+    }
+
+    async fn send(&self, input: AgentInput) -> bool {
+        let AgentInput::SendMessage(payload) = input;
+        let visible_message = payload.message.clone();
+        let visible_images = payload.images.clone();
+        let outbound = AgentInput::SendMessage(protocol::SendMessagePayload {
+            message: payload.message,
+            images: payload.images,
+        });
+
+        if self
+            .events_tx
+            .send(backend_user_message(visible_message, visible_images))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        self.input_tx.send(outbound).await.is_ok()
+    }
+
+    async fn interrupt(&self) -> bool {
+        self.interrupt_tx.send(()).await.is_ok()
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.session_id
+            .lock()
+            .expect("kiro session_id mutex poisoned")
+            .clone()
+            .expect("kiro session_id not initialized")
+    }
+}
+
+fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
+    if let Ok(event) = serde_json::from_value::<ChatEvent>(value.clone()) {
+        return Some(event);
+    }
+
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    match kind {
+        "StreamStart" => {
+            let data = value.get("data").unwrap_or(&Value::Null);
+            Some(ChatEvent::StreamStart(StreamStartData {
+                message_id: data
+                    .get("message_id")
+                    .or_else(|| data.get("messageId"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string()),
+                agent: data
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or(BACKEND_AGENT_NAME)
+                    .to_string(),
+                model: data
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string()),
+            }))
+        }
+        "StreamDelta" => {
+            let data = value.get("data").unwrap_or(&Value::Null);
+            let text = data
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if text.is_empty() {
+                return None;
+            }
+            Some(ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: data
+                    .get("message_id")
+                    .or_else(|| data.get("messageId"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string()),
+                text,
+            }))
+        }
+        "StreamEnd" => {
+            let data = value.get("data").unwrap_or(&Value::Null);
+            let msg = data.get("message").unwrap_or(&Value::Null);
+            let content = msg
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model = msg
+                .get("model_info")
+                .or_else(|| msg.get("modelInfo"))
+                .and_then(|v| v.get("model"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            Some(ChatEvent::StreamEnd(StreamEndData {
+                message: ChatMessage {
+                    timestamp: msg
+                        .get("timestamp")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(unix_now_ms),
+                    sender: MessageSender::Assistant {
+                        agent: BACKEND_AGENT_NAME.to_string(),
+                    },
+                    content,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: model.map(|m| ModelInfo { model: m }),
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2856,200 +3270,5 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0]["path"], "hello.py");
         assert_eq!(files[0]["bytes"], 26);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Backend trait implementation
-// ---------------------------------------------------------------------------
-
-use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SpawnCostHint, StreamEndData,
-    StreamStartData, StreamTextDeltaData,
-};
-
-use super::{Backend, BackendSpawnConfig, EventStream};
-
-const BACKEND_EVENT_BUFFER: usize = 256;
-const BACKEND_INPUT_BUFFER: usize = 64;
-const BACKEND_AGENT_NAME: &str = "kiro";
-
-pub struct KiroBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-}
-
-fn kiro_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
-    match cost_hint {
-        Some(SpawnCostHint::Low) => Some("haiku"),
-        Some(SpawnCostHint::Medium) => Some("sonnet"),
-        Some(SpawnCostHint::High) => Some("opus"),
-        None => None,
-    }
-}
-
-impl Backend for KiroBackend {
-    async fn spawn(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-    ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
-
-        tokio::spawn(async move {
-            let roots = if workspace_roots.is_empty() {
-                vec!["/tmp".to_string()]
-            } else {
-                workspace_roots
-            };
-            let (session, mut raw_events) = match KiroSession::spawn(&roots, None, &[], None).await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::error!("Failed to spawn Kiro session: {err}");
-                    return;
-                }
-            };
-
-            let handle = session.command_handle();
-            if let Some(model) = kiro_backend_model(config.cost_hint) {
-                if let Err(err) = handle
-                    .execute(SessionCommand::UpdateSettings {
-                        settings: json!({ "model": model }),
-                        persist: false,
-                    })
-                    .await
-                {
-                    tracing::error!("Failed to set initial Kiro model: {err}");
-                    session.shutdown().await;
-                    return;
-                }
-            }
-
-            loop {
-                tokio::select! {
-                    incoming = raw_events.recv() => {
-                        let Some(raw) = incoming else {
-                            break;
-                        };
-                        if let Some(event) = map_kiro_value_to_chat_event(&raw) {
-                            if events_tx.send(event).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    input = input_rx.recv() => {
-                        let Some(input) = input else { break };
-                        match input {
-                            AgentInput::SendMessage(payload) => {
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message: payload.message,
-                                        images: None,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send Kiro follow-up prompt: {err}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            session.shutdown().await;
-        });
-
-        Ok((Self { input_tx }, EventStream::new(events_rx)))
-    }
-
-    async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).await.is_ok()
-    }
-}
-
-fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
-    if let Ok(event) = serde_json::from_value::<ChatEvent>(value.clone()) {
-        return Some(event);
-    }
-
-    let kind = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    match kind {
-        "StreamStart" => {
-            let data = value.get("data").unwrap_or(&Value::Null);
-            Some(ChatEvent::StreamStart(StreamStartData {
-                message_id: data
-                    .get("message_id")
-                    .or_else(|| data.get("messageId"))
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string()),
-                agent: data
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .unwrap_or(BACKEND_AGENT_NAME)
-                    .to_string(),
-                model: data
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string()),
-            }))
-        }
-        "StreamDelta" => {
-            let data = value.get("data").unwrap_or(&Value::Null);
-            let text = data
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if text.is_empty() {
-                return None;
-            }
-            Some(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: data
-                    .get("message_id")
-                    .or_else(|| data.get("messageId"))
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string()),
-                text,
-            }))
-        }
-        "StreamEnd" => {
-            let data = value.get("data").unwrap_or(&Value::Null);
-            let msg = data.get("message").unwrap_or(&Value::Null);
-            let content = msg
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let model = msg
-                .get("model_info")
-                .or_else(|| msg.get("modelInfo"))
-                .and_then(|v| v.get("model"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
-            Some(ChatEvent::StreamEnd(StreamEndData {
-                message: ChatMessage {
-                    timestamp: msg
-                        .get("timestamp")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_else(unix_now_ms),
-                    sender: MessageSender::Assistant {
-                        agent: BACKEND_AGENT_NAME.to_string(),
-                    },
-                    content,
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    model_info: model.map(|m| ModelInfo { model: m }),
-                    token_usage: None,
-                    context_breakdown: None,
-                    images: None,
-                },
-            }))
-        }
-        _ => None,
     }
 }

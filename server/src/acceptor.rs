@@ -151,7 +151,6 @@ pub async fn listen_uds(
     let listener = UnixListener::bind(path)?;
     loop {
         let (stream, _) = listener.accept().await?;
-        let config = config;
         let host = host.clone();
 
         tokio::spawn(async move {

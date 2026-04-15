@@ -31,19 +31,21 @@ Key principles:
 ### Relation to old Tyde protocol
 
 Carry forward (minimal subset):
-- A trimmed `ChatEvent` enum with 10 core variants and their data types
-  (`ChatMessage`, `StreamStartData`, `StreamTextDeltaData`, `StreamEndData`,
-  `ToolRequest`, `ToolExecutionCompletedData`, etc.)
+- A trimmed `ChatEvent` enum with 11 core variants and their data types
+  (`ChatMessage`, `TypingStatusChanged`, `StreamStartData`,
+  `StreamTextDeltaData`, `StreamEndData`, `ToolRequest`,
+  `ToolExecutionCompletedData`, etc.)
 - Typed tool request/result modeling (`ToolRequestType`, `ToolExecutionResult`)
-- Runtime agent state implicit from stream events (not a separate enum)
+- `TypingStatusChanged(bool)` as the single source of truth for agent
+  activity (typing indicator, shimmer, button state)
 
 Redesign:
 - Remove `Invoke/Result` request-response framing entirely
 - Replace string event dispatch (`event: "..."`) with `FrameKind` enum variants
 - Use stream paths as routing/correlation (`/agent/<id>/<instance>`), not
   `conversation_id` strings
-- Replace `is_running: bool` with implicit state derived from stream events
-  (between `StreamStart` and `StreamEnd` = thinking, after `StreamEnd` = idle)
+- `TypingStatusChanged(bool)` carried forward from old protocol as the
+  exclusive signal for agent activity state
 
 ---
 
@@ -267,9 +269,8 @@ pub struct AgentStartPayload {
 
 - The `AgentStart` event is how the client learns the agent's stream URL and
   ID. After receiving it, the client renders events from this stream.
-- There is no `state` field. Agent runtime state is implicit from stream
-  events: between `StreamStart` and `StreamEnd` the agent is thinking, after
-  `StreamEnd` the agent is idle/waiting.
+- There is no `state` field. Agent activity state is signaled by
+  `TypingStatusChanged(bool)` events on the chat stream.
 - There is no `summary`, `error`, or `updated_at_ms` field. These are
   runtime-mutable concerns that don't belong in a birth certificate.
 - `project_id` is included because project ownership is explicit server-owned
@@ -345,15 +346,16 @@ impl fmt::Display for AgentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    Tycode,
+    Kiro,
     Claude,
     Codex,
     Gemini,
 }
 ```
 
-Only backends that Tyde2 will initially support. The old protocol had `Tycode`
-and `Kiro` — those are excluded until needed. Add variants when backends are
-implemented, not preemptively.
+These variants match the backends currently exposed by Tyde2: `Tycode`,
+`Kiro`, `Claude`, `Codex`, and `Gemini`.
 
 ### AgentErrorCode
 
@@ -465,6 +467,7 @@ Data types are carried forward from the old protocol (minus `ts_rs`/
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
     MessageAdded(ChatMessage),
+    TypingStatusChanged(bool),
     StreamStart(StreamStartData),
     StreamDelta(StreamTextDeltaData),
     StreamReasoningDelta(StreamTextDeltaData),
@@ -900,17 +903,22 @@ a complete `StreamStart`...`StreamEnd` cycle).
 
 ### State transitions during a turn
 
-Agent runtime state is implicit from stream events:
+Agent activity state is signaled exclusively by `TypingStatusChanged(bool)`:
 
-- **Agent starts working** → `ChatEvent(StreamStart)` — agent is thinking.
-- **Agent finishes a turn** → `ChatEvent(StreamEnd)` — agent is idle/waiting
-  (unless another `StreamStart` follows immediately for autonomous work).
+- **Agent starts working** → `ChatEvent(TypingStatusChanged(true))` — emitted
+  by the backend before the first `StreamStart` of an agentic loop.
+- **Agent finishes all work** → `ChatEvent(TypingStatusChanged(false))` —
+  emitted when the backend is truly idle (after the final `StreamEnd`, after
+  all tool execution completes). This does NOT fire between turns in an
+  agentic loop — only when the agent is done.
 - **Agent hits fatal error** → `AgentError { fatal: true }` (stream is dead,
   no further events)
 
-There is no separate state enum or typing status event. The
-`StreamStart`/`StreamEnd` bookends are the single source of truth for whether
-the agent is actively working or idle.
+`TypingStatusChanged` is the **exclusive** source of truth for whether the
+agent is actively working. The frontend MUST use this event (not
+`StreamStart`/`StreamEnd`) to drive the shimmer, typing indicator, and button
+state. `StreamStart`/`StreamEnd` delineate individual LLM turns within the
+agentic loop but do NOT indicate overall agent activity.
 
 ### Follow-up messages
 
@@ -1079,14 +1087,16 @@ started when it sees `StreamStart` and ended when it sees `StreamEnd`. Adding a
 guarantee and adds a field that must be generated, propagated, and validated for
 no additional information.
 
-### Why no `AgentState` enum?
+### Why `TypingStatusChanged` instead of deriving state from `StreamStart`/`StreamEnd`?
 
-Agent runtime state (thinking vs idle) is implicit from stream events: between
-`StreamStart` and `StreamEnd` the agent is thinking, after `StreamEnd` the
-agent is idle. Adding a separate state enum would create a second source of
-truth. Instead, the `StreamStart`/`StreamEnd` bookends — which must exist
-anyway for turn delineation — double as the state signal. Agent death is
-signaled by `AgentError { fatal: true }` — no terminal status event needed.
+An agentic loop may have multiple `StreamStart`/`StreamEnd` cycles
+(LLM turn → tool execution → next LLM turn). If the frontend derived typing
+state from these bookends, the shimmer would flicker off between turns while
+tools execute. `TypingStatusChanged(bool)` is emitted once at the start of
+the loop (`true`) and once at the very end (`false`), giving the frontend a
+single, stable signal for the entire duration the agent is working. Backends
+own this signal because only the backend knows when the agentic loop is truly
+complete.
 
 ### Why `/agent/<agent_id>/<instance_id>` instead of `/agent/<agent_id>`?
 
