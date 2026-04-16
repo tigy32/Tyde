@@ -12,6 +12,7 @@ pub mod file_view;
 pub mod git_panel;
 pub mod header;
 pub mod home_view;
+pub mod host_browser;
 pub mod project_rail;
 pub mod sessions_panel;
 pub mod settings_panel;

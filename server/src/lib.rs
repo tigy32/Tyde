@@ -1,6 +1,7 @@
 mod acceptor;
 mod agent;
 pub mod backend;
+pub(crate) mod browse_stream;
 pub(crate) mod connection;
 pub(crate) mod host;
 pub(crate) mod project_stream;
@@ -16,8 +17,9 @@ pub use backend::{acp, claude, codex, gemini, kiro, subprocess};
 pub use acceptor::{HandshakeError, accept, listen_uds};
 pub use connection::run_connection;
 pub use host::{
-    HostHandle, spawn_host, spawn_host_with_mock_backend, spawn_host_with_session_store,
-    spawn_host_with_store_paths,
+    HostHandle, HostRuntimeConfig, spawn_host, spawn_host_with_mock_backend,
+    spawn_host_with_mock_backend_and_runtime_config, spawn_host_with_session_store,
+    spawn_host_with_store_paths, spawn_host_with_store_paths_and_runtime_config,
 };
 
 use std::collections::HashMap;

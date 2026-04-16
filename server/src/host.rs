@@ -3,21 +3,22 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use protocol::{
-    AgentId, AgentStartPayload, FrameKind, HostSettingsPayload, NewAgentPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectFileListPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
-    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, SessionId,
-    SessionListPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
-    TerminalSendPayload,
+    AgentId, AgentStartPayload, FrameKind, HostBrowseListPayload, HostBrowseStartPayload,
+    HostSettingsPayload, NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectFileListPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectRootPath,
+    ProjectStageFilePayload, ProjectStageHunkPayload, SessionId, SessionListPayload,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload,
+    TerminalId, TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::agent::AgentHandle;
 use crate::agent::registry::{AgentRegistry, ResolvedSpawnRequest};
-use crate::backend::BackendSession;
+use crate::backend::{BackendSession, StartupMcpServer, StartupMcpTransport};
+use crate::browse_stream;
 use crate::project_stream::{
     ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing, build_file_list,
     build_git_status, read_diff, read_file, scan_raw_entries, spawn_project_subscription,
@@ -33,6 +34,9 @@ struct HostSubscriber {
     stream: Stream,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HostRuntimeConfig {}
+
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
     pub project_store: Arc<Mutex<ProjectStore>>,
@@ -40,9 +44,12 @@ pub(crate) struct HostState {
     pub session_store: Arc<Mutex<SessionStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pub use_mock_backend: bool,
+    #[allow(dead_code)]
+    pub runtime_config: HostRuntimeConfig,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<(StreamPath, StreamPath), ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
+    browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
 }
 
 #[derive(Clone)]
@@ -162,6 +169,16 @@ impl HostHandle {
                 subscription.task.abort();
             }
 
+            let browse_keys = state
+                .browse_streams
+                .keys()
+                .filter(|(host_stream, _)| host_stream == path)
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in browse_keys {
+                state.browse_streams.remove(&key);
+            }
+
             let terminal_keys = state
                 .terminal_streams
                 .keys()
@@ -193,6 +210,12 @@ impl HostHandle {
         } else {
             None
         };
+        let host_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .unwrap_or_else(|err| panic!("failed to load host settings for spawn: {err}"));
 
         let request = match payload.params {
             SpawnAgentParams::New {
@@ -211,6 +234,8 @@ impl HostHandle {
                             panic!("cannot spawn agent in missing project {}", project_id)
                         });
                 }
+                let startup_mcp_servers =
+                    startup_mcp_servers_for_settings(&host_settings, &workspace_roots);
                 ResolvedSpawnRequest {
                     name: payload.name,
                     parent_agent_id: payload.parent_agent_id,
@@ -222,6 +247,7 @@ impl HostHandle {
                         images,
                     }),
                     cost_hint,
+                    startup_mcp_servers,
                     resume_session_id: None,
                     use_mock_backend,
                 }
@@ -242,6 +268,8 @@ impl HostHandle {
                             panic!("cannot resume agent in missing project {}", project_id)
                         });
                 }
+                let startup_mcp_servers =
+                    startup_mcp_servers_for_settings(&host_settings, &record.workspace_roots);
                 ResolvedSpawnRequest {
                     name: payload.name,
                     parent_agent_id: payload.parent_agent_id,
@@ -253,6 +281,7 @@ impl HostHandle {
                         images: None,
                     }),
                     cost_hint: None,
+                    startup_mcp_servers,
                     resume_session_id: Some(session_id),
                     use_mock_backend,
                 }
@@ -510,6 +539,80 @@ impl HostHandle {
         self.state.lock().await.registry.agent_handle(agent_id)
     }
 
+    pub(crate) async fn open_browse_stream(
+        &self,
+        connection_host_stream: &StreamPath,
+        host_output_stream: &Stream,
+        payload: HostBrowseStartPayload,
+    ) {
+        let browse_stream_path = payload.browse_stream;
+        assert!(
+            browse_stream_path.0.starts_with("/browse/"),
+            "browse stream must start with /browse/, got {}",
+            browse_stream_path
+        );
+        let browse_stream = host_output_stream.with_path(browse_stream_path.clone());
+
+        {
+            let mut state = self.state.lock().await;
+            let previous = state.browse_streams.insert(
+                (connection_host_stream.clone(), browse_stream_path.clone()),
+                browse_stream.clone(),
+            );
+            assert!(
+                previous.is_none(),
+                "duplicate browse stream registration for {}",
+                browse_stream_path
+            );
+        }
+
+        let initial = payload.initial.unwrap_or_else(browse_stream::home_dir);
+        let opened = browse_stream::opened_payload(&initial);
+        browse_stream::emit_opened(&browse_stream, &opened).await;
+
+        match browse_stream::list_dir(&initial, payload.include_hidden).await {
+            Ok(entries) => browse_stream::emit_entries(&browse_stream, &entries).await,
+            Err(error) => browse_stream::emit_error(&browse_stream, &error).await,
+        }
+    }
+
+    pub(crate) async fn list_browse_dir(
+        &self,
+        connection_host_stream: &StreamPath,
+        browse_stream_path: &StreamPath,
+        payload: HostBrowseListPayload,
+    ) {
+        let browse_stream = {
+            let state = self.state.lock().await;
+            state
+                .browse_streams
+                .get(&(connection_host_stream.clone(), browse_stream_path.clone()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "browse stream {} is not owned by host stream {}",
+                        browse_stream_path, connection_host_stream
+                    )
+                })
+        };
+
+        match browse_stream::list_dir(&payload.path, payload.include_hidden).await {
+            Ok(entries) => browse_stream::emit_entries(&browse_stream, &entries).await,
+            Err(error) => browse_stream::emit_error(&browse_stream, &error).await,
+        }
+    }
+
+    pub(crate) async fn close_browse_stream(
+        &self,
+        connection_host_stream: &StreamPath,
+        browse_stream_path: &StreamPath,
+    ) {
+        let mut state = self.state.lock().await;
+        state
+            .browse_streams
+            .remove(&(connection_host_stream.clone(), browse_stream_path.clone()));
+    }
+
     pub(crate) async fn refresh_project(
         &self,
         connection_host_stream: &StreamPath,
@@ -716,8 +819,13 @@ pub fn spawn_host() -> HostHandle {
         .unwrap_or_else(|err| panic!("failed to resolve default project store path: {err}"));
     let settings_path = HostSettingsStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default settings store path: {err}"));
-    spawn_host_with_store_paths(session_path, project_path, settings_path)
-        .unwrap_or_else(|err| panic!("failed to initialize host stores: {err}"))
+    spawn_host_with_store_paths_and_runtime_config(
+        session_path,
+        project_path,
+        settings_path,
+        HostRuntimeConfig::default(),
+    )
+    .unwrap_or_else(|err| panic!("failed to initialize host stores: {err}"))
 }
 
 pub fn spawn_host_with_session_store(path: PathBuf) -> Result<HostHandle, String> {
@@ -726,7 +834,12 @@ pub fn spawn_host_with_session_store(path: PathBuf) -> Result<HostHandle, String
         .ok_or_else(|| format!("Session store path has no parent: {}", path.display()))?;
     let project_path = parent.join("projects.json");
     let settings_path = parent.join("settings.json");
-    spawn_host_with_store_paths(path, project_path, settings_path)
+    spawn_host_with_store_paths_and_runtime_config(
+        path,
+        project_path,
+        settings_path,
+        HostRuntimeConfig::default(),
+    )
 }
 
 pub fn spawn_host_with_store_paths(
@@ -734,7 +847,27 @@ pub fn spawn_host_with_store_paths(
     project_path: PathBuf,
     settings_path: PathBuf,
 ) -> Result<HostHandle, String> {
-    spawn_host_inner(session_path, project_path, settings_path, false)
+    spawn_host_with_store_paths_and_runtime_config(
+        session_path,
+        project_path,
+        settings_path,
+        HostRuntimeConfig::default(),
+    )
+}
+
+pub fn spawn_host_with_store_paths_and_runtime_config(
+    session_path: PathBuf,
+    project_path: PathBuf,
+    settings_path: PathBuf,
+    runtime_config: HostRuntimeConfig,
+) -> Result<HostHandle, String> {
+    spawn_host_inner(
+        session_path,
+        project_path,
+        settings_path,
+        false,
+        runtime_config,
+    )
 }
 
 /// Spawn a host that uses MockBackend for all agent spawns (for tests).
@@ -743,7 +876,27 @@ pub fn spawn_host_with_mock_backend(
     project_path: PathBuf,
     settings_path: PathBuf,
 ) -> Result<HostHandle, String> {
-    spawn_host_inner(session_path, project_path, settings_path, true)
+    spawn_host_with_mock_backend_and_runtime_config(
+        session_path,
+        project_path,
+        settings_path,
+        HostRuntimeConfig::default(),
+    )
+}
+
+pub fn spawn_host_with_mock_backend_and_runtime_config(
+    session_path: PathBuf,
+    project_path: PathBuf,
+    settings_path: PathBuf,
+    runtime_config: HostRuntimeConfig,
+) -> Result<HostHandle, String> {
+    spawn_host_inner(
+        session_path,
+        project_path,
+        settings_path,
+        true,
+        runtime_config,
+    )
 }
 
 fn spawn_host_inner(
@@ -751,6 +904,7 @@ fn spawn_host_inner(
     project_path: PathBuf,
     settings_path: PathBuf,
     use_mock_backend: bool,
+    runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     let session_store = SessionStore::load(session_path)?;
     let project_store = ProjectStore::load(project_path)?;
@@ -763,11 +917,77 @@ fn spawn_host_inner(
             session_store: Arc::new(Mutex::new(session_store)),
             agent_sessions: HashMap::new(),
             use_mock_backend,
+            runtime_config,
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
+            browse_streams: HashMap::new(),
         })),
     })
+}
+
+fn startup_mcp_servers_for_settings(
+    settings: &protocol::HostSettings,
+    workspace_roots: &[String],
+) -> Vec<StartupMcpServer> {
+    let mut servers = Vec::new();
+
+    if settings.tyde_debug_mcp_enabled {
+        let mut env = HashMap::new();
+        if let Some(repo_root) = workspace_roots.first().map(|value| value.trim())
+            && !repo_root.is_empty()
+        {
+            env.insert("TYDE_DEBUG_REPO_ROOT".to_string(), repo_root.to_string());
+        }
+        servers.push(StartupMcpServer {
+            name: "tyde-debug".to_string(),
+            transport: StartupMcpTransport::Stdio {
+                command: resolve_tyde_dev_driver_command(),
+                args: vec!["debug".to_string()],
+                env,
+            },
+        });
+    }
+
+    servers
+}
+
+fn resolve_tyde_dev_driver_command() -> String {
+    if let Ok(path) = std::env::var("TYDE_DEV_DRIVER_BIN") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Some(path) = workspace_tyde_dev_driver_path() {
+        return path.display().to_string();
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let candidate = parent.join(format!("tyde-dev-driver{}", std::env::consts::EXE_SUFFIX));
+        if candidate.is_file() {
+            return candidate.display().to_string();
+        }
+    }
+
+    "tyde-dev-driver".to_string()
+}
+
+fn workspace_tyde_dev_driver_path() -> Option<PathBuf> {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+    let candidate = workspace_root
+        .join("target")
+        .join(profile)
+        .join(format!("tyde-dev-driver{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
 }
 
 async fn emit_new_agent_for_subscriber(

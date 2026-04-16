@@ -113,6 +113,29 @@ and bug fixes that remove root causes instead of papering over them.
 - **The UI subscribes to output events and renders based on what it receives.** It does not "call a function and wait for a result." It fires an event and reacts to whatever events come back on the relevant stream.
 - **No request IDs, no response correlation.** Streams are the correlation mechanism. If the client sends a "send message" event on a stream, subsequent events on that stream are the result — but they're events, not responses.
 
+## The UI Is a Pure Projection of State
+
+The UI has no hidden data of its own. Everything it displays is a deterministic function of the current signal state, and the signal state is updated exclusively by server events flowing through the dispatcher. If the server emits a change, the UI must re-render. If the server is silent, the UI must not change on its own.
+
+Concrete rules — violate any of these and the UI will silently go stale:
+
+- **Never snapshot a signal's value into a view.** Reading `signal.get()` once and baking the result into a non-reactive expression (a component prop, a `let` binding consumed directly in `view! { ... }`, a `Vec` destructured into static children) freezes that data forever. Wrap the read in a `move || signal.get()` closure so Leptos tracks the dependency and re-runs on change.
+
+- **Keyed `<For>` rows are created once per key.** A `<For each=... key=... let:entry>` block does *not* re-invoke the row closure when the underlying data for the same key changes. Any field of `entry` used directly as a child value, prop, or class string is a snapshot. If a row needs to reflect live updates to its backing record:
+  - Pass only the stable identifier (id, host_id, etc.) as a prop.
+  - Inside the row, look the record up reactively: `move || state.xs.get().into_iter().find(|x| x.id == id)`.
+  - Derive display fields from that reactive closure.
+
+- **Keys must be stable identifiers, not indices.** Keying `<For>` by array index means that when the list content changes at a given slot, the old row is kept and its snapshotted content stays on screen. Key by the record's actual ID.
+
+- **Sub-lists inside `<For>` rows must be reactive.** If a row renders a list derived from another signal (e.g. a host row showing its projects), that derivation must live inside a `move ||` closure so it re-runs when the underlying signal changes. Destructuring the signal's value into a `Vec` at row creation time freezes the sub-list.
+
+- **Never cache derived state on the frontend.** If the UI needs a value that isn't in a signal, it should be computed via a `Memo` from existing signals or added as a server-emitted event. Do not store it in a plain `let` at component construction — that breaks the projection.
+
+- **There is no "refresh" action.** Users should never need to click a button to see what just happened. Any view that can go stale is a bug to fix with reactivity, not a button to paper over. A `Refresh` button is only valid as a way to *request* new data from the server; it must never be the mechanism by which the UI updates when data arrives.
+
+The mental model: server events → `state.rs` signals → reactive view closures → DOM. Any break in that chain — a manual mirror, an untracked snapshot, a keyed row that ignores same-key updates — is a reactivity bug.
+
 ## Actors Over Locks
 
 - **Prefer single-task actors over `Arc<Mutex<T>>`.** An actor runs on one tokio task, owns its state, and receives messages via channels. No locking needed because there's no concurrent access.

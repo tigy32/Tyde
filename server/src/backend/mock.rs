@@ -19,6 +19,7 @@ const MOCK_MODEL: &str = "mock";
 struct MockSessionRecord {
     workspace_roots: Vec<String>,
     prompts: Vec<String>,
+    startup_mcp_server_names: Vec<String>,
     created_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -36,10 +37,15 @@ pub struct MockBackend {
 impl Backend for MockBackend {
     async fn spawn(
         workspace_roots: Vec<String>,
-        _config: BackendSpawnConfig,
+        config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
+        let startup_mcp_server_names = config
+            .startup_mcp_servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
 
@@ -52,6 +58,7 @@ impl Backend for MockBackend {
                 MockSessionRecord {
                     workspace_roots,
                     prompts: Vec::new(),
+                    startup_mcp_server_names: startup_mcp_server_names.clone(),
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
@@ -64,13 +71,13 @@ impl Backend for MockBackend {
 
         tokio::spawn(async move {
             record_prompt(&session_id_for_task, &initial_message);
-            if !emit_turn(&events_tx, &initial_message).await {
+            if !emit_turn(&events_tx, &session_id_for_task, &initial_message).await {
                 return;
             }
             while let Some(input) = input_rx.recv().await {
                 let AgentInput::SendMessage(payload) = input;
                 record_prompt(&session_id_for_task, &payload.message);
-                if !emit_turn(&events_tx, &payload.message).await {
+                if !emit_turn(&events_tx, &session_id_for_task, &payload.message).await {
                     return;
                 }
             }
@@ -107,7 +114,7 @@ impl Backend for MockBackend {
             while let Some(input) = input_rx.recv().await {
                 let AgentInput::SendMessage(payload) = input;
                 record_prompt(&session_id_for_task, &payload.message);
-                if !emit_turn(&events_tx, &payload.message).await {
+                if !emit_turn(&events_tx, &session_id_for_task, &payload.message).await {
                     return;
                 }
             }
@@ -167,9 +174,16 @@ fn record_prompt(session_id: &SessionId, prompt: &str) {
     record.updated_at_ms = now_ms();
 }
 
-async fn emit_turn(events_tx: &mpsc::Sender<ChatEvent>, user_message: &str) -> bool {
+async fn emit_turn(
+    events_tx: &mpsc::Sender<ChatEvent>,
+    session_id: &SessionId,
+    user_message: &str,
+) -> bool {
     let message_id = Some(Uuid::new_v4().to_string());
-    let response_text = format!("mock backend response to: {user_message}");
+    let response_text = format!(
+        "{}mock backend response to: {user_message}",
+        startup_mcp_response_prefix(session_id)
+    );
 
     if events_tx
         .send(ChatEvent::TypingStatusChanged(true))
@@ -237,6 +251,22 @@ async fn emit_turn(events_tx: &mpsc::Sender<ChatEvent>, user_message: &str) -> b
         .send(ChatEvent::TypingStatusChanged(false))
         .await
         .is_ok()
+}
+
+fn startup_mcp_response_prefix(session_id: &SessionId) -> String {
+    let store = session_store()
+        .lock()
+        .expect("mock backend session store mutex poisoned");
+    let Some(record) = store.get(&session_id.0) else {
+        return String::new();
+    };
+    if record.startup_mcp_server_names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "[startup_mcp_servers: {}] ",
+        record.startup_mcp_server_names.join(", ")
+    )
 }
 
 fn now_ms() -> u64 {

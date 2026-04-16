@@ -1260,8 +1260,7 @@ impl CodexInner {
                 let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
                     return;
                 };
-                let trimmed = reasoning_text.trim();
-                if trimmed.is_empty() {
+                if !contains_non_whitespace(&reasoning_text) {
                     return;
                 }
                 emit_event_to(
@@ -1270,7 +1269,7 @@ impl CodexInner {
                         "kind": "StreamReasoningDelta",
                         "data": {
                             "message_id": item_id,
-                            "text": trimmed
+                            "text": reasoning_text
                         }
                     }),
                 );
@@ -1966,8 +1965,7 @@ impl CodexInner {
                 let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
                     return;
                 };
-                let reasoning_text = reasoning_text.trim().to_string();
-                if reasoning_text.is_empty() {
+                if !contains_non_whitespace(&reasoning_text) {
                     return;
                 }
 
@@ -1978,7 +1976,7 @@ impl CodexInner {
                         let duplicate = stream
                             .reasoning
                             .split('\n')
-                            .any(|line| line.trim() == reasoning_text.as_str());
+                            .any(|line| line == reasoning_text.as_str());
                         if !duplicate {
                             if !stream.reasoning.is_empty() && !stream.reasoning.ends_with('\n') {
                                 stream.reasoning.push('\n');
@@ -3603,11 +3601,10 @@ fn extract_codex_reasoning_fragment(value: Option<&Value>) -> Option<String> {
     let value = value?;
     match value {
         Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
+            if !contains_non_whitespace(text) {
                 None
             } else {
-                Some(trimmed.to_string())
+                Some(text.to_string())
             }
         }
         Value::Array(values) => {
@@ -3677,14 +3674,17 @@ fn is_terminal_codex_error_notification(state: &CodexState, params: &Value) -> b
 fn join_nonempty_chunks(chunks: Vec<String>) -> Option<String> {
     let normalized = chunks
         .into_iter()
-        .map(|chunk| chunk.trim().to_string())
-        .filter(|chunk| !chunk.is_empty())
+        .filter(|chunk| contains_non_whitespace(chunk))
         .collect::<Vec<_>>();
     if normalized.is_empty() {
         None
     } else {
         Some(normalized.join("\n"))
     }
+}
+
+fn contains_non_whitespace(text: &str) -> bool {
+    text.chars().any(|ch| !ch.is_whitespace())
 }
 
 fn map_plan_status(status: &str) -> &'static str {
@@ -5325,14 +5325,14 @@ impl Backend for CodexBackend {
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
 
         tokio::spawn(async move {
-            let (session, mut raw_events) = match CodexSession::spawn(&roots, None, &[], None).await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::error!("Failed to spawn Codex resume session: {err}");
-                    return;
-                }
-            };
+            let (session, mut raw_events) =
+                match CodexSession::spawn(&roots, None, &config.startup_mcp_servers, None).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Codex resume session: {err}");
+                        return;
+                    }
+                };
 
             let handle = session.command_handle();
             let (model_override, effort_override) = codex_backend_defaults(config.cost_hint);
@@ -6268,6 +6268,19 @@ If you skip spawn_agent or wait_agent, this test fails."#;
         assert_eq!(
             extract_codex_item_reasoning(&item),
             Some("Checking assumptions first.".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_codex_item_reasoning_preserves_boundary_whitespace() {
+        let item = json!({
+            "type": "reasoning",
+            "reasoning": " user"
+        });
+
+        assert_eq!(
+            extract_codex_item_reasoning(&item),
+            Some(" user".to_string())
         );
     }
 

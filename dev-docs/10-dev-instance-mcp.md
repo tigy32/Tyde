@@ -184,6 +184,11 @@ The key rule is:
 **Tyde2 should have exactly one MCP server for dev instances: the external
 driver. The child desktop instance should expose typed dev transports, not MCP.**
 
+For agents running inside Tyde backends, that external driver is still
+**backend-owned**. The agent should see a backend-local MCP server such as
+`tyde-dev-driver debug`, and that driver should launch child Tyde instances on
+the same host as the backend. The child instance still does not speak MCP.
+
 ### High-Level Shape
 
 ```text
@@ -219,6 +224,10 @@ It owns:
 - derived debug event log
 
 It does **not** own product behavior.
+
+When a Tyde agent is configured with the debug MCP server, the backend launches
+this driver as a stdio MCP server on the backend host. That gives the agent a
+backend-local MCP surface even when the backend is running remotely over SSH.
 
 #### 2. Child Dev Instance Endpoints
 
@@ -285,6 +294,9 @@ It may **not** own:
 - SSH logic
 - product state snapshots
 
+It also may **not** own the MCP server that agents call. The shell only exposes
+typed child-instance transports; the backend-side driver is the MCP boundary.
+
 That keeps it within the "dumb transport shell" rule.
 
 ### Frontend Ownership
@@ -298,6 +310,10 @@ The frontend owns only webview-local UI behavior:
 
 Even here, the interface must be typed. No string action router and no
 free-form payload maps.
+
+That means `Evaluate` still terminates in the child frontend, but the agent
+reaches it through the backend-local driver, not by talking to the frontend or
+shell directly.
 
 ---
 
@@ -386,6 +402,10 @@ Recommended first-slice tools:
 - `tyde_debug_evaluate`
 - `tyde_debug_query_screenshot`
 
+For agents, these tools are exposed by the backend-launched `tyde-dev-driver
+debug` process. That process owns lifecycle, readiness, and routing to child
+instance endpoints on the same host.
+
 ### Why Keep These Names
 
 These names already existed in the old workflow and match how external agents
@@ -396,6 +416,9 @@ The important change is internal:
 - MCP ends at the driver
 - the child speaks typed internal transports
 - product state comes from the real Tyde protocol
+
+The agent-facing server is backend-local. The child instance remains transport
+only.
 
 ### Tool Semantics
 
@@ -578,6 +601,9 @@ It should:
 The shell may pass requests into the webview, but the message boundary must
 stay typed end-to-end.
 
+The backend-side driver talks to this endpoint after launching a child instance.
+It does not ask the shell to expose MCP directly.
+
 ---
 
 ## Launcher Command
@@ -690,6 +716,7 @@ Tyde2 should rebuild it like this:
 
 - one external MCP server: `tyde-dev-driver`
 - no MCP server inside the child app
+- agents use a backend-local `tyde-dev-driver debug` MCP process
 - product-state inspection through the real Tyde protocol
 - UI inspection through a small typed devtools protocol
 - lifecycle, remote/local launch, and screenshot helpers owned by the driver

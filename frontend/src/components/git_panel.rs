@@ -15,7 +15,7 @@ pub fn GitPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let git_roots = Memo::new(move |_| {
-        let pid = state.active_project_id.get()?;
+        let pid = state.active_project.get()?.project_id;
         let map = state.git_status.get();
         map.get(&pid).cloned()
     });
@@ -243,14 +243,10 @@ fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
     let state = expect_context::<AppState>();
     state.center_view.set(CenterView::Editor);
 
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
-        None => return,
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
     };
-    let project_id = match state.active_project_id.get_untracked() {
-        Some(id) => id,
-        None => return,
-    };
+    let project_id = active_project.project_id.clone();
     let stream = StreamPath(format!("/project/{}", project_id.0));
 
     spawn_local(async move {
@@ -259,7 +255,14 @@ fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
             scope,
             path: Some(path),
         };
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await {
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectReadDiff,
+            &payload,
+        )
+        .await
+        {
             log::error!("failed to send ProjectReadDiff: {e}");
         }
     });
@@ -268,14 +271,10 @@ fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
 fn stage_file(root: ProjectRootPath, path: String) {
     let state = expect_context::<AppState>();
 
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
-        None => return,
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
     };
-    let project_id = match state.active_project_id.get_untracked() {
-        Some(id) => id,
-        None => return,
-    };
+    let project_id = active_project.project_id.clone();
     let stream = StreamPath(format!("/project/{}", project_id.0));
 
     spawn_local(async move {
@@ -285,24 +284,34 @@ fn stage_file(root: ProjectRootPath, path: String) {
                 relative_path: path,
             },
         };
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectStageFile, &payload).await {
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectStageFile,
+            &payload,
+        )
+        .await
+        {
             log::error!("failed to send ProjectStageFile: {e}");
         }
     });
 }
 
 async fn send_project_refresh(state: &AppState) {
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
-        None => return,
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
     };
-    let project_id = match state.active_project_id.get_untracked() {
-        Some(id) => id,
-        None => return,
-    };
+    let project_id = active_project.project_id.clone();
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = ProjectRefreshPayload {};
-    if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectRefresh, &payload).await {
+    if let Err(e) = send_frame(
+        &active_project.host_id,
+        stream,
+        FrameKind::ProjectRefresh,
+        &payload,
+    )
+    .await
+    {
         log::error!("failed to send ProjectRefresh: {e}");
     }
 }

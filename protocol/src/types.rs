@@ -123,6 +123,9 @@ pub enum FrameKind {
     ProjectStageFile,
     ProjectStageHunk,
     ProjectListDir,
+    HostBrowseStart,
+    HostBrowseList,
+    HostBrowseClose,
     TerminalCreate,
     TerminalSend,
     TerminalResize,
@@ -145,6 +148,9 @@ pub enum FrameKind {
     TerminalOutput,
     TerminalExit,
     TerminalError,
+    HostBrowseOpened,
+    HostBrowseEntries,
+    HostBrowseError,
 }
 
 impl fmt::Display for FrameKind {
@@ -169,6 +175,9 @@ impl fmt::Display for FrameKind {
             Self::ProjectStageFile => f.write_str("project_stage_file"),
             Self::ProjectStageHunk => f.write_str("project_stage_hunk"),
             Self::ProjectListDir => f.write_str("project_list_dir"),
+            Self::HostBrowseStart => f.write_str("host_browse_start"),
+            Self::HostBrowseList => f.write_str("host_browse_list"),
+            Self::HostBrowseClose => f.write_str("host_browse_close"),
             Self::TerminalCreate => f.write_str("terminal_create"),
             Self::TerminalSend => f.write_str("terminal_send"),
             Self::TerminalResize => f.write_str("terminal_resize"),
@@ -189,6 +198,9 @@ impl fmt::Display for FrameKind {
             Self::TerminalOutput => f.write_str("terminal_output"),
             Self::TerminalExit => f.write_str("terminal_exit"),
             Self::TerminalError => f.write_str("terminal_error"),
+            Self::HostBrowseOpened => f.write_str("host_browse_opened"),
+            Self::HostBrowseEntries => f.write_str("host_browse_entries"),
+            Self::HostBrowseError => f.write_str("host_browse_error"),
         }
     }
 }
@@ -245,6 +257,8 @@ pub struct HostSettings {
     pub enabled_backends: Vec<BackendKind>,
     #[serde(default)]
     pub default_backend: Option<BackendKind>,
+    #[serde(default)]
+    pub tyde_debug_mcp_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +277,9 @@ pub enum HostSettingValue {
     },
     DefaultBackend {
         default_backend: Option<BackendKind>,
+    },
+    TydeDebugMcpEnabled {
+        enabled: bool,
     },
 }
 
@@ -578,6 +595,101 @@ pub enum ProjectGitDiffLineKind {
     Context,
     Added,
     Removed,
+}
+
+/// Absolute host-native path. Server-owned semantics: interpretation is up to
+/// the receiving host (POSIX vs Windows, home expansion, symlink policy).
+/// Frontend never constructs, normalizes, or interprets the bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostAbsPath(pub String);
+
+impl fmt::Display for HostAbsPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPlatform {
+    Macos,
+    Linux,
+    Windows,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseStartPayload {
+    /// `/browse/<uuid>` — client-allocated stream path on which the server
+    /// will emit `HostBrowseOpened` / `HostBrowseEntries` / `HostBrowseError`.
+    pub browse_stream: StreamPath,
+    /// Initial directory to list. None = server chooses (its home directory).
+    pub initial: Option<HostAbsPath>,
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseListPayload {
+    pub path: HostAbsPath,
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostBrowseClosePayload {}
+
+/// Seq 0 on `/browse/<uuid>`. Birth certificate of the browse stream — declares
+/// the host's filesystem shape so the client never has to infer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseOpenedPayload {
+    pub home: HostAbsPath,
+    pub root: HostAbsPath,
+    pub separator: char,
+    pub platform: HostPlatform,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseEntriesPayload {
+    pub path: HostAbsPath,
+    pub parent: Option<HostAbsPath>,
+    pub entries: Vec<HostBrowseEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseEntry {
+    pub name: String,
+    pub kind: ProjectFileKind,
+    pub size: Option<u64>,
+    pub mtime_ms: Option<u64>,
+    pub is_hidden: bool,
+    pub symlink_target: Option<HostAbsPath>,
+    pub entry_error: Option<HostBrowseEntryError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBrowseEntryError {
+    PermissionDenied,
+    BrokenSymlink,
+    StatFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostBrowseErrorPayload {
+    pub path: HostAbsPath,
+    pub code: HostBrowseErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostBrowseErrorCode {
+    NotFound,
+    NotADirectory,
+    PermissionDenied,
+    SymlinkLoop,
+    TooLarge,
+    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

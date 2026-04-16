@@ -81,6 +81,7 @@ impl ProtocolValidator {
                 active_stream: None,
                 started_turns: 0,
                 pending_tool_calls: HashMap::new(),
+                cancelled_tool_calls: HashMap::new(),
             },
         );
 
@@ -233,9 +234,14 @@ fn validate_chat_event(
         ChatEvent::ToolExecutionCompleted(data) => {
             validate_tool_execution_completed(recent_frames, envelope, state, data)
         }
+        ChatEvent::OperationCancelled(_) => {
+            state
+                .cancelled_tool_calls
+                .extend(state.pending_tool_calls.drain());
+            Ok(())
+        }
         ChatEvent::TypingStatusChanged(_)
         | ChatEvent::TaskUpdate(_)
-        | ChatEvent::OperationCancelled(_)
         | ChatEvent::RetryAttempt(_) => Ok(()),
     }
 }
@@ -282,7 +288,11 @@ fn validate_tool_execution_completed(
     state: &mut AgentStreamState,
     data: &ToolExecutionCompletedData,
 ) -> Result<(), ProtocolViolation> {
-    let Some(expected_tool_name) = state.pending_tool_calls.remove(&data.tool_call_id) else {
+    let expected_tool_name = state
+        .pending_tool_calls
+        .remove(&data.tool_call_id)
+        .or_else(|| state.cancelled_tool_calls.remove(&data.tool_call_id));
+    let Some(expected_tool_name) = expected_tool_name else {
         return Err(build_violation(
             recent_frames,
             envelope,
@@ -376,6 +386,7 @@ struct AgentStreamState {
     active_stream: Option<ActiveStreamState>,
     started_turns: u64,
     pending_tool_calls: HashMap<String, String>,
+    cancelled_tool_calls: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -727,5 +738,96 @@ mod tests {
                 .to_string()
                 .contains("previous tool requests are still unresolved")
         );
+    }
+
+    #[test]
+    fn operation_cancelled_clears_unresolved_tool_requests() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_start_envelope(0))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message("hi"),
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(3, &tool_request("call-1")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                4,
+                &ChatEvent::OperationCancelled(crate::OperationCancelledData {
+                    message: "cancelled".to_owned(),
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                5,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-2".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn accepts_late_tool_completion_after_operation_cancelled() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_start_envelope(0))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message("hi"),
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(3, &tool_request("call-1")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                4,
+                &ChatEvent::OperationCancelled(crate::OperationCancelledData {
+                    message: "cancelled".to_owned(),
+                }),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
+            .unwrap();
     }
 }

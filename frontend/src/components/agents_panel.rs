@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::state::{AgentInfo, AppState, CenterView};
+use crate::state::{ActiveAgentRef, AgentInfo, AppState, CenterView};
 
 fn backend_class(kind: protocol::BackendKind) -> &'static str {
     match kind {
@@ -73,6 +73,7 @@ pub fn AgentsPanel() -> impl IntoView {
     let filtered_agents = Memo::new(move |_| {
         let agents = state.agents.get();
         let streaming_map = state.streaming_text.get();
+        let turn_active_map = state.agent_turn_active.get();
         let query = search.get().to_lowercase();
         let hide_sub = hide_sub_agents.get();
         let hide_done = hide_inactive.get();
@@ -84,9 +85,9 @@ pub fn AgentsPanel() -> impl IntoView {
                     return false;
                 }
                 if hide_done {
-                    let is_thinking = streaming_map.contains_key(&a.agent_id);
+                    let is_thinking = streaming_map.contains_key(&a.agent_id)
+                        || turn_active_map.get(&a.agent_id).copied().unwrap_or(false);
                     if !is_thinking {
-                        // Agent is idle or terminated — hide it
                         return false;
                     }
                 }
@@ -209,17 +210,7 @@ fn agent_card(state: AppState, agent: AgentInfo) -> impl IntoView {
     let name = agent.name.clone();
     let backend = agent.backend_kind;
     let created = agent.created_at_ms;
-
-    let is_thinking = state
-        .streaming_text
-        .with_untracked(|map| map.contains_key(&agent_id));
-    let derived = if agent.fatal_error.is_some() {
-        DerivedAgentState::Terminated
-    } else if is_thinking {
-        DerivedAgentState::Thinking
-    } else {
-        DerivedAgentState::Idle
-    };
+    let has_fatal = agent.fatal_error.is_some();
 
     let error_msg = agent.fatal_error.as_ref().map(|msg| {
         let truncated: String = msg.chars().take(80).collect();
@@ -227,10 +218,39 @@ fn agent_card(state: AppState, agent: AgentInfo) -> impl IntoView {
     });
 
     let click_id = agent_id.clone();
+    let click_host_id = agent.host_id.clone();
+    let state_for_click = state.clone();
     let on_click = move |_| {
-        state.active_agent_id.set(Some(click_id.clone()));
-        state.center_view.set(CenterView::Chat);
+        state_for_click.active_agent.set(Some(ActiveAgentRef {
+            host_id: click_host_id.clone(),
+            agent_id: click_id.clone(),
+        }));
+        state_for_click.center_view.set(CenterView::Chat);
     };
+
+    let derived = {
+        let agent_id = agent_id.clone();
+        let streaming = state.streaming_text;
+        let turn_active = state.agent_turn_active;
+        move || {
+            if has_fatal {
+                return DerivedAgentState::Terminated;
+            }
+            let typing = turn_active.with(|map| map.get(&agent_id).copied().unwrap_or(false));
+            let streaming_open = streaming.with(|map| map.contains_key(&agent_id));
+            if typing || streaming_open {
+                DerivedAgentState::Thinking
+            } else {
+                DerivedAgentState::Idle
+            }
+        }
+    };
+
+    let status_class_sig = {
+        let derived = derived.clone();
+        move || status_class(&derived())
+    };
+    let status_icon_sig = move || status_icon(&derived());
 
     view! {
         <button class="agent-card" on:click=on_click>
@@ -239,7 +259,7 @@ fn agent_card(state: AppState, agent: AgentInfo) -> impl IntoView {
                 <span class={backend_class(backend)}>{backend_label(backend)}</span>
             </div>
             <div class="agent-card-bottom">
-                <span class={status_class(&derived)}>{status_icon(&derived)}</span>
+                <span class=status_class_sig>{status_icon_sig}</span>
                 <span class="agent-card-time">{relative_time(created)}</span>
             </div>
             {error_msg.map(|msg| view! {

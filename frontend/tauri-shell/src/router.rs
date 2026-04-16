@@ -2,12 +2,16 @@ use std::collections::HashMap;
 
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{
     HOST_DISCONNECTED_EVENT, HOST_ERROR_EVENT, HOST_LINE_EVENT, HostDisconnectedEvent,
     HostErrorEvent, HostLineEvent,
 };
+use crate::host_store::HostTransportConfig;
+
+const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --stdio";
 
 #[derive(Clone)]
 pub struct ProxyRouterHandle {
@@ -23,6 +27,7 @@ enum RouterCommand {
     ConnectDuplex {
         app: AppHandle,
         host_id: String,
+        transport: HostTransportConfig,
         host: server::HostHandle,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -61,6 +66,7 @@ impl ProxyRouterHandle {
         &self,
         app: AppHandle,
         host_id: String,
+        transport: HostTransportConfig,
         host: server::HostHandle,
     ) -> Result<(), String> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -68,6 +74,7 @@ impl ProxyRouterHandle {
             .send(RouterCommand::ConnectDuplex {
                 app,
                 host_id,
+                transport,
                 host,
                 reply: reply_tx,
             })
@@ -120,6 +127,7 @@ async fn router_actor(
             RouterCommand::ConnectDuplex {
                 app,
                 host_id,
+                transport,
                 host,
                 reply,
             } => {
@@ -132,36 +140,26 @@ async fn router_actor(
                 let connection_id = next_connection_id;
                 next_connection_id += 1;
 
-                // Create an in-process duplex stream — one end for the shell,
-                // one end for the server. Exactly like the test fixture.
-                let (client_stream, server_stream) = tokio::io::duplex(8192);
-                let config = server::ServerConfig::current();
-
-                // Hand the server end to the server's accept + run_connection loop.
-                tokio::spawn(async move {
-                    match server::accept(&config, server_stream).await {
-                        Ok(conn) => {
-                            if let Err(e) = server::run_connection(conn, host).await {
-                                tracing::error!(?e, "server connection loop failed");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(?e, "server handshake failed");
-                        }
+                let setup = match setup_connection_transport(&app, &host_id, transport, host).await
+                {
+                    Ok(setup) => setup,
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                        continue;
                     }
-                });
-
-                // Use the client end for our connection actor.
-                let (read_half, write_half) = tokio::io::split(client_stream);
+                };
                 let (connection_tx, connection_rx) = mpsc::channel(64);
                 tokio::spawn(connection_actor(
-                    app,
-                    host_id.clone(),
-                    connection_id,
-                    BufReader::new(read_half),
-                    write_half,
-                    connection_rx,
-                    router_tx.clone(),
+                    ConnectionActorContext {
+                        app,
+                        host_id: host_id.clone(),
+                        connection_id,
+                        rx: connection_rx,
+                        router_tx: router_tx.clone(),
+                        cleanup: setup.cleanup,
+                    },
+                    setup.reader,
+                    setup.writer,
                 ));
                 hosts.insert(
                     host_id.clone(),
@@ -219,18 +217,40 @@ async fn router_actor(
     }
 }
 
-async fn connection_actor<R, W>(
+struct ConnectionSetup {
+    reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    cleanup: ConnectionCleanup,
+}
+
+struct ConnectionActorContext {
     app: AppHandle,
     host_id: String,
     connection_id: u64,
-    mut reader: R,
-    mut writer: W,
-    mut rx: mpsc::Receiver<ConnectionCommand>,
+    rx: mpsc::Receiver<ConnectionCommand>,
     router_tx: mpsc::Sender<RouterCommand>,
-) where
+    cleanup: ConnectionCleanup,
+}
+
+enum ConnectionCleanup {
+    None,
+    Child(Child),
+}
+
+async fn connection_actor<R, W>(context: ConnectionActorContext, mut reader: R, mut writer: W)
+where
     R: AsyncBufRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
+    let ConnectionActorContext {
+        app,
+        host_id,
+        connection_id,
+        mut rx,
+        router_tx,
+        mut cleanup,
+    } = context;
+
     loop {
         let mut incoming = String::new();
         tokio::select! {
@@ -264,6 +284,14 @@ async fn connection_actor<R, W>(
                     Some(ConnectionCommand::Disconnect) | None => break,
                 }
             }
+        }
+    }
+
+    match &mut cleanup {
+        ConnectionCleanup::None => {}
+        ConnectionCleanup::Child(child) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 
@@ -316,4 +344,100 @@ fn trim_line_ending(mut line: String) -> String {
         line.pop();
     }
     line
+}
+
+async fn setup_connection_transport(
+    app: &AppHandle,
+    host_id: &str,
+    transport: HostTransportConfig,
+    host: server::HostHandle,
+) -> Result<ConnectionSetup, String> {
+    match transport {
+        HostTransportConfig::LocalEmbedded => {
+            let (client_stream, server_stream) = tokio::io::duplex(8192);
+            let config = server::ServerConfig::current();
+
+            tokio::spawn(async move {
+                match server::accept(&config, server_stream).await {
+                    Ok(conn) => {
+                        if let Err(e) = server::run_connection(conn, host).await {
+                            tracing::error!(?e, "server connection loop failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "server handshake failed");
+                    }
+                }
+            });
+
+            let (read_half, write_half) = tokio::io::split(client_stream);
+            Ok(ConnectionSetup {
+                reader: Box::new(BufReader::new(read_half)),
+                writer: Box::new(write_half),
+                cleanup: ConnectionCleanup::None,
+            })
+        }
+        HostTransportConfig::SshStdio {
+            ssh_destination,
+            remote_command,
+        } => {
+            let command = remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string());
+            let mut child = Command::new("ssh");
+            child
+                .arg("-T")
+                .arg(&ssh_destination)
+                .arg(&command)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let mut child = child.spawn().map_err(|err| {
+                format!("failed to start ssh transport for host {host_id}: {err}")
+            })?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| format!("ssh transport for host {host_id} has no stdout"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| format!("ssh transport for host {host_id} has no stdin"))?;
+
+            if let Some(stderr) = child.stderr.take() {
+                let app = app.clone();
+                let host_id = host_id.to_string();
+                tokio::spawn(async move {
+                    let mut stderr = BufReader::new(stderr);
+                    loop {
+                        let mut line = String::new();
+                        match stderr.read_line(&mut line).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let line = trim_line_ending(line);
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                tracing::warn!(host_id, "{line}");
+                            }
+                            Err(error) => {
+                                let _ = emit_error(
+                                    &app,
+                                    &host_id,
+                                    format!("failed to read ssh stderr: {error}"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            Ok(ConnectionSetup {
+                reader: Box::new(BufReader::new(stdout)),
+                writer: Box::new(stdin),
+                cleanup: ConnectionCleanup::Child(child),
+            })
+        }
+    }
 }

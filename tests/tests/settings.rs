@@ -7,6 +7,7 @@ fn expected_empty_settings() -> HostSettings {
     HostSettings {
         enabled_backends: Vec::new(),
         default_backend: None,
+        tyde_debug_mcp_enabled: false,
     }
 }
 
@@ -95,6 +96,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
         HostSettings {
             enabled_backends: vec![BackendKind::Kiro, BackendKind::Claude, BackendKind::Gemini,],
             default_backend: Some(BackendKind::Claude),
+            tyde_debug_mcp_enabled: false,
         }
     );
 }

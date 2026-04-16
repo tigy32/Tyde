@@ -19,38 +19,46 @@ struct PendingImage {
 }
 
 fn active_instance_stream(state: &AppState) -> Option<StreamPath> {
-    let agent_id = state.active_agent_id.get_untracked()?;
+    let active_agent = state.active_agent.get_untracked()?;
     let agents = state.agents.get_untracked();
     agents
         .iter()
-        .find(|a| a.agent_id == agent_id)
+        .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
         .map(|a| a.instance_stream.clone())
 }
 
 fn selected_backend_kind(state: &AppState) -> Option<BackendKind> {
-    if let Some(agent_id) = state.active_agent_id.get_untracked() {
+    if let Some(active_agent) = state.active_agent.get_untracked() {
         let agents = state.agents.get_untracked();
-        if let Some(agent) = agents.iter().find(|a| a.agent_id == agent_id) {
+        if let Some(agent) = agents
+            .iter()
+            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+        {
             return Some(agent.backend_kind);
         }
     }
 
-    state.host_settings.get_untracked().and_then(|settings| {
-        settings
-            .default_backend
-            .or_else(|| settings.enabled_backends.first().copied())
-    })
+    state
+        .selected_host_settings_untracked()
+        .and_then(|settings| {
+            settings
+                .default_backend
+                .or_else(|| settings.enabled_backends.first().copied())
+        })
 }
 
 fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
-    if let Some(agent_id) = state.active_agent_id.get() {
+    if let Some(active_agent) = state.active_agent.get() {
         let agents = state.agents.get();
-        if let Some(agent) = agents.iter().find(|a| a.agent_id == agent_id) {
+        if let Some(agent) = agents
+            .iter()
+            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+        {
             return Some(agent.backend_kind);
         }
     }
 
-    state.host_settings.get().and_then(|settings| {
+    state.selected_host_settings().and_then(|settings| {
         settings
             .default_backend
             .or_else(|| settings.enabled_backends.first().copied())
@@ -85,13 +93,13 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
     state.chat_input.set(String::new());
     pending_images.set(Vec::new());
 
-    if state.active_agent_id.get_untracked().is_none() {
+    if state.active_agent.get_untracked().is_none() {
         spawn_new_chat(state, text, payload_images);
         return;
     }
 
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
+    let host_id = match state.active_agent.get_untracked() {
+        Some(active_agent) => active_agent.host_id,
         None => return,
     };
 
@@ -114,8 +122,8 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
 }
 
 fn interrupt_active_turn(state: &AppState) {
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
+    let host_id = match state.active_agent.get_untracked() {
+        Some(active_agent) => active_agent.host_id,
         None => return,
     };
 
@@ -148,8 +156,8 @@ fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>
         return;
     }
 
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
+    let host_id = match state.active_agent.get_untracked() {
+        Some(active_agent) => active_agent.host_id,
         None => return,
     };
 
@@ -312,9 +320,9 @@ pub fn ChatInput() -> impl IntoView {
 
     let ui_state = state.clone();
     let ui_images = pending_images;
-    let ui_mode = move || {
+    let ui_mode = Memo::new(move |_| {
         let is_connected = matches!(
-            ui_state.connection_status.get(),
+            ui_state.selected_host_connection_status(),
             ConnectionStatus::Connected
         );
         let has_text = !ui_state.chat_input.get().trim().is_empty();
@@ -322,13 +330,13 @@ pub fn ChatInput() -> impl IntoView {
         let has_input = has_text || has_images;
         let is_thinking = ui_state.agent_initializing.get()
             || ui_state
-                .active_agent_id
+                .active_agent
                 .get()
-                .map(|agent_id| {
+                .map(|agent_ref| {
                     ui_state
                         .agent_turn_active
                         .get()
-                        .get(&agent_id)
+                        .get(&agent_ref.agent_id)
                         .copied()
                         .unwrap_or(false)
                 })
@@ -360,14 +368,14 @@ pub fn ChatInput() -> impl IntoView {
             interrupt_title,
             is_thinking && has_input,
         )
-    };
+    });
 
-    let can_send = move || ui_mode().0;
-    let can_interrupt = move || ui_mode().1;
-    let send_label = move || ui_mode().2;
-    let interrupt_label = move || ui_mode().3;
-    let interrupt_title = move || ui_mode().4;
-    let is_steer = move || ui_mode().5;
+    let can_send = move || ui_mode.get().0;
+    let can_interrupt = move || ui_mode.get().1;
+    let send_label = move || ui_mode.get().2;
+    let interrupt_label = move || ui_mode.get().3;
+    let interrupt_title = move || ui_mode.get().4;
+    let is_steer = Memo::new(move |_| ui_mode.get().5);
 
     let thinking_state = state.clone();
     let is_thinking = move || {
@@ -375,13 +383,13 @@ pub fn ChatInput() -> impl IntoView {
             return true;
         }
         thinking_state
-            .active_agent_id
+            .active_agent
             .get()
-            .map(|agent_id| {
+            .map(|agent_ref| {
                 thinking_state
                     .agent_turn_active
                     .get()
-                    .get(&agent_id)
+                    .get(&agent_ref.agent_id)
                     .copied()
                     .unwrap_or(false)
             })
@@ -392,7 +400,7 @@ pub fn ChatInput() -> impl IntoView {
     let submit_on_enter_images = pending_images;
     let submit_on_enter_mode = move || {
         matches!(
-            submit_on_enter_state.connection_status.get(),
+            submit_on_enter_state.selected_host_connection_status(),
             ConnectionStatus::Connected
         ) && (!submit_on_enter_state.chat_input.get().trim().is_empty()
             || !submit_on_enter_images.get().is_empty())
@@ -417,8 +425,9 @@ pub fn ChatInput() -> impl IntoView {
 
     let on_click_interrupt_state = state.clone();
     let on_click_interrupt_images = pending_images;
+    let is_steer_for_click = is_steer;
     let on_click_interrupt = move |_| {
-        if is_steer() {
+        if is_steer_for_click.get() {
             steer_chat_input(&on_click_interrupt_state, on_click_interrupt_images);
         } else {
             interrupt_active_turn(&on_click_interrupt_state);
@@ -627,7 +636,7 @@ pub fn ChatInput() -> impl IntoView {
                     disabled=move || !can_send()
                     on:click=on_click_send
                     title=move || {
-                        if is_steer() {
+                        if is_steer.get() {
                             "Queue message"
                         } else {
                             "Send message (Enter)"

@@ -9,13 +9,13 @@ use crate::bridge;
 // WASM is single-threaded, so RefCell is fine.
 // Per-stream monotonic sequence numbers, as required by the protocol.
 thread_local! {
-    static SEQ_MAP: RefCell<HashMap<StreamPath, u64>> = RefCell::new(HashMap::new());
+    static SEQ_MAP: RefCell<HashMap<(String, StreamPath), u64>> = RefCell::new(HashMap::new());
 }
 
-fn next_seq(stream: &StreamPath) -> u64 {
+fn next_seq(host_id: &str, stream: &StreamPath) -> u64 {
     SEQ_MAP.with(|map| {
         let mut map = map.borrow_mut();
-        let counter = map.entry(stream.clone()).or_insert(0);
+        let counter = map.entry((host_id.to_owned(), stream.clone())).or_insert(0);
         let v = *counter;
         *counter += 1;
         v
@@ -28,7 +28,7 @@ pub async fn send_frame<T: Serialize>(
     kind: FrameKind,
     payload: &T,
 ) -> Result<(), String> {
-    let seq = next_seq(&stream);
+    let seq = next_seq(host_id, &stream);
     let envelope = Envelope::from_payload(stream, kind, seq, payload).map_err(|e| e.to_string())?;
     let line = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
     bridge::send_host_line(bridge::SendHostLineRequest {

@@ -19,15 +19,26 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    #[allow(dead_code)]
     pub async fn new() -> Self {
+        Self::new_with_runtime_config(server::HostRuntimeConfig::default()).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_runtime_config(runtime_config: server::HostRuntimeConfig) -> Self {
         init_tracing();
 
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
         let settings_path = session_store_dir.path().join("settings.json");
-        let host = server::spawn_host_with_mock_backend(session_path, project_path, settings_path)
-            .expect("initialize host with mock backend");
+        let host = server::spawn_host_with_mock_backend_and_runtime_config(
+            session_path,
+            project_path,
+            settings_path,
+            runtime_config,
+        )
+        .expect("initialize host with mock backend");
         let client = connect_client(host.clone()).await;
 
         Self {

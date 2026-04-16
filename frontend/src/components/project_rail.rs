@@ -1,132 +1,158 @@
 use leptos::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 
-use crate::send::send_frame;
-use crate::state::{AppState, CenterView};
-
-use protocol::{FrameKind, ProjectCreatePayload};
+use crate::components::host_browser::open_project_browser;
+use crate::state::{ActiveProjectRef, AppState, CenterView};
 
 #[component]
 pub fn ProjectRail() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let state_for_connected = state.clone();
+    let state_for_add = state.clone();
+    let state_for_hosts = state.clone();
 
-    let projects = move || state.projects.get();
-    let active_id = move || state.active_project_id.get();
-
+    let state_for_home = state.clone();
     let go_home = move |_| {
-        state.active_project_id.set(None);
-        state.center_view.set(CenterView::Home);
+        state_for_home.switch_active_project(None);
     };
 
     let home_class = move || {
-        if active_id().is_none() && state.center_view.get() == CenterView::Home {
+        if state.active_project.get().is_none() && state.center_view.get() == CenterView::Home {
             "rail-item rail-home active"
         } else {
             "rail-item rail-home"
         }
     };
 
-    let connected = Memo::new(move |_| state.host_id.get().is_some());
+    let connected = Memo::new(move |_| state_for_connected.active_connection_count() > 0);
 
-    let adding = state.adding_project;
-
-    let add_project = move |_| {
-        adding.set(true);
-    };
-
-    let on_add_submit = move |path: String| {
-        adding.set(false);
-        let path = path.trim().to_owned();
-        if path.is_empty() {
-            return;
-        }
-        let name = path
-            .rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or(&path)
-            .to_owned();
-        let host_id = state.host_id.get_untracked();
-        let host_stream = state.host_stream.get_untracked();
-        if let (Some(hid), Some(hs)) = (host_id, host_stream) {
-            spawn_local(async move {
-                if let Err(e) = send_frame(
-                    &hid,
-                    hs,
-                    FrameKind::ProjectCreate,
-                    &ProjectCreatePayload {
-                        name,
-                        roots: vec![path],
-                    },
-                )
-                .await
-                {
-                    log::error!("failed to send ProjectCreate: {e}");
-                }
-            });
+    let expanded = RwSignal::new(false);
+    let toggle_expanded = move |_| expanded.update(|value| *value = !*value);
+    let nav_class = move || {
+        if expanded.get() {
+            "project-rail expanded"
+        } else {
+            "project-rail"
         }
     };
-
-    let on_add_cancel = move || {
-        adding.set(false);
+    let toggle_title = move || {
+        if expanded.get() { "Collapse" } else { "Expand" }
     };
+
+    let on_add_click = move |_| open_project_browser(&state_for_add);
 
     view! {
-        <nav class="project-rail">
+        <nav class=nav_class>
             <div class="rail-items">
+                <button class="rail-toggle" on:click=toggle_expanded title=toggle_title>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="9 18 15 12 9 6"/>
+                    </svg>
+                </button>
+
                 <button class=home_class on:click=go_home title="Home">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
                         <polyline points="9 22 9 12 15 12 15 22"/>
                     </svg>
+                    <span class="rail-label">"Home"</span>
                 </button>
 
                 <div class="rail-divider"></div>
 
                 <For
-                    each=projects
-                    key=|p| p.id.0.clone()
-                    let:project
+                    each=move || state_for_hosts.configured_hosts.get()
+                    key=|host| host.id.clone()
+                    let:host
                 >
                     {
-                        let pid = project.id.clone();
-                        let name = project.name.clone();
-                        let initial = project.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                        let hue = name_to_hue(&name);
-                        let style = format!("background: hsl({hue}, 45%, 35%); color: hsl({hue}, 60%, 85%)");
-
                         let state = state.clone();
-                        let pid_click = pid.clone();
-                        let on_click = move |_| {
-                            state.active_project_id.set(Some(pid_click.clone()));
+                        let host_id = host.id.clone();
+                        let host_label = host.label.clone();
+
+                        let state_for_status = state.clone();
+                        let host_id_for_status = host_id.clone();
+                        let status = move || {
+                            state_for_status.connection_statuses
+                                .get()
+                                .get(&host_id_for_status)
+                                .cloned()
+                                .unwrap_or(crate::state::ConnectionStatus::Disconnected)
                         };
 
-                        let is_active = {
-                            let pid = pid.clone();
-                            move || active_id().as_ref().map(|id| *id == pid).unwrap_or(false)
-                        };
-
-                        let item_class = move || {
-                            if is_active() {
-                                "rail-item rail-project active"
-                            } else {
-                                "rail-item rail-project"
-                            }
+                        let state_for_projects = state.clone();
+                        let host_id_for_projects = host_id.clone();
+                        let projects_view = move || {
+                            let state = state_for_projects.clone();
+                            let host_id_filter = host_id_for_projects.clone();
+                            state.projects.get()
+                                .into_iter()
+                                .filter(move |project| project.host_id == host_id_filter)
+                                .map(|project_info| {
+                                    let state = state.clone();
+                                    let host_id = project_info.host_id.clone();
+                                    let host_id_for_class = host_id.clone();
+                                    let project = project_info.project.clone();
+                                    let project_id = project.id.clone();
+                                    let project_id_for_class = project_id.clone();
+                                    let item_class = move || {
+                                        if state.active_project.get().as_ref().is_some_and(|active| {
+                                            active.host_id == host_id_for_class && active.project_id == project_id_for_class
+                                        }) {
+                                            "rail-item rail-project active"
+                                        } else {
+                                            "rail-item rail-project"
+                                        }
+                                    };
+                                    let on_click = move |_| {
+                                        state.switch_active_project(Some(ActiveProjectRef {
+                                            host_id: host_id.clone(),
+                                            project_id: project_id.clone(),
+                                        }));
+                                    };
+                                    let abbrev = abbreviate(&project.name);
+                                    let hue = name_to_hue(&project.name);
+                                    let tag_style = format!(
+                                        "background: hsl({hue}, 45%, 35%); color: hsl({hue}, 60%, 85%)"
+                                    );
+                                    let project_name = project.name.clone();
+                                    let project_name_for_title = project_name.clone();
+                                    view! {
+                                        <button class=item_class title=project_name_for_title on:click=on_click>
+                                            <span class="rail-tag" style=tag_style>{abbrev}</span>
+                                            <span class="rail-label">{project_name.clone()}</span>
+                                        </button>
+                                    }
+                                })
+                                .collect_view()
                         };
 
                         view! {
-                            <button class=item_class style=style title=name on:click=on_click>
-                                {initial}
-                            </button>
+                            <div class="rail-host-group">
+                                <div class="rail-host-label" title=host_label.clone()>
+                                    {host_label.clone()}
+                                    <span class="rail-host-state">
+                                        {move || match status() {
+                                            crate::state::ConnectionStatus::Connected => "●",
+                                            crate::state::ConnectionStatus::Connecting => "◐",
+                                            crate::state::ConnectionStatus::Disconnected => "○",
+                                            crate::state::ConnectionStatus::Error(_) => "!",
+                                        }}
+                                    </span>
+                                </div>
+                                {projects_view}
+                            </div>
                         }
                     }
                 </For>
             </div>
 
             <div class="rail-bottom">
-                <Show when=move || adding.get()>
-                    <AddProjectInput on_submit=on_add_submit on_cancel=on_add_cancel />
-                </Show>
-                <button class="rail-item rail-add" title="New Project" on:click=add_project disabled=move || !connected.get()>
+                <button
+                    class="rail-item rail-add"
+                    title="New Project on Selected Host"
+                    on:click=on_add_click
+                    disabled=move || !connected.get()
+                >
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <line x1="12" y1="5" x2="12" y2="19"/>
                         <line x1="5" y1="12" x2="19" y2="12"/>
@@ -137,48 +163,80 @@ pub fn ProjectRail() -> impl IntoView {
     }
 }
 
-#[component]
-fn AddProjectInput(
-    on_submit: impl Fn(String) + 'static + Copy,
-    on_cancel: impl Fn() + 'static + Copy,
-) -> impl IntoView {
-    let input_ref = NodeRef::<leptos::html::Input>::new();
-
-    Effect::new(move |_| {
-        if let Some(el) = input_ref.get() {
-            let _ = el.focus();
-        }
+fn name_to_hue(name: &str) -> u32 {
+    let hash = name.bytes().fold(0u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u32)
     });
-
-    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
-        "Enter" => {
-            if let Some(el) = input_ref.get_untracked() {
-                on_submit(el.value());
-            }
-        }
-        "Escape" => {
-            on_cancel();
-        }
-        _ => {}
-    };
-
-    view! {
-        <div class="add-project-popover">
-            <input
-                node_ref=input_ref
-                class="add-project-input"
-                type="text"
-                placeholder="/path/to/workspace"
-                on:keydown=on_keydown
-            />
-        </div>
-    }
+    hash % 360
 }
 
-/// Derive a stable hue (0..360) from a project name for the avatar color.
-fn name_to_hue(name: &str) -> u32 {
-    let hash: u32 = name
-        .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-    hash % 360
+/// Produce a short lowercase tag for a project name.
+///
+/// - Multi-token names (split on non-alphanumerics) take the first char of each
+///   token, up to 3.
+/// - Single CamelCase tokens take the uppercase letters (`ThingDoStuff` -> `tds`).
+/// - Otherwise fall back to the first 3 characters.
+fn abbreviate(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "?".into();
+    }
+
+    let tokens: Vec<&str> = trimmed
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    let raw: String = if tokens.len() > 1 {
+        tokens
+            .iter()
+            .take(3)
+            .filter_map(|token| token.chars().next())
+            .collect()
+    } else if let Some(token) = tokens.first() {
+        let caps: String = token.chars().filter(|c| c.is_uppercase()).collect();
+        if caps.chars().count() >= 2 {
+            caps.chars().take(3).collect()
+        } else {
+            token.chars().take(3).collect()
+        }
+    } else {
+        trimmed.chars().take(3).collect()
+    };
+
+    raw.to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abbreviate;
+
+    #[test]
+    fn camel_case_uses_capitals() {
+        assert_eq!(abbreviate("ThingDoStuff"), "tds");
+        assert_eq!(abbreviate("MyCoolApp"), "mca");
+    }
+
+    #[test]
+    fn multi_token_uses_initials() {
+        assert_eq!(abbreviate("api-gateway"), "ag");
+        assert_eq!(abbreviate("web_app_server"), "was");
+    }
+
+    #[test]
+    fn single_lowercase_uses_prefix() {
+        assert_eq!(abbreviate("agentflow"), "age");
+        assert_eq!(abbreviate("go"), "go");
+    }
+
+    #[test]
+    fn single_capital_falls_back_to_prefix() {
+        assert_eq!(abbreviate("Anthropic"), "ant");
+    }
+
+    #[test]
+    fn empty_returns_placeholder() {
+        assert_eq!(abbreviate(""), "?");
+        assert_eq!(abbreviate("   "), "?");
+    }
 }

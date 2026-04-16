@@ -181,7 +181,79 @@ rejection, surfaces the message, and does not retry without updating.
 
 ---
 
-## 6. Rust Types
+## 6. Error Handling
+
+Tyde distinguishes sharply between:
+
+- **protocol violations / impossible invariants** — bugs in Tyde itself
+- **operational failures** — filesystem, git, process, backend, permission, or
+  environment errors while serving a valid request
+
+These must not be handled the same way.
+
+### 6.1 Protocol violations
+
+Protocol violations are fail-fast bugs. The server should panic with
+diagnostics when it detects any of these:
+
+- frame kind on the wrong stream
+- malformed stream path
+- message sent on a stream owned by another connection
+- impossible internal state that indicates Tyde bookkeeping corruption
+
+These are not user-facing runtime errors. They indicate a broken implementation
+or a broken caller and should not be silently downgraded into normal stream
+events.
+
+### 6.2 Operational failures
+
+Once a stream is valid and established, request handling failures must be
+surfaced on **that stream**, not by crashing the whole server process.
+
+Rules:
+
+- The server emits a typed error event on the owning stream.
+- If the error is recoverable, the error payload sets `fatal: false` and the
+  stream remains usable.
+- If the stream can no longer make progress, the error payload sets
+  `fatal: true`; after that, no further frames are emitted on that stream.
+- `reject` is only for handshake / connection establishment failure. It is not
+  a substitute for stream-local runtime errors after the connection is live.
+
+Examples:
+
+- `terminal_send` after exit -> `terminal_error { fatal: false }`
+- backend turn failure on an agent stream -> `agent_error { fatal: false|true }`
+- project file read or directory listing failure -> `project_error { fatal: false }`
+- project subscription becomes invalid because the project was deleted ->
+  `project_error { fatal: true }`
+
+### 6.3 Stream ownership
+
+Each stream family defines its own typed error payload because the useful error
+context differs by domain:
+
+- host stream: `reject` during handshake only
+- agent stream: `agent_error`
+- terminal stream: `terminal_error`
+- host browse stream: `host_browse_error`
+- project stream: `project_error`
+
+The common contract is:
+
+- errors are scoped to the owning stream
+- `fatal` means the stream is dead after the error
+- non-fatal errors do not close the stream
+
+### 6.4 Non-goal
+
+The protocol must not swallow errors. Surfacing an error on a stream is not
+"softening" it; it is preserving diagnostics without turning a routine runtime
+failure into a connection-wide or process-wide outage.
+
+---
+
+## 7. Rust Types
 
 These types belong in the `protocol` crate.
 

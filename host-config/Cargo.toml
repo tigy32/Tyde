@@ -1,0 +1,6 @@
+[package]
+name = "host-config"
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true

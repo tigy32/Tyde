@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -101,19 +101,18 @@ pub fn FileExplorer() -> impl IntoView {
     let state = expect_context::<AppState>();
     let filter = RwSignal::new(String::new());
     let show_hidden = RwSignal::new(false);
+    let expanded_dirs = RwSignal::new(HashSet::<String>::new());
 
     let tree = Memo::new(move |_| {
-        let pid = state.active_project_id.get()?;
+        let pid = state.active_project.get()?.project_id;
         let file_map = state.file_tree.get();
         let entries = file_map.get(&pid)?;
         Some(build_tree(entries))
     });
 
     let project_root = Memo::new(move |_| {
-        let pid = state.active_project_id.get()?;
-        let projects = state.projects.get();
-        let project = projects.iter().find(|p| p.id == pid)?;
-        project.roots.first().cloned()
+        let project = state.active_project_info_untracked()?;
+        project.project.roots.first().cloned()
     });
 
     let on_filter_input = move |ev: leptos::ev::Event| {
@@ -159,7 +158,7 @@ pub fn FileExplorer() -> impl IntoView {
                         Some(nodes) => {
                             let filter_val = filter.get().to_lowercase();
                             let hidden = show_hidden.get();
-                            render_nodes(nodes, 0, &filter_val, hidden)
+                            render_nodes(nodes, 0, &filter_val, hidden, expanded_dirs)
                         }
                         None => vec![
                             view! {
@@ -175,31 +174,30 @@ pub fn FileExplorer() -> impl IntoView {
 
 /// Send a ProjectListDir request so the server returns 2 levels of entries under `dir_path`.
 fn request_dir_listing(state: &AppState, dir_relative_path: &str) {
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
-        None => return,
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
     };
-    let project_id = match state.active_project_id.get_untracked() {
-        Some(pid) => pid,
-        None => return,
+    let project_id = active_project.project_id.clone();
+    let Some(project) = state.active_project_info_untracked() else {
+        return;
     };
-    let root = {
-        let projects = state.projects.get_untracked();
-        match projects.iter().find(|p| p.id == project_id) {
-            Some(p) => match p.roots.first() {
-                Some(r) => ProjectRootPath(r.clone()),
-                None => return,
-            },
-            None => return,
-        }
+    let Some(root) = project.project.roots.first().cloned() else {
+        return;
     };
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = ProjectListDirPayload {
-        root,
+        root: ProjectRootPath(root),
         path: dir_relative_path.to_owned(),
     };
     spawn_local(async move {
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectListDir, &payload).await {
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectListDir,
+            &payload,
+        )
+        .await
+        {
             log::error!("failed to send ProjectListDir: {e}");
         }
     });
@@ -210,6 +208,7 @@ fn render_nodes(
     depth: usize,
     filter: &str,
     show_hidden: bool,
+    expanded_dirs: RwSignal<HashSet<String>>,
 ) -> Vec<AnyView> {
     nodes
         .into_iter()
@@ -233,8 +232,13 @@ fn render_nodes(
                     let name = node.name.clone();
                     let dir_path = node.relative_path.clone();
                     let children = node.children.clone();
-                    let expanded = RwSignal::new(false);
                     let filter_owned = filter.to_owned();
+                    let is_expanded = {
+                        let dir_path = dir_path.clone();
+                        Signal::derive(move || {
+                            expanded_dirs.with(|set| set.contains(&dir_path))
+                        })
+                    };
 
                     view! {
                         <div class="fe-dir-group">
@@ -244,8 +248,15 @@ fn render_nodes(
                                 on:click={
                                     let dir_path = dir_path.clone();
                                     move |_| {
-                                        let opening = !expanded.get_untracked();
-                                        expanded.set(opening);
+                                        let opening = !expanded_dirs
+                                            .with_untracked(|set| set.contains(&dir_path));
+                                        expanded_dirs.update(|set| {
+                                            if opening {
+                                                set.insert(dir_path.clone());
+                                            } else {
+                                                set.remove(&dir_path);
+                                            }
+                                        });
                                         if opening {
                                             let state = expect_context::<AppState>();
                                             request_dir_listing(&state, &dir_path);
@@ -253,15 +264,15 @@ fn render_nodes(
                                     }
                                 }
                             >
-                                <span class="fe-chevron">{move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
-                                <span class="fe-icon fe-folder-icon">{move || if expanded.get() { "\u{1f4c2}" } else { "\u{1f4c1}" }}</span>
+                                <span class="fe-chevron">{move || if is_expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
+                                <span class="fe-icon fe-folder-icon">{move || if is_expanded.get() { "\u{1f4c2}" } else { "\u{1f4c1}" }}</span>
                                 <span class="fe-name">{name.clone()}</span>
                             </button>
-                            <Show when=move || expanded.get()>
+                            <Show when=move || is_expanded.get()>
                                 {
                                     let children = children.clone();
                                     let filter_owned = filter_owned.clone();
-                                    move || render_nodes(children.clone(), depth + 1, &filter_owned, show_hidden)
+                                    move || render_nodes(children.clone(), depth + 1, &filter_owned, show_hidden, expanded_dirs)
                                 }
                             </Show>
                         </div>

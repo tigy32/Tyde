@@ -10,10 +10,15 @@ async fn main() {
                 Err(err) => Err(err),
             }
         }
-        _ => Err(
-            "usage: tyde-dev-driver agent-control [--tcp 127.0.0.1:7777 | --uds /path/to/socket]"
-                .to_string(),
-        ),
+        Some("debug") => {
+            args.remove(0);
+            let config = tyde_dev_driver::debug::DebugServerConfig::from_args_env(&args);
+            match config {
+                Ok(config) => tyde_dev_driver::debug::run_stdio_server(config).await,
+                Err(err) => Err(err),
+            }
+        }
+        _ => Err("usage: tyde-dev-driver <agent-control|debug> ...".to_string()),
     };
 
     if let Err(err) = result {

@@ -119,13 +119,12 @@ fn execute_command(state: &AppState, id: &str) {
             state.settings_open.set(true);
         }
         "refresh_project" => {
-            let host_id = state.host_id.get_untracked();
-            let project_id = state.active_project_id.get_untracked();
-            if let (Some(hid), Some(pid)) = (host_id, project_id) {
+            let active_project = state.active_project_ref_untracked();
+            if let Some(active_project) = active_project {
                 spawn_local(async move {
-                    let stream = StreamPath(format!("/project/{}", pid.0));
+                    let stream = StreamPath(format!("/project/{}", active_project.project_id.0));
                     if let Err(e) = send_frame(
-                        &hid,
+                        &active_project.host_id,
                         stream,
                         FrameKind::ProjectRefresh,
                         &ProjectRefreshPayload {},
@@ -302,15 +301,8 @@ pub fn CommandPalette() -> impl IntoView {
                         <span class="cp-mode-badge">{mode_label}</span>
                     </div>
                     <div class="cp-results">
-                        <For
-                            each=move || {
-                                results.get().into_iter().enumerate().collect::<Vec<_>>()
-                            }
-                            key=|(i, _)| *i
-                            let:item
-                        >
-                            {
-                                let (idx, result) = item;
+                        {move || {
+                            results.get().into_iter().enumerate().map(|(idx, result)| {
                                 let is_selected = move || selected_index.get() == idx;
                                 let on_click = move |_| {
                                     selected_index.set(idx);
@@ -347,8 +339,8 @@ pub fn CommandPalette() -> impl IntoView {
                                         }.into_any()
                                     }
                                 }
-                            }
-                        </For>
+                            }).collect_view()
+                        }}
                         <Show when=move || results.get().is_empty()>
                             <div class="cp-empty">"No results"</div>
                         </Show>

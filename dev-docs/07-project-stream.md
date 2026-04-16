@@ -159,6 +159,7 @@ Expected outputs:
 
 - `project_file_list`
 - `project_git_status`
+- `project_error` on failure
 
 The server may emit them in that order consistently for predictability.
 
@@ -175,6 +176,7 @@ pub struct ProjectReadFilePayload {
 Expected output:
 
 - `project_file_contents`
+- `project_error` on failure
 
 ### 5.3 `project_read_diff`
 
@@ -203,6 +205,7 @@ Rules:
 Expected output:
 
 - `project_git_diff`
+- `project_error` on failure
 
 ### 5.4 `project_stage_file`
 
@@ -219,6 +222,7 @@ Expected outputs:
 - `project_git_status`
 - optionally `project_git_diff` if the server chooses to refresh the relevant
   diff view
+- `project_error` on failure
 
 ### 5.5 `project_stage_hunk`
 
@@ -240,6 +244,7 @@ Expected outputs:
 
 - `project_git_status`
 - `project_git_diff`
+- `project_error` on failure
 
 ---
 
@@ -406,6 +411,75 @@ Important:
 - the UI does not parse raw patch text to discover hunk boundaries
 - `hunk_id` is the stable server-issued handle used by `project_stage_hunk`
 
+### 6.5 `project_error`
+
+Reports project-stream request failures and subscription failures that occur
+after the stream is valid and established.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectErrorCode {
+    NotFound,
+    InvalidPath,
+    RootMismatch,
+    PermissionDenied,
+    GitFailed,
+    IoFailed,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectErrorContext {
+    Refresh,
+    Watch,
+    ListDir {
+        root: ProjectRootPath,
+        path: String,
+    },
+    ReadFile {
+        path: ProjectPath,
+    },
+    ReadDiff {
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<String>,
+    },
+    StageFile {
+        path: ProjectPath,
+    },
+    StageHunk {
+        path: ProjectPath,
+        hunk_id: String,
+    },
+}
+
+pub struct ProjectErrorPayload {
+    pub code: ProjectErrorCode,
+    pub message: String,
+    pub fatal: bool,
+    pub context: ProjectErrorContext,
+}
+```
+
+Rules:
+
+- `fatal: false` means the specific request failed but the stream remains open.
+- `fatal: true` means the project stream is dead. No further events are emitted
+  on `/project/<project_id>` after the error.
+- `project_error` is for operational failures, not protocol violations.
+
+Examples:
+
+- stale directory path during `project_list_dir` -> `not_found`, `fatal: false`
+- permission denied reading a file -> `permission_denied`, `fatal: false`
+- `git diff` process exits non-zero -> `git_failed`, `fatal: false`
+- project deleted while a live subscription is active -> `not_found`,
+  `fatal: true`, context `watch`
+- internal watcher task failure that leaves the subscription unusable ->
+  `internal`, `fatal: true`
+
 ---
 
 ## 7. Refresh and Live Updates
@@ -484,19 +558,52 @@ The frontend never guesses which repository a file belongs to.
 
 ## 9. Failure Model
 
-If the project does not exist, the root does not belong to the project, the
-file path is invalid, or the hunk ID is unknown, the server should fail loudly.
+Project streams follow the global error-handling rules from `02-protocol.md`.
 
-That likely means one of:
+### 9.1 Operational failures
 
-- panic for protocol violation / impossible state
-- explicit typed error event, if we later decide project streams need one
+These must emit `project_error`, not panic the whole server:
 
-What we must not do:
+- requested file or directory no longer exists
+- root path is not accessible
+- permission denied
+- git command fails
+- hunk ID is unknown
+- file read / stat / diff generation fails for a valid project stream
+
+Default classification:
+
+- request-specific failures -> `fatal: false`
+- stream-wide subscription failures -> `fatal: true`
+
+### 9.2 Fatal project-stream failures
+
+The server emits `project_error { fatal: true }` and closes the stream
+logically when:
+
+- the project disappears while the subscription is active
+- the live watch / poll loop cannot continue safely
+- server-side state for that subscription is no longer usable
+
+After a fatal `project_error`, the client must treat the project stream as
+terminated and stop sending further project frames on it.
+
+### 9.3 What remains fail-fast
+
+These are still protocol bugs and should panic with diagnostics:
+
+- malformed `/project/<project_id>` stream path
+- client sends project frames on the wrong stream kind
+- project stream ownership mismatch between connection and stream
+- impossible internal invariants that indicate Tyde bookkeeping corruption
+
+### 9.4 What we must not do
 
 - silently ignore bad paths
 - guess another root
-- return partial state and pretend success
+- return partial success and pretend the request worked
+- crash the whole host because one project request hit a routine filesystem or
+  git error
 
 ---
 

@@ -9,29 +9,27 @@ use protocol::{
     SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 
-/// Enter draft-chat mode without spawning a backend session yet.
-/// If `backend_override` is provided, the first message will use that backend
-/// instead of the default.
 pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
-    state.active_agent_id.set(None);
+    state.active_agent.set(None);
     state.draft_backend_override.set(backend_override);
     state.center_view.set(CenterView::Chat);
 }
 
-/// Resolve which backend to use for a new chat: explicit override first, then
-/// the host default, then the first enabled backend.
-pub fn resolve_backend(state: &AppState) -> Option<BackendKind> {
+pub fn resolve_backend(state: &AppState, host_id: &str) -> Option<BackendKind> {
     let draft = state.draft_backend_override.get_untracked();
     draft.or_else(|| {
-        state.host_settings.get_untracked().and_then(|settings| {
-            settings
-                .default_backend
-                .or_else(|| settings.enabled_backends.first().copied())
-        })
+        state
+            .host_settings_by_host
+            .get_untracked()
+            .get(host_id)
+            .and_then(|settings| {
+                settings
+                    .default_backend
+                    .or_else(|| settings.enabled_backends.first().copied())
+            })
     })
 }
 
-/// Spawn a new chat agent for the currently active project using the first user message.
 pub fn spawn_new_chat(
     state: &AppState,
     initial_message: String,
@@ -47,46 +45,47 @@ pub fn spawn_new_chat(
         return;
     }
 
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
-        None => {
-            log::error!("spawn_new_chat: not connected");
-            return;
+    let active_project = state.active_project_ref_untracked();
+    let (host_id, host_stream, project_id, roots) = match active_project {
+        Some(active_project) => {
+            let Some(project) = state.active_project_info_untracked() else {
+                log::error!("spawn_new_chat: active project not found");
+                return;
+            };
+            let Some(host_stream) = state.host_stream_untracked(&active_project.host_id) else {
+                log::error!("spawn_new_chat: host stream missing for active project host");
+                return;
+            };
+            (
+                active_project.host_id,
+                host_stream,
+                Some(project.project.id),
+                project.project.roots,
+            )
         }
-    };
-    let host_stream = match state.host_stream.get_untracked() {
-        Some(s) => s,
-        None => {
-            log::error!("spawn_new_chat: no host stream");
-            return;
-        }
-    };
-    let (project_id, roots) = match state.active_project_id.get_untracked() {
-        Some(pid) => {
-            let projects = state.projects.get_untracked();
-            match projects.into_iter().find(|p| p.id == pid) {
-                Some(p) => (Some(p.id), p.roots.clone()),
-                None => (None, Vec::new()),
+        None => match state.selected_host_stream_untracked() {
+            Some((host_id, host_stream)) => (host_id, host_stream, None, Vec::new()),
+            None => {
+                log::error!("spawn_new_chat: no selected connected host");
+                return;
             }
-        }
-        None => (None, Vec::new()),
+        },
     };
 
-    let backend_kind = match resolve_backend(state) {
+    let backend_kind = match resolve_backend(state, &host_id) {
         Some(kind) => kind,
         None => {
             log::error!("spawn_new_chat: no backend available — enable one in settings");
             return;
         }
     };
-    // Draft override consumed — clear it.
+
     state.draft_backend_override.set(None);
     state.agent_initializing.set(true);
-    let name = "Chat".to_string();
 
     spawn_local(async move {
         let payload = SpawnAgentPayload {
-            name,
+            name: "Chat".to_string(),
             parent_agent_id: None,
             project_id,
             params: SpawnAgentParams::New {
@@ -97,56 +96,49 @@ pub fn spawn_new_chat(
                 cost_hint: None,
             },
         };
-        if let Err(e) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await {
-            log::error!("failed to send SpawnAgent: {e}");
+        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
+        {
+            log::error!("failed to send SpawnAgent: {error}");
         }
     });
 }
 
-/// Request file contents from the server for the given relative path in the active project.
 pub fn open_file(state: &AppState, relative_path: &str) {
-    let host_id = match state.host_id.get_untracked() {
-        Some(id) => id,
-        None => {
-            log::error!("open_file: not connected");
-            return;
-        }
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        log::error!("open_file: no active project");
+        return;
     };
-    let project_id = match state.active_project_id.get_untracked() {
-        Some(pid) => pid,
-        None => {
-            log::error!("open_file: no active project");
-            return;
-        }
+    let Some(project) = state.active_project_info_untracked() else {
+        log::error!("open_file: active project not found");
+        return;
     };
-    let root = {
-        let projects = state.projects.get_untracked();
-        match projects.iter().find(|p| p.id == project_id) {
-            Some(p) => match p.roots.first() {
-                Some(r) => ProjectRootPath(r.clone()),
-                None => {
-                    log::error!("open_file: project has no roots");
-                    return;
-                }
-            },
-            None => {
-                log::error!("open_file: project not found");
-                return;
-            }
-        }
+    let Some(_host_stream) = state.host_stream_untracked(&active_project.host_id) else {
+        log::error!("open_file: host stream missing");
+        return;
+    };
+    let Some(root) = project.project.roots.first().cloned() else {
+        log::error!("open_file: project has no roots");
+        return;
     };
 
-    let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = ProjectReadFilePayload {
         path: ProjectPath {
-            root,
+            root: ProjectRootPath(root),
             relative_path: relative_path.to_owned(),
         },
     };
+    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
 
     spawn_local(async move {
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadFile, &payload).await {
-            log::error!("failed to send ProjectReadFile: {e}");
+        if let Err(error) = send_frame(
+            &active_project.host_id,
+            project_stream,
+            FrameKind::ProjectReadFile,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send ProjectReadFile: {error}");
         }
     });
 }

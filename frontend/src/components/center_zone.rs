@@ -41,13 +41,18 @@ pub fn CenterZone() -> impl IntoView {
     // New chat split button
     let menu_open = RwSignal::new(false);
 
-    let is_connected =
-        Memo::new(move |_| matches!(state.connection_status.get(), ConnectionStatus::Connected));
+    let is_connected_state = state.clone();
+    let is_connected = Memo::new(move |_| {
+        matches!(
+            is_connected_state.selected_host_connection_status(),
+            ConnectionStatus::Connected
+        )
+    });
 
+    let enabled_backends_state = state.clone();
     let enabled_backends = Memo::new(move |_| {
-        state
-            .host_settings
-            .get()
+        enabled_backends_state
+            .selected_host_settings()
             .map(|s| s.enabled_backends)
             .unwrap_or_default()
     });

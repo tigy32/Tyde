@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use protocol::MessageSender;
 
 use crate::components::tool_card::ToolCardView;
+use crate::highlight::highlight_code_blocks;
 use crate::markdown::render_markdown;
 use crate::state::ChatMessageEntry;
 
@@ -174,8 +175,20 @@ pub fn ChatMessageView(entry: ChatMessageEntry) -> impl IntoView {
             })}
 
             // Message content (rendered as markdown) — hide if empty
-            {(!content.is_empty()).then(|| view! {
-                <div class="chat-card-body" inner_html=content_html.clone()></div>
+            {(!content.is_empty()).then(|| {
+                let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+                Effect::new(move |_| {
+                    if let Some(el) = body_ref.get() {
+                        highlight_code_blocks(&el);
+                    }
+                });
+                view! {
+                    <div
+                        class="chat-card-body"
+                        node_ref=body_ref
+                        inner_html=content_html.clone()
+                    ></div>
+                }
             })}
 
             // Images

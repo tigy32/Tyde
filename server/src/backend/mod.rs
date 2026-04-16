@@ -109,6 +109,7 @@ pub struct BackendSession {
 #[derive(Debug, Clone, Default)]
 pub struct BackendSpawnConfig {
     pub cost_hint: Option<SpawnCostHint>,
+    pub startup_mcp_servers: Vec<StartupMcpServer>,
 }
 
 /// Output stream of ChatEvents from a backend session.

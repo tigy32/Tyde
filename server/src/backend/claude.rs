@@ -286,17 +286,15 @@ impl ClaudeStdoutSummary {
     }
 
     fn best_reasoning(&self) -> Option<String> {
-        let streamed = self.streamed_reasoning.trim();
-        if !streamed.is_empty() {
-            return Some(streamed.to_string());
+        if contains_non_whitespace(&self.streamed_reasoning) {
+            return Some(self.streamed_reasoning.clone());
         }
         if let Some(reasoning) = self
             .result_reasoning
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
+            .as_ref()
+            .filter(|text| contains_non_whitespace(text))
         {
-            return Some(reasoning.to_string());
+            return Some(reasoning.clone());
         }
         None
     }
@@ -599,43 +597,16 @@ impl ClaudeInner {
                         .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
                         .await;
                     let known_context_window = summary.result_context_window;
-                    if let Some(phase) = take_phase_emission(&mut summary) {
-                        let text = phase.text;
-                        let selected_model = phase.model.clone().or(model_hint.clone());
-                        let tool_calls = phase
-                            .tool_calls
-                            .iter()
-                            .map(|tool| {
-                                json!({
-                                    "id": tool.id,
-                                    "name": tool.name,
-                                    "arguments": tool.arguments,
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        let context_breakdown = estimate_context_breakdown(
-                            phase.usage.as_ref(),
+                    if !self
+                        .emit_terminal_phase_or_placeholder(
+                            &mut summary,
                             conversation_history_bytes,
-                            phase.tool_io_bytes,
-                            phase.reasoning_bytes,
                             known_context_window,
-                            selected_model.as_deref(),
-                        );
-                        if !text.is_empty() {
-                            self.add_conversation_bytes(text.len() as u64).await;
-                        }
-                        self.emit_stream_end(
-                            text,
-                            selected_model,
-                            phase.usage,
-                            phase.reasoning,
-                            tool_calls,
-                            Some(context_breakdown),
-                        );
-                        for tool_call in &phase.tool_calls {
-                            self.emit_tool_request(tool_call);
-                        }
-                    } else if summary.emitted_phase_count == 0 {
+                            model_hint,
+                        )
+                        .await
+                        && summary.emitted_phase_count == 0
+                    {
                         self.emit_error("Claude returned no assistant output.");
                     }
                 }
@@ -645,43 +616,16 @@ impl ClaudeInner {
                         .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
                         .await;
                     let known_context_window = summary.result_context_window;
-                    if let Some(phase) = take_phase_emission(&mut summary) {
-                        let partial = phase.text;
-                        let selected_model = phase.model.clone();
-                        let tool_calls = phase
-                            .tool_calls
-                            .iter()
-                            .map(|tool| {
-                                json!({
-                                    "id": tool.id,
-                                    "name": tool.name,
-                                    "arguments": tool.arguments,
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        let context_breakdown = estimate_context_breakdown(
-                            phase.usage.as_ref(),
+                    if !self
+                        .emit_terminal_phase_or_placeholder(
+                            &mut summary,
                             conversation_history_bytes,
-                            phase.tool_io_bytes,
-                            phase.reasoning_bytes,
                             known_context_window,
-                            selected_model.as_deref(),
-                        );
-                        if !partial.is_empty() {
-                            self.add_conversation_bytes(partial.len() as u64).await;
-                        }
-                        self.emit_stream_end(
-                            partial,
-                            selected_model,
-                            phase.usage,
-                            phase.reasoning,
-                            tool_calls,
-                            Some(context_breakdown),
-                        );
-                        for tool_call in &phase.tool_calls {
-                            self.emit_tool_request(tool_call);
-                        }
-                    } else if summary.emitted_phase_count == 0 {
+                            None,
+                        )
+                        .await
+                        && summary.emitted_phase_count == 0
+                    {
                         self.emit_error("Claude turn cancelled.");
                     }
                     self.emit_operation_cancelled("Claude turn cancelled.");
@@ -690,6 +634,15 @@ impl ClaudeInner {
                     let mut summary = summary;
                     let _ = self
                         .normalize_usage_for_turn(summary.result_cumulative_usage.take())
+                        .await;
+                    let known_context_window = summary.result_context_window;
+                    let _ = self
+                        .emit_terminal_phase_or_placeholder(
+                            &mut summary,
+                            conversation_history_bytes,
+                            known_context_window,
+                            None,
+                        )
                         .await;
                     let detail = summary.error_message().unwrap_or(error);
                     self.emit_error(&detail);
@@ -1287,6 +1240,17 @@ impl ClaudeInner {
         }));
     }
 
+    fn emit_placeholder_stream_end(&self, model: Option<String>, context_breakdown: Option<Value>) {
+        self.emit_stream_end(
+            String::new(),
+            model,
+            None,
+            None,
+            Vec::new(),
+            context_breakdown,
+        );
+    }
+
     fn emit_operation_cancelled(&self, message: &str) {
         self.emit_event(json!({
             "kind": "OperationCancelled",
@@ -1311,6 +1275,68 @@ impl ClaudeInner {
             derive_turn_token_usage(&cumulative_usage, state.last_cumulative_usage.as_ref());
         state.last_cumulative_usage = Some(cumulative_usage);
         per_turn
+    }
+
+    async fn emit_terminal_phase_or_placeholder(
+        &self,
+        summary: &mut ClaudeStdoutSummary,
+        conversation_history_bytes: u64,
+        known_context_window: Option<u64>,
+        model_hint: Option<String>,
+    ) -> bool {
+        if let Some(phase) = take_phase_emission(summary) {
+            let text = phase.text;
+            let selected_model = phase.model.clone().or(model_hint);
+            let tool_calls = phase
+                .tool_calls
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "id": tool.id,
+                        "name": tool.name,
+                        "arguments": tool.arguments,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let context_breakdown = estimate_context_breakdown(
+                phase.usage.as_ref(),
+                conversation_history_bytes,
+                phase.tool_io_bytes,
+                phase.reasoning_bytes,
+                known_context_window,
+                selected_model.as_deref(),
+            );
+            if !text.is_empty() {
+                self.add_conversation_bytes(text.len() as u64).await;
+            }
+            self.emit_stream_end(
+                text,
+                selected_model,
+                phase.usage,
+                phase.reasoning,
+                tool_calls,
+                Some(context_breakdown),
+            );
+            for tool_call in &phase.tool_calls {
+                self.emit_tool_request(tool_call);
+            }
+            return true;
+        }
+
+        if summary.emitted_phase_count == 0 {
+            let selected_model = summary.model.clone().or(model_hint);
+            let context_breakdown = estimate_context_breakdown(
+                None,
+                conversation_history_bytes,
+                summary.tool_io_bytes,
+                summary.reasoning_bytes,
+                known_context_window,
+                selected_model.as_deref(),
+            );
+            self.emit_placeholder_stream_end(selected_model, Some(context_breakdown));
+        }
+
+        false
     }
 }
 
@@ -2614,15 +2640,14 @@ fn append_reasoning_text(
     text: &str,
     separate_with_newline: bool,
 ) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if !contains_non_whitespace(text) {
         return;
     }
     if separate_with_newline && !summary.streamed_reasoning.is_empty() {
         summary.streamed_reasoning.push('\n');
     }
-    summary.reasoning_bytes = summary.reasoning_bytes.saturating_add(trimmed.len() as u64);
-    summary.streamed_reasoning.push_str(trimmed);
+    summary.reasoning_bytes = summary.reasoning_bytes.saturating_add(text.len() as u64);
+    summary.streamed_reasoning.push_str(text);
 }
 
 fn extract_text_from_message(message: &Value) -> Option<String> {
@@ -2676,14 +2701,13 @@ fn extract_reasoning_from_message(message: &Value) -> Option<String> {
             continue;
         }
         if let Some(text) = extract_reasoning_text(block) {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
+            if !contains_non_whitespace(&text) {
                 continue;
             }
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(trimmed);
+            out.push_str(&text);
         }
     }
     if out.is_empty() { None } else { Some(out) }
@@ -2710,19 +2734,17 @@ fn extract_reasoning_from_result(value: &Value) -> Option<String> {
         "reasoning_text",
     ] {
         if let Some(text) = value.get(key).and_then(extract_reasoning_text)
-            && !text.trim().is_empty()
+            && contains_non_whitespace(&text)
         {
-            return Some(text.trim().to_string());
+            return Some(text);
         }
     }
 
     if let Some(message) = value.get("message")
         && let Some(reasoning) = extract_reasoning_from_message(message)
+        && contains_non_whitespace(&reasoning)
     {
-        let trimmed = reasoning.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
+        return Some(reasoning);
     }
 
     None
@@ -2738,11 +2760,10 @@ fn is_reasoning_marker(marker: &str) -> bool {
 fn extract_reasoning_text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
+            if !contains_non_whitespace(text) {
                 None
             } else {
-                Some(trimmed.to_string())
+                Some(text.to_string())
             }
         }
         Value::Array(parts) => {
@@ -2755,7 +2776,11 @@ fn extract_reasoning_text(value: &Value) -> Option<String> {
                     out.push_str(&text);
                 }
             }
-            if out.is_empty() { None } else { Some(out) }
+            if contains_non_whitespace(&out) {
+                Some(out)
+            } else {
+                None
+            }
         }
         Value::Object(map) => {
             for key in [
@@ -2798,6 +2823,10 @@ fn extract_reasoning_text(value: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn contains_non_whitespace(text: &str) -> bool {
+    text.chars().any(|ch| !ch.is_whitespace())
 }
 
 fn extract_tool_calls_from_message(message: &Value) -> Vec<ClaudeToolCall> {
@@ -4794,7 +4823,9 @@ impl Backend for ClaudeBackend {
                 workspace_roots
             };
             let (session, mut raw_events) =
-                match ClaudeSession::spawn(&roots, None, &[], None, None).await {
+                match ClaudeSession::spawn(&roots, None, &config.startup_mcp_servers, None, None)
+                    .await
+                {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::error!("Failed to spawn Claude session: {err}");
@@ -4942,7 +4973,9 @@ impl Backend for ClaudeBackend {
 
         tokio::spawn(async move {
             let (session, mut raw_events) =
-                match ClaudeSession::spawn(&roots, None, &[], None, None).await {
+                match ClaudeSession::spawn(&roots, None, &config.startup_mcp_servers, None, None)
+                    .await
+                {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::error!("Failed to spawn Claude resume session: {err}");
@@ -6105,6 +6138,24 @@ mod tests {
             extract_reasoning_text(&block),
             Some("Tracing Claude summary output.".to_string())
         );
+    }
+
+    #[test]
+    fn extract_reasoning_text_preserves_boundary_whitespace() {
+        assert_eq!(
+            extract_reasoning_text(&json!(" user")),
+            Some(" user".to_string())
+        );
+    }
+
+    #[test]
+    fn append_reasoning_text_preserves_leading_spaces_between_deltas() {
+        let mut summary = ClaudeStdoutSummary::default();
+
+        append_reasoning_text(&mut summary, "The", false);
+        append_reasoning_text(&mut summary, " user", false);
+
+        assert_eq!(summary.streamed_reasoning, "The user");
     }
 
     #[test]

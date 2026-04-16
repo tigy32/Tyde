@@ -2,24 +2,26 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
+use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentErrorPayload, AgentId, AgentStartPayload, ChatEvent, Envelope, FrameKind,
-    HostSettingsPayload, NewAgentPayload, NewTerminalPayload, Project, ProjectFileContentsPayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    ListSessionsPayload, NewAgentPayload, NewTerminalPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
     ProjectNotifyPayload, ProtocolValidator, RejectPayload, SessionListPayload, StreamPath,
     TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
 };
 
+use crate::send::send_frame;
 use crate::state::{
-    AgentInfo, AppState, CenterView, ChatMessageEntry, ConnectionStatus, DiffViewState, OpenFile,
-    StreamingState, TerminalInfo, ToolRequestEntry, TransientEvent,
+    ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, CenterView, ChatMessageEntry,
+    ConnectionStatus, DiffViewState, OpenFile, ProjectInfo, SessionInfo, StreamingState,
+    TerminalInfo, ToolRequestEntry, TransientEvent,
 };
 
-/// Non-panicking sequence validator for inbound frames.
-/// Logs errors on mismatch instead of panicking like the protocol crate's `SeqValidator`.
 struct FrontendSeqValidator {
-    expected: HashMap<StreamPath, u64>,
+    expected: HashMap<(String, StreamPath), u64>,
 }
 
 impl FrontendSeqValidator {
@@ -29,15 +31,16 @@ impl FrontendSeqValidator {
         }
     }
 
-    fn validate(&mut self, stream: &StreamPath, seq: u64, kind: FrameKind) -> bool {
-        let expected = self.expected.get(stream).copied().unwrap_or(0);
+    fn validate(&mut self, host_id: &str, stream: &StreamPath, seq: u64, kind: FrameKind) -> bool {
+        let key = (host_id.to_string(), stream.clone());
+        let expected = self.expected.get(&key).copied().unwrap_or(0);
         if seq != expected {
             log::error!(
-                "sequence mismatch on stream {stream} kind {kind}: expected {expected}, got {seq}"
+                "sequence mismatch on host {host_id} stream {stream} kind {kind}: expected {expected}, got {seq}"
             );
             return false;
         }
-        self.expected.insert(stream.clone(), expected + 1);
+        self.expected.insert(key, expected + 1);
         true
     }
 }
@@ -47,90 +50,148 @@ thread_local! {
     static INBOUND_PROTOCOL: RefCell<ProtocolValidator> = RefCell::new(ProtocolValidator::new());
 }
 
-pub fn dispatch_envelope(state: &AppState, envelope: Envelope) {
-    // Validate inbound sequence numbers (log-only, still dispatch on mismatch)
-    INBOUND_SEQ.with(|v| {
-        v.borrow_mut()
-            .validate(&envelope.stream, envelope.seq, envelope.kind)
+pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
+    INBOUND_SEQ.with(|validator| {
+        validator
+            .borrow_mut()
+            .validate(host_id, &envelope.stream, envelope.seq, envelope.kind);
     });
-    INBOUND_PROTOCOL.with(|v| {
-        if let Err(error) = v.borrow_mut().validate_envelope(&envelope) {
+    INBOUND_PROTOCOL.with(|validator| {
+        if let Err(error) = validator.borrow_mut().validate_envelope(&envelope) {
             log::error!("protocol violation: {error}");
         }
     });
 
     match envelope.kind {
         FrameKind::Welcome => {
-            state.connection_status.set(ConnectionStatus::Connected);
-            log::info!("connected to server");
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(host_id.to_string(), ConnectionStatus::Connected);
+            });
+
+            if let Some(stream) = state.host_stream_untracked(host_id) {
+                let host_id = host_id.to_string();
+                spawn_local(async move {
+                    let _ = send_frame(
+                        &host_id,
+                        stream,
+                        FrameKind::ListSessions,
+                        &ListSessionsPayload {},
+                    )
+                    .await;
+                });
+            }
+
+            log::info!("connected to host {}", host_id);
         }
         FrameKind::Reject => match envelope.parse_payload::<RejectPayload>() {
-            Ok(p) => {
-                log::error!("connection rejected: {} ({:?})", p.message, p.code);
-                state
-                    .connection_status
-                    .set(ConnectionStatus::Error(p.message));
+            Ok(payload) => {
+                log::error!(
+                    "connection rejected on host {}: {}",
+                    host_id,
+                    payload.message
+                );
+                state.connection_statuses.update(|statuses| {
+                    statuses.insert(
+                        host_id.to_string(),
+                        ConnectionStatus::Error(payload.message),
+                    );
+                });
             }
-            Err(e) => {
-                log::error!("failed to parse reject payload: {e}");
-                state
-                    .connection_status
-                    .set(ConnectionStatus::Error("rejected".into()));
+            Err(error) => {
+                log::error!("failed to parse reject payload: {error}");
+                state.connection_statuses.update(|statuses| {
+                    statuses.insert(
+                        host_id.to_string(),
+                        ConnectionStatus::Error("rejected".to_string()),
+                    );
+                });
             }
         },
         FrameKind::HostSettings => match envelope.parse_payload::<HostSettingsPayload>() {
-            Ok(p) => {
-                state.host_settings.set(Some(p.settings));
+            Ok(payload) => {
+                state.host_settings_by_host.update(|settings| {
+                    settings.insert(host_id.to_string(), payload.settings);
+                });
             }
-            Err(e) => log::error!("failed to parse host_settings payload: {e}"),
+            Err(error) => log::error!("failed to parse host_settings payload: {error}"),
         },
         FrameKind::NewAgent => match envelope.parse_payload::<NewAgentPayload>() {
-            Ok(p) => {
-                let agent_id = p.agent_id.clone();
+            Ok(payload) => {
+                let agent_id = payload.agent_id.clone();
                 let info = AgentInfo {
-                    agent_id: p.agent_id,
-                    name: p.name,
-                    backend_kind: p.backend_kind,
-                    workspace_roots: p.workspace_roots,
-                    project_id: p.project_id,
-                    parent_agent_id: p.parent_agent_id,
-                    created_at_ms: p.created_at_ms,
-                    instance_stream: p.instance_stream,
+                    host_id: host_id.to_string(),
+                    agent_id: payload.agent_id,
+                    name: payload.name,
+                    backend_kind: payload.backend_kind,
+                    workspace_roots: payload.workspace_roots,
+                    project_id: payload.project_id,
+                    parent_agent_id: payload.parent_agent_id,
+                    created_at_ms: payload.created_at_ms,
+                    instance_stream: payload.instance_stream,
                     fatal_error: None,
                 };
-                state
-                    .agents
-                    .update(|agents: &mut Vec<AgentInfo>| agents.push(info));
-                state.active_agent_id.set(Some(agent_id));
+                let project_id = info.project_id.clone();
+                state.agents.update(|agents| {
+                    agents
+                        .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
+                    agents.push(info);
+                });
                 state.agent_initializing.set(false);
-                state.center_view.set(CenterView::Chat);
+
+                let target_project =
+                    project_id
+                        .as_ref()
+                        .map(|pid| crate::state::ActiveProjectRef {
+                            host_id: host_id.to_string(),
+                            project_id: pid.clone(),
+                        });
+                let active_project = state.active_project.get_untracked();
+                let new_active_agent = ActiveAgentRef {
+                    host_id: host_id.to_string(),
+                    agent_id,
+                };
+
+                if target_project == active_project {
+                    state.active_agent.set(Some(new_active_agent));
+                    state.center_view.set(CenterView::Chat);
+                } else if let Some(target) = target_project {
+                    // Spawned for a project the user isn't currently viewing.
+                    // Stash into that project's memory so switching over shows it.
+                    state.project_view_memory.update(|map| {
+                        let slot = map.entry(target).or_default();
+                        slot.active_agent = Some(new_active_agent);
+                        slot.center_view = Some(CenterView::Chat);
+                    });
+                } else {
+                    // No project context — fall through to global behavior.
+                    state.active_agent.set(Some(new_active_agent));
+                    state.center_view.set(CenterView::Chat);
+                }
             }
-            Err(e) => log::error!("failed to parse new_agent payload: {e}"),
+            Err(error) => log::error!("failed to parse new_agent payload: {error}"),
         },
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
-            Ok(_p) => {
-                // AgentStart is the birth certificate — no state change needed.
-                // Agent runtime state is implicit from StreamStart/StreamEnd events.
-            }
-            Err(e) => log::error!("failed to parse agent_start payload: {e}"),
+            Ok(_) => {}
+            Err(error) => log::error!("failed to parse agent_start payload: {error}"),
         },
         FrameKind::AgentError => match envelope.parse_payload::<AgentErrorPayload>() {
-            Ok(p) => {
-                let error_msg = p.message.clone();
-                let error_agent_id = p.agent_id.clone();
-                if p.fatal {
-                    state.agents.update(|agents: &mut Vec<AgentInfo>| {
-                        if let Some(agent) = agents.iter_mut().find(|a| a.agent_id == p.agent_id) {
-                            agent.fatal_error = Some(p.message);
+            Ok(payload) => {
+                let error_agent_id = payload.agent_id.clone();
+                if payload.fatal {
+                    state.agents.update(|agents| {
+                        if let Some(agent) = agents.iter_mut().find(|agent| {
+                            agent.host_id == host_id && agent.agent_id == payload.agent_id
+                        }) {
+                            agent.fatal_error = Some(payload.message.clone());
                         }
                     });
                 }
-                // Also inject an inline error message into the chat
+
                 let entry = ChatMessageEntry {
                     message: protocol::ChatMessage {
                         timestamp: js_sys::Date::now() as u64,
                         sender: protocol::MessageSender::Error,
-                        content: error_msg,
+                        content: payload.message,
                         reasoning: None,
                         tool_calls: Vec::new(),
                         model_info: None,
@@ -140,246 +201,344 @@ pub fn dispatch_envelope(state: &AppState, envelope: Envelope) {
                     },
                     tool_requests: Vec::new(),
                 };
-                state.chat_messages.update(
-                    |map: &mut std::collections::HashMap<
-                        protocol::AgentId,
-                        Vec<ChatMessageEntry>,
-                    >| {
-                        map.entry(error_agent_id).or_default().push(entry);
-                    },
-                );
+                state.chat_messages.update(|map| {
+                    map.entry(error_agent_id).or_default().push(entry);
+                });
             }
-            Err(e) => log::error!("failed to parse agent_error payload: {e}"),
+            Err(error) => log::error!("failed to parse agent_error payload: {error}"),
         },
-        FrameKind::ChatEvent => {
-            dispatch_chat_event(state, &envelope.stream, &envelope);
-        }
+        FrameKind::ChatEvent => dispatch_chat_event(state, host_id, &envelope.stream, &envelope),
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
-            Ok(p) => {
-                state.sessions.set(p.sessions);
+            Ok(payload) => {
+                state.sessions.update(|sessions| {
+                    sessions.retain(|session| session.host_id != host_id);
+                    sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
+                        host_id: host_id.to_string(),
+                        summary,
+                    }));
+                });
             }
-            Err(e) => log::error!("failed to parse session_list payload: {e}"),
+            Err(error) => log::error!("failed to parse session_list payload: {error}"),
         },
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
-                state.projects.update(|projects: &mut Vec<Project>| {
-                    if let Some(existing) = projects.iter_mut().find(|p| p.id == project.id) {
-                        *existing = project;
+                state.projects.update(|projects| {
+                    if let Some(existing) = projects
+                        .iter_mut()
+                        .find(|entry| entry.host_id == host_id && entry.project.id == project.id)
+                    {
+                        existing.project = project;
                     } else {
-                        projects.push(project);
+                        projects.push(ProjectInfo {
+                            host_id: host_id.to_string(),
+                            project,
+                        });
                     }
                 });
             }
             Ok(ProjectNotifyPayload::Delete { project }) => {
-                state
-                    .projects
-                    .update(|projects: &mut Vec<Project>| projects.retain(|p| p.id != project.id));
+                state.projects.update(|projects| {
+                    projects.retain(|entry| {
+                        !(entry.host_id == host_id && entry.project.id == project.id)
+                    });
+                });
+                let deleted_ref = crate::state::ActiveProjectRef {
+                    host_id: host_id.to_string(),
+                    project_id: project.id.clone(),
+                };
+                state.forget_project_view_memory(&deleted_ref);
+                if state
+                    .active_project
+                    .get_untracked()
+                    .as_ref()
+                    .is_some_and(|active| active == &deleted_ref)
+                {
+                    state.switch_active_project(None);
+                }
             }
-            Err(e) => log::error!("failed to parse project_notify payload: {e}"),
+            Err(error) => log::error!("failed to parse project_notify payload: {error}"),
         },
         FrameKind::ProjectFileList => {
-            let project_id = match resolve_project_id(&envelope.stream) {
-                Some(id) => id,
-                None => {
-                    log::warn!(
-                        "project_file_list on non-project stream {}",
-                        envelope.stream
-                    );
-                    return;
-                }
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "project_file_list on non-project stream {}",
+                    envelope.stream
+                );
+                return;
             };
             match envelope.parse_payload::<ProjectFileListPayload>() {
-                Ok(p) => {
-                    let diff_entries: Vec<_> =
-                        p.roots.into_iter().flat_map(|r| r.entries).collect();
-                    state.file_tree.update(
-                        |map: &mut HashMap<ProjectId, Vec<protocol::ProjectFileEntry>>| {
-                            let existing = map.entry(project_id.clone()).or_default();
-                            for entry in diff_entries {
-                                match entry.op {
-                                    protocol::FileEntryOp::Add => {
-                                        if !existing
-                                            .iter()
-                                            .any(|e| e.relative_path == entry.relative_path)
-                                        {
-                                            existing.push(entry);
-                                        }
-                                    }
-                                    protocol::FileEntryOp::Remove => {
-                                        existing.retain(|e| e.relative_path != entry.relative_path);
+                Ok(payload) => {
+                    let diff_entries: Vec<_> = payload
+                        .roots
+                        .into_iter()
+                        .flat_map(|root| root.entries)
+                        .collect();
+                    state.file_tree.update(|file_tree| {
+                        let existing = file_tree.entry(project_id.clone()).or_default();
+                        for entry in diff_entries {
+                            match entry.op {
+                                protocol::FileEntryOp::Add => {
+                                    if !existing.iter().any(|existing| {
+                                        existing.relative_path == entry.relative_path
+                                    }) {
+                                        existing.push(entry);
                                     }
                                 }
+                                protocol::FileEntryOp::Remove => {
+                                    existing.retain(|existing| {
+                                        existing.relative_path != entry.relative_path
+                                    });
+                                }
                             }
-                        },
-                    );
+                        }
+                    });
                 }
-                Err(e) => log::error!("failed to parse project_file_list payload: {e}"),
+                Err(error) => log::error!("failed to parse project_file_list payload: {error}"),
             }
         }
         FrameKind::ProjectGitStatus => {
-            let project_id = match resolve_project_id(&envelope.stream) {
-                Some(id) => id,
-                None => {
-                    log::warn!(
-                        "project_git_status on non-project stream {}",
-                        envelope.stream
-                    );
-                    return;
-                }
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "project_git_status on non-project stream {}",
+                    envelope.stream
+                );
+                return;
             };
             match envelope.parse_payload::<ProjectGitStatusPayload>() {
-                Ok(p) => {
-                    state.git_status.update(
-                        |map: &mut HashMap<ProjectId, Vec<protocol::ProjectRootGitStatus>>| {
-                            map.insert(project_id, p.roots);
-                        },
-                    );
+                Ok(payload) => {
+                    state.git_status.update(|git_status| {
+                        git_status.insert(project_id, payload.roots);
+                    });
                 }
-                Err(e) => log::error!("failed to parse project_git_status payload: {e}"),
+                Err(error) => log::error!("failed to parse project_git_status payload: {error}"),
             }
         }
         FrameKind::ProjectGitDiff => match envelope.parse_payload::<ProjectGitDiffPayload>() {
-            Ok(p) => {
+            Ok(payload) => {
                 state.diff_content.set(Some(DiffViewState {
-                    root: p.root,
-                    scope: p.scope,
-                    files: p.files,
+                    root: payload.root,
+                    scope: payload.scope,
+                    files: payload.files,
                 }));
             }
-            Err(e) => log::error!("failed to parse project_git_diff payload: {e}"),
+            Err(error) => log::error!("failed to parse project_git_diff payload: {error}"),
         },
         FrameKind::ProjectFileContents => {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
-                Ok(p) => {
+                Ok(payload) => {
                     state.open_file.set(Some(OpenFile {
-                        path: p.path,
-                        contents: p.contents,
-                        is_binary: p.is_binary,
+                        path: payload.path,
+                        contents: payload.contents,
+                        is_binary: payload.is_binary,
                     }));
                     state.center_view.set(CenterView::Editor);
                 }
-                Err(e) => log::error!("failed to parse project_file_contents payload: {e}"),
+                Err(error) => log::error!("failed to parse project_file_contents payload: {error}"),
             }
         }
-        FrameKind::NewTerminal => {
-            match envelope.parse_payload::<NewTerminalPayload>() {
-                Ok(p) => {
-                    let info = TerminalInfo {
-                        terminal_id: p.terminal_id,
-                        stream: p.stream,
-                        project_id: None,
-                        cwd: String::new(),
-                        shell: String::new(),
-                        cols: 80,
-                        rows: 24,
-                        created_at_ms: 0,
-                        output_buffer: String::new(),
-                        exited: false,
-                        exit_code: None,
-                    };
-                    state
-                        .terminals
-                        .update(|terms: &mut Vec<TerminalInfo>| terms.push(info));
-                    // Auto-select first terminal
-                    if state.active_terminal_id.get_untracked().is_none() {
-                        let id = state
-                            .terminals
-                            .with_untracked(|terms| terms.last().map(|t| t.terminal_id.clone()));
-                        state.active_terminal_id.set(id);
-                    }
+        FrameKind::NewTerminal => match envelope.parse_payload::<NewTerminalPayload>() {
+            Ok(payload) => {
+                let info = TerminalInfo {
+                    host_id: host_id.to_string(),
+                    terminal_id: payload.terminal_id,
+                    stream: payload.stream,
+                    project_id: None,
+                    cwd: String::new(),
+                    shell: String::new(),
+                    cols: 80,
+                    rows: 24,
+                    created_at_ms: 0,
+                    pending_output: Vec::new(),
+                    widget_mounted: false,
+                    exited: false,
+                    exit_code: None,
+                    exit_signal: None,
+                };
+                state
+                    .terminals
+                    .update(|terminals| terminals.push(info.clone()));
+                if state.active_terminal.get_untracked().is_none() {
+                    state.active_terminal.set(Some(ActiveTerminalRef {
+                        host_id: info.host_id,
+                        terminal_id: info.terminal_id,
+                    }));
                 }
-                Err(e) => log::error!("failed to parse new_terminal payload: {e}"),
             }
-        }
+            Err(error) => log::error!("failed to parse new_terminal payload: {error}"),
+        },
         FrameKind::TerminalStart => match envelope.parse_payload::<TerminalStartPayload>() {
-            Ok(p) => {
-                state.terminals.update(|terms: &mut Vec<TerminalInfo>| {
-                    if let Some(t) = terms.iter_mut().find(|t| t.stream == envelope.stream) {
-                        t.project_id = p.project_id;
-                        t.cwd = p.cwd;
-                        t.shell = p.shell;
-                        t.cols = p.cols;
-                        t.rows = p.rows;
-                        t.created_at_ms = p.created_at_ms;
+            Ok(payload) => {
+                state.terminals.update(|terminals| {
+                    if let Some(terminal) = terminals.iter_mut().find(|terminal| {
+                        terminal.host_id == host_id && terminal.stream == envelope.stream
+                    }) {
+                        terminal.project_id = payload.project_id;
+                        terminal.cwd = payload.cwd;
+                        terminal.shell = payload.shell;
+                        terminal.cols = payload.cols;
+                        terminal.rows = payload.rows;
+                        terminal.created_at_ms = payload.created_at_ms;
                     }
                 });
             }
-            Err(e) => log::error!("failed to parse terminal_start payload: {e}"),
+            Err(error) => log::error!("failed to parse terminal_start payload: {error}"),
         },
         FrameKind::TerminalOutput => match envelope.parse_payload::<TerminalOutputPayload>() {
-            Ok(p) => {
-                state.terminals.update(|terms: &mut Vec<TerminalInfo>| {
-                    if let Some(t) = terms.iter_mut().find(|t| t.stream == envelope.stream) {
-                        t.output_buffer.push_str(&p.data);
+            Ok(payload) => {
+                let mut write_tid: Option<String> = None;
+                state.terminals.update(|terminals| {
+                    if let Some(terminal) = terminals.iter_mut().find(|terminal| {
+                        terminal.host_id == host_id && terminal.stream == envelope.stream
+                    }) {
+                        if terminal.widget_mounted {
+                            write_tid = Some(terminal.terminal_id.0.clone());
+                        } else {
+                            terminal.pending_output.push(payload.data.clone());
+                        }
                     }
                 });
+                if let Some(tid) = write_tid {
+                    crate::term_bridge::write(&tid, &payload.data);
+                }
             }
-            Err(e) => log::error!("failed to parse terminal_output payload: {e}"),
+            Err(error) => log::error!("failed to parse terminal_output payload: {error}"),
         },
         FrameKind::TerminalExit => match envelope.parse_payload::<TerminalExitPayload>() {
-            Ok(p) => {
-                state.terminals.update(|terms: &mut Vec<TerminalInfo>| {
-                    if let Some(t) = terms.iter_mut().find(|t| t.stream == envelope.stream) {
-                        t.exited = true;
-                        t.exit_code = p.exit_code;
+            Ok(payload) => {
+                state.terminals.update(|terminals| {
+                    if let Some(terminal) = terminals.iter_mut().find(|terminal| {
+                        terminal.host_id == host_id && terminal.stream == envelope.stream
+                    }) {
+                        terminal.exited = true;
+                        terminal.exit_code = payload.exit_code;
+                        terminal.exit_signal = payload.signal;
                     }
                 });
             }
-            Err(e) => log::error!("failed to parse terminal_exit payload: {e}"),
+            Err(error) => log::error!("failed to parse terminal_exit payload: {error}"),
         },
         FrameKind::TerminalError => match envelope.parse_payload::<TerminalErrorPayload>() {
-            Ok(p) => {
-                log::error!("terminal error ({:?}): {}", p.code, p.message);
-                if p.fatal {
-                    state.terminals.update(|terms: &mut Vec<TerminalInfo>| {
-                        if let Some(t) = terms.iter_mut().find(|t| t.stream == envelope.stream) {
-                            t.exited = true;
+            Ok(payload) => {
+                log::error!("terminal error ({:?}): {}", payload.code, payload.message);
+                if payload.fatal {
+                    state.terminals.update(|terminals| {
+                        if let Some(terminal) = terminals.iter_mut().find(|terminal| {
+                            terminal.host_id == host_id && terminal.stream == envelope.stream
+                        }) {
+                            terminal.exited = true;
                         }
                     });
                 }
             }
-            Err(e) => log::error!("failed to parse terminal_error payload: {e}"),
+            Err(error) => log::error!("failed to parse terminal_error payload: {error}"),
         },
-        // Client->server kinds should never arrive from server
+        FrameKind::HostBrowseOpened => match envelope.parse_payload::<HostBrowseOpenedPayload>() {
+            Ok(payload) => dispatch_browse_opened(state, host_id, &envelope.stream, payload),
+            Err(error) => log::error!("failed to parse host_browse_opened payload: {error}"),
+        },
+        FrameKind::HostBrowseEntries => {
+            match envelope.parse_payload::<HostBrowseEntriesPayload>() {
+                Ok(payload) => dispatch_browse_entries(state, host_id, &envelope.stream, payload),
+                Err(error) => log::error!("failed to parse host_browse_entries payload: {error}"),
+            }
+        }
+        FrameKind::HostBrowseError => match envelope.parse_payload::<HostBrowseErrorPayload>() {
+            Ok(payload) => dispatch_browse_error(state, host_id, &envelope.stream, payload),
+            Err(error) => log::error!("failed to parse host_browse_error payload: {error}"),
+        },
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
         }
     }
 }
 
-/// Extract project_id from a stream path like `/project/{project_id}`.
-fn resolve_project_id(stream: &StreamPath) -> Option<ProjectId> {
-    let path = &stream.0;
-    let suffix = path.strip_prefix("/project/")?;
-    if suffix.is_empty() {
-        return None;
-    }
-    Some(ProjectId(suffix.to_owned()))
-}
-
-fn resolve_agent_id(state: &AppState, stream: &StreamPath) -> Option<AgentId> {
-    state.agents.with_untracked(|agents| {
-        agents
-            .iter()
-            .find(|a| a.instance_stream == *stream)
-            .map(|a| a.agent_id.clone())
+fn active_browse_dialog(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+) -> Option<crate::state::BrowseDialogState> {
+    state.browse_dialog.with_untracked(|dialog| {
+        dialog
+            .as_ref()
+            .filter(|d| d.host_id == host_id && &d.browse_stream == stream)
+            .cloned()
     })
 }
 
-fn dispatch_chat_event(state: &AppState, stream: &StreamPath, envelope: &Envelope) {
-    let agent_id = match resolve_agent_id(state, stream) {
-        Some(id) => id,
-        None => {
-            log::warn!("chat_event on unknown stream {stream}");
-            return;
-        }
+fn dispatch_browse_opened(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: HostBrowseOpenedPayload,
+) {
+    let Some(dialog) = active_browse_dialog(state, host_id, stream) else {
+        log::warn!("host_browse_opened on inactive stream {stream}");
+        return;
+    };
+    dialog.platform.set(Some(payload.platform));
+    dialog.separator.set(payload.separator);
+    dialog.home.set(Some(payload.home));
+}
+
+fn dispatch_browse_entries(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: HostBrowseEntriesPayload,
+) {
+    let Some(dialog) = active_browse_dialog(state, host_id, stream) else {
+        log::warn!("host_browse_entries on inactive stream {stream}");
+        return;
+    };
+    dialog.error.set(None);
+    dialog.current_path.set(Some(payload.path));
+    dialog.parent.set(payload.parent);
+    dialog.entries.set(payload.entries);
+    dialog.loading.set(false);
+}
+
+fn dispatch_browse_error(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: HostBrowseErrorPayload,
+) {
+    let Some(dialog) = active_browse_dialog(state, host_id, stream) else {
+        log::warn!("host_browse_error on inactive stream {stream}");
+        return;
+    };
+    dialog.error.set(Some(payload));
+    dialog.loading.set(false);
+}
+
+fn resolve_project_id(stream: &StreamPath) -> Option<ProjectId> {
+    let suffix = stream.0.strip_prefix("/project/")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(ProjectId(suffix.to_string()))
+}
+
+fn resolve_agent_id(state: &AppState, host_id: &str, stream: &StreamPath) -> Option<AgentId> {
+    state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| agent.host_id == host_id && agent.instance_stream == *stream)
+            .map(|agent| agent.agent_id.clone())
+    })
+}
+
+fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, envelope: &Envelope) {
+    let Some(agent_id) = resolve_agent_id(state, host_id, stream) else {
+        log::warn!("chat_event on unknown stream {stream}");
+        return;
     };
 
     let event = match envelope.parse_payload::<ChatEvent>() {
-        Ok(ev) => ev,
-        Err(e) => {
+        Ok(event) => event,
+        Err(error) => {
             log::error!(
-                "failed to parse chat_event payload: {e}\nraw: {}",
+                "failed to parse chat_event payload: {error}\nraw: {}",
                 serde_json::to_string(&envelope.payload).unwrap_or_default(),
             );
             return;
@@ -390,168 +549,134 @@ fn dispatch_chat_event(state: &AppState, stream: &StreamPath, envelope: &Envelop
         ChatEvent::TypingStatusChanged(typing) => {
             state.agent_turn_active.update(|map| {
                 if typing {
-                    map.insert(agent_id, true);
+                    map.insert(agent_id.clone(), true);
                 } else {
                     map.remove(&agent_id);
                 }
             });
         }
-
-        ChatEvent::MessageAdded(msg) => {
-            log::info!(
-                "MessageAdded for {}: sender={:?} token_usage={} tools={}",
-                agent_id,
-                msg.sender,
-                msg.token_usage.is_some(),
-                msg.tool_calls.len(),
-            );
+        ChatEvent::MessageAdded(message) => {
             let entry = ChatMessageEntry {
-                message: msg,
+                message,
                 tool_requests: Vec::new(),
             };
-            state.chat_messages.update(
-                |map: &mut std::collections::HashMap<AgentId, Vec<ChatMessageEntry>>| {
-                    map.entry(agent_id).or_default().push(entry);
-                },
-            );
+            state.chat_messages.update(|messages| {
+                messages.entry(agent_id.clone()).or_default().push(entry);
+            });
         }
-
         ChatEvent::StreamStart(data) => {
-            let ss = StreamingState {
+            let streaming = StreamingState {
                 agent_name: data.agent,
                 model: data.model,
                 text: leptos::prelude::ArcRwSignal::new(String::new()),
                 reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
                 tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
             };
-            state.streaming_text.update(
-                |map: &mut std::collections::HashMap<AgentId, StreamingState>| {
-                    map.insert(agent_id, ss);
-                },
-            );
+            state.streaming_text.update(|map| {
+                map.insert(agent_id.clone(), streaming);
+            });
         }
-
         ChatEvent::StreamDelta(data) => {
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
-            if let Some(ss) = streaming {
-                ss.text.update(|text| text.push_str(&data.text));
+            if let Some(streaming) = streaming {
+                streaming.text.update(|text| text.push_str(&data.text));
             }
         }
-
         ChatEvent::StreamReasoningDelta(data) => {
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
-            if let Some(ss) = streaming {
-                ss.reasoning
+            if let Some(streaming) = streaming {
+                streaming
+                    .reasoning
                     .update(|reasoning| reasoning.push_str(&data.text));
             }
         }
-
         ChatEvent::StreamEnd(data) => {
-            let has_token_usage = data.message.token_usage.is_some();
-            let has_context = data.message.context_breakdown.is_some();
-            let tool_call_count = data.message.tool_calls.len();
-            log::info!(
-                "StreamEnd for {}: token_usage={}, context_breakdown={}, tool_calls={}",
-                agent_id,
-                has_token_usage,
-                has_context,
-                tool_call_count,
-            );
-            if let Some(ref tu) = data.message.token_usage {
-                log::info!(
-                    "  token_usage: input={} output={} cached={:?} reasoning={:?}",
-                    tu.input_tokens,
-                    tu.output_tokens,
-                    tu.cached_prompt_tokens,
-                    tu.reasoning_tokens,
-                );
-            }
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
             let tool_requests = streaming
                 .as_ref()
-                .map(|ss| ss.tool_requests.get_untracked())
+                .map(|streaming| streaming.tool_requests.get_untracked())
                 .unwrap_or_default();
-            state.streaming_text.update(
-                |map: &mut std::collections::HashMap<AgentId, StreamingState>| {
-                    map.remove(&agent_id);
-                },
-            );
+            state.streaming_text.update(|map| {
+                map.remove(&agent_id);
+            });
+            let has_renderable_content = !data.message.content.trim().is_empty()
+                || data
+                    .message
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
+                || !data.message.tool_calls.is_empty()
+                || data
+                    .message
+                    .images
+                    .as_ref()
+                    .is_some_and(|images| !images.is_empty())
+                || !tool_requests.is_empty();
+            if !has_renderable_content {
+                return;
+            }
             let entry = ChatMessageEntry {
                 message: data.message,
                 tool_requests,
             };
-            state.chat_messages.update(
-                |map: &mut std::collections::HashMap<AgentId, Vec<ChatMessageEntry>>| {
-                    map.entry(agent_id).or_default().push(entry);
-                },
-            );
+            state.chat_messages.update(|messages| {
+                messages.entry(agent_id.clone()).or_default().push(entry);
+            });
         }
-
-        ChatEvent::ToolRequest(req) => {
-            let tool_name = req.tool_name.clone();
-            let tool_call_id = req.tool_call_id.clone();
-            log::info!(
-                "ToolRequest for {}: tool={} call_id={}",
-                agent_id,
-                tool_name,
-                tool_call_id,
-            );
+        ChatEvent::ToolRequest(request) => {
+            let tool_name = request.tool_name.clone();
+            let tool_call_id = request.tool_call_id.clone();
             let tool_entry = ToolRequestEntry {
-                request: req,
+                request,
                 result: None,
             };
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
-            if let Some(ss) = streaming {
-                ss.tool_requests.update(|tools| tools.push(tool_entry));
+            if let Some(streaming) = streaming {
+                streaming
+                    .tool_requests
+                    .update(|tools| tools.push(tool_entry));
                 return;
             }
-            state.chat_messages.update(
-                |map: &mut std::collections::HashMap<AgentId, Vec<ChatMessageEntry>>| {
-                    if let Some(messages) = map.get_mut(&agent_id) {
-                        if let Some(last) = messages.last_mut() {
-                            last.tool_requests.push(tool_entry);
-                        } else {
-                            log::error!(
-                                "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for agent {} — no messages exist yet to attach it to",
-                                tool_name, tool_call_id, agent_id
-                            );
-                        }
+            state.chat_messages.update(|messages| {
+                if let Some(agent_messages) = messages.get_mut(&agent_id) {
+                    if let Some(last) = agent_messages.last_mut() {
+                        last.tool_requests.push(tool_entry);
                     } else {
                         log::error!(
-                            "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for agent {} — agent has no message list",
-                            tool_name, tool_call_id, agent_id
+                            "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — no messages exist yet",
+                            tool_name, tool_call_id, host_id, agent_id
                         );
                     }
-                },
-            );
+                } else {
+                    log::error!(
+                        "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — agent has no message list",
+                        tool_name, tool_call_id, host_id, agent_id
+                    );
+                }
+            });
         }
-
         ChatEvent::ToolExecutionCompleted(data) => {
             let call_id = data.tool_call_id.clone();
             let tool_name = data.tool_name.clone();
-            log::info!(
-                "ToolExecutionCompleted for {}: tool={} call_id={} success={}",
-                agent_id,
-                tool_name,
-                call_id,
-                data.success,
-            );
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
-            if let Some(ss) = streaming {
+            if let Some(streaming) = streaming {
                 let mut matched = false;
-                ss.tool_requests.update(|tools| {
-                    if let Some(tr) = tools.iter_mut().find(|t| t.request.tool_call_id == call_id) {
-                        tr.result = Some(data.clone());
+                streaming.tool_requests.update(|tools| {
+                    if let Some(tool) = tools
+                        .iter_mut()
+                        .find(|tool| tool.request.tool_call_id == call_id)
+                    {
+                        tool.result = Some(data.clone());
                         matched = true;
                     }
                 });
@@ -559,70 +684,59 @@ fn dispatch_chat_event(state: &AppState, stream: &StreamPath, envelope: &Envelop
                     return;
                 }
             }
-            state.chat_messages.update(
-                |map: &mut std::collections::HashMap<AgentId, Vec<ChatMessageEntry>>| {
-                    if let Some(messages) = map.get_mut(&agent_id) {
-                        // Find the tool request by call id in any message
-                        for msg in messages.iter_mut().rev() {
-                            if let Some(tr) = msg
-                                .tool_requests
-                                .iter_mut()
-                                .find(|t| t.request.tool_call_id == call_id)
-                            {
-                                tr.result = Some(data);
-                                return;
-                            }
+            state.chat_messages.update(|messages| {
+                if let Some(agent_messages) = messages.get_mut(&agent_id) {
+                    for message in agent_messages.iter_mut().rev() {
+                        if let Some(tool) = message
+                            .tool_requests
+                            .iter_mut()
+                            .find(|tool| tool.request.tool_call_id == call_id)
+                        {
+                            tool.result = Some(data);
+                            return;
                         }
-                        log::error!(
-                            "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for agent {} — no matching request found (was the request dropped?)",
-                            tool_name, call_id, agent_id
-                        );
-                    } else {
-                        log::error!(
-                            "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for agent {} — agent has no message list",
-                            tool_name, call_id, agent_id
-                        );
                     }
-                },
-            );
+                    log::error!(
+                        "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for host {} agent {} — no matching request found",
+                        tool_name, call_id, host_id, agent_id
+                    );
+                } else {
+                    log::error!(
+                        "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for host {} agent {} — agent has no message list",
+                        tool_name, call_id, host_id, agent_id
+                    );
+                }
+            });
         }
-
         ChatEvent::TaskUpdate(task_list) => {
-            state.task_lists.update(
-                |map: &mut std::collections::HashMap<AgentId, protocol::TaskList>| {
-                    map.insert(agent_id, task_list);
-                },
-            );
+            state.task_lists.update(|task_lists| {
+                task_lists.insert(agent_id.clone(), task_list);
+            });
         }
-
         ChatEvent::OperationCancelled(data) => {
-            state.streaming_text.update(
-                |map: &mut std::collections::HashMap<AgentId, StreamingState>| {
-                    map.remove(&agent_id);
-                },
-            );
-            let event = TransientEvent::OperationCancelled {
-                message: data.message,
-            };
-            state.transient_events.update(
-                |map: &mut std::collections::HashMap<AgentId, Vec<TransientEvent>>| {
-                    map.entry(agent_id).or_default().push(event);
-                },
-            );
+            state.streaming_text.update(|map| {
+                map.remove(&agent_id);
+            });
+            state.transient_events.update(|events| {
+                events.entry(agent_id.clone()).or_default().push(
+                    TransientEvent::OperationCancelled {
+                        message: data.message,
+                    },
+                );
+            });
         }
-
         ChatEvent::RetryAttempt(data) => {
-            let event = TransientEvent::RetryAttempt {
-                attempt: data.attempt,
-                max_retries: data.max_retries,
-                error: data.error,
-                backoff_ms: data.backoff_ms,
-            };
-            state.transient_events.update(
-                |map: &mut std::collections::HashMap<AgentId, Vec<TransientEvent>>| {
-                    map.entry(agent_id).or_default().push(event);
-                },
-            );
+            state.transient_events.update(|events| {
+                events
+                    .entry(agent_id)
+                    .or_default()
+                    .push(TransientEvent::RetryAttempt {
+                        attempt: data.attempt,
+                        max_retries: data.max_retries,
+                        error: data.error,
+                        backoff_ms: data.backoff_ms,
+                    });
+            });
         }
     }
 }

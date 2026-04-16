@@ -1,17 +1,22 @@
 mod bridge;
 mod dev_host;
 mod devtools;
+mod host_store;
 mod router;
 
 use std::sync::Arc;
 
 use devtools_protocol::UiDebugResponseSubmission;
+use host_store::{
+    ConfiguredHostStore, HostStore, HostTransportConfig, UpsertConfiguredHostRequest,
+};
 use router::ProxyRouterHandle;
 use tauri::Manager;
 
 struct ShellState {
     router: ProxyRouterHandle,
     host: server::HostHandle,
+    host_store: HostStore,
     ui_debug: Arc<devtools::UiDebugBridgeState>,
 }
 
@@ -21,9 +26,13 @@ async fn connect_host(
     state: tauri::State<'_, ShellState>,
     host_id: String,
 ) -> Result<(), String> {
+    let configured_host = state
+        .host_store
+        .get(&host_id)?
+        .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
     state
         .router
-        .connect_local(app, host_id, state.host.clone())
+        .connect_local(app, host_id, configured_host.transport, state.host.clone())
         .await
 }
 
@@ -42,6 +51,46 @@ async fn send_host_line(
     line: String,
 ) -> Result<(), String> {
     state.router.send_line(host_id, line).await
+}
+
+#[tauri::command]
+fn list_configured_hosts(
+    state: tauri::State<'_, ShellState>,
+) -> Result<ConfiguredHostStore, String> {
+    state.host_store.list()
+}
+
+#[tauri::command]
+fn upsert_configured_host(
+    state: tauri::State<'_, ShellState>,
+    id: Option<String>,
+    label: String,
+    transport: HostTransportConfig,
+    auto_connect: bool,
+) -> Result<ConfiguredHostStore, String> {
+    state.host_store.upsert(UpsertConfiguredHostRequest {
+        id,
+        label,
+        transport,
+        auto_connect,
+    })
+}
+
+#[tauri::command]
+async fn remove_configured_host(
+    state: tauri::State<'_, ShellState>,
+    host_id: String,
+) -> Result<ConfiguredHostStore, String> {
+    let _ = state.router.disconnect(host_id.clone()).await;
+    state.host_store.remove(&host_id)
+}
+
+#[tauri::command]
+fn set_selected_host(
+    state: tauri::State<'_, ShellState>,
+    host_id: Option<String>,
+) -> Result<ConfiguredHostStore, String> {
+    state.host_store.set_selected_host(host_id)
 }
 
 #[tauri::command]
@@ -77,24 +126,40 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             tracing::info!("setup: spawning host and router");
-            let host = server::spawn_host();
+            let host_store_path =
+                host_store::HostStore::default_path().map_err(std::io::Error::other)?;
+            let host_store =
+                host_store::HostStore::load(host_store_path).map_err(std::io::Error::other)?;
             let router = ProxyRouterHandle::new();
             let ui_debug = Arc::new(devtools::UiDebugBridgeState::default());
+            let ui_debug_addr =
+                devtools::start_ui_debug_http_server(app.handle(), ui_debug.clone())
+                    .map_err(std::io::Error::other)?;
+            if let Some(url) = &ui_debug_addr {
+                tracing::info!("ui debug HTTP server ready at {url}");
+            }
+
+            let host = server::spawn_host_with_store_paths_and_runtime_config(
+                server::store::session::SessionStore::default_path()
+                    .map_err(std::io::Error::other)?,
+                server::store::project::ProjectStore::default_path()
+                    .map_err(std::io::Error::other)?,
+                server::store::settings::HostSettingsStore::default_path()
+                    .map_err(std::io::Error::other)?,
+                server::HostRuntimeConfig::default(),
+            )
+            .map_err(std::io::Error::other)?;
 
             if let Some(addr) =
                 dev_host::start_dev_host_listener(host.clone()).map_err(std::io::Error::other)?
             {
                 tracing::info!("dev host listener ready at {addr}");
             }
-            if let Some(url) = devtools::start_ui_debug_http_server(app.handle(), ui_debug.clone())
-                .map_err(std::io::Error::other)?
-            {
-                tracing::info!("ui debug HTTP server ready at {url}");
-            }
 
             app.manage(ShellState {
                 router,
                 host,
+                host_store,
                 ui_debug,
             });
             Ok(())
@@ -103,6 +168,10 @@ pub fn run() {
             connect_host,
             disconnect_host,
             send_host_line,
+            list_configured_hosts,
+            upsert_configured_host,
+            remove_configured_host,
+            set_selected_host,
             mark_ui_debug_ready,
             submit_ui_debug_response
         ])

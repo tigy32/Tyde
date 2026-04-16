@@ -375,7 +375,7 @@ impl GeminiInner {
                             "data": { "session_id": session_id }
                         }));
                     }
-                    if !self.emit_summary_and_tool_requests(&mut summary) {
+                    if !self.emit_summary_or_placeholder_stream_end(&mut summary) {
                         let error = summary
                             .error_message()
                             .unwrap_or_else(|| "Gemini returned no assistant output.".to_string());
@@ -386,10 +386,12 @@ impl GeminiInner {
                     if let Some(session_id) = summary.session_id.clone() {
                         self.set_session_id(turn_id, session_id).await;
                     }
-                    self.emit_summary_and_tool_requests(&mut summary);
+                    self.emit_summary_or_placeholder_stream_end(&mut summary);
                     self.emit_operation_cancelled("Gemini turn cancelled.");
                 }
                 TurnOutcome::Failed { summary, error } => {
+                    let mut summary = summary;
+                    self.emit_summary_or_placeholder_stream_end(&mut summary);
                     let detail = summary.error_message().unwrap_or(error);
                     self.emit_error(&detail);
                 }
@@ -662,11 +664,7 @@ impl GeminiInner {
 
     fn emit_summary_and_tool_requests(&self, summary: &mut GeminiStdoutSummary) -> bool {
         let text = summary.streamed_text.trim().to_string();
-        let reasoning = if summary.streamed_reasoning.trim().is_empty() {
-            None
-        } else {
-            Some(summary.streamed_reasoning.trim().to_string())
-        };
+        let reasoning = preserve_nonempty_whitespace(&summary.streamed_reasoning);
         let tool_calls_json: Vec<Value> = summary
             .tool_calls
             .iter()
@@ -689,6 +687,21 @@ impl GeminiInner {
             self.emit_tool_request(tool_call);
         }
         true
+    }
+
+    fn emit_summary_or_placeholder_stream_end(&self, summary: &mut GeminiStdoutSummary) -> bool {
+        if self.emit_summary_and_tool_requests(summary) {
+            return true;
+        }
+
+        self.emit_stream_end(
+            String::new(),
+            summary.model.clone(),
+            summary.usage.take(),
+            None,
+            Vec::new(),
+        );
+        false
     }
 
     fn emit_event(&self, event: Value) {
@@ -1074,11 +1087,28 @@ fn consume_message_event(
 }
 
 fn extract_message_text(value: &Value) -> Option<String> {
-    value
-        .get("content")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    extract_text_fragment(value.get("content"))
+        .or_else(|| extract_text_fragment(value.get("text")))
+        .or_else(|| value.get("message").and_then(extract_message_text))
+}
+
+fn extract_text_fragment(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Array(items) => {
+            let combined = items
+                .iter()
+                .filter_map(|item| extract_text_fragment(Some(item)))
+                .collect::<String>();
+            (!combined.is_empty()).then_some(combined)
+        }
+        Value::Object(map) => extract_text_fragment(map.get("text"))
+            .or_else(|| extract_text_fragment(map.get("content")))
+            .or_else(|| extract_text_fragment(map.get("parts")))
+            .or_else(|| extract_text_fragment(map.get("delta")))
+            .or_else(|| extract_text_fragment(map.get("message"))),
+        _ => None,
+    }
 }
 
 fn extract_gemini_tool_call(value: &Value) -> Option<GeminiToolCall> {
@@ -1142,11 +1172,7 @@ fn close_current_phase(
     inner: &GeminiInner,
 ) {
     let text = summary.streamed_text.trim().to_string();
-    let reasoning = if summary.streamed_reasoning.trim().is_empty() {
-        None
-    } else {
-        Some(summary.streamed_reasoning.trim().to_string())
-    };
+    let reasoning = preserve_nonempty_whitespace(&summary.streamed_reasoning);
     let tool_calls_json: Vec<Value> = summary
         .tool_calls
         .iter()
@@ -1177,6 +1203,12 @@ fn close_current_phase(
     summary.tool_calls.clear();
     segment.has_content = false;
     segment.awaiting_stream_start = true;
+}
+
+fn preserve_nonempty_whitespace(text: &str) -> Option<String> {
+    text.chars()
+        .any(|ch| !ch.is_whitespace())
+        .then(|| text.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,16 +1678,16 @@ impl Backend for GeminiBackend {
             } else {
                 workspace_roots
             };
-            let (session, mut raw_events) = match GeminiSession::spawn(&roots, None, &[], None)
-                .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::error!("Failed to spawn Gemini session: {err}");
-                    let _ = ready_tx.send(Err(format!("Failed to spawn Gemini session: {err}")));
-                    return;
-                }
-            };
+            let (session, mut raw_events) =
+                match GeminiSession::spawn(&roots, None, &config.startup_mcp_servers, None).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::error!("Failed to spawn Gemini session: {err}");
+                        let _ =
+                            ready_tx.send(Err(format!("Failed to spawn Gemini session: {err}")));
+                        return;
+                    }
+                };
 
             let handle = session.command_handle();
             let model_override = gemini_backend_model(config.cost_hint).map(str::to_string);
@@ -1758,6 +1790,13 @@ impl Backend for GeminiBackend {
                         {
                             break;
                         }
+                        if events_tx
+                            .send(ChatEvent::TypingStatusChanged(false))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -1805,7 +1844,7 @@ impl Backend for GeminiBackend {
 
         tokio::spawn(async move {
             let (session, mut raw_events) =
-                match GeminiSession::spawn(&roots, None, &[], None).await {
+                match GeminiSession::spawn(&roots, None, &config.startup_mcp_servers, None).await {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::error!("Failed to spawn Gemini resume session: {err}");
@@ -1884,6 +1923,13 @@ impl Backend for GeminiBackend {
                                     message: "Gemini turn cancelled.".to_string(),
                                 },
                             ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if events_tx
+                            .send(ChatEvent::TypingStatusChanged(false))
                             .await
                             .is_err()
                         {

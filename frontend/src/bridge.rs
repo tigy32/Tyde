@@ -1,7 +1,14 @@
 use devtools_protocol::UiDebugRequestEvent;
+use js_sys::Function;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
+
+// Host-config types are defined once in the `host-config` crate and shared
+// verbatim with the Tauri shell. Re-export them for downstream modules.
+pub use host_config::{
+    ConfiguredHost, ConfiguredHostStore, HostTransportConfig, UpsertConfiguredHostRequest,
+};
 
 // --- Tauri JS bindings ---
 
@@ -73,6 +80,57 @@ pub async fn connect_host(request: ConnectHostRequest) -> Result<(), String> {
     Ok(())
 }
 
+pub async fn disconnect_host(host_id: String) -> Result<(), String> {
+    let args =
+        serde_wasm_bindgen::to_value(&ConnectHostRequest { host_id }).map_err(|e| e.to_string())?;
+    tauri_invoke("disconnect_host", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
+pub async fn list_configured_hosts() -> Result<ConfiguredHostStore, String> {
+    let value = tauri_invoke("list_configured_hosts", JsValue::NULL)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn upsert_configured_host(
+    request: UpsertConfiguredHostRequest,
+) -> Result<ConfiguredHostStore, String> {
+    let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
+    let value = tauri_invoke("upsert_configured_host", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+pub async fn remove_configured_host(host_id: String) -> Result<ConfiguredHostStore, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&ConnectHostRequest { host_id }).map_err(|e| e.to_string())?;
+    let value = tauri_invoke("remove_configured_host", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelectedHostRequest {
+    pub host_id: Option<String>,
+}
+
+pub async fn set_selected_host(
+    request: SetSelectedHostRequest,
+) -> Result<ConfiguredHostStore, String> {
+    let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
+    let value = tauri_invoke("set_selected_host", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
 pub async fn send_host_line(request: SendHostLineRequest) -> Result<(), String> {
     let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
     tauri_invoke("send_host_line", args)
@@ -97,13 +155,20 @@ pub async fn submit_ui_debug_response(request: SubmitUiDebugResponseRequest) -> 
 }
 
 // --- Event listeners ---
-// Each returns an UnlistenHandle that keeps the closure and JS unlisten callback alive.
-// In this desktop app, listeners live for the entire app lifetime and are intentionally
-// leaked via `mem::forget` in app.rs — the unlisten callback is never invoked.
+// Each returns an UnlistenHandle that keeps the closure and JS unlisten callback alive
+// until the app tears the listener down.
 
 pub struct UnlistenHandle {
     _closure: Closure<dyn Fn(JsValue)>,
-    _unlisten: JsValue,
+    unlisten: JsValue,
+}
+
+impl UnlistenHandle {
+    pub fn remove(self) {
+        if let Ok(callback) = self.unlisten.dyn_into::<Function>() {
+            let _ = callback.call0(&JsValue::NULL);
+        }
+    }
 }
 
 pub async fn listen_host_line(
@@ -181,6 +246,6 @@ async fn listen_event(
         .map_err(|e| format!("{e:?}"))?;
     Ok(UnlistenHandle {
         _closure: closure,
-        _unlisten: unlisten,
+        unlisten,
     })
 }

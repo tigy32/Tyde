@@ -2,6 +2,8 @@ use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::app::{connect_one_host, refresh_configured_hosts};
+use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
 use crate::state::AppState;
 
@@ -110,23 +112,39 @@ pub fn restore_appearance(state: &AppState) {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SettingsTab {
+    Hosts,
     Appearance,
     General,
     Backends,
+    Debug,
 }
 
 impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
+            Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
             Self::General => "General",
             Self::Backends => "Backends",
+            Self::Debug => "Debug",
         }
     }
 
     /// All searchable text for this tab: labels, descriptions, option names.
     fn search_text(self) -> &'static [&'static str] {
         match self {
+            Self::Hosts => &[
+                "Hosts",
+                "Configured Hosts",
+                "Add remote host",
+                "SSH destination",
+                "Remote command",
+                "Auto-connect",
+                "Select host",
+                "Connect",
+                "Disconnect",
+                "Remove host",
+            ],
             Self::Appearance => &[
                 "Appearance",
                 "Color Theme",
@@ -161,6 +179,14 @@ impl SettingsTab {
                 "OpenAI",
                 "Google",
             ],
+            Self::Debug => &[
+                "Debug",
+                "Tyde Debug MCP",
+                "Enable the Tyde debug MCP server for new chats",
+                "JavaScript evaluation",
+                "Frontend debugging",
+                "MCP server",
+            ],
         }
     }
 
@@ -175,10 +201,12 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 3] = [
+const ALL_TABS: [SettingsTab; 5] = [
+    SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::General,
     SettingsTab::Backends,
+    SettingsTab::Debug,
 ];
 
 #[component]
@@ -191,6 +219,10 @@ pub fn SettingsPanel() -> impl IntoView {
     Effect::new(move |_| {
         if state_for_refresh.settings_open.get() {
             request_host_settings(&state_for_refresh);
+            let state = state_for_refresh.clone();
+            spawn_local(async move {
+                refresh_configured_hosts(&state).await;
+            });
         }
     });
 
@@ -247,15 +279,282 @@ pub fn SettingsPanel() -> impl IntoView {
 
                         <div class="settings-content">
                             {move || match active_tab.get() {
+                                SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
                                 SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
                                 SettingsTab::General => view! { <GeneralTab /> }.into_any(),
                                 SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
+                                SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
                             }}
                         </div>
                     </div>
                 </div>
             </div>
         </Show>
+    }
+}
+
+#[component]
+fn HostsTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_selected_host = state.clone();
+    let state_for_configured_hosts = state.clone();
+    let label_sig = RwSignal::new(String::new());
+    let ssh_destination_sig = RwSignal::new(String::new());
+    let remote_command_sig = RwSignal::new(String::new());
+    let auto_connect_sig = RwSignal::new(true);
+
+    let on_add = {
+        let state = state.clone();
+        move |_| {
+            let label = label_sig.get_untracked().trim().to_string();
+            let ssh_destination = ssh_destination_sig.get_untracked().trim().to_string();
+            let remote_command = remote_command_sig.get_untracked().trim().to_string();
+            let auto_connect = auto_connect_sig.get_untracked();
+            if label.is_empty() || ssh_destination.is_empty() {
+                log::error!("host label and ssh destination are required");
+                return;
+            }
+
+            let state = state.clone();
+            spawn_local(async move {
+                let result = bridge::upsert_configured_host(bridge::UpsertConfiguredHostRequest {
+                    id: None,
+                    label,
+                    transport: BridgeHostTransportConfig::SshStdio {
+                        ssh_destination,
+                        remote_command: if remote_command.is_empty() {
+                            None
+                        } else {
+                            Some(remote_command)
+                        },
+                    },
+                    auto_connect,
+                })
+                .await;
+
+                match result {
+                    Ok(_) => refresh_configured_hosts(&state).await,
+                    Err(error) => log::error!("failed to save configured host: {error}"),
+                }
+            });
+
+            label_sig.set(String::new());
+            ssh_destination_sig.set(String::new());
+            remote_command_sig.set(String::new());
+            auto_connect_sig.set(true);
+        }
+    };
+
+    view! {
+        <h2 class="settings-panel-title">"Hosts"</h2>
+
+        <div class="settings-field">
+            <label class="settings-label">"Selected Host"</label>
+            <p class="settings-description">"Choose which host the host-scoped settings tabs operate on."</p>
+            <select
+                class="settings-select settings-select-full"
+                prop:value=move || state.selected_host_id.get().unwrap_or_default()
+                on:change=move |ev: web_sys::Event| {
+                    let target = ev.target().unwrap();
+                    let select: web_sys::HtmlSelectElement = target.unchecked_into();
+                    let state = state_for_selected_host.clone();
+                    spawn_local(async move {
+                        match bridge::set_selected_host(bridge::SetSelectedHostRequest {
+                            host_id: Some(select.value()),
+                        }).await {
+                            Ok(_) => refresh_configured_hosts(&state).await,
+                            Err(error) => log::error!("failed to set selected host: {error}"),
+                        }
+                    });
+                }
+            >
+                {move || state.configured_hosts.get().into_iter().map(|host| {
+                    view! { <option value=host.id>{host.label}</option> }
+                }).collect_view()}
+            </select>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Configured Hosts"</label>
+            <p class="settings-description">"The embedded local host is always present and connected automatically."</p>
+            <div class="settings-host-list">
+                {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
+                    let host_id = host.id.clone();
+                    let is_local = host_id == "local";
+                    let host_id_for_connect = host_id.clone();
+                    let host_id_for_disconnect = host_id.clone();
+                    let host_id_for_remove = host_id.clone();
+                    let status = state_for_configured_hosts
+                        .connection_statuses
+                        .get()
+                        .get(&host_id)
+                        .cloned()
+                        .unwrap_or(crate::state::ConnectionStatus::Disconnected);
+                    let (status_class, status_text) = match &status {
+                        crate::state::ConnectionStatus::Connected => ("connected", "Connected".to_string()),
+                        crate::state::ConnectionStatus::Connecting => ("connecting", "Connecting…".to_string()),
+                        crate::state::ConnectionStatus::Disconnected => ("disconnected", "Disconnected".to_string()),
+                        crate::state::ConnectionStatus::Error(message) => ("error", format!("Error: {message}")),
+                    };
+                    let is_connected = matches!(status, crate::state::ConnectionStatus::Connected);
+                    let is_connecting = matches!(status, crate::state::ConnectionStatus::Connecting);
+                    let connect_state = state.clone();
+                    let disconnect_state = state.clone();
+                    let remove_state = state.clone();
+                    let (badge_class, badge_text, transport_text) = match &host.transport {
+                        BridgeHostTransportConfig::LocalEmbedded => (
+                            "host-badge host-badge-local",
+                            "Local",
+                            "Embedded local host".to_string(),
+                        ),
+                        BridgeHostTransportConfig::SshStdio { ssh_destination, .. } => (
+                            "host-badge host-badge-ssh",
+                            "SSH",
+                            format!("ssh {ssh_destination}"),
+                        ),
+                    };
+
+                    view! {
+                        <div class="host-card">
+                            <div class="host-card-main">
+                                <div class="host-card-title-row">
+                                    <span class=badge_class>{badge_text}</span>
+                                    <span class="host-card-label">{host.label.clone()}</span>
+                                </div>
+                                <p class="host-card-transport">{transport_text}</p>
+                                <div class="host-card-status">
+                                    <span class=format!("status-dot {status_class}")></span>
+                                    <span class="status-text">{status_text}</span>
+                                </div>
+                            </div>
+                            <div class="host-card-actions">
+                                {(!is_local).then(|| {
+                                    let host_id_for_connect = host_id_for_connect.clone();
+                                    let host_id_for_disconnect = host_id_for_disconnect.clone();
+                                    let connect_state = connect_state.clone();
+                                    let disconnect_state = disconnect_state.clone();
+                                    if is_connected {
+                                        view! {
+                                            <button
+                                                class="settings-btn"
+                                                on:click=move |_| {
+                                                    let host_id = host_id_for_disconnect.clone();
+                                                    let state = disconnect_state.clone();
+                                                    spawn_local(async move {
+                                                        if let Err(error) = bridge::disconnect_host(host_id.clone()).await {
+                                                            log::error!("failed to disconnect host: {error}");
+                                                        }
+                                                        state.connection_statuses.update(|statuses| {
+                                                            statuses.insert(host_id.clone(), crate::state::ConnectionStatus::Disconnected);
+                                                        });
+                                                        state.clear_host_runtime(&host_id);
+                                                    });
+                                                }
+                                            >
+                                                "Disconnect"
+                                            </button>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <button
+                                                class="settings-btn settings-btn-primary"
+                                                disabled=is_connecting
+                                                on:click=move |_| {
+                                                    let state = connect_state.clone();
+                                                    let host_id = host_id_for_connect.clone();
+                                                    spawn_local(async move {
+                                                        connect_one_host(state, host_id).await;
+                                                    });
+                                                }
+                                            >
+                                                {if is_connecting { "Connecting…" } else { "Connect" }}
+                                            </button>
+                                        }.into_any()
+                                    }
+                                })}
+                                {(!is_local).then(|| {
+                                    let host_id = host_id_for_remove.clone();
+                                    view! {
+                                        <button
+                                            class="settings-btn settings-btn-danger"
+                                            on:click=move |_| {
+                                                let state = remove_state.clone();
+                                                let host_id = host_id.clone();
+                                                spawn_local(async move {
+                                                    match bridge::remove_configured_host(host_id).await {
+                                                        Ok(_) => refresh_configured_hosts(&state).await,
+                                                        Err(error) => log::error!("failed to remove host: {error}"),
+                                                    }
+                                                });
+                                            }
+                                        >
+                                            "Remove"
+                                        </button>
+                                    }
+                                })}
+                            </div>
+                        </div>
+                    }
+                }).collect_view()}
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Add Remote Host"</label>
+            <p class="settings-description">"Configure a remote host that Tyde can connect to over SSH."</p>
+            <div class="settings-form">
+                <div class="settings-form-row">
+                    <label class="settings-form-label">
+                        <span>"Label"</span>
+                        <input
+                            class="settings-text-input"
+                            type="text"
+                            placeholder="e.g. Workstation"
+                            prop:value=move || label_sig.get()
+                            on:input=move |ev| label_sig.set(event_target_value(&ev))
+                        />
+                    </label>
+                    <label class="settings-form-label">
+                        <span>"SSH destination"</span>
+                        <input
+                            class="settings-text-input"
+                            type="text"
+                            placeholder="user@host"
+                            prop:value=move || ssh_destination_sig.get()
+                            on:input=move |ev| ssh_destination_sig.set(event_target_value(&ev))
+                        />
+                    </label>
+                </div>
+                <label class="settings-form-label">
+                    <span>"Remote command"<span class="settings-form-hint">" (optional)"</span></span>
+                    <input
+                        class="settings-text-input"
+                        type="text"
+                        placeholder="tyde host --stdio"
+                        prop:value=move || remote_command_sig.get()
+                        on:input=move |ev| remote_command_sig.set(event_target_value(&ev))
+                    />
+                </label>
+                <div class="settings-form-footer">
+                    <div class="settings-checkbox-row">
+                        <label class="settings-toggle">
+                            <input
+                                type="checkbox"
+                                prop:checked=move || auto_connect_sig.get()
+                                on:change=move |ev: web_sys::Event| {
+                                    let target = ev.target().unwrap();
+                                    let input: web_sys::HtmlInputElement = target.unchecked_into();
+                                    auto_connect_sig.set(input.checked());
+                                }
+                            />
+                            <span class="settings-toggle-slider"></span>
+                        </label>
+                        <span>"Auto-connect on launch"</span>
+                    </div>
+                    <button class="settings-btn settings-btn-primary" on:click=on_add>"Add Host"</button>
+                </div>
+            </div>
+        </div>
     }
 }
 
@@ -365,25 +664,21 @@ fn GeneralTab() -> impl IntoView {
 fn BackendsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let default_backend_value = move || {
-        state
-            .host_settings
-            .get()
-            .and_then(|settings| settings.default_backend.map(backend_value))
-            .unwrap_or("")
-            .to_owned()
-    };
-
     view! {
         <h2 class="settings-panel-title">"Backends"</h2>
 
         <div class="settings-field">
             <label class="settings-label">"Default Backend"</label>
             <p class="settings-description">"The backend to use by default when creating new agents."</p>
-            {move || match state.host_settings.get() {
+            {move || match state.selected_host_settings() {
                 Some(settings) => {
                     let state_for_change = state.clone();
                     let has_enabled = !settings.enabled_backends.is_empty();
+                    let default_backend_value = settings
+                        .default_backend
+                        .map(backend_value)
+                        .unwrap_or("")
+                        .to_owned();
                     let options = settings
                         .enabled_backends
                         .into_iter()
@@ -423,7 +718,7 @@ fn BackendsTab() -> impl IntoView {
                     }
                     .into_any()
                 }
-                None => view! { <p class="settings-description">"Host settings not loaded."</p> }.into_any(),
+                None => view! { <p class="settings-description">"Host settings not loaded for the selected host."</p> }.into_any(),
             }}
         </div>
 
@@ -441,26 +736,79 @@ fn BackendsTab() -> impl IntoView {
 }
 
 #[component]
-fn BackendCard(kind: BackendKind) -> impl IntoView {
+fn DebugTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let name = backend_label(kind);
-    let description = backend_description(kind);
-    let badge_class = backend_badge_class(kind);
+    let state_for_checked = state.clone();
+    let state_for_disabled = state.clone();
 
     let checked = move || {
-        state
-            .host_settings
-            .get()
-            .is_some_and(|settings| settings.enabled_backends.contains(&kind))
+        state_for_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.tyde_debug_mcp_enabled)
     };
-    let disable_toggle = move || state.host_settings.get().is_none();
+    let disabled = move || state_for_disabled.selected_host_settings().is_none();
 
     let on_toggle = {
         let state = state.clone();
         move |ev: web_sys::Event| {
             let target = ev.target().unwrap();
             let input: web_sys::HtmlInputElement = target.unchecked_into();
-            let Some(settings) = state.host_settings.get_untracked() else {
+            send_host_setting(
+                &state,
+                HostSettingValue::TydeDebugMcpEnabled {
+                    enabled: input.checked(),
+                },
+            );
+        }
+    };
+
+    view! {
+        <h2 class="settings-panel-title">"Debug"</h2>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Tyde Debug MCP"</label>
+                    <p class="settings-description">
+                        "When enabled, newly created chats are started with the Tyde debug MCP server so agents can inspect and drive the frontend through JavaScript."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=checked
+                        disabled=disabled
+                        on:change=on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn BackendCard(kind: BackendKind) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let name = backend_label(kind);
+    let description = backend_description(kind);
+    let badge_class = backend_badge_class(kind);
+    let state_for_checked = state.clone();
+    let state_for_disable = state.clone();
+
+    let checked = move || {
+        state_for_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.enabled_backends.contains(&kind))
+    };
+    let disable_toggle = move || state_for_disable.selected_host_settings().is_none();
+
+    let on_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            let Some(settings) = state.selected_host_settings_untracked() else {
                 log::error!("backend toggle requested before host settings loaded");
                 return;
             };
@@ -503,12 +851,8 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
 }
 
 fn request_host_settings(state: &AppState) {
-    let Some(host_id) = state.host_id.get_untracked() else {
-        log::error!("request_host_settings: not connected");
-        return;
-    };
-    let Some(host_stream) = state.host_stream.get_untracked() else {
-        log::error!("request_host_settings: no host stream");
+    let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
+        log::error!("request_host_settings: no selected connected host");
         return;
     };
 
@@ -527,12 +871,8 @@ fn request_host_settings(state: &AppState) {
 }
 
 fn send_host_setting(state: &AppState, setting: HostSettingValue) {
-    let Some(host_id) = state.host_id.get_untracked() else {
-        log::error!("send_host_setting: not connected");
-        return;
-    };
-    let Some(host_stream) = state.host_stream.get_untracked() else {
-        log::error!("send_host_setting: no host stream");
+    let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
+        log::error!("send_host_setting: no selected connected host");
         return;
     };
 

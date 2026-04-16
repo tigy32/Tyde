@@ -1,282 +1,74 @@
-/// Lightweight markdown-to-HTML renderer for chat messages.
-/// Handles the subset of markdown commonly produced by coding agents:
-/// fenced code blocks, inline code, bold, italic, links, lists, blockquotes,
-/// headings, horizontal rules, and paragraphs.
-/// Output is intentionally safe: all user text is HTML-escaped before insertion.
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
+
+/// Render agent/assistant markdown to HTML.
+///
+/// - GFM extensions: tables, strikethrough, task lists, footnotes.
+/// - Raw HTML in the source is downgraded to escaped text to prevent XSS.
+/// - Fenced code blocks are wrapped in `.md-code-block` with a language label
+///   and a copy button; the inner `<code>` gets `class="language-XXX"` so
+///   highlight.js can pick it up.
 pub fn render_markdown(input: &str) -> String {
-    let mut html = String::with_capacity(input.len() * 2);
-    let lines: Vec<&str> = input.lines().collect();
-    let len = lines.len();
-    let mut i = 0;
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
 
-    while i < len {
-        let line = lines[i];
+    let parser = Parser::new_ext(input, options);
 
-        // Fenced code block
-        if let Some(fence) = line.strip_prefix("```") {
-            let lang = fence.trim();
-            let lang_class = if lang.is_empty() {
-                String::new()
-            } else {
-                format!(" data-lang=\"{}\"", escape_html(lang))
+    let mut in_code: Option<(String, String)> = None;
+    let events = parser.filter_map(|ev| match ev {
+        Event::Start(Tag::CodeBlock(kind)) => {
+            let lang = match kind {
+                CodeBlockKind::Fenced(l) => l.to_string(),
+                CodeBlockKind::Indented => String::new(),
             };
-            html.push_str(&format!(
-                "<div class=\"md-code-block\"><div class=\"md-code-header\"><span class=\"md-code-lang\">{}</span><button class=\"md-copy-code\" onclick=\"(() => {{ const c = this.closest('.md-code-block').querySelector('code'); navigator.clipboard.writeText(c.textContent).then(() => {{ this.textContent = '✓'; setTimeout(() => this.textContent = 'Copy', 1200); }}); }})()\">Copy</button></div><pre><code{}>",
-                escape_html(if lang.is_empty() { "text" } else { lang }),
-                lang_class,
-            ));
-            i += 1;
-            while i < len && !lines[i].starts_with("```") {
-                if i > 0 && !html.ends_with("<code>") && !html.ends_with(">") {
-                    html.push('\n');
-                }
-                // Check if we need a newline before this line
-                let code_line = lines[i];
-                html.push_str(&escape_html(code_line));
-                html.push('\n');
-                i += 1;
-            }
-            // Trim trailing newline inside code
-            if html.ends_with('\n') {
-                html.pop();
-            }
-            html.push_str("</code></pre></div>");
-            i += 1; // skip closing ```
-            continue;
+            in_code = Some((lang, String::new()));
+            None
         }
-
-        // Heading
-        if line.starts_with('#') {
-            let level = line.chars().take_while(|c| *c == '#').count().min(6);
-            let text = line[level..].trim_start_matches(' ');
-            html.push_str(&format!(
-                "<h{level} class=\"md-heading\">{}</h{level}>",
-                render_inline(text)
-            ));
-            i += 1;
-            continue;
+        Event::End(TagEnd::CodeBlock) => {
+            let (lang, code) = in_code.take().expect("unbalanced code block");
+            Some(Event::Html(CowStr::Boxed(
+                build_code_block(&lang, &code).into_boxed_str(),
+            )))
         }
-
-        // Horizontal rule
-        if matches!(line.trim(), "---" | "***" | "___") {
-            html.push_str("<hr class=\"md-hr\">");
-            i += 1;
-            continue;
+        Event::Text(t) if in_code.is_some() => {
+            in_code.as_mut().unwrap().1.push_str(&t);
+            None
         }
+        Event::Html(s) => Some(Event::Text(s)),
+        Event::InlineHtml(s) => Some(Event::Text(s)),
+        other => Some(other),
+    });
 
-        // Blockquote
-        if line.starts_with("> ") || line == ">" {
-            html.push_str("<blockquote class=\"md-blockquote\">");
-            while i < len && (lines[i].starts_with("> ") || lines[i] == ">") {
-                let content = lines[i].strip_prefix("> ").unwrap_or("");
-                html.push_str(&format!("<p>{}</p>", render_inline(content)));
-                i += 1;
-            }
-            html.push_str("</blockquote>");
-            continue;
-        }
-
-        // Unordered list
-        if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") {
-            html.push_str("<ul class=\"md-list\">");
-            while i < len
-                && (lines[i].starts_with("- ")
-                    || lines[i].starts_with("* ")
-                    || lines[i].starts_with("+ ")
-                    || lines[i].starts_with("  "))
-            {
-                let content = if lines[i].starts_with("  ") {
-                    lines[i].trim()
-                } else {
-                    &lines[i][2..]
-                };
-                html.push_str(&format!("<li>{}</li>", render_inline(content)));
-                i += 1;
-            }
-            html.push_str("</ul>");
-            continue;
-        }
-
-        // Ordered list
-        if is_ordered_list_item(line) {
-            html.push_str("<ol class=\"md-list\">");
-            while i < len && (is_ordered_list_item(lines[i]) || lines[i].starts_with("   ")) {
-                let content = if lines[i].starts_with("   ") {
-                    lines[i].trim()
-                } else {
-                    let dot_pos = lines[i].find(". ").unwrap_or(0);
-                    &lines[i][dot_pos + 2..]
-                };
-                html.push_str(&format!("<li>{}</li>", render_inline(content)));
-                i += 1;
-            }
-            html.push_str("</ol>");
-            continue;
-        }
-
-        // Empty line
-        if line.trim().is_empty() {
-            i += 1;
-            continue;
-        }
-
-        // Paragraph - collect contiguous non-empty lines
-        html.push_str("<p class=\"md-paragraph\">");
-        let mut first = true;
-        while i < len
-            && !lines[i].trim().is_empty()
-            && !lines[i].starts_with('#')
-            && !lines[i].starts_with("```")
-            && !lines[i].starts_with("> ")
-            && !lines[i].starts_with("- ")
-            && !lines[i].starts_with("* ")
-            && !lines[i].starts_with("+ ")
-            && !is_ordered_list_item(lines[i])
-            && !matches!(lines[i].trim(), "---" | "***" | "___")
-        {
-            if !first {
-                html.push('\n');
-            }
-            html.push_str(&render_inline(lines[i]));
-            first = false;
-            i += 1;
-        }
-        html.push_str("</p>");
-    }
-
-    html
+    let mut out = String::with_capacity(input.len() * 2);
+    html::push_html(&mut out, events);
+    out
 }
 
-fn is_ordered_list_item(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if let Some(pos) = trimmed.find(". ") {
-        trimmed[..pos].chars().all(|c| c.is_ascii_digit()) && pos > 0
+fn build_code_block(lang: &str, code: &str) -> String {
+    let code_trimmed = code.strip_suffix('\n').unwrap_or(code);
+    let lang_label = if lang.is_empty() {
+        "text".to_owned()
     } else {
-        false
-    }
-}
+        escape_html(lang)
+    };
+    let lang_class = if lang.is_empty() {
+        String::new()
+    } else {
+        format!(" class=\"language-{}\"", escape_attr(lang))
+    };
+    let code_escaped = escape_html(code_trimmed);
 
-/// Render inline markdown: bold, italic, strikethrough, inline code, links
-fn render_inline(text: &str) -> String {
-    let mut result = String::with_capacity(text.len() * 2);
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        // Inline code (backtick)
-        if chars[i] == '`'
-            && let Some(end) = find_closing(&chars, i + 1, '`')
-        {
-            let code: String = chars[i + 1..end].iter().collect();
-            result.push_str(&format!(
-                "<code class=\"md-inline-code\">{}</code>",
-                escape_html(&code)
-            ));
-            i = end + 1;
-            continue;
-        }
-
-        // Bold + italic ***text***
-        if i + 2 < len
-            && chars[i] == '*'
-            && chars[i + 1] == '*'
-            && chars[i + 2] == '*'
-            && let Some(end) = find_closing_seq(&chars, i + 3, &['*', '*', '*'])
-        {
-            let inner: String = chars[i + 3..end].iter().collect();
-            result.push_str(&format!(
-                "<strong><em>{}</em></strong>",
-                render_inline(&inner)
-            ));
-            i = end + 3;
-            continue;
-        }
-
-        // Bold **text**
-        if i + 1 < len
-            && chars[i] == '*'
-            && chars[i + 1] == '*'
-            && let Some(end) = find_closing_seq(&chars, i + 2, &['*', '*'])
-        {
-            let inner: String = chars[i + 2..end].iter().collect();
-            result.push_str(&format!("<strong>{}</strong>", render_inline(&inner)));
-            i = end + 2;
-            continue;
-        }
-
-        // Italic *text*
-        if chars[i] == '*'
-            && let Some(end) = find_closing(&chars, i + 1, '*')
-        {
-            let inner: String = chars[i + 1..end].iter().collect();
-            result.push_str(&format!("<em>{}</em>", render_inline(&inner)));
-            i = end + 1;
-            continue;
-        }
-
-        // Strikethrough ~~text~~
-        if i + 1 < len
-            && chars[i] == '~'
-            && chars[i + 1] == '~'
-            && let Some(end) = find_closing_seq(&chars, i + 2, &['~', '~'])
-        {
-            let inner: String = chars[i + 2..end].iter().collect();
-            result.push_str(&format!("<del>{}</del>", render_inline(&inner)));
-            i = end + 2;
-            continue;
-        }
-
-        // Link [text](url)
-        if chars[i] == '['
-            && let Some(bracket_end) = find_closing(&chars, i + 1, ']')
-            && bracket_end + 1 < len
-            && chars[bracket_end + 1] == '('
-            && let Some(paren_end) = find_closing(&chars, bracket_end + 2, ')')
-        {
-            let text: String = chars[i + 1..bracket_end].iter().collect();
-            let url: String = chars[bracket_end + 2..paren_end].iter().collect();
-            // Only allow safe protocols
-            if url.starts_with("http://")
-                || url.starts_with("https://")
-                || url.starts_with("mailto:")
-            {
-                result.push_str(&format!(
-                    "<a class=\"md-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a>",
-                    escape_attr(&url),
-                    escape_html(&text)
-                ));
-            } else {
-                result.push_str(&escape_html(&text));
-            }
-            i = paren_end + 1;
-            continue;
-        }
-
-        // Plain character
-        match chars[i] {
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '&' => result.push_str("&amp;"),
-            '"' => result.push_str("&quot;"),
-            c => result.push(c),
-        }
-        i += 1;
-    }
-
-    result
-}
-
-fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    (start..chars.len()).find(|&j| chars[j] == marker)
-}
-
-fn find_closing_seq(chars: &[char], start: usize, markers: &[char]) -> Option<usize> {
-    let mlen = markers.len();
-    if chars.len() < start + mlen {
-        return None;
-    }
-    (start..=chars.len() - mlen).find(|&j| chars[j..j + mlen] == *markers)
+    format!(
+        "<div class=\"md-code-block\">\
+         <div class=\"md-code-header\">\
+         <span class=\"md-code-lang\">{lang_label}</span>\
+         <button class=\"md-copy-code\" onclick=\"(() => {{ const c = this.closest('.md-code-block').querySelector('code'); navigator.clipboard.writeText(c.textContent).then(() => {{ this.textContent='\u{2713}'; setTimeout(() => this.textContent='Copy', 1200); }}); }})()\">Copy</button>\
+         </div>\
+         <pre><code{lang_class}>{code_escaped}</code></pre>\
+         </div>"
+    )
 }
 
 fn escape_html(s: &str) -> String {

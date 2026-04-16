@@ -381,8 +381,8 @@ impl KiroInner {
                     .to_ascii_lowercase();
 
                 if stop_reason == "cancelled" {
-                    self.clear_active_stream().await;
-                    self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                    self.force_finalize_active_stream_if_any(Some(response.clone()), true)
+                        .await;
                     self.emit_event(json!({
                         "kind": "OperationCancelled",
                         "data": { "message": "Operation cancelled" }
@@ -398,8 +398,8 @@ impl KiroInner {
                         .or_else(|| response.get("message").and_then(Value::as_str))
                         .unwrap_or("Kiro prompt failed")
                         .to_string();
-                    self.clear_active_stream().await;
-                    self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                    self.force_finalize_active_stream_if_any(Some(response.clone()), true)
+                        .await;
                     self.emit_event(json!({ "kind": "Error", "data": message }));
                     return Ok(());
                 }
@@ -416,8 +416,7 @@ impl KiroInner {
                 self.bridge
                     .notify("session/cancel", json!({ "sessionId": session_id }))
                     .await?;
-                self.clear_active_stream().await;
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                self.force_finalize_active_stream_if_any(None, true).await;
                 self.emit_event(json!({
                     "kind": "OperationCancelled",
                     "data": { "message": "Operation cancelled" }
@@ -998,8 +997,15 @@ impl KiroInner {
         };
 
         if let Some((prev_message_id, prev_text, prev_tool_calls)) = previous_stream {
-            self.emit_stream_end(prev_message_id, prev_text, None, prev_tool_calls, false)
-                .await;
+            self.emit_stream_end(
+                prev_message_id,
+                prev_text,
+                None,
+                prev_tool_calls,
+                false,
+                false,
+            )
+            .await;
         }
 
         if let Some(start_message_id) = started_message_id {
@@ -1122,8 +1128,15 @@ impl KiroInner {
         };
 
         if let Some((prev_message_id, prev_text, prev_tool_calls)) = previous_stream {
-            self.emit_stream_end(prev_message_id, prev_text, None, prev_tool_calls, false)
-                .await;
+            self.emit_stream_end(
+                prev_message_id,
+                prev_text,
+                None,
+                prev_tool_calls,
+                false,
+                false,
+            )
+            .await;
         }
 
         if let Some((message_id, model)) = start_event {
@@ -1425,6 +1438,21 @@ impl KiroInner {
     }
 
     async fn finalize_active_stream_if_any(&self, usage: Option<Value>, end_typing: bool) {
+        self.finalize_active_stream_if_any_with_mode(usage, false, end_typing)
+            .await;
+    }
+
+    async fn force_finalize_active_stream_if_any(&self, usage: Option<Value>, end_typing: bool) {
+        self.finalize_active_stream_if_any_with_mode(usage, true, end_typing)
+            .await;
+    }
+
+    async fn finalize_active_stream_if_any_with_mode(
+        &self,
+        usage: Option<Value>,
+        force_emit: bool,
+        end_typing: bool,
+    ) {
         let active = {
             let mut state = self.state.lock().await;
             state.active_message_id.take().map(|message_id| {
@@ -1437,7 +1465,7 @@ impl KiroInner {
         };
 
         if let Some((message_id, text, tool_calls)) = active {
-            self.emit_stream_end(message_id, text, usage, tool_calls, end_typing)
+            self.emit_stream_end(message_id, text, usage, tool_calls, force_emit, end_typing)
                 .await;
         } else if end_typing {
             self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
@@ -1459,10 +1487,11 @@ impl KiroInner {
         text: String,
         token_usage: Option<Value>,
         tool_calls: Vec<Value>,
+        force_emit: bool,
         end_typing: bool,
     ) {
         let cleaned_text = strip_ansi_and_controls(&text);
-        if !has_renderable_stream_text(&cleaned_text) && tool_calls.is_empty() {
+        if !force_emit && !has_renderable_stream_text(&cleaned_text) && tool_calls.is_empty() {
             if end_typing {
                 self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
             }
@@ -2810,17 +2839,24 @@ impl Backend for KiroBackend {
                 workspace_roots
             };
             let requested_model = kiro_backend_model(config.cost_hint);
-            let (session, mut raw_events) =
-                match KiroSession::spawn(&roots, requested_model, None, &[], None).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        tracing::error!("Failed to spawn Kiro session: {err}");
-                        if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(Err(format!("Failed to spawn Kiro session: {err}")));
-                        }
-                        return;
+            let (session, mut raw_events) = match KiroSession::spawn(
+                &roots,
+                requested_model,
+                None,
+                &config.startup_mcp_servers,
+                None,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Kiro session: {err}");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(format!("Failed to spawn Kiro session: {err}")));
                     }
-                };
+                    return;
+                }
+            };
             *session_id_task
                 .lock()
                 .expect("kiro session_id mutex poisoned") = Some(SessionId(
@@ -2921,14 +2957,21 @@ impl Backend for KiroBackend {
                 workspace_roots
             };
             let requested_model = kiro_backend_model(config.cost_hint);
-            let (session, mut raw_events) =
-                match KiroSession::spawn(&roots, requested_model, None, &[], None).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        tracing::error!("Failed to spawn Kiro resume session: {err}");
-                        return;
-                    }
-                };
+            let (session, mut raw_events) = match KiroSession::spawn(
+                &roots,
+                requested_model,
+                None,
+                &config.startup_mcp_servers,
+                None,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Kiro resume session: {err}");
+                    return;
+                }
+            };
 
             let handle = session.command_handle();
             if let Err(err) = handle

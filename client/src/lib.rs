@@ -7,15 +7,15 @@ use std::time::Duration;
 mod runtime;
 
 use protocol::{
-    AgentErrorPayload, AgentId, AgentStartPayload, Envelope, FrameError, FrameKind, HelloPayload,
-    HostSettingsPayload, InterruptPayload, ListSessionsPayload, NewAgentPayload,
-    NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    AgentErrorPayload, AgentId, AgentStartPayload, DumpSettingsPayload, Envelope, FrameError,
+    FrameKind, HelloPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
+    NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
     ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload,
     ProjectRenamePayload, ProjectStageFilePayload, ProjectStageHunkPayload, RejectPayload,
-    SendMessagePayload, SeqValidator, SessionListPayload, SpawnAgentPayload, StreamPath,
-    TYDE_VERSION, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    SendMessagePayload, SeqValidator, SessionListPayload, SetSettingPayload, SpawnAgentPayload,
+    StreamPath, TYDE_VERSION, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
     TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
     write_envelope,
@@ -120,6 +120,16 @@ impl Connection {
                 .map_err(FrameError::Json)?;
         self.outgoing_seq.insert(host_stream, seq + 1);
         write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn dump_settings(&mut self, payload: DumpSettingsPayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::DumpSettings, &payload)
+            .await
+    }
+
+    pub async fn set_setting(&mut self, payload: SetSettingPayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SetSetting, &payload)
+            .await
     }
 
     pub async fn project_create(

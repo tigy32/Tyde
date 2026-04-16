@@ -1,6 +1,7 @@
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, DumpSettingsPayload, Envelope,
-    FrameKind, InterruptPayload, ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    FrameKind, HostBrowseClosePayload, HostBrowseListPayload, HostBrowseStartPayload,
+    InterruptPayload, ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectId, ProjectListDirPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectStageFilePayload,
     ProjectStageHunkPayload, SendMessagePayload, SetSettingPayload, SpawnAgentParams,
@@ -120,6 +121,24 @@ pub(crate) async fn route_client_envelope(
                     "project_delete id must not be empty"
                 );
                 host.delete_project(payload).await;
+            }
+            FrameKind::HostBrowseStart => {
+                let payload: HostBrowseStartPayload = envelope
+                    .parse_payload()
+                    .expect("invalid host_browse_start payload");
+                assert!(
+                    payload.browse_stream.0.starts_with("/browse/"),
+                    "host_browse_start browse_stream must start with /browse/, got {}",
+                    payload.browse_stream
+                );
+                if let Some(initial) = payload.initial.as_ref() {
+                    assert!(
+                        !initial.0.trim().is_empty(),
+                        "host_browse_start initial must not be empty when provided"
+                    );
+                }
+                host.open_browse_stream(connection_host_stream, host_output_stream, payload)
+                    .await;
             }
             FrameKind::TerminalCreate => {
                 let payload: TerminalCreatePayload = envelope
@@ -349,6 +368,37 @@ pub(crate) async fn route_client_envelope(
             other => {
                 panic!(
                     "protocol violation: unexpected client frame kind {} on project stream {}",
+                    other, envelope.stream
+                );
+            }
+        }
+        return;
+    }
+
+    if envelope.stream.0.starts_with("/browse/") {
+        let stream_path = envelope.stream.clone();
+        match envelope.kind {
+            FrameKind::HostBrowseList => {
+                let payload: HostBrowseListPayload = envelope
+                    .parse_payload()
+                    .expect("invalid host_browse_list payload");
+                assert!(
+                    !payload.path.0.trim().is_empty(),
+                    "host_browse_list path must not be empty"
+                );
+                host.list_browse_dir(connection_host_stream, &stream_path, payload)
+                    .await;
+            }
+            FrameKind::HostBrowseClose => {
+                let _: HostBrowseClosePayload = envelope
+                    .parse_payload()
+                    .expect("invalid host_browse_close payload");
+                host.close_browse_stream(connection_host_stream, &stream_path)
+                    .await;
+            }
+            other => {
+                panic!(
+                    "protocol violation: unexpected client frame kind {} on browse stream {}",
                     other, envelope.stream
                 );
             }

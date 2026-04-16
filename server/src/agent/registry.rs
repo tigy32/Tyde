@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::agent::{AgentHandle, now_ms, spawn_agent_actor};
+use crate::backend::StartupMcpServer;
 use crate::store::session::SessionStore;
 
 pub(crate) struct AgentRegistry {
@@ -23,6 +24,7 @@ pub(crate) struct ResolvedSpawnRequest {
     pub workspace_roots: Vec<String>,
     pub initial_input: Option<SendMessagePayload>,
     pub cost_hint: Option<SpawnCostHint>,
+    pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub resume_session_id: Option<SessionId>,
     /// When true, all backend spawns use MockBackend regardless of backend_kind.
     /// Set by the test fixture.

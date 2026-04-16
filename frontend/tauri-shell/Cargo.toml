@@ -12,10 +12,12 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 devtools-protocol = { path = "../../devtools-protocol" }
+host-config = { path = "../../host-config" }
 serde_json.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tauri = { version = "2.10.3", features = [] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true
 server = { path = "../../server" }

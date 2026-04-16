@@ -13,24 +13,24 @@ use protocol::BackendKind;
 pub fn ChatView() -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let has_agent = move || state.active_agent_id.get().is_some();
+    let has_agent = move || state.active_agent.get().is_some();
 
     let messages = move || -> Vec<crate::state::ChatMessageEntry> {
-        let Some(agent_id) = state.active_agent_id.get() else {
+        let Some(active_agent) = state.active_agent.get() else {
             return Vec::new();
         };
         let map = state.chat_messages.get();
-        map.get(&agent_id).cloned().unwrap_or_default()
+        map.get(&active_agent.agent_id).cloned().unwrap_or_default()
     };
 
     let streaming = move || {
-        let agent_id = state.active_agent_id.get()?;
+        let agent_id = state.active_agent.get()?.agent_id;
         let map = state.streaming_text.get();
         map.get(&agent_id).cloned()
     };
 
     let task_list = move || {
-        let agent_id = state.active_agent_id.get()?;
+        let agent_id = state.active_agent.get()?.agent_id;
         let map = state.task_lists.get();
         map.get(&agent_id).cloned()
     };
@@ -60,28 +60,31 @@ pub fn ChatView() -> impl IntoView {
     };
 
     let transient_events = move || {
-        let agent_id = state.active_agent_id.get()?;
+        let agent_id = state.active_agent.get()?.agent_id;
         let map = state.transient_events.get();
         map.get(&agent_id).cloned()
     };
 
     let agent_name = move || -> String {
-        let Some(agent_id) = state.active_agent_id.get() else {
+        let Some(active_agent) = state.active_agent.get() else {
             return String::new();
         };
         let agents = state.agents.get();
-        match agents.iter().find(|a| a.agent_id == agent_id) {
+        match agents
+            .iter()
+            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+        {
             Some(a) => a.name.clone(),
             None => "[unknown agent]".to_owned(),
         }
     };
 
     let agent_backend = move || -> Option<BackendKind> {
-        let agent_id = state.active_agent_id.get()?;
+        let active_agent = state.active_agent.get()?;
         let agents = state.agents.get();
         agents
             .iter()
-            .find(|a| a.agent_id == agent_id)
+            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
             .map(|a| a.backend_kind)
     };
 

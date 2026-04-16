@@ -179,6 +179,7 @@ pub(crate) async fn spawn_agent_actor(
 ) -> Result<(AgentHandle, SessionId), String> {
     let spawn_config = BackendSpawnConfig {
         cost_hint: request.cost_hint,
+        startup_mcp_servers: request.startup_mcp_servers,
     };
     let use_mock = request.use_mock_backend;
     let (backend, mut events, actor_session_id, initial_follow_up): (

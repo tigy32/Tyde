@@ -1,10 +1,7 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{
-    BackendKind, FrameKind, ListSessionsPayload, SessionSummary, SpawnAgentParams,
-    SpawnAgentPayload,
-};
+use protocol::{BackendKind, FrameKind, ListSessionsPayload, SpawnAgentParams, SpawnAgentPayload};
 
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus};
@@ -44,23 +41,23 @@ fn last_path_component(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn session_title(s: &SessionSummary) -> String {
-    if let Some(ref ua) = s.user_alias
+fn session_title(s: &crate::state::SessionInfo) -> String {
+    if let Some(ref ua) = s.summary.user_alias
         && !ua.is_empty()
     {
         return ua.clone();
     }
-    if let Some(ref a) = s.alias
+    if let Some(ref a) = s.summary.alias
         && !a.is_empty()
     {
         return a.clone();
     }
-    let id_str = s.id.0.clone();
+    let id_str = s.summary.id.0.clone();
     id_str.chars().take(50).collect()
 }
 
-fn session_id_short(s: &SessionSummary) -> String {
-    s.id.0.chars().take(8).collect()
+fn session_id_short(s: &crate::state::SessionInfo) -> String {
+    s.summary.id.0.chars().take(8).collect()
 }
 
 #[component]
@@ -68,9 +65,14 @@ pub fn SessionsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
     let hide_child_sessions = RwSignal::new(false);
+    let state_for_connection = state.clone();
 
-    let is_connected =
-        Memo::new(move |_| state.connection_status.get() == ConnectionStatus::Connected);
+    let is_connected = Memo::new(move |_| {
+        matches!(
+            state_for_connection.selected_host_connection_status(),
+            ConnectionStatus::Connected
+        )
+    });
 
     let filtered_sessions = Memo::new(move |_| {
         let sessions = state.sessions.get();
@@ -80,16 +82,17 @@ pub fn SessionsPanel() -> impl IntoView {
         sessions
             .into_iter()
             .filter(|s| {
-                if hide_children && s.parent_id.is_some() {
+                if hide_children && s.summary.parent_id.is_some() {
                     return false;
                 }
                 if !query.is_empty() {
                     let title = session_title(s).to_lowercase();
                     let workspace_match = s
+                        .summary
                         .workspace_roots
                         .iter()
                         .any(|w| w.to_lowercase().contains(&query));
-                    let backend_match = backend_label(s.backend_kind)
+                    let backend_match = backend_label(s.summary.backend_kind)
                         .to_lowercase()
                         .contains(&query);
                     if !title.contains(&query) && !workspace_match && !backend_match {
@@ -114,11 +117,14 @@ pub fn SessionsPanel() -> impl IntoView {
     let on_refresh = move |_| {
         let state = state_for_refresh.clone();
         spawn_local(async move {
-            let host_id = state.host_id.get();
-            let host_stream = state.host_stream.get();
-            if let (Some(hid), Some(hs)) = (host_id, host_stream)
-                && let Err(e) =
-                    send_frame(&hid, hs, FrameKind::ListSessions, &ListSessionsPayload {}).await
+            if let Some((host_id, host_stream)) = state.selected_host_stream_untracked()
+                && let Err(e) = send_frame(
+                    &host_id,
+                    host_stream,
+                    FrameKind::ListSessions,
+                    &ListSessionsPayload {},
+                )
+                .await
             {
                 log::error!("failed to send ListSessions: {e}");
             }
@@ -176,22 +182,24 @@ pub fn SessionsPanel() -> impl IntoView {
 
 fn session_card(
     state: AppState,
-    session: SessionSummary,
+    session: crate::state::SessionInfo,
     is_connected: Memo<bool>,
 ) -> impl IntoView {
     let title = session_title(&session);
     let short_id = session_id_short(&session);
-    let full_id = session.id.0.clone();
-    let backend = session.backend_kind;
-    let created = format_date(session.created_at_ms);
+    let full_id = session.summary.id.0.clone();
+    let backend = session.summary.backend_kind;
+    let created = format_date(session.summary.created_at_ms);
     let workspace = session
+        .summary
         .workspace_roots
         .first()
         .map(|w| last_path_component(w).to_string())
         .unwrap_or_default();
-    let msg_count = session.message_count;
-    let session_id = session.id.clone();
-    let resumable = session.resumable;
+    let msg_count = session.summary.message_count;
+    let session_id = session.summary.id.clone();
+    let resumable = session.summary.resumable;
+    let session_host_id = session.host_id.clone();
 
     let on_click = move |_| {
         if !is_connected.get() || !resumable {
@@ -199,10 +207,9 @@ fn session_card(
         }
         let state = state.clone();
         let sid = session_id.clone();
+        let host_id = session_host_id.clone();
         spawn_local(async move {
-            let host_id = state.host_id.get();
-            let host_stream = state.host_stream.get();
-            if let (Some(hid), Some(hs)) = (host_id, host_stream) {
+            if let Some(host_stream) = state.host_stream_untracked(&host_id) {
                 let payload = SpawnAgentPayload {
                     name: format!("resume-{}", sid),
                     parent_agent_id: None,
@@ -212,7 +219,9 @@ fn session_card(
                         prompt: None,
                     },
                 };
-                if let Err(e) = send_frame(&hid, hs, FrameKind::SpawnAgent, &payload).await {
+                if let Err(e) =
+                    send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
+                {
                     log::error!("failed to send SpawnAgent (resume): {e}");
                 }
             }

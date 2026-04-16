@@ -9,6 +9,7 @@ members = [
     "frontend/tauri-shell",
     "devtools-protocol",
     "dev-driver",
+    "host-config",
 ]
 
 [workspace.package]
