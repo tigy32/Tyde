@@ -4263,8 +4263,8 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
         match &server.transport {
             StartupMcpTransport::Http {
                 url,
-                headers,
                 bearer_token_env_var,
+                ..
             } => {
                 let trimmed_url = url.trim();
                 if trimmed_url.is_empty() {
@@ -4280,13 +4280,6 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
                         "{base}.bearer_token_env_var={}",
                         toml_quoted(env_var)
                     ));
-                }
-                for (key, value) in headers {
-                    let key = key.trim();
-                    if key.is_empty() {
-                        continue;
-                    }
-                    overrides.push(format!("{base}.http_headers.{key}={}", toml_quoted(value)));
                 }
             }
             StartupMcpTransport::Stdio { command, args, env } => {
@@ -6730,6 +6723,27 @@ If you skip spawn_agent or wait_agent, this test fails."#;
         assert_eq!(
             policy.get("type").and_then(Value::as_str),
             Some("workspaceWrite")
+        );
+    }
+
+    #[test]
+    fn codex_http_mcp_config_uses_url_and_omits_headers() {
+        let overrides = codex_mcp_config_overrides(&[StartupMcpServer {
+            name: "tyde-debug".to_string(),
+            transport: StartupMcpTransport::Http {
+                url: "http://127.0.0.1:4012/mcp?repo_root=%2Ftmp%2Fproj".to_string(),
+                headers: HashMap::from([("x-ignored".to_string(), "value".to_string())]),
+                bearer_token_env_var: None,
+            },
+        }]);
+
+        assert!(overrides.iter().any(|entry| {
+            entry
+                == "mcp_servers.tyde-debug.url=\"http://127.0.0.1:4012/mcp?repo_root=%2Ftmp%2Fproj\""
+        }));
+        assert!(
+            !overrides.iter().any(|entry| entry.contains("http_headers")),
+            "Codex MCP config should not emit unsupported HTTP header overrides: {overrides:?}"
         );
     }
 }

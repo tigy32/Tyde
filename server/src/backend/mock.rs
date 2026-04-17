@@ -9,7 +9,7 @@ use protocol::{
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::{Backend, BackendSession, BackendSpawnConfig, EventStream};
+use super::{Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpTransport};
 
 const INPUT_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 256;
@@ -19,7 +19,7 @@ const MOCK_MODEL: &str = "mock";
 struct MockSessionRecord {
     workspace_roots: Vec<String>,
     prompts: Vec<String>,
-    startup_mcp_server_names: Vec<String>,
+    startup_mcp_servers: Vec<String>,
     created_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -41,10 +41,13 @@ impl Backend for MockBackend {
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
-        let startup_mcp_server_names = config
+        let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
-            .map(|server| server.name.clone())
+            .map(|server| match &server.transport {
+                StartupMcpTransport::Http { .. } => format!("{}(http)", server.name),
+                StartupMcpTransport::Stdio { .. } => format!("{}(stdio)", server.name),
+            })
             .collect::<Vec<_>>();
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
@@ -58,7 +61,7 @@ impl Backend for MockBackend {
                 MockSessionRecord {
                     workspace_roots,
                     prompts: Vec::new(),
-                    startup_mcp_server_names: startup_mcp_server_names.clone(),
+                    startup_mcp_servers: startup_mcp_servers.clone(),
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
@@ -260,12 +263,12 @@ fn startup_mcp_response_prefix(session_id: &SessionId) -> String {
     let Some(record) = store.get(&session_id.0) else {
         return String::new();
     };
-    if record.startup_mcp_server_names.is_empty() {
+    if record.startup_mcp_servers.is_empty() {
         return String::new();
     }
     format!(
         "[startup_mcp_servers: {}] ",
-        record.startup_mcp_server_names.join(", ")
+        record.startup_mcp_servers.join(", ")
     )
 }
 

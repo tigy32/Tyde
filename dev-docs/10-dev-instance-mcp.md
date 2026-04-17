@@ -181,13 +181,13 @@ to the right places.
 
 The key rule is:
 
-**Tyde2 should have exactly one MCP server for dev instances: the external
-driver. The child desktop instance should expose typed dev transports, not MCP.**
+**Tyde2 should expose exactly one MCP surface for dev instances, and it should
+live in `tyde-server`, not in the child desktop instance.**
 
-For agents running inside Tyde backends, that external driver is still
-**backend-owned**. The agent should see a backend-local MCP server such as
-`tyde-dev-driver debug`, and that driver should launch child Tyde instances on
-the same host as the backend. The child instance still does not speak MCP.
+For agents running inside Tyde backends, the host injects a backend-local
+loopback HTTP MCP URL such as `http://127.0.0.1:<port>/mcp`. The server owns
+that MCP surface and launches child Tyde dev instances on the same host as the
+backend. The child instance still does not speak MCP.
 
 ### High-Level Shape
 
@@ -195,7 +195,7 @@ the same host as the backend. The child instance still does not speak MCP.
 MCP client
     |
     v
-tyde-dev-driver
+tyde-server debug MCP
     | \
     |  \__ UI debug transport
     |
@@ -209,9 +209,10 @@ Tyde dev instance
 
 ### Three Layers
 
-#### 1. `tyde-dev-driver`
+#### 1. `tyde-server` debug MCP
 
-A separate dev-only binary/crate. This is the only MCP server in the design.
+An embedded loopback-only HTTP MCP server inside the Tyde host. This is the
+only MCP server in the design.
 
 It owns:
 
@@ -225,9 +226,10 @@ It owns:
 
 It does **not** own product behavior.
 
-When a Tyde agent is configured with the debug MCP server, the backend launches
-this driver as a stdio MCP server on the backend host. That gives the agent a
-backend-local MCP surface even when the backend is running remotely over SSH.
+When a Tyde agent is configured with the debug MCP server, the host injects
+that loopback HTTP MCP URL into the backend spawn config. That gives the agent
+a backend-local MCP surface even when the Tyde host is running remotely over
+SSH.
 
 #### 2. Child Dev Instance Endpoints
 
@@ -434,16 +436,24 @@ Output:
 
 - `instance_id`
 - `status`
+- `project_dir`
 - metadata needed for debugging
 
 This tool:
 
 1. reserves ports
-2. spawns the instance
+2. spawns the instance with watch-driven reload disabled
 3. waits for both child endpoints to be ready
 4. opens a host protocol connection
 5. starts background event capture
 6. returns only when the instance is actually usable
+
+The restart rule is important:
+
+- launched dev instances should disable automatic reload/watch behavior
+- an agent that wants to test newer code must stop the old instance and start a
+  new one after making changes
+- tool docs should say this explicitly so agents do not assume hot reload
 
 #### `tyde_debug_events_since`
 
@@ -620,6 +630,7 @@ For this repo, the launcher must account for:
 - `beforeDevCommand`
 - `devUrl`
 - the frontend dev server port
+- disabling Tauri and frontend watch-driven reload for launched instances
 
 That likely means one of these approaches:
 
@@ -630,6 +641,9 @@ That likely means one of these approaches:
 Either is acceptable. The important rule is:
 
 **one code path, in the driver, with explicit inputs.**
+
+For Tyde2 specifically, that code path should disable watch-driven reload. The
+goal is to keep the instance stable until explicitly restarted.
 
 Do not spread launcher assumptions across the shell, frontend, and driver.
 
@@ -703,7 +717,7 @@ The important check is architectural, not just behavioral:
 
 - product state must come through the Tyde protocol
 - UI debug must come through the typed devtools protocol
-- MCP must exist only at the external driver boundary
+- MCP must exist only at the server-owned loopback boundary
 
 ---
 
@@ -714,12 +728,12 @@ architecture.
 
 Tyde2 should rebuild it like this:
 
-- one external MCP server: `tyde-dev-driver`
+- one loopback-only HTTP MCP server inside `tyde-server`
 - no MCP server inside the child app
-- agents use a backend-local `tyde-dev-driver debug` MCP process
+- agents receive a backend-local `http://127.0.0.1:<port>/mcp` startup MCP
 - product-state inspection through the real Tyde protocol
 - UI inspection through a small typed devtools protocol
-- lifecycle, remote/local launch, and screenshot helpers owned by the driver
+- lifecycle and screenshot helpers owned by `tyde-server`
 - `tauri-shell` kept as a transport shell instead of becoming a second backend
 
 That preserves the power of the legacy workflow without reintroducing the same

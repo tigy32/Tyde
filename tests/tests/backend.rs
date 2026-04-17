@@ -297,8 +297,8 @@ async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
     let final_text =
         spawn_mock_agent_and_collect_turn(&mut fixture.client, BackendKind::Claude, "hello").await;
     assert!(
-        final_text.contains("[startup_mcp_servers: tyde-debug]"),
-        "expected mock backend turn to reflect injected startup MCP server, got: {final_text}"
+        final_text.contains("[startup_mcp_servers: tyde-debug(http)]"),
+        "expected mock backend turn to reflect injected HTTP startup MCP server, got: {final_text}"
     );
 }
 

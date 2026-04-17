@@ -3,6 +3,7 @@ mod agent;
 pub mod backend;
 pub(crate) mod browse_stream;
 pub(crate) mod connection;
+pub(crate) mod debug_mcp;
 pub(crate) mod host;
 pub(crate) mod project_stream;
 pub mod remote;

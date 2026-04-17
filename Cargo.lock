@@ -3933,6 +3933,8 @@ name = "server"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "client",
+ "devtools-protocol",
  "portable-pty",
  "protocol",
  "serde",

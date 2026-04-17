@@ -19,6 +19,7 @@ use crate::agent::AgentHandle;
 use crate::agent::registry::{AgentRegistry, ResolvedSpawnRequest};
 use crate::backend::{BackendSession, StartupMcpServer, StartupMcpTransport};
 use crate::browse_stream;
+use crate::debug_mcp::DebugMcpHandle;
 use crate::project_stream::{
     ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing, build_file_list,
     build_git_status, read_diff, read_file, scan_raw_entries, spawn_project_subscription,
@@ -35,7 +36,9 @@ struct HostSubscriber {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct HostRuntimeConfig {}
+pub struct HostRuntimeConfig {
+    pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
+}
 
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
@@ -44,8 +47,7 @@ pub(crate) struct HostState {
     pub session_store: Arc<Mutex<SessionStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pub use_mock_backend: bool,
-    #[allow(dead_code)]
-    pub runtime_config: HostRuntimeConfig,
+    pub debug_mcp: DebugMcpHandle,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<(StreamPath, StreamPath), ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
@@ -234,8 +236,11 @@ impl HostHandle {
                             panic!("cannot spawn agent in missing project {}", project_id)
                         });
                 }
-                let startup_mcp_servers =
-                    startup_mcp_servers_for_settings(&host_settings, &workspace_roots);
+                let startup_mcp_servers = startup_mcp_servers_for_settings(
+                    &host_settings,
+                    &workspace_roots,
+                    &state.debug_mcp,
+                );
                 ResolvedSpawnRequest {
                     name: payload.name,
                     parent_agent_id: payload.parent_agent_id,
@@ -268,8 +273,11 @@ impl HostHandle {
                             panic!("cannot resume agent in missing project {}", project_id)
                         });
                 }
-                let startup_mcp_servers =
-                    startup_mcp_servers_for_settings(&host_settings, &record.workspace_roots);
+                let startup_mcp_servers = startup_mcp_servers_for_settings(
+                    &host_settings,
+                    &record.workspace_roots,
+                    &state.debug_mcp,
+                );
                 ResolvedSpawnRequest {
                     name: payload.name,
                     parent_agent_id: payload.parent_agent_id,
@@ -909,6 +917,7 @@ fn spawn_host_inner(
     let session_store = SessionStore::load(session_path)?;
     let project_store = ProjectStore::load(project_path)?;
     let settings_store = HostSettingsStore::load(settings_path)?;
+    let debug_mcp = crate::debug_mcp::start_server(runtime_config.debug_mcp_bind_addr)?;
     Ok(HostHandle {
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
@@ -917,7 +926,7 @@ fn spawn_host_inner(
             session_store: Arc::new(Mutex::new(session_store)),
             agent_sessions: HashMap::new(),
             use_mock_backend,
-            runtime_config,
+            debug_mcp,
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
@@ -929,22 +938,23 @@ fn spawn_host_inner(
 fn startup_mcp_servers_for_settings(
     settings: &protocol::HostSettings,
     workspace_roots: &[String],
+    debug_mcp: &DebugMcpHandle,
 ) -> Vec<StartupMcpServer> {
     let mut servers = Vec::new();
 
     if settings.tyde_debug_mcp_enabled {
-        let mut env = HashMap::new();
-        if let Some(repo_root) = workspace_roots.first().map(|value| value.trim())
-            && !repo_root.is_empty()
-        {
-            env.insert("TYDE_DEBUG_REPO_ROOT".to_string(), repo_root.to_string());
-        }
+        let url = workspace_roots
+            .first()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|repo_root| debug_mcp_url_for_repo_root(&debug_mcp.url, repo_root))
+            .unwrap_or_else(|| debug_mcp.url.clone());
         servers.push(StartupMcpServer {
             name: "tyde-debug".to_string(),
-            transport: StartupMcpTransport::Stdio {
-                command: resolve_tyde_dev_driver_command(),
-                args: vec!["debug".to_string()],
-                env,
+            transport: StartupMcpTransport::Http {
+                url,
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
             },
         });
     }
@@ -952,42 +962,30 @@ fn startup_mcp_servers_for_settings(
     servers
 }
 
-fn resolve_tyde_dev_driver_command() -> String {
-    if let Ok(path) = std::env::var("TYDE_DEV_DRIVER_BIN") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    if let Some(path) = workspace_tyde_dev_driver_path() {
-        return path.display().to_string();
-    }
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let candidate = parent.join(format!("tyde-dev-driver{}", std::env::consts::EXE_SUFFIX));
-        if candidate.is_file() {
-            return candidate.display().to_string();
-        }
-    }
-
-    "tyde-dev-driver".to_string()
+fn debug_mcp_url_for_repo_root(base_url: &str, repo_root: &str) -> String {
+    let separator = if base_url.contains('?') { '&' } else { '?' };
+    format!(
+        "{base_url}{separator}repo_root={}",
+        percent_encode_query_component(repo_root)
+    )
 }
 
-fn workspace_tyde_dev_driver_path() -> Option<PathBuf> {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
-    let candidate = workspace_root
-        .join("target")
-        .join(profile)
-        .join(format!("tyde-dev-driver{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    encoded
 }
 
 async fn emit_new_agent_for_subscriber(

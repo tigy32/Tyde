@@ -15,7 +15,9 @@ use protocol::{
     ToolExecutionCompletedData, ToolRequest,
 };
 
-use super::{Backend, BackendSession, BackendSpawnConfig, EventStream};
+use super::{
+    Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpServer, StartupMcpTransport,
+};
 
 const BACKEND_INPUT_BUFFER: usize = 64;
 const BACKEND_EVENT_BUFFER: usize = 256;
@@ -54,7 +56,7 @@ fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>
 impl Backend for TycodeBackend {
     async fn spawn(
         workspace_roots: Vec<String>,
-        _config: BackendSpawnConfig,
+        config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
@@ -70,19 +72,22 @@ impl Backend for TycodeBackend {
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let mcp_servers_json = build_tycode_mcp_servers_json(&config.startup_mcp_servers);
 
         tokio::spawn(async move {
             let roots_json = serde_json::json!(workspace_roots).to_string();
             let known_session_ids = known_tycode_session_ids();
-
-            let mut child = match Command::new(subprocess_bin())
-                .arg("--workspace-roots")
-                .arg(&roots_json)
+            let mut command = Command::new(subprocess_bin());
+            command.arg("--workspace-roots").arg(&roots_json);
+            if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
+                command.arg("--mcp-servers").arg(mcp_servers_json);
+            }
+            command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
+                .stderr(Stdio::piped());
+
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(err) => {
                     tracing::error!("Failed to spawn tycode-subprocess: {err}");
@@ -347,7 +352,7 @@ impl Backend for TycodeBackend {
 
     async fn resume(
         workspace_roots: Vec<String>,
-        _config: BackendSpawnConfig,
+        config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
@@ -359,17 +364,21 @@ impl Backend for TycodeBackend {
             workspace_roots
         };
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
+        let mcp_servers_json = build_tycode_mcp_servers_json(&config.startup_mcp_servers);
 
         tokio::spawn(async move {
             let roots_json = serde_json::json!(workspace_roots).to_string();
-            let mut child = match Command::new(subprocess_bin())
-                .arg("--workspace-roots")
-                .arg(&roots_json)
+            let mut command = Command::new(subprocess_bin());
+            command.arg("--workspace-roots").arg(&roots_json);
+            if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
+                command.arg("--mcp-servers").arg(mcp_servers_json);
+            }
+            command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
+                .stderr(Stdio::piped());
+
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(err) => {
                     tracing::error!("Failed to spawn tycode-subprocess for resume: {err}");
@@ -616,6 +625,70 @@ fn discover_new_tycode_session(known_session_ids: &[String]) -> Option<SessionId
         .map(|session| session.id)
 }
 
+fn build_tycode_mcp_servers_json(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {
+    if startup_mcp_servers.is_empty() {
+        return None;
+    }
+
+    let mut servers = serde_json::Map::new();
+    for server in startup_mcp_servers {
+        let name = server.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let config = match &server.transport {
+            StartupMcpTransport::Http {
+                url,
+                headers,
+                bearer_token_env_var,
+            } => {
+                let trimmed_url = url.trim();
+                if trimmed_url.is_empty() {
+                    continue;
+                }
+                let mut config = serde_json::Map::new();
+                config.insert("url".to_string(), Value::String(trimmed_url.to_string()));
+                if !headers.is_empty() {
+                    config.insert(
+                        "headers".to_string(),
+                        serde_json::to_value(headers)
+                            .expect("HashMap<String, String> is always serializable"),
+                    );
+                }
+                if let Some(env_var) = bearer_token_env_var
+                    .as_ref()
+                    .map(|raw| raw.trim())
+                    .filter(|raw| !raw.is_empty())
+                {
+                    config.insert(
+                        "bearer_token_env_var".to_string(),
+                        Value::String(env_var.to_string()),
+                    );
+                }
+                Value::Object(config)
+            }
+            StartupMcpTransport::Stdio { command, args, env } => {
+                let trimmed_command = command.trim();
+                if trimmed_command.is_empty() {
+                    continue;
+                }
+                serde_json::json!({
+                    "command": trimmed_command,
+                    "args": args,
+                    "env": env,
+                })
+            }
+        };
+        servers.insert(name.to_string(), config);
+    }
+
+    if servers.is_empty() {
+        return None;
+    }
+
+    Some(serde_json::json!({ "mcpServers": servers }).to_string())
+}
+
 fn tycode_session_started(value: &Value) -> Option<SessionId> {
     if value.get("kind").and_then(Value::as_str) != Some("SessionStarted") {
         return None;
@@ -837,4 +910,36 @@ fn unix_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn build_tycode_mcp_servers_json_supports_http_servers() {
+        let json = build_tycode_mcp_servers_json(&[StartupMcpServer {
+            name: "tyde-debug".to_string(),
+            transport: StartupMcpTransport::Http {
+                url: "http://127.0.0.1:4123/mcp".to_string(),
+                headers: HashMap::from([(
+                    "x-tyde-debug-repo-root".to_string(),
+                    "/tmp/project".to_string(),
+                )]),
+                bearer_token_env_var: None,
+            },
+        }])
+        .expect("HTTP MCP config should serialize");
+        let value: Value = serde_json::from_str(&json).expect("parse JSON");
+        assert_eq!(
+            value["mcpServers"]["tyde-debug"]["url"],
+            Value::String("http://127.0.0.1:4123/mcp".to_string())
+        );
+        assert_eq!(
+            value["mcpServers"]["tyde-debug"]["headers"]["x-tyde-debug-repo-root"],
+            Value::String("/tmp/project".to_string())
+        );
+    }
 }
