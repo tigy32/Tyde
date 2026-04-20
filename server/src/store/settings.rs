@@ -120,6 +120,9 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::TydeDebugMcpEnabled { enabled } => {
             settings.tyde_debug_mcp_enabled = enabled;
         }
+        HostSettingValue::TydeAgentControlMcpEnabled { enabled } => {
+            settings.tyde_agent_control_mcp_enabled = enabled;
+        }
     }
 
     Ok(())
@@ -130,6 +133,7 @@ fn empty_settings() -> HostSettings {
         enabled_backends: Vec::new(),
         default_backend: None,
         tyde_debug_mcp_enabled: false,
+        tyde_agent_control_mcp_enabled: true,
     }
 }
 
@@ -149,6 +153,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         enabled_backends,
         default_backend: settings.default_backend,
         tyde_debug_mcp_enabled: settings.tyde_debug_mcp_enabled,
+        tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
     })
 }
 

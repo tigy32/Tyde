@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -36,9 +36,7 @@ impl ProjectStore {
 
     pub fn list(&self) -> Result<Vec<Project>, String> {
         let records = Self::read_from_disk(&self.path)?;
-        let mut projects: Vec<_> = records.values().cloned().collect();
-        projects.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
-        Ok(projects)
+        Ok(Self::ordered_projects(&records))
     }
 
     pub fn get(&self, id: &ProjectId) -> Option<Project> {
@@ -49,12 +47,13 @@ impl ProjectStore {
 
     pub fn create(&self, name: String, roots: Vec<String>) -> Result<Project, String> {
         let id = ProjectId(Uuid::new_v4().to_string());
+        let mut records = Self::read_from_disk(&self.path)?;
         let project = Project {
             id: id.clone(),
             name,
             roots,
+            sort_order: Self::next_sort_order(&records),
         };
-        let mut records = Self::read_from_disk(&self.path)?;
         let previous = records.insert(id.0.clone(), project.clone());
         assert!(
             previous.is_none(),
@@ -74,6 +73,41 @@ impl ProjectStore {
         let updated = project.clone();
         self.save(&records)?;
         Ok(updated)
+    }
+
+    pub fn reorder(&self, project_ids: Vec<ProjectId>) -> Result<Vec<Project>, String> {
+        let mut records = Self::read_from_disk(&self.path)?;
+        let current_projects = Self::ordered_projects(&records);
+        let mut seen_ids = HashSet::new();
+        for project_id in &project_ids {
+            if !records.contains_key(&project_id.0) {
+                return Err(format!("cannot reorder missing project {}", project_id));
+            }
+            if !seen_ids.insert(project_id.0.clone()) {
+                return Err(format!(
+                    "project reorder contains duplicate id {}",
+                    project_id
+                ));
+            }
+        }
+
+        let mut ordered_ids = project_ids;
+        ordered_ids.extend(
+            current_projects
+                .iter()
+                .filter(|project| !seen_ids.contains(&project.id.0))
+                .map(|project| project.id.clone()),
+        );
+
+        for (index, project_id) in ordered_ids.into_iter().enumerate() {
+            let Some(project) = records.get_mut(&project_id.0) else {
+                return Err(format!("cannot reorder missing project {}", project_id));
+            };
+            project.sort_order = index as u64;
+        }
+
+        self.save(&records)?;
+        Ok(Self::ordered_projects(&records))
     }
 
     pub fn add_root(&self, id: &ProjectId, root: String) -> Result<Project, String> {
@@ -139,5 +173,25 @@ impl ProjectStore {
             )
         })?;
         Ok(())
+    }
+
+    fn ordered_projects(records: &HashMap<String, Project>) -> Vec<Project> {
+        let mut projects: Vec<_> = records.values().cloned().collect();
+        projects.sort_by(|left, right| {
+            left.sort_order
+                .cmp(&right.sort_order)
+                .then(left.name.cmp(&right.name))
+                .then(left.id.0.cmp(&right.id.0))
+        });
+        projects
+    }
+
+    fn next_sort_order(records: &HashMap<String, Project>) -> u64 {
+        records
+            .values()
+            .map(|project| project.sort_order)
+            .max()
+            .map(|max_order| max_order.saturating_add(1))
+            .unwrap_or(0)
     }
 }

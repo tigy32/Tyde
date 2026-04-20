@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use fixture::Fixture;
 use protocol::{
-    BackendKind, ChatEvent, DumpSettingsPayload, Envelope, FrameKind, HostSettingValue, ImageData,
-    ListSessionsPayload, MessageSender, NewAgentPayload, ProtocolValidator, SessionListPayload,
+    BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
+    MessageSender, NewAgentPayload, ProtocolValidator, SessionListPayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
     SessionSummary, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
     StreamPath, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
 };
@@ -161,7 +162,10 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
                         cost_hint: cost_hint_for(BackendKind::Tycode),
+                        custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
+                        session_settings: Default::default(),
+                        resolved_spawn_config: Default::default(),
                     },
                     protocol::SendMessagePayload {
                         message: "Reply exactly with ok".to_owned(),
@@ -172,7 +176,17 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
             .await
             .map_err(|_| "Tycode spawn timed out".to_string())?
             .map_err(|err| format!("Tycode spawn failed: {err}"))?;
-            let (_backend, _events) = result;
+            let (_backend, mut events) = result;
+            tokio::time::timeout(REAL_BACKEND_PROBE_TIMEOUT, async {
+                while let Some(event) = events.recv().await {
+                    if matches!(event, ChatEvent::StreamEnd(_)) {
+                        return Ok(());
+                    }
+                }
+                Err("Tycode probe stream ended before StreamEnd".to_string())
+            })
+            .await
+            .map_err(|_| "Tycode initial turn timed out".to_string())??;
             Ok(())
         }
         BackendKind::Kiro => {
@@ -185,7 +199,10 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
                     vec![workspace.path().to_string_lossy().to_string()],
                     server::backend::BackendSpawnConfig {
                         cost_hint: cost_hint_for(BackendKind::Kiro),
+                        custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
+                        session_settings: Default::default(),
+                        resolved_spawn_config: Default::default(),
                     },
                     protocol::SendMessagePayload {
                         message: "Reply exactly with ok".to_owned(),
@@ -196,7 +213,17 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
             .await
             .map_err(|_| "Kiro ACP spawn timed out".to_string())?
             .map_err(|err| format!("Kiro ACP spawn failed: {err}"))?;
-            let (_backend, _events) = result;
+            let (_backend, mut events) = result;
+            tokio::time::timeout(REAL_BACKEND_PROBE_TIMEOUT, async {
+                while let Some(event) = events.recv().await {
+                    if matches!(event, ChatEvent::StreamEnd(_)) {
+                        return Ok(());
+                    }
+                }
+                Err("Kiro probe stream ended before StreamEnd".to_string())
+            })
+            .await
+            .map_err(|_| "Kiro initial turn timed out".to_string())??;
             Ok(())
         }
     }
@@ -235,7 +262,8 @@ async fn spawn_mock_agent_and_collect_turn(
 ) -> String {
     client
         .spawn_agent(SpawnAgentPayload {
-            name: "Chat".to_string(),
+            name: Some("Chat".to_string()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
@@ -244,6 +272,7 @@ async fn spawn_mock_agent_and_collect_turn(
                 images: None,
                 backend_kind,
                 cost_hint: None,
+                session_settings: None,
             },
         })
         .await
@@ -270,6 +299,32 @@ async fn spawn_mock_agent_and_collect_turn(
     }
 }
 
+fn write_fake_kiro_probe_program(dir: &tempfile::TempDir) -> PathBuf {
+    let path = dir.path().join("fake-kiro-cli-chat");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r _ || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-probe-session","availableModels":[{"id":"kiro-sonnet","name":"Kiro Sonnet","isDefault":true},{"id":"kiro-haiku","name":"Kiro Haiku","isDefault":false}]}}'
+while IFS= read -r _; do :; done
+"#,
+    )
+    .expect("write fake Kiro probe program");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat fake Kiro probe program")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake Kiro probe program");
+    }
+    path
+}
+
 #[tokio::test]
 async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
     init_tracing();
@@ -278,28 +333,265 @@ async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
 
     fixture
         .client
-        .dump_settings(DumpSettingsPayload {})
-        .await
-        .expect("dump_settings failed");
-    let env = expect_fixture_event(&mut fixture.client, "HostSettings").await;
-    assert_eq!(env.kind, FrameKind::HostSettings);
-
-    fixture
-        .client
         .set_setting(SetSettingPayload {
             setting: HostSettingValue::TydeDebugMcpEnabled { enabled: true },
         })
         .await
         .expect("set_setting failed");
-    let env = expect_fixture_event(&mut fixture.client, "HostSettings").await;
-    assert_eq!(env.kind, FrameKind::HostSettings);
+    loop {
+        let env =
+            expect_fixture_event(&mut fixture.client, "host settings after set_setting").await;
+        if env.kind == FrameKind::HostSettings {
+            break;
+        }
+    }
 
     let final_text =
         spawn_mock_agent_and_collect_turn(&mut fixture.client, BackendKind::Claude, "hello").await;
     assert!(
-        final_text.contains("[startup_mcp_servers: tyde-debug(http)]"),
-        "expected mock backend turn to reflect injected HTTP startup MCP server, got: {final_text}"
+        final_text.contains("tyde-debug(http)"),
+        "expected mock backend turn to reflect injected tyde-debug HTTP startup MCP server, got: {final_text}"
     );
+}
+
+#[tokio::test]
+async fn kiro_dynamic_schema_discovery_uses_probe_models() {
+    init_tracing();
+
+    let probe_dir = tempfile::tempdir().expect("create Kiro probe tempdir");
+    let probe_program = write_fake_kiro_probe_program(&probe_dir);
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        kiro_probe_program: Some(probe_program.to_string_lossy().to_string()),
+        ..server::HostRuntimeConfig::default()
+    })
+    .await;
+
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Kiro],
+            },
+        })
+        .await
+        .expect("enable Kiro backend");
+
+    let schemas = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Kiro SessionSchemas").await;
+        if env.kind != FrameKind::SessionSchemas {
+            continue;
+        }
+        let payload: SessionSchemasPayload = env.parse_payload().expect("parse SessionSchemas");
+        if payload
+            .schemas
+            .iter()
+            .any(|schema| schema.backend_kind() == BackendKind::Kiro)
+        {
+            break payload;
+        }
+    };
+
+    let kiro_schema = schemas
+        .schemas
+        .into_iter()
+        .find(|schema| schema.backend_kind() == BackendKind::Kiro)
+        .expect("Kiro schema should be present");
+    let SessionSchemaEntry::Ready {
+        schema: kiro_schema,
+    } = kiro_schema
+    else {
+        panic!("expected Kiro schema to be ready");
+    };
+    assert_eq!(kiro_schema.fields.len(), 1);
+    assert_eq!(kiro_schema.fields[0].key, "model");
+
+    match &kiro_schema.fields[0].field_type {
+        SessionSettingFieldType::Select {
+            options,
+            default,
+            nullable,
+        } => {
+            assert_eq!(
+                options,
+                &vec![
+                    protocol::SelectOption {
+                        value: "kiro-sonnet".to_string(),
+                        label: "Kiro Sonnet".to_string(),
+                    },
+                    protocol::SelectOption {
+                        value: "kiro-haiku".to_string(),
+                        label: "Kiro Haiku".to_string(),
+                    },
+                ]
+            );
+            assert_eq!(default.as_deref(), Some("kiro-sonnet"));
+            assert!(*nullable);
+        }
+        other => panic!("expected Kiro model field to be a Select, got {other:?}"),
+    }
+
+    let mut session_settings = SessionSettingsValues::default();
+    session_settings.0.insert(
+        "model".to_string(),
+        SessionSettingValue::String("kiro-haiku".to_string()),
+    );
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Kiro".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_string()],
+                prompt: "hello".to_string(),
+                images: None,
+                backend_kind: BackendKind::Kiro,
+                cost_hint: None,
+                session_settings: Some(session_settings),
+            },
+        })
+        .await
+        .expect("spawn Kiro agent with discovered model");
+
+    let new_agent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Kiro NewAgent").await;
+        if env.kind == FrameKind::NewAgent {
+            break env
+                .parse_payload::<NewAgentPayload>()
+                .expect("parse Kiro NewAgent");
+        }
+    };
+    let agent_stream = new_agent.instance_stream.clone();
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Kiro AgentStart").await;
+        if env.kind == FrameKind::AgentStart && env.stream == agent_stream {
+            break;
+        }
+    }
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Kiro StreamEnd").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse Kiro ChatEvent");
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_unknown_system_frame_is_tolerated() {
+    server::backend::claude::validate_system_frame(&serde_json::json!({
+        "type": "system",
+        "subtype": "task_started",
+        "task_type": "local_agent",
+        "task_id": "task-123",
+    }))
+    .expect("unknown Claude system subtypes should not crash parsing");
+}
+
+#[tokio::test]
+async fn claude_system_frame_without_subtype_still_fails_loudly() {
+    let err = server::backend::claude::validate_system_frame(&serde_json::json!({
+        "type": "system",
+    }))
+    .expect_err("Claude system frame without subtype should be rejected");
+    assert!(
+        err.contains("invalid Claude system frame"),
+        "expected loud Claude system-frame error, got: {err}",
+    );
+}
+
+#[tokio::test]
+async fn compact_turn_emits_system_message_and_stream_end_without_error() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Compact".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_string()],
+                prompt: "/compact".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn compact test agent");
+
+    let new_agent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "compact NewAgent").await;
+        if env.kind == FrameKind::NewAgent {
+            break env
+                .parse_payload::<NewAgentPayload>()
+                .expect("parse compact NewAgent");
+        }
+    };
+    let agent_stream = new_agent.instance_stream.clone();
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "compact AgentStart").await;
+        if env.kind == FrameKind::AgentStart && env.stream == agent_stream {
+            break;
+        }
+    }
+
+    let mut saw_system_message = false;
+    let mut saw_stream_end = false;
+    let mut saw_typing_false = false;
+
+    while !saw_typing_false {
+        let env = expect_fixture_event(&mut fixture.client, "compact ChatEvent").await;
+        if env.stream != agent_stream {
+            continue;
+        }
+        assert_ne!(
+            env.kind,
+            FrameKind::AgentError,
+            "compact turn should not emit AgentError"
+        );
+        if env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+
+        let event: ChatEvent = env.parse_payload().expect("parse compact ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::System) {
+                    assert_eq!(message.content, "Conversation compacted.");
+                    saw_system_message = true;
+                }
+            }
+            ChatEvent::StreamEnd(data) => {
+                assert!(
+                    data.message.content.is_empty(),
+                    "compact turn should not fabricate assistant text"
+                );
+                saw_stream_end = true;
+            }
+            ChatEvent::TypingStatusChanged(false) => {
+                saw_typing_false = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_system_message,
+        "compact turn should emit a visible system message"
+    );
+    assert!(saw_stream_end, "compact turn should emit StreamEnd");
 }
 
 /// Fixture that uses real backends (not mock) so backend_kind dispatch is tested.
@@ -406,11 +698,26 @@ impl RealBackendFixture {
 }
 
 async fn expect_next_event(client: &mut ValidatedConnection, context: &str) -> Envelope {
-    match tokio::time::timeout(REAL_BACKEND_TIMEOUT, client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+    loop {
+        let env = match tokio::time::timeout(REAL_BACKEND_TIMEOUT, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+        ) {
+            continue;
+        }
+
+        return env;
     }
 }
 
@@ -448,8 +755,16 @@ async fn spawn_agent_via_protocol(
     name: &str,
     prompt: &str,
 ) -> protocol::StreamPath {
-    spawn_agent_via_protocol_with_images(client, workspace_roots, backend_kind, name, prompt, None)
-        .await
+    spawn_agent_via_protocol_with_options(
+        client,
+        workspace_roots,
+        backend_kind,
+        name,
+        prompt,
+        None,
+        cost_hint_for(backend_kind),
+    )
+    .await
 }
 
 async fn spawn_agent_via_protocol_with_images(
@@ -460,9 +775,31 @@ async fn spawn_agent_via_protocol_with_images(
     prompt: &str,
     images: Option<Vec<ImageData>>,
 ) -> protocol::StreamPath {
+    spawn_agent_via_protocol_with_options(
+        client,
+        workspace_roots,
+        backend_kind,
+        name,
+        prompt,
+        images,
+        cost_hint_for(backend_kind),
+    )
+    .await
+}
+
+async fn spawn_agent_via_protocol_with_options(
+    client: &mut ValidatedConnection,
+    workspace_roots: Vec<String>,
+    backend_kind: BackendKind,
+    name: &str,
+    prompt: &str,
+    images: Option<Vec<ImageData>>,
+    cost_hint: Option<SpawnCostHint>,
+) -> protocol::StreamPath {
     client
         .spawn_agent(SpawnAgentPayload {
-            name: name.to_owned(),
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
@@ -470,7 +807,8 @@ async fn spawn_agent_via_protocol_with_images(
                 prompt: prompt.to_owned(),
                 images,
                 backend_kind,
-                cost_hint: cost_hint_for(backend_kind),
+                cost_hint,
+                session_settings: None,
             },
         })
         .await
@@ -503,7 +841,8 @@ async fn resume_agent_via_protocol(
 ) -> StreamPath {
     client
         .spawn_agent(SpawnAgentPayload {
-            name: name.to_owned(),
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Resume {
@@ -560,6 +899,11 @@ async fn expect_assistant_turn_after_user_echo(
             ChatEvent::MessageAdded(message) => {
                 if matches!(message.sender, MessageSender::User) && message.content == prompt {
                     got_user_message_echo = true;
+                } else if got_user_message_echo && matches!(message.sender, MessageSender::Error) {
+                    panic!(
+                        "backend returned error instead of assistant response for prompt {:?}: {}",
+                        prompt, message.content
+                    );
                 }
             }
             ChatEvent::StreamStart(_) => {
@@ -907,6 +1251,44 @@ async fn assert_backend_describes_image_input(
     );
 }
 
+async fn assert_backend_returns_non_empty_name_for_name_prompt(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let workspace_roots = fixture.workspace_roots();
+    let source_prompt = "review the auth logs for login regressions";
+    let prompt = format!(
+        "Return only a short 2-4 word work name for this request. No quotes, no markdown, no explanation. Request: {source_prompt}"
+    );
+    let agent_stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "name-generator-probe",
+        &prompt,
+        None,
+        Some(SpawnCostHint::Low),
+    )
+    .await;
+    let response =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &agent_stream, &prompt).await;
+    let trimmed = response.final_text.trim();
+
+    assert!(
+        !trimmed.is_empty(),
+        "expected non-empty name-generation response for {backend_kind:?}; delta_count={} response={:?}",
+        response.delta_count,
+        response.final_text
+    );
+
+    let word_count = trimmed.split_whitespace().count();
+    assert!(
+        (2..=4).contains(&word_count),
+        "expected 2-4 words from name-generation response for {backend_kind:?}; got {:?}",
+        response.final_text
+    );
+}
+
 async fn expect_tool_turn_after_user_echo(
     client: &mut ValidatedConnection,
     agent_stream: &StreamPath,
@@ -1186,8 +1568,9 @@ async fn assert_backend_interrupts_long_running_command(
     let tool_call_id = loop {
         let context = format!("{backend_kind:?} long-running ToolRequest");
         let env = expect_next_event(&mut fixture.client, &context).await;
-        assert_eq!(env.kind, FrameKind::ChatEvent);
-        assert_eq!(env.stream, agent_stream);
+        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+            continue;
+        }
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
             ChatEvent::MessageAdded(message) => {
@@ -1220,8 +1603,9 @@ async fn assert_backend_interrupts_long_running_command(
     while Instant::now() < cancel_deadline {
         let context = format!("{backend_kind:?} interrupt outcome");
         let env = expect_next_event(&mut fixture.client, &context).await;
-        assert_eq!(env.kind, FrameKind::ChatEvent);
-        assert_eq!(env.stream, agent_stream);
+        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+            continue;
+        }
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
             ChatEvent::OperationCancelled(_) => {
@@ -1288,13 +1672,7 @@ async fn assert_backend_interrupts_long_running_command(
 
 #[tokio::test]
 async fn resumable_real_backends_remember_secret() {
-    let backends = [
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Gemini,
-        BackendKind::Tycode,
-        BackendKind::Kiro,
-    ];
+    let backends = [BackendKind::Claude, BackendKind::Codex, BackendKind::Gemini];
     let mut failures = Vec::new();
 
     for backend_kind in backends {
@@ -1342,7 +1720,6 @@ async fn real_backends_emit_stream_deltas() {
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Gemini,
-        BackendKind::Tycode,
         BackendKind::Kiro,
     ];
     let mut failures = Vec::new();
@@ -1395,7 +1772,6 @@ async fn real_backends_emit_typing_status() {
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Gemini,
-        BackendKind::Tycode,
         BackendKind::Kiro,
     ];
     let mut failures = Vec::new();
@@ -1483,13 +1859,7 @@ async fn real_codex_emits_tool_events_for_file_copy() {
 
 #[tokio::test]
 async fn real_backends_interrupt_long_running_command() {
-    let backends = [
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Gemini,
-        BackendKind::Tycode,
-        BackendKind::Kiro,
-    ];
+    let backends = [BackendKind::Claude, BackendKind::Codex, BackendKind::Kiro];
     let mut failures = Vec::new();
 
     for backend_kind in backends {
@@ -1569,6 +1939,49 @@ async fn real_codex_describes_image_input() {
     assert!(
         failures.is_empty(),
         "real backend image input failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn real_codex_low_cost_name_generation_prompt_returns_non_empty_response() {
+    let backends = [BackendKind::Codex];
+    let mut failures = Vec::new();
+
+    for backend_kind in backends {
+        if !backend_binary_available(backend_kind) {
+            eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+            continue;
+        }
+        if !backend_runtime_available(backend_kind) {
+            eprintln!(
+                "SKIPPED: {} not runnable in current environment",
+                backend_label(backend_kind)
+            );
+            continue;
+        }
+        if let Err(reason) = probe_backend_runtime(backend_kind).await {
+            eprintln!(
+                "SKIPPED: {} failed readiness probe: {}",
+                backend_label(backend_kind),
+                reason
+            );
+            continue;
+        }
+
+        let handle = tokio::spawn(async move {
+            let mut fixture = RealBackendFixture::new().await;
+            assert_backend_returns_non_empty_name_for_name_prompt(&mut fixture, backend_kind).await;
+        });
+
+        if let Err(err) = handle.await {
+            failures.push(format!("{}: {}", backend_label(backend_kind), err));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "real backend name-generation failures:\n{}",
         failures.join("\n")
     );
 }

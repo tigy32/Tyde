@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,10 +9,12 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
-use crate::claude::{SubAgentEmitter, SubAgentHandle};
+use crate::backend::{
+    SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
+};
+use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
 const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -22,9 +25,10 @@ const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX: u64 = 400_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
-const CODEX_FORCED_THREAD_SANDBOX: &str = "workspace-write";
+const CODEX_FORCED_THREAD_SANDBOX: &str = "danger-full-access";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
+static DISCOVERED_MODELS: OnceLock<Vec<protocol::SelectOption>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct CodexCommandHandle {
@@ -174,6 +178,7 @@ impl CodexSession {
                 model,
                 reasoning_effort: Some("xhigh".to_string()),
                 approval_policy: None,
+                turn_network_access: codex_has_http_mcp_servers(startup_mcp_servers),
                 active_turn_id: None,
                 active_stream: None,
                 token_usage_by_turn: HashMap::new(),
@@ -205,7 +210,48 @@ impl CodexSession {
         }
     }
 
-    pub async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+    pub async fn list_mcp_server_statuses(&self) -> Result<Value, String> {
+        self.inner
+            .rpc
+            .request(
+                "mcpServerStatus/list",
+                json!({
+                    "detail": "toolsAndAuthOnly",
+                    "limit": 100
+                }),
+            )
+            .await
+    }
+
+    pub async fn call_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Option<Value>,
+        meta: Option<Value>,
+    ) -> Result<Value, String> {
+        let thread_id = {
+            let state = self.inner.state.lock().await;
+            state.thread_id.clone()
+        };
+
+        self.inner
+            .rpc
+            .request(
+                "mcpServer/tool/call",
+                json!({
+                    "threadId": thread_id,
+                    "server": server,
+                    "tool": tool,
+                    "arguments": arguments,
+                    "_meta": meta
+                }),
+            )
+            .await
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
         let mut state = self.inner.state.lock().await;
         state.subagent_emitter = Some(emitter);
     }
@@ -246,6 +292,81 @@ pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, 
     limits
 }
 
+pub async fn discover_models() {
+    if DISCOVERED_MODELS.get().is_some() {
+        return;
+    }
+
+    // `model/list` is a JSON-RPC method, not a CLI subcommand. Spawn a short-lived
+    // app-server session to call it, the same way query_account_rate_limits does.
+    let (rpc, _inbound_rx) = match CodexRpc::spawn(None, &[], None).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::warn!("Codex model discovery: failed to spawn app-server: {err}");
+            return;
+        }
+    };
+
+    let init_result = rpc
+        .request(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "tyde", "title": Value::Null, "version": "0.1" },
+                "capabilities": { "experimentalApi": true }
+            }),
+        )
+        .await;
+    if let Err(err) = init_result {
+        tracing::warn!("Codex model discovery: initialize failed: {err}");
+        rpc.shutdown().await;
+        return;
+    }
+
+    let response = rpc
+        .request("model/list", json!({ "includeHidden": false }))
+        .await;
+    rpc.shutdown().await;
+
+    let response = match response {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!("Codex model discovery: model/list RPC failed: {err}");
+            return;
+        }
+    };
+
+    let raw_models = response
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let models = raw_models
+        .into_iter()
+        .filter_map(|model| {
+            let id = model
+                .get("model")
+                .or_else(|| model.get("id"))
+                .and_then(Value::as_str)?;
+            let label = model
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or(id);
+            Some(protocol::SelectOption {
+                value: id.to_string(),
+                label: label.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if models.is_empty() {
+        tracing::warn!("Codex model discovery: model/list returned no models");
+        return;
+    }
+
+    let _ = DISCOVERED_MODELS.set(models);
+}
+
 #[derive(Clone)]
 struct PendingRequest {
     request_id: Value,
@@ -278,10 +399,8 @@ struct TurnContextEstimate {
 }
 
 struct CodexSubAgentStream {
-    handle: SubAgentHandle,
-    description: String,
+    raw_event_tx: mpsc::UnboundedSender<Value>,
     receiver_thread_id: Option<String>,
-    tool_name: String,
     external_agent_id: Option<String>,
 }
 
@@ -297,8 +416,6 @@ struct CodexSubAgentSpawnInfo {
 #[derive(Clone)]
 struct CodexWaitAgentCompletion {
     external_agent_id: String,
-    success: bool,
-    final_response: Option<String>,
 }
 
 struct CodexState {
@@ -306,6 +423,7 @@ struct CodexState {
     model: Option<String>,
     reasoning_effort: Option<String>,
     approval_policy: Option<String>,
+    turn_network_access: bool,
     active_turn_id: Option<String>,
     active_stream: Option<ActiveStreamState>,
     token_usage_by_turn: HashMap<String, Value>,
@@ -358,7 +476,13 @@ impl CodexInner {
                     return Ok(());
                 }
 
-                let (thread_id, model_override, effort_override, approval_policy_override) = {
+                let (
+                    thread_id,
+                    model_override,
+                    effort_override,
+                    approval_policy_override,
+                    turn_network_access,
+                ) = {
                     let mut state = self.state.lock().await;
                     state.pending_user_input_bytes = message.len() as u64;
                     (
@@ -366,6 +490,7 @@ impl CodexInner {
                         state.model.clone(),
                         state.reasoning_effort.clone(),
                         state.approval_policy.clone(),
+                        state.turn_network_access,
                     )
                 };
 
@@ -400,9 +525,9 @@ impl CodexInner {
                 let approval_policy = approval_policy_override
                     .unwrap_or_else(|| CODEX_FORCED_APPROVAL_POLICY.to_string());
                 params["approvalPolicy"] = Value::String(approval_policy);
-                // Force writable sandbox on each turn so resumed/continued threads
-                // cannot fall back to a read-only default.
-                params["sandboxPolicy"] = codex_workspace_write_sandbox_policy();
+                // Force full-access sandbox on each turn so resumed/continued threads cannot fall back to a more restrictive default.
+                params["sandboxPolicy"] =
+                    codex_danger_full_access_sandbox_policy(turn_network_access);
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
                     self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
@@ -566,11 +691,7 @@ impl CodexInner {
             .cloned()
             .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
 
-        self.complete_all_codex_subagents(
-            false,
-            Some("Sub-agent run cancelled because the session was resumed.".to_string()),
-        )
-        .await;
+        self.complete_all_codex_subagents().await;
 
         {
             let mut state = self.state.lock().await;
@@ -842,11 +963,7 @@ impl CodexInner {
                 }));
             }
             CodexInbound::Closed { exit_code } => {
-                self.complete_all_codex_subagents(
-                    false,
-                    Some("Codex backend exited before sub-agent completion.".to_string()),
-                )
-                .await;
+                self.complete_all_codex_subagents().await;
                 self.emit_event(json!({
                     "kind": "SubprocessExit",
                     "data": { "exit_code": exit_code }
@@ -1458,8 +1575,7 @@ impl CodexInner {
         };
 
         if terminal {
-            self.complete_all_codex_subagents(false, Some(message.clone()))
-                .await;
+            self.complete_all_codex_subagents().await;
             self.emit_event(json!({ "kind": "Error", "data": message }));
             self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
             return;
@@ -2161,12 +2277,10 @@ impl CodexInner {
                     self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
                         .await;
                     if !success {
-                        self.complete_codex_subagent_if_needed(&item_id, item, false)
-                            .await;
+                        self.complete_codex_subagent_if_needed(&item_id).await;
                     }
                 } else {
-                    self.complete_codex_subagent_if_needed(&item_id, item, success)
-                        .await;
+                    self.complete_codex_subagent_if_needed(&item_id).await;
                 }
                 self.complete_codex_subagents_from_wait_if_needed(item)
                     .await;
@@ -2198,12 +2312,10 @@ impl CodexInner {
                     self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
                         .await;
                     if !success {
-                        self.complete_codex_subagent_if_needed(&item_id, item, false)
-                            .await;
+                        self.complete_codex_subagent_if_needed(&item_id).await;
                     }
                 } else {
-                    self.complete_codex_subagent_if_needed(&item_id, item, success)
-                        .await;
+                    self.complete_codex_subagent_if_needed(&item_id).await;
                 }
                 self.complete_codex_subagents_from_wait_if_needed(item)
                     .await;
@@ -2234,8 +2346,11 @@ impl CodexInner {
                 spawn.name,
                 spawn.description.clone(),
                 spawn.agent_type,
+                spawn.receiver_thread_id.clone().map(SessionId),
             )
             .await;
+        let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
+        spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx.clone());
 
         let mut state = self.state.lock().await;
         tracing::info!(
@@ -2247,47 +2362,15 @@ impl CodexInner {
             .subagent_streams
             .entry(spawn.item_id)
             .or_insert(CodexSubAgentStream {
-                handle,
-                description: spawn.description,
+                raw_event_tx,
                 receiver_thread_id: spawn.receiver_thread_id,
-                tool_name: spawn.tool_name,
                 external_agent_id: None,
             });
     }
 
-    async fn complete_codex_subagent_if_needed(&self, item_id: &str, item: &Value, success: bool) {
-        let (emitter, stream) = {
-            let mut state = self.state.lock().await;
-            (
-                state.subagent_emitter.clone(),
-                state.subagent_streams.remove(item_id),
-            )
-        };
-
-        let Some(stream) = stream else {
-            return;
-        };
-        let Some(emitter) = emitter else {
-            return;
-        };
-
-        let final_response = extract_codex_subagent_final_response(item).or_else(|| {
-            if success {
-                None
-            } else {
-                Some(codex_subagent_failure_message(&stream))
-            }
-        });
-
-        emitter
-            .on_subagent_completed(
-                item_id,
-                stream.handle.agent_id,
-                success,
-                final_response,
-                stream.handle.event_tx.clone(),
-            )
-            .await;
+    async fn complete_codex_subagent_if_needed(&self, item_id: &str) {
+        let mut state = self.state.lock().await;
+        state.subagent_streams.remove(item_id);
     }
 
     async fn record_codex_subagent_spawn_result_if_needed(&self, item_id: &str, item: &Value) {
@@ -2316,12 +2399,8 @@ impl CodexInner {
             completions.len()
         );
         for completion in completions {
-            self.complete_codex_subagent_by_external_id(
-                &completion.external_agent_id,
-                completion.success,
-                completion.final_response.clone(),
-            )
-            .await;
+            self.complete_codex_subagent_by_external_id(&completion.external_agent_id)
+                .await;
         }
     }
 
@@ -2333,110 +2412,42 @@ impl CodexInner {
             "Codex subagent notification parsed for external_agent_id={}",
             completion.external_agent_id
         );
-        self.complete_codex_subagent_by_external_id(
-            &completion.external_agent_id,
-            completion.success,
-            completion.final_response,
-        )
-        .await;
-    }
-
-    async fn complete_codex_subagent_by_external_id(
-        &self,
-        external_agent_id: &str,
-        success: bool,
-        final_response: Option<String>,
-    ) {
-        let (emitter, stream_item_id, stream) = {
-            let mut state = self.state.lock().await;
-            let emitter = state.subagent_emitter.clone();
-
-            let direct_match = state.subagent_streams.iter().find_map(|(item_id, stream)| {
-                (stream.external_agent_id.as_deref() == Some(external_agent_id))
-                    .then(|| item_id.clone())
-            });
-
-            let fallback_single_unknown = if direct_match.is_none() {
-                let mut unknown = state
-                    .subagent_streams
-                    .iter()
-                    .filter(|(_, stream)| stream.external_agent_id.is_none())
-                    .map(|(item_id, _)| item_id.clone());
-                let first = unknown.next();
-                if first.is_some() && unknown.next().is_none() {
-                    first
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let item_id = direct_match.or(fallback_single_unknown);
-            let stream = item_id
-                .as_ref()
-                .and_then(|id| state.subagent_streams.remove(id));
-            (emitter, item_id, stream)
-        };
-
-        let Some(emitter) = emitter else {
-            return;
-        };
-        let Some(item_id) = stream_item_id else {
-            return;
-        };
-        let Some(stream) = stream else {
-            return;
-        };
-
-        let final_response = final_response.or_else(|| {
-            if success {
-                None
-            } else {
-                Some(codex_subagent_failure_message(&stream))
-            }
-        });
-
-        emitter
-            .on_subagent_completed(
-                &item_id,
-                stream.handle.agent_id,
-                success,
-                final_response,
-                stream.handle.event_tx.clone(),
-            )
+        self.complete_codex_subagent_by_external_id(&completion.external_agent_id)
             .await;
     }
 
-    async fn complete_all_codex_subagents(&self, success: bool, message: Option<String>) {
-        let (emitter, streams) = {
-            let mut state = self.state.lock().await;
-            let streams = state.subagent_streams.drain().collect::<Vec<_>>();
-            (state.subagent_emitter.clone(), streams)
+    async fn complete_codex_subagent_by_external_id(&self, external_agent_id: &str) {
+        let mut state = self.state.lock().await;
+
+        let direct_match = state.subagent_streams.iter().find_map(|(item_id, stream)| {
+            (stream.external_agent_id.as_deref() == Some(external_agent_id))
+                .then(|| item_id.clone())
+        });
+
+        let fallback_single_unknown = if direct_match.is_none() {
+            let mut unknown = state
+                .subagent_streams
+                .iter()
+                .filter(|(_, stream)| stream.external_agent_id.is_none())
+                .map(|(item_id, _)| item_id.clone());
+            let first = unknown.next();
+            if first.is_some() && unknown.next().is_none() {
+                first
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
-        let Some(emitter) = emitter else {
-            return;
-        };
-
-        for (item_id, stream) in streams {
-            let final_response = message.clone().or_else(|| {
-                if success {
-                    None
-                } else {
-                    Some(codex_subagent_failure_message(&stream))
-                }
-            });
-            emitter
-                .on_subagent_completed(
-                    &item_id,
-                    stream.handle.agent_id,
-                    success,
-                    final_response,
-                    stream.handle.event_tx.clone(),
-                )
-                .await;
+        if let Some(item_id) = direct_match.or(fallback_single_unknown) {
+            state.subagent_streams.remove(&item_id);
         }
+    }
+
+    async fn complete_all_codex_subagents(&self) {
+        let mut state = self.state.lock().await;
+        state.subagent_streams.clear();
     }
 
     fn handle_plan_update(&self, params: &Value) {
@@ -2518,8 +2529,7 @@ impl CodexInner {
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
 
         if turn_status == "interrupted" {
-            self.complete_all_codex_subagents(false, Some("Operation cancelled".to_string()))
-                .await;
+            self.complete_all_codex_subagents().await;
             self.emit_event(json!({
                 "kind": "OperationCancelled",
                 "data": { "message": "Operation cancelled" }
@@ -2535,8 +2545,7 @@ impl CodexInner {
                 .and_then(Value::as_str)
                 .unwrap_or("Codex turn failed")
                 .to_string();
-            self.complete_all_codex_subagents(false, Some(message.clone()))
-                .await;
+            self.complete_all_codex_subagents().await;
             self.emit_event(json!({ "kind": "Error", "data": message }));
         }
     }
@@ -2708,7 +2717,7 @@ fn find_subagent_event_tx_for_thread(
         stream.receiver_thread_id.as_deref() == Some(thread_id)
             || stream.external_agent_id.as_deref() == Some(thread_id)
     }) {
-        return Some(stream.handle.event_tx.clone());
+        return Some(stream.raw_event_tx.clone());
     }
 
     // Early in a spawn, Codex may start emitting sub-agent notifications before
@@ -2718,7 +2727,7 @@ fn find_subagent_event_tx_for_thread(
         .subagent_streams
         .values()
         .filter(|stream| stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none())
-        .map(|stream| stream.handle.event_tx.clone());
+        .map(|stream| stream.raw_event_tx.clone());
     let first = unresolved.next()?;
     if unresolved.next().is_some() {
         return None;
@@ -3057,25 +3066,13 @@ fn codex_parse_collab_agent_state_entry(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let final_response = state_entry
-        .get("message")
-        .and_then(codex_status_text_from_entry)
-        .or_else(|| codex_status_text_from_entry(state_entry));
 
     match status.as_str() {
-        "completed" => Some(CodexWaitAgentCompletion {
-            external_agent_id: external_agent_id.to_string(),
-            success: true,
-            final_response,
-        }),
-        "errored" | "error" | "failed" | "interrupted" | "shutdown" | "notfound" => {
+        "completed" | "errored" | "error" | "failed" | "interrupted" | "shutdown" | "notfound" => {
             Some(CodexWaitAgentCompletion {
                 external_agent_id: external_agent_id.to_string(),
-                success: false,
-                final_response,
             })
         }
-        "running" | "pendinginit" => None,
         _ => None,
     }
 }
@@ -3089,88 +3086,34 @@ fn codex_parse_wait_agent_status_entry(
         return None;
     }
 
-    let (success, final_response) = match status_entry {
+    let is_running = match status_entry {
         Value::Object(map) => {
-            if let Some(value) = map.get("completed") {
-                (true, codex_status_text_from_entry(value))
-            } else if let Some(value) = map.get("failed").or_else(|| map.get("error")) {
-                (false, codex_status_text_from_entry(value))
-            } else if let Some(value) = map
-                .get("cancelled")
-                .or_else(|| map.get("canceled"))
-                .or_else(|| map.get("interrupted"))
+            if map.get("completed").is_some()
+                || map.get("failed").is_some()
+                || map.get("error").is_some()
+                || map.get("cancelled").is_some()
+                || map.get("canceled").is_some()
+                || map.get("interrupted").is_some()
+                || map.get("success").and_then(Value::as_bool).is_some()
             {
-                (false, codex_status_text_from_entry(value))
-            } else if let Some(success) = map.get("success").and_then(Value::as_bool) {
-                let text = map
-                    .get("message")
-                    .or_else(|| map.get("result"))
-                    .or_else(|| map.get("summary"))
-                    .and_then(codex_status_text_from_entry);
-                (success, text)
+                false
             } else if let Some(status) = map.get("status").and_then(Value::as_str) {
                 let normalized = status.trim().to_ascii_lowercase();
-                let success = matches!(
-                    normalized.as_str(),
-                    "completed" | "complete" | "succeeded" | "success" | "ok" | "done"
-                );
-                let text = map
-                    .get("message")
-                    .or_else(|| map.get("result"))
-                    .or_else(|| map.get("summary"))
-                    .and_then(codex_status_text_from_entry);
-                (success, text)
+                matches!(normalized.as_str(), "running" | "pendinginit")
             } else {
-                (true, codex_status_text_from_entry(status_entry))
+                false
             }
         }
-        Value::String(_) | Value::Number(_) | Value::Bool(_) => {
-            (true, codex_status_text_from_entry(status_entry))
-        }
-        _ => (true, None),
+        _ => false,
     };
+
+    if is_running {
+        return None;
+    }
 
     Some(CodexWaitAgentCompletion {
         external_agent_id: external_agent_id.to_string(),
-        success,
-        final_response,
     })
-}
-
-fn codex_status_text_from_entry(value: &Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    if let Some(num) = value.as_i64() {
-        return Some(num.to_string());
-    }
-    if let Some(num) = value.as_u64() {
-        return Some(num.to_string());
-    }
-    if let Some(num) = value.as_f64() {
-        return Some(num.to_string());
-    }
-    if let Some(flag) = value.as_bool() {
-        return Some(flag.to_string());
-    }
-    codex_find_string(
-        value,
-        &[
-            "message",
-            "result",
-            "summary",
-            "text",
-            "content",
-            "output",
-            "completed",
-            "failed",
-            "error",
-        ],
-        3,
-    )
 }
 
 fn extract_codex_subagent_notification_completion(text: &str) -> Option<CodexWaitAgentCompletion> {
@@ -3180,11 +3123,7 @@ fn extract_codex_subagent_notification_completion(text: &str) -> Option<CodexWai
     if let Some(parsed) = codex_parse_wait_agent_status_entry(&external_agent_id, &status_entry) {
         return Some(parsed);
     }
-    Some(CodexWaitAgentCompletion {
-        external_agent_id,
-        success: true,
-        final_response: codex_status_text_from_entry(&status_entry),
-    })
+    Some(CodexWaitAgentCompletion { external_agent_id })
 }
 
 fn codex_extract_tagged_payload_json(text: &str, tag: &str) -> Option<Value> {
@@ -3232,38 +3171,6 @@ where
         }
         _ => {}
     }
-}
-
-fn codex_subagent_failure_message(stream: &CodexSubAgentStream) -> String {
-    if let Some(thread_id) = stream.receiver_thread_id.as_ref() {
-        format!("{} failed (thread {}).", stream.tool_name, thread_id)
-    } else if !stream.description.trim().is_empty() {
-        format!("{} failed: {}", stream.tool_name, stream.description)
-    } else {
-        format!("{} failed", stream.tool_name)
-    }
-}
-
-fn extract_codex_subagent_final_response(item: &Value) -> Option<String> {
-    let text = codex_find_string(
-        item,
-        &[
-            "finalResponse",
-            "final_response",
-            "response",
-            "resultText",
-            "output",
-            "summary",
-            "text",
-            "message",
-        ],
-        5,
-    )?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.to_string())
 }
 
 fn codex_find_string(value: &Value, keys: &[&str], depth: usize) -> Option<String> {
@@ -4141,8 +4048,21 @@ fn parse_review_decision(message: &str) -> &'static str {
     }
 }
 
-fn codex_workspace_write_sandbox_policy() -> Value {
-    json!({ "type": "workspaceWrite" })
+fn codex_has_http_mcp_servers(startup_mcp_servers: &[StartupMcpServer]) -> bool {
+    startup_mcp_servers.iter().any(|server| {
+        matches!(
+            server.transport,
+            StartupMcpTransport::Http {
+                url: _,
+                headers: _,
+                bearer_token_env_var: _,
+            }
+        )
+    })
+}
+
+fn codex_danger_full_access_sandbox_policy(_network_access: bool) -> Value {
+    json!({ "type": "dangerFullAccess" })
 }
 
 fn normalize_reasoning_effort(raw: &str) -> Option<String> {
@@ -4263,6 +4183,7 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
         match &server.transport {
             StartupMcpTransport::Http {
                 url,
+                headers,
                 bearer_token_env_var,
                 ..
             } => {
@@ -4271,6 +4192,13 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
                     continue;
                 }
                 overrides.push(format!("{base}.url={}", toml_quoted(trimmed_url)));
+                for (key, value) in headers {
+                    let key = key.trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    overrides.push(format!("{base}.http_headers.{key}={}", toml_quoted(value)));
+                }
                 if let Some(env_var) = bearer_token_env_var
                     .as_ref()
                     .map(|raw| raw.trim())
@@ -4523,13 +4451,15 @@ impl CodexRpc {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SessionId, SpawnCostHint,
-    StreamEndData, StreamStartData, StreamTextDeltaData, ToolExecutionCompletedData,
+    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SelectOption, SessionId,
+    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
+    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, ToolExecutionCompletedData,
     ToolExecutionResult, ToolRequest, ToolRequestType,
 };
 
 use super::{
     Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+    resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
 const BACKEND_INPUT_BUFFER: usize = 64;
@@ -4539,15 +4469,49 @@ pub struct CodexBackend {
     input_tx: mpsc::Sender<AgentInput>,
     interrupt_tx: mpsc::Sender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
+    subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+}
+
+impl CodexBackend {
+    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        let _ = self.subagent_emitter_tx.send(Some(emitter));
+    }
 }
 
 fn codex_backend_defaults(cost_hint: Option<SpawnCostHint>) -> (Option<String>, Option<String>) {
     match cost_hint {
-        Some(SpawnCostHint::Low) => (None, Some("minimal".to_string())),
+        Some(SpawnCostHint::Low) => (None, Some("low".to_string())),
         Some(SpawnCostHint::Medium) => (None, Some("medium".to_string())),
         Some(SpawnCostHint::High) => (None, Some("xhigh".to_string())),
         None => (None, None),
     }
+}
+
+fn codex_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+    let (model, effort) = codex_backend_defaults(Some(cost_hint));
+    let mut values = protocol::SessionSettingsValues::default();
+    if let Some(model) = model {
+        values
+            .0
+            .insert("model".to_string(), SessionSettingValue::String(model));
+    }
+    if let Some(effort) = effort {
+        values.0.insert(
+            "reasoning_effort".to_string(),
+            SessionSettingValue::String(effort),
+        );
+    }
+    values
+}
+
+pub(crate) fn resolve_session_settings(
+    config: &BackendSpawnConfig,
+) -> protocol::SessionSettingsValues {
+    resolve_backend_settings(
+        config,
+        &CodexBackend::session_settings_schema(),
+        codex_cost_hint_defaults,
+    )
 }
 
 fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
@@ -4564,11 +4528,107 @@ fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>
     })
 }
 
+fn backend_error_message(content: String) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        timestamp: unix_now_ms(),
+        sender: MessageSender::Error,
+        content,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
+}
+
+fn spawn_codex_subagent_event_bridge(
+    mut raw_rx: mpsc::UnboundedReceiver<Value>,
+    event_tx: mpsc::UnboundedSender<ChatEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(raw) = raw_rx.recv().await {
+            let event = match raw_chat_event(&raw) {
+                Some(event) => event,
+                None => match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                    "Error" => {
+                        let message = raw
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex backend error")
+                            .to_string();
+                        backend_error_message(message)
+                    }
+                    _ => continue,
+                },
+            };
+            if event_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn raw_chat_event(value: &Value) -> Option<ChatEvent> {
     serde_json::from_value::<ChatEvent>(value.clone()).ok()
 }
 
 impl Backend for CodexBackend {
+    fn session_settings_schema() -> SessionSettingsSchema {
+        SessionSettingsSchema {
+            backend_kind: protocol::BackendKind::Codex,
+            fields: vec![
+                SessionSettingField {
+                    key: "model".to_string(),
+                    label: "Model".to_string(),
+                    description: None,
+                    use_slider: false,
+                    field_type: SessionSettingFieldType::Select {
+                        options: match DISCOVERED_MODELS.get() {
+                            Some(models) => models.clone(),
+                            None => {
+                                tracing::warn!(
+                                    "Codex session settings schema requested before model discovery completed"
+                                );
+                                Vec::new()
+                            }
+                        },
+                        default: None,
+                        nullable: true,
+                    },
+                },
+                SessionSettingField {
+                    key: "reasoning_effort".to_string(),
+                    label: "Reasoning Effort".to_string(),
+                    description: None,
+                    use_slider: true,
+                    field_type: SessionSettingFieldType::Select {
+                        options: vec![
+                            SelectOption {
+                                value: "low".to_string(),
+                                label: "Low".to_string(),
+                            },
+                            SelectOption {
+                                value: "medium".to_string(),
+                                label: "Medium".to_string(),
+                            },
+                            SelectOption {
+                                value: "high".to_string(),
+                                label: "High".to_string(),
+                            },
+                            SelectOption {
+                                value: "xhigh".to_string(),
+                                label: "XHigh".to_string(),
+                            },
+                        ],
+                        default: Some("xhigh".to_string()),
+                        nullable: true,
+                    },
+                },
+            ],
+        }
+    }
+
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -4587,16 +4647,43 @@ impl Backend for CodexBackend {
         let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
+        let (subagent_emitter_tx, _subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
         tokio::spawn(async move {
             let mut ready_tx = Some(ready_tx);
-            let (model_override, effort_override) = codex_backend_defaults(config.cost_hint);
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let effort_override = match resolved_settings.0.get("reasoning_effort") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let mut startup_mcp_config_overrides =
+                codex_mcp_config_overrides(&config.startup_mcp_servers);
+            if let Some(instructions) = combined_instructions.as_ref() {
+                let path = crate::steering::write_codex_steering_tempfile(instructions)
+                    .unwrap_or_else(|err| {
+                        panic!("failed to materialize Codex instructions: {err}")
+                    });
+                startup_mcp_config_overrides.push(format!(
+                    "model_instructions_file={}",
+                    toml_quoted(&path.display().to_string())
+                ));
+            }
+            let turn_network_access = codex_has_http_mcp_servers(&config.startup_mcp_servers);
             // --- spawn codex CLI ------------------------------------------------
-            let mut child = match Command::new("codex")
-                .arg("app-server")
-                .arg("--listen")
-                .arg("stdio://")
+            let mut command = Command::new("codex");
+            command.arg("app-server").arg("--listen").arg("stdio://");
+            for override_key_value in &startup_mcp_config_overrides {
+                command.arg("-c").arg(override_key_value);
+            }
+            let mut child = match command
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -4782,6 +4869,11 @@ impl Backend for CodexBackend {
             let mut active_turn_id: Option<String> = None;
             let mut typing_status_active = false;
             let mut file_change_call_ids: HashMap<String, Vec<String>> = HashMap::new();
+            let mut saw_agent_message_delta = false;
+            let mut saw_agent_message_completed = false;
+            let mut reasoning_notification_count = 0usize;
+            let mut started_item_types: Vec<String> = Vec::new();
+            let mut completed_item_types: Vec<String> = Vec::new();
             let stdin_for_input = Arc::clone(&stdin);
             let pending_for_input = Arc::clone(&pending);
             let next_id_for_input = Arc::clone(&next_id);
@@ -4838,6 +4930,12 @@ impl Backend for CodexBackend {
             if let Some(effort) = effort_override.clone() {
                 initial_turn_params["effort"] = Value::String(effort);
             }
+            initial_turn_params["summary"] =
+                Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
+            initial_turn_params["approvalPolicy"] =
+                Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
+            initial_turn_params["sandboxPolicy"] =
+                codex_danger_full_access_sandbox_policy(turn_network_access);
             if let Err(err) = rpc_request(
                 &stdin_for_input,
                 &pending_for_input,
@@ -4861,6 +4959,9 @@ impl Backend for CodexBackend {
                 tokio::select! {
                     notif = notif_rx.recv() => {
                         let Some((method, params)) = notif else { break };
+                        if is_reasoning_notification_method(method.as_str()) {
+                            reasoning_notification_count = reasoning_notification_count.saturating_add(1);
+                        }
 
                         match method.as_str() {
                             "turn/started" => {
@@ -4873,6 +4974,11 @@ impl Backend for CodexBackend {
                                 active_turn_id = Some(turn_id.clone());
                                 current_message_id = Some(turn_id.clone());
                                 accumulated_text.clear();
+                                saw_agent_message_delta = false;
+                                saw_agent_message_completed = false;
+                                reasoning_notification_count = 0;
+                                started_item_types.clear();
+                                completed_item_types.clear();
                                 if !typing_status_active {
                                     let _ = events_tx
                                         .send(ChatEvent::TypingStatusChanged(true))
@@ -4896,6 +5002,7 @@ impl Backend for CodexBackend {
                                 if delta.is_empty() {
                                     continue;
                                 }
+                                saw_agent_message_delta = true;
                                 let msg_id = params
                                     .get("itemId")
                                     .and_then(Value::as_str)
@@ -4940,8 +5047,12 @@ impl Backend for CodexBackend {
                                     .and_then(Value::as_str)
                                     .unwrap_or("item")
                                     .to_string();
+                                if !item_type.is_empty() && completed_item_types.len() < 8 {
+                                    completed_item_types.push(item_type.to_string());
+                                }
                                 match item_type {
                                     "agentMessage" => {
+                                        saw_agent_message_completed = true;
                                         let text = item
                                             .get("text")
                                             .and_then(Value::as_str)
@@ -5088,6 +5199,9 @@ impl Backend for CodexBackend {
                                     .and_then(Value::as_str)
                                     .unwrap_or("tool-call")
                                     .to_string();
+                                if !item_type.is_empty() && started_item_types.len() < 8 {
+                                    started_item_types.push(item_type.to_string());
+                                }
                                 match item_type {
                                     "commandExecution" => {
                                         let command = item
@@ -5166,29 +5280,60 @@ impl Backend for CodexBackend {
                                     .and_then(|v| v.get("status"))
                                     .and_then(Value::as_str)
                                     .unwrap_or("completed");
+                                let turn_id_for_log = active_turn_id.clone();
+                                let turn_error_message = (turn_status == "failed").then(|| {
+                                    params
+                                        .get("turn")
+                                        .and_then(|v| v.get("error"))
+                                        .and_then(|v| v.get("message"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Codex turn failed")
+                                        .to_string()
+                                });
                                 active_turn_id = None;
                                 // If we still have an open stream (no item/completed
                                 // for agentMessage was received), close it now.
                                 if current_message_id.is_some() {
                                     let final_text = std::mem::take(&mut accumulated_text);
-                                    let message = ChatMessage {
-                                        timestamp: unix_now_ms(),
-                                        sender: MessageSender::Assistant {
-                                            agent: CODEX_AGENT_NAME.to_owned(),
-                                        },
-                                        content: final_text,
-                                        reasoning: None,
-                                        tool_calls: Vec::new(),
-                                        model_info: Some(ModelInfo {
-                                            model: model_name.clone(),
-                                        }),
-                                        token_usage: None,
-                                        context_breakdown: None,
-                                        images: None,
-                                    };
-                                    let _ = events_tx
-                                        .send(ChatEvent::StreamEnd(StreamEndData { message }))
-                                        .await;
+                                    let had_assistant_content = !final_text.trim().is_empty()
+                                        || saw_agent_message_delta
+                                        || saw_agent_message_completed;
+                                    let should_emit_empty_stream_end =
+                                        !had_assistant_content && turn_status != "failed";
+                                    if !had_assistant_content && !should_emit_empty_stream_end {
+                                        tracing::warn!(
+                                            turn_id = ?turn_id_for_log,
+                                            turn_status,
+                                            model = %model_name,
+                                            model_override = ?model_override,
+                                            reasoning_effort = ?effort_override,
+                                            reasoning_notification_count,
+                                            started_item_types = ?started_item_types,
+                                            completed_item_types = ?completed_item_types,
+                                            turn_error_message = ?turn_error_message,
+                                            "Codex turn completed without any assistant message content"
+                                        );
+                                    }
+                                    if had_assistant_content || should_emit_empty_stream_end {
+                                        let message = ChatMessage {
+                                            timestamp: unix_now_ms(),
+                                            sender: MessageSender::Assistant {
+                                                agent: CODEX_AGENT_NAME.to_owned(),
+                                            },
+                                            content: final_text,
+                                            reasoning: None,
+                                            tool_calls: Vec::new(),
+                                            model_info: Some(ModelInfo {
+                                                model: model_name.clone(),
+                                            }),
+                                            token_usage: None,
+                                            context_breakdown: None,
+                                            images: None,
+                                        };
+                                        let _ = events_tx
+                                            .send(ChatEvent::StreamEnd(StreamEndData { message }))
+                                            .await;
+                                    }
                                     current_message_id = None;
                                 }
                                 if turn_status == "interrupted" {
@@ -5199,6 +5344,9 @@ impl Backend for CodexBackend {
                                             },
                                         ))
                                         .await;
+                                }
+                                if let Some(message) = turn_error_message {
+                                    let _ = events_tx.send(backend_error_message(message)).await;
                                 }
                                 if typing_status_active {
                                     let _ = events_tx
@@ -5212,57 +5360,86 @@ impl Backend for CodexBackend {
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else { break };
-                        let AgentInput::SendMessage(payload) = input;
-                        let backend_message = payload.message;
-                        let visible_message = backend_message.clone();
-                        let visible_images = payload.images.clone();
-                        let images = protocol_images_to_attachments(payload.images);
-                        if events_tx
-                            .send(backend_user_message(visible_message, visible_images))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        let mut input_items = vec![json!({
-                            "type": "text",
-                            "text": backend_message,
-                        })];
-                        if let Some(imgs) = images {
-                            for image in imgs {
-                                let path = match persist_temp_image(&image).await {
-                                    Ok(path) => path,
-                                    Err(err) => {
-                                        tracing::error!(
-                                            "Failed to persist Codex image attachment: {err}"
-                                        );
-                                        continue;
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let backend_message = payload.message;
+                                let visible_message = backend_message.clone();
+                                let visible_images = payload.images.clone();
+                                let images = protocol_images_to_attachments(payload.images);
+                                if events_tx
+                                    .send(backend_user_message(visible_message, visible_images))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                let mut input_items = vec![json!({
+                                    "type": "text",
+                                    "text": backend_message,
+                                })];
+                                if let Some(imgs) = images {
+                                    for image in imgs {
+                                        let path = match persist_temp_image(&image).await {
+                                            Ok(path) => path,
+                                            Err(err) => {
+                                                tracing::error!(
+                                                    "Failed to persist Codex image attachment: {err}"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        input_items.push(json!({
+                                            "type": "localImage",
+                                            "path": path,
+                                        }));
                                     }
-                                };
-                                input_items.push(json!({
-                                    "type": "localImage",
-                                    "path": path,
-                                }));
+                                }
+                                let mut turn_params = json!({
+                                    "threadId": thread_id_for_input,
+                                    "input": input_items,
+                                });
+                                if let Some(model) = model_for_input.clone() {
+                                    turn_params["model"] = Value::String(model);
+                                }
+                                if let Some(effort) = effort_for_input.clone() {
+                                    turn_params["effort"] = Value::String(effort);
+                                }
+                                turn_params["summary"] =
+                                    Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
+                                turn_params["approvalPolicy"] =
+                                    Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
+                                turn_params["sandboxPolicy"] =
+                                    codex_danger_full_access_sandbox_policy(turn_network_access);
+                                let _ = rpc_request(
+                                    &stdin_for_input,
+                                    &pending_for_input,
+                                    &next_id_for_input,
+                                    "turn/start",
+                                    turn_params,
+                                )
+                                .await;
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                let _ = rpc_request(
+                                    &stdin_for_input,
+                                    &pending_for_input,
+                                    &next_id_for_input,
+                                    "thread/update",
+                                    json!({
+                                        "threadId": thread_id_for_input,
+                                        "settings": session_settings_to_json(&payload.values),
+                                    }),
+                                )
+                                .await;
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
                             }
                         }
-                        let mut turn_params = json!({
-                            "threadId": thread_id_for_input,
-                            "input": input_items,
-                        });
-                        if let Some(model) = model_for_input.clone() {
-                            turn_params["model"] = Value::String(model);
-                        }
-                        if let Some(effort) = effort_for_input.clone() {
-                            turn_params["effort"] = Value::String(effort);
-                        }
-                        let _ = rpc_request(
-                            &stdin_for_input,
-                            &pending_for_input,
-                            &next_id_for_input,
-                            "turn/start",
-                            turn_params,
-                        )
-                        .await;
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(()) = interrupt else { break };
@@ -5294,6 +5471,7 @@ impl Backend for CodexBackend {
                 input_tx,
                 interrupt_tx,
                 session_id,
+                subagent_emitter_tx,
             },
             EventStream::new(events_rx),
         ))
@@ -5307,6 +5485,8 @@ impl Backend for CodexBackend {
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
         let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (subagent_emitter_tx, _subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
         let roots = if workspace_roots.is_empty() {
             vec!["/tmp".to_string()]
@@ -5318,17 +5498,33 @@ impl Backend for CodexBackend {
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
 
         tokio::spawn(async move {
-            let (session, mut raw_events) =
-                match CodexSession::spawn(&roots, None, &config.startup_mcp_servers, None).await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::error!("Failed to spawn Codex resume session: {err}");
-                        return;
-                    }
-                };
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
+            let (session, mut raw_events) = match CodexSession::spawn(
+                &roots,
+                None,
+                &config.startup_mcp_servers,
+                combined_instructions.as_deref(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Codex resume session: {err}");
+                    return;
+                }
+            };
 
             let handle = session.command_handle();
-            let (model_override, effort_override) = codex_backend_defaults(config.cost_hint);
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let effort_override = match resolved_settings.0.get("reasoning_effort") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
             if model_override.is_some() || effort_override.is_some() {
                 let settings = json!({
                     "model": model_override,
@@ -5372,17 +5568,39 @@ impl Backend for CodexBackend {
                         let Some(input) = input else {
                             break;
                         };
-                        let AgentInput::SendMessage(payload) = input;
-                        let images = protocol_images_to_attachments(payload.images);
-                        if let Err(err) = handle
-                            .execute(SessionCommand::SendMessage {
-                                message: payload.message,
-                                images,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to send Codex resume follow-up: {err}");
-                            break;
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Codex resume follow-up: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update resumed Codex session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
                         }
                     }
                     interrupt = interrupt_rx.recv() => {
@@ -5403,6 +5621,7 @@ impl Backend for CodexBackend {
                 input_tx,
                 interrupt_tx,
                 session_id: backend_session_id,
+                subagent_emitter_tx,
             },
             EventStream::new(events_rx),
         ))
@@ -5427,11 +5646,18 @@ impl Backend for CodexBackend {
     async fn interrupt(&self) -> bool {
         self.interrupt_tx.send(()).await.is_ok()
     }
+
+    async fn shutdown(self) {
+        drop(self);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sub_agent::SubAgentHandle;
+    use protocol::AgentId;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -5534,6 +5760,7 @@ mod tests {
             model: Some("codex".to_string()),
             reasoning_effort: Some("xhigh".to_string()),
             approval_policy: None,
+            turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
             active_stream: Some(ActiveStreamState {
                 turn_id: "turn-test".to_string(),
@@ -5590,22 +5817,13 @@ mod tests {
         name: String,
         description: String,
         agent_type: String,
-        agent_id: u64,
-    }
-
-    #[derive(Debug)]
-    struct RecordedCompletion {
-        tool_use_id: String,
-        agent_id: u64,
-        success: bool,
-        final_response: Option<String>,
+        agent_id: AgentId,
     }
 
     struct RecordingSubAgentEmitter {
         next_agent_id: AtomicU64,
         spawns: tokio::sync::Mutex<Vec<RecordedSpawn>>,
-        completions: tokio::sync::Mutex<Vec<RecordedCompletion>>,
-        events_by_agent_id: Arc<tokio::sync::Mutex<HashMap<u64, Vec<Value>>>>,
+        events_by_agent_id: Arc<tokio::sync::Mutex<HashMap<AgentId, Vec<ChatEvent>>>>,
     }
 
     impl RecordingSubAgentEmitter {
@@ -5613,7 +5831,6 @@ mod tests {
             Self {
                 next_agent_id: AtomicU64::new(1),
                 spawns: tokio::sync::Mutex::new(Vec::new()),
-                completions: tokio::sync::Mutex::new(Vec::new()),
                 events_by_agent_id: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             }
         }
@@ -5622,11 +5839,7 @@ mod tests {
             self.spawns.lock().await.len()
         }
 
-        async fn completion_count(&self) -> usize {
-            self.completions.lock().await.len()
-        }
-
-        async fn events_by_agent(&self) -> HashMap<u64, Vec<Value>> {
+        async fn events_by_agent(&self) -> HashMap<AgentId, Vec<ChatEvent>> {
             self.events_by_agent_id.lock().await.clone()
         }
     }
@@ -5638,56 +5851,111 @@ mod tests {
             name: String,
             description: String,
             agent_type: String,
+            _session_id_hint: Option<SessionId>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubAgentHandle> + Send + '_>>
         {
             Box::pin(async move {
-                let agent_id = self.next_agent_id.fetch_add(1, Ordering::Relaxed);
-                let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+                let agent_id = AgentId(format!(
+                    "subagent-{}",
+                    self.next_agent_id.fetch_add(1, Ordering::Relaxed)
+                ));
+                let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
                 let events_by_agent_id = Arc::clone(&self.events_by_agent_id);
+                let agent_id_for_events = agent_id.clone();
                 tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
                         let mut guard = events_by_agent_id.lock().await;
-                        guard.entry(agent_id).or_default().push(event);
+                        guard
+                            .entry(agent_id_for_events.clone())
+                            .or_default()
+                            .push(event);
                     }
                 });
                 live_test_log(&format!(
-                    "spawn callback: tool_use_id={tool_use_id} agent_id={agent_id} name={name:?} agent_type={agent_type:?} description={description:?}"
+                    "spawn callback: tool_use_id={tool_use_id} agent_id={} name={name:?} agent_type={agent_type:?} description={description:?}",
+                    agent_id.0
                 ));
                 self.spawns.lock().await.push(RecordedSpawn {
                     tool_use_id,
                     name,
                     description,
                     agent_type,
-                    agent_id,
+                    agent_id: agent_id.clone(),
                 });
-                SubAgentHandle {
-                    agent_id,
-                    conversation_id: 10_000 + agent_id,
-                    event_tx,
-                }
+                let _ = agent_id;
+                SubAgentHandle { event_tx }
             })
         }
+    }
 
-        fn on_subagent_completed(
-            &self,
-            tool_use_id: &str,
-            agent_id: u64,
-            success: bool,
-            final_response: Option<String>,
-            _event_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-            let tool_use_id = tool_use_id.to_string();
-            Box::pin(async move {
-                live_test_log(&format!(
-                    "completion callback: tool_use_id={tool_use_id} agent_id={agent_id} success={success} final_response={final_response:?}"
-                ));
-                self.completions.lock().await.push(RecordedCompletion {
-                    tool_use_id,
-                    agent_id,
-                    success,
-                    final_response,
-                });
-            })
+    async fn live_test_select_model(session: &CodexSession) -> Option<String> {
+        let response = session
+            .inner
+            .rpc
+            .request("model/list", json!({ "includeHidden": false }))
+            .await
+            .ok()?;
+        let models = response
+            .get("data")
+            .or_else(|| response.get("models"))
+            .and_then(Value::as_array)?;
+        // `gpt-5.3-codex-spark` is cheaper, but the current Tyde Codex backend
+        // always sends `reasoning.summary`, and Spark rejects that parameter.
+        // Prefer the cheapest compatible model for live tests until that
+        // backend-level incompatibility is addressed.
+        let preferred = ["gpt-5.3-codex", "gpt-5.4-mini", "gpt-5.4"];
+        preferred.iter().find_map(|candidate| {
+            models
+                .iter()
+                .find(|model| {
+                    model
+                        .get("model")
+                        .or_else(|| model.get("id"))
+                        .and_then(Value::as_str)
+                        == Some(*candidate)
+                })
+                .map(|_| (*candidate).to_string())
+        })
+    }
+
+    async fn live_test_wait_for_mcp_tool(
+        session: &CodexSession,
+        server_name: &str,
+        tool_name: &str,
+        timeout: Duration,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let response = session
+                .list_mcp_server_statuses()
+                .await
+                .expect("list mcp server statuses");
+
+            let found = response
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|server| {
+                    server.get("name").and_then(Value::as_str) == Some(server_name)
+                        && server
+                            .get("tools")
+                            .and_then(Value::as_object)
+                            .is_some_and(|tools| tools.contains_key(tool_name))
+                })
+                .cloned();
+
+            if let Some(server) = found {
+                return server;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for MCP tool {server_name}/{tool_name}; last response={}",
+                response
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -5800,14 +6068,10 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             let mut event_stream_closed = false;
             while tokio::time::Instant::now() < deadline {
                 poll_ticks = poll_ticks.saturating_add(1);
-                if emitter.completion_count().await > 0 {
-                    live_test_log("completion callback observed; exiting wait loop");
-                    break;
-                }
                 if let Some(idle_at) = idle_edge_at
                     && tokio::time::Instant::now().duration_since(idle_at) >= idle_grace {
                         live_test_log(&format!(
-                            "idle edge grace elapsed ({:?}) with no completion callback; exiting wait loop",
+                            "idle edge grace elapsed ({:?}); exiting wait loop",
                             idle_grace
                         ));
                         break;
@@ -5822,9 +6086,8 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                         }
                         if event.get("kind").and_then(Value::as_str) == Some("Error") {
                             let spawn_count_now = emitter.spawn_count().await;
-                            let completion_count_now = emitter.completion_count().await;
                             live_test_log(&format!(
-                                "error event encountered; spawn_count={spawn_count_now} completion_count={completion_count_now}"
+                                "error event encountered; spawn_count={spawn_count_now}"
                             ));
                             panic!("Codex emitted error during live subagent test: {event}");
                         }
@@ -5888,7 +6151,6 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             }
 
             let spawn_count = emitter.spawn_count().await;
-            let completion_count = emitter.completion_count().await;
             let wait_diagnostics = format!(
                 "seen_typing_true={} last_typing_status={:?} idle_edge_observed={} tool_requests={} tool_execution_completed_events={} stream_ends={} last_stream_end_preview={:?} event_stream_closed={} poll_ticks={}",
                 seen_typing_true,
@@ -5901,20 +6163,13 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 event_stream_closed,
                 poll_ticks
             );
-            live_test_log(&format!(
-                "post-run counts: spawn_count={spawn_count} completion_count={completion_count}"
-            ));
+            live_test_log(&format!("post-run counts: spawn_count={spawn_count}"));
             live_test_log(&format!("wait diagnostics: {wait_diagnostics}"));
             assert!(
                 spawn_count > 0,
                 "Expected at least one sub-agent spawn callback from live Codex run. diagnostics={wait_diagnostics}"
             );
-            assert!(
-                completion_count > 0,
-                "Expected at least one sub-agent completion callback from live Codex run. diagnostics={wait_diagnostics}"
-            );
             let spawns = emitter.spawns.lock().await;
-            let completions = emitter.completions.lock().await;
             for spawn in spawns.iter() {
                 live_test_log(&format!(
                     "recorded spawn: tool_use_id={} agent_id={} name={:?} agent_type={:?} description={:?}",
@@ -5925,22 +6180,13 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                     spawn.description
                 ));
             }
-            for completion in completions.iter() {
-                live_test_log(&format!(
-                    "recorded completion: tool_use_id={} agent_id={} success={} final_response={:?}",
-                    completion.tool_use_id,
-                    completion.agent_id,
-                    completion.success,
-                    completion.final_response
-                ));
-            }
             assert!(
                 spawns.iter().any(|s| !s.tool_use_id.is_empty()),
                 "spawn callback should include a tool_use_id. diagnostics={wait_diagnostics}"
             );
             assert!(
-                spawns.iter().any(|s| s.agent_id > 0),
-                "spawn callback should include a non-zero agent_id. diagnostics={wait_diagnostics}"
+                spawns.iter().any(|s| !s.agent_id.0.is_empty()),
+                "spawn callback should include a non-empty agent_id. diagnostics={wait_diagnostics}"
             );
             assert!(
                 spawns.iter().any(|s| !s.name.trim().is_empty()),
@@ -5951,14 +6197,6 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                     .iter()
                     .any(|s| !s.description.is_empty() || !s.agent_type.is_empty()),
                 "spawn callback should include description or agent type metadata. diagnostics={wait_diagnostics}"
-            );
-            assert!(
-                completions.iter().any(|c| !c.tool_use_id.is_empty() && c.agent_id > 0),
-                "completion callback should include tool_use_id and agent_id. diagnostics={wait_diagnostics}"
-            );
-            assert!(
-                completions.iter().any(|c| c.success || c.final_response.is_some()),
-                "completion callback should provide success or a final response. diagnostics={wait_diagnostics}"
             );
             let events_by_agent = emitter.events_by_agent().await;
             for (agent_id, events) in &events_by_agent {
@@ -5972,7 +6210,7 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 events_by_agent.values().any(|events| {
                     events
                         .iter()
-                        .any(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                        .any(|event| matches!(event, ChatEvent::StreamEnd(_)))
                 }),
                 "sub-agent event stream should include a StreamEnd. diagnostics={wait_diagnostics}"
             );
@@ -5980,12 +6218,11 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 events_by_agent.values().any(|events| {
                     events
                         .iter()
-                        .any(|event| event.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
+                        .any(|event| matches!(event, ChatEvent::ToolRequest(_)))
                 }),
                 "sub-agent event stream should include at least one ToolRequest. diagnostics={wait_diagnostics}"
             );
             drop(spawns);
-            drop(completions);
             live_test_log("shutting down session");
             session.shutdown().await;
 
@@ -5993,6 +6230,432 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             live_test_log("workspace removed; final assertions");
 
             live_test_log("live codex sub-agent test completed successfully");
+        });
+    }
+
+    #[test]
+    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    fn live_codex_session_can_call_tyde_debug_mcp_tool_via_rpc() {
+        live_test_log("starting live codex MCP RPC test");
+        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+            return;
+        }
+
+        let codex_available = std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !codex_available {
+            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
+            return;
+        }
+
+        if let Ok(out) = std::process::Command::new("codex")
+            .args(["login", "status"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            let logged_in = out.status.success() && combined.contains("logged in");
+            let explicitly_not_logged_in = combined.contains("not logged in");
+            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
+                eprintln!(
+                    "Skipping live Codex test (`codex login status` indicates no active login)."
+                );
+                return;
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let workspace = std::env::temp_dir().join(format!("tyde-codex-live-mcp-rpc-{suffix}"));
+            std::fs::create_dir_all(&workspace).expect("create temp workspace");
+
+            let debug_mcp =
+                crate::debug_mcp::start_server(None).expect("start Tyde debug MCP server");
+            live_test_log(&format!("debug MCP URL: {}", debug_mcp.url));
+
+            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
+            let startup_mcp_servers = vec![StartupMcpServer {
+                name: "tyde-debug".to_string(),
+                transport: StartupMcpTransport::Http {
+                    url: debug_mcp.url.clone(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            }];
+
+            let (session, _event_rx) =
+                CodexSession::spawn(&workspace_roots, None, &startup_mcp_servers, None)
+                    .await
+                    .expect("spawn codex session");
+
+            let server = live_test_wait_for_mcp_tool(
+                &session,
+                "tyde-debug",
+                "tyde_dev_instance_list",
+                Duration::from_secs(30),
+            )
+            .await;
+            live_test_log(&format!("mcp server inventory: {server}"));
+
+            let tools = server
+                .get("tools")
+                .and_then(Value::as_object)
+                .expect("server tools map");
+            assert!(
+                tools.contains_key("tyde_dev_instance_list"),
+                "expected tyde_dev_instance_list in MCP inventory: {server}"
+            );
+
+            let response = session
+                .call_mcp_tool("tyde-debug", "tyde_dev_instance_list", None, None)
+                .await
+                .expect("call tyde_dev_instance_list");
+            live_test_log(&format!("mcp tool response: {response}"));
+
+            assert_ne!(
+                response.get("isError").and_then(Value::as_bool),
+                Some(true),
+                "expected successful MCP tool call: {response}"
+            );
+
+            let content = response
+                .get("content")
+                .and_then(Value::as_array)
+                .expect("mcp tool content array");
+            assert!(
+                content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("text")
+                        && item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.trim_start().starts_with('['))
+                }),
+                "expected JSON text content from tyde_dev_instance_list: {response}"
+            );
+
+            session.shutdown().await;
+            let _ = std::fs::remove_dir_all(&workspace);
+        });
+    }
+
+    #[test]
+    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    fn live_codex_session_can_call_tyde_agent_control_mcp_tool_via_rpc() {
+        live_test_log("starting live codex agent-control MCP RPC test");
+        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+            return;
+        }
+
+        let codex_available = std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !codex_available {
+            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
+            return;
+        }
+
+        if let Ok(out) = std::process::Command::new("codex")
+            .args(["login", "status"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            let logged_in = out.status.success() && combined.contains("logged in");
+            let explicitly_not_logged_in = combined.contains("not logged in");
+            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
+                eprintln!(
+                    "Skipping live Codex test (`codex login status` indicates no active login)."
+                );
+                return;
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let workspace =
+                std::env::temp_dir().join(format!("tyde-codex-live-agent-control-{suffix}"));
+            std::fs::create_dir_all(&workspace).expect("create temp workspace");
+
+            let host = crate::host::spawn_host_with_mock_backend(
+                workspace.join("sessions.json"),
+                workspace.join("projects.json"),
+                workspace.join("settings.json"),
+            )
+            .expect("spawn mock host");
+            let agent_control = crate::agent_control_mcp::start_server(None, host)
+                .expect("start Tyde agent-control MCP server");
+            live_test_log(&format!("agent-control MCP URL: {}", agent_control.url));
+
+            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
+            let startup_mcp_servers = vec![StartupMcpServer {
+                name: "tyde-agent-control".to_string(),
+                transport: StartupMcpTransport::Http {
+                    url: agent_control.url.clone(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            }];
+
+            let (session, _event_rx) =
+                CodexSession::spawn(&workspace_roots, None, &startup_mcp_servers, None)
+                    .await
+                    .expect("spawn codex session");
+
+            let server = live_test_wait_for_mcp_tool(
+                &session,
+                "tyde-agent-control",
+                "tyde_list_agents",
+                Duration::from_secs(30),
+            )
+            .await;
+            live_test_log(&format!("agent-control inventory: {server}"));
+
+            let tools = server
+                .get("tools")
+                .and_then(Value::as_object)
+                .expect("server tools map");
+            assert!(
+                tools.contains_key("tyde_list_agents"),
+                "expected tyde_list_agents in MCP inventory: {server}"
+            );
+            assert!(
+                tools.contains_key("tyde_spawn_agent"),
+                "expected tyde_spawn_agent in MCP inventory: {server}"
+            );
+
+            let response = session
+                .call_mcp_tool("tyde-agent-control", "tyde_list_agents", None, None)
+                .await
+                .expect("call tyde_list_agents");
+            live_test_log(&format!("agent-control tool response: {response}"));
+
+            assert_ne!(
+                response.get("isError").and_then(Value::as_bool),
+                Some(true),
+                "expected successful MCP tool call: {response}"
+            );
+
+            let content = response
+                .get("content")
+                .and_then(Value::as_array)
+                .expect("mcp tool content array");
+            assert!(
+                content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("text")
+                        && item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.trim_start().starts_with('['))
+                }),
+                "expected JSON text content from tyde_list_agents: {response}"
+            );
+
+            session.shutdown().await;
+            let _ = std::fs::remove_dir_all(&workspace);
+        });
+    }
+
+    #[test]
+    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    fn live_codex_model_emits_mcp_tool_call_for_tyde_debug_tool() {
+        live_test_log("starting live codex model-driven MCP test");
+        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+            return;
+        }
+
+        let codex_available = std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !codex_available {
+            eprintln!("Skipping live Codex test (`codex` CLI is not available).");
+            return;
+        }
+
+        if let Ok(out) = std::process::Command::new("codex")
+            .args(["login", "status"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            let logged_in = out.status.success() && combined.contains("logged in");
+            let explicitly_not_logged_in = combined.contains("not logged in");
+            if explicitly_not_logged_in || (!logged_in && out.status.success()) {
+                eprintln!(
+                    "Skipping live Codex test (`codex login status` indicates no active login)."
+                );
+                return;
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let workspace =
+                std::env::temp_dir().join(format!("tyde-codex-live-mcp-model-{suffix}"));
+            std::fs::create_dir_all(&workspace).expect("create temp workspace");
+
+            let debug_mcp =
+                crate::debug_mcp::start_server(None).expect("start Tyde debug MCP server");
+            let workspace_roots = vec![workspace.to_string_lossy().to_string()];
+            let startup_mcp_servers = vec![StartupMcpServer {
+                name: "tyde-debug".to_string(),
+                transport: StartupMcpTransport::Http {
+                    url: debug_mcp.url.clone(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            }];
+
+            let (session, mut event_rx) =
+                CodexSession::spawn(&workspace_roots, None, &startup_mcp_servers, None)
+                    .await
+                    .expect("spawn codex session");
+
+            let _ = live_test_wait_for_mcp_tool(
+                &session,
+                "tyde-debug",
+                "tyde_dev_instance_list",
+                Duration::from_secs(30),
+            )
+            .await;
+
+            if let Some(model) = live_test_select_model(&session).await {
+                live_test_log(&format!("using live Codex test model: {model}"));
+                session
+                    .command_handle()
+                    .execute(SessionCommand::UpdateSettings {
+                        settings: json!({ "model": model }),
+                        persist: false,
+                    })
+                    .await
+                    .expect("set live codex test model");
+            } else {
+                live_test_log("no preferred live Codex test model found; using session default");
+            }
+
+            let prompt = r#"Test harness: call the MCP tool `tyde_dev_instance_list` exactly once, then reply with the number of instances it returned as a single line like `instances=0`.
+Do not describe the tool, and do not skip the tool call."#;
+
+            session
+                .command_handle()
+                .execute(SessionCommand::SendMessage {
+                    message: prompt.to_string(),
+                    images: None,
+                })
+                .await
+                .expect("send message");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+            let mut saw_mcp_tool_request = false;
+            let mut saw_mcp_tool_completion = false;
+            let mut final_message: Option<String> = None;
+
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
+                    Ok(Some(event)) => {
+                        if live_test_verbose() {
+                            live_test_log(&format!("event(raw): {event}"));
+                        } else {
+                            live_test_log(&format!("event: {}", summarize_live_event(&event)));
+                        }
+
+                        if event.get("kind").and_then(Value::as_str) == Some("Error") {
+                            panic!("Codex emitted error during live MCP test: {event}");
+                        }
+
+                        match event.get("kind").and_then(Value::as_str) {
+                            Some("ToolRequest") => {
+                                if event
+                                    .get("data")
+                                    .and_then(|d| d.get("tool_name"))
+                                    .and_then(Value::as_str)
+                                    == Some("tyde_dev_instance_list")
+                                {
+                                    saw_mcp_tool_request = true;
+                                }
+                            }
+                            Some("ToolExecutionCompleted") => {
+                                if event
+                                    .get("data")
+                                    .and_then(|d| d.get("tool_name"))
+                                    .and_then(Value::as_str)
+                                    == Some("tyde_dev_instance_list")
+                                {
+                                    saw_mcp_tool_completion = true;
+                                }
+                            }
+                            Some("StreamEnd") => {
+                                final_message = event
+                                    .get("data")
+                                    .and_then(|d| d.get("message"))
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string);
+                                if saw_mcp_tool_request && saw_mcp_tool_completion {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+
+            assert!(
+                saw_mcp_tool_request,
+                "expected Codex to emit ToolRequest for tyde_dev_instance_list; final_message={final_message:?}"
+            );
+            assert!(
+                saw_mcp_tool_completion,
+                "expected Codex to emit ToolExecutionCompleted for tyde_dev_instance_list; final_message={final_message:?}"
+            );
+            assert!(
+                final_message
+                    .as_deref()
+                    .is_some_and(|message| message.trim().starts_with("instances=")),
+                "expected final message summarizing instance count, got {final_message:?}"
+            );
+
+            session.shutdown().await;
+            let _ = std::fs::remove_dir_all(&workspace);
         });
     }
 
@@ -6013,14 +6676,8 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 state.subagent_streams.insert(
                     "spawn-1".to_string(),
                     CodexSubAgentStream {
-                        handle: SubAgentHandle {
-                            agent_id: 1,
-                            conversation_id: 10_001,
-                            event_tx: subagent_tx,
-                        },
-                        description: "Test sub-agent".to_string(),
+                        raw_event_tx: subagent_tx,
                         receiver_thread_id: Some("thread-sub-1".to_string()),
-                        tool_name: "spawnAgent".to_string(),
                         external_agent_id: Some("thread-sub-1".to_string()),
                     },
                 );
@@ -6614,24 +7271,13 @@ If you skip spawn_agent or wait_agent, this test fails."#;
         });
 
         let completions = extract_codex_wait_agent_completions(&item);
-        let by_id = completions
+        let ids: HashSet<String> = completions
             .into_iter()
-            .map(|entry| {
-                (
-                    entry.external_agent_id,
-                    (entry.success, entry.final_response),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+            .map(|entry| entry.external_agent_id)
+            .collect();
 
-        assert_eq!(
-            by_id.get("agent_123"),
-            Some(&(true, Some("done".to_string())))
-        );
-        assert_eq!(
-            by_id.get("agent_456"),
-            Some(&(false, Some("boom".to_string())))
-        );
+        assert!(ids.contains("agent_123"));
+        assert!(ids.contains("agent_456"));
     }
 
     #[test]
@@ -6648,26 +7294,15 @@ If you skip spawn_agent or wait_agent, this test fails."#;
         });
 
         let completions = extract_codex_wait_agent_completions(&item);
-        let by_id = completions
+        let ids: HashSet<String> = completions
             .into_iter()
-            .map(|entry| {
-                (
-                    entry.external_agent_id,
-                    (entry.success, entry.final_response),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+            .map(|entry| entry.external_agent_id)
+            .collect();
 
-        assert_eq!(
-            by_id.get("thread_sub_ok"),
-            Some(&(true, Some("LIVE_SUBAGENT_OK".to_string())))
-        );
-        assert_eq!(
-            by_id.get("thread_sub_err"),
-            Some(&(false, Some("boom".to_string())))
-        );
+        assert!(ids.contains("thread_sub_ok"));
+        assert!(ids.contains("thread_sub_err"));
         assert!(
-            !by_id.contains_key("thread_sub_running"),
+            !ids.contains("thread_sub_running"),
             "running state should not be treated as a completed wait result"
         );
     }
@@ -6687,11 +7322,6 @@ If you skip spawn_agent or wait_agent, this test fails."#;
         let completion =
             extract_codex_subagent_notification_completion(text).expect("subagent notification");
         assert_eq!(completion.external_agent_id, "agent_123");
-        assert!(completion.success);
-        assert_eq!(
-            completion.final_response,
-            Some("worker finished".to_string())
-        );
     }
 
     #[test]
@@ -6704,30 +7334,47 @@ If you skip spawn_agent or wait_agent, this test fails."#;
     }
 
     #[test]
-    fn extract_codex_subagent_final_response_prefers_text_fields() {
-        let item = json!({
-            "type": "collabToolCall",
-            "result": {
-                "summary": "Finished static analysis; no critical issues."
-            }
-        });
-        assert_eq!(
-            extract_codex_subagent_final_response(&item),
-            Some("Finished static analysis; no critical issues.".to_string())
-        );
-    }
-
-    #[test]
-    fn codex_workspace_write_sandbox_policy_is_workspace_write() {
-        let policy = codex_workspace_write_sandbox_policy();
+    fn codex_danger_full_access_sandbox_policy_is_danger_full_access() {
+        let policy = codex_danger_full_access_sandbox_policy(false);
         assert_eq!(
             policy.get("type").and_then(Value::as_str),
-            Some("workspaceWrite")
+            Some("dangerFullAccess")
         );
+        assert_eq!(policy.get("networkAccess"), None);
     }
 
     #[test]
-    fn codex_http_mcp_config_uses_url_and_omits_headers() {
+    fn codex_danger_full_access_sandbox_policy_ignores_network_flag() {
+        let policy = codex_danger_full_access_sandbox_policy(true);
+        assert_eq!(
+            policy.get("type").and_then(Value::as_str),
+            Some("dangerFullAccess")
+        );
+        assert_eq!(policy.get("networkAccess"), None);
+    }
+
+    #[test]
+    fn codex_has_http_mcp_servers_detects_http_transports() {
+        assert!(codex_has_http_mcp_servers(&[StartupMcpServer {
+            name: "tyde-debug".to_string(),
+            transport: StartupMcpTransport::Http {
+                url: "http://127.0.0.1:4012/mcp".to_string(),
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        }]));
+        assert!(!codex_has_http_mcp_servers(&[StartupMcpServer {
+            name: "stdio-server".to_string(),
+            transport: StartupMcpTransport::Stdio {
+                command: "mcp-server".to_string(),
+                args: vec!["serve".to_string()],
+                env: HashMap::new(),
+            },
+        }]));
+    }
+
+    #[test]
+    fn codex_http_mcp_config_includes_url_and_headers() {
         let overrides = codex_mcp_config_overrides(&[StartupMcpServer {
             name: "tyde-debug".to_string(),
             transport: StartupMcpTransport::Http {
@@ -6742,8 +7389,10 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 == "mcp_servers.tyde-debug.url=\"http://127.0.0.1:4012/mcp?repo_root=%2Ftmp%2Fproj\""
         }));
         assert!(
-            !overrides.iter().any(|entry| entry.contains("http_headers")),
-            "Codex MCP config should not emit unsupported HTTP header overrides: {overrides:?}"
+            overrides
+                .iter()
+                .any(|entry| entry == "mcp_servers.tyde-debug.http_headers.x-ignored=\"value\""),
+            "expected Codex MCP config to emit HTTP header overrides: {overrides:?}"
         );
     }
 }

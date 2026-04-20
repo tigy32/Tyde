@@ -1,17 +1,21 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorPayload, AgentStartPayload, ChatEvent, Envelope, FrameError, FrameKind,
-    HostSettingsPayload, InterruptPayload, ListSessionsPayload, NewAgentPayload,
+    AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload, ChatEvent,
+    CustomAgentNotifyPayload, Envelope, FrameError, FrameKind, HostSettingsPayload,
+    InterruptPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
     NewTerminalPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectStageFilePayload,
-    ProjectStageHunkPayload, SendMessagePayload, SessionListPayload, SpawnAgentPayload, StreamPath,
-    TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
-    TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
-    read_envelope, write_envelope,
+    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
+    StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
+    TerminalStartPayload, read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -112,16 +116,26 @@ pub struct TerminalCommands {
 
 pub enum HostEvent {
     HostSettings(HostSettingsPayload),
+    BackendSetup(BackendSetupPayload),
+    SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
     ProjectNotify(ProjectNotifyPayload),
+    CustomAgentNotify(CustomAgentNotifyPayload),
+    SteeringNotify(SteeringNotifyPayload),
+    SkillNotify(SkillNotifyPayload),
+    McpServerNotify(McpServerNotifyPayload),
+    AgentClosed(AgentClosedPayload),
     NewAgent(AgentEndpoint),
     NewTerminal(TerminalEndpoint),
 }
 
 pub enum AgentEvent {
     Start(AgentStartPayload),
+    Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
     Chat(Box<ChatEvent>),
+    SessionSettings(SessionSettingsPayload),
+    QueuedMessages(QueuedMessagesPayload),
 }
 
 pub enum ProjectEvent {
@@ -201,6 +215,10 @@ impl HostCommands {
         self.send(FrameKind::ProjectRename, &payload).await
     }
 
+    pub async fn project_reorder(&self, payload: ProjectReorderPayload) -> Result<(), ClientError> {
+        self.send(FrameKind::ProjectReorder, &payload).await
+    }
+
     pub async fn project_add_root(
         &self,
         payload: ProjectAddRootPayload,
@@ -254,12 +272,41 @@ impl AgentCommands {
             .await
     }
 
+    pub async fn set_session_settings(
+        &self,
+        payload: SetSessionSettingsPayload,
+    ) -> Result<(), ClientError> {
+        self.shared
+            .send(self.stream.clone(), FrameKind::SetSessionSettings, &payload)
+            .await
+    }
+
+    pub async fn set_name(&self, name: String) -> Result<(), ClientError> {
+        self.shared
+            .send(
+                self.stream.clone(),
+                FrameKind::SetAgentName,
+                &SetAgentNamePayload { name },
+            )
+            .await
+    }
+
     pub async fn interrupt(&self) -> Result<(), ClientError> {
         self.shared
             .send(
                 self.stream.clone(),
                 FrameKind::Interrupt,
                 &InterruptPayload::default(),
+            )
+            .await
+    }
+
+    pub async fn close(&self) -> Result<(), ClientError> {
+        self.shared
+            .send(
+                self.stream.clone(),
+                FrameKind::CloseAgent,
+                &CloseAgentPayload::default(),
             )
             .await
     }
@@ -570,24 +617,80 @@ async fn handle_host_envelope(
                 Ok(payload) => payload,
                 Err(_) => return false,
             };
-            host_tx.send(HostEvent::HostSettings(payload)).await.is_ok()
+            let _ = host_tx.send(HostEvent::HostSettings(payload)).await;
+            true
+        }
+        FrameKind::BackendSetup => {
+            let payload: BackendSetupPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::BackendSetup(payload)).await;
+            true
         }
         FrameKind::SessionList => {
             let payload: SessionListPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
                 Err(_) => return false,
             };
-            host_tx.send(HostEvent::SessionList(payload)).await.is_ok()
+            let _ = host_tx.send(HostEvent::SessionList(payload)).await;
+            true
         }
         FrameKind::ProjectNotify => {
             let payload: ProjectNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
                 Err(_) => return false,
             };
-            host_tx
-                .send(HostEvent::ProjectNotify(payload))
-                .await
-                .is_ok()
+            let _ = host_tx.send(HostEvent::ProjectNotify(payload)).await;
+            true
+        }
+        FrameKind::CustomAgentNotify => {
+            let payload: CustomAgentNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::CustomAgentNotify(payload)).await;
+            true
+        }
+        FrameKind::SteeringNotify => {
+            let payload: SteeringNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SteeringNotify(payload)).await;
+            true
+        }
+        FrameKind::SkillNotify => {
+            let payload: SkillNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SkillNotify(payload)).await;
+            true
+        }
+        FrameKind::McpServerNotify => {
+            let payload: McpServerNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::McpServerNotify(payload)).await;
+            true
+        }
+        FrameKind::SessionSchemas => {
+            let payload: SessionSchemasPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::SessionSchemas(payload)).await;
+            true
+        }
+        FrameKind::AgentClosed => {
+            let payload: AgentClosedPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::AgentClosed(payload)).await;
+            true
         }
         FrameKind::NewAgent => {
             let payload: NewAgentPayload = match envelope.parse_payload() {
@@ -625,9 +728,17 @@ async fn handle_host_envelope(
                     shared: shared.clone(),
                     rx: agent_rx,
                 },
-                commands: AgentCommands { stream, shared },
+                commands: AgentCommands {
+                    stream: stream.clone(),
+                    shared: shared.clone(),
+                },
             };
-            host_tx.send(HostEvent::NewAgent(endpoint)).await.is_ok()
+            if host_tx.send(HostEvent::NewAgent(endpoint)).await.is_err() {
+                // Host event consumer dropped — unregister the route so the agent
+                // stream doesn't accumulate buffered events with no reader.
+                shared.unregister_route(&stream);
+            }
+            true
         }
         FrameKind::NewTerminal => {
             let payload: NewTerminalPayload = match envelope.parse_payload() {
@@ -665,9 +776,19 @@ async fn handle_host_envelope(
                     shared: shared.clone(),
                     rx: terminal_rx,
                 },
-                commands: TerminalCommands { stream, shared },
+                commands: TerminalCommands {
+                    stream: stream.clone(),
+                    shared: shared.clone(),
+                },
             };
-            host_tx.send(HostEvent::NewTerminal(endpoint)).await.is_ok()
+            if host_tx
+                .send(HostEvent::NewTerminal(endpoint))
+                .await
+                .is_err()
+            {
+                shared.unregister_route(&stream);
+            }
+            true
         }
         other => panic!(
             "unexpected server frame kind {} on host stream {}",
@@ -713,12 +834,39 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
             );
             AgentEvent::Error(payload)
         }
+        FrameKind::AgentRenamed => {
+            let payload: AgentRenamedPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            let stream_parts = parse_agent_stream(&envelope.stream);
+            assert_eq!(
+                payload.agent_id, stream_parts.agent_id,
+                "agent_renamed payload agent_id {} does not match stream {}",
+                payload.agent_id, envelope.stream
+            );
+            AgentEvent::Renamed(payload)
+        }
         FrameKind::ChatEvent => {
             let payload: ChatEvent = match envelope.parse_payload() {
                 Ok(payload) => payload,
                 Err(_) => return,
             };
             AgentEvent::Chat(Box::new(payload))
+        }
+        FrameKind::SessionSettings => {
+            let payload: SessionSettingsPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            AgentEvent::SessionSettings(payload)
+        }
+        FrameKind::QueuedMessages => {
+            let payload: QueuedMessagesPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            AgentEvent::QueuedMessages(payload)
         }
         other => panic!(
             "unexpected server frame kind {} on agent stream {}",

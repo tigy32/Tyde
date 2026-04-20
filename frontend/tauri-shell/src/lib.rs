@@ -7,9 +7,7 @@ mod router;
 use std::sync::Arc;
 
 use devtools_protocol::UiDebugResponseSubmission;
-use host_store::{
-    ConfiguredHostStore, HostStore, HostTransportConfig, UpsertConfiguredHostRequest,
-};
+use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
 use tauri::Manager;
 
@@ -63,17 +61,9 @@ fn list_configured_hosts(
 #[tauri::command]
 fn upsert_configured_host(
     state: tauri::State<'_, ShellState>,
-    id: Option<String>,
-    label: String,
-    transport: HostTransportConfig,
-    auto_connect: bool,
+    request: UpsertConfiguredHostRequest,
 ) -> Result<ConfiguredHostStore, String> {
-    state.host_store.upsert(UpsertConfiguredHostRequest {
-        id,
-        label,
-        transport,
-        auto_connect,
-    })
+    state.host_store.upsert(request)
 }
 
 #[tauri::command]

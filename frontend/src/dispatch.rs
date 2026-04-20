@@ -5,19 +5,22 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    AgentErrorPayload, AgentId, AgentStartPayload, ChatEvent, Envelope, FrameKind,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
-    ListSessionsPayload, NewAgentPayload, NewTerminalPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProtocolValidator, RejectPayload, SessionListPayload, StreamPath,
+    AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload,
+    AgentStartPayload, BackendSetupPayload, ChatEvent, CustomAgentNotifyPayload, Envelope,
+    FrameKind, HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload,
+    HostSettingsPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
+    NewTerminalPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectPayload, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
     TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
 };
 
 use crate::send::send_frame;
 use crate::state::{
-    ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, CenterView, ChatMessageEntry,
-    ConnectionStatus, DiffViewState, OpenFile, ProjectInfo, SessionInfo, StreamingState,
-    TerminalInfo, ToolRequestEntry, TransientEvent,
+    ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
+    DiffViewState, OpenFile, ProjectInfo, SessionInfo, StreamingState, TabContent, TerminalInfo,
+    ToolRequestEntry, TransientEvent, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -31,17 +34,15 @@ impl FrontendSeqValidator {
         }
     }
 
-    fn validate(&mut self, host_id: &str, stream: &StreamPath, seq: u64, kind: FrameKind) -> bool {
+    fn validate(&mut self, host_id: &str, stream: &StreamPath, seq: u64, kind: FrameKind) {
         let key = (host_id.to_string(), stream.clone());
         let expected = self.expected.get(&key).copied().unwrap_or(0);
         if seq != expected {
-            log::error!(
+            panic!(
                 "sequence mismatch on host {host_id} stream {stream} kind {kind}: expected {expected}, got {seq}"
             );
-            return false;
         }
         self.expected.insert(key, expected + 1);
-        true
     }
 }
 
@@ -58,7 +59,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
     });
     INBOUND_PROTOCOL.with(|validator| {
         if let Err(error) = validator.borrow_mut().validate_envelope(&envelope) {
-            log::error!("protocol violation: {error}");
+            panic!("protocol violation: {error}");
         }
     });
 
@@ -98,45 +99,128 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 });
             }
             Err(error) => {
-                log::error!("failed to parse reject payload: {error}");
-                state.connection_statuses.update(|statuses| {
-                    statuses.insert(
-                        host_id.to_string(),
-                        ConnectionStatus::Error("rejected".to_string()),
-                    );
-                });
+                panic!("failed to parse reject payload: {error}");
             }
         },
         FrameKind::HostSettings => match envelope.parse_payload::<HostSettingsPayload>() {
             Ok(payload) => {
+                log::info!(
+                    "dispatch host_settings host={} enabled_backends={} default_backend={:?} debug_mcp={} agent_control_mcp={}",
+                    host_id,
+                    payload.settings.enabled_backends.len(),
+                    payload.settings.default_backend,
+                    payload.settings.tyde_debug_mcp_enabled,
+                    payload.settings.tyde_agent_control_mcp_enabled
+                );
                 state.host_settings_by_host.update(|settings| {
                     settings.insert(host_id.to_string(), payload.settings);
                 });
             }
-            Err(error) => log::error!("failed to parse host_settings payload: {error}"),
+            Err(error) => panic!("failed to parse host_settings payload: {error}"),
         },
+        FrameKind::BackendSetup => match envelope.parse_payload::<BackendSetupPayload>() {
+            Ok(payload) => {
+                log::info!(
+                    "dispatch backend_setup host={} backends={}",
+                    host_id,
+                    payload.backends.len()
+                );
+                state.backend_setup_by_host.update(|setup| {
+                    setup.insert(host_id.to_string(), payload.backends);
+                });
+            }
+            Err(error) => panic!("failed to parse backend_setup payload: {error}"),
+        },
+        FrameKind::SessionSchemas => match envelope.parse_payload::<SessionSchemasPayload>() {
+            Ok(payload) => {
+                state.session_schemas.update(|schemas_by_host| {
+                    let host_schemas = schemas_by_host.entry(host_id.to_string()).or_default();
+                    host_schemas.clear();
+                    for schema in payload.schemas {
+                        host_schemas.insert(schema.backend_kind(), schema);
+                    }
+                });
+                state.schemas_loaded_for_host.update(|loaded| {
+                    loaded.insert(host_id.to_string(), true);
+                });
+            }
+            Err(error) => panic!("failed to parse session_schemas payload: {error}"),
+        },
+        FrameKind::SessionSettings => {
+            let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
+                log::warn!("session_settings on unknown stream {}", envelope.stream);
+                return;
+            };
+            match envelope.parse_payload::<SessionSettingsPayload>() {
+                Ok(payload) => {
+                    state.agent_session_settings.update(|map| {
+                        map.insert(agent_id, payload.values);
+                    });
+                }
+                Err(error) => panic!("failed to parse session_settings payload: {error}"),
+            }
+        }
+        FrameKind::QueuedMessages => {
+            let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
+                log::warn!("queued_messages on unknown stream {}", envelope.stream);
+                return;
+            };
+            match envelope.parse_payload::<QueuedMessagesPayload>() {
+                Ok(payload) => {
+                    log::info!(
+                        "dispatch queued_messages host={} agent_id={} count={}",
+                        host_id,
+                        agent_id,
+                        payload.messages.len()
+                    );
+                    state.agent_message_queue.update(|map| {
+                        map.insert(agent_id, payload.messages);
+                    });
+                }
+                Err(error) => panic!("failed to parse queued_messages payload: {error}"),
+            }
+        }
         FrameKind::NewAgent => match envelope.parse_payload::<NewAgentPayload>() {
             Ok(payload) => {
+                log::info!(
+                    "dispatch new_agent host={} agent_id={} name={} backend={:?} instance_stream={}",
+                    host_id,
+                    payload.agent_id,
+                    payload.name,
+                    payload.backend_kind,
+                    payload.instance_stream
+                );
                 let agent_id = payload.agent_id.clone();
+                let origin = payload.origin;
                 let info = AgentInfo {
                     host_id: host_id.to_string(),
                     agent_id: payload.agent_id,
                     name: payload.name,
+                    origin,
                     backend_kind: payload.backend_kind,
                     workspace_roots: payload.workspace_roots,
                     project_id: payload.project_id,
                     parent_agent_id: payload.parent_agent_id,
+                    custom_agent_id: payload.custom_agent_id,
                     created_at_ms: payload.created_at_ms,
                     instance_stream: payload.instance_stream,
+                    started: false,
                     fatal_error: None,
                 };
                 let project_id = info.project_id.clone();
+                // Only User-origin agents auto-open a chat tab and steal focus.
+                // AgentControl and BackendNative agents appear in the sidebar
+                // but must not disrupt the user's current view.
+                let is_programmatic = !matches!(origin, AgentOrigin::User);
                 state.agents.update(|agents| {
                     agents
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
                     agents.push(info);
                 });
-                state.agent_initializing.set(false);
+
+                if is_programmatic {
+                    return;
+                }
 
                 let target_project =
                     project_id
@@ -151,31 +235,119 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     agent_id,
                 };
 
+                let agent_name = state
+                    .agents
+                    .with_untracked(|agents| {
+                        agents
+                            .iter()
+                            .find(|a| {
+                                a.host_id == host_id && a.agent_id == new_active_agent.agent_id
+                            })
+                            .map(|a| a.name.clone())
+                    })
+                    .unwrap_or_else(|| "Chat".to_string());
+
                 if target_project == active_project {
-                    state.active_agent.set(Some(new_active_agent));
-                    state.center_view.set(CenterView::Chat);
+                    state.active_agent.set(Some(new_active_agent.clone()));
+                    // Upgrade a "New Chat" tab if one exists, otherwise open new
+                    state.center_zone.update(|cz| {
+                        let new_chat = TabContent::Chat { agent_ref: None };
+                        if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
+                            tab.content = TabContent::Chat {
+                                agent_ref: Some(new_active_agent.clone()),
+                            };
+                            tab.label = agent_name.clone();
+                            cz.active_tab_id = Some(tab.id);
+                        } else {
+                            cz.open(
+                                TabContent::Chat {
+                                    agent_ref: Some(new_active_agent.clone()),
+                                },
+                                agent_name.clone(),
+                                true,
+                            );
+                        }
+                    });
                 } else if let Some(target) = target_project {
                     // Spawned for a project the user isn't currently viewing.
                     // Stash into that project's memory so switching over shows it.
                     state.project_view_memory.update(|map| {
                         let slot = map.entry(target).or_default();
-                        slot.active_agent = Some(new_active_agent);
-                        slot.center_view = Some(CenterView::Chat);
+                        slot.active_agent = Some(new_active_agent.clone());
+                        let cz = slot.center_zone.get_or_insert_with(Default::default);
+                        let new_chat = TabContent::Chat { agent_ref: None };
+                        if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
+                            tab.content = TabContent::Chat {
+                                agent_ref: Some(new_active_agent),
+                            };
+                            tab.label = agent_name;
+                            cz.active_tab_id = Some(tab.id);
+                        } else {
+                            cz.open(
+                                TabContent::Chat {
+                                    agent_ref: Some(new_active_agent),
+                                },
+                                agent_name,
+                                true,
+                            );
+                        }
                     });
                 } else {
                     // No project context — fall through to global behavior.
-                    state.active_agent.set(Some(new_active_agent));
-                    state.center_view.set(CenterView::Chat);
+                    state.active_agent.set(Some(new_active_agent.clone()));
+                    state.center_zone.update(|cz| {
+                        let new_chat = TabContent::Chat { agent_ref: None };
+                        if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
+                            tab.content = TabContent::Chat {
+                                agent_ref: Some(new_active_agent.clone()),
+                            };
+                            tab.label = agent_name.clone();
+                            cz.active_tab_id = Some(tab.id);
+                        } else {
+                            cz.open(
+                                TabContent::Chat {
+                                    agent_ref: Some(new_active_agent),
+                                },
+                                agent_name,
+                                true,
+                            );
+                        }
+                    });
                 }
             }
-            Err(error) => log::error!("failed to parse new_agent payload: {error}"),
+            Err(error) => panic!("failed to parse new_agent payload: {error}"),
         },
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
-            Ok(_) => {}
-            Err(error) => log::error!("failed to parse agent_start payload: {error}"),
+            Ok(payload) => {
+                log::info!(
+                    "dispatch agent_start host={} agent_id={} name={} backend={:?}",
+                    host_id,
+                    payload.agent_id,
+                    payload.name,
+                    payload.backend_kind
+                );
+                apply_agent_started(state, host_id, &payload.agent_id);
+            }
+            Err(error) => panic!("failed to parse agent_start payload: {error}"),
+        },
+        FrameKind::AgentRenamed => match envelope.parse_payload::<AgentRenamedPayload>() {
+            Ok(payload) => apply_agent_rename(state, host_id, payload),
+            Err(error) => panic!("failed to parse agent_renamed payload: {error}"),
+        },
+        FrameKind::AgentClosed => match envelope.parse_payload::<AgentClosedPayload>() {
+            Ok(payload) => apply_agent_closed(state, host_id, payload.agent_id),
+            Err(error) => panic!("failed to parse agent_closed payload: {error}"),
         },
         FrameKind::AgentError => match envelope.parse_payload::<AgentErrorPayload>() {
             Ok(payload) => {
+                log::error!(
+                    "dispatch agent_error host={} agent_id={} fatal={} code={:?} message={}",
+                    host_id,
+                    payload.agent_id,
+                    payload.fatal,
+                    payload.code,
+                    payload.message
+                );
                 let error_agent_id = payload.agent_id.clone();
                 if payload.fatal {
                     state.agents.update(|agents| {
@@ -205,7 +377,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     map.entry(error_agent_id).or_default().push(entry);
                 });
             }
-            Err(error) => log::error!("failed to parse agent_error payload: {error}"),
+            Err(error) => panic!("failed to parse agent_error payload: {error}"),
         },
         FrameKind::ChatEvent => dispatch_chat_event(state, host_id, &envelope.stream, &envelope),
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
@@ -218,7 +390,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }));
                 });
             }
-            Err(error) => log::error!("failed to parse session_list payload: {error}"),
+            Err(error) => panic!("failed to parse session_list payload: {error}"),
         },
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
@@ -234,6 +406,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             project,
                         });
                     }
+                    sort_project_infos(projects);
                 });
             }
             Ok(ProjectNotifyPayload::Delete { project }) => {
@@ -256,7 +429,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     state.switch_active_project(None);
                 }
             }
-            Err(error) => log::error!("failed to parse project_notify payload: {error}"),
+            Err(error) => panic!("failed to parse project_notify payload: {error}"),
         },
         FrameKind::ProjectFileList => {
             let Some(project_id) = resolve_project_id(&envelope.stream) else {
@@ -293,7 +466,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         }
                     });
                 }
-                Err(error) => log::error!("failed to parse project_file_list payload: {error}"),
+                Err(error) => panic!("failed to parse project_file_list payload: {error}"),
             }
         }
         FrameKind::ProjectGitStatus => {
@@ -310,30 +483,48 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         git_status.insert(project_id, payload.roots);
                     });
                 }
-                Err(error) => log::error!("failed to parse project_git_status payload: {error}"),
+                Err(error) => panic!("failed to parse project_git_status payload: {error}"),
             }
         }
         FrameKind::ProjectGitDiff => match envelope.parse_payload::<ProjectGitDiffPayload>() {
             Ok(payload) => {
-                state.diff_content.set(Some(DiffViewState {
-                    root: payload.root,
-                    scope: payload.scope,
-                    files: payload.files,
-                }));
+                let key = (payload.root.clone(), payload.scope);
+                state.diff_contents.update(|diffs| {
+                    diffs.insert(
+                        key,
+                        DiffViewState {
+                            root: payload.root,
+                            scope: payload.scope,
+                            files: payload.files,
+                        },
+                    );
+                });
             }
-            Err(error) => log::error!("failed to parse project_git_diff payload: {error}"),
+            Err(error) => panic!("failed to parse project_git_diff payload: {error}"),
         },
         FrameKind::ProjectFileContents => {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
                 Ok(payload) => {
-                    state.open_file.set(Some(OpenFile {
-                        path: payload.path,
-                        contents: payload.contents,
-                        is_binary: payload.is_binary,
-                    }));
-                    state.center_view.set(CenterView::Editor);
+                    let path = payload.path.clone();
+                    let label = path
+                        .relative_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&path.relative_path)
+                        .to_string();
+                    state.open_files.update(|files| {
+                        files.insert(
+                            path.clone(),
+                            OpenFile {
+                                path: payload.path,
+                                contents: payload.contents,
+                                is_binary: payload.is_binary,
+                            },
+                        );
+                    });
+                    state.open_tab(TabContent::File { path }, label, true);
                 }
-                Err(error) => log::error!("failed to parse project_file_contents payload: {error}"),
+                Err(error) => panic!("failed to parse project_file_contents payload: {error}"),
             }
         }
         FrameKind::NewTerminal => match envelope.parse_payload::<NewTerminalPayload>() {
@@ -357,17 +548,31 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state
                     .terminals
                     .update(|terminals| terminals.push(info.clone()));
-                if state.active_terminal.get_untracked().is_none() {
+                let force_focus = state
+                    .pending_terminal_focus
+                    .with_untracked(|p| p.as_deref() == Some(host_id));
+                if force_focus || state.active_terminal.get_untracked().is_none() {
                     state.active_terminal.set(Some(ActiveTerminalRef {
                         host_id: info.host_id,
                         terminal_id: info.terminal_id,
                     }));
                 }
+                if force_focus {
+                    state.pending_terminal_focus.set(None);
+                }
             }
-            Err(error) => log::error!("failed to parse new_terminal payload: {error}"),
+            Err(error) => panic!("failed to parse new_terminal payload: {error}"),
         },
         FrameKind::TerminalStart => match envelope.parse_payload::<TerminalStartPayload>() {
             Ok(payload) => {
+                log::info!(
+                    "dispatch terminal_start host={} stream={} project_id={:?} cwd={} shell={}",
+                    host_id,
+                    envelope.stream,
+                    payload.project_id,
+                    payload.cwd,
+                    payload.shell
+                );
                 state.terminals.update(|terminals| {
                     if let Some(terminal) = terminals.iter_mut().find(|terminal| {
                         terminal.host_id == host_id && terminal.stream == envelope.stream
@@ -381,7 +586,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => log::error!("failed to parse terminal_start payload: {error}"),
+            Err(error) => panic!("failed to parse terminal_start payload: {error}"),
         },
         FrameKind::TerminalOutput => match envelope.parse_payload::<TerminalOutputPayload>() {
             Ok(payload) => {
@@ -401,10 +606,17 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     crate::term_bridge::write(&tid, &payload.data);
                 }
             }
-            Err(error) => log::error!("failed to parse terminal_output payload: {error}"),
+            Err(error) => panic!("failed to parse terminal_output payload: {error}"),
         },
         FrameKind::TerminalExit => match envelope.parse_payload::<TerminalExitPayload>() {
             Ok(payload) => {
+                log::info!(
+                    "dispatch terminal_exit host={} stream={} exit_code={:?} signal={:?}",
+                    host_id,
+                    envelope.stream,
+                    payload.exit_code,
+                    payload.signal
+                );
                 state.terminals.update(|terminals| {
                     if let Some(terminal) = terminals.iter_mut().find(|terminal| {
                         terminal.host_id == host_id && terminal.stream == envelope.stream
@@ -415,7 +627,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => log::error!("failed to parse terminal_exit payload: {error}"),
+            Err(error) => panic!("failed to parse terminal_exit payload: {error}"),
         },
         FrameKind::TerminalError => match envelope.parse_payload::<TerminalErrorPayload>() {
             Ok(payload) => {
@@ -430,21 +642,87 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     });
                 }
             }
-            Err(error) => log::error!("failed to parse terminal_error payload: {error}"),
+            Err(error) => panic!("failed to parse terminal_error payload: {error}"),
         },
         FrameKind::HostBrowseOpened => match envelope.parse_payload::<HostBrowseOpenedPayload>() {
             Ok(payload) => dispatch_browse_opened(state, host_id, &envelope.stream, payload),
-            Err(error) => log::error!("failed to parse host_browse_opened payload: {error}"),
+            Err(error) => panic!("failed to parse host_browse_opened payload: {error}"),
         },
         FrameKind::HostBrowseEntries => {
             match envelope.parse_payload::<HostBrowseEntriesPayload>() {
                 Ok(payload) => dispatch_browse_entries(state, host_id, &envelope.stream, payload),
-                Err(error) => log::error!("failed to parse host_browse_entries payload: {error}"),
+                Err(error) => panic!("failed to parse host_browse_entries payload: {error}"),
             }
         }
         FrameKind::HostBrowseError => match envelope.parse_payload::<HostBrowseErrorPayload>() {
             Ok(payload) => dispatch_browse_error(state, host_id, &envelope.stream, payload),
-            Err(error) => log::error!("failed to parse host_browse_error payload: {error}"),
+            Err(error) => panic!("failed to parse host_browse_error payload: {error}"),
+        },
+        FrameKind::CustomAgentNotify => {
+            match envelope.parse_payload::<CustomAgentNotifyPayload>() {
+                Ok(CustomAgentNotifyPayload::Upsert { custom_agent }) => {
+                    state.custom_agents.update(|map| {
+                        let host_map = map.entry(host_id.to_string()).or_default();
+                        host_map.insert(custom_agent.id.clone(), custom_agent);
+                    });
+                }
+                Ok(CustomAgentNotifyPayload::Delete { id }) => {
+                    state.custom_agents.update(|map| {
+                        if let Some(host_map) = map.get_mut(host_id) {
+                            host_map.remove(&id);
+                        }
+                    });
+                }
+                Err(error) => panic!("failed to parse custom_agent_notify payload: {error}"),
+            }
+        }
+        FrameKind::McpServerNotify => match envelope.parse_payload::<McpServerNotifyPayload>() {
+            Ok(McpServerNotifyPayload::Upsert { mcp_server }) => {
+                state.mcp_servers.update(|map| {
+                    let host_map = map.entry(host_id.to_string()).or_default();
+                    host_map.insert(mcp_server.id.clone(), mcp_server);
+                });
+            }
+            Ok(McpServerNotifyPayload::Delete { id }) => {
+                state.mcp_servers.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&id);
+                    }
+                });
+            }
+            Err(error) => panic!("failed to parse mcp_server_notify payload: {error}"),
+        },
+        FrameKind::SteeringNotify => match envelope.parse_payload::<SteeringNotifyPayload>() {
+            Ok(SteeringNotifyPayload::Upsert { steering }) => {
+                state.steering.update(|map| {
+                    let host_map = map.entry(host_id.to_string()).or_default();
+                    host_map.insert(steering.id.clone(), steering);
+                });
+            }
+            Ok(SteeringNotifyPayload::Delete { id }) => {
+                state.steering.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&id);
+                    }
+                });
+            }
+            Err(error) => panic!("failed to parse steering_notify payload: {error}"),
+        },
+        FrameKind::SkillNotify => match envelope.parse_payload::<SkillNotifyPayload>() {
+            Ok(SkillNotifyPayload::Upsert { skill }) => {
+                state.skills.update(|map| {
+                    let host_map = map.entry(host_id.to_string()).or_default();
+                    host_map.insert(skill.id.clone(), skill);
+                });
+            }
+            Ok(SkillNotifyPayload::Delete { id }) => {
+                state.skills.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&id);
+                    }
+                });
+            }
+            Err(error) => panic!("failed to parse skill_notify payload: {error}"),
         },
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
@@ -528,6 +806,151 @@ fn resolve_agent_id(state: &AppState, host_id: &str, stream: &StreamPath) -> Opt
     })
 }
 
+fn apply_agent_started(state: &AppState, host_id: &str, agent_id: &AgentId) {
+    state.agents.update(|agents| {
+        if let Some(agent) = agents
+            .iter_mut()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == *agent_id)
+        {
+            agent.started = true;
+        }
+    });
+}
+
+fn apply_agent_rename(state: &AppState, host_id: &str, payload: AgentRenamedPayload) {
+    let agent_id = payload.agent_id;
+    let name = payload.name;
+
+    state.agents.update(|agents| {
+        if let Some(agent) = agents
+            .iter_mut()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == agent_id)
+        {
+            agent.name = name.clone();
+        }
+    });
+
+    state.streaming_text.update(|map| {
+        if let Some(streaming) = map.get_mut(&agent_id) {
+            streaming.agent_name = name.clone();
+        }
+    });
+
+    state
+        .center_zone
+        .update(|cz| rename_agent_tabs(cz, host_id, &agent_id, &name));
+    state.project_view_memory.update(|memories| {
+        for memory in memories.values_mut() {
+            if let Some(center_zone) = memory.center_zone.as_mut() {
+                rename_agent_tabs(center_zone, host_id, &agent_id, &name);
+            }
+        }
+    });
+}
+
+fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
+    state.agents.update(|agents| {
+        agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
+    });
+    state.chat_messages.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.streaming_text.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.agent_turn_active.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.transient_events.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.task_lists.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.agent_message_queue.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.agent_session_settings.update(|map| {
+        map.remove(&agent_id);
+    });
+
+    let was_active = state.active_agent.with_untracked(|a| {
+        a.as_ref()
+            .is_some_and(|a| a.host_id == host_id && a.agent_id == agent_id)
+    });
+    if was_active {
+        state.active_agent.set(None);
+    }
+
+    state
+        .center_zone
+        .update(|cz| close_agent_tabs(cz, host_id, &agent_id));
+    state.project_view_memory.update(|memories| {
+        for memory in memories.values_mut() {
+            if let Some(center_zone) = memory.center_zone.as_mut() {
+                close_agent_tabs(center_zone, host_id, &agent_id);
+            }
+            if memory
+                .active_agent
+                .as_ref()
+                .is_some_and(|a| a.host_id == host_id && a.agent_id == agent_id)
+            {
+                memory.active_agent = None;
+            }
+        }
+    });
+}
+
+fn close_agent_tabs(
+    center_zone: &mut crate::state::CenterZoneState,
+    host_id: &str,
+    agent_id: &AgentId,
+) {
+    let remove_ids: Vec<_> = center_zone
+        .tabs
+        .iter()
+        .filter(|tab| {
+            matches!(
+                &tab.content,
+                TabContent::Chat { agent_ref: Some(ar) }
+                    if ar.host_id == host_id && ar.agent_id == *agent_id
+            )
+        })
+        .map(|tab| tab.id)
+        .collect();
+    for id in remove_ids {
+        // Preserve non-closeable tabs (shouldn't exist for chats, but be safe).
+        let closeable = center_zone
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.closeable)
+            .unwrap_or(true);
+        if closeable {
+            center_zone.close(id);
+        }
+    }
+}
+
+fn rename_agent_tabs(
+    center_zone: &mut crate::state::CenterZoneState,
+    host_id: &str,
+    agent_id: &AgentId,
+    name: &str,
+) {
+    for tab in &mut center_zone.tabs {
+        let matches_agent = matches!(
+            &tab.content,
+            TabContent::Chat {
+                agent_ref: Some(agent_ref)
+            } if agent_ref.host_id == host_id && agent_ref.agent_id == *agent_id
+        );
+        if matches_agent {
+            tab.label = name.to_string();
+        }
+    }
+}
+
 fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, envelope: &Envelope) {
     let Some(agent_id) = resolve_agent_id(state, host_id, stream) else {
         log::warn!("chat_event on unknown stream {stream}");
@@ -547,6 +970,17 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
 
     match event {
         ChatEvent::TypingStatusChanged(typing) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=typing active={}",
+                host_id,
+                agent_id,
+                typing
+            );
+            if typing {
+                state.transient_events.update(|events| {
+                    events.remove(&agent_id);
+                });
+            }
             state.agent_turn_active.update(|map| {
                 if typing {
                     map.insert(agent_id.clone(), true);
@@ -556,6 +990,13 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::MessageAdded(message) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=message_added sender={:?} text_len={}",
+                host_id,
+                agent_id,
+                message.sender,
+                message.content.len()
+            );
             let entry = ChatMessageEntry {
                 message,
                 tool_requests: Vec::new(),
@@ -565,6 +1006,16 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::StreamStart(data) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=stream_start message_id={:?} model={:?}",
+                host_id,
+                agent_id,
+                data.message_id,
+                data.model
+            );
+            state.transient_events.update(|events| {
+                events.remove(&agent_id);
+            });
             let streaming = StreamingState {
                 agent_name: data.agent,
                 model: data.model,
@@ -577,6 +1028,13 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::StreamDelta(data) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=stream_delta message_id={:?} text_len={}",
+                host_id,
+                agent_id,
+                data.message_id,
+                data.text.len()
+            );
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
@@ -585,6 +1043,13 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             }
         }
         ChatEvent::StreamReasoningDelta(data) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=reasoning_delta message_id={:?} text_len={}",
+                host_id,
+                agent_id,
+                data.message_id,
+                data.text.len()
+            );
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
@@ -595,6 +1060,13 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             }
         }
         ChatEvent::StreamEnd(data) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=stream_end text_len={} tool_calls={}",
+                host_id,
+                agent_id,
+                data.message.content.len(),
+                data.message.tool_calls.len()
+            );
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
@@ -630,6 +1102,13 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::ToolRequest(request) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=tool_request tool_call_id={} tool_name={}",
+                host_id,
+                agent_id,
+                request.tool_call_id,
+                request.tool_name
+            );
             let tool_name = request.tool_name.clone();
             let tool_call_id = request.tool_call_id.clone();
             let tool_entry = ToolRequestEntry {
@@ -664,6 +1143,14 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::ToolExecutionCompleted(data) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=tool_execution_completed tool_call_id={} tool_name={} success={}",
+                host_id,
+                agent_id,
+                data.tool_call_id,
+                data.tool_name,
+                data.success
+            );
             let call_id = data.tool_call_id.clone();
             let tool_name = data.tool_name.clone();
             let streaming = state
@@ -709,11 +1196,23 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::TaskUpdate(task_list) => {
+            log::info!(
+                "dispatch chat_event host={} agent_id={} type=task_update items={}",
+                host_id,
+                agent_id,
+                task_list.tasks.len()
+            );
             state.task_lists.update(|task_lists| {
                 task_lists.insert(agent_id.clone(), task_list);
             });
         }
         ChatEvent::OperationCancelled(data) => {
+            log::warn!(
+                "dispatch chat_event host={} agent_id={} type=operation_cancelled message={}",
+                host_id,
+                agent_id,
+                data.message
+            );
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
             });
@@ -726,6 +1225,15 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::RetryAttempt(data) => {
+            log::warn!(
+                "dispatch chat_event host={} agent_id={} type=retry attempt={} max_retries={} backoff_ms={} error={}",
+                host_id,
+                agent_id,
+                data.attempt,
+                data.max_retries,
+                data.backoff_ms,
+                data.error
+            );
             state.transient_events.update(|events| {
                 events
                     .entry(agent_id)

@@ -41,6 +41,10 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         HostEvent::HostSettings(_) => {}
         _ => panic!("expected initial HostSettings"),
     }
+    match next_host_event(&mut events, "initial session schemas").await {
+        HostEvent::SessionSchemas(_) => {}
+        _ => panic!("expected initial SessionSchemas"),
+    }
 
     let (session_list_tx, session_list_rx) = oneshot::channel();
     let (new_agent_tx, new_agent_rx) = oneshot::channel();
@@ -62,8 +66,15 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     }
                 }
                 HostEvent::HostSettings(_)
+                | HostEvent::BackendSetup(_)
+                | HostEvent::AgentClosed(_)
                 | HostEvent::ProjectNotify(_)
-                | HostEvent::NewTerminal(_) => {}
+                | HostEvent::NewTerminal(_)
+                | HostEvent::SessionSchemas(_)
+                | HostEvent::CustomAgentNotify(_)
+                | HostEvent::SteeringNotify(_)
+                | HostEvent::SkillNotify(_)
+                | HostEvent::McpServerNotify(_) => {}
             }
 
             if session_list_tx.is_none() && new_agent_tx.is_none() {
@@ -88,7 +99,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     let prompt = "runtime split test";
     commands
         .spawn_agent(SpawnAgentPayload {
-            name: "split-runtime".to_owned(),
+            name: Some("split-runtime".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
@@ -97,6 +109,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                session_settings: None,
             },
         })
         .await
@@ -140,6 +153,9 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     }
                     _ => {}
                 },
+                AgentEvent::Renamed(_)
+                | AgentEvent::SessionSettings(_)
+                | AgentEvent::QueuedMessages(_) => {}
                 AgentEvent::Error(err) => panic!("unexpected agent error: {}", err.message),
             }
         }
@@ -151,7 +167,10 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     }
     match next_agent_probe(&mut probe_rx, "initial stream end").await {
         AgentProbe::Final(content) => {
-            assert_eq!(content, format!("mock backend response to: {prompt}"))
+            assert!(
+                content.ends_with(&format!("mock backend response to: {prompt}")),
+                "expected mock response suffix, got: {content}"
+            );
         }
         other => panic!("expected initial final response, got {other:?}"),
     }
@@ -167,7 +186,10 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
 
     match next_agent_probe(&mut probe_rx, "follow-up stream end").await {
         AgentProbe::Final(content) => {
-            assert_eq!(content, format!("mock backend response to: {follow_up}"))
+            assert!(
+                content.ends_with(&format!("mock backend response to: {follow_up}")),
+                "expected mock response suffix, got: {content}"
+            );
         }
         other => panic!("expected follow-up final response, got {other:?}"),
     }

@@ -17,23 +17,28 @@ use crate::dispatch::dispatch_envelope;
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus};
 
-use protocol::{Envelope, FrameKind, HelloPayload, PROTOCOL_VERSION, StreamPath, TYDE_VERSION};
+use protocol::{
+    Envelope, FrameKind, HelloPayload, PROTOCOL_VERSION, ProjectPath, ProjectRootPath, StreamPath,
+    TYDE_VERSION,
+};
 
 fn generate_host_stream() -> StreamPath {
     let id = (js_sys::Math::random() * 1_000_000_000.0) as u64;
     StreamPath(format!("/host/{id}"))
 }
 
-struct KeydownListenerHandle {
+struct EventListenerHandle {
     window: web_sys::Window,
-    callback: Closure<dyn Fn(web_sys::KeyboardEvent)>,
+    event: &'static str,
+    callback: wasm_bindgen::closure::Closure<dyn Fn(web_sys::Event)>,
 }
 
-impl KeydownListenerHandle {
+impl EventListenerHandle {
     fn remove(self) {
-        let _ = self
-            .window
-            .remove_event_listener_with_callback("keydown", self.callback.as_ref().unchecked_ref());
+        let _ = self.window.remove_event_listener_with_callback(
+            self.event,
+            self.callback.as_ref().unchecked_ref(),
+        );
     }
 }
 
@@ -42,7 +47,8 @@ thread_local! {
     static APP_LISTENER_TOKEN: Cell<u64> = const { Cell::new(0) };
     static HOST_LISTENER_HANDLES: RefCell<Vec<bridge::UnlistenHandle>> = const { RefCell::new(Vec::new()) };
     static DEVTOOLS_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
-    static KEYDOWN_LISTENER_HANDLE: RefCell<Option<KeydownListenerHandle>> = const { RefCell::new(None) };
+    static KEYDOWN_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static CLICK_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
 }
 
 fn set_app_listeners_active(active: bool) {
@@ -83,6 +89,11 @@ fn clear_app_listeners() {
             handle.remove();
         }
     });
+    CLICK_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
 }
 
 fn install_keydown_listener(state: AppState) {
@@ -92,38 +103,296 @@ fn install_keydown_listener(state: AppState) {
         }
     });
 
-    let callback =
-        Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
-            let ctrl_or_meta = ev.ctrl_key() || ev.meta_key();
-            match ev.key().as_str() {
-                "k" if ctrl_or_meta => {
-                    ev.prevent_default();
-                    state.command_palette_open.update(|v| *v = !*v);
-                }
-                "," if ctrl_or_meta => {
-                    ev.prevent_default();
-                    state.settings_open.update(|v| *v = !*v);
-                }
-                "n" if ctrl_or_meta => {
-                    ev.prevent_default();
-                    crate::actions::begin_new_chat(&state, None);
-                }
-                "Escape" => {
-                    if state.command_palette_open.get_untracked() {
-                        state.command_palette_open.set(false);
-                    } else if state.settings_open.get_untracked() {
-                        state.settings_open.set(false);
-                    }
-                }
-                _ => {}
+    let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+        let Ok(ev) = ev.dyn_into::<web_sys::KeyboardEvent>() else {
+            return;
+        };
+        let ctrl_or_meta = ev.ctrl_key() || ev.meta_key();
+        match ev.key().as_str() {
+            "k" if ctrl_or_meta => {
+                ev.prevent_default();
+                state.command_palette_open.update(|v| *v = !*v);
             }
-        });
+            "," if ctrl_or_meta => {
+                ev.prevent_default();
+                state.settings_open.update(|v| *v = !*v);
+            }
+            "n" if ctrl_or_meta => {
+                ev.prevent_default();
+                crate::actions::begin_new_chat(&state, None);
+            }
+            "Escape" => {
+                if state.command_palette_open.get_untracked() {
+                    state.command_palette_open.set(false);
+                } else if state.settings_open.get_untracked() {
+                    state.settings_open.set(false);
+                }
+            }
+            _ => {}
+        }
+    });
     let window = web_sys::window().unwrap();
     let _ = window.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
     KEYDOWN_LISTENER_HANDLE.with(|slot| {
-        slot.borrow_mut()
-            .replace(KeydownListenerHandle { window, callback });
+        slot.borrow_mut().replace(EventListenerHandle {
+            window,
+            event: "keydown",
+            callback,
+        });
     });
+}
+
+/// Intercept link clicks inside rendered chat messages.
+///
+/// - File-like hrefs are opened in the Tyde file viewer.
+/// - External URLs (http/https) are opened in the system browser.
+/// - No link ever navigates the webview itself.
+fn install_click_listener(state: AppState) {
+    CLICK_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
+
+    let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+        let Some(target) = ev.target() else { return };
+
+        // Walk up from the click target to find an <a> element.
+        let anchor: Option<web_sys::HtmlAnchorElement> = {
+            let mut node: Option<web_sys::Element> = target.dyn_into::<web_sys::Element>().ok();
+            loop {
+                match node {
+                    None => break None,
+                    Some(el) => {
+                        if let Ok(a) = el.clone().dyn_into::<web_sys::HtmlAnchorElement>() {
+                            break Some(a);
+                        }
+                        node = el.parent_element();
+                    }
+                }
+            }
+        };
+
+        let Some(anchor) = anchor else { return };
+
+        // Only intercept links inside rendered chat content.
+        let in_chat = anchor.closest(".chat-card-body").ok().flatten().is_some();
+        if !in_chat {
+            return;
+        }
+
+        let href = anchor.get_attribute("href").unwrap_or_default();
+        if href.is_empty() {
+            return;
+        }
+
+        ev.prevent_default();
+
+        if href.starts_with("http://")
+            || href.starts_with("https://")
+            || href.starts_with("mailto:")
+        {
+            // External link → open in system browser / mail client.
+            if let Some(window) = web_sys::window() {
+                let _ = window.open_with_url_and_target(&href, "_blank");
+            }
+        } else {
+            let roots = state
+                .active_project_info_untracked()
+                .map(|project| project.project.roots)
+                .unwrap_or_default();
+            if let Some(path) = resolve_chat_file_href(&href, &roots) {
+                crate::actions::open_project_path(&state, path);
+            } else {
+                log::warn!("ignoring unsupported chat link target: {href}");
+            }
+        }
+    });
+
+    let window = web_sys::window().unwrap();
+    let _ = window.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+    CLICK_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(EventListenerHandle {
+            window,
+            event: "click",
+            callback,
+        });
+    });
+}
+
+fn resolve_chat_file_href(href: &str, project_roots: &[String]) -> Option<ProjectPath> {
+    let decoded = percent_decode_path(href).unwrap_or_else(|| href.to_owned());
+    let normalized = normalize_file_reference(&decoded)?;
+
+    if let Some(path) = project_path_from_absolute(&normalized, project_roots) {
+        return Some(path);
+    }
+
+    if is_absolute_path(&normalized) {
+        return None;
+    }
+
+    let root = project_roots.first()?.clone();
+    Some(ProjectPath {
+        root: ProjectRootPath(root),
+        relative_path: normalized,
+    })
+}
+
+fn normalize_file_reference(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_scheme = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    let without_fragment = without_scheme.split('#').next().unwrap_or(without_scheme);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let without_line_suffix = strip_trailing_line_suffix(without_query);
+    let normalized = without_line_suffix
+        .trim_start_matches("./")
+        .replace('\\', "/");
+
+    if normalized.trim().is_empty() {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+fn strip_trailing_line_suffix(path: &str) -> &str {
+    let mut candidate = path;
+    for _ in 0..2 {
+        let Some((prefix, suffix)) = candidate.rsplit_once(':') else {
+            break;
+        };
+        if suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            candidate = prefix;
+        } else {
+            break;
+        }
+    }
+    candidate
+}
+
+fn project_path_from_absolute(path: &str, project_roots: &[String]) -> Option<ProjectPath> {
+    for root in project_roots {
+        let normalized_root = root.replace('\\', "/");
+        if path == normalized_root {
+            return None;
+        }
+
+        if let Some(rest) = path.strip_prefix(&normalized_root) {
+            if !rest.starts_with('/') {
+                continue;
+            }
+            let relative_path = rest.trim_start_matches('/');
+            if relative_path.is_empty() {
+                return None;
+            }
+            return Some(ProjectPath {
+                root: ProjectRootPath(root.clone()),
+                relative_path: relative_path.to_owned(),
+            });
+        }
+    }
+
+    None
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with('/')
+        || matches!(
+            path.as_bytes(),
+            [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
+        )
+}
+
+fn percent_decode_path(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut chars = value.as_bytes().iter().copied();
+    while let Some(byte) = chars.next() {
+        match byte {
+            b'%' => {
+                let high = chars.next()?;
+                let low = chars.next()?;
+                let decoded = (decode_hex_nibble(high)? << 4) | decode_hex_nibble(low)?;
+                bytes.push(decoded);
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_chat_file_href;
+    use protocol::{ProjectPath, ProjectRootPath};
+
+    #[test]
+    fn resolves_absolute_file_links_with_line_numbers() {
+        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let resolved =
+            resolve_chat_file_href("/Users/mike/Tyde2/server/src/agent/mod.rs:366", &roots);
+
+        assert_eq!(
+            resolved,
+            Some(ProjectPath {
+                root: ProjectRootPath("/Users/mike/Tyde2".to_owned()),
+                relative_path: "server/src/agent/mod.rs".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_relative_file_links_with_line_and_column_numbers() {
+        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let resolved = resolve_chat_file_href("./server/src/agent/mod.rs:366:8", &roots);
+
+        assert_eq!(
+            resolved,
+            Some(ProjectPath {
+                root: ProjectRootPath("/Users/mike/Tyde2".to_owned()),
+                relative_path: "server/src/agent/mod.rs".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_percent_encoded_file_urls() {
+        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let resolved =
+            resolve_chat_file_href("file:///Users/mike/Tyde2/docs/My%20File.md#L12", &roots);
+
+        assert_eq!(
+            resolved,
+            Some(ProjectPath {
+                root: ProjectRootPath("/Users/mike/Tyde2".to_owned()),
+                relative_path: "docs/My File.md".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_paths_outside_the_active_project() {
+        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let resolved = resolve_chat_file_href("/tmp/outside.rs:12", &roots);
+
+        assert_eq!(resolved, None);
+    }
 }
 
 #[component]
@@ -168,8 +437,12 @@ pub fn App() -> impl IntoView {
     });
 
     let state_for_keys = state.clone();
+    let state_for_clicks = state.clone();
     Effect::new(move |_| {
         install_keydown_listener(state_for_keys.clone());
+    });
+    Effect::new(move |_| {
+        install_click_listener(state_for_clicks.clone());
     });
 
     view! {
@@ -186,13 +459,9 @@ pub fn App() -> impl IntoView {
 }
 
 async fn initialize_hosts(state: AppState, listener_token: u64) {
-    let handles = match install_host_listeners(state.clone()).await {
-        Ok(handles) => handles,
-        Err(err) => {
-            log::error!("failed to install host listeners: {err}");
-            return;
-        }
-    };
+    let handles = install_host_listeners(state.clone())
+        .await
+        .expect("failed to install host listeners");
 
     if app_listener_token_is_current(listener_token) {
         HOST_LISTENER_HANDLES.with(|slot| {
@@ -215,7 +484,10 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
         .configured_hosts
         .get_untracked()
         .into_iter()
-        .filter(|host| host.auto_connect || host.id == "local")
+        .filter(|host| {
+            host.auto_connect
+                || matches!(host.transport, bridge::HostTransportConfig::LocalEmbedded)
+        })
         .map(|host| host.id)
         .collect::<Vec<_>>();
 
@@ -231,8 +503,17 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     handles.push(
         bridge::listen_host_line(move |event| {
             match serde_json::from_str::<Envelope>(&event.line) {
-                Ok(envelope) => dispatch_envelope(&line_state, &event.host_id, envelope),
-                Err(error) => log::error!(
+                Ok(envelope) => {
+                    log::info!(
+                        "host_frame_rx host={} stream={} seq={} kind={}",
+                        event.host_id,
+                        envelope.stream,
+                        envelope.seq,
+                        envelope.kind
+                    );
+                    dispatch_envelope(&line_state, &event.host_id, envelope)
+                }
+                Err(error) => panic!(
                     "failed to parse envelope from host {}: {error}",
                     event.host_id
                 ),
@@ -253,7 +534,12 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
                     Some(ConnectionStatus::Connecting)
                 );
             disconnect_state.connection_statuses.update(|statuses| {
-                statuses.insert(event.host_id.clone(), ConnectionStatus::Disconnected);
+                if !matches!(
+                    statuses.get(&event.host_id),
+                    Some(ConnectionStatus::Error(_))
+                ) {
+                    statuses.insert(event.host_id.clone(), ConnectionStatus::Disconnected);
+                }
             });
             disconnect_state.clear_host_runtime(&event.host_id);
             if reconnect_local {
@@ -296,7 +582,7 @@ pub async fn refresh_configured_hosts(state: &AppState) {
             });
         }
         Err(error) => {
-            log::error!("failed to load configured hosts: {error}");
+            panic!("failed to load configured hosts: {error}");
         }
     }
 }
@@ -306,7 +592,7 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         statuses.insert(host_id.clone(), ConnectionStatus::Connecting);
     });
 
-    if let Err(error) = bridge::connect_host(bridge::ConnectHostRequest {
+    if let Err(error) = bridge::connect_host(bridge::HostIdRequest {
         host_id: host_id.clone(),
     })
     .await

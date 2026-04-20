@@ -16,7 +16,9 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpServer, StartupMcpTransport,
+    Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpServer,
+    StartupMcpTransport, empty_session_settings_schema, render_combined_spawn_instructions,
+    setup::tycode_versioned_binary_path,
 };
 
 const BACKEND_INPUT_BUFFER: usize = 64;
@@ -25,18 +27,84 @@ const BACKEND_EVENT_BUFFER: usize = 256;
 /// Binary name for the tycode subprocess.
 /// Can be overridden via the `TYDE_REMOTE_SUBPROCESS_PATH` env var.
 fn subprocess_bin() -> String {
+    if let Ok(path) = tycode_versioned_binary_path() {
+        if path.exists() {
+            return path.to_string_lossy().to_string();
+        }
+    }
     std::env::var("TYDE_REMOTE_SUBPROCESS_PATH").unwrap_or_else(|_| "tycode-subprocess".into())
 }
 
 pub struct TycodeBackend {
     input_tx: mpsc::Sender<AgentInput>,
     interrupt_tx: mpsc::Sender<()>,
+    shutdown_tx: mpsc::Sender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
 enum TycodeStdinCommand {
     Json(Value),
     Cancel,
+}
+
+struct TempWorkspaceRoot {
+    path: PathBuf,
+}
+
+impl TempWorkspaceRoot {
+    fn new(prefix: &str) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).map_err(|err| {
+            format!(
+                "Failed to create temporary workspace {}: {err}",
+                path.display()
+            )
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempWorkspaceRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn write_text_file(path: &PathBuf, body: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Failed to create directory {}: {err}", parent.display()))?;
+    fs::write(path, body).map_err(|err| format!("Failed to write {}: {err}", path.display()))
+}
+
+fn materialize_tycode_customization(
+    config: &BackendSpawnConfig,
+) -> Result<Option<TempWorkspaceRoot>, String> {
+    let steering = render_combined_spawn_instructions(&config.resolved_spawn_config);
+    if steering.is_none() && config.resolved_spawn_config.skills.is_empty() {
+        return Ok(None);
+    }
+    let root = TempWorkspaceRoot::new("tyde-tycode-customization")?;
+    if let Some(steering) = steering {
+        write_text_file(
+            &root.path.join(".tycode").join("tyde_steering.md"),
+            &steering,
+        )?;
+    }
+    for skill in &config.resolved_spawn_config.skills {
+        write_text_file(
+            &root
+                .path
+                .join(".tycode")
+                .join("skills")
+                .join(&skill.name)
+                .join("SKILL.md"),
+            &skill.body,
+        )?;
+    }
+    Ok(Some(root))
 }
 
 fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
@@ -54,6 +122,10 @@ fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>
 }
 
 impl Backend for TycodeBackend {
+    fn session_settings_schema() -> protocol::SessionSettingsSchema {
+        empty_session_settings_schema(BackendKind::Tycode)
+    }
+
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -63,6 +135,7 @@ impl Backend for TycodeBackend {
         let initial_images = initial_input.images;
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
         let workspace_roots = if workspace_roots.is_empty() {
             vec!["/tmp".to_string()]
@@ -75,6 +148,18 @@ impl Backend for TycodeBackend {
         let mcp_servers_json = build_tycode_mcp_servers_json(&config.startup_mcp_servers);
 
         tokio::spawn(async move {
+            let materialized_customization = match materialize_tycode_customization(&config) {
+                Ok(root) => root,
+                Err(err) => {
+                    tracing::error!("Failed to materialize Tycode customization: {err}");
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
+            let mut workspace_roots = workspace_roots;
+            if let Some(root) = materialized_customization.as_ref() {
+                workspace_roots.push(root.path.to_string_lossy().to_string());
+            }
             let roots_json = serde_json::json!(workspace_roots).to_string();
             let known_session_ids = known_tycode_session_ids();
             let mut command = Command::new(subprocess_bin());
@@ -160,24 +245,35 @@ impl Backend for TycodeBackend {
             let events_tx2 = events_tx.clone();
             tokio::spawn(async move {
                 while let Some(input) = input_rx.recv().await {
-                    let AgentInput::SendMessage(payload) = input;
-                    let message = payload.message;
-                    let images = payload.images;
-                    if events_tx2
-                        .send(backend_user_message(message.clone(), images))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    if stdin_tx2
-                        .send(TycodeStdinCommand::Json(
-                            serde_json::json!({ "UserInput": message }),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    match input {
+                        AgentInput::SendMessage(payload) => {
+                            let message = payload.message;
+                            let images = payload.images;
+                            if events_tx2
+                                .send(backend_user_message(message.clone(), images))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if stdin_tx2
+                                .send(TycodeStdinCommand::Json(
+                                    serde_json::json!({ "UserInput": message }),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        AgentInput::UpdateSessionSettings(_) => {}
+                        AgentInput::EditQueuedMessage(_)
+                        | AgentInput::CancelQueuedMessage(_)
+                        | AgentInput::SendQueuedMessageNow(_) => {
+                            panic!(
+                                "queued-message inputs must be handled by the agent actor before reaching the backend"
+                            );
+                        }
                     }
                 }
             });
@@ -200,7 +296,19 @@ impl Backend for TycodeBackend {
             let mut stream_open = false;
             let mut accumulated_text = String::new();
             let mut ready_tx = Some(ready_tx);
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = tokio::select! {
+                    line = lines.next_line() => line,
+                    shutdown = shutdown_rx.recv() => {
+                        if shutdown.is_some() {
+                            let _ = child.kill().await;
+                        }
+                        break;
+                    }
+                };
+                let Ok(Some(line)) = line else {
+                    break;
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -344,6 +452,7 @@ impl Backend for TycodeBackend {
             Self {
                 input_tx,
                 interrupt_tx,
+                shutdown_tx,
                 session_id,
             },
             EventStream::new(events_rx),
@@ -357,6 +466,7 @@ impl Backend for TycodeBackend {
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
         let workspace_roots = if workspace_roots.is_empty() {
             vec!["/tmp".to_string()]
@@ -367,6 +477,17 @@ impl Backend for TycodeBackend {
         let mcp_servers_json = build_tycode_mcp_servers_json(&config.startup_mcp_servers);
 
         tokio::spawn(async move {
+            let materialized_customization = match materialize_tycode_customization(&config) {
+                Ok(root) => root,
+                Err(err) => {
+                    tracing::error!("Failed to materialize Tycode resume customization: {err}");
+                    return;
+                }
+            };
+            let mut workspace_roots = workspace_roots;
+            if let Some(root) = materialized_customization.as_ref() {
+                workspace_roots.push(root.path.to_string_lossy().to_string());
+            }
             let roots_json = serde_json::json!(workspace_roots).to_string();
             let mut command = Command::new(subprocess_bin());
             command.arg("--workspace-roots").arg(&roots_json);
@@ -432,24 +553,35 @@ impl Backend for TycodeBackend {
             let events_tx2 = events_tx.clone();
             tokio::spawn(async move {
                 while let Some(input) = input_rx.recv().await {
-                    let AgentInput::SendMessage(payload) = input;
-                    let message = payload.message;
-                    let images = payload.images;
-                    if events_tx2
-                        .send(backend_user_message(message.clone(), images))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    if stdin_tx2
-                        .send(TycodeStdinCommand::Json(
-                            serde_json::json!({ "UserInput": message }),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    match input {
+                        AgentInput::SendMessage(payload) => {
+                            let message = payload.message;
+                            let images = payload.images;
+                            if events_tx2
+                                .send(backend_user_message(message.clone(), images))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if stdin_tx2
+                                .send(TycodeStdinCommand::Json(
+                                    serde_json::json!({ "UserInput": message }),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        AgentInput::UpdateSessionSettings(_) => {}
+                        AgentInput::EditQueuedMessage(_)
+                        | AgentInput::CancelQueuedMessage(_)
+                        | AgentInput::SendQueuedMessageNow(_) => {
+                            panic!(
+                                "queued-message inputs must be handled by the agent actor before reaching the backend"
+                            );
+                        }
                     }
                 }
             });
@@ -470,7 +602,19 @@ impl Backend for TycodeBackend {
             let mut lines = BufReader::new(stdout).lines();
             let mut stream_open = false;
             let mut accumulated_text = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
+            loop {
+                let line = tokio::select! {
+                    line = lines.next_line() => line,
+                    shutdown = shutdown_rx.recv() => {
+                        if shutdown.is_some() {
+                            let _ = child.kill().await;
+                        }
+                        break;
+                    }
+                };
+                let Ok(Some(line)) = line else {
+                    break;
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -539,6 +683,7 @@ impl Backend for TycodeBackend {
             Self {
                 input_tx,
                 interrupt_tx,
+                shutdown_tx,
                 session_id: known_session_id,
             },
             EventStream::new(events_rx),
@@ -563,6 +708,10 @@ impl Backend for TycodeBackend {
 
     async fn interrupt(&self) -> bool {
         self.interrupt_tx.send(()).await.is_ok()
+    }
+
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(()).await;
     }
 }
 

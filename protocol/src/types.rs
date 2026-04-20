@@ -52,6 +52,16 @@ impl fmt::Display for SessionId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct QueuedMessageId(pub String);
+
+impl fmt::Display for QueuedMessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ProjectId(pub String);
 
 impl fmt::Display for ProjectId {
@@ -60,8 +70,48 @@ impl fmt::Display for ProjectId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CustomAgentId(pub String);
+
+impl fmt::Display for CustomAgentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SteeringId(pub String);
+
+impl fmt::Display for SteeringId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SkillId(pub String);
+
+impl fmt::Display for SkillId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct McpServerId(pub String);
+
+impl fmt::Display for McpServerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Which coding agent backend to use. Enum, not string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Tycode,
@@ -78,6 +128,19 @@ impl BackendKind {
             Self::Tycode | Self::Gemini => false,
         }
     }
+}
+
+/// Provenance of a live agent — who created it.
+/// `parent_agent_id` answers "which agent owns this child"; `origin` answers "who created it."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOrigin {
+    /// Explicitly spawned or resumed by a human user.
+    User,
+    /// Spawned programmatically through Tyde-owned orchestration (e.g. agent-control MCP).
+    AgentControl,
+    /// Spawned by the backend's own native sub-agent mechanism (e.g. Claude subagents).
+    BackendNative,
 }
 
 /// Backend-agnostic hint for picking a cheaper or more capable spawned agent.
@@ -107,16 +170,30 @@ pub enum FrameKind {
     Reject,
 
     // Input events (client -> server)
-    DumpSettings,
     SetSetting,
     SpawnAgent,
     ListSessions,
+    DeleteSession,
     SendMessage,
+    EditQueuedMessage,
+    CancelQueuedMessage,
+    SendQueuedMessageNow,
+    SetAgentName,
     Interrupt,
+    CloseAgent,
+    RunBackendSetup,
     ProjectCreate,
     ProjectRename,
+    ProjectReorder,
     ProjectAddRoot,
     ProjectDelete,
+    CustomAgentUpsert,
+    CustomAgentDelete,
+    SteeringUpsert,
+    SteeringDelete,
+    SkillRefresh,
+    McpServerUpsert,
+    McpServerDelete,
     ProjectRefresh,
     ProjectReadDiff,
     ProjectReadFile,
@@ -131,14 +208,24 @@ pub enum FrameKind {
     TerminalResize,
     TerminalClose,
 
+    SetSessionSettings,
+
     // Output events (server -> client)
     HostSettings,
+    BackendSetup,
     NewAgent,
     AgentStart,
+    AgentRenamed,
+    AgentClosed,
     ChatEvent,
     AgentError,
+    QueuedMessages,
     SessionList,
     ProjectNotify,
+    CustomAgentNotify,
+    SteeringNotify,
+    SkillNotify,
+    McpServerNotify,
     ProjectFileList,
     ProjectGitStatus,
     ProjectFileContents,
@@ -151,6 +238,8 @@ pub enum FrameKind {
     HostBrowseOpened,
     HostBrowseEntries,
     HostBrowseError,
+    SessionSchemas,
+    SessionSettings,
 }
 
 impl fmt::Display for FrameKind {
@@ -159,16 +248,30 @@ impl fmt::Display for FrameKind {
             Self::Hello => f.write_str("hello"),
             Self::Welcome => f.write_str("welcome"),
             Self::Reject => f.write_str("reject"),
-            Self::DumpSettings => f.write_str("dump_settings"),
             Self::SetSetting => f.write_str("set_setting"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
+            Self::DeleteSession => f.write_str("delete_session"),
             Self::SendMessage => f.write_str("send_message"),
+            Self::EditQueuedMessage => f.write_str("edit_queued_message"),
+            Self::CancelQueuedMessage => f.write_str("cancel_queued_message"),
+            Self::SendQueuedMessageNow => f.write_str("send_queued_message_now"),
+            Self::SetAgentName => f.write_str("set_agent_name"),
             Self::Interrupt => f.write_str("interrupt"),
+            Self::CloseAgent => f.write_str("close_agent"),
+            Self::RunBackendSetup => f.write_str("run_backend_setup"),
             Self::ProjectCreate => f.write_str("project_create"),
             Self::ProjectRename => f.write_str("project_rename"),
+            Self::ProjectReorder => f.write_str("project_reorder"),
             Self::ProjectAddRoot => f.write_str("project_add_root"),
             Self::ProjectDelete => f.write_str("project_delete"),
+            Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
+            Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
+            Self::SteeringUpsert => f.write_str("steering_upsert"),
+            Self::SteeringDelete => f.write_str("steering_delete"),
+            Self::SkillRefresh => f.write_str("skill_refresh"),
+            Self::McpServerUpsert => f.write_str("mcp_server_upsert"),
+            Self::McpServerDelete => f.write_str("mcp_server_delete"),
             Self::ProjectRefresh => f.write_str("project_refresh"),
             Self::ProjectReadDiff => f.write_str("project_read_diff"),
             Self::ProjectReadFile => f.write_str("project_read_file"),
@@ -183,12 +286,20 @@ impl fmt::Display for FrameKind {
             Self::TerminalResize => f.write_str("terminal_resize"),
             Self::TerminalClose => f.write_str("terminal_close"),
             Self::HostSettings => f.write_str("host_settings"),
+            Self::BackendSetup => f.write_str("backend_setup"),
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentStart => f.write_str("agent_start"),
+            Self::AgentRenamed => f.write_str("agent_renamed"),
+            Self::AgentClosed => f.write_str("agent_closed"),
             Self::ChatEvent => f.write_str("chat_event"),
             Self::AgentError => f.write_str("agent_error"),
+            Self::QueuedMessages => f.write_str("queued_messages"),
             Self::SessionList => f.write_str("session_list"),
             Self::ProjectNotify => f.write_str("project_notify"),
+            Self::CustomAgentNotify => f.write_str("custom_agent_notify"),
+            Self::SteeringNotify => f.write_str("steering_notify"),
+            Self::SkillNotify => f.write_str("skill_notify"),
+            Self::McpServerNotify => f.write_str("mcp_server_notify"),
             Self::ProjectFileList => f.write_str("project_file_list"),
             Self::ProjectGitStatus => f.write_str("project_git_status"),
             Self::ProjectFileContents => f.write_str("project_file_contents"),
@@ -201,6 +312,9 @@ impl fmt::Display for FrameKind {
             Self::HostBrowseOpened => f.write_str("host_browse_opened"),
             Self::HostBrowseEntries => f.write_str("host_browse_entries"),
             Self::HostBrowseError => f.write_str("host_browse_error"),
+            Self::SetSessionSettings => f.write_str("set_session_settings"),
+            Self::SessionSchemas => f.write_str("session_schemas"),
+            Self::SessionSettings => f.write_str("session_settings"),
         }
     }
 }
@@ -259,10 +373,13 @@ pub struct HostSettings {
     pub default_backend: Option<BackendKind>,
     #[serde(default)]
     pub tyde_debug_mcp_enabled: bool,
+    #[serde(default = "default_agent_control_mcp_enabled")]
+    pub tyde_agent_control_mcp_enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DumpSettingsPayload {}
+fn default_agent_control_mcp_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetSettingPayload {
@@ -281,11 +398,61 @@ pub enum HostSettingValue {
     TydeDebugMcpEnabled {
         enabled: bool,
     },
+    TydeAgentControlMcpEnabled {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSettingsPayload {
     pub settings: HostSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendSetupStatus {
+    Installed,
+    NotInstalled,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendSetupAction {
+    Install,
+    SignIn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSetupCommand {
+    pub title: String,
+    pub description: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_command: Option<String>,
+    pub runnable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSetupInfo {
+    pub backend_kind: BackendKind,
+    pub status: BackendSetupStatus,
+    pub installed_version: Option<String>,
+    pub docs_url: String,
+    pub install_command: Option<BackendSetupCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_command: Option<BackendSetupCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSetupPayload {
+    pub backends: Vec<BackendSetupInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBackendSetupPayload {
+    pub backend_kind: BackendKind,
+    pub action: BackendSetupAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,7 +472,10 @@ pub enum RejectCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnAgentPayload {
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
     pub parent_agent_id: Option<AgentId>,
     pub project_id: Option<ProjectId>,
     pub params: SpawnAgentParams,
@@ -321,6 +491,8 @@ pub enum SpawnAgentParams {
         images: Option<Vec<ImageData>>,
         backend_kind: BackendKind,
         cost_hint: Option<SpawnCostHint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_settings: Option<SessionSettingsValues>,
     },
     Resume {
         session_id: SessionId,
@@ -335,11 +507,53 @@ pub struct SendMessagePayload {
     pub images: Option<Vec<ImageData>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedMessageEntry {
+    pub id: QueuedMessageId,
+    pub message: String,
+    pub images: Vec<ImageData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedMessagesPayload {
+    pub messages: Vec<QueuedMessageEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditQueuedMessagePayload {
+    pub id: QueuedMessageId,
+    pub message: String,
+    pub images: Vec<ImageData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelQueuedMessagePayload {
+    pub id: QueuedMessageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendQueuedMessageNowPayload {
+    pub id: QueuedMessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetAgentNamePayload {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterruptPayload {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloseAgentPayload {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListSessionsPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteSessionPayload {
+    pub session_id: SessionId,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -368,25 +582,169 @@ pub struct SessionListPayload {
 #[derive(Debug, Clone)]
 pub enum AgentInput {
     SendMessage(SendMessagePayload),
+    EditQueuedMessage(EditQueuedMessagePayload),
+    CancelQueuedMessage(CancelQueuedMessagePayload),
+    SendQueuedMessageNow(SendQueuedMessageNowPayload),
+    UpdateSessionSettings(SetSessionSettingsPayload),
+}
+
+// ── Session settings ───────────────────────────────────────────────────
+
+/// Schema describing one backend's configurable session settings.
+/// The frontend auto-generates UI controls from this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettingsSchema {
+    pub backend_kind: BackendKind,
+    pub fields: Vec<SessionSettingField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionSchemaEntry {
+    Ready {
+        schema: SessionSettingsSchema,
+    },
+    Pending {
+        backend_kind: BackendKind,
+    },
+    Unavailable {
+        backend_kind: BackendKind,
+        message: String,
+    },
+}
+
+impl SessionSchemaEntry {
+    pub fn backend_kind(&self) -> BackendKind {
+        match self {
+            Self::Ready { schema } => schema.backend_kind,
+            Self::Pending { backend_kind } | Self::Unavailable { backend_kind, .. } => {
+                *backend_kind
+            }
+        }
+    }
+
+    pub fn ready_schema(&self) -> Option<&SessionSettingsSchema> {
+        match self {
+            Self::Ready { schema } => Some(schema),
+            Self::Pending { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// One configurable field in a backend's session settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettingField {
+    /// Machine-readable key, e.g. "model", "reasoning_effort".
+    pub key: String,
+    /// Human-readable label for the UI.
+    pub label: String,
+    /// Optional description shown as tooltip or help text.
+    pub description: Option<String>,
+    /// The type and constraints of this field.
+    pub field_type: SessionSettingFieldType,
+    /// For Select fields: render as a horizontal slider instead of a dropdown.
+    /// Options are treated as ordered positions (low→high). Defaults to false.
+    #[serde(default)]
+    pub use_slider: bool,
+}
+
+/// The type of a session setting field. Determines how the frontend renders it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionSettingFieldType {
+    Select {
+        options: Vec<SelectOption>,
+        default: Option<String>,
+        nullable: bool,
+    },
+    Toggle {
+        default: bool,
+    },
+    Integer {
+        min: i64,
+        max: i64,
+        step: i64,
+        default: i64,
+    },
+}
+
+/// One option in a Select field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// A single session setting value. Typed enum — not serde_json::Value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSettingValue {
+    String(String),
+    Bool(bool),
+    Integer(i64),
+    Null,
+}
+
+/// Current session settings values for an agent.
+/// Keys match `SessionSettingField.key` from the schema.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettingsValues(pub HashMap<String, SessionSettingValue>);
+
+/// Server → Client on host stream.
+/// Carries session settings schemas for all enabled backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSchemasPayload {
+    pub schemas: Vec<SessionSchemaEntry>,
+}
+
+/// Client → Server on agent stream.
+/// Partial update: only keys present are changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSessionSettingsPayload {
+    pub values: SessionSettingsValues,
+}
+
+/// Server → Client on agent stream.
+/// Full effective session settings snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettingsPayload {
+    pub values: SessionSettingsValues,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStartPayload {
     pub agent_id: AgentId,
     pub name: String,
+    pub origin: AgentOrigin,
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
     pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRenamedPayload {
+    pub agent_id: AgentId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentClosedPayload {
+    pub agent_id: AgentId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewAgentPayload {
     pub agent_id: AgentId,
     pub name: String,
+    pub origin: AgentOrigin,
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
     pub created_at_ms: u64,
@@ -394,10 +752,146 @@ pub struct NewAgentPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomAgent {
+    pub id: CustomAgentId,
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub skill_ids: Vec<SkillId>,
+    #[serde(default)]
+    pub mcp_server_ids: Vec<McpServerId>,
+    pub tool_policy: ToolPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolPolicy {
+    Unrestricted,
+    AllowList { tools: Vec<String> },
+    DenyList { tools: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Steering {
+    pub id: SteeringId,
+    pub scope: SteeringScope,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteeringScope {
+    Host,
+    Project(ProjectId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skill {
+    pub id: SkillId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub id: McpServerId,
+    pub name: String,
+    pub transport: McpTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpTransportConfig {
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer_token_env_var: Option<String>,
+    },
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomAgentUpsertPayload {
+    pub custom_agent: CustomAgent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomAgentDeletePayload {
+    pub id: CustomAgentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteeringUpsertPayload {
+    pub steering: Steering,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteeringDeletePayload {
+    pub id: SteeringId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRefreshPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerUpsertPayload {
+    pub mcp_server: McpServerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerDeletePayload {
+    pub id: McpServerId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CustomAgentNotifyPayload {
+    Upsert { custom_agent: CustomAgent },
+    Delete { id: CustomAgentId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SteeringNotifyPayload {
+    Upsert { steering: Steering },
+    Delete { id: SteeringId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillNotifyPayload {
+    Upsert { skill: Skill },
+    Delete { id: SkillId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpServerNotifyPayload {
+    Upsert { mcp_server: McpServerConfig },
+    Delete { id: McpServerId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub roots: Vec<String>,
+    #[serde(default)]
+    pub sort_order: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +904,11 @@ pub struct ProjectCreatePayload {
 pub struct ProjectRenamePayload {
     pub id: ProjectId,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectReorderPayload {
+    pub project_ids: Vec<ProjectId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,7 +939,7 @@ impl fmt::Display for ProjectRootPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProjectPath {
     pub root: ProjectRootPath,
     pub relative_path: String,
@@ -454,7 +953,7 @@ pub struct ProjectReadFilePayload {
     pub path: ProjectPath,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectDiffScope {
     Unstaged,
@@ -705,6 +1204,7 @@ impl fmt::Display for TerminalId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TerminalLaunchTarget {
+    HostDefault,
     Project {
         project_id: ProjectId,
         root: ProjectRootPath,

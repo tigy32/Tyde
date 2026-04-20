@@ -181,8 +181,7 @@ async fn router_actor(
                     .tx
                     .send(ConnectionCommand::Disconnect)
                     .await
-                    .map_err(|_| "connection task is unavailable".to_owned())
-                    .unwrap_or(());
+                    .expect("connection task channel closed before disconnect was sent");
                 let _ = reply.send(Ok(()));
             }
             RouterCommand::SendLine {
@@ -259,6 +258,11 @@ where
                     Ok(0) => break,
                     Ok(_) => {
                         let line = trim_line_ending(incoming);
+                        tracing::info!(
+                            host_id,
+                            line_len = line.len(),
+                            "proxy router received line from host"
+                        );
                         if let Err(error) = app.emit(
                             HOST_LINE_EVENT,
                             HostLineEvent {
@@ -313,6 +317,8 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: String) -> R
     if line.contains('\n') {
         return Err("host line must not contain a newline".to_owned());
     }
+
+    tracing::info!(line_len = line.len(), "proxy router sending line to host");
 
     writer
         .write_all(line.as_bytes())
@@ -419,6 +425,7 @@ async fn setup_connection_transport(
                                     continue;
                                 }
                                 tracing::warn!(host_id, "{line}");
+                                let _ = emit_error(&app, &host_id, format!("ssh: {line}"));
                             }
                             Err(error) => {
                                 let _ = emit_error(

@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.tyde.desktop",
   "build": {
-    "beforeDevCommand": "trunk serve --port 1420 --config frontend/Trunk.toml",
-    "beforeBuildCommand": "trunk build --release --config frontend/Trunk.toml",
+    "beforeDevCommand": "trunk serve --port 1420 --config ../Trunk.toml",
+    "beforeBuildCommand": "trunk build --release --config ../Trunk.toml",
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:1420"
   },
@@ -20,7 +20,8 @@
         "title": "Tyde",
         "width": 1280,
         "height": 860,
-        "resizable": true
+        "resizable": true,
+        "dragDropEnabled": false
       }
     ]
   }

@@ -14,6 +14,7 @@ pub mod header;
 pub mod home_view;
 pub mod host_browser;
 pub mod project_rail;
+pub mod session_settings;
 pub mod sessions_panel;
 pub mod settings_panel;
 pub mod task_list;

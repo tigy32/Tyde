@@ -16,23 +16,54 @@ use uuid::Uuid;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    match timeout(EVENT_TIMEOUT, client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+    loop {
+        let env = match timeout(EVENT_TIMEOUT, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+                | FrameKind::SessionList
+        ) {
+            continue;
+        }
+
+        return env;
     }
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    match timeout(duration, client.next_event()).await {
-        Err(_) => {}
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(env))) => panic!(
-            "unexpected event before {context}: kind={} stream={}",
-            env.kind, env.stream
-        ),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+    loop {
+        match timeout(duration, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(env)))
+                if matches!(
+                    env.kind,
+                    FrameKind::HostSettings
+                        | FrameKind::SessionSchemas
+                        | FrameKind::BackendSetup
+                        | FrameKind::QueuedMessages
+                        | FrameKind::SessionSettings
+                        | FrameKind::SessionList
+                ) =>
+            {
+                continue;
+            }
+            Ok(Ok(Some(env))) => panic!(
+                "unexpected event before {context}: kind={} stream={}",
+                env.kind, env.stream
+            ),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
     }
 }
 

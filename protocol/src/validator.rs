@@ -1,9 +1,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
+use crate::types::{CloseAgentPayload, NewTerminalPayload};
 use crate::{
-    BackendKind, ChatEvent, Envelope, FrameKind, NewAgentPayload, StreamPath,
-    ToolExecutionCompletedData, ToolRequest,
+    AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
+    ChatEvent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
+    HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload, ProjectRenamePayload,
+    ProjectReorderPayload, RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
+    TerminalCreatePayload, ToolExecutionCompletedData, ToolRequest,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -53,39 +62,169 @@ impl ProtocolValidator {
     }
 
     fn validate_host_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
-        if envelope.kind != FrameKind::NewAgent {
-            return Ok(());
+        match envelope.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = envelope.parse_payload().map_err(|error| {
+                    self.violation(
+                        envelope,
+                        None,
+                        format!("failed to parse NewAgent payload: {error}"),
+                    )
+                })?;
+
+                if self.agent_streams.contains_key(&payload.instance_stream) {
+                    return Err(self.violation(
+                        envelope,
+                        Some(payload.backend_kind),
+                        format!("duplicate NewAgent for stream {}", payload.instance_stream),
+                    ));
+                }
+
+                validate_agent_origin(payload.origin, payload.parent_agent_id.as_ref()).map_err(
+                    |message| self.violation(envelope, Some(payload.backend_kind), message),
+                )?;
+
+                self.agent_streams.insert(
+                    payload.instance_stream,
+                    AgentStreamState {
+                        agent_id: payload.agent_id,
+                        backend_kind: payload.backend_kind,
+                        saw_agent_start: false,
+                        active_stream: None,
+                        started_turns: 0,
+                        pending_tool_calls: HashMap::new(),
+                        cancelled_tool_calls: HashMap::new(),
+                    },
+                );
+                Ok(())
+            }
+            FrameKind::AgentClosed => {
+                let payload: AgentClosedPayload = envelope.parse_payload().map_err(|error| {
+                    self.violation(
+                        envelope,
+                        None,
+                        format!("failed to parse AgentClosed payload: {error}"),
+                    )
+                })?;
+
+                let streams_to_remove = self
+                    .agent_streams
+                    .iter()
+                    .filter_map(|(stream, state)| {
+                        (state.agent_id == payload.agent_id).then_some(stream.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let removed = streams_to_remove.len();
+                for stream in streams_to_remove {
+                    self.agent_streams.remove(&stream);
+                }
+                if removed == 0 {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        format!(
+                            "AgentClosed referenced unknown agent_id {}",
+                            payload.agent_id
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            FrameKind::HostSettings => {
+                parse_host_payload::<HostSettingsPayload>(self, envelope, "HostSettings")
+            }
+            FrameKind::BackendSetup => {
+                parse_host_payload::<BackendSetupPayload>(self, envelope, "BackendSetup")
+            }
+            FrameKind::SessionSchemas => {
+                parse_host_payload::<SessionSchemasPayload>(self, envelope, "SessionSchemas")
+            }
+            FrameKind::SessionList => {
+                parse_host_payload::<SessionListPayload>(self, envelope, "SessionList")
+            }
+            FrameKind::ProjectNotify => {
+                parse_host_payload::<ProjectNotifyPayload>(self, envelope, "ProjectNotify")
+            }
+            FrameKind::CustomAgentNotify => {
+                parse_host_payload::<CustomAgentNotifyPayload>(self, envelope, "CustomAgentNotify")
+            }
+            FrameKind::SteeringNotify => {
+                parse_host_payload::<SteeringNotifyPayload>(self, envelope, "SteeringNotify")
+            }
+            FrameKind::SkillNotify => {
+                parse_host_payload::<SkillNotifyPayload>(self, envelope, "SkillNotify")
+            }
+            FrameKind::McpServerNotify => {
+                parse_host_payload::<McpServerNotifyPayload>(self, envelope, "McpServerNotify")
+            }
+            FrameKind::SetSetting => {
+                parse_host_payload::<SetSettingPayload>(self, envelope, "SetSetting")
+            }
+            FrameKind::SpawnAgent => {
+                parse_host_payload::<SpawnAgentPayload>(self, envelope, "SpawnAgent")
+            }
+            FrameKind::ListSessions => {
+                parse_host_payload::<ListSessionsPayload>(self, envelope, "ListSessions")
+            }
+            FrameKind::DeleteSession => {
+                parse_host_payload::<DeleteSessionPayload>(self, envelope, "DeleteSession")
+            }
+            FrameKind::ProjectCreate => {
+                parse_host_payload::<ProjectCreatePayload>(self, envelope, "ProjectCreate")
+            }
+            FrameKind::ProjectRename => {
+                parse_host_payload::<ProjectRenamePayload>(self, envelope, "ProjectRename")
+            }
+            FrameKind::ProjectReorder => {
+                parse_host_payload::<ProjectReorderPayload>(self, envelope, "ProjectReorder")
+            }
+            FrameKind::ProjectAddRoot => {
+                parse_host_payload::<ProjectAddRootPayload>(self, envelope, "ProjectAddRoot")
+            }
+            FrameKind::ProjectDelete => {
+                parse_host_payload::<ProjectDeletePayload>(self, envelope, "ProjectDelete")
+            }
+            FrameKind::CustomAgentUpsert => {
+                parse_host_payload::<CustomAgentUpsertPayload>(self, envelope, "CustomAgentUpsert")
+            }
+            FrameKind::CustomAgentDelete => {
+                parse_host_payload::<CustomAgentDeletePayload>(self, envelope, "CustomAgentDelete")
+            }
+            FrameKind::SteeringUpsert => {
+                parse_host_payload::<SteeringUpsertPayload>(self, envelope, "SteeringUpsert")
+            }
+            FrameKind::SteeringDelete => {
+                parse_host_payload::<SteeringDeletePayload>(self, envelope, "SteeringDelete")
+            }
+            FrameKind::SkillRefresh => {
+                parse_host_payload::<SkillRefreshPayload>(self, envelope, "SkillRefresh")
+            }
+            FrameKind::McpServerUpsert => {
+                parse_host_payload::<McpServerUpsertPayload>(self, envelope, "McpServerUpsert")
+            }
+            FrameKind::McpServerDelete => {
+                parse_host_payload::<McpServerDeletePayload>(self, envelope, "McpServerDelete")
+            }
+            FrameKind::HostBrowseStart => {
+                parse_host_payload::<HostBrowseStartPayload>(self, envelope, "HostBrowseStart")
+            }
+            FrameKind::HostBrowseList => {
+                parse_host_payload::<HostBrowseListPayload>(self, envelope, "HostBrowseList")
+            }
+            FrameKind::HostBrowseClose => {
+                parse_host_payload::<HostBrowseClosePayload>(self, envelope, "HostBrowseClose")
+            }
+            FrameKind::TerminalCreate => {
+                parse_host_payload::<TerminalCreatePayload>(self, envelope, "TerminalCreate")
+            }
+            FrameKind::RunBackendSetup => {
+                parse_host_payload::<RunBackendSetupPayload>(self, envelope, "RunBackendSetup")
+            }
+            FrameKind::NewTerminal => {
+                parse_host_payload::<NewTerminalPayload>(self, envelope, "NewTerminal")
+            }
+            _ => Ok(()),
         }
-
-        let payload: NewAgentPayload = envelope.parse_payload().map_err(|error| {
-            self.violation(
-                envelope,
-                None,
-                format!("failed to parse NewAgent payload: {error}"),
-            )
-        })?;
-
-        if self.agent_streams.contains_key(&payload.instance_stream) {
-            return Err(self.violation(
-                envelope,
-                Some(payload.backend_kind),
-                format!("duplicate NewAgent for stream {}", payload.instance_stream),
-            ));
-        }
-
-        self.agent_streams.insert(
-            payload.instance_stream,
-            AgentStreamState {
-                backend_kind: payload.backend_kind,
-                saw_agent_start: false,
-                active_stream: None,
-                started_turns: 0,
-                pending_tool_calls: HashMap::new(),
-                cancelled_tool_calls: HashMap::new(),
-            },
-        );
-
-        Ok(())
     }
 
     fn validate_agent_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
@@ -112,6 +251,24 @@ impl ProtocolValidator {
                         format!("duplicate AgentStart for stream {}", envelope.stream),
                     ));
                 }
+                let payload: AgentStartPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse AgentStart payload: {error}"),
+                    )
+                })?;
+                if let Err(message) =
+                    validate_agent_origin(payload.origin, payload.parent_agent_id.as_ref())
+                {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        message,
+                    ));
+                }
                 state.saw_agent_start = true;
             }
             FrameKind::ChatEvent => {
@@ -125,7 +282,36 @@ impl ProtocolValidator {
                 })?;
                 validate_chat_event(&recent_frames, envelope, state, &event)?;
             }
+            FrameKind::AgentRenamed => {
+                if !state.saw_agent_start {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "AgentRenamed arrived before AgentStart on {}",
+                            envelope.stream
+                        ),
+                    ));
+                }
+            }
             FrameKind::AgentError => {}
+            FrameKind::SessionSettings => {}
+            FrameKind::SetSessionSettings => {}
+            FrameKind::QueuedMessages => {}
+            FrameKind::EditQueuedMessage => {}
+            FrameKind::CancelQueuedMessage => {}
+            FrameKind::SendQueuedMessageNow => {}
+            FrameKind::CloseAgent => {
+                let _: CloseAgentPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse CloseAgent payload: {error}"),
+                    )
+                })?;
+            }
             other => {
                 return Err(build_violation(
                     &recent_frames,
@@ -168,6 +354,33 @@ impl ProtocolValidator {
             message,
         )
     }
+}
+
+fn validate_agent_origin(
+    origin: AgentOrigin,
+    parent_agent_id: Option<&crate::AgentId>,
+) -> Result<(), String> {
+    match origin {
+        AgentOrigin::BackendNative if parent_agent_id.is_none() => {
+            Err("backend_native agents must include parent_agent_id".to_owned())
+        }
+        AgentOrigin::User | AgentOrigin::AgentControl | AgentOrigin::BackendNative => Ok(()),
+    }
+}
+
+fn parse_host_payload<T: serde::de::DeserializeOwned>(
+    validator: &ProtocolValidator,
+    envelope: &Envelope,
+    label: &str,
+) -> Result<(), ProtocolViolation> {
+    let _: T = envelope.parse_payload().map_err(|error| {
+        validator.violation(
+            envelope,
+            None,
+            format!("failed to parse {label} payload: {error}"),
+        )
+    })?;
+    Ok(())
 }
 
 fn validate_chat_event(
@@ -381,6 +594,7 @@ pub struct ObservedFrame {
 
 #[derive(Debug, Clone)]
 struct AgentStreamState {
+    agent_id: crate::AgentId,
     backend_kind: BackendKind,
     saw_agent_start: bool,
     active_stream: Option<ActiveStreamState>,
@@ -498,8 +712,10 @@ mod tests {
             &NewAgentPayload {
                 agent_id: crate::AgentId("test-agent".to_owned()),
                 name: "test".to_owned(),
+                origin: AgentOrigin::User,
                 backend_kind: BackendKind::Claude,
                 workspace_roots: vec![],
+                custom_agent_id: None,
                 project_id: None,
                 parent_agent_id: None,
                 created_at_ms: 0,
@@ -517,8 +733,10 @@ mod tests {
             &crate::AgentStartPayload {
                 agent_id: crate::AgentId("test-agent".to_owned()),
                 name: "test".to_owned(),
+                origin: AgentOrigin::User,
                 backend_kind: BackendKind::Claude,
                 workspace_roots: vec![],
+                custom_agent_id: None,
                 project_id: None,
                 parent_agent_id: None,
                 created_at_ms: 0,

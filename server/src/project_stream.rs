@@ -344,18 +344,19 @@ pub(crate) fn read_file(
     project: &Project,
     payload: ProjectReadFilePayload,
 ) -> Result<ProjectFileContentsPayload, String> {
-    validate_project_path(project, &payload.path)?;
-    let absolute = absolute_project_path(&payload.path)?;
+    let path = normalize_read_path(project, payload.path)?;
+    validate_project_path(project, &path)?;
+    let absolute = absolute_project_path(&path)?;
     let bytes = fs::read(&absolute)
         .map_err(|err| format!("Failed to read file '{}': {err}", absolute.display()))?;
     match String::from_utf8(bytes) {
         Ok(contents) => Ok(ProjectFileContentsPayload {
-            path: payload.path,
+            path,
             contents: Some(contents),
             is_binary: false,
         }),
         Err(_) => Ok(ProjectFileContentsPayload {
-            path: payload.path,
+            path,
             contents: None,
             is_binary: true,
         }),
@@ -530,17 +531,115 @@ fn validate_project_path(project: &Project, path: &ProjectPath) -> Result<(), St
     validate_relative_path(&path.relative_path)
 }
 
+fn normalize_read_path(project: &Project, path: ProjectPath) -> Result<ProjectPath, String> {
+    let normalized_relative_path = normalize_file_reference(&path.relative_path)?;
+
+    if let Some(path) = project_path_from_absolute(project, &normalized_relative_path) {
+        return Ok(path);
+    }
+
+    Ok(ProjectPath {
+        root: path.root,
+        relative_path: normalized_relative_path,
+    })
+}
+
+fn normalize_file_reference(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("relative path must not be empty".to_owned());
+    }
+
+    let decoded = percent_decode_path(trimmed).unwrap_or_else(|| trimmed.to_owned());
+    let without_scheme = decoded.strip_prefix("file://").unwrap_or(decoded.as_str());
+    let without_fragment = without_scheme.split('#').next().unwrap_or(without_scheme);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let without_line_suffix = strip_trailing_line_suffix(without_query);
+    let normalized = without_line_suffix.trim_start_matches("./");
+
+    if normalized.trim().is_empty() {
+        return Err("relative path must not be empty".to_owned());
+    }
+
+    Ok(normalized.to_owned())
+}
+
+fn strip_trailing_line_suffix(path: &str) -> &str {
+    let mut candidate = path;
+    for _ in 0..2 {
+        let Some((prefix, suffix)) = candidate.rsplit_once(':') else {
+            break;
+        };
+        if suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            candidate = prefix;
+        } else {
+            break;
+        }
+    }
+    candidate
+}
+
+fn project_path_from_absolute(project: &Project, absolute_path: &str) -> Option<ProjectPath> {
+    let absolute = Path::new(absolute_path);
+    if !absolute.is_absolute() {
+        return None;
+    }
+
+    for root in &project.roots {
+        let Ok(relative) = absolute.strip_prefix(root) else {
+            continue;
+        };
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if relative_path.is_empty() {
+            return None;
+        }
+        return Some(ProjectPath {
+            root: ProjectRootPath(root.clone()),
+            relative_path,
+        });
+    }
+
+    None
+}
+
+fn percent_decode_path(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut chars = value.as_bytes().iter().copied();
+    while let Some(byte) = chars.next() {
+        match byte {
+            b'%' => {
+                let high = chars.next()?;
+                let low = chars.next()?;
+                let decoded = (decode_hex_nibble(high)? << 4) | decode_hex_nibble(low)?;
+                bytes.push(decoded);
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn validate_relative_path(path: &str) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("relative path must not be empty".to_owned());
     }
 
     let relative = Path::new(path);
-    assert!(
-        relative.is_relative(),
-        "project relative path must be relative: {}",
-        path
-    );
+    if !relative.is_relative() {
+        return Err(format!("project relative path must be relative: {}", path));
+    }
 
     for component in relative.components() {
         match component {

@@ -1,11 +1,18 @@
+use std::collections::HashSet;
+
+use protocol::types::CloseAgentPayload;
 use protocol::{
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, DumpSettingsPayload, Envelope,
-    FrameKind, HostBrowseClosePayload, HostBrowseListPayload, HostBrowseStartPayload,
-    InterruptPayload, ListSessionsPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectId, ProjectListDirPayload, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectStageFilePayload,
-    ProjectStageHunkPayload, SendMessagePayload, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
+    CustomAgentDeletePayload, CustomAgentUpsertPayload, DeleteSessionPayload,
+    EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
+    HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerUpsertPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectId, ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, RunBackendSetupPayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
     TerminalResizePayload, TerminalSendPayload,
 };
 use uuid::Uuid;
@@ -21,12 +28,6 @@ pub(crate) async fn route_client_envelope(
 ) {
     if envelope.stream == *connection_host_stream {
         match envelope.kind {
-            FrameKind::DumpSettings => {
-                let _: DumpSettingsPayload = envelope
-                    .parse_payload()
-                    .expect("invalid dump_settings payload");
-                host.dump_settings(host_output_stream).await;
-            }
             FrameKind::SetSetting => {
                 let payload: SetSettingPayload = envelope
                     .parse_payload()
@@ -37,10 +38,12 @@ pub(crate) async fn route_client_envelope(
                 let payload: SpawnAgentPayload = envelope
                     .parse_payload()
                     .expect("invalid spawn_agent payload");
-                assert!(
-                    !payload.name.trim().is_empty(),
-                    "spawn_agent name must not be empty"
-                );
+                if let Some(name) = payload.name.as_ref() {
+                    assert!(
+                        !name.trim().is_empty(),
+                        "spawn_agent name must not be empty when provided"
+                    );
+                }
                 match &payload.params {
                     SpawnAgentParams::New {
                         workspace_roots,
@@ -73,6 +76,12 @@ pub(crate) async fn route_client_envelope(
                     .expect("invalid list_sessions payload");
                 host.list_sessions(host_output_stream).await;
             }
+            FrameKind::DeleteSession => {
+                let payload: DeleteSessionPayload = envelope
+                    .parse_payload()
+                    .expect("invalid delete_session payload");
+                host.delete_session(payload.session_id).await;
+            }
             FrameKind::ProjectCreate => {
                 let payload: ProjectCreatePayload = envelope
                     .parse_payload()
@@ -98,6 +107,24 @@ pub(crate) async fn route_client_envelope(
                 );
                 host.rename_project(payload).await;
             }
+            FrameKind::ProjectReorder => {
+                let payload: ProjectReorderPayload = envelope
+                    .parse_payload()
+                    .expect("invalid project_reorder payload");
+                let mut seen_ids = HashSet::new();
+                for project_id in &payload.project_ids {
+                    assert!(
+                        !project_id.0.trim().is_empty(),
+                        "project_reorder ids must not be empty"
+                    );
+                    assert!(
+                        seen_ids.insert(project_id.0.clone()),
+                        "project_reorder contains duplicate id {}",
+                        project_id
+                    );
+                }
+                host.reorder_projects(payload).await;
+            }
             FrameKind::ProjectAddRoot => {
                 let payload: ProjectAddRootPayload = envelope
                     .parse_payload()
@@ -121,6 +148,48 @@ pub(crate) async fn route_client_envelope(
                     "project_delete id must not be empty"
                 );
                 host.delete_project(payload).await;
+            }
+            FrameKind::CustomAgentUpsert => {
+                let payload: CustomAgentUpsertPayload = envelope
+                    .parse_payload()
+                    .expect("invalid custom_agent_upsert payload");
+                host.upsert_custom_agent(payload).await;
+            }
+            FrameKind::CustomAgentDelete => {
+                let payload: CustomAgentDeletePayload = envelope
+                    .parse_payload()
+                    .expect("invalid custom_agent_delete payload");
+                host.delete_custom_agent(payload).await;
+            }
+            FrameKind::SteeringUpsert => {
+                let payload: SteeringUpsertPayload = envelope
+                    .parse_payload()
+                    .expect("invalid steering_upsert payload");
+                host.upsert_steering(payload).await;
+            }
+            FrameKind::SteeringDelete => {
+                let payload: SteeringDeletePayload = envelope
+                    .parse_payload()
+                    .expect("invalid steering_delete payload");
+                host.delete_steering(payload).await;
+            }
+            FrameKind::SkillRefresh => {
+                let payload: SkillRefreshPayload = envelope
+                    .parse_payload()
+                    .expect("invalid skill_refresh payload");
+                host.refresh_skills(payload).await;
+            }
+            FrameKind::McpServerUpsert => {
+                let payload: McpServerUpsertPayload = envelope
+                    .parse_payload()
+                    .expect("invalid mcp_server_upsert payload");
+                host.upsert_mcp_server(payload).await;
+            }
+            FrameKind::McpServerDelete => {
+                let payload: McpServerDeletePayload = envelope
+                    .parse_payload()
+                    .expect("invalid mcp_server_delete payload");
+                host.delete_mcp_server(payload).await;
             }
             FrameKind::HostBrowseStart => {
                 let payload: HostBrowseStartPayload = envelope
@@ -157,6 +226,13 @@ pub(crate) async fn route_client_envelope(
                 host.create_terminal(connection_host_stream, host_output_stream, payload)
                     .await;
             }
+            FrameKind::RunBackendSetup => {
+                let payload: RunBackendSetupPayload = envelope
+                    .parse_payload()
+                    .expect("invalid run_backend_setup payload");
+                host.run_backend_setup(connection_host_stream, host_output_stream, payload)
+                    .await;
+            }
             other => {
                 panic!(
                     "protocol violation: unexpected client frame kind {} on host stream {}",
@@ -187,19 +263,128 @@ pub(crate) async fn route_client_envelope(
                     send_agent_not_running_error(stream, agent_id).await;
                 }
             }
+            FrameKind::EditQueuedMessage => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path);
+                let payload: EditQueuedMessagePayload = envelope
+                    .parse_payload()
+                    .expect("invalid edit_queued_message payload");
+
+                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
+                    agent
+                        .send_input(AgentInput::EditQueuedMessage(payload))
+                        .await
+                } else {
+                    false
+                };
+
+                if !sent {
+                    let stream = host_output_stream.with_path(stream_path);
+                    send_agent_not_running_error(stream, agent_id).await;
+                }
+            }
+            FrameKind::CancelQueuedMessage => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path);
+                let payload: CancelQueuedMessagePayload = envelope
+                    .parse_payload()
+                    .expect("invalid cancel_queued_message payload");
+
+                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
+                    agent
+                        .send_input(AgentInput::CancelQueuedMessage(payload))
+                        .await
+                } else {
+                    false
+                };
+
+                if !sent {
+                    let stream = host_output_stream.with_path(stream_path);
+                    send_agent_not_running_error(stream, agent_id).await;
+                }
+            }
+            FrameKind::SendQueuedMessageNow => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path);
+                let payload: SendQueuedMessageNowPayload = envelope
+                    .parse_payload()
+                    .expect("invalid send_queued_message_now payload");
+
+                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
+                    agent
+                        .send_input(AgentInput::SendQueuedMessageNow(payload))
+                        .await
+                } else {
+                    false
+                };
+
+                if !sent {
+                    let stream = host_output_stream.with_path(stream_path);
+                    send_agent_not_running_error(stream, agent_id).await;
+                }
+            }
+            FrameKind::SetAgentName => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path);
+                let payload: SetAgentNamePayload = envelope
+                    .parse_payload()
+                    .expect("invalid set_agent_name payload");
+                assert!(
+                    !payload.name.trim().is_empty(),
+                    "set_agent_name name must not be empty"
+                );
+
+                match host.agent_handle(&agent_id).await {
+                    Some(agent) => match agent.set_name(payload.name).await {
+                        Some(true) => host.fan_out_session_lists().await,
+                        Some(false) => {}
+                        None => {
+                            let stream = host_output_stream.with_path(stream_path);
+                            send_agent_not_running_error(stream, agent_id).await;
+                        }
+                    },
+                    None => {
+                        let stream = host_output_stream.with_path(stream_path);
+                        send_agent_not_running_error(stream, agent_id).await;
+                    }
+                }
+            }
             FrameKind::Interrupt => {
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path);
                 let _: InterruptPayload =
                     envelope.parse_payload().expect("invalid interrupt payload");
 
-                let interrupted = if let Some(agent) = host.agent_handle(&agent_id).await {
-                    agent.interrupt().await
+                let interrupted = host.interrupt_agent(&agent_id).await;
+
+                if !interrupted {
+                    let stream = host_output_stream.with_path(stream_path);
+                    send_agent_not_running_error(stream, agent_id).await;
+                }
+            }
+            FrameKind::CloseAgent => {
+                let agent_id = parse_agent_id(&envelope.stream);
+                let _: CloseAgentPayload = envelope
+                    .parse_payload()
+                    .expect("invalid close_agent payload");
+                host.close_agent(&agent_id).await;
+            }
+            FrameKind::SetSessionSettings => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path);
+                let payload: SetSessionSettingsPayload = envelope
+                    .parse_payload()
+                    .expect("invalid set_session_settings payload");
+
+                let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
+                    agent
+                        .send_input(AgentInput::UpdateSessionSettings(payload))
+                        .await
                 } else {
                     false
                 };
 
-                if !interrupted {
+                if !sent {
                     let stream = host_output_stream.with_path(stream_path);
                     send_agent_not_running_error(stream, agent_id).await;
                 }

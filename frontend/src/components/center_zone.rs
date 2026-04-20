@@ -6,7 +6,7 @@ use crate::components::diff_view::DiffView;
 use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
 use crate::components::settings_panel::SettingsPanel;
-use crate::state::{AppState, CenterView, ConnectionStatus};
+use crate::state::{AppState, ConnectionStatus, TabContent, TabId};
 
 use protocol::BackendKind;
 
@@ -21,22 +21,51 @@ fn backend_label(kind: BackendKind) -> &'static str {
 }
 
 #[component]
-pub fn CenterZone() -> impl IntoView {
+fn TabButton(tab_id: TabId) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let set_home = move |_| state.center_view.set(CenterView::Home);
-    let set_chat = move |_| state.center_view.set(CenterView::Chat);
-    let set_editor = move |_| state.center_view.set(CenterView::Editor);
-
-    let tab_class = move |target: CenterView| {
-        move || {
-            if state.center_view.get() == target {
-                "tab active"
-            } else {
-                "tab"
-            }
-        }
+    let tab_data = move || {
+        state
+            .center_zone
+            .with(|cz| cz.tabs.iter().find(|t| t.id == tab_id).cloned())
     };
+    let is_active = move || {
+        state
+            .center_zone
+            .with(|cz| cz.active_tab_id == Some(tab_id))
+    };
+
+    let on_click = move |_| state.activate_tab(tab_id);
+
+    let is_closeable = move || tab_data().is_some_and(|t| t.closeable);
+
+    view! {
+        <button
+            class=move || if is_active() { "tab active" } else { "tab" }
+            on:click=on_click
+        >
+            <span class="tab-label">{move || tab_data().map(|t| t.label).unwrap_or_default()}</span>
+            {move || is_closeable().then(|| {
+                let on_close = move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    let state = expect_context::<AppState>();
+                    state.close_tab(tab_id);
+                };
+                view! {
+                    <span class="tab-close" on:click=on_close>
+                        <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+                            <path d="M1 1L7 7M7 1L1 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                        </svg>
+                    </span>
+                }
+            })}
+        </button>
+    }
+}
+
+#[component]
+pub fn CenterZone() -> impl IntoView {
+    let state = expect_context::<AppState>();
 
     // New chat split button
     let menu_open = RwSignal::new(false);
@@ -71,12 +100,26 @@ pub fn CenterZone() -> impl IntoView {
         menu_open.set(false);
     };
 
+    let tab_ids = move || {
+        state
+            .center_zone
+            .with(|cz| cz.tabs.iter().map(|t| t.id).collect::<Vec<_>>())
+    };
+
+    let tab_bar_class = move || {
+        if state.tabs_enabled.get() {
+            "tab-bar"
+        } else {
+            "tab-bar tab-bar-hidden"
+        }
+    };
+
     view! {
         <div class="center-zone">
-            <div class="tab-bar">
-                <button class={tab_class(CenterView::Home)} on:click=set_home>"Home"</button>
-                <button class={tab_class(CenterView::Chat)} on:click=set_chat>"Chat"</button>
-                <button class={tab_class(CenterView::Editor)} on:click=set_editor>"Editor"</button>
+            <div class=tab_bar_class>
+                {move || tab_ids().into_iter().map(|id| {
+                    view! { <TabButton tab_id=id /> }
+                }).collect_view()}
 
                 <div class="tab-bar-spacer"></div>
 
@@ -138,22 +181,31 @@ pub fn CenterZone() -> impl IntoView {
                 </div>
             </div>
             <div class="center-content">
-                {move || match state.center_view.get() {
-                    CenterView::Home => view! {
-                        <div class="center-content-scroll">
-                            <HomeView />
-                        </div>
-                    }.into_any(),
-                    CenterView::Chat => view! {
-                        <ChatView />
-                    }.into_any(),
-                    CenterView::Editor => {
-                        let has_file = state.open_file.get().is_some();
-                        if has_file {
-                            view! { <FileView /> }.into_any()
-                        } else {
-                            view! { <DiffView /> }.into_any()
+                {move || {
+                    let cz = state.center_zone.get();
+                    let active_tab = cz.active_tab_id
+                        .and_then(|id| cz.tabs.iter().find(|t| t.id == id));
+                    match active_tab.map(|t| &t.content) {
+                        Some(TabContent::Home) => view! {
+                            <div class="center-content-scroll">
+                                <HomeView />
+                            </div>
+                        }.into_any(),
+                        Some(TabContent::Chat { agent_ref }) => {
+                            state.active_agent.set(agent_ref.clone());
+                            view! { <ChatView /> }.into_any()
                         }
+                        Some(TabContent::File { path }) => {
+                            view! { <FileView path=path.clone() /> }.into_any()
+                        }
+                        Some(TabContent::Diff { root, scope }) => {
+                            view! { <DiffView root=root.clone() scope=*scope /> }.into_any()
+                        }
+                        None => view! {
+                            <div class="center-content-scroll">
+                                <HomeView />
+                            </div>
+                        }.into_any(),
                     }
                 }}
             </div>

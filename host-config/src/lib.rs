@@ -66,3 +66,54 @@ pub struct UpsertConfiguredHostRequest {
     pub transport: HostTransportConfig,
     pub auto_connect: bool,
 }
+
+// ── Tauri bridge request/event types ────────────────────────────────────────
+//
+// Shared between the tauri-shell (serializes/emits) and the WASM frontend
+// (deserializes/receives). One definition here makes field-mismatch bugs
+// between the two sides impossible.
+
+/// Generic single-host-id request (connect, disconnect, remove).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostIdRequest {
+    pub host_id: String,
+}
+
+/// Request to send a line of text to a connected host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendHostLineRequest {
+    pub host_id: String,
+    pub line: String,
+}
+
+/// Request to change the UI-selected host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelectedHostRequest {
+    pub host_id: Option<String>,
+}
+
+/// Tauri event payload: a line of NDJSON from a connected host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLineEvent {
+    pub host_id: String,
+    pub line: String,
+}
+
+/// Tauri event payload: a host connection was dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDisconnectedEvent {
+    pub host_id: String,
+}
+
+/// Tauri event payload: a host connection encountered an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostErrorEvent {
+    pub host_id: String,
+    pub message: String,
+}

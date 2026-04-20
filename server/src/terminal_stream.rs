@@ -8,7 +8,7 @@ use protocol::{
     TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
     TerminalSendPayload, TerminalStartPayload,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::stream::{Stream, StreamClosed};
 
@@ -35,6 +35,7 @@ struct TerminalState {
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     exit: Mutex<Option<TerminalExitPayload>>,
+    exit_notify: Notify,
 }
 
 enum TerminalEvent {
@@ -146,6 +147,16 @@ impl TerminalHandle {
         }
     }
 
+    pub(crate) async fn wait_for_exit(&self) -> TerminalExitPayload {
+        loop {
+            let notified = self.state.exit_notify.notified();
+            if let Some(payload) = self.state.exit_payload() {
+                return payload;
+            }
+            notified.await;
+        }
+    }
+
     fn not_running_message(&self, message: &str) -> Option<String> {
         if self.state.exit_payload().is_some() {
             return Some(message.to_owned());
@@ -189,6 +200,7 @@ impl TerminalState {
             return false;
         }
         *exit = Some(payload);
+        self.exit_notify.notify_waiters();
         true
     }
 }
@@ -208,6 +220,7 @@ pub(crate) async fn create_terminal(
         writer: Mutex::new(created.writer),
         child: Mutex::new(created.child),
         exit: Mutex::new(None),
+        exit_notify: Notify::new(),
     });
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 

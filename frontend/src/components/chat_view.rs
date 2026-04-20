@@ -88,6 +88,19 @@ pub fn ChatView() -> impl IntoView {
             .map(|a| a.backend_kind)
     };
 
+    let agent_initializing = move || -> bool {
+        let active_agent = match state.active_agent.get() {
+            Some(active_agent) => active_agent,
+            None => return false,
+        };
+        state.agents.get().iter().any(|agent| {
+            agent.host_id == active_agent.host_id
+                && agent.agent_id == active_agent.agent_id
+                && !agent.started
+                && agent.fatal_error.is_none()
+        })
+    };
+
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
     let show_scroll_btn = RwSignal::new(false);
@@ -145,28 +158,17 @@ pub fn ChatView() -> impl IntoView {
             <Show
                 when=has_agent
                 fallback=move || {
-                    let is_initializing = move || state.agent_initializing.get();
                     view! {
                         <div class="chat-welcome">
-                            <Show
-                                when=is_initializing
-                                fallback=move || view! {
-                                    <div class="chat-welcome-inner">
-                                        <img class="chat-welcome-icon" src="icon.png" alt="Tyde" />
-                                        <h2 class="chat-welcome-title">"Tyde"</h2>
-                                        <p class="chat-welcome-subtitle">"Send a message to start a conversation"</p>
-                                        <div class="chat-welcome-shortcuts">
-                                            <span class="chat-welcome-shortcut"><kbd>"Enter"</kbd>" Send Message"</span>
-                                            <span class="chat-welcome-shortcut"><kbd>"Ctrl+K"</kbd>" Command Palette"</span>
-                                        </div>
-                                    </div>
-                                }
-                            >
-                                <div class="chat-initializing-overlay">
-                                    <div class="chat-initializing-spinner"></div>
-                                    <p class="chat-initializing-text">"Initializing agent\u{2026}"</p>
+                            <div class="chat-welcome-inner">
+                                <img class="chat-welcome-icon" src="icon.png" alt="Tyde" />
+                                <h2 class="chat-welcome-title">"Tyde"</h2>
+                                <p class="chat-welcome-subtitle">"Send a message to start a conversation"</p>
+                                <div class="chat-welcome-shortcuts">
+                                    <span class="chat-welcome-shortcut"><kbd>"Enter"</kbd>" Send Message"</span>
+                                    <span class="chat-welcome-shortcut"><kbd>"Ctrl+K"</kbd>" Command Palette"</span>
                                 </div>
-                            </Show>
+                            </div>
                         </div>
                     }
                 }
@@ -192,6 +194,12 @@ pub fn ChatView() -> impl IntoView {
                         />
                     }
                 }}
+                <Show when=agent_initializing>
+                    <div class="chat-initializing-overlay">
+                        <div class="chat-initializing-spinner"></div>
+                        <p class="chat-initializing-text">"Initializing agent\u{2026}"</p>
+                    </div>
+                </Show>
                 <div class="chat-messages-wrapper">
                     <div class="chat-messages" node_ref=scroll_ref>
                         // Show welcome hint when chat is empty and no streaming

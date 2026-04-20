@@ -6,15 +6,22 @@ use std::time::Duration;
 
 mod runtime;
 
+use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorPayload, AgentId, AgentStartPayload, DumpSettingsPayload, Envelope, FrameError,
-    FrameKind, HelloPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
-    NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
-    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload,
-    ProjectRenamePayload, ProjectStageFilePayload, ProjectStageHunkPayload, RejectPayload,
-    SendMessagePayload, SeqValidator, SessionListPayload, SetSettingPayload, SpawnAgentPayload,
+    AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
+    CancelQueuedMessagePayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload,
+    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload, NewTerminalPayload,
+    PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
+    RejectPayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
     StreamPath, TYDE_VERSION, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
     TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
@@ -122,13 +129,69 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
-    pub async fn dump_settings(&mut self, payload: DumpSettingsPayload) -> Result<(), FrameError> {
-        self.send_host_payload(FrameKind::DumpSettings, &payload)
+    pub async fn delete_session(
+        &mut self,
+        payload: DeleteSessionPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::DeleteSession, &payload)
             .await
     }
 
     pub async fn set_setting(&mut self, payload: SetSettingPayload) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::SetSetting, &payload)
+            .await
+    }
+
+    pub async fn custom_agent_upsert(
+        &mut self,
+        payload: CustomAgentUpsertPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::CustomAgentUpsert, &payload)
+            .await
+    }
+
+    pub async fn custom_agent_delete(
+        &mut self,
+        payload: CustomAgentDeletePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::CustomAgentDelete, &payload)
+            .await
+    }
+
+    pub async fn steering_upsert(
+        &mut self,
+        payload: SteeringUpsertPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SteeringUpsert, &payload)
+            .await
+    }
+
+    pub async fn steering_delete(
+        &mut self,
+        payload: SteeringDeletePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SteeringDelete, &payload)
+            .await
+    }
+
+    pub async fn skill_refresh(&mut self, payload: SkillRefreshPayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::SkillRefresh, &payload)
+            .await
+    }
+
+    pub async fn mcp_server_upsert(
+        &mut self,
+        payload: McpServerUpsertPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::McpServerUpsert, &payload)
+            .await
+    }
+
+    pub async fn mcp_server_delete(
+        &mut self,
+        payload: McpServerDeletePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::McpServerDelete, &payload)
             .await
     }
 
@@ -145,6 +208,14 @@ impl Connection {
         payload: ProjectRenamePayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::ProjectRename, &payload)
+            .await
+    }
+
+    pub async fn project_reorder(
+        &mut self,
+        payload: ProjectReorderPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::ProjectReorder, &payload)
             .await
     }
 
@@ -309,9 +380,80 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    pub async fn set_agent_name(
+        &mut self,
+        stream: &StreamPath,
+        name: String,
+    ) -> Result<(), FrameError> {
+        self.set_agent_name_stream(&Stream::from_path(stream.clone()), name)
+            .await
+    }
+
+    pub async fn set_agent_name_stream(
+        &mut self,
+        stream: &Stream,
+        name: String,
+    ) -> Result<(), FrameError> {
+        let payload = SetAgentNamePayload { name };
+        let seq = self
+            .outgoing_seq
+            .get(stream.path())
+            .copied()
+            .expect("set_agent_name on unknown stream — AgentStart must be received first");
+        let envelope = Envelope::from_payload(
+            stream.path().clone(),
+            FrameKind::SetAgentName,
+            seq,
+            &payload,
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.path().clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn set_session_settings(
+        &mut self,
+        stream: &StreamPath,
+        payload: SetSessionSettingsPayload,
+    ) -> Result<(), FrameError> {
+        let stream = Stream::from_path(stream.clone());
+        let seq =
+            self.outgoing_seq.get(stream.path()).copied().expect(
+                "set_session_settings on unknown stream — AgentStart must be received first",
+            );
+        let envelope = Envelope::from_payload(
+            stream.path().clone(),
+            FrameKind::SetSessionSettings,
+            seq,
+            &payload,
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.path().clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn interrupt(&mut self, stream: &StreamPath) -> Result<(), FrameError> {
         self.interrupt_stream(&Stream::from_path(stream.clone()))
             .await
+    }
+
+    pub async fn close_agent(&mut self, stream: &StreamPath) -> Result<(), FrameError> {
+        self.close_agent_stream(&Stream::from_path(stream.clone()))
+            .await
+    }
+
+    pub async fn close_agent_stream(&mut self, stream: &Stream) -> Result<(), FrameError> {
+        let payload = CloseAgentPayload::default();
+        let seq = self
+            .outgoing_seq
+            .get(stream.path())
+            .copied()
+            .expect("close_agent on unknown stream — AgentStart must be received first");
+        let envelope =
+            Envelope::from_payload(stream.path().clone(), FrameKind::CloseAgent, seq, &payload)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.path().clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
     }
 
     pub async fn interrupt_stream(&mut self, stream: &Stream) -> Result<(), FrameError> {
@@ -325,6 +467,45 @@ impl Connection {
             Envelope::from_payload(stream.path().clone(), FrameKind::Interrupt, seq, &payload)
                 .map_err(FrameError::Json)?;
         self.outgoing_seq.insert(stream.path().clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn cancel_queued_message(
+        &mut self,
+        stream: &StreamPath,
+        payload: CancelQueuedMessagePayload,
+    ) -> Result<(), FrameError> {
+        let seq =
+            self.outgoing_seq.get(stream).copied().expect(
+                "cancel_queued_message on unknown stream — AgentStart must be received first",
+            );
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::CancelQueuedMessage,
+            seq,
+            &payload,
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn send_queued_message_now(
+        &mut self,
+        stream: &StreamPath,
+        payload: SendQueuedMessageNowPayload,
+    ) -> Result<(), FrameError> {
+        let seq = self.outgoing_seq.get(stream).copied().expect(
+            "send_queued_message_now on unknown stream — AgentStart must be received first",
+        );
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::SendQueuedMessageNow,
+            seq,
+            &payload,
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
         write_envelope(&mut self.writer, &envelope).await
     }
 
@@ -378,9 +559,49 @@ impl Connection {
                     let _: ProjectNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::CustomAgentNotify => {
+                    let _: CustomAgentNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SteeringNotify => {
+                    let _: SteeringNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SkillNotify => {
+                    let _: SkillNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::McpServerNotify => {
+                    let _: McpServerNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::HostSettings => {
                     let _: HostSettingsPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::BackendSetup => {
+                    let _: BackendSetupPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::SessionSchemas => {
+                    let _: SessionSchemasPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    let streams_to_remove = self
+                        .outgoing_seq
+                        .keys()
+                        .filter(|stream| stream.0.starts_with("/agent/"))
+                        .filter_map(|stream| {
+                            let parts = parse_agent_stream(stream);
+                            (parts.agent_id == payload.agent_id).then_some(stream.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    for stream in streams_to_remove {
+                        self.outgoing_seq.remove(&stream);
+                    }
                 }
                 other => {
                     panic!(
@@ -422,16 +643,39 @@ impl Connection {
                     );
                     assert!(
                         self.outgoing_seq.contains_key(&envelope.stream),
-                        "AgentError on stream {} before AgentStart",
+                        "AgentError on stream {} before NewAgent",
+                        envelope.stream
+                    );
+                }
+                FrameKind::AgentRenamed => {
+                    let payload: AgentRenamedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    let stream_parts = parse_agent_stream(&envelope.stream);
+                    assert_eq!(
+                        payload.agent_id, stream_parts.agent_id,
+                        "agent_renamed payload agent_id {} does not match stream {}",
+                        payload.agent_id, envelope.stream
+                    );
+                    assert!(
+                        self.outgoing_seq.contains_key(&envelope.stream),
+                        "AgentRenamed on stream {} before NewAgent",
                         envelope.stream
                     );
                 }
                 FrameKind::ChatEvent => {
                     assert!(
                         self.outgoing_seq.contains_key(&envelope.stream),
-                        "ChatEvent on stream {} before AgentStart",
+                        "ChatEvent on stream {} before NewAgent",
                         envelope.stream
                     );
+                }
+                FrameKind::SessionSettings => {
+                    let _: SessionSettingsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::QueuedMessages => {
+                    let _: QueuedMessagesPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 other => {
                     panic!(

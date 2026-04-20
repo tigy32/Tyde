@@ -4,7 +4,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
 use crate::send::send_frame;
-use crate::state::{AppState, CenterView, DockVisibility};
+use crate::state::{AppState, DockVisibility, TabContent};
 
 use protocol::{FrameKind, ProjectFileKind, ProjectRefreshPayload, StreamPath};
 
@@ -45,11 +45,6 @@ const COMMANDS: &[CommandEntry] = &[
         name: "Go to Chat",
         shortcut: None,
         id: "go_chat",
-    },
-    CommandEntry {
-        name: "Go to Editor",
-        shortcut: None,
-        id: "go_editor",
     },
     CommandEntry {
         name: "Open Settings",
@@ -111,9 +106,22 @@ fn execute_command(state: &AppState, id: &str) {
         "toggle_left" => toggle_dock(state.left_dock),
         "toggle_right" => toggle_dock(state.right_dock),
         "toggle_bottom" => toggle_dock(state.bottom_dock),
-        "go_home" => state.center_view.set(CenterView::Home),
-        "go_chat" => state.center_view.set(CenterView::Chat),
-        "go_editor" => state.center_view.set(CenterView::Editor),
+        "go_home" => state.open_tab(TabContent::Home, "Home".to_string(), false),
+        "go_chat" => {
+            // Activate the most recent chat tab, or open a new chat
+            let found = state.center_zone.with_untracked(|cz| {
+                cz.tabs
+                    .iter()
+                    .rev()
+                    .find(|t| matches!(t.content, TabContent::Chat { .. }))
+                    .map(|t| t.id)
+            });
+            if let Some(id) = found {
+                state.activate_tab(id);
+            } else {
+                begin_new_chat(state, None);
+            }
+        }
         "open_settings" => {
             state.command_palette_open.set(false);
             state.settings_open.set(true);

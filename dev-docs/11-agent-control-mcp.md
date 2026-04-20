@@ -76,53 +76,57 @@ Tyde2 already has the correct internal boundary:
 If agent control is rebuilt, it should sit **on top of** that boundary, not
 next to it.
 
-### Settings-Owned MCP Is The Wrong Shape
+### Settings-Owned MCP Is The Wrong Shape (Legacy)
 
-The old app persisted MCP enablement inside product settings. That made a
-developer/integration surface into app runtime state.
+The old app persisted MCP enablement inside product settings. That was wrong
+**for the old app** because it made a developer/integration surface into app
+runtime state.
 
-Tyde2 should treat agent-control MCP the same way `10-dev-instance-mcp.md`
-treats dev-instance MCP:
-
-- external capability
-- explicit endpoint configuration
-- no product-owned MCP toggle
+For Tyde2, agent control is a first-class host capability, not a developer
+tool. The host **should** have a setting for it because it controls whether
+spawned agents can orchestrate other agents.
 
 ---
 
 ## Tyde2 Design
 
-The correct shape is:
+Agent control MCP follows the same pattern as debug MCP (`10-dev-instance-mcp.md`):
+an embedded loopback HTTP MCP server inside `tyde-server`.
 
 ```text
-MCP client
+Tyde agent (backend process)
     |
+    | startup MCP injection
     v
-tyde-dev-driver agent-control
+tyde-server agent-control MCP (loopback HTTP)
     |
+    | direct access
     v
-Tyde host protocol connection
-    |
-    v
-tyde-server HostHandle
+tyde-server HostHandle (agent lifecycle)
 ```
 
 ### Core Rule
 
-**Tyde2 agent control MCP must be an external MCP server implemented in
-`tyde-dev-driver`.**
+**Tyde2 agent control MCP is an embedded loopback HTTP MCP server inside
+`tyde-server`, injected into agents as a startup MCP server.**
 
-The desktop app does **not** speak MCP.
-
-The shell exposes a loopback host endpoint. The external driver connects using
-the real Tyde wire protocol and derives all agent state from protocol events.
+The desktop app does **not** speak MCP externally. The server owns the MCP
+boundary internally and injects the loopback HTTP URL into agent spawn configs
+when the setting is enabled.
 
 This exactly follows the rewrite philosophy:
 
 - one source of truth: `protocol`
 - server owns behavior
 - shell stays transport-only
-- MCP ends at the external boundary
+- MCP ends at the server boundary
+
+And matches the proven debug MCP pattern:
+
+- server starts an HTTP MCP listener on `127.0.0.1:0`
+- when spawning an agent, if `tyde_agent_control_mcp_enabled` is true, the
+  server adds the agent-control MCP URL to `startup_mcp_servers`
+- the agent discovers the MCP surface automatically
 
 ---
 
@@ -130,66 +134,61 @@ This exactly follows the rewrite philosophy:
 
 ### `server`
 
-`server` continues to own:
+`server` owns everything:
 
-- agent creation
-- agent input routing
-- agent output events
+- the loopback HTTP MCP server (`agent_control_mcp.rs`)
+- MCP tool definitions
+- agent creation, input routing, output events
 - canonical agent history
+- wait/block semantics
+- state derivation from its own agent records
 
-No MCP-specific logic belongs here.
+This is simpler than the old external-driver design because the server already
+has direct access to all agent state. No protocol connection bootstrapping, no
+snapshot derivation from events, no external process coordination.
+
+### `protocol`
+
+`protocol` owns:
+
+- `HostSettings.tyde_agent_control_mcp_enabled`
+- `HostSettingValue::TydeAgentControlMcpEnabled`
 
 ### `frontend/tauri-shell`
 
-The shell may own exactly one thing for this feature:
+The shell owns nothing for this feature. No loopback endpoint, no MCP, no
+settings beyond the existing `HostSettings` event rendering.
 
-- a loopback host listener that forwards raw stream connections into
-  `server::accept` and `server::run_connection`
+### `frontend`
 
-That is transport work, so it belongs in the shell.
-
-The shell must **not** own:
-
-- MCP tools
-- spawn/wait/list orchestration logic
-- agent dashboard derivation
-- app settings for this feature
-
-### `tyde-dev-driver`
-
-The driver owns:
-
-- MCP stdio server lifecycle
-- connection to the Tyde host endpoint
-- state derivation from protocol events
-- wait semantics (`run`, `await`, `list`)
-- agent-control tool definitions
-
-That is the correct place for an external integration surface.
+The frontend adds a toggle for the setting in the settings panel, same pattern
+as the debug MCP toggle.
 
 ---
 
-## Child Endpoint
+## Setting
 
-The desktop shell exposes a loopback TCP host endpoint when explicitly
-configured.
+`HostSettings` gains a new field:
 
-First-slice env contract:
+```rust
+pub struct HostSettings {
+    pub enabled_backends: Vec<BackendKind>,
+    pub default_backend: Option<BackendKind>,
+    pub tyde_debug_mcp_enabled: bool,
+    pub tyde_agent_control_mcp_enabled: bool,  // new
+}
+```
 
-- `TYDE_AGENT_CONTROL_HOST_BIND_ADDR=127.0.0.1:<port>`
+Default: **`true`**.
 
-Compatibility alias:
+Agent control is a core host capability. Agents should be able to orchestrate
+other agents by default. Users can disable it if they want to restrict that.
 
-- `TYDE_DEV_HOST_BIND_ADDR`
+The setting is toggled via `SetSetting` with a new `HostSettingValue` variant:
 
-Rules:
-
-- only loopback addresses are allowed
-- no product settings are persisted
-- the shell only forwards Tyde protocol frames
-
-This is intentionally the same boundary the dev-instance driver uses in
-`10-dev-instance-mcp.md`.
+```rust
+TydeAgentControlMcpEnabled { enabled: bool }
+```
 
 ---
 
@@ -199,7 +198,6 @@ The first slice keeps the legacy tool names because they were good:
 
 - `tyde_run_agent`
 - `tyde_spawn_agent`
-- `tyde_await_agent`
 - `tyde_send_agent_message`
 - `tyde_cancel_agent`
 - `tyde_list_agents`
@@ -211,23 +209,21 @@ The first slice keeps the legacy tool names because they were good:
 - `workspace_roots`
 - `prompt`
 - `backend_kind?`
-- `parent_agent_id?`
 - `project_id?`
 - `name?`
 - `cost_hint?`
 
-`backend_kind` is optional only if the connected host has an explicit
-`default_backend` in `HostSettings`.
+`backend_kind` is optional only if the host has an explicit `default_backend`
+in `HostSettings`.
+
+`parent_agent_id` is not a tool argument. The server injects the loopback MCP
+URL per agent as `/mcp?agent_id=<agent-id>`, and the HTTP handler infers the
+caller from that request URL.
 
 ### Output Shape
 
-The old surface returned `status`, `message`, `error`, and summary-like data.
-That is still useful, but Tyde2 has one important semantic difference:
-
-- agents are long-lived and reusable
-- a completed turn does **not** mean the agent is gone
-
-So the driver derives tool-level status from the latest protocol events:
+Agents are long-lived and reusable. A completed turn does **not** mean the
+agent is gone. The server derives tool-level status from its own agent records:
 
 - `running`: currently in an active streamed turn
 - `completed`: most recent turn reached `StreamEnd`; agent is idle and can take
@@ -240,74 +236,92 @@ one-shot jobs.
 
 ---
 
-## State Derivation
+## Implementation
 
-The driver derives its state from:
+### Server Structure
 
-- `HostSettings`
-- `NewAgent`
-- `AgentStart`
-- `ChatEvent`
-- `AgentError`
+Create `server/src/agent_control_mcp.rs` following the same pattern as
+`server/src/debug_mcp.rs`:
 
-It does **not** query Tauri internals or maintain an app-private RPC.
+- `start_server()` returns an `AgentControlMcpHandle` with the HTTP URL
+- loopback-only bind, reject non-loopback peers
+- JSON-RPC 2.0 MCP protocol
+- tool dispatch routes to agent lifecycle operations on the `HostHandle`
 
-Per agent, the driver tracks:
+### Startup MCP Injection
 
-- immutable metadata from `NewAgent`/`AgentStart`
-- the instance stream for this connection
-- current derived status
-- last completed/cancelled message
-- last error
-- driver-side activity counters used for wait semantics
+In `startup_mcp_servers_for_settings()`, add the agent-control MCP URL when
+`settings.tyde_agent_control_mcp_enabled` is true:
 
-This state is driver-owned and derived. The source of truth remains the Tyde
-protocol stream.
+```rust
+if settings.tyde_agent_control_mcp_enabled {
+    servers.push(StartupMcpServer {
+        name: "tyde-agent-control".to_string(),
+        transport: StartupMcpTransport::Http {
+            url: agent_control_mcp.url.clone(),
+            headers: HashMap::new(),
+            bearer_token_env_var: None,
+        },
+    });
+}
+```
 
----
+### Auto-propagation
 
-## Wait Semantics
+Child completion notices are **not** a separate MCP wait surface anymore.
+Instead, the server auto-enqueues them onto the parent's queued-message state.
 
-`tyde_run_agent` and `tyde_await_agent` keep the legacy usability:
+Rules:
 
-- block until one or more watched agents stop running
-- reset the idle timeout whenever a watched agent shows new activity
-- cap total wall time to avoid infinite blocking
+- When a child reaches idle because `TypingStatusChanged(false)` arrives after
+  a `StreamEnd`, and the child has `parent_agent_id`, the server formats a
+  completion notice and enqueues it as a normal queued follow-up on the parent.
+- When a child emits `OperationCancelled` or enters a fatal `AgentError`, the
+  server enqueues the same notice shape with outcome `cancelled` or `failed`.
+- Idle with no final output does not enqueue anything.
+- If the parent is already idle, the actor still enqueues first and then
+  immediately dispatches the queued message so the parent auto-resumes.
+- Backend-native relay sub-agents use the host-owned
+  `HostSubAgentEmitter::on_subagent_completed` callback to emit the same notice
+  format into the parent's queue path.
 
-Recommended defaults:
+Exact preamble:
 
-- idle timeout: `60_000ms`
-- wall cap: `10 * idle_timeout`
+```text
+[TYDE CHILD AGENT UPDATE]
+This is an automatic system-generated child completion notice, not a user instruction.
+Child name: {child_name}
+Child id: {child_id}
+Child state: idle
+Child outcome: {completed|cancelled|failed}
 
-`tyde_run_agent` is just:
+Child message:
+{verbatim final message or synthesized status text}
+[END TYDE CHILD AGENT UPDATE]
+```
+
+This keeps the queued-message model server-owned and avoids a separate
+tool-level wait/control protocol for fan-out completions.
+
+### `tyde_run_agent`
+
+`tyde_run_agent` remains as the synchronous one-shot convenience:
 
 1. spawn
 2. wait for that agent's next non-running state
 3. return the derived result
 
----
+### Advantage Over External Driver
 
-## Bootstrap Constraint
+Because the server owns agent state directly, the implementation is simpler:
 
-Today the host protocol does **not** emit an explicit "initial replay complete"
-event for a newly connected subscriber.
-
-So the first slice of the driver does this during startup:
-
-1. connect to the host
-2. require initial `HostSettings`
-3. keep consuming replayed host/agent events until a short quiet window
-4. mark the derived snapshot as bootstrapped
-
-That bootstrap quiet window is a driver concern only. It does not alter product
-behavior or invent a parallel protocol.
-
-Future improvement:
-
-- add an explicit host replay-complete event so the driver can remove this
-  startup quiescence rule
-
-That would be cleaner, but it is not required for the first useful slice.
+- no protocol connection bootstrapping
+- no snapshot derivation from event streams
+- no bootstrap quiescence window
+- no external process lifecycle
+- direct access to agent records, status, and history
+- child completion propagation can use internal actor commands instead of
+  reconstructing parent/child coordination in the MCP caller
 
 ---
 
@@ -318,49 +332,61 @@ feature.
 
 Specifically out of scope:
 
-- in-app MCP HTTP server
-- persisted UI toggles for this feature
+- persisted UI toggles beyond `HostSettings` (no separate config file)
 - tool-policy enforcement in the MCP server
-- automatic MCP injection into spawned backend sessions
+- automatic MCP injection into spawned backend sessions (agents spawned by
+  agents — that is a future recursive capability)
 - remote control / SSH tunneling
 
 Those can come later, but they are separate features.
 
 The first slice is:
 
-- external MCP server
-- explicit loopback host endpoint
-- real host protocol connection
-- useful spawn/run/await/message/cancel/list tools
+- embedded loopback HTTP MCP server in `tyde-server`
+- `HostSettings` toggle (default on)
+- startup MCP injection into agents
+- useful spawn/run/message/cancel/list tools
+
+---
+
+## Migration From `tyde-dev-driver agent-control`
+
+The existing `dev-driver/src/agent_control.rs` implementation has the right
+tool semantics and wait logic. The migration is:
+
+1. Move the tool definitions and dispatch logic into
+   `server/src/agent_control_mcp.rs`, adapting from protocol-event-derived
+   state to direct server state access.
+2. Replace the `client::Connection` + `SnapshotState` pattern with direct
+   `HostHandle` calls for agent lifecycle.
+3. Replace protocol-event-based child waiting with server-internal queued
+   completion propagation plus the retained `tyde_run_agent` one-shot wait.
+4. Remove the `agent-control` subcommand from `tyde-dev-driver`.
+5. Remove the `TYDE_AGENT_CONTROL_HOST_BIND_ADDR` env var and related shell
+   loopback endpoint code (if any was added for agent control specifically).
 
 ---
 
 ## Future Work
 
-Once the external shape is stable, the next useful additions are:
+Once the embedded shape is stable, the next useful additions are:
 
-1. Explicit replay-complete host event.
-2. Host-owned startup MCP configuration so spawned Tyde agents can themselves
+1. Recursive agent control: agents spawned via agent-control MCP themselves
    receive the agent-control MCP surface.
-3. Remote launch/connection support in the driver only.
-
-That sequence preserves the right architecture while still recovering the
-powerful workflows the old app enabled.
+2. Host-owned cost/concurrency limits for MCP-spawned agents.
+3. Tool-policy enforcement (restrict which tools spawned agents can use).
 
 ---
 
 ## Summary
 
-The old agent MCP server had the right user-facing behavior and the wrong
-ownership model.
+Agent control MCP follows the same pattern as debug MCP:
 
-Tyde2 should rebuild it like this:
-
-- external MCP server: `tyde-dev-driver agent-control`
-- child app exposes only a loopback Tyde host endpoint
-- all state derived from the real protocol
-- no MCP inside the shell
-- no persisted product settings for the MCP server
+- embedded loopback HTTP MCP server in `tyde-server`
+- injected into agents as a startup MCP server
+- `HostSettings.tyde_agent_control_mcp_enabled` (default: true)
+- no external process, no shell involvement, no separate protocol connection
+- server has direct access to agent lifecycle — simpler implementation
 
 That keeps the workflow power while staying aligned with the rewrite
-philosophy.
+philosophy and the proven debug MCP pattern.

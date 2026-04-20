@@ -4,11 +4,13 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::actions::spawn_new_chat;
+use crate::components::session_settings::SessionSettingsBar;
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus};
 
 use protocol::{
-    BackendKind, FrameKind, ImageData, InterruptPayload, SendMessagePayload, StreamPath,
+    AgentOrigin, BackendKind, CancelQueuedMessagePayload, FrameKind, ImageData, InterruptPayload,
+    QueuedMessageId, SendMessagePayload, SendQueuedMessageNowPayload, StreamPath,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +18,113 @@ struct PendingImage {
     name: String,
     media_type: String,
     data: String,
+}
+
+#[component]
+fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let id_for_lookup = id.clone();
+    let id_for_send = id.clone();
+    let id_for_cancel = id.clone();
+    let state_preview = state.clone();
+    let state_send = state.clone();
+    let state_cancel = state.clone();
+
+    let preview = move || {
+        let Some(active) = state_preview.active_agent.get() else {
+            return String::new();
+        };
+        let queue = state_preview.agent_message_queue.get();
+        let Some(entries) = queue.get(&active.agent_id) else {
+            return String::new();
+        };
+        let Some(entry) = entries.iter().find(|entry| entry.id == id_for_lookup) else {
+            return String::new();
+        };
+        let chars: Vec<char> = entry.message.chars().collect();
+        if chars.len() > 80 {
+            chars[..80].iter().collect::<String>() + "…"
+        } else {
+            entry.message.clone()
+        }
+    };
+
+    let on_send_now = move |_| {
+        let Some(active) = state_send.active_agent.get_untracked() else {
+            return;
+        };
+        let agents = state_send.agents.get_untracked();
+        let Some(agent) = agents
+            .iter()
+            .find(|agent| agent.host_id == active.host_id && agent.agent_id == active.agent_id)
+        else {
+            return;
+        };
+        let host_id = agent.host_id.clone();
+        let stream = agent.instance_stream.clone();
+        let id = id_for_send.clone();
+        spawn_local(async move {
+            if let Err(error) = send_frame(
+                &host_id,
+                stream,
+                FrameKind::SendQueuedMessageNow,
+                &SendQueuedMessageNowPayload { id },
+            )
+            .await
+            {
+                log::error!("failed to send send_queued_message_now: {error}");
+            }
+        });
+    };
+
+    let on_cancel = move |_| {
+        let Some(active) = state_cancel.active_agent.get_untracked() else {
+            return;
+        };
+        let agents = state_cancel.agents.get_untracked();
+        let Some(agent) = agents
+            .iter()
+            .find(|agent| agent.host_id == active.host_id && agent.agent_id == active.agent_id)
+        else {
+            return;
+        };
+        let host_id = agent.host_id.clone();
+        let stream = agent.instance_stream.clone();
+        let id = id_for_cancel.clone();
+        spawn_local(async move {
+            if let Err(error) = send_frame(
+                &host_id,
+                stream,
+                FrameKind::CancelQueuedMessage,
+                &CancelQueuedMessagePayload { id },
+            )
+            .await
+            {
+                log::error!("failed to send cancel_queued_message: {error}");
+            }
+        });
+    };
+
+    view! {
+        <div class="queued-message-item">
+            <span class="queued-message-preview">{preview}</span>
+            <button
+                class="queued-message-btn queued-message-send-now"
+                title="Send this message now"
+                on:click=on_send_now
+            >
+                "↑ Send Now"
+            </button>
+            <button
+                class="queued-message-btn queued-message-cancel"
+                title="Cancel this queued message"
+                on:click=on_cancel
+            >
+                "× Cancel"
+            </button>
+        </div>
+    }
 }
 
 fn active_instance_stream(state: &AppState) -> Option<StreamPath> {
@@ -62,6 +171,31 @@ fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
         settings
             .default_backend
             .or_else(|| settings.enabled_backends.first().copied())
+    })
+}
+
+fn active_agent_is_initializing_tracked(state: &AppState) -> bool {
+    let active_agent = match state.active_agent.get() {
+        Some(active_agent) => active_agent,
+        None => return false,
+    };
+    state.agents.get().iter().any(|agent| {
+        agent.host_id == active_agent.host_id
+            && agent.agent_id == active_agent.agent_id
+            && !agent.started
+            && agent.fatal_error.is_none()
+    })
+}
+
+fn active_agent_is_backend_native(state: &AppState) -> bool {
+    let active_agent = match state.active_agent.get() {
+        Some(a) => a,
+        None => return false,
+    };
+    state.agents.get().iter().any(|agent| {
+        agent.host_id == active_agent.host_id
+            && agent.agent_id == active_agent.agent_id
+            && matches!(agent.origin, AgentOrigin::BackendNative)
     })
 }
 
@@ -328,7 +462,7 @@ pub fn ChatInput() -> impl IntoView {
         let has_text = !ui_state.chat_input.get().trim().is_empty();
         let has_images = !ui_images.get().is_empty();
         let has_input = has_text || has_images;
-        let is_thinking = ui_state.agent_initializing.get()
+        let is_thinking = active_agent_is_initializing_tracked(&ui_state)
             || ui_state
                 .active_agent
                 .get()
@@ -370,8 +504,11 @@ pub fn ChatInput() -> impl IntoView {
         )
     });
 
-    let can_send = move || ui_mode.get().0;
-    let can_interrupt = move || ui_mode.get().1;
+    let readonly_state = state.clone();
+    let is_readonly = Memo::new(move |_| active_agent_is_backend_native(&readonly_state));
+
+    let can_send = move || ui_mode.get().0 && !is_readonly.get();
+    let can_interrupt = move || ui_mode.get().1 && !is_readonly.get();
     let send_label = move || ui_mode.get().2;
     let interrupt_label = move || ui_mode.get().3;
     let interrupt_title = move || ui_mode.get().4;
@@ -379,7 +516,7 @@ pub fn ChatInput() -> impl IntoView {
 
     let thinking_state = state.clone();
     let is_thinking = move || {
-        if thinking_state.agent_initializing.get() {
+        if active_agent_is_initializing_tracked(&thinking_state) {
             return true;
         }
         thinking_state
@@ -553,6 +690,18 @@ pub fn ChatInput() -> impl IntoView {
         }
     });
 
+    let queue_state = state.clone();
+    let queue_ids = Memo::new(move |_| -> Vec<QueuedMessageId> {
+        let Some(active) = queue_state.active_agent.get() else {
+            return Vec::new();
+        };
+        let queue = queue_state.agent_message_queue.get();
+        queue
+            .get(&active.agent_id)
+            .map(|entries| entries.iter().map(|e| e.id.clone()).collect())
+            .unwrap_or_default()
+    });
+
     view! {
         <div
             class="chat-input-area"
@@ -621,11 +770,28 @@ pub fn ChatInput() -> impl IntoView {
                 </div>
             </Show>
 
+            <Show when=move || !queue_ids.get().is_empty()>
+                <div class="queued-messages">
+                    <For
+                        each=move || queue_ids.get()
+                        key=|id| id.0.clone()
+                        let:id
+                    >
+                        <QueuedMessageRow id=id />
+                    </For>
+                </div>
+            </Show>
+
+            <Show when=move || is_readonly.get()>
+                <div class="chat-readonly-notice">"Read-only: native sub-agent"</div>
+            </Show>
+
             <div class="chat-input-row">
                 <textarea
                     class="chat-textarea"
                     placeholder="Type a message or drop images..."
                     prop:value=move || state.chat_input.get()
+                    prop:disabled=move || is_readonly.get()
                     on:input=on_input
                     on:keydown=on_keydown
                     rows="1"
@@ -654,6 +820,7 @@ pub fn ChatInput() -> impl IntoView {
                     <span>{interrupt_label}</span>
                 </button>
             </div>
+            <SessionSettingsBar />
         </div>
     }
 }

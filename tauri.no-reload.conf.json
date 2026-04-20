@@ -1,0 +1,28 @@
+{
+  "productName": "Tyde",
+  "mainBinaryName": "tauri-shell",
+  "version": "0.1.0",
+  "identifier": "com.tyde.desktop",
+  "build": {
+    "beforeDevCommand": "trunk serve --port 1420 --config /Users/mike/Tyde2/frontend/Trunk.toml --no-autoreload",
+    "beforeBuildCommand": "trunk build --release --config ../Trunk.toml",
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:1420"
+  },
+  "bundle": {
+    "active": false
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tyde",
+        "width": 1280,
+        "height": 860,
+        "resizable": true,
+        "dragDropEnabled": false
+      }
+    ]
+  }
+}

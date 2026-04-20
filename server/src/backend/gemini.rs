@@ -12,13 +12,16 @@ use tokio::io::BufReader;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::backend::{SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::backend::{
+    SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
+};
 use crate::remote::{
     parse_remote_workspace_roots, shell_quote_arg, shell_quote_command, ssh_control_args,
 };
 use crate::subprocess::ImageAttachment;
 
 const GEMINI_AGENT_NAME: &str = "gemini";
+const GEMINI_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 static GEMINI_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -110,7 +113,7 @@ impl GeminiSession {
                 ssh_host: resolved_ssh_host,
                 session_id: None,
                 model: None,
-                permission_mode: None,
+                permission_mode: Some(GEMINI_DEFAULT_PERMISSION_MODE.to_string()),
                 steering_content: steering_content
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -233,7 +236,16 @@ impl GeminiInner {
             SessionCommand::ListModels => {
                 this.emit_event(json!({
                     "kind": "ModelsList",
-                    "data": { "models": gemini_known_models() }
+                    "data": {
+                        "models": gemini_known_models()
+                            .into_iter()
+                            .map(|model| json!({
+                                "id": model.value,
+                                "displayName": model.label,
+                                "isDefault": false,
+                            }))
+                            .collect::<Vec<_>>()
+                    }
                 }));
                 Ok(())
             }
@@ -1302,28 +1314,21 @@ fn map_tool_completion_result(tool_name: &str, result_content: &str) -> Value {
 // Known models
 // ---------------------------------------------------------------------------
 
-fn gemini_known_models() -> Vec<Value> {
-    let models: &[(&str, &str, bool)] = &[
-        ("auto-gemini-2.5", "Auto (Gemini 2.5)", true),
-        ("auto-gemini-3", "Auto (Gemini 3)", false),
-        ("gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview", false),
-        ("gemini-3-pro-preview", "Gemini 3 Pro Preview", false),
-        ("gemini-3-flash-preview", "Gemini 3 Flash Preview", false),
-        (
-            "gemini-3.1-flash-lite-preview",
-            "Gemini 3.1 Flash Lite Preview",
-            false,
-        ),
-        ("gemini-2.5-pro", "Gemini 2.5 Pro", false),
-        ("gemini-2.5-flash", "Gemini 2.5 Flash", false),
-        ("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite", false),
-    ];
-    models
-        .iter()
-        .map(|(id, display, default)| {
-            json!({ "id": id, "displayName": display, "isDefault": default })
-        })
-        .collect()
+fn gemini_known_models() -> Vec<SelectOption> {
+    vec![
+        SelectOption {
+            value: "gemini-2.5-pro".to_string(),
+            label: "Gemini 2.5 Pro".to_string(),
+        },
+        SelectOption {
+            value: "gemini-2.5-flash".to_string(),
+            label: "Gemini 2.5 Flash".to_string(),
+        },
+        SelectOption {
+            value: "gemini-2.5-flash-lite".to_string(),
+            label: "Gemini 2.5 Flash Lite".to_string(),
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,10 +1575,15 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
 // Backend trait implementation
 // ===========================================================================
 
-use protocol::{AgentInput, ChatEvent, ChatMessage, MessageSender, SessionId, SpawnCostHint};
+use protocol::{
+    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SelectOption, SessionId,
+    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
+    SpawnCostHint,
+};
 
 use super::{
     Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+    resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
 const EVENT_BUFFER: usize = 256;
@@ -1594,6 +1604,27 @@ fn gemini_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str
         Some(SpawnCostHint::High) => Some("gemini-2.5-pro"),
         None => None,
     }
+}
+
+fn gemini_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+    let mut values = protocol::SessionSettingsValues::default();
+    if let Some(model) = gemini_backend_model(Some(cost_hint)) {
+        values.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String(model.to_string()),
+        );
+    }
+    values
+}
+
+pub(crate) fn resolve_session_settings(
+    config: &BackendSpawnConfig,
+) -> protocol::SessionSettingsValues {
+    resolve_backend_settings(
+        config,
+        &GeminiBackend::session_settings_schema(),
+        gemini_cost_hint_defaults,
+    )
 }
 
 fn backend_error_message(content: String) -> ChatEvent {
@@ -1660,6 +1691,23 @@ async fn forward_gemini_backend_event(
 }
 
 impl Backend for GeminiBackend {
+    fn session_settings_schema() -> SessionSettingsSchema {
+        SessionSettingsSchema {
+            backend_kind: BackendKind::Gemini,
+            fields: vec![SessionSettingField {
+                key: "model".to_string(),
+                label: "Model".to_string(),
+                description: None,
+                use_slider: false,
+                field_type: SessionSettingFieldType::Select {
+                    options: gemini_known_models(),
+                    default: None,
+                    nullable: true,
+                },
+            }],
+        }
+    }
+
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -1678,22 +1726,34 @@ impl Backend for GeminiBackend {
             } else {
                 workspace_roots
             };
-            let (session, mut raw_events) =
-                match GeminiSession::spawn(&roots, None, &config.startup_mcp_servers, None).await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::error!("Failed to spawn Gemini session: {err}");
-                        let _ =
-                            ready_tx.send(Err(format!("Failed to spawn Gemini session: {err}")));
-                        return;
-                    }
-                };
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
+            let (session, mut raw_events) = match GeminiSession::spawn(
+                &roots,
+                None,
+                &config.startup_mcp_servers,
+                combined_instructions.as_deref(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Gemini session: {err}");
+                    let _ = ready_tx.send(Err(format!("Failed to spawn Gemini session: {err}")));
+                    return;
+                }
+            };
 
             let handle = session.command_handle();
-            let model_override = gemini_backend_model(config.cost_hint).map(str::to_string);
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
             if model_override.is_some() {
                 let settings = json!({
                     "model": model_override,
+                    "permission_mode": GEMINI_DEFAULT_PERMISSION_MODE,
                 });
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
@@ -1758,17 +1818,39 @@ impl Backend for GeminiBackend {
                         let Some(input) = incoming else {
                             break;
                         };
-                        let AgentInput::SendMessage(payload) = input;
-                        let images = protocol_images_to_attachments(payload.images);
-                        if let Err(err) = handle
-                            .execute(SessionCommand::SendMessage {
-                                message: payload.message,
-                                images,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to send Gemini follow-up: {err}");
-                            break;
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Gemini follow-up: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update Gemini session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
                         }
                     }
                     interrupt = interrupt_rx.recv() => {
@@ -1843,20 +1925,33 @@ impl Backend for GeminiBackend {
         let backend_session_id_task = Arc::clone(&backend_session_id);
 
         tokio::spawn(async move {
-            let (session, mut raw_events) =
-                match GeminiSession::spawn(&roots, None, &config.startup_mcp_servers, None).await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::error!("Failed to spawn Gemini resume session: {err}");
-                        return;
-                    }
-                };
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
+            let (session, mut raw_events) = match GeminiSession::spawn(
+                &roots,
+                None,
+                &config.startup_mcp_servers,
+                combined_instructions.as_deref(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Gemini resume session: {err}");
+                    return;
+                }
+            };
 
             let handle = session.command_handle();
-            let model_override = gemini_backend_model(config.cost_hint).map(str::to_string);
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
             if model_override.is_some() {
                 let settings = json!({
                     "model": model_override,
+                    "permission_mode": GEMINI_DEFAULT_PERMISSION_MODE,
                 });
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
@@ -1896,17 +1991,39 @@ impl Backend for GeminiBackend {
                         let Some(input) = input else {
                             break;
                         };
-                        let AgentInput::SendMessage(payload) = input;
-                        let images = protocol_images_to_attachments(payload.images);
-                        if let Err(err) = handle
-                            .execute(SessionCommand::SendMessage {
-                                message: payload.message,
-                                images,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to send Gemini resume follow-up: {err}");
-                            break;
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Gemini resume follow-up: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update resumed Gemini session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
                         }
                     }
                     interrupt = interrupt_rx.recv() => {
@@ -1970,5 +2087,30 @@ impl Backend for GeminiBackend {
 
     async fn interrupt(&self) -> bool {
         self.interrupt_tx.send(()).await.is_ok()
+    }
+
+    async fn shutdown(self) {
+        drop(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spawn_defaults_permission_mode_to_bypass_permissions() {
+        let workspace = std::env::temp_dir().join(format!("tyde-gemini-test-{}", unix_now_ms()));
+        std::fs::create_dir_all(&workspace).expect("create temp workspace");
+        let roots = vec![workspace.display().to_string()];
+        let (session, _events) = GeminiSession::spawn(&roots, None, &[], None)
+            .await
+            .expect("spawn Gemini session");
+
+        let state = session.inner.state.lock().await;
+        assert_eq!(
+            state.permission_mode.as_deref(),
+            Some(GEMINI_DEFAULT_PERMISSION_MODE)
+        );
     }
 }

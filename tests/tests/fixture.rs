@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use protocol::FrameKind;
+use protocol::{AgentId, FrameKind};
 use tyde_dev_driver::agent_control::AgentControlHandle;
 
 pub fn init_tracing() {
@@ -72,6 +72,16 @@ impl Fixture {
         connect_client(host).await
     }
 
+    #[allow(dead_code)]
+    pub async fn agent_ids(&self) -> Vec<AgentId> {
+        self.host.agent_ids().await
+    }
+
+    #[allow(dead_code)]
+    pub async fn agent_control_http_url(&self) -> String {
+        self.host.agent_control_mcp_url().await
+    }
+
     fn session_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("sessions.json")
     }
@@ -82,6 +92,11 @@ impl Fixture {
 
     fn settings_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("settings.json")
+    }
+
+    #[allow(dead_code)]
+    pub fn store_dir(&self) -> &Path {
+        self.session_store_dir.path()
     }
 }
 
@@ -97,6 +112,17 @@ async fn connect_client(host: server::HostHandle) -> client::Connection {
         env.kind,
         FrameKind::HostSettings,
         "first host event on connect must be HostSettings"
+    );
+
+    let env = client
+        .next_event()
+        .await
+        .expect("initial session schemas read failed")
+        .expect("connection closed before initial session schemas");
+    assert_eq!(
+        env.kind,
+        FrameKind::SessionSchemas,
+        "second host event on connect must be SessionSchemas"
     );
 
     client

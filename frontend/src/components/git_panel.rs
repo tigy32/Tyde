@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, CenterView};
+use crate::state::AppState;
 
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectGitChangeKind, ProjectGitFileStatus, ProjectPath,
@@ -241,7 +241,15 @@ fn change_kind_class(kind: Option<ProjectGitChangeKind>) -> &'static str {
 
 fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
     let state = expect_context::<AppState>();
-    state.center_view.set(CenterView::Editor);
+    let label = format!("Diff: {}", path.rsplit('/').next().unwrap_or(&path));
+    state.open_tab(
+        crate::state::TabContent::Diff {
+            root: root.clone(),
+            scope,
+        },
+        label,
+        true,
+    );
 
     let Some(active_project) = state.active_project_ref_untracked() else {
         return;

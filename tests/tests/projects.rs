@@ -6,7 +6,7 @@ use protocol::{
     ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
 };
 use std::fs;
 use std::path::Path;
@@ -14,23 +14,52 @@ use std::process::Command;
 use std::time::Duration;
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
-    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before {context}"),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        Err(_) => panic!("timed out waiting for {context}"),
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+                | FrameKind::SessionList
+        ) {
+            continue;
+        }
+        return env;
     }
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    match tokio::time::timeout(duration, client.next_event()).await {
-        Err(_) => {}
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(env))) => panic!(
-            "unexpected event before {context}: kind={} stream={}",
-            env.kind, env.stream
-        ),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+    loop {
+        match tokio::time::timeout(duration, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(env)))
+                if matches!(
+                    env.kind,
+                    FrameKind::HostSettings
+                        | FrameKind::SessionSchemas
+                        | FrameKind::BackendSetup
+                        | FrameKind::QueuedMessages
+                        | FrameKind::SessionSettings
+                        | FrameKind::SessionList
+                ) =>
+            {
+                continue;
+            }
+            Ok(Ok(Some(env))) => panic!(
+                "unexpected event before {context}: kind={} stream={}",
+                env.kind, env.stream
+            ),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
     }
 }
 
@@ -265,6 +294,71 @@ async fn rename_project_emits_updated_upsert() {
 }
 
 #[tokio::test]
+async fn reorder_projects_persists_and_replays_in_custom_order() {
+    let mut fixture = Fixture::new().await;
+    let project_a =
+        create_project(&mut fixture.client, "Alpha", vec!["/tmp/alpha".to_owned()]).await;
+    let project_b = create_project(&mut fixture.client, "Beta", vec!["/tmp/beta".to_owned()]).await;
+    let project_c =
+        create_project(&mut fixture.client, "Gamma", vec!["/tmp/gamma".to_owned()]).await;
+
+    fixture
+        .client
+        .project_reorder(ProjectReorderPayload {
+            project_ids: vec![
+                project_c.id.clone(),
+                project_a.id.clone(),
+                project_b.id.clone(),
+            ],
+        })
+        .await
+        .expect("project_reorder failed");
+
+    let reordered = vec![
+        expect_project_notify(&mut fixture.client, "project reorder 1").await,
+        expect_project_notify(&mut fixture.client, "project reorder 2").await,
+        expect_project_notify(&mut fixture.client, "project reorder 3").await,
+    ]
+    .into_iter()
+    .map(|payload| match payload {
+        ProjectNotifyPayload::Upsert { project } => project,
+        other => panic!("expected reordered upsert project notification, got {other:?}"),
+    })
+    .collect::<Vec<_>>();
+
+    let expected = vec![
+        Project {
+            sort_order: 0,
+            ..project_c.clone()
+        },
+        Project {
+            sort_order: 1,
+            ..project_a.clone()
+        },
+        Project {
+            sort_order: 2,
+            ..project_b.clone()
+        },
+    ];
+    assert_eq!(reordered, expected);
+
+    let mut fresh_client = fixture.connect_fresh_host().await;
+    let replayed = vec![
+        expect_project_notify(&mut fresh_client, "reordered replay 1").await,
+        expect_project_notify(&mut fresh_client, "reordered replay 2").await,
+        expect_project_notify(&mut fresh_client, "reordered replay 3").await,
+    ]
+    .into_iter()
+    .map(|payload| match payload {
+        ProjectNotifyPayload::Upsert { project } => project,
+        other => panic!("expected reordered replay upsert project notification, got {other:?}"),
+    })
+    .collect::<Vec<_>>();
+
+    assert_eq!(replayed, expected);
+}
+
+#[tokio::test]
 async fn add_root_emits_updated_upsert() {
     let mut fixture = Fixture::new().await;
     let project =
@@ -371,15 +465,33 @@ async fn invalid_project_create_closes_the_connection() {
         .await
         .expect("project_create write failed");
 
-    let closed = fixture
-        .client
-        .next_event()
-        .await
-        .expect("next_event after invalid project_create failed");
-    assert!(
-        closed.is_none(),
-        "invalid project_create should terminate the connection",
-    );
+    loop {
+        match fixture
+            .client
+            .next_event()
+            .await
+            .expect("next_event after invalid project_create failed")
+        {
+            None => break,
+            Some(env)
+                if matches!(
+                    env.kind,
+                    FrameKind::HostSettings
+                        | FrameKind::SessionSchemas
+                        | FrameKind::BackendSetup
+                        | FrameKind::QueuedMessages
+                        | FrameKind::SessionSettings
+                        | FrameKind::SessionList
+                ) =>
+            {
+                continue;
+            }
+            Some(env) => panic!(
+                "invalid project_create should terminate the connection, got: {} on {}",
+                env.kind, env.stream
+            ),
+        }
+    }
 }
 
 #[tokio::test]
@@ -530,6 +642,105 @@ async fn project_read_file_returns_file_contents() {
         file_contents.contents.as_deref(),
         Some("fn main() { println!(\"hi\"); }\n")
     );
+}
+
+#[tokio::test]
+async fn project_read_file_accepts_absolute_path_with_line_suffix() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "read-file-absolute-link",
+        &[("src/main.rs", "fn main() { println!(\"hi\"); }\n")],
+    );
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read File Absolute Link",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    relative_path: format!("{}/src/main.rs:366", project.roots[0]),
+                },
+            },
+        )
+        .await
+        .expect("project_read_file failed");
+
+    let file_contents = expect_project_file_contents(
+        &mut fixture.client,
+        "project file contents for absolute file link",
+    )
+    .await;
+    assert_eq!(file_contents.path.relative_path, "src/main.rs");
+    assert!(!file_contents.is_binary);
+    assert_eq!(
+        file_contents.contents.as_deref(),
+        Some("fn main() { println!(\"hi\"); }\n")
+    );
+}
+
+#[tokio::test]
+async fn project_read_file_outside_project_does_not_crash_host() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "read-file-invalid-absolute-link",
+        &[("src/main.rs", "fn main() { println!(\"hi\"); }\n")],
+    );
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read File Invalid Absolute Link",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    relative_path: "/tmp/not-in-project.rs:12".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("project_read_file failed");
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(200),
+        "invalid absolute project read should not emit a file payload",
+    )
+    .await;
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    relative_path: "src/main.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("project_read_file failed after invalid absolute link");
+
+    let file_contents = expect_project_file_contents(
+        &mut fixture.client,
+        "project file contents after invalid absolute file link",
+    )
+    .await;
+    assert_eq!(file_contents.path.relative_path, "src/main.rs");
+    assert!(!file_contents.is_binary);
 }
 
 #[tokio::test]

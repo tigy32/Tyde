@@ -8,10 +8,8 @@ usage() {
     echo "Commands:"
     echo "  check     Type-check the full workspace (native + WASM)"
     echo "  build     Build the frontend WASM bundle (into frontend/dist/)"
-    echo "  dev       Start Trunk dev server with hot-reload (port 1420)"
+    echo "  dev       Run the Tauri desktop app from the live workspace with no hot reload"
     echo "  tauri     Build and run the full Tauri desktop app"
-    echo "  tauri-dev Run Tauri in dev mode (hot-reload frontend + native shell)"
-    echo "  tauri-no-reload Run Tauri in dev mode from the live workspace with no hot reload"
     echo "  clean     Remove build artifacts"
     exit 1
 }
@@ -39,18 +37,20 @@ write_no_reload_tauri_config() {
     python3 - "$repo_dir" "$port" "$config_path" <<'PY'
 import json
 import pathlib
+import shlex
 import sys
 
 repo_dir = pathlib.Path(sys.argv[1])
 port = sys.argv[2]
 config_path = pathlib.Path(sys.argv[3])
 source_path = repo_dir / "frontend/tauri-shell/tauri.conf.json"
+trunk_config_path = repo_dir / "frontend/Trunk.toml"
 
 with source_path.open() as handle:
     config = json.load(handle)
 
 config["build"]["beforeDevCommand"] = (
-    f"trunk serve --port {port} --config frontend/Trunk.toml --no-autoreload"
+    f"trunk serve --port {port} --config {shlex.quote(str(trunk_config_path))} --no-autoreload"
 )
 config["build"]["devUrl"] = f"http://127.0.0.1:{port}"
 
@@ -83,48 +83,8 @@ cmd_build() {
 cmd_dev() {
     ensure_wasm_target
     ensure_trunk
-    echo "==> Starting Trunk dev server on http://127.0.0.1:1420 ..."
-    cd frontend
-    trunk serve --port 1420
-}
-
-cmd_tauri() {
-    ensure_wasm_target
-    ensure_trunk
-    echo "==> Building frontend..."
-    cd frontend
-    trunk build --release
-    cd tauri-shell
-    echo "==> Building Tauri desktop app..."
-    cargo build --release
-    echo "==> Running Tyde..."
-    cargo run --release
-}
-
-cmd_tauri_dev() {
-    ensure_wasm_target
-    ensure_trunk
-    echo "==> Starting Trunk dev server on :1420 ..."
-    cd frontend
-    trunk serve --port 1420 &
-    TRUNK_PID=$!
-    trap "kill $TRUNK_PID 2>/dev/null" EXIT
-    echo "==> Waiting for Trunk dev server..."
-    for i in $(seq 1 60); do
-        if curl -s http://127.0.0.1:1420 >/dev/null 2>&1; then break; fi
-        sleep 1
-    done
-    echo "==> Building and running Tauri shell..."
-    cd tauri-shell
-    cargo run
-}
-
-cmd_tauri_no_reload() {
-    ensure_wasm_target
-    ensure_trunk
-
     if ! command -v python3 &>/dev/null; then
-        echo "python3 is required for tauri-no-reload" >&2
+        echo "python3 is required for dev" >&2
         exit 1
     fi
 
@@ -145,6 +105,19 @@ cmd_tauri_no_reload() {
     npx tauri dev --config "$config_path" --no-watch
 }
 
+cmd_tauri() {
+    ensure_wasm_target
+    ensure_trunk
+    echo "==> Building frontend..."
+    cd frontend
+    trunk build --release
+    cd tauri-shell
+    echo "==> Building Tauri desktop app..."
+    cargo build --release
+    echo "==> Running Tyde..."
+    cargo run --release
+}
+
 cmd_clean() {
     echo "==> Cleaning build artifacts..."
     cargo clean
@@ -159,8 +132,6 @@ case "$1" in
     build)     cmd_build ;;
     dev)       cmd_dev ;;
     tauri)     cmd_tauri ;;
-    tauri-dev) cmd_tauri_dev ;;
-    tauri-no-reload) cmd_tauri_no_reload ;;
     clean)     cmd_clean ;;
     *)         usage ;;
 esac

@@ -1,5 +1,6 @@
 mod acceptor;
 mod agent;
+pub(crate) mod agent_control_mcp;
 pub mod backend;
 pub(crate) mod browse_stream;
 pub(crate) mod connection;
@@ -11,6 +12,7 @@ pub(crate) mod router;
 pub mod steering;
 pub mod store;
 pub(crate) mod stream;
+pub(crate) mod sub_agent;
 pub(crate) mod terminal_stream;
 
 pub use backend::{acp, claude, codex, gemini, kiro, subprocess};

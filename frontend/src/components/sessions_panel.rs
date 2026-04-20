@@ -1,7 +1,10 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{BackendKind, FrameKind, ListSessionsPayload, SpawnAgentParams, SpawnAgentPayload};
+use protocol::{
+    BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload, SpawnAgentParams,
+    SpawnAgentPayload,
+};
 
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus};
@@ -65,15 +68,6 @@ pub fn SessionsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
     let hide_child_sessions = RwSignal::new(false);
-    let state_for_connection = state.clone();
-
-    let is_connected = Memo::new(move |_| {
-        matches!(
-            state_for_connection.selected_host_connection_status(),
-            ConnectionStatus::Connected
-        )
-    });
-
     let filtered_sessions = Memo::new(move |_| {
         let sessions = state.sessions.get();
         let query = search.get().to_lowercase();
@@ -169,7 +163,7 @@ pub fn SessionsPanel() -> impl IntoView {
                         view! {
                             <div class="session-card-list">
                                 {sessions.into_iter().map(|session| {
-                                    session_card(state.clone(), session, is_connected)
+                                    session_card(state.clone(), session)
                                 }).collect_view()}
                             </div>
                         }.into_any()
@@ -180,11 +174,7 @@ pub fn SessionsPanel() -> impl IntoView {
     }
 }
 
-fn session_card(
-    state: AppState,
-    session: crate::state::SessionInfo,
-    is_connected: Memo<bool>,
-) -> impl IntoView {
+fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl IntoView {
     let title = session_title(&session);
     let short_id = session_id_short(&session);
     let full_id = session.summary.id.0.clone();
@@ -201,17 +191,35 @@ fn session_card(
     let resumable = session.summary.resumable;
     let session_host_id = session.host_id.clone();
 
-    let on_click = move |_| {
-        if !is_connected.get() || !resumable {
-            return;
-        }
-        let state = state.clone();
-        let sid = session_id.clone();
-        let host_id = session_host_id.clone();
+    // Per-row connection status keyed on this session's host, not the selected host.
+    let host_id_for_connected = session_host_id.clone();
+    let state_for_connected = state.clone();
+    let is_connected = Memo::new(move |_| {
+        state_for_connected
+            .connection_statuses
+            .get()
+            .get(&host_id_for_connected)
+            .map_or(false, |s| matches!(s, ConnectionStatus::Connected))
+    });
+
+    // Clone before closures move session_id, session_host_id, and state.
+    let delete_host_id = session_host_id.clone();
+    let delete_session_id = session_id.clone();
+    let state_for_delete = state.clone();
+
+    // Shared resume action used by both click and keydown handlers.
+    let resume_state = state.clone();
+    let resume_sid = session_id.clone();
+    let resume_host = session_host_id.clone();
+    let do_resume = std::rc::Rc::new(move || {
+        let state = resume_state.clone();
+        let sid = resume_sid.clone();
+        let host_id = resume_host.clone();
         spawn_local(async move {
             if let Some(host_stream) = state.host_stream_untracked(&host_id) {
                 let payload = SpawnAgentPayload {
-                    name: format!("resume-{}", sid),
+                    name: None,
+                    custom_agent_id: None,
                     parent_agent_id: None,
                     project_id: None,
                     params: SpawnAgentParams::Resume {
@@ -226,6 +234,24 @@ fn session_card(
                 }
             }
         });
+    });
+
+    let do_resume2 = do_resume.clone();
+    let on_click = move |_: web_sys::MouseEvent| {
+        if !is_connected.get() || !resumable {
+            return;
+        }
+        do_resume();
+    };
+
+    let on_keydown_card = move |ev: web_sys::KeyboardEvent| {
+        if matches!(ev.key().as_str(), "Enter" | " ") {
+            ev.prevent_default();
+            if !is_connected.get() || !resumable {
+                return;
+            }
+            do_resume2();
+        }
     };
 
     let disabled_class = move || {
@@ -237,10 +263,54 @@ fn session_card(
     };
 
     view! {
-        <button class=disabled_class title=full_id on:click=on_click>
+        <div
+            class=disabled_class
+            title=full_id
+            tabindex="0"
+            role="button"
+            on:click=on_click
+            on:keydown=on_keydown_card
+        >
             <div class="session-card-top">
                 <span class="session-card-title">{title}</span>
-                <span class={backend_class(backend)}>{backend_label(backend)}</span>
+                <div>
+                    {move || {
+                        if !is_connected.get() {
+                            return None;
+                        }
+                        // Create the handler fresh each time so the move closure
+                        // doesn't exhaust its captured values across invocations.
+                        let state = state_for_delete.clone();
+                        let host_id = delete_host_id.clone();
+                        let sid = delete_session_id.clone();
+                        let on_delete = move |ev: web_sys::MouseEvent| {
+                            ev.stop_propagation();
+                            let state = state.clone();
+                            let host_id = host_id.clone();
+                            let sid = sid.clone();
+                            spawn_local(async move {
+                                if let Some(host_stream) = state.host_stream_untracked(&host_id) {
+                                    if let Err(e) = send_frame(
+                                        &host_id,
+                                        host_stream,
+                                        FrameKind::DeleteSession,
+                                        &DeleteSessionPayload { session_id: sid },
+                                    )
+                                    .await
+                                    {
+                                        log::error!("failed to send DeleteSession: {e}");
+                                    }
+                                }
+                            });
+                        };
+                        Some(view! {
+                            <button type="button" class="filter-toggle" on:click=on_delete>
+                                "Delete"
+                            </button>
+                        })
+                    }}
+                    <span class={backend_class(backend)}>{backend_label(backend)}</span>
+                </div>
             </div>
             <div class="session-card-meta">
                 <span class="session-card-date">{created}</span>
@@ -250,6 +320,6 @@ fn session_card(
                 <span class="session-card-msgs">{format!("{msg_count} msgs")}</span>
             </div>
             <div class="session-card-id">{short_id}</div>
-        </button>
+        </div>
     }
 }

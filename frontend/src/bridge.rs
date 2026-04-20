@@ -7,7 +7,9 @@ use wasm_bindgen_futures::JsFuture;
 // Host-config types are defined once in the `host-config` crate and shared
 // verbatim with the Tauri shell. Re-export them for downstream modules.
 pub use host_config::{
-    ConfiguredHost, ConfiguredHostStore, HostTransportConfig, UpsertConfiguredHostRequest,
+    ConfiguredHost, ConfiguredHostStore, HostDisconnectedEvent, HostErrorEvent, HostIdRequest,
+    HostLineEvent, HostTransportConfig, SendHostLineRequest, SetSelectedHostRequest,
+    UpsertConfiguredHostRequest,
 };
 
 // --- Tauri JS bindings ---
@@ -25,39 +27,6 @@ extern "C" {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConnectHostRequest {
-    pub host_id: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SendHostLineRequest {
-    pub host_id: String,
-    pub line: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostLineEvent {
-    pub host_id: String,
-    pub line: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostDisconnectedEvent {
-    pub host_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostErrorEvent {
-    pub host_id: String,
-    pub message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SubmitUiDebugResponseRequest {
     pub request_id: String,
     pub response: devtools_protocol::UiDebugResponse,
@@ -72,7 +41,7 @@ struct TauriEvent<T> {
 
 // --- Command invocations ---
 
-pub async fn connect_host(request: ConnectHostRequest) -> Result<(), String> {
+pub async fn connect_host(request: HostIdRequest) -> Result<(), String> {
     let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
     tauri_invoke("connect_host", args)
         .await
@@ -82,7 +51,7 @@ pub async fn connect_host(request: ConnectHostRequest) -> Result<(), String> {
 
 pub async fn disconnect_host(host_id: String) -> Result<(), String> {
     let args =
-        serde_wasm_bindgen::to_value(&ConnectHostRequest { host_id }).map_err(|e| e.to_string())?;
+        serde_wasm_bindgen::to_value(&HostIdRequest { host_id }).map_err(|e| e.to_string())?;
     tauri_invoke("disconnect_host", args)
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -99,7 +68,11 @@ pub async fn list_configured_hosts() -> Result<ConfiguredHostStore, String> {
 pub async fn upsert_configured_host(
     request: UpsertConfiguredHostRequest,
 ) -> Result<ConfiguredHostStore, String> {
-    let args = serde_wasm_bindgen::to_value(&request).map_err(|e| e.to_string())?;
+    #[derive(Serialize)]
+    struct Args {
+        request: UpsertConfiguredHostRequest,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { request }).map_err(|e| e.to_string())?;
     let value = tauri_invoke("upsert_configured_host", args)
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -108,17 +81,11 @@ pub async fn upsert_configured_host(
 
 pub async fn remove_configured_host(host_id: String) -> Result<ConfiguredHostStore, String> {
     let args =
-        serde_wasm_bindgen::to_value(&ConnectHostRequest { host_id }).map_err(|e| e.to_string())?;
+        serde_wasm_bindgen::to_value(&HostIdRequest { host_id }).map_err(|e| e.to_string())?;
     let value = tauri_invoke("remove_configured_host", args)
         .await
         .map_err(|e| format!("{e:?}"))?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetSelectedHostRequest {
-    pub host_id: Option<String>,
 }
 
 pub async fn set_selected_host(
@@ -175,13 +142,8 @@ pub async fn listen_host_line(
     callback: impl Fn(HostLineEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
     listen_event("tyde://host-line", move |val: JsValue| {
-        let event: TauriEvent<HostLineEvent> = match serde_wasm_bindgen::from_value(val) {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("failed to parse host-line event: {e:?}");
-                return;
-            }
-        };
+        let event: TauriEvent<HostLineEvent> =
+            serde_wasm_bindgen::from_value(val).expect("failed to parse host-line event");
         callback(event.payload);
     })
     .await
@@ -191,13 +153,8 @@ pub async fn listen_host_disconnected(
     callback: impl Fn(HostDisconnectedEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
     listen_event("tyde://host-disconnected", move |val: JsValue| {
-        let event: TauriEvent<HostDisconnectedEvent> = match serde_wasm_bindgen::from_value(val) {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("failed to parse host-disconnected event: {e:?}");
-                return;
-            }
-        };
+        let event: TauriEvent<HostDisconnectedEvent> =
+            serde_wasm_bindgen::from_value(val).expect("failed to parse host-disconnected event");
         callback(event.payload);
     })
     .await
@@ -207,13 +164,8 @@ pub async fn listen_host_error(
     callback: impl Fn(HostErrorEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
     listen_event("tyde://host-error", move |val: JsValue| {
-        let event: TauriEvent<HostErrorEvent> = match serde_wasm_bindgen::from_value(val) {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("failed to parse host-error event: {e:?}");
-                return;
-            }
-        };
+        let event: TauriEvent<HostErrorEvent> =
+            serde_wasm_bindgen::from_value(val).expect("failed to parse host-error event");
         callback(event.payload);
     })
     .await
@@ -223,13 +175,8 @@ pub async fn listen_ui_debug_request(
     callback: impl Fn(UiDebugRequestEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
     listen_event("tyde://ui-debug-request", move |val: JsValue| {
-        let event: TauriEvent<UiDebugRequestEvent> = match serde_wasm_bindgen::from_value(val) {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("failed to parse ui-debug-request event: {e:?}");
-                return;
-            }
-        };
+        let event: TauriEvent<UiDebugRequestEvent> =
+            serde_wasm_bindgen::from_value(val).expect("failed to parse ui-debug-request event");
         callback(event.payload);
     })
     .await

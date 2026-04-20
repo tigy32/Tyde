@@ -2,9 +2,9 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentStartPayload, BackendKind, ChatEvent, Envelope, FrameKind, ListSessionsPayload,
-    NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload, SessionListPayload,
-    SpawnAgentParams, SpawnAgentPayload,
+    AgentStartPayload, BackendKind, ChatEvent, DeleteSessionPayload, Envelope, FrameKind,
+    ListSessionsPayload, NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload,
+    SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use std::time::Duration;
 
@@ -16,12 +16,56 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
-
-        if env.stream.0.starts_with("/host/") && env.kind == FrameKind::HostSettings {
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+                | FrameKind::SessionList
+        ) {
             continue;
         }
 
         return env;
+    }
+}
+
+async fn wait_for_session_list(
+    client: &mut client::Connection,
+    context: &str,
+) -> SessionListPayload {
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+                | FrameKind::NewAgent
+                | FrameKind::AgentStart
+                | FrameKind::AgentError
+                | FrameKind::ChatEvent
+        ) {
+            continue;
+        }
+        if env.kind == FrameKind::SessionList {
+            return env
+                .parse_payload()
+                .expect("failed to parse SessionListPayload");
+        }
+        panic!(
+            "wait_for_session_list({context}) received unexpected event: kind={} stream={}",
+            env.kind, env.stream
+        );
     }
 }
 
@@ -62,14 +106,29 @@ async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
-    match tokio::time::timeout(duration, client.next_event()).await {
-        Err(_) => {}
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(env))) => panic!(
-            "unexpected event before {context}: kind={} stream={}",
-            env.kind, env.stream
-        ),
-        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+    loop {
+        match tokio::time::timeout(duration, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(env)))
+                if matches!(
+                    env.kind,
+                    FrameKind::HostSettings
+                        | FrameKind::SessionSchemas
+                        | FrameKind::BackendSetup
+                        | FrameKind::QueuedMessages
+                        | FrameKind::SessionSettings
+                        | FrameKind::SessionList
+                ) =>
+            {
+                continue;
+            }
+            Ok(Ok(Some(env))) => panic!(
+                "unexpected event before {context}: kind={} stream={}",
+                env.kind, env.stream
+            ),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
     }
 }
 
@@ -90,7 +149,8 @@ async fn list_sessions_and_resume_agent() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "resumable".to_owned(),
+            name: Some("resumable".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
@@ -99,6 +159,7 @@ async fn list_sessions_and_resume_agent() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                session_settings: None,
             },
         })
         .await
@@ -116,9 +177,7 @@ async fn list_sessions_and_resume_agent() {
         .await
         .expect("list_sessions failed");
 
-    let env = expect_next_event(&mut fixture.client, "SessionList").await;
-    assert_eq!(env.kind, FrameKind::SessionList);
-    let list: SessionListPayload = env.parse_payload().expect("parse SessionList");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList").await;
     assert_eq!(list.sessions.len(), 1, "expected one stored session");
     let session = &list.sessions[0];
     assert_eq!(session.backend_kind, BackendKind::Claude);
@@ -129,7 +188,8 @@ async fn list_sessions_and_resume_agent() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "resumed".to_owned(),
+            name: Some("resumed".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Resume {
@@ -159,8 +219,7 @@ async fn list_sessions_and_resume_agent() {
         .await
         .expect("list_sessions after resume failed");
 
-    let env = expect_next_event(&mut fixture.client, "SessionList after resume").await;
-    let list: SessionListPayload = env.parse_payload().expect("parse SessionList after resume");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList after resume").await;
     assert_eq!(
         list.sessions.len(),
         1,
@@ -180,9 +239,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
         .await
         .expect("initial list_sessions failed");
 
-    let env = expect_next_event(&mut fixture.client, "initial empty SessionList").await;
-    assert_eq!(env.kind, FrameKind::SessionList);
-    let list: SessionListPayload = env.parse_payload().expect("parse initial SessionList");
+    let list = wait_for_session_list(&mut fixture.client, "initial empty SessionList").await;
     assert!(
         list.sessions.is_empty(),
         "expected no sessions before any spawn"
@@ -191,7 +248,8 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "parent".to_owned(),
+            name: Some("parent".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
@@ -200,6 +258,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                session_settings: None,
             },
         })
         .await
@@ -217,7 +276,8 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "child".to_owned(),
+            name: Some("child".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: Some(parent_new_agent.agent_id.clone()),
             project_id: None,
             params: SpawnAgentParams::New {
@@ -226,6 +286,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                session_settings: None,
             },
         })
         .await
@@ -241,9 +302,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
         .await
         .expect("list_sessions with parent/child failed");
 
-    let env = expect_next_event(&mut fixture.client, "SessionList with parent/child").await;
-    assert_eq!(env.kind, FrameKind::SessionList);
-    let list: SessionListPayload = env.parse_payload().expect("parse parent/child SessionList");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList with parent/child").await;
     assert_eq!(
         list.sessions.len(),
         2,
@@ -253,12 +312,12 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     let parent = list
         .sessions
         .iter()
-        .find(|session| session.alias.as_deref() == Some("parent"))
+        .find(|session| session.user_alias.as_deref() == Some("parent"))
         .expect("missing parent session in SessionList");
     let child = list
         .sessions
         .iter()
-        .find(|session| session.alias.as_deref() == Some("child"))
+        .find(|session| session.user_alias.as_deref() == Some("child"))
         .expect("missing child session in SessionList");
     assert_eq!(
         child.parent_id.as_ref(),
@@ -269,7 +328,8 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "resumed-parent".to_owned(),
+            name: Some("resumed-parent".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Resume {
@@ -330,7 +390,8 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "project-session".to_owned(),
+            name: Some("project-session".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: Some(project_a.id.clone()),
             params: SpawnAgentParams::New {
@@ -339,6 +400,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                session_settings: None,
             },
         })
         .await
@@ -366,8 +428,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
         .await
         .expect("list_sessions after project spawn failed");
 
-    let env = expect_next_event(&mut fixture.client, "SessionList after project spawn").await;
-    let list: SessionListPayload = env.parse_payload().expect("parse project SessionList");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList after project spawn").await;
     assert_eq!(list.sessions.len(), 1);
     let session = &list.sessions[0];
     assert_eq!(session.project_id.as_ref(), Some(&project_a.id));
@@ -375,7 +436,8 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "resume-same-project".to_owned(),
+            name: Some("resume-same-project".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::Resume {
@@ -398,7 +460,8 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: "resume-other-project".to_owned(),
+            name: Some("resume-other-project".to_owned()),
+            custom_agent_id: None,
             parent_agent_id: None,
             project_id: Some(project_b.id.clone()),
             params: SpawnAgentParams::Resume {
@@ -428,10 +491,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
         .await
         .expect("list_sessions after override failed");
 
-    let env = expect_next_event(&mut fixture.client, "SessionList after override").await;
-    let list: SessionListPayload = env
-        .parse_payload()
-        .expect("parse SessionList after override");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList after override").await;
     assert_eq!(
         list.sessions.len(),
         1,
@@ -458,4 +518,90 @@ async fn create_project(
         ProjectNotifyPayload::Upsert { project } => project,
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+}
+
+// Bug 6: Delete Session
+
+#[tokio::test]
+async fn delete_session_removes_it_from_list() {
+    let mut fixture = Fixture::new().await;
+
+    // Spawn an agent so a session gets recorded.
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("to-delete".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/delete-session".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+
+    // Confirm the session is present.
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions failed");
+    let list = wait_for_session_list(&mut fixture.client, "initial SessionList").await;
+    assert_eq!(list.sessions.len(), 1, "expected one session before delete");
+    let session_id = list.sessions[0].id.clone();
+
+    // Delete the session — server will fan-out an updated SessionList automatically.
+    fixture
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: session_id.clone(),
+        })
+        .await
+        .expect("delete_session failed");
+
+    let list = wait_for_session_list(&mut fixture.client, "SessionList after delete").await;
+    assert!(
+        list.sessions.is_empty(),
+        "session list must be empty after delete, got {:?}",
+        list.sessions
+            .iter()
+            .map(|s| s.id.0.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn delete_nonexistent_session_is_graceful() {
+    let mut fixture = Fixture::new().await;
+
+    // Delete a session that was never created — server must not crash and must
+    // emit an updated (empty) SessionList.
+    fixture
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: SessionId("nonexistent-session-id".to_owned()),
+        })
+        .await
+        .expect("delete_session write failed");
+
+    let list = wait_for_session_list(
+        &mut fixture.client,
+        "SessionList after deleting nonexistent session",
+    )
+    .await;
+    assert!(
+        list.sessions.is_empty(),
+        "session list should be empty; deleting a nonexistent session must be a no-op"
+    );
 }

@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use client::ClientConfig;
 use protocol::{
-    AgentErrorPayload, AgentId, AgentStartPayload, BackendKind, ChatEvent, FrameKind, HostSettings,
-    HostSettingsPayload, NewAgentPayload, ProjectId, SendMessagePayload, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, StreamPath,
+    AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
+    FrameKind, HostSettings, HostSettingsPayload, NewAgentPayload, ProjectId, SendMessagePayload,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -78,7 +78,7 @@ struct SnapshotState {
 
 #[derive(Debug)]
 struct PendingSpawn {
-    expected_name: String,
+    expected_name: Option<String>,
     expected_backend_kind: BackendKind,
     expected_workspace_roots: Vec<String>,
     expected_project_id: Option<ProjectId>,
@@ -88,7 +88,9 @@ struct PendingSpawn {
 
 impl PendingSpawn {
     fn matches(&self, payload: &NewAgentPayload) -> bool {
-        payload.name == self.expected_name
+        self.expected_name
+            .as_ref()
+            .is_none_or(|expected_name| payload.name == *expected_name)
             && payload.backend_kind == self.expected_backend_kind
             && payload.workspace_roots == self.expected_workspace_roots
             && payload.project_id == self.expected_project_id
@@ -357,7 +359,7 @@ pub struct SpawnRequest {
     pub backend_kind: BackendKind,
     pub parent_agent_id: Option<AgentId>,
     pub project_id: Option<ProjectId>,
-    pub name: String,
+    pub name: Option<String>,
     pub cost_hint: Option<SpawnCostHint>,
 }
 
@@ -529,6 +531,7 @@ async fn run_runtime(
                         }
                         let payload = SpawnAgentPayload {
                             name: request.name.clone(),
+                            custom_agent_id: None,
                             parent_agent_id: request.parent_agent_id.clone(),
                             project_id: request.project_id.clone(),
                             params: SpawnAgentParams::New {
@@ -537,6 +540,7 @@ async fn run_runtime(
                                 images: None,
                                 backend_kind: request.backend_kind,
                                 cost_hint: request.cost_hint,
+                                session_settings: None,
                             },
                         };
                         if let Err(err) = connection.spawn_agent(payload).await {
@@ -785,6 +789,28 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 | ChatEvent::RetryAttempt(_) => {}
             }
         }
+        FrameKind::AgentRenamed => {
+            let payload: AgentRenamedPayload = envelope
+                .parse_payload()
+                .expect("validated AgentRenamed payload should parse");
+            let stream_agent_id = parse_agent_id_from_stream(&envelope.stream);
+            assert_eq!(
+                stream_agent_id, payload.agent_id,
+                "agent_renamed payload agent_id {} must match stream {}",
+                payload.agent_id.0, envelope.stream.0
+            );
+            let agent = snapshot
+                .agents
+                .get_mut(&payload.agent_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "agent renamed arrived for unknown agent stream {}",
+                        envelope.stream.0
+                    )
+                });
+            agent.activity_counter = agent.activity_counter.saturating_add(1);
+            agent.name = payload.name;
+        }
         FrameKind::AgentError => {
             let payload: AgentErrorPayload = envelope
                 .parse_payload()
@@ -1018,9 +1044,7 @@ fn build_spawn_request(
 
     let parent_agent_id = parent_agent_id.as_deref().map(parse_agent_id).transpose()?;
     let project_id = project_id.as_deref().map(parse_project_id).transpose()?;
-    let name = name
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default_agent_name(backend_kind));
+    let name = name.filter(|value| !value.trim().is_empty());
 
     Ok(SpawnRequest {
         workspace_roots,
@@ -1031,18 +1055,6 @@ fn build_spawn_request(
         name,
         cost_hint: cost_hint.map(SpawnCostHint::from),
     })
-}
-
-fn default_agent_name(backend_kind: BackendKind) -> String {
-    let prefix = match backend_kind {
-        BackendKind::Tycode => "tycode",
-        BackendKind::Kiro => "kiro",
-        BackendKind::Claude => "claude",
-        BackendKind::Codex => "codex",
-        BackendKind::Gemini => "gemini",
-    };
-    let id = Uuid::new_v4().simple().to_string();
-    format!("{prefix}-{}", &id[..8])
 }
 
 #[derive(Debug, Deserialize)]
@@ -1630,7 +1642,7 @@ mod tests {
             backend_kind: BackendKind::Claude,
             parent_agent_id: None,
             project_id: None,
-            name: "test-agent".to_string(),
+            name: Some("test-agent".to_string()),
             cost_hint: None,
         };
 
@@ -1663,7 +1675,7 @@ mod tests {
             backend_kind: BackendKind::Claude,
             parent_agent_id: None,
             project_id: None,
-            name: "send-message-agent".to_string(),
+            name: Some("send-message-agent".to_string()),
             cost_hint: None,
         };
 

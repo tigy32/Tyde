@@ -38,6 +38,13 @@ pub async fn run_connection(
                         break;
                     };
 
+                    tracing::info!(
+                        stream = %envelope.stream,
+                        seq = envelope.seq,
+                        kind = %envelope.kind,
+                        "server received envelope"
+                    );
+
                     connection
                         .incoming_seq
                         .validate(&envelope.stream, envelope.seq, envelope.kind);
@@ -69,5 +76,11 @@ async fn write_outgoing(
         .insert(outgoing.stream.clone(), seq + 1);
 
     outgoing.seq = seq;
+    tracing::info!(
+        stream = %outgoing.stream,
+        seq = outgoing.seq,
+        kind = %outgoing.kind,
+        "server sending envelope"
+    );
     write_envelope(&mut connection.writer, &outgoing).await
 }

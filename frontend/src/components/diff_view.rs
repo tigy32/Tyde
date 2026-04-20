@@ -1,14 +1,18 @@
 use leptos::prelude::*;
 
-use crate::state::{AppState, DiffViewState};
+use crate::state::AppState;
 
-use protocol::{ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLineKind};
+use protocol::{
+    ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLineKind,
+    ProjectRootPath,
+};
 
 #[component]
-pub fn DiffView() -> impl IntoView {
+pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let diff = move || state.diff_content.get();
+    let key = (root, scope);
+    let diff = move || state.diff_contents.with(|diffs| diffs.get(&key).cloned());
 
     view! {
         <div class="diff-view">
@@ -25,7 +29,7 @@ pub fn DiffView() -> impl IntoView {
 }
 
 #[component]
-fn DiffContent(diff: DiffViewState) -> impl IntoView {
+fn DiffContent(diff: crate::state::DiffViewState) -> impl IntoView {
     let scope_label = match diff.scope {
         ProjectDiffScope::Staged => "staged",
         ProjectDiffScope::Unstaged => "unstaged",

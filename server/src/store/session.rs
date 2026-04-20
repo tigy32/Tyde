@@ -3,10 +3,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::{BackendKind, ProjectId, SessionId, SessionSummary};
+use protocol::{
+    BackendKind, CustomAgentId, ProjectId, SessionId, SessionSettingsValues, SessionSummary,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::BackendSession;
+
+fn default_resumable() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -15,6 +21,8 @@ pub struct SessionRecord {
     pub workspace_roots: Vec<String>,
     #[serde(default)]
     pub project_id: Option<ProjectId>,
+    #[serde(default)]
+    pub custom_agent_id: Option<CustomAgentId>,
     #[serde(default)]
     pub alias: Option<String>,
     #[serde(default)]
@@ -27,6 +35,10 @@ pub struct SessionRecord {
     pub message_count: u32,
     #[serde(default)]
     pub token_count: Option<u64>,
+    #[serde(default)]
+    pub session_settings: Option<SessionSettingsValues>,
+    #[serde(default = "default_resumable")]
+    pub resumable: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,6 +87,7 @@ impl SessionStore {
         session: &BackendSession,
         parent_id: Option<SessionId>,
         project_id: Option<ProjectId>,
+        custom_agent_id: Option<CustomAgentId>,
     ) -> Result<SessionRecord, String> {
         let now = now_ms();
         self.read_modify_write(|records| {
@@ -85,6 +98,7 @@ impl SessionStore {
                     backend_kind: session.backend_kind,
                     workspace_roots: session.workspace_roots.clone(),
                     project_id: project_id.clone(),
+                    custom_agent_id: custom_agent_id.clone(),
                     alias: session.title.clone(),
                     user_alias: None,
                     parent_id: parent_id.clone(),
@@ -92,11 +106,14 @@ impl SessionStore {
                     updated_at_ms: session.updated_at_ms.unwrap_or(now),
                     message_count: 0,
                     token_count: session.token_count,
+                    session_settings: None,
+                    resumable: session.resumable,
                 });
 
             entry.backend_kind = session.backend_kind;
             entry.workspace_roots = session.workspace_roots.clone();
             entry.project_id = project_id;
+            entry.custom_agent_id = custom_agent_id;
             if entry.alias.is_none() {
                 entry.alias = session.title.clone();
             }
@@ -108,6 +125,7 @@ impl SessionStore {
             }
             entry.updated_at_ms = session.updated_at_ms.unwrap_or(now);
             entry.token_count = session.token_count.or(entry.token_count);
+            entry.resumable = session.resumable;
 
             entry.clone()
         })
@@ -122,6 +140,76 @@ impl SessionStore {
                 update(record);
             }
         })
+    }
+
+    pub fn set_alias(&self, session_id: &SessionId, alias: String) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.alias = Some(alias);
+            record.updated_at_ms = now_ms();
+        })
+    }
+
+    pub fn set_alias_if_missing(
+        &self,
+        session_id: &SessionId,
+        alias: String,
+    ) -> Result<(), String> {
+        self.update(session_id, |record| {
+            if record.alias.is_none() {
+                record.alias = Some(alias);
+                record.updated_at_ms = now_ms();
+            }
+        })
+    }
+
+    pub fn set_user_alias(&self, session_id: &SessionId, user_alias: String) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.user_alias = Some(user_alias);
+            record.updated_at_ms = now_ms();
+        })
+    }
+
+    pub fn set_generated_alias_if_no_user_alias(
+        &self,
+        session_id: &SessionId,
+        alias: String,
+    ) -> Result<bool, String> {
+        self.read_modify_write(|records| {
+            let Some(record) = records.get_mut(&session_id.0) else {
+                return false;
+            };
+            if record.user_alias.is_some() {
+                return false;
+            }
+
+            if record.alias.as_deref() != Some(alias.as_str()) {
+                record.alias = Some(alias);
+                record.updated_at_ms = now_ms();
+            }
+            true
+        })
+    }
+
+    pub fn set_session_settings(
+        &self,
+        session_id: &SessionId,
+        settings: SessionSettingsValues,
+    ) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.session_settings = Some(settings);
+            record.updated_at_ms = now_ms();
+        })
+    }
+
+    pub fn delete(&self, session_id: &SessionId) -> Result<(), String> {
+        self.read_modify_write(|records| {
+            records.remove(&session_id.0);
+        })
+    }
+
+    pub fn effective_name(&self, session_id: &SessionId) -> Option<String> {
+        self.get(session_id)
+            .and_then(|record| record.user_alias.or(record.alias))
     }
 
     pub fn summaries(&self) -> Result<Vec<SessionSummary>, String> {
@@ -140,7 +228,7 @@ impl SessionStore {
                 updated_at_ms: record.updated_at_ms,
                 message_count: record.message_count,
                 token_count: record.token_count,
-                resumable: true,
+                resumable: record.resumable,
             })
             .collect())
     }

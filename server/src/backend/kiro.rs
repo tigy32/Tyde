@@ -12,7 +12,7 @@ use crate::acp::{
     extract_text_from_update, extract_tool_call_id, map_plan_status, normalize_update_type,
     parse_tool_call_completion, parse_tool_call_request,
 };
-use crate::backend::{SessionCommand, StartupMcpServer};
+use crate::backend::{SessionCommand, StartupMcpServer, render_combined_spawn_instructions};
 use crate::subprocess::ImageAttachment;
 
 const KIRO_AGENT_NAME: &str = "kiro";
@@ -50,6 +50,7 @@ impl KiroSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            None,
         )
         .await
     }
@@ -69,6 +70,7 @@ impl KiroSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            None,
         )
         .await
     }
@@ -80,6 +82,25 @@ impl KiroSession {
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        Self::spawn_admin_with_program_override(
+            workspace_roots,
+            initial_model,
+            ssh_host,
+            startup_mcp_servers,
+            steering_content,
+            None,
+        )
+        .await
+    }
+
+    pub async fn spawn_admin_with_program_override(
+        workspace_roots: &[String],
+        initial_model: Option<&str>,
+        ssh_host: Option<String>,
+        startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
+        program_override: Option<String>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             true,
@@ -88,6 +109,7 @@ impl KiroSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            program_override,
         )
         .await
     }
@@ -100,6 +122,7 @@ impl KiroSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        program_override: Option<String>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let roots = resolve_kiro_session_roots(
             workspace_roots,
@@ -112,7 +135,7 @@ impl KiroSession {
 
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &acp_args)
             .with_local_cwd(roots.session_cwd.clone());
-        spawn_spec.local_program = resolve_kiro_chat_binary();
+        spawn_spec.local_program = program_override.unwrap_or_else(resolve_kiro_chat_binary);
         if let Some(model) = initial_model
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -2420,31 +2443,159 @@ fn extract_known_models(value: &Value) -> Vec<Value> {
         .cloned()
         .unwrap_or_default();
 
-    raw_models
-        .iter()
-        .filter_map(|model| {
-            let id = model
-                .get("id")
-                .or_else(|| model.get("modelId"))
-                .or_else(|| model.get("name"))
-                .and_then(Value::as_str)?;
-            let display_name = model
-                .get("name")
-                .or_else(|| model.get("displayName"))
-                .and_then(Value::as_str)
-                .unwrap_or(id);
-            let is_default = model
-                .get("isDefault")
-                .or_else(|| model.get("default"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Some(json!({
-                "id": id,
-                "displayName": display_name,
-                "isDefault": is_default,
-            }))
-        })
-        .collect()
+    let mut deduped: Vec<Value> = Vec::new();
+    let mut indexes = HashMap::new();
+
+    for model in &raw_models {
+        let Some(id) = model
+            .get("id")
+            .or_else(|| model.get("modelId"))
+            .or_else(|| model.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        else {
+            continue;
+        };
+        let display_name = model
+            .get("name")
+            .or_else(|| model.get("displayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .unwrap_or(id);
+        let is_default = model
+            .get("isDefault")
+            .or_else(|| model.get("default"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let normalized_id = id.to_ascii_lowercase();
+        let preferred_id = id.to_string();
+
+        match indexes.get(&normalized_id).copied() {
+            Some(index) => {
+                let existing = deduped
+                    .get_mut(index)
+                    .and_then(Value::as_object_mut)
+                    .expect("deduped Kiro model entry must be an object");
+                if preferred_id == normalized_id {
+                    existing.insert("id".to_string(), Value::String(normalized_id.clone()));
+                }
+                if is_default {
+                    existing.insert("isDefault".to_string(), Value::Bool(true));
+                }
+            }
+            None => {
+                let id_value = if id == normalized_id {
+                    normalized_id.clone()
+                } else {
+                    preferred_id
+                };
+                indexes.insert(normalized_id, deduped.len());
+                deduped.push(json!({
+                    "id": id_value,
+                    "displayName": display_name,
+                    "isDefault": is_default,
+                }));
+            }
+        }
+    }
+
+    deduped
+}
+
+fn session_settings_schema_from_known_models(
+    known_models: &[Value],
+) -> Result<protocol::SessionSettingsSchema, String> {
+    let mut options = Vec::new();
+    let mut default = None;
+
+    for model in known_models {
+        let id = model
+            .get("id")
+            .or_else(|| model.get("modelId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("Kiro model entry missing id: {model}"))?;
+        let label = model
+            .get("displayName")
+            .or_else(|| model.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id);
+        if model
+            .get("isDefault")
+            .or_else(|| model.get("default"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            default = Some(id.to_string());
+        }
+        options.push(protocol::SelectOption {
+            value: id.to_string(),
+            label: label.to_string(),
+        });
+    }
+
+    if options.is_empty() {
+        return Err("Kiro reported no selectable models".to_string());
+    }
+
+    Ok(protocol::SessionSettingsSchema {
+        backend_kind: protocol::BackendKind::Kiro,
+        fields: vec![protocol::SessionSettingField {
+            key: "model".to_string(),
+            label: "Model".to_string(),
+            description: None,
+            use_slider: false,
+            field_type: protocol::SessionSettingFieldType::Select {
+                options,
+                default,
+                nullable: true,
+            },
+        }],
+    })
+}
+
+pub(crate) async fn probe_session_settings_schema(
+    workspace_roots: &[String],
+    program_override: Option<String>,
+) -> Result<protocol::SessionSettingsSchema, String> {
+    let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+        workspace_roots,
+        None,
+        None,
+        &[],
+        None,
+        program_override,
+    )
+    .await?;
+    let handle = session.command_handle();
+
+    let probe_result = async {
+        handle.execute(SessionCommand::ListModels).await?;
+        loop {
+            let raw = tokio::time::timeout(Duration::from_secs(5), raw_events.recv())
+                .await
+                .map_err(|_| "Timed out waiting for Kiro ModelsList event".to_string())?
+                .ok_or_else(|| "Kiro admin probe ended before ModelsList".to_string())?;
+            if raw.get("kind").and_then(Value::as_str) != Some("ModelsList") {
+                continue;
+            }
+            let known_models = raw
+                .get("data")
+                .and_then(|data| data.get("models"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("Kiro ModelsList missing data.models array: {raw}"))?;
+            return session_settings_schema_from_known_models(known_models);
+        }
+    }
+    .await;
+
+    session.shutdown().await;
+    probe_result
 }
 
 fn normalize_optional_string(value: &Value) -> Option<String> {
@@ -2774,11 +2925,13 @@ fn extract_session_timestamp(metadata: &Value) -> u64 {
 
 use protocol::{
     AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo, SessionId,
-    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+    SessionSettingValue, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+    Backend, BackendSession, BackendSpawnConfig, EventStream, empty_session_settings_schema,
+    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 const BACKEND_EVENT_BUFFER: usize = 256;
@@ -2801,6 +2954,27 @@ fn kiro_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> 
     }
 }
 
+fn kiro_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+    let mut values = protocol::SessionSettingsValues::default();
+    if let Some(model) = kiro_backend_model(Some(cost_hint)) {
+        values.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String(model.to_string()),
+        );
+    }
+    values
+}
+
+pub(crate) fn resolve_session_settings(
+    config: &BackendSpawnConfig,
+) -> protocol::SessionSettingsValues {
+    resolve_backend_settings(
+        config,
+        &KiroBackend::session_settings_schema(),
+        kiro_cost_hint_defaults,
+    )
+}
+
 fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
         timestamp: unix_now_ms(),
@@ -2816,6 +2990,10 @@ fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>
 }
 
 impl Backend for KiroBackend {
+    fn session_settings_schema() -> protocol::SessionSettingsSchema {
+        empty_session_settings_schema(BackendKind::Kiro)
+    }
+
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -2838,13 +3016,14 @@ impl Backend for KiroBackend {
             } else {
                 workspace_roots
             };
-            let requested_model = kiro_backend_model(config.cost_hint);
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn(
                 &roots,
-                requested_model,
+                None,
                 None,
                 &config.startup_mcp_servers,
-                None,
+                combined_instructions.as_deref(),
             )
             .await
             {
@@ -2864,6 +3043,27 @@ impl Backend for KiroBackend {
             ));
 
             let handle = session.command_handle();
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            if model_override.is_some() {
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings: session_settings_to_json(&resolved_settings),
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure Kiro session: {err}");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(format!("Failed to configure Kiro session: {err}")));
+                    }
+                    session.shutdown().await;
+                    return;
+                }
+            }
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(()));
             }
@@ -2894,18 +3094,40 @@ impl Backend for KiroBackend {
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else { break };
-                        let AgentInput::SendMessage(payload) = input;
-                        let message = payload.message;
-                        let images = protocol_images_to_attachments(payload.images);
-                        if let Err(err) = handle
-                            .execute(SessionCommand::SendMessage {
-                                message,
-                                images,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to send Kiro follow-up prompt: {err}");
-                            break;
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let message = payload.message;
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Kiro follow-up prompt: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update Kiro session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
                         }
                     }
                     interrupt = interrupt_rx.recv() => {
@@ -2956,13 +3178,14 @@ impl Backend for KiroBackend {
             } else {
                 workspace_roots
             };
-            let requested_model = kiro_backend_model(config.cost_hint);
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn(
                 &roots,
-                requested_model,
+                None,
                 None,
                 &config.startup_mcp_servers,
-                None,
+                combined_instructions.as_deref(),
             )
             .await
             {
@@ -2988,6 +3211,25 @@ impl Backend for KiroBackend {
                 .lock()
                 .expect("kiro session_id mutex poisoned") = Some(session_id);
 
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            if model_override.is_some() {
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings: session_settings_to_json(&resolved_settings),
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure resumed Kiro session: {err}");
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
             loop {
                 tokio::select! {
                     incoming = raw_events.recv() => {
@@ -3001,17 +3243,39 @@ impl Backend for KiroBackend {
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else { break };
-                        let AgentInput::SendMessage(payload) = input;
-                        let images = protocol_images_to_attachments(payload.images);
-                        if let Err(err) = handle
-                            .execute(SessionCommand::SendMessage {
-                                message: payload.message,
-                                images,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to send resumed Kiro follow-up prompt: {err}");
-                            break;
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send resumed Kiro follow-up prompt: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update resumed Kiro session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
                         }
                     }
                     interrupt = interrupt_rx.recv() => {
@@ -3072,28 +3336,43 @@ impl Backend for KiroBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        let AgentInput::SendMessage(payload) = input;
-        let visible_message = payload.message.clone();
-        let visible_images = payload.images.clone();
-        let outbound = AgentInput::SendMessage(protocol::SendMessagePayload {
-            message: payload.message,
-            images: payload.images,
-        });
+        match input {
+            AgentInput::SendMessage(payload) => {
+                let visible_message = payload.message.clone();
+                let visible_images = payload.images.clone();
+                let outbound = AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: payload.message,
+                    images: payload.images,
+                });
 
-        if self
-            .events_tx
-            .send(backend_user_message(visible_message, visible_images))
-            .await
-            .is_err()
-        {
-            return false;
+                if self
+                    .events_tx
+                    .send(backend_user_message(visible_message, visible_images))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+
+                self.input_tx.send(outbound).await.is_ok()
+            }
+            input @ AgentInput::UpdateSessionSettings(_) => self.input_tx.send(input).await.is_ok(),
+            AgentInput::EditQueuedMessage(_)
+            | AgentInput::CancelQueuedMessage(_)
+            | AgentInput::SendQueuedMessageNow(_) => {
+                panic!(
+                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                );
+            }
         }
-
-        self.input_tx.send(outbound).await.is_ok()
     }
 
     async fn interrupt(&self) -> bool {
         self.interrupt_tx.send(()).await.is_ok()
+    }
+
+    async fn shutdown(self) {
+        drop(self);
     }
 
     fn session_id(&self) -> SessionId {
@@ -3195,6 +3474,24 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn extract_known_models_dedupes_case_variants() {
+        let models = extract_known_models(&json!({
+            "models": {
+                "availableModels": [
+                    { "id": "Auto", "name": "Auto", "isDefault": false },
+                    { "id": "auto", "name": "Auto", "isDefault": true },
+                    { "id": "claude-sonnet", "name": "Claude Sonnet", "isDefault": false }
+                ]
+            }
+        }));
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], Value::String("auto".to_string()));
+        assert_eq!(models[0]["isDefault"], Value::Bool(true));
+        assert_eq!(models[1]["id"], Value::String("claude-sonnet".to_string()));
+    }
 
     // Real Kiro ACP events captured from a live session.
 

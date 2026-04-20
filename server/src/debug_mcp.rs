@@ -5,12 +5,25 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
 use devtools_protocol::{UiDebugRequest, UiDebugResponse};
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_handler, tool_router,
+    transport::{
+        StreamableHttpServerConfig,
+        streamable_http_server::{
+            session::local::LocalSessionManager, tower::StreamableHttpService,
+        },
+    },
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
@@ -54,130 +67,35 @@ struct DevInstanceSummary {
     status: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    id: Option<Value>,
-    method: String,
-    params: Option<Value>,
+#[derive(Clone)]
+struct TydeDebugMcpServer {
+    state: Arc<DebugMcpState>,
+    tool_router: ToolRouter<Self>,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse<T> {
-    jsonrpc: &'static str,
-    id: Value,
-    result: T,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcErrorResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    error: JsonRpcErrorObject,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcErrorObject {
-    code: i64,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CallToolParams {
-    name: String,
-    arguments: Option<Map<String, Value>>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InitializeResult {
-    protocol_version: &'static str,
-    capabilities: InitializeCapabilities,
-    server_info: ServerInfoPayload,
-    instructions: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InitializeCapabilities {
-    tools: ToolsCapability,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ToolsCapability {
-    list_changed: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ServerInfoPayload {
-    name: &'static str,
-    version: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolsListResult {
-    tools: Vec<ToolDefinition>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ToolDefinition {
-    name: &'static str,
-    description: &'static str,
-    input_schema: Value,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ToolCallResult {
-    content: Vec<TextContent>,
-    is_error: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct TextContent {
-    #[serde(rename = "type")]
-    type_name: &'static str,
-    text: String,
-}
-
-impl ToolCallResult {
-    fn json<T: Serialize>(value: T) -> Self {
+impl TydeDebugMcpServer {
+    fn new(state: Arc<DebugMcpState>) -> Self {
         Self {
-            content: vec![TextContent {
-                type_name: "text",
-                text: serde_json::to_string(&value)
-                    .expect("tool result serialization should not fail"),
-            }],
-            is_error: false,
-        }
-    }
-
-    fn text_error(message: impl Into<String>) -> Self {
-        Self {
-            content: vec![TextContent {
-                type_name: "text",
-                text: message.into(),
-            }],
-            is_error: true,
+            state,
+            tool_router: Self::tool_router(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 struct StartInstanceToolInput {
     project_dir: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 struct StopInstanceToolInput {
     instance_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+struct EmptyToolInput {}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 struct EvaluateToolInput {
     instance_id: String,
     expression: String,
@@ -195,11 +113,107 @@ struct StartInstanceResult {
     ui_debug_addr: String,
 }
 
-struct HttpRequest {
-    method: String,
-    target: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
+fn ok_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::success(vec![Content::json(value)?]))
+}
+
+fn err_text(message: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(message.into())])
+}
+
+fn repo_root_from_parts(parts: &axum::http::request::Parts) -> Option<PathBuf> {
+    let repo_root_from_header = parts
+        .headers
+        .get(DEBUG_REPO_ROOT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if repo_root_from_header.is_some() {
+        return repo_root_from_header;
+    }
+
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| parts.uri.path());
+    split_request_target(target).1
+}
+
+#[tool_router]
+impl TydeDebugMcpServer {
+    #[tool(
+        description = "Launch a Tyde desktop dev instance with hot reload disabled. Stop and restart it to pick up code changes. Waits until the typed host and UI-debug loopback endpoints are ready."
+    )]
+    async fn tyde_dev_instance_start(
+        &self,
+        Parameters(input): Parameters<StartInstanceToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo_root = repo_root_from_parts(&parts);
+        match start_instance(&self.state, repo_root.as_deref(), input).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(description = "Stop a previously launched Tyde dev instance.")]
+    async fn tyde_dev_instance_stop(
+        &self,
+        Parameters(input): Parameters<StopInstanceToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match stop_instance(&self.state, &input.instance_id).await {
+            Ok(summary) => ok_json(summary),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(description = "List all Tyde dev instances currently launched by this MCP server.")]
+    async fn tyde_dev_instance_list(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match list_instances(&self.state).await {
+            Ok(summaries) => ok_json(summaries),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Run JavaScript inside a launched Tyde dev instance frontend. The expression is used as the body of an async function, so use `return ...` when you want to return a value."
+    )]
+    async fn tyde_debug_evaluate(
+        &self,
+        Parameters(input): Parameters<EvaluateToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if input.expression.trim().is_empty() {
+            return Ok(err_text("expression must not be empty"));
+        }
+        match evaluate_instance(&self.state, input).await {
+            Ok(value) => ok_json(json!({ "value": value })),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for TydeDebugMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            instructions: Some(
+                "Tyde server hosted debug MCP. Start a child Tyde dev instance with tyde_dev_instance_start, then inspect or drive its frontend with tyde_debug_evaluate. Dev instances are launched with hot reload disabled, so restart the instance when you want it to pick up code changes."
+                    .into(),
+            ),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
 }
 
 pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, String> {
@@ -233,9 +247,24 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
                 .build()
                 .expect("failed to build debug MCP runtime");
             runtime.block_on(async move {
-                let listener = TcpListener::from_std(listener)
+                let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to create tokio debug MCP listener");
-                run_accept_loop(listener, state).await;
+                let mcp_service: StreamableHttpService<TydeDebugMcpServer, LocalSessionManager> =
+                    StreamableHttpService::new(
+                        move || Ok(TydeDebugMcpServer::new(Arc::clone(&state))),
+                        Default::default(),
+                        StreamableHttpServerConfig {
+                            stateful_mode: true,
+                            sse_keep_alive: None,
+                            ..Default::default()
+                        },
+                    );
+                let router = Router::new()
+                    .route("/healthz", get(healthz_handler))
+                    .nest_service("/mcp", mcp_service);
+                if let Err(err) = axum::serve(listener, router).await {
+                    tracing::warn!("debug MCP HTTP server stopped: {err}");
+                }
             });
         })
         .map_err(|err| format!("failed to spawn debug MCP server thread: {err}"))?;
@@ -243,289 +272,6 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
     Ok(DebugMcpHandle {
         url: format!("http://{local_addr}/mcp"),
     })
-}
-
-async fn run_accept_loop(listener: TcpListener, state: Arc<DebugMcpState>) {
-    loop {
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(parts) => parts,
-            Err(err) => {
-                tracing::error!("debug MCP accept failed: {err}");
-                continue;
-            }
-        };
-
-        if !peer_addr.ip().is_loopback() {
-            tracing::warn!("rejecting non-loopback debug MCP peer {peer_addr}");
-            continue;
-        }
-
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state).await {
-                tracing::warn!("debug MCP HTTP connection failed: {err}");
-            }
-        });
-    }
-}
-
-async fn handle_connection(mut stream: TcpStream, state: Arc<DebugMcpState>) -> Result<(), String> {
-    let Some(request) = read_http_request(&mut stream).await? else {
-        return Ok(());
-    };
-
-    let response = match request.target.as_str() {
-        "/mcp" => handle_mcp_http_request(&state, request).await,
-        _ => HttpResponse::text(404, "Not Found", "not found"),
-    };
-
-    write_http_response(&mut stream, response).await
-}
-
-async fn handle_mcp_http_request(state: &Arc<DebugMcpState>, request: HttpRequest) -> HttpResponse {
-    if request.method != "POST" {
-        return HttpResponse::text(405, "Method Not Allowed", "POST required");
-    }
-
-    let (target_path, query_repo_root) = split_request_target(&request.target);
-    if target_path != "/mcp" {
-        return HttpResponse::text(404, "Not Found", "not found");
-    }
-
-    let rpc_request: JsonRpcRequest = match serde_json::from_slice(&request.body) {
-        Ok(value) => value,
-        Err(err) => {
-            return HttpResponse::text(
-                400,
-                "Bad Request",
-                &format!("invalid JSON-RPC request body: {err}"),
-            );
-        }
-    };
-
-    let repo_root = query_repo_root.or_else(|| {
-        request
-            .headers
-            .get(DEBUG_REPO_ROOT_HEADER)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
-
-    match handle_rpc_request(state, repo_root.as_deref(), rpc_request).await {
-        Ok(body) => HttpResponse::json(200, "OK", body),
-        Err((status, reason, message)) => HttpResponse::text(status, reason, &message),
-    }
-}
-
-async fn handle_rpc_request(
-    state: &Arc<DebugMcpState>,
-    repo_root: Option<&Path>,
-    request: JsonRpcRequest,
-) -> Result<Vec<u8>, (u16, &'static str, String)> {
-    let response = match request.method.as_str() {
-        "initialize" => {
-            let Some(id) = request.id else {
-                return Err((400, "Bad Request", "initialize requires an id".to_string()));
-            };
-            serde_json::to_vec(&JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: InitializeResult {
-                    protocol_version: "2025-03-26",
-                    capabilities: InitializeCapabilities {
-                        tools: ToolsCapability { list_changed: false },
-                    },
-                    server_info: ServerInfoPayload {
-                        name: "tyde-debug",
-                        version: "0.0.0",
-                    },
-                    instructions: "Tyde server hosted debug MCP. Start a child Tyde dev instance with tyde_dev_instance_start, then inspect or drive its frontend with tyde_debug_evaluate. Dev instances are launched with hot reload disabled, so restart the instance when you want it to pick up code changes.".to_string(),
-                },
-            })
-            .map_err(internal_json_error)?
-        }
-        "notifications/initialized" | "notifications/cancelled" => {
-            serde_json::to_vec(&json!({})).map_err(internal_json_error)?
-        }
-        "ping" => {
-            let Some(id) = request.id else {
-                return Err((400, "Bad Request", "ping requires an id".to_string()));
-            };
-            serde_json::to_vec(&JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: json!({}),
-            })
-            .map_err(internal_json_error)?
-        }
-        "tools/list" => {
-            let Some(id) = request.id else {
-                return Err((400, "Bad Request", "tools/list requires an id".to_string()));
-            };
-            serde_json::to_vec(&JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: ToolsListResult {
-                    tools: tool_definitions(),
-                },
-            })
-            .map_err(internal_json_error)?
-        }
-        "tools/call" => {
-            let Some(id) = request.id else {
-                return Err((400, "Bad Request", "tools/call requires an id".to_string()));
-            };
-            let params: CallToolParams = serde_json::from_value(
-                request.params.unwrap_or_else(|| json!({})),
-            )
-            .map_err(|err| {
-                (
-                    400,
-                    "Bad Request",
-                    format!("invalid tools/call params: {err}"),
-                )
-            })?;
-            let result = dispatch_tool(state, repo_root, params).await;
-            serde_json::to_vec(&JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result,
-            })
-            .map_err(internal_json_error)?
-        }
-        other => {
-            let Some(id) = request.id else {
-                return Err((400, "Bad Request", format!("method not found: {other}")));
-            };
-            serde_json::to_vec(&JsonRpcErrorResponse {
-                jsonrpc: "2.0",
-                id,
-                error: JsonRpcErrorObject {
-                    code: -32601,
-                    message: format!("method not found: {other}"),
-                },
-            })
-            .map_err(internal_json_error)?
-        }
-    };
-
-    Ok(response)
-}
-
-fn internal_json_error(err: serde_json::Error) -> (u16, &'static str, String) {
-    (
-        500,
-        "Internal Server Error",
-        format!("failed to serialize debug MCP response JSON: {err}"),
-    )
-}
-
-fn tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "tyde_dev_instance_start",
-            description: "Launch a Tyde desktop dev instance with hot reload disabled. Stop and restart it to pick up code changes. Waits until the typed host and UI-debug loopback endpoints are ready.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "project_dir": { "type": "string" }
-                },
-                "required": ["project_dir"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "tyde_dev_instance_stop",
-            description: "Stop a previously launched Tyde dev instance.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "instance_id": { "type": "string" }
-                },
-                "required": ["instance_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "tyde_dev_instance_list",
-            description: "List all Tyde dev instances currently launched by this MCP server.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "tyde_debug_evaluate",
-            description: "Run JavaScript inside a launched Tyde dev instance frontend. The expression is used as the body of an async function, so use `return ...` when you want to return a value.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "instance_id": { "type": "string" },
-                    "expression": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 0 }
-                },
-                "required": ["instance_id", "expression"],
-                "additionalProperties": false
-            }),
-        },
-    ]
-}
-
-fn parse_tool_input<T: for<'de> Deserialize<'de>>(
-    arguments: Option<Map<String, Value>>,
-) -> Result<T, String> {
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
-        .map_err(|err| format!("invalid tool arguments: {err}"))
-}
-
-async fn dispatch_tool(
-    state: &Arc<DebugMcpState>,
-    repo_root: Option<&Path>,
-    params: CallToolParams,
-) -> ToolCallResult {
-    match params.name.as_str() {
-        "tyde_dev_instance_start" => {
-            let input = match parse_tool_input::<StartInstanceToolInput>(params.arguments) {
-                Ok(input) => input,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            match start_instance(state, repo_root, input).await {
-                Ok(result) => ToolCallResult::json(result),
-                Err(err) => ToolCallResult::text_error(err),
-            }
-        }
-        "tyde_dev_instance_stop" => {
-            let input = match parse_tool_input::<StopInstanceToolInput>(params.arguments) {
-                Ok(input) => input,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            match stop_instance(state, &input.instance_id).await {
-                Ok(summary) => ToolCallResult::json(summary),
-                Err(err) => ToolCallResult::text_error(err),
-            }
-        }
-        "tyde_dev_instance_list" => match list_instances(state).await {
-            Ok(summaries) => ToolCallResult::json(summaries),
-            Err(err) => ToolCallResult::text_error(err),
-        },
-        "tyde_debug_evaluate" => {
-            let input = match parse_tool_input::<EvaluateToolInput>(params.arguments) {
-                Ok(input) => input,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            if input.expression.trim().is_empty() {
-                return ToolCallResult::text_error("expression must not be empty");
-            }
-            match evaluate_instance(state, input).await {
-                Ok(value) => ToolCallResult::json(json!({ "value": value })),
-                Err(err) => ToolCallResult::text_error(err),
-            }
-        }
-        other => ToolCallResult::text_error(format!("unknown tool '{other}'")),
-    }
 }
 
 async fn start_instance(
@@ -794,12 +540,14 @@ fn write_dev_config(
     instance_id: &str,
 ) -> Result<PathBuf, String> {
     let source_path = repo_root.join("frontend/tauri-shell/tauri.conf.json");
+    let trunk_config_path = repo_root.join("frontend/Trunk.toml");
     let contents = std::fs::read_to_string(&source_path)
         .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?;
     let mut json: Value = serde_json::from_str(&contents)
         .map_err(|err| format!("failed to parse {}: {err}", source_path.display()))?;
     json["build"]["beforeDevCommand"] = Value::String(format!(
-        "trunk serve --port {frontend_port} --config frontend/Trunk.toml --no-autoreload"
+        "trunk serve --port {frontend_port} --config {} --no-autoreload",
+        shell_single_quote(&trunk_config_path.display().to_string())
     ));
     json["build"]["devUrl"] = Value::String(format!("http://127.0.0.1:{frontend_port}"));
 
@@ -828,72 +576,15 @@ fn tauri_dev_command(repo_root: &Path, config_path: &Path) -> Result<Command, St
     Ok(command)
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
-}
-
-async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
-        .await
-        .map_err(|err| format!("failed to read debug MCP request line: {err}"))?;
-    if read == 0 {
-        return Ok(None);
-    }
-
-    let parts = request_line
-        .trim_end_matches(['\r', '\n'])
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    if parts.len() != 3 {
-        return Err(format!("invalid debug MCP request line: {request_line:?}"));
-    }
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|err| format!("failed to read debug MCP header: {err}"))?;
-        if read == 0 {
-            return Err("unexpected EOF while reading debug MCP HTTP headers".to_string());
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let Some((name, value)) = trimmed.split_once(':') else {
-            return Err(format!("invalid debug MCP header line: {trimmed:?}"));
-        };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = headers
-        .get("content-length")
-        .map(|raw| {
-            raw.parse::<usize>()
-                .map_err(|err| format!("invalid Content-Length header {raw:?}: {err}"))
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let mut body = vec![0u8; content_length];
-    reader
-        .read_exact(&mut body)
-        .await
-        .map_err(|err| format!("failed to read debug MCP HTTP body: {err}"))?;
-
-    Ok(Some(HttpRequest {
-        method: parts[0].to_string(),
-        target: parts[1].to_string(),
-        headers,
-        body,
-    }))
 }
 
 fn split_request_target(target: &str) -> (&str, Option<PathBuf>) {
@@ -943,54 +634,8 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-struct HttpResponse {
-    status: u16,
-    reason: &'static str,
-    content_type: &'static str,
-    body: Vec<u8>,
-}
-
-impl HttpResponse {
-    fn json(status: u16, reason: &'static str, body: Vec<u8>) -> Self {
-        Self {
-            status,
-            reason,
-            content_type: "application/json",
-            body,
-        }
-    }
-
-    fn text(status: u16, reason: &'static str, body: &str) -> Self {
-        Self {
-            status,
-            reason,
-            content_type: "text/plain; charset=utf-8",
-            body: body.as_bytes().to_vec(),
-        }
-    }
-}
-
-async fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<(), String> {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status,
-        response.reason,
-        response.content_type,
-        response.body.len()
-    );
-    stream
-        .write_all(header.as_bytes())
-        .await
-        .map_err(|err| format!("failed to write debug MCP HTTP header: {err}"))?;
-    stream
-        .write_all(&response.body)
-        .await
-        .map_err(|err| format!("failed to write debug MCP HTTP body: {err}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|err| format!("failed to flush debug MCP HTTP response: {err}"))?;
-    Ok(())
+async fn healthz_handler() -> impl IntoResponse {
+    Json(HealthResponse { status: "ok" })
 }
 
 #[cfg(test)]
@@ -1023,9 +668,10 @@ mod tests {
         );
         assert_eq!(
             json["build"]["beforeDevCommand"],
-            Value::String(
-                "trunk serve --port 17777 --config frontend/Trunk.toml --no-autoreload".to_string()
-            )
+            Value::String(format!(
+                "trunk serve --port 17777 --config '{}' --no-autoreload",
+                repo_root.join("frontend/Trunk.toml").display()
+            ))
         );
         let _ = std::fs::remove_file(path);
     }
