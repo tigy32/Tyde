@@ -24,7 +24,7 @@ pub fn SessionSettingsControls(
                 let description = field.description.clone();
                 let field_type = field.field_type.clone();
                 let use_slider = field.use_slider;
-                let on_change = on_change;
+                let on_change_cb = on_change;
 
                 view! {
                     <div
@@ -91,7 +91,7 @@ pub fn SessionSettingsControls(
                                                 } else {
                                                     current.0.insert(key.clone(), SessionSettingValue::String(val.clone()));
                                                 }
-                                                on_change.run(current);
+                                                on_change_cb.run(current);
                                             }
                                         }
                                     }
@@ -146,7 +146,7 @@ pub fn SessionSettingsControls(
                                         } else {
                                             current.0.insert(key.clone(), SessionSettingValue::String(selected));
                                         }
-                                        on_change.run(current);
+                                        on_change_cb.run(current);
                                     }
                                 };
 
@@ -189,7 +189,7 @@ pub fn SessionSettingsControls(
                                         let checked = input.checked();
                                         let mut current = values.get_untracked();
                                         current.0.insert(key.clone(), SessionSettingValue::Bool(checked));
-                                        on_change.run(current);
+                                        on_change_cb.run(current);
                                     }
                                 };
 
@@ -226,7 +226,7 @@ pub fn SessionSettingsControls(
                                             let clamped = n.clamp(min, max);
                                             let mut current = values.get_untracked();
                                             current.0.insert(key.clone(), SessionSettingValue::Integer(clamped));
-                                            on_change.run(current);
+                                            on_change_cb.run(current);
                                         }
                                     }
                                 };
@@ -284,9 +284,9 @@ pub fn SessionSettingsBar() -> impl IntoView {
     // missing-schema banner, preventing a flash during host connect.
     let schema_status = {
         let state = state.clone();
-        let current_binding = current_binding.clone();
+        let current_binding_for_status = current_binding;
         move || -> Option<(BackendKind, Option<SessionSchemaEntry>)> {
-            let (host_id, backend_kind) = current_binding()?;
+            let (host_id, backend_kind) = current_binding_for_status()?;
             let loaded = state
                 .schemas_loaded_for_host
                 .get()

@@ -45,6 +45,26 @@ type BackendSpawnResult = Result<(BackendHandle, EventStream, SessionId), String
 type BackendResumeResult = Result<(BackendHandle, EventStream), String>;
 type BackendFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
+struct TerminalFailureContext<'a> {
+    accepting_input: &'a Arc<AtomicBool>,
+    status_handle: &'a registry::AgentStatusHandle,
+    canonical_stream: &'a str,
+    event_log: &'a mut Vec<Envelope>,
+    subscribers: &'a mut Vec<Stream>,
+    queue: &'a mut VecDeque<QueuedMessageEntry>,
+    start: &'a AgentStartPayload,
+    child_completion_tx: &'a HostChildCompletionNoticeTx,
+}
+
+struct AgentNameChangeContext<'a> {
+    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_id: Option<&'a SessionId>,
+    pending_alias: &'a mut Option<InitialAgentAlias>,
+    current_start: &'a mut AgentStartPayload,
+    event_log: &'a mut [Envelope],
+    subscribers: &'a mut Vec<Stream>,
+}
+
 enum AgentCommand {
     SendInput(AgentInput),
     EnqueueAutoFollowUp {
@@ -627,15 +647,17 @@ pub(crate) fn spawn_agent_actor(
                 )
                 .await;
                 enter_terminal_failure(
-                    &accepting_input_task,
-                    &status_handle,
-                    &canonical_stream,
-                    &mut event_log,
-                    &mut subscribers,
-                    &mut queue,
+                    TerminalFailureContext {
+                        accepting_input: &accepting_input_task,
+                        status_handle: &status_handle,
+                        canonical_stream: &canonical_stream,
+                        event_log: &mut event_log,
+                        subscribers: &mut subscribers,
+                        queue: &mut queue,
+                        start: &current_start,
+                        child_completion_tx: &child_completion_tx,
+                    },
                     &payload,
-                    &current_start,
-                    &child_completion_tx,
                 )
                 .await;
                 park_terminal_agent(
@@ -745,15 +767,17 @@ pub(crate) fn spawn_agent_actor(
                     fatal: true,
                 };
                 enter_terminal_failure(
-                    &accepting_input_task,
-                    &status_handle,
-                    &canonical_stream,
-                    &mut event_log,
-                    &mut subscribers,
-                    &mut queue,
+                    TerminalFailureContext {
+                        accepting_input: &accepting_input_task,
+                        status_handle: &status_handle,
+                        canonical_stream: &canonical_stream,
+                        event_log: &mut event_log,
+                        subscribers: &mut subscribers,
+                        queue: &mut queue,
+                        start: &current_start,
+                        child_completion_tx: &child_completion_tx,
+                    },
                     &payload,
-                    &current_start,
-                    &child_completion_tx,
                 )
                 .await;
                 park_terminal_agent(
@@ -791,15 +815,17 @@ pub(crate) fn spawn_agent_actor(
                             fatal: true,
                         };
                         enter_terminal_failure(
-                            &accepting_input_task,
-                            &status_handle,
-                            &canonical_stream,
-                            &mut event_log,
-                            &mut subscribers,
-                            &mut queue,
+                            TerminalFailureContext {
+                                accepting_input: &accepting_input_task,
+                                status_handle: &status_handle,
+                                canonical_stream: &canonical_stream,
+                                event_log: &mut event_log,
+                                subscribers: &mut subscribers,
+                                queue: &mut queue,
+                                start: &current_start,
+                                child_completion_tx: &child_completion_tx,
+                            },
                             &payload,
-                            &current_start,
-                            &child_completion_tx,
                         )
                         .await;
                         park_terminal_agent(
@@ -902,19 +928,18 @@ pub(crate) fn spawn_agent_actor(
                         );
                     }
 
-                    if matches!(event, ChatEvent::TypingStatusChanged(false)) {
-                        if let Some(message_text) = turn_completion
+                    if matches!(event, ChatEvent::TypingStatusChanged(false))
+                        && let Some(message_text) = turn_completion
                             .completed_message
                             .take()
                             .filter(|message| !message.trim().is_empty())
-                        {
-                            maybe_emit_child_completion_notice(
-                                &child_completion_tx,
-                                &current_start,
-                                ChildCompletionOutcome::Completed,
-                                message_text,
-                            );
-                        }
+                    {
+                        maybe_emit_child_completion_notice(
+                            &child_completion_tx,
+                            &current_start,
+                            ChildCompletionOutcome::Completed,
+                            message_text,
+                        );
                     }
 
                     if matches!(event, ChatEvent::TypingStatusChanged(false))
@@ -960,15 +985,17 @@ pub(crate) fn spawn_agent_actor(
                                 fatal: true,
                             };
                             enter_terminal_failure(
-                                &accepting_input_task,
-                                &status_handle,
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &mut queue,
+                                TerminalFailureContext {
+                                    accepting_input: &accepting_input_task,
+                                    status_handle: &status_handle,
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                    queue: &mut queue,
+                                    start: &current_start,
+                                    child_completion_tx: &child_completion_tx,
+                                },
                                 &payload,
-                                &current_start,
-                                &child_completion_tx,
                             )
                             .await;
                             park_terminal_agent(
@@ -1025,15 +1052,17 @@ pub(crate) fn spawn_agent_actor(
                                                 fatal: true,
                                             };
                                             enter_terminal_failure(
-                                                &accepting_input_task,
-                                                &status_handle,
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &mut queue,
+                                                TerminalFailureContext {
+                                                    accepting_input: &accepting_input_task,
+                                                    status_handle: &status_handle,
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    subscribers: &mut subscribers,
+                                                    queue: &mut queue,
+                                                    start: &current_start,
+                                                    child_completion_tx: &child_completion_tx,
+                                                },
                                                 &payload,
-                                                &current_start,
-                                                &child_completion_tx,
                                             )
                                             .await;
                                             park_terminal_agent(
@@ -1180,15 +1209,17 @@ pub(crate) fn spawn_agent_actor(
                                             fatal: true,
                                         };
                                         enter_terminal_failure(
-                                            &accepting_input_task,
-                                            &status_handle,
-                                            &canonical_stream,
-                                            &mut event_log,
-                                            &mut subscribers,
-                                            &mut queue,
+                                            TerminalFailureContext {
+                                                accepting_input: &accepting_input_task,
+                                                status_handle: &status_handle,
+                                                canonical_stream: &canonical_stream,
+                                                event_log: &mut event_log,
+                                                subscribers: &mut subscribers,
+                                                queue: &mut queue,
+                                                start: &current_start,
+                                                child_completion_tx: &child_completion_tx,
+                                            },
                                             &payload,
-                                            &current_start,
-                                            &child_completion_tx,
                                         )
                                         .await;
                                         park_terminal_agent(
@@ -1329,15 +1360,17 @@ pub(crate) fn spawn_agent_actor(
                                     fatal: true,
                                 };
                                 enter_terminal_failure(
-                                    &accepting_input_task,
-                                    &status_handle,
-                                    &canonical_stream,
-                                    &mut event_log,
-                                    &mut subscribers,
-                                    &mut queue,
+                                    TerminalFailureContext {
+                                        accepting_input: &accepting_input_task,
+                                        status_handle: &status_handle,
+                                        canonical_stream: &canonical_stream,
+                                        event_log: &mut event_log,
+                                        subscribers: &mut subscribers,
+                                        queue: &mut queue,
+                                        start: &current_start,
+                                        child_completion_tx: &child_completion_tx,
+                                    },
                                     &payload,
-                                    &current_start,
-                                    &child_completion_tx,
                                 )
                                 .await;
                                 park_terminal_agent(
@@ -1359,12 +1392,14 @@ pub(crate) fn spawn_agent_actor(
                             reply,
                         } => {
                             let applied = apply_agent_name_change(
-                                &session_store,
-                                current_session_id.as_ref(),
-                                &mut pending_alias,
-                                &mut current_start,
-                                &mut event_log,
-                                &mut subscribers,
+                                AgentNameChangeContext {
+                                    session_store: &session_store,
+                                    session_id: current_session_id.as_ref(),
+                                    pending_alias: &mut pending_alias,
+                                    current_start: &mut current_start,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                },
                                 name,
                                 persistence,
                             )
@@ -1609,12 +1644,14 @@ pub(crate) fn spawn_relay_agent_actor(
                             reply,
                         } => {
                             let applied = apply_agent_name_change(
-                                &session_store,
-                                Some(&session_id),
-                                &mut pending_alias,
-                                &mut current_start,
-                                &mut event_log,
-                                &mut subscribers,
+                                AgentNameChangeContext {
+                                    session_store: &session_store,
+                                    session_id: Some(&session_id),
+                                    pending_alias: &mut pending_alias,
+                                    current_start: &mut current_start,
+                                    event_log: &mut event_log,
+                                    subscribers: &mut subscribers,
+                                },
                                 name,
                                 persistence,
                             )
@@ -1728,20 +1765,11 @@ fn maybe_emit_child_completion_notice(
     });
 }
 
-async fn enter_terminal_failure(
-    accepting_input: &Arc<AtomicBool>,
-    status_handle: &registry::AgentStatusHandle,
-    canonical_stream: &str,
-    event_log: &mut Vec<Envelope>,
-    subscribers: &mut Vec<Stream>,
-    queue: &mut VecDeque<QueuedMessageEntry>,
-    payload: &AgentErrorPayload,
-    start: &AgentStartPayload,
-    child_completion_tx: &HostChildCompletionNoticeTx,
-) {
-    accepting_input.store(false, Ordering::SeqCst);
-    queue.clear();
-    status_handle
+async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &AgentErrorPayload) {
+    context.accepting_input.store(false, Ordering::SeqCst);
+    context.queue.clear();
+    context
+        .status_handle
         .update(|s| {
             s.terminated = true;
             s.is_thinking = false;
@@ -1750,19 +1778,25 @@ async fn enter_terminal_failure(
             s.activity_counter = s.activity_counter.saturating_add(1);
         })
         .await;
-    update_queued_messages_snapshot(canonical_stream, event_log, subscribers, queue).await;
+    update_queued_messages_snapshot(
+        context.canonical_stream,
+        context.event_log,
+        context.subscribers,
+        context.queue,
+    )
+    .await;
     append_event(
-        canonical_stream,
-        event_log,
-        subscribers,
+        context.canonical_stream,
+        context.event_log,
+        context.subscribers,
         FrameKind::AgentError,
         payload,
     )
     .await;
     if payload.fatal {
         maybe_emit_child_completion_notice(
-            child_completion_tx,
-            start,
+            context.child_completion_tx,
+            context.start,
             ChildCompletionOutcome::Failed,
             payload.message.clone(),
         );
@@ -1774,7 +1808,7 @@ async fn park_terminal_agent(
     session_id: Option<&SessionId>,
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
-    event_log: &mut Vec<Envelope>,
+    event_log: &mut [Envelope],
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::Receiver<AgentCommand>,
 ) {
@@ -1789,12 +1823,14 @@ async fn park_terminal_agent(
                 reply,
             } => {
                 let applied = apply_agent_name_change(
-                    session_store,
-                    session_id,
-                    pending_alias,
-                    current_start,
-                    event_log,
-                    subscribers,
+                    AgentNameChangeContext {
+                        session_store,
+                        session_id,
+                        pending_alias,
+                        current_start,
+                        event_log,
+                        subscribers,
+                    },
                     name,
                     persistence,
                 )
@@ -1819,12 +1855,7 @@ async fn park_terminal_agent(
 }
 
 async fn apply_agent_name_change(
-    session_store: &Arc<Mutex<SessionStore>>,
-    session_id: Option<&SessionId>,
-    pending_alias: &mut Option<InitialAgentAlias>,
-    current_start: &mut AgentStartPayload,
-    event_log: &mut [Envelope],
-    subscribers: &mut Vec<Stream>,
+    context: AgentNameChangeContext<'_>,
     name: String,
     persistence: AgentNamePersistence,
 ) -> bool {
@@ -1833,9 +1864,9 @@ async fn apply_agent_name_change(
         return false;
     }
 
-    let persisted = if let Some(session_id) = session_id {
+    let persisted = if let Some(session_id) = context.session_id {
         let persist_result = {
-            let store = session_store.lock().await;
+            let store = context.session_store.lock().await;
             match persistence {
                 AgentNamePersistence::User => store
                     .set_user_alias(session_id, trimmed.to_string())
@@ -1850,35 +1881,35 @@ async fn apply_agent_name_change(
             Err(err) => {
                 tracing::error!(
                     "failed to persist renamed agent {}: {}",
-                    current_start.agent_id,
+                    context.current_start.agent_id,
                     err
                 );
                 let payload = AgentErrorPayload {
-                    agent_id: current_start.agent_id.clone(),
+                    agent_id: context.current_start.agent_id.clone(),
                     code: AgentErrorCode::Internal,
                     message: format!("failed to persist agent name: {err}"),
                     fatal: false,
                 };
-                broadcast_live_event(subscribers, FrameKind::AgentError, &payload).await;
+                broadcast_live_event(context.subscribers, FrameKind::AgentError, &payload).await;
                 return false;
             }
         }
     } else {
         match persistence {
             AgentNamePersistence::User => {
-                *pending_alias = Some(InitialAgentAlias {
+                *context.pending_alias = Some(InitialAgentAlias {
                     name: trimmed.to_string(),
                     persistence: InitialAgentAliasPersistence::User,
                 });
                 true
             }
             AgentNamePersistence::GeneratedIfNoUserAlias => {
-                if pending_alias.as_ref().is_some_and(|alias| {
+                if context.pending_alias.as_ref().is_some_and(|alias| {
                     matches!(alias.persistence, InitialAgentAliasPersistence::User)
                 }) {
                     false
                 } else {
-                    *pending_alias = Some(InitialAgentAlias {
+                    *context.pending_alias = Some(InitialAgentAlias {
                         name: trimmed.to_string(),
                         persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
                     });
@@ -1891,18 +1922,18 @@ async fn apply_agent_name_change(
         return false;
     }
 
-    if current_start.name == trimmed {
+    if context.current_start.name == trimmed {
         return true;
     }
 
-    current_start.name = trimmed.to_string();
-    overwrite_agent_start_payload(event_log, current_start);
+    context.current_start.name = trimmed.to_string();
+    overwrite_agent_start_payload(context.event_log, context.current_start);
 
     let payload = AgentRenamedPayload {
-        agent_id: current_start.agent_id.clone(),
-        name: current_start.name.clone(),
+        agent_id: context.current_start.agent_id.clone(),
+        name: context.current_start.name.clone(),
     };
-    broadcast_live_event(subscribers, FrameKind::AgentRenamed, &payload).await;
+    broadcast_live_event(context.subscribers, FrameKind::AgentRenamed, &payload).await;
     true
 }
 

@@ -19,6 +19,16 @@ const KIRO_AGENT_NAME: &str = "kiro";
 const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
 const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 
+struct KiroSpawnMode<'a> {
+    ephemeral: bool,
+    admin_session: bool,
+    initial_model: Option<&'a str>,
+    ssh_host: Option<String>,
+    startup_mcp_servers: &'a [StartupMcpServer],
+    steering_content: Option<&'a str>,
+    program_override: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct KiroCommandHandle {
     inner: Arc<KiroInner>,
@@ -44,13 +54,15 @@ impl KiroSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            false,
-            false,
-            initial_model,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            None,
+            KiroSpawnMode {
+                ephemeral: false,
+                admin_session: false,
+                initial_model,
+                ssh_host,
+                startup_mcp_servers,
+                steering_content,
+                program_override: None,
+            },
         )
         .await
     }
@@ -64,13 +76,15 @@ impl KiroSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            true,
-            false,
-            initial_model,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            None,
+            KiroSpawnMode {
+                ephemeral: true,
+                admin_session: false,
+                initial_model,
+                ssh_host,
+                startup_mcp_servers,
+                steering_content,
+                program_override: None,
+            },
         )
         .await
     }
@@ -103,40 +117,39 @@ impl KiroSession {
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            true,
-            true,
-            initial_model,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            program_override,
+            KiroSpawnMode {
+                ephemeral: true,
+                admin_session: true,
+                initial_model,
+                ssh_host,
+                startup_mcp_servers,
+                steering_content,
+                program_override,
+            },
         )
         .await
     }
 
     async fn spawn_with_mode(
         workspace_roots: &[String],
-        ephemeral: bool,
-        admin_session: bool,
-        initial_model: Option<&str>,
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        program_override: Option<String>,
+        mode: KiroSpawnMode<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let roots = resolve_kiro_session_roots(
             workspace_roots,
-            ssh_host.as_deref(),
-            admin_session,
-            ephemeral,
+            mode.ssh_host.as_deref(),
+            mode.admin_session,
+            mode.ephemeral,
         )
         .await?;
         let acp_args: Vec<&str> = vec!["acp"];
 
         let mut spawn_spec = AcpSpawnSpec::new("Kiro ACP", "kiro-cli-chat", &acp_args)
             .with_local_cwd(roots.session_cwd.clone());
-        spawn_spec.local_program = program_override.unwrap_or_else(resolve_kiro_chat_binary);
-        if let Some(model) = initial_model
+        spawn_spec.local_program = mode
+            .program_override
+            .unwrap_or_else(resolve_kiro_chat_binary);
+        if let Some(model) = mode
+            .initial_model
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
@@ -145,11 +158,11 @@ impl KiroSession {
             spawn_spec.remote_args.push("--model".to_string());
             spawn_spec.remote_args.push(model.to_string());
         }
-        if ssh_host.is_some() {
+        if mode.ssh_host.is_some() {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
 
-        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, ssh_host.as_deref()).await?;
+        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref()).await?;
 
         bridge
             .request(
@@ -175,9 +188,9 @@ impl KiroSession {
         let session_result: Result<(String, Value), String> = async {
             let mut session_params = json!({
                 "cwd": roots.session_cwd,
-                "mcpServers": acp_mcp_servers_json(startup_mcp_servers)
+                "mcpServers": acp_mcp_servers_json(mode.startup_mcp_servers)
             });
-            if let Some(content) = steering_content
+            if let Some(content) = mode.steering_content
                 && !content.trim().is_empty()
             {
                 session_params["systemPrompt"] = Value::String(content.to_string());
@@ -211,13 +224,13 @@ impl KiroSession {
             bridge,
             event_tx,
             shutting_down: AtomicBool::new(false),
-            ssh_host,
+            ssh_host: mode.ssh_host,
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
-                admin_session,
-                steering_content: steering_content.map(|s| s.to_string()),
-                startup_mcp_servers: startup_mcp_servers.to_vec(),
+                admin_session: mode.admin_session,
+                steering_content: mode.steering_content.map(|s| s.to_string()),
+                startup_mcp_servers: mode.startup_mcp_servers.to_vec(),
                 model: initial_model,
                 mode: initial_mode,
                 known_models: extract_known_models(&session_started),
@@ -3048,21 +3061,20 @@ impl Backend for KiroBackend {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
                 _ => None,
             };
-            if model_override.is_some() {
-                if let Err(err) = handle
+            if model_override.is_some()
+                && let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings: session_settings_to_json(&resolved_settings),
                         persist: false,
                     })
                     .await
-                {
-                    tracing::error!("Failed to configure Kiro session: {err}");
-                    if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(Err(format!("Failed to configure Kiro session: {err}")));
-                    }
-                    session.shutdown().await;
-                    return;
+            {
+                tracing::error!("Failed to configure Kiro session: {err}");
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!("Failed to configure Kiro session: {err}")));
                 }
+                session.shutdown().await;
+                return;
             }
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(()));
@@ -3216,18 +3228,17 @@ impl Backend for KiroBackend {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
                 _ => None,
             };
-            if model_override.is_some() {
-                if let Err(err) = handle
+            if model_override.is_some()
+                && let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings: session_settings_to_json(&resolved_settings),
                         persist: false,
                     })
                     .await
-                {
-                    tracing::error!("Failed to configure resumed Kiro session: {err}");
-                    session.shutdown().await;
-                    return;
-                }
+            {
+                tracing::error!("Failed to configure resumed Kiro session: {err}");
+                session.shutdown().await;
+                return;
             }
 
             loop {

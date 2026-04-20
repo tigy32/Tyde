@@ -106,6 +106,18 @@ pub async fn send_host_line(request: SendHostLineRequest) -> Result<(), String> 
     Ok(())
 }
 
+pub async fn submit_feedback(feedback: String) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        feedback: String,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { feedback }).map_err(|e| e.to_string())?;
+    tauri_invoke("submit_feedback", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
 pub async fn mark_ui_debug_ready() -> Result<(), String> {
     tauri_invoke("mark_ui_debug_ready", JsValue::NULL)
         .await

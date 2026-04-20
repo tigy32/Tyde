@@ -1,16 +1,17 @@
 {
   "productName": "Tyde",
-  "mainBinaryName": "tauri-shell",
+  "mainBinaryName": "tyde",
   "version": "0.1.0",
-  "identifier": "com.tyde.desktop",
+  "identifier": "com.tyde.app",
   "build": {
-    "beforeDevCommand": "trunk serve --port 1420 --config ../Trunk.toml",
-    "beforeBuildCommand": "trunk build --release --config ../Trunk.toml",
+    "beforeDevCommand": "ROOT=$(git rev-parse --show-toplevel) && trunk serve --port 1420 --config \"$ROOT/frontend/Trunk.toml\"",
+    "beforeBuildCommand": "ROOT=$(git rev-parse --show-toplevel) && trunk build --release --config \"$ROOT/frontend/Trunk.toml\"",
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:1420"
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": "all"
   },
   "app": {
     "withGlobalTauri": true,

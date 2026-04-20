@@ -7,6 +7,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
 use crate::components::command_palette::CommandPalette;
+use crate::components::feedback_modal::FeedbackModal;
 use crate::components::header::Header;
 use crate::components::host_browser::HostBrowser;
 use crate::components::project_rail::ProjectRail;
@@ -445,6 +446,11 @@ pub fn App() -> impl IntoView {
         install_click_listener(state_for_clicks.clone());
     });
 
+    let state_for_feedback = state.clone();
+    let open_feedback = move |_| {
+        state_for_feedback.feedback_open.set(true);
+    };
+
     view! {
         <div class="app-shell">
             <Header />
@@ -452,7 +458,15 @@ pub fn App() -> impl IntoView {
                 <ProjectRail />
                 <Workbench />
             </div>
+            <button
+                class="feedback-fab"
+                title="Send feedback"
+                on:click=open_feedback
+            >
+                "Send feedback"
+            </button>
             <CommandPalette />
+            <FeedbackModal />
             <HostBrowser />
         </div>
     }

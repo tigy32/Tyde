@@ -678,16 +678,13 @@ impl ClaudeInner {
                         .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
                         .await;
                     let known_context_window = summary.result_context_window;
-                    if !self
-                        .emit_terminal_phase_or_placeholder(
-                            &mut summary,
-                            conversation_history_bytes,
-                            known_context_window,
-                            None,
-                        )
-                        .await
-                        && summary.emitted_phase_count == 0
-                    {}
+                    self.emit_terminal_phase_or_placeholder(
+                        &mut summary,
+                        conversation_history_bytes,
+                        known_context_window,
+                        None,
+                    )
+                    .await;
                     self.emit_operation_cancelled("Claude turn cancelled.");
                 }
                 TurnOutcome::Failed { summary, error } => {

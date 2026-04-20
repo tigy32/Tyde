@@ -27,10 +27,10 @@ const BACKEND_EVENT_BUFFER: usize = 256;
 /// Binary name for the tycode subprocess.
 /// Can be overridden via the `TYDE_REMOTE_SUBPROCESS_PATH` env var.
 fn subprocess_bin() -> String {
-    if let Ok(path) = tycode_versioned_binary_path() {
-        if path.exists() {
-            return path.to_string_lossy().to_string();
-        }
+    if let Ok(path) = tycode_versioned_binary_path()
+        && path.exists()
+    {
+        return path.to_string_lossy().to_string();
     }
     std::env::var("TYDE_REMOTE_SUBPROCESS_PATH").unwrap_or_else(|_| "tycode-subprocess".into())
 }

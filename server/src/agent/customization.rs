@@ -38,17 +38,22 @@ impl Default for ResolvedSpawnConfig {
     }
 }
 
+pub(crate) struct ResolveSpawnConfigRequest<'a> {
+    pub backend_kind: BackendKind,
+    pub project_id: Option<&'a ProjectId>,
+    pub custom_agent_id: Option<&'a CustomAgentId>,
+    pub built_in_mcp_servers: &'a [StartupMcpServer],
+    pub custom_agent_store: &'a CustomAgentStore,
+    pub mcp_server_store: &'a McpServerStore,
+    pub steering_store: &'a SteeringStore,
+    pub skill_store: &'a SkillStore,
+}
+
 pub(crate) fn resolve_spawn_config(
-    backend_kind: BackendKind,
-    project_id: Option<&ProjectId>,
-    custom_agent_id: Option<&CustomAgentId>,
-    built_in_mcp_servers: &[StartupMcpServer],
-    custom_agent_store: &CustomAgentStore,
-    mcp_server_store: &McpServerStore,
-    steering_store: &SteeringStore,
-    skill_store: &SkillStore,
+    request: ResolveSpawnConfigRequest<'_>,
 ) -> Result<ResolvedSpawnConfig, String> {
-    let mut mcp_servers = built_in_mcp_servers
+    let mut mcp_servers = request
+        .built_in_mcp_servers
         .iter()
         .map(startup_mcp_server_to_protocol)
         .collect::<Vec<_>>();
@@ -61,19 +66,20 @@ pub(crate) fn resolve_spawn_config(
     let mut skills = Vec::new();
     let mut tool_policy = ToolPolicy::Unrestricted;
 
-    if let Some(custom_agent_id) = custom_agent_id {
-        let custom_agent = custom_agent_store
+    if let Some(custom_agent_id) = request.custom_agent_id {
+        let custom_agent = request
+            .custom_agent_store
             .get(custom_agent_id)
             .ok_or_else(|| format!("cannot resolve missing custom agent {}", custom_agent_id))?;
         instructions = custom_agent.instructions.clone();
         tool_policy = custom_agent.tool_policy.clone();
 
         for skill_id in &custom_agent.skill_ids {
-            skills.push(resolve_skill(skill_store, skill_id)?);
+            skills.push(resolve_skill(request.skill_store, skill_id)?);
         }
 
         for mcp_server_id in &custom_agent.mcp_server_ids {
-            let mcp_server = mcp_server_store.get(mcp_server_id).ok_or_else(|| {
+            let mcp_server = request.mcp_server_store.get(mcp_server_id).ok_or_else(|| {
                 format!(
                     "custom agent {} references missing MCP server {}",
                     custom_agent.id, mcp_server_id
@@ -100,16 +106,16 @@ pub(crate) fn resolve_spawn_config(
     match &tool_policy {
         ToolPolicy::Unrestricted => {}
         ToolPolicy::AllowList { .. } | ToolPolicy::DenyList { .. } => {
-            if backend_kind != BackendKind::Claude {
+            if request.backend_kind != BackendKind::Claude {
                 return Err(format!(
                     "backend {:?} does not support tool policy {:?}",
-                    backend_kind, tool_policy
+                    request.backend_kind, tool_policy
                 ));
             }
         }
     }
 
-    let steering_body = resolve_steering_body(steering_store, project_id)?;
+    let steering_body = resolve_steering_body(request.steering_store, request.project_id)?;
 
     Ok(ResolvedSpawnConfig {
         instructions,

@@ -42,7 +42,7 @@ pub struct AgentInfo {
 // ── Tab system ──────────────────────────────────────────────────────────
 
 thread_local! {
-    static NEXT_TAB_ID: Cell<u64> = Cell::new(0);
+    static NEXT_TAB_ID: Cell<u64> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -153,13 +153,13 @@ impl CenterZoneState {
     }
 
     pub fn replace_active(&mut self, content: TabContent, label: String, closeable: bool) -> TabId {
-        if let Some(active_id) = self.active_tab_id {
-            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id) {
-                tab.content = content;
-                tab.label = label;
-                tab.closeable = closeable;
-                return active_id;
-            }
+        if let Some(active_id) = self.active_tab_id
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active_id)
+        {
+            tab.content = content;
+            tab.label = label;
+            tab.closeable = closeable;
+            return active_id;
         }
         self.open(content, label, closeable)
     }
@@ -368,6 +368,7 @@ pub struct AppState {
     pub project_view_memory: RwSignal<HashMap<ActiveProjectRef, ProjectViewMemory>>,
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
+    pub feedback_open: RwSignal<bool>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
@@ -423,6 +424,7 @@ impl AppState {
             project_view_memory: RwSignal::new(HashMap::new()),
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
+            feedback_open: RwSignal::new(false),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),

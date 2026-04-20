@@ -2,7 +2,7 @@ mod fixture;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use fixture::Fixture;
@@ -12,6 +12,7 @@ use protocol::{
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
 use server::store::settings::HostSettingsStore;
+use tokio::sync::Mutex;
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -232,7 +233,7 @@ fn generated_alias_never_overrides_user_alias() {
 
 #[tokio::test]
 async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe() {
-    let _env_guard = env_lock().lock().expect("lock env guard");
+    let _env_guard = env_lock().lock().await;
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     write_fake_tycode_binary(temp_home.path());
     let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());

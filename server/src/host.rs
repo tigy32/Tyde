@@ -24,7 +24,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent::customization::{
-    ResolvedSpawnConfig, protocol_mcp_servers_to_startup, resolve_spawn_config,
+    ResolveSpawnConfigRequest, ResolvedSpawnConfig, protocol_mcp_servers_to_startup,
+    resolve_spawn_config,
 };
 use crate::agent::registry::{
     AgentRegistry, InitialAgentAlias, InitialAgentAliasPersistence, RelaySpawnRequest,
@@ -141,6 +142,17 @@ impl HostSubAgentEmitter {
             workspace_roots,
         }
     }
+}
+
+struct HostStorePaths {
+    session: PathBuf,
+    project: PathBuf,
+    settings: PathBuf,
+    custom_agent: PathBuf,
+    mcp_server: PathBuf,
+    steering: PathBuf,
+    skills_index: PathBuf,
+    skills_root_dir: PathBuf,
 }
 
 impl SubAgentEmitter for HostSubAgentEmitter {
@@ -544,16 +556,16 @@ impl HostHandle {
                     let mcp_servers = mcp_server_store.lock().await;
                     let steering = steering_store.lock().await;
                     let skills = skill_store.lock().await;
-                    match resolve_spawn_config(
+                    match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind,
-                        payload.project_id.as_ref(),
-                        requested_custom_agent_id.as_ref(),
-                        &startup_mcp_servers,
-                        &custom_agents,
-                        &mcp_servers,
-                        &steering,
-                        &skills,
-                    ) {
+                        project_id: payload.project_id.as_ref(),
+                        custom_agent_id: requested_custom_agent_id.as_ref(),
+                        built_in_mcp_servers: &startup_mcp_servers,
+                        custom_agent_store: &custom_agents,
+                        mcp_server_store: &mcp_servers,
+                        steering_store: &steering,
+                        skill_store: &skills,
+                    }) {
                         Ok(resolved) => (requested_custom_agent_id, resolved, None, None),
                         Err(err) => (
                             requested_custom_agent_id,
@@ -702,16 +714,16 @@ impl HostHandle {
                         let skills = skill_store.lock().await;
                         (
                             None,
-                            resolve_spawn_config(
-                                record.backend_kind,
-                                project_id.as_ref(),
-                                None,
-                                &startup_mcp_servers,
-                                &custom_agents,
-                                &mcp_servers,
-                                &steering,
-                                &skills,
-                            )
+                            resolve_spawn_config(ResolveSpawnConfigRequest {
+                                backend_kind: record.backend_kind,
+                                project_id: project_id.as_ref(),
+                                custom_agent_id: None,
+                                built_in_mcp_servers: &startup_mcp_servers,
+                                custom_agent_store: &custom_agents,
+                                mcp_server_store: &mcp_servers,
+                                steering_store: &steering,
+                                skill_store: &skills,
+                            })
                             .unwrap_or_else(|err| {
                                 panic!(
                                     "failed to resolve resume customization after deleted custom agent {}: {err}",
@@ -729,16 +741,16 @@ impl HostHandle {
                         let mcp_servers = mcp_server_store.lock().await;
                         let steering = steering_store.lock().await;
                         let skills = skill_store.lock().await;
-                        match resolve_spawn_config(
-                            record.backend_kind,
-                            project_id.as_ref(),
-                            Some(stored_custom_agent_id),
-                            &startup_mcp_servers,
-                            &custom_agents,
-                            &mcp_servers,
-                            &steering,
-                            &skills,
-                        ) {
+                        match resolve_spawn_config(ResolveSpawnConfigRequest {
+                            backend_kind: record.backend_kind,
+                            project_id: project_id.as_ref(),
+                            custom_agent_id: Some(stored_custom_agent_id),
+                            built_in_mcp_servers: &startup_mcp_servers,
+                            custom_agent_store: &custom_agents,
+                            mcp_server_store: &mcp_servers,
+                            steering_store: &steering,
+                            skill_store: &skills,
+                        }) {
                             Ok(resolved) => {
                                 (Some(stored_custom_agent_id.clone()), resolved, None, None)
                             }
@@ -755,16 +767,16 @@ impl HostHandle {
                     let mcp_servers = mcp_server_store.lock().await;
                     let steering = steering_store.lock().await;
                     let skills = skill_store.lock().await;
-                    match resolve_spawn_config(
-                        record.backend_kind,
-                        project_id.as_ref(),
-                        None,
-                        &startup_mcp_servers,
-                        &custom_agents,
-                        &mcp_servers,
-                        &steering,
-                        &skills,
-                    ) {
+                    match resolve_spawn_config(ResolveSpawnConfigRequest {
+                        backend_kind: record.backend_kind,
+                        project_id: project_id.as_ref(),
+                        custom_agent_id: None,
+                        built_in_mcp_servers: &startup_mcp_servers,
+                        custom_agent_store: &custom_agents,
+                        mcp_server_store: &mcp_servers,
+                        steering_store: &steering,
+                        skill_store: &skills,
+                    }) {
                         Ok(resolved) => (None, resolved, None, None),
                         Err(err) => (None, ResolvedSpawnConfig::default(), None, Some(err)),
                     }
@@ -2063,14 +2075,16 @@ pub fn spawn_host() -> HostHandle {
     let skills_root_dir = SkillStore::default_root_dir()
         .unwrap_or_else(|err| panic!("failed to resolve default skills root dir: {err}"));
     spawn_host_inner(
-        session_path,
-        project_path,
-        settings_path,
-        custom_agent_path,
-        mcp_server_path,
-        steering_path,
-        skills_index_path,
-        skills_root_dir,
+        HostStorePaths {
+            session: session_path,
+            project: project_path,
+            settings: settings_path,
+            custom_agent: custom_agent_path,
+            mcp_server: mcp_server_path,
+            steering: steering_path,
+            skills_index: skills_index_path,
+            skills_root_dir,
+        },
         false,
         HostRuntimeConfig::default(),
     )
@@ -2120,14 +2134,16 @@ pub fn spawn_host_with_store_paths_and_runtime_config(
             )
         })?;
     spawn_host_inner(
-        session_path,
-        project_path,
-        settings_path,
-        parent.join("custom_agents.json"),
-        parent.join("mcp_servers.json"),
-        parent.join("steering.json"),
-        parent.join("skills.json"),
-        parent.join("skills"),
+        HostStorePaths {
+            session: session_path,
+            project: project_path,
+            settings: settings_path,
+            custom_agent: parent.join("custom_agents.json"),
+            mcp_server: parent.join("mcp_servers.json"),
+            steering: parent.join("steering.json"),
+            skills_index: parent.join("skills.json"),
+            skills_root_dir: parent.join("skills"),
+        },
         false,
         runtime_config,
     )
@@ -2163,38 +2179,33 @@ pub fn spawn_host_with_mock_backend_and_runtime_config(
             )
         })?;
     spawn_host_inner(
-        session_path,
-        project_path,
-        settings_path,
-        parent.join("custom_agents.json"),
-        parent.join("mcp_servers.json"),
-        parent.join("steering.json"),
-        parent.join("skills.json"),
-        parent.join("skills"),
+        HostStorePaths {
+            session: session_path,
+            project: project_path,
+            settings: settings_path,
+            custom_agent: parent.join("custom_agents.json"),
+            mcp_server: parent.join("mcp_servers.json"),
+            steering: parent.join("steering.json"),
+            skills_index: parent.join("skills.json"),
+            skills_root_dir: parent.join("skills"),
+        },
         true,
         runtime_config,
     )
 }
 
 fn spawn_host_inner(
-    session_path: PathBuf,
-    project_path: PathBuf,
-    settings_path: PathBuf,
-    custom_agent_path: PathBuf,
-    mcp_server_path: PathBuf,
-    steering_path: PathBuf,
-    skills_index_path: PathBuf,
-    skills_root_dir: PathBuf,
+    paths: HostStorePaths,
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
-    let session_store = SessionStore::load(session_path)?;
-    let project_store = ProjectStore::load(project_path)?;
-    let settings_store = HostSettingsStore::load(settings_path)?;
-    let custom_agent_store = CustomAgentStore::load(custom_agent_path)?;
-    let mcp_server_store = McpServerStore::load(mcp_server_path)?;
-    let steering_store = SteeringStore::load(steering_path)?;
-    let skill_store = SkillStore::load(skills_index_path, skills_root_dir)?;
+    let session_store = SessionStore::load(paths.session)?;
+    let project_store = ProjectStore::load(paths.project)?;
+    let settings_store = HostSettingsStore::load(paths.settings)?;
+    let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
+    let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
+    let steering_store = SteeringStore::load(paths.steering)?;
+    let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
     let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
         mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
     let (child_completion_tx, child_completion_rx) =
@@ -2356,25 +2367,23 @@ async fn process_child_completion_notice(host: &HostHandle, mut notice: ChildCom
         return;
     }
 
-    if let Some(parent_start_handle) = parent_start {
-        if let Some(parent_snapshot) = parent_start_handle.snapshot().await {
-            if parent_snapshot.origin == AgentOrigin::BackendNative {
-                tracing::warn!(
-                    parent_agent_id = %notice.parent_id,
-                    child_agent_id = %notice.child_id,
-                    "dropping child completion notice because backend-native relay parents do not accept auto follow-ups"
-                );
-                return;
-            }
-        }
+    if let Some(parent_start_handle) = parent_start
+        && let Some(parent_snapshot) = parent_start_handle.snapshot().await
+        && parent_snapshot.origin == AgentOrigin::BackendNative
+    {
+        tracing::warn!(
+            parent_agent_id = %notice.parent_id,
+            child_agent_id = %notice.child_id,
+            "dropping child completion notice because backend-native relay parents do not accept auto follow-ups"
+        );
+        return;
     }
 
-    if notice.child_name.trim().is_empty() {
-        if let Some(child_handle) = child_start {
-            if let Some(child_snapshot) = child_handle.snapshot().await {
-                notice.child_name = child_snapshot.name;
-            }
-        }
+    if notice.child_name.trim().is_empty()
+        && let Some(child_handle) = child_start
+        && let Some(child_snapshot) = child_handle.snapshot().await
+    {
+        notice.child_name = child_snapshot.name;
     }
 
     if notice.child_name.trim().is_empty() {

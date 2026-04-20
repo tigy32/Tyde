@@ -7,6 +7,7 @@ pub mod chat_view;
 pub mod command_palette;
 pub mod diff_view;
 pub mod dock_zone;
+pub mod feedback_modal;
 pub mod file_explorer;
 pub mod file_view;
 pub mod git_panel;

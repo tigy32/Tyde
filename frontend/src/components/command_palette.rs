@@ -56,6 +56,11 @@ const COMMANDS: &[CommandEntry] = &[
         shortcut: None,
         id: "refresh_project",
     },
+    CommandEntry {
+        name: "Send Feedback",
+        shortcut: None,
+        id: "send_feedback",
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,6 +130,10 @@ fn execute_command(state: &AppState, id: &str) {
         "open_settings" => {
             state.command_palette_open.set(false);
             state.settings_open.set(true);
+        }
+        "send_feedback" => {
+            state.command_palette_open.set(false);
+            state.feedback_open.set(true);
         }
         "refresh_project" => {
             let active_project = state.active_project_ref_untracked();

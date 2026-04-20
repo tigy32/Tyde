@@ -334,6 +334,12 @@ pub fn SettingsPanel() -> impl IntoView {
                                     }).collect_view()}
                                 </div>
                             </div>
+                            <div class="settings-nav-footer">
+                                <button class="settings-feedback-link" on:click=move |_| {
+                                    state.settings_open.set(false);
+                                    state.feedback_open.set(true);
+                                }>"Send Feedback"</button>
+                            </div>
                         </nav>
 
                         <div class="settings-content">

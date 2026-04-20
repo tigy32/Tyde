@@ -1,6 +1,7 @@
 mod bridge;
 mod dev_host;
 mod devtools;
+mod host_stdio;
 mod host_store;
 mod router;
 
@@ -103,6 +104,19 @@ async fn submit_ui_debug_response(
         .await
 }
 
+#[tauri::command]
+async fn submit_feedback(feedback: String) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let params = [("entry.515008519", feedback.as_str())];
+    client
+        .post("https://docs.google.com/forms/d/e/1FAIpQLSfcaoYqtm0FRdibE5qJhVYONUbKAMn6KTIopx40Fk8l9yn2vA/formResponse")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send feedback: {e}"))?;
+    Ok(())
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -163,8 +177,13 @@ pub fn run() {
             remove_configured_host,
             set_selected_host,
             mark_ui_debug_ready,
-            submit_ui_debug_response
+            submit_ui_debug_response,
+            submit_feedback
         ])
         .run(tauri::generate_context!())
         .expect("failed to run desktop shell");
+}
+
+pub fn run_host_stdio() -> Result<(), String> {
+    host_stdio::run()
 }

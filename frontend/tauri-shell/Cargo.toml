@@ -2,10 +2,15 @@
 name = "tauri-shell"
 version = "0.1.0"
 edition.workspace = true
+default-run = "tyde"
 
 [lib]
 name = "tauri_shell"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "tyde"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
@@ -13,6 +18,7 @@ tauri-build = { version = "2.5.6", features = [] }
 [dependencies]
 devtools-protocol = { path = "../../devtools-protocol" }
 host-config = { path = "../../host-config" }
+reqwest = { version = "0.12", features = ["json"] }
 serde_json.workspace = true
 serde.workspace = true
 tokio.workspace = true

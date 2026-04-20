@@ -199,7 +199,7 @@ fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl Int
             .connection_statuses
             .get()
             .get(&host_id_for_connected)
-            .map_or(false, |s| matches!(s, ConnectionStatus::Connected))
+            .is_some_and(|s| matches!(s, ConnectionStatus::Connected))
     });
 
     // Clone before closures move session_id, session_host_id, and state.
@@ -289,17 +289,16 @@ fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl Int
                             let host_id = host_id.clone();
                             let sid = sid.clone();
                             spawn_local(async move {
-                                if let Some(host_stream) = state.host_stream_untracked(&host_id) {
-                                    if let Err(e) = send_frame(
+                                if let Some(host_stream) = state.host_stream_untracked(&host_id)
+                                    && let Err(e) = send_frame(
                                         &host_id,
                                         host_stream,
                                         FrameKind::DeleteSession,
                                         &DeleteSessionPayload { session_id: sid },
                                     )
                                     .await
-                                    {
-                                        log::error!("failed to send DeleteSession: {e}");
-                                    }
+                                {
+                                    log::error!("failed to send DeleteSession: {e}");
                                 }
                             });
                         };

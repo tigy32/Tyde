@@ -306,11 +306,11 @@ fn agent_card(
     let agent_id_for_effect = agent_id.clone();
     // Auto-focus and select-all when editing mode activates.
     Effect::new(move |_| {
-        if editing_agent.with(|e| e.as_ref() == Some(&agent_id_for_effect)) {
-            if let Some(el) = input_ref.get() {
-                let _ = el.focus();
-                el.select();
-            }
+        if editing_agent.with(|e| e.as_ref() == Some(&agent_id_for_effect))
+            && let Some(el) = input_ref.get()
+        {
+            let _ = el.focus();
+            el.select();
         }
     });
 
@@ -510,19 +510,25 @@ fn agent_card(
                             </button>
                         }
                     })}
-                    <button type="button" class="filter-toggle" on:click=on_rename>
-                        "Rename"
+                    <button
+                        type="button"
+                        class="filter-toggle agent-card-action"
+                        title="Rename agent"
+                        aria-label="Rename agent"
+                        on:click=on_rename
+                    >
+                        "\u{270E}"
                     </button>
                     <button
                         type="button"
-                        class="filter-toggle agent-card-close"
+                        class="filter-toggle agent-card-close agent-card-action"
                         title="Close agent"
+                        aria-label="Close agent"
                         on:click=on_close
                         on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
                     >
                         "\u{00D7}"
                     </button>
-                    <span class={backend_class(backend)}>{backend_label(backend)}</span>
                 </div>
             </div>
             <div class="agent-card-bottom">
@@ -534,6 +540,7 @@ fn agent_card(
                         <span class="agent-card-custom-agent" title=title>{n}</span>
                     }
                 })}
+                <span class={format!("{} agent-card-backend", backend_class(backend))}>{backend_label(backend)}</span>
             </div>
             {error_msg.map(|msg| view! {
                 <div class="agent-card-error">{msg}</div>
