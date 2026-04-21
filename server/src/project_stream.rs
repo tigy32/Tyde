@@ -27,6 +27,12 @@ const PROJECT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// A (relative_path, kind) pair used for diffing file listings between polls.
 pub(crate) type RawFileEntry = (String, ProjectFileKind);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitAccessMode {
+    ReadOnly,
+    Mutating,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ProjectSnapshotState {
     /// Previous file entries per root, used to compute diffs.
@@ -258,10 +264,24 @@ pub(crate) fn build_dir_listing(
 }
 
 pub(crate) fn build_git_status(project: &Project) -> Result<ProjectGitStatusPayload, String> {
+    build_git_status_with_runner(project, run_git_mode)
+}
+
+fn build_git_status_with_runner<F>(
+    project: &Project,
+    mut run_git: F,
+) -> Result<ProjectGitStatusPayload, String>
+where
+    F: FnMut(&str, &[&str], GitAccessMode) -> Result<String, String>,
+{
     let mut roots = Vec::with_capacity(project.roots.len());
 
     for root in &project.roots {
-        let output = run_git(root, &["status", "--porcelain=v2", "--branch"])?;
+        let output = run_git(
+            root,
+            &["status", "--porcelain=v2", "--branch"],
+            GitAccessMode::ReadOnly,
+        )?;
         let mut branch = None;
         let mut ahead = 0;
         let mut behind = 0;
@@ -367,6 +387,17 @@ pub(crate) fn read_diff(
     project: &Project,
     payload: ProjectReadDiffPayload,
 ) -> Result<ProjectGitDiffPayload, String> {
+    read_diff_with_runner(project, payload, run_git_mode)
+}
+
+fn read_diff_with_runner<F>(
+    project: &Project,
+    payload: ProjectReadDiffPayload,
+    mut run_git: F,
+) -> Result<ProjectGitDiffPayload, String>
+where
+    F: FnMut(&str, &[&str], GitAccessMode) -> Result<String, String>,
+{
     validate_root(project, &payload.root)?;
     if let Some(path) = &payload.path {
         validate_relative_path(path)?;
@@ -381,7 +412,7 @@ pub(crate) fn read_diff(
         args.push(path);
     }
 
-    let raw = run_git(&payload.root.0, &args)?;
+    let raw = run_git(&payload.root.0, &args, GitAccessMode::ReadOnly)?;
     Ok(ProjectGitDiffPayload {
         root: payload.root,
         scope: payload.scope,
@@ -392,7 +423,11 @@ pub(crate) fn read_diff(
 
 pub(crate) fn stage_file(project: &Project, path: &ProjectPath) -> Result<(), String> {
     validate_project_path(project, path)?;
-    run_git(&path.root.0, &["add", "--", &path.relative_path])?;
+    run_git_mode(
+        &path.root.0,
+        &["add", "--", &path.relative_path],
+        GitAccessMode::Mutating,
+    )?;
     Ok(())
 }
 
@@ -407,7 +442,11 @@ pub(crate) fn stage_hunk(
         "project_stage_hunk hunk_id must not be empty"
     );
 
-    let raw = run_git(&path.root.0, &["diff", "--", &path.relative_path])?;
+    let raw = run_git_mode(
+        &path.root.0,
+        &["diff", "--", &path.relative_path],
+        GitAccessMode::ReadOnly,
+    )?;
     let parsed = parse_raw_git_diff(&raw);
     let Some(file) = parsed
         .iter()
@@ -443,10 +482,11 @@ pub(crate) fn stage_hunk(
         patch.push('\n');
     }
 
-    run_git_with_stdin(
+    run_git_with_stdin_mode(
         &path.root.0,
         &["apply", "--cached", "--recount", "--whitespace=nowarn", "-"],
         &patch,
+        GitAccessMode::Mutating,
     )?;
     Ok(())
 }
@@ -665,11 +705,17 @@ fn absolute_project_path(path: &ProjectPath) -> Result<PathBuf, String> {
     Ok(Path::new(&path.root.0).join(&path.relative_path))
 }
 
-fn run_git(root: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
+fn run_git_mode(root: &str, args: &[&str], access_mode: GitAccessMode) -> Result<String, String> {
+    run_git_mode_with_binary("git", root, args, access_mode)
+}
+
+fn run_git_mode_with_binary(
+    git_binary: impl AsRef<std::ffi::OsStr>,
+    root: &str,
+    args: &[&str],
+    access_mode: GitAccessMode,
+) -> Result<String, String> {
+    let output = git_command(git_binary, root, args, access_mode)
         .output()
         .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
     if !output.status.success() {
@@ -684,11 +730,23 @@ fn run_git(root: &str, args: &[&str]) -> Result<String, String> {
         .map_err(|err| format!("git output was not valid UTF-8 in '{}': {err}", root))
 }
 
-fn run_git_with_stdin(root: &str, args: &[&str], stdin: &str) -> Result<String, String> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
+fn run_git_with_stdin_mode(
+    root: &str,
+    args: &[&str],
+    stdin: &str,
+    access_mode: GitAccessMode,
+) -> Result<String, String> {
+    run_git_with_stdin_mode_with_binary("git", root, args, stdin, access_mode)
+}
+
+fn run_git_with_stdin_mode_with_binary(
+    git_binary: impl AsRef<std::ffi::OsStr>,
+    root: &str,
+    args: &[&str],
+    stdin: &str,
+    access_mode: GitAccessMode,
+) -> Result<String, String> {
+    let mut child = git_command(git_binary, root, args, access_mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -718,6 +776,20 @@ fn run_git_with_stdin(root: &str, args: &[&str], stdin: &str) -> Result<String, 
     }
     String::from_utf8(output.stdout)
         .map_err(|err| format!("git output was not valid UTF-8 in '{}': {err}", root))
+}
+
+fn git_command(
+    git_binary: impl AsRef<std::ffi::OsStr>,
+    root: &str,
+    args: &[&str],
+    access_mode: GitAccessMode,
+) -> Command {
+    let mut command = Command::new(git_binary);
+    if matches!(access_mode, GitAccessMode::ReadOnly) {
+        command.arg("--no-optional-locks");
+    }
+    command.arg("-C").arg(root).args(args);
+    command
 }
 
 fn parse_change_kind(status: char) -> Option<ProjectGitChangeKind> {
@@ -860,5 +932,207 @@ fn classify_diff_line(line: &str) -> ProjectGitDiffLineKind {
         Some('+') => ProjectGitDiffLineKind::Added,
         Some('-') => ProjectGitDiffLineKind::Removed,
         _ => ProjectGitDiffLineKind::Context,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use protocol::{ProjectDiffScope, ProjectId};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_project(root: &str) -> Project {
+        Project {
+            id: ProjectId("project-1".to_owned()),
+            name: "Project".to_owned(),
+            roots: vec![root.to_owned()],
+            sort_order: 0,
+        }
+    }
+
+    #[test]
+    fn build_git_status_uses_read_only_git_access() {
+        let project = test_project("/repo");
+        let mut calls = Vec::new();
+
+        let status = build_git_status_with_runner(&project, |root, args, access_mode| {
+            calls.push((
+                root.to_owned(),
+                args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+                access_mode,
+            ));
+            Ok("# branch.oid abc123\n# branch.head main\n".to_owned())
+        })
+        .expect("build_git_status should succeed");
+
+        assert_eq!(
+            calls,
+            vec![(
+                "/repo".to_owned(),
+                vec![
+                    "status".to_owned(),
+                    "--porcelain=v2".to_owned(),
+                    "--branch".to_owned(),
+                ],
+                GitAccessMode::ReadOnly,
+            )]
+        );
+        assert_eq!(status.roots.len(), 1);
+        assert_eq!(status.roots[0].branch.as_deref(), Some("main"));
+        assert!(status.roots[0].clean);
+    }
+
+    #[test]
+    fn read_diff_uses_read_only_git_access() {
+        let project = test_project("/repo");
+        let mut calls = Vec::new();
+
+        let diff = read_diff_with_runner(
+            &project,
+            ProjectReadDiffPayload {
+                root: ProjectRootPath("/repo".to_owned()),
+                scope: ProjectDiffScope::Unstaged,
+                path: Some("src/lib.rs".to_owned()),
+            },
+            |root, args, access_mode| {
+                calls.push((
+                    root.to_owned(),
+                    args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+                    access_mode,
+                ));
+                Ok(String::new())
+            },
+        )
+        .expect("read_diff should succeed");
+
+        assert_eq!(
+            calls,
+            vec![(
+                "/repo".to_owned(),
+                vec!["diff".to_owned(), "--".to_owned(), "src/lib.rs".to_owned(),],
+                GitAccessMode::ReadOnly,
+            )]
+        );
+        assert_eq!(diff.root.0, "/repo");
+        assert_eq!(diff.path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[cfg(unix)]
+    struct FakeGitBinary {
+        dir: PathBuf,
+        binary: PathBuf,
+        log_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeGitBinary {
+        fn new(stdout: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("tyde-project-stream-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).expect("create fake git dir");
+
+            let binary = dir.join("git");
+            let stdout_path = dir.join("stdout.txt");
+            let log_path = dir.join("args.log");
+
+            fs::write(&stdout_path, stdout).expect("write fake git stdout");
+            fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\n",
+                    log_path.display(),
+                    stdout_path.display()
+                ),
+            )
+            .expect("write fake git script");
+
+            let mut permissions = fs::metadata(&binary)
+                .expect("stat fake git script")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary, permissions).expect("chmod fake git script");
+
+            Self {
+                dir,
+                binary,
+                log_path,
+            }
+        }
+
+        fn binary_path(&self) -> &Path {
+            &self.binary
+        }
+
+        fn logged_args(&self) -> Vec<String> {
+            fs::read_to_string(&self.log_path)
+                .expect("read fake git log")
+                .lines()
+                .map(|line| line.to_owned())
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeGitBinary {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_git_commands_disable_optional_locks() {
+        let fake_git = FakeGitBinary::new("# branch.oid abc123\n# branch.head main\n");
+
+        let output = run_git_mode_with_binary(
+            fake_git.binary_path(),
+            "/repo",
+            &["status", "--porcelain=v2", "--branch"],
+            GitAccessMode::ReadOnly,
+        )
+        .expect("read-only git command should succeed");
+
+        assert!(output.contains("# branch.head main"));
+        assert_eq!(
+            fake_git.logged_args(),
+            vec![
+                "--no-optional-locks".to_owned(),
+                "-C".to_owned(),
+                "/repo".to_owned(),
+                "status".to_owned(),
+                "--porcelain=v2".to_owned(),
+                "--branch".to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutating_git_commands_do_not_disable_locks() {
+        let fake_git = FakeGitBinary::new("");
+
+        run_git_mode_with_binary(
+            fake_git.binary_path(),
+            "/repo",
+            &["add", "--", "src/lib.rs"],
+            GitAccessMode::Mutating,
+        )
+        .expect("mutating git command should succeed");
+
+        assert_eq!(
+            fake_git.logged_args(),
+            vec![
+                "-C".to_owned(),
+                "/repo".to_owned(),
+                "add".to_owned(),
+                "--".to_owned(),
+                "src/lib.rs".to_owned(),
+            ]
+        );
     }
 }
