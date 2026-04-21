@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -72,13 +72,27 @@ pub(crate) fn tycode_versioned_binary_path() -> Result<PathBuf, String> {
         .join("tycode-subprocess"))
 }
 
-pub(crate) fn tycode_probe_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = tycode_versioned_binary_path() {
-        candidates.push(path.to_string_lossy().to_string());
+pub(crate) fn resolve_tycode_binary_path() -> Option<String> {
+    if let Ok(path) = tycode_versioned_binary_path()
+        && path.is_file()
+    {
+        return Some(path.to_string_lossy().to_string());
     }
-    candidates.push("tycode-subprocess".to_string());
-    candidates
+
+    process_env::resolve_login_shell_command_path("tycode-subprocess")
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+pub(crate) fn tycode_probe_candidates() -> Vec<String> {
+    tycode_probe_candidates_from_resolved_path(resolve_tycode_binary_path().as_deref())
+}
+
+fn tycode_probe_candidates_from_resolved_path(resolved_binary_path: Option<&str>) -> Vec<String> {
+    resolved_binary_path
+        .map(Path::new)
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
 }
 
 async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetupInfo {
@@ -547,5 +561,19 @@ mod tests {
             "",
         );
         assert_eq!(parsed.as_deref(), Some("tycode-subprocess 0.7.3"));
+    }
+
+    #[test]
+    fn tycode_never_exposes_a_sign_in_command() {
+        assert!(sign_in_command(BackendKind::Tycode).is_none());
+    }
+
+    #[test]
+    fn tycode_probe_candidates_use_only_resolved_absolute_paths() {
+        assert_eq!(
+            tycode_probe_candidates_from_resolved_path(Some("/tmp/tycode-subprocess")),
+            vec!["/tmp/tycode-subprocess".to_string()]
+        );
+        assert!(tycode_probe_candidates_from_resolved_path(None).is_empty());
     }
 }

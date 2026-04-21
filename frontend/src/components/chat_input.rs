@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use js_sys::{Array, Promise};
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -391,40 +394,57 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
             }
         };
 
+        type FileReaderCallback = Closure<dyn FnMut(web_sys::ProgressEvent)>;
+
+        let onload_slot: Rc<RefCell<Option<FileReaderCallback>>> = Rc::new(RefCell::new(None));
+        let onerror_slot: Rc<RefCell<Option<FileReaderCallback>>> = Rc::new(RefCell::new(None));
+
         let reader_for_load = reader.clone();
         let resolve_fn = resolve.clone();
         let reject_for_load = reject.clone();
-        let onload =
-            Closure::wrap(Box::new(move |_ev: web_sys::ProgressEvent| {
-                match reader_for_load.result() {
-                    Ok(result) => {
-                        let _ = resolve_fn.call1(&JsValue::UNDEFINED, &result);
-                    }
-                    Err(err) => {
-                        let _ = reject_for_load.call1(&JsValue::UNDEFINED, &err);
-                    }
+        let onload_slot_for_load = onload_slot.clone();
+        let onerror_slot_for_load = onerror_slot.clone();
+        let onload = Closure::wrap(Box::new(move |_ev: web_sys::ProgressEvent| {
+            reader_for_load.set_onload(None);
+            reader_for_load.set_onerror(None);
+            match reader_for_load.result() {
+                Ok(result) => {
+                    let _ = resolve_fn.call1(&JsValue::UNDEFINED, &result);
                 }
-            }) as Box<dyn FnMut(_)>);
+                Err(err) => {
+                    let _ = reject_for_load.call1(&JsValue::UNDEFINED, &err);
+                }
+            }
+            onload_slot_for_load.borrow_mut().take();
+            onerror_slot_for_load.borrow_mut().take();
+        }) as Box<dyn FnMut(_)>);
 
         let reader_for_error = reader.clone();
         let reject_for_error = reject.clone();
         let reject_for_start = reject.clone();
+        let onload_slot_for_error = onload_slot.clone();
+        let onerror_slot_for_error = onerror_slot.clone();
         let onerror = Closure::wrap(Box::new(move |_ev: web_sys::ProgressEvent| {
-            let _ = &reader_for_error;
+            reader_for_error.set_onload(None);
+            reader_for_error.set_onerror(None);
             let err = JsValue::from_str("Failed to read dropped image");
             let _ = reject_for_error.call1(&JsValue::UNDEFINED, &err);
+            onload_slot_for_error.borrow_mut().take();
+            onerror_slot_for_error.borrow_mut().take();
         }) as Box<dyn FnMut(_)>);
 
         reader.set_onload(Some(onload.as_ref().unchecked_ref()));
         reader.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        onload_slot.borrow_mut().replace(onload);
+        onerror_slot.borrow_mut().replace(onerror);
 
         if let Err(err) = reader.read_as_data_url(&file) {
+            reader.set_onload(None);
+            reader.set_onerror(None);
+            onload_slot.borrow_mut().take();
+            onerror_slot.borrow_mut().take();
             let _ = reject_for_start.call1(&JsValue::UNDEFINED, &err);
-            return;
         }
-
-        onload.forget();
-        onerror.forget();
     });
 
     let data_url = JsFuture::from(promise)

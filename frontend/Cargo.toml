@@ -33,4 +33,5 @@ web-sys = { version = "0.3", features = [
 ] }
 log = "0.4"
 console_log = "1"
+console_error_panic_hook = "0.1"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

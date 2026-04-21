@@ -473,9 +473,13 @@ pub fn App() -> impl IntoView {
 }
 
 async fn initialize_hosts(state: AppState, listener_token: u64) {
-    let handles = install_host_listeners(state.clone())
-        .await
-        .expect("failed to install host listeners");
+    let handles = match install_host_listeners(state.clone()).await {
+        Ok(handles) => handles,
+        Err(error) => {
+            log::error!("failed to install host listeners: {error}");
+            return;
+        }
+    };
 
     if app_listener_token_is_current(listener_token) {
         HOST_LISTENER_HANDLES.with(|slot| {
@@ -527,10 +531,20 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
                     );
                     dispatch_envelope(&line_state, &event.host_id, envelope)
                 }
-                Err(error) => panic!(
-                    "failed to parse envelope from host {}: {error}",
-                    event.host_id
-                ),
+                Err(error) => {
+                    log::error!(
+                        "failed to parse envelope from host {}: {error}",
+                        event.host_id
+                    );
+                    line_state.connection_statuses.update(|statuses| {
+                        statuses.insert(
+                            event.host_id.clone(),
+                            ConnectionStatus::Error(format!(
+                                "failed to parse host envelope: {error}"
+                            )),
+                        );
+                    });
+                }
             }
         })
         .await?,
@@ -596,7 +610,7 @@ pub async fn refresh_configured_hosts(state: &AppState) {
             });
         }
         Err(error) => {
-            panic!("failed to load configured hosts: {error}");
+            log::error!("failed to load configured hosts: {error}");
         }
     }
 }

@@ -91,7 +91,7 @@ impl ProtocolValidator {
                         backend_kind: payload.backend_kind,
                         saw_agent_start: false,
                         active_stream: None,
-                        started_turns: 0,
+                        assistant_turn_open: false,
                         pending_tool_calls: HashMap::new(),
                         cancelled_tool_calls: HashMap::new(),
                     },
@@ -390,7 +390,25 @@ fn validate_chat_event(
     event: &ChatEvent,
 ) -> Result<(), ProtocolViolation> {
     match event {
-        ChatEvent::MessageAdded(_) => Ok(()),
+        ChatEvent::MessageAdded(message) => match message.sender {
+            crate::MessageSender::Assistant { .. } => {
+                if !state.pending_tool_calls.is_empty() {
+                    return Err(build_violation(
+                        recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        "received assistant MessageAdded while previous tool requests are still unresolved"
+                            .to_owned(),
+                    ));
+                }
+                state.assistant_turn_open = true;
+                Ok(())
+            }
+            _ => {
+                state.assistant_turn_open = false;
+                Ok(())
+            }
+        },
         ChatEvent::StreamStart(data) => {
             if state.active_stream.is_some() {
                 return Err(build_violation(
@@ -409,7 +427,7 @@ fn validate_chat_event(
                         .to_owned(),
                 ));
             }
-            state.started_turns += 1;
+            state.assistant_turn_open = true;
             state.active_stream = Some(ActiveStreamState {
                 message_id: data.message_id.clone(),
             });
@@ -451,6 +469,7 @@ fn validate_chat_event(
             state
                 .cancelled_tool_calls
                 .extend(state.pending_tool_calls.drain());
+            state.assistant_turn_open = false;
             Ok(())
         }
         ChatEvent::TypingStatusChanged(_)
@@ -465,13 +484,13 @@ fn validate_tool_request(
     state: &mut AgentStreamState,
     request: &ToolRequest,
 ) -> Result<(), ProtocolViolation> {
-    if state.started_turns == 0 {
+    if !state.assistant_turn_open {
         return Err(build_violation(
             recent_frames,
             envelope,
             Some(state.backend_kind),
             format!(
-                "received ToolRequest {} before any assistant StreamStart",
+                "received ToolRequest {} before any assistant turn",
                 request.tool_call_id
             ),
         ));
@@ -598,7 +617,7 @@ struct AgentStreamState {
     backend_kind: BackendKind,
     saw_agent_start: bool,
     active_stream: Option<ActiveStreamState>,
-    started_turns: u64,
+    assistant_turn_open: bool,
     pending_tool_calls: HashMap<String, String>,
     cancelled_tool_calls: HashMap<String, String>,
 }
@@ -766,6 +785,28 @@ mod tests {
         }
     }
 
+    fn assistant_message_added(content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(assistant_message(content))
+    }
+
+    fn user_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            timestamp: 0,
+            sender: MessageSender::User,
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls: vec![],
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    fn user_message_added(content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(user_message(content))
+    }
+
     fn tool_request(call_id: &str) -> ChatEvent {
         ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: call_id.to_owned(),
@@ -828,7 +869,26 @@ mod tests {
     }
 
     #[test]
-    fn accepts_turn_with_tools_before_stream_end() {
+    fn accepts_non_streaming_turn_with_tools_after_assistant_message() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_start_envelope(0))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(1, &assistant_message_added("hi")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(2, &tool_request("call-1")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(3, &tool_completed("call-1")))
+            .unwrap();
+    }
+
+    #[test]
+    fn accepts_streaming_turn_with_tool_request_before_stream_end() {
         let mut validator = ProtocolValidator::new();
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
@@ -846,32 +906,23 @@ mod tests {
             ))
             .unwrap();
         validator
-            .validate_envelope(&chat_envelope(
-                2,
-                &ChatEvent::StreamDelta(StreamTextDeltaData {
-                    message_id: Some("msg-1".to_owned()),
-                    text: "hi".to_owned(),
-                }),
-            ))
-            .unwrap();
-        validator
-            .validate_envelope(&chat_envelope(3, &tool_request("call-1")))
-            .unwrap();
-        validator
-            .validate_envelope(&chat_envelope(4, &tool_completed("call-1")))
+            .validate_envelope(&chat_envelope(2, &tool_request("call-1")))
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(
-                5,
+                3,
                 &ChatEvent::StreamEnd(StreamEndData {
                     message: assistant_message("hi"),
                 }),
             ))
             .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(4, &tool_completed("call-1")))
+            .unwrap();
     }
 
     #[test]
-    fn rejects_tool_request_before_stream_start() {
+    fn rejects_tool_request_before_assistant_turn() {
         let mut validator = ProtocolValidator::new();
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
@@ -880,7 +931,7 @@ mod tests {
             .unwrap();
         let violation = validator
             .validate_envelope(&chat_envelope(1, &tool_request("call-1")))
-            .expect_err("tool request before stream start should be invalid");
+            .expect_err("tool request before assistant turn should be invalid");
 
         assert!(violation.to_string().contains("ToolRequest"));
         assert_eq!(violation.backend_kind, Some(BackendKind::Claude));
@@ -1046,6 +1097,56 @@ mod tests {
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(5, &tool_completed("call-1")))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_tool_completion_even_after_assistant_turn() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_start_envelope(0))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(1, &assistant_message_added("hi")))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(2, &tool_completed("call-unknown")))
+            .expect_err("unknown tool completion should be invalid");
+
+        assert!(violation.to_string().contains("unknown tool_call_id"));
+        assert_eq!(violation.backend_kind, Some(BackendKind::Claude));
+    }
+
+    #[test]
+    fn accepts_mixed_non_streaming_sequence_across_multiple_turns() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_start_envelope(0))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(1, &assistant_message_added("")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(2, &tool_request("call-1")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(3, &tool_completed("call-1")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(4, &user_message_added("next turn")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(5, &assistant_message_added("")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(6, &tool_request("call-2")))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(7, &tool_completed("call-2")))
             .unwrap();
     }
 }

@@ -18,22 +18,15 @@ use protocol::{
 use super::{
     Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpServer,
     StartupMcpTransport, empty_session_settings_schema, render_combined_spawn_instructions,
-    setup::tycode_versioned_binary_path,
+    setup::resolve_tycode_binary_path,
 };
 use crate::process_env;
 
 const BACKEND_INPUT_BUFFER: usize = 64;
 const BACKEND_EVENT_BUFFER: usize = 256;
 
-/// Binary name for the tycode subprocess.
-/// Can be overridden via the `TYDE_REMOTE_SUBPROCESS_PATH` env var.
-fn subprocess_bin() -> String {
-    if let Ok(path) = tycode_versioned_binary_path()
-        && path.exists()
-    {
-        return path.to_string_lossy().to_string();
-    }
-    std::env::var("TYDE_REMOTE_SUBPROCESS_PATH").unwrap_or_else(|_| "tycode-subprocess".into())
+fn subprocess_bin() -> Result<String, String> {
+    resolve_tycode_binary_path().ok_or_else(|| "tycode-subprocess not found".to_string())
 }
 
 pub struct TycodeBackend {
@@ -163,7 +156,15 @@ impl Backend for TycodeBackend {
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
             let known_session_ids = known_tycode_session_ids();
-            let mut command = Command::new(subprocess_bin());
+            let subprocess_bin = match subprocess_bin() {
+                Ok(path) => path,
+                Err(err) => {
+                    tracing::error!("{err}");
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
+            let mut command = Command::new(&subprocess_bin);
             command.arg("--workspace-roots").arg(&roots_json);
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
@@ -493,7 +494,14 @@ impl Backend for TycodeBackend {
                 workspace_roots.push(root.path.to_string_lossy().to_string());
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
-            let mut command = Command::new(subprocess_bin());
+            let subprocess_bin = match subprocess_bin() {
+                Ok(path) => path,
+                Err(err) => {
+                    tracing::error!("{err}");
+                    return;
+                }
+            };
+            let mut command = Command::new(&subprocess_bin);
             command.arg("--workspace-roots").arg(&roots_json);
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);

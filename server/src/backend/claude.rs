@@ -5097,7 +5097,7 @@ impl Backend for ClaudeBackend {
                                 label: "Opus".to_string(),
                             },
                         ],
-                        default: Some("sonnet".to_string()),
+                        default: None,
                         nullable: true,
                     },
                 },
@@ -5125,7 +5125,7 @@ impl Backend for ClaudeBackend {
                                 label: "Max".to_string(),
                             },
                         ],
-                        default: Some("high".to_string()),
+                        default: None,
                         nullable: true,
                     },
                 },
@@ -5538,6 +5538,7 @@ async fn signal_ready(ready_tx: &ClaudeReadyTx, result: Result<(), String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
@@ -5573,6 +5574,74 @@ mod tests {
             }),
         };
         (inner, event_rx)
+    }
+
+    #[test]
+    fn claude_optional_session_settings_have_no_schema_defaults() {
+        let schema = ClaudeBackend::session_settings_schema();
+
+        let model_field = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "model")
+            .expect("Claude schema should include model");
+        let effort_field = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "effort")
+            .expect("Claude schema should include effort");
+
+        match &model_field.field_type {
+            SessionSettingFieldType::Select {
+                default, nullable, ..
+            } => {
+                assert!(*nullable, "Claude model should remain optional");
+                assert_eq!(
+                    default, &None,
+                    "Claude model should stay unset until explicitly chosen"
+                );
+            }
+            other => panic!("expected Claude model field to be Select, got {other:?}"),
+        }
+
+        match &effort_field.field_type {
+            SessionSettingFieldType::Select {
+                default, nullable, ..
+            } => {
+                assert!(*nullable, "Claude effort should remain optional");
+                assert_eq!(
+                    default, &None,
+                    "Claude effort should stay unset until explicitly chosen"
+                );
+            }
+            other => panic!("expected Claude effort field to be Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_resolve_session_settings_leaves_optional_fields_unset_by_default() {
+        let resolved = resolve_session_settings(&BackendSpawnConfig::default());
+        assert!(
+            resolved.0.is_empty(),
+            "Claude should not inject model or effort when the user left them unset"
+        );
+    }
+
+    #[test]
+    fn claude_cost_hint_still_sets_explicit_session_settings() {
+        let resolved = resolve_session_settings(&BackendSpawnConfig {
+            cost_hint: Some(SpawnCostHint::Medium),
+            ..BackendSpawnConfig::default()
+        });
+
+        assert_eq!(
+            resolved.0.get("model"),
+            Some(&SessionSettingValue::String("sonnet".to_string()))
+        );
+        assert_eq!(
+            resolved.0.get("effort"),
+            Some(&SessionSettingValue::String("medium".to_string()))
+        );
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 
@@ -19,6 +21,39 @@ enum DragAxis {
     Bottom,
 }
 
+struct WindowMouseListenerHandle {
+    window: web_sys::Window,
+    event: &'static str,
+    callback: Closure<dyn Fn(web_sys::MouseEvent)>,
+}
+
+impl WindowMouseListenerHandle {
+    fn remove(self) {
+        let _ = self.window.remove_event_listener_with_callback(
+            self.event,
+            self.callback.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+thread_local! {
+    static MOUSEMOVE_LISTENER_HANDLE: RefCell<Option<WindowMouseListenerHandle>> = const { RefCell::new(None) };
+    static MOUSEUP_LISTENER_HANDLE: RefCell<Option<WindowMouseListenerHandle>> = const { RefCell::new(None) };
+}
+
+fn clear_drag_window_listeners() {
+    MOUSEMOVE_LISTENER_HANDLE.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    MOUSEUP_LISTENER_HANDLE.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+}
+
 #[component]
 pub fn Workbench() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -36,9 +71,11 @@ pub fn Workbench() -> impl IntoView {
     let drag_start_size = RwSignal::new(0.0f64);
 
     let workbench_ref = NodeRef::<leptos::html::Div>::new();
+    on_cleanup(clear_drag_window_listeners);
 
     // Global mousemove + mouseup for drag
     Effect::new(move |_| {
+        clear_drag_window_listeners();
         let window = web_sys::window().unwrap();
 
         let on_mousemove =
@@ -111,8 +148,20 @@ pub fn Workbench() -> impl IntoView {
             .add_event_listener_with_callback("mousemove", on_mousemove.as_ref().unchecked_ref());
         let _ =
             window.add_event_listener_with_callback("mouseup", on_mouseup.as_ref().unchecked_ref());
-        on_mousemove.forget();
-        on_mouseup.forget();
+        MOUSEMOVE_LISTENER_HANDLE.with(|slot| {
+            slot.borrow_mut().replace(WindowMouseListenerHandle {
+                window: window.clone(),
+                event: "mousemove",
+                callback: on_mousemove,
+            });
+        });
+        MOUSEUP_LISTENER_HANDLE.with(|slot| {
+            slot.borrow_mut().replace(WindowMouseListenerHandle {
+                window,
+                event: "mouseup",
+                callback: on_mouseup,
+            });
+        });
     });
 
     let start_drag = move |axis: DragAxis, ev: web_sys::MouseEvent| {

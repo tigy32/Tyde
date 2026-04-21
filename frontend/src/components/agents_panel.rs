@@ -398,6 +398,7 @@ fn agent_card(
             on:keydown=on_keydown_card
         >
             <div class="agent-card-top">
+                <div class="agent-card-top-main">
                 {move || {
                     if editing_agent.with(|e| e.as_ref() == Some(&agent_id_for_editing_block)) {
                         let host_id = host_id_for_edit.clone();
@@ -478,26 +479,26 @@ fn agent_card(
                         }.into_any()
                     }
                 }}
-                <div>
-                    {(child_count > 0).then(|| {
-                        let agent_id_col = agent_id.clone();
-                        let agent_id_icon = agent_id.clone();
-                        let toggle = move |ev: web_sys::MouseEvent| {
-                            ev.stop_propagation();
-                            let id = agent_id_col.clone();
-                            collapsed_parents.update(|set| {
-                                if set.contains(&id) {
-                                    set.remove(&id);
-                                } else {
-                                    set.insert(id);
-                                }
-                            });
-                        };
-                        view! {
+                {(child_count > 0).then(|| {
+                    let agent_id_col = agent_id.clone();
+                    let agent_id_icon = agent_id.clone();
+                    let toggle = move |ev: web_sys::MouseEvent| {
+                        ev.stop_propagation();
+                        let id = agent_id_col.clone();
+                        collapsed_parents.update(|set| {
+                            if set.contains(&id) {
+                                set.remove(&id);
+                            } else {
+                                set.insert(id);
+                            }
+                        });
+                    };
+                    view! {
+                        <span class="agent-card-child-badge">
                             <span class="agent-child-count">{child_count}</span>
                             <button
                                 type="button"
-                                class="filter-toggle"
+                                class="agent-card-collapse-toggle"
                                 title="Toggle sub-agents"
                                 on:click=toggle
                                 on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
@@ -508,8 +509,11 @@ fn agent_card(
                                     "\u{25BC}"
                                 }}
                             </button>
-                        }
-                    })}
+                        </span>
+                    }
+                })}
+                </div>
+                <div class="agent-card-top-actions">
                     <button
                         type="button"
                         class="filter-toggle agent-card-action"

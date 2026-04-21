@@ -153,11 +153,13 @@ impl UnlistenHandle {
 pub async fn listen_host_line(
     callback: impl Fn(HostLineEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
-    listen_event("tyde://host-line", move |val: JsValue| {
-        let event: TauriEvent<HostLineEvent> =
-            serde_wasm_bindgen::from_value(val).expect("failed to parse host-line event");
-        callback(event.payload);
-    })
+    listen_event(
+        "tyde://host-line",
+        move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<HostLineEvent>>(val) {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host-line event: {error}"),
+        },
+    )
     .await
 }
 
@@ -165,9 +167,10 @@ pub async fn listen_host_disconnected(
     callback: impl Fn(HostDisconnectedEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
     listen_event("tyde://host-disconnected", move |val: JsValue| {
-        let event: TauriEvent<HostDisconnectedEvent> =
-            serde_wasm_bindgen::from_value(val).expect("failed to parse host-disconnected event");
-        callback(event.payload);
+        match serde_wasm_bindgen::from_value::<TauriEvent<HostDisconnectedEvent>>(val) {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host-disconnected event: {error}"),
+        }
     })
     .await
 }
@@ -175,22 +178,29 @@ pub async fn listen_host_disconnected(
 pub async fn listen_host_error(
     callback: impl Fn(HostErrorEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
-    listen_event("tyde://host-error", move |val: JsValue| {
-        let event: TauriEvent<HostErrorEvent> =
-            serde_wasm_bindgen::from_value(val).expect("failed to parse host-error event");
-        callback(event.payload);
-    })
+    listen_event(
+        "tyde://host-error",
+        move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<HostErrorEvent>>(val)
+        {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host-error event: {error}"),
+        },
+    )
     .await
 }
 
 pub async fn listen_ui_debug_request(
     callback: impl Fn(UiDebugRequestEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {
-    listen_event("tyde://ui-debug-request", move |val: JsValue| {
-        let event: TauriEvent<UiDebugRequestEvent> =
-            serde_wasm_bindgen::from_value(val).expect("failed to parse ui-debug-request event");
-        callback(event.payload);
-    })
+    listen_event(
+        "tyde://ui-debug-request",
+        move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<UiDebugRequestEvent>>(
+            val,
+        ) {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse ui-debug-request event: {error}"),
+        },
+    )
     .await
 }
 

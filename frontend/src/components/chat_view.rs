@@ -1,5 +1,8 @@
+use std::cell::RefCell;
+
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
@@ -8,6 +11,31 @@ use crate::components::task_list::TaskListView;
 use crate::state::{AppState, TransientEvent};
 
 use protocol::BackendKind;
+
+struct ScrollListenerHandle {
+    element: web_sys::HtmlDivElement,
+    callback: Closure<dyn Fn()>,
+}
+
+impl ScrollListenerHandle {
+    fn remove(self) {
+        let _ = self
+            .element
+            .remove_event_listener_with_callback("scroll", self.callback.as_ref().unchecked_ref());
+    }
+}
+
+thread_local! {
+    static SCROLL_LISTENER_HANDLE: RefCell<Option<ScrollListenerHandle>> = const { RefCell::new(None) };
+}
+
+fn clear_scroll_listener() {
+    SCROLL_LISTENER_HANDLE.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+}
 
 #[component]
 pub fn ChatView() -> impl IntoView {
@@ -104,13 +132,15 @@ pub fn ChatView() -> impl IntoView {
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
     let show_scroll_btn = RwSignal::new(false);
+    on_cleanup(clear_scroll_listener);
 
     // Track user scroll position to detect manual scroll-up
     let scroll_ref_for_handler = scroll_ref;
     Effect::new(move |_| {
+        clear_scroll_listener();
         if let Some(el) = scroll_ref_for_handler.get() {
             let el_clone = el.clone();
-            let handler = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+            let handler = Closure::<dyn Fn()>::new(move || {
                 let scroll_height = el_clone.scroll_height();
                 let scroll_top = el_clone.scroll_top();
                 let client_height = el_clone.client_height();
@@ -120,7 +150,12 @@ pub fn ChatView() -> impl IntoView {
                 show_scroll_btn.set(!is_near_bottom);
             });
             let _ = el.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
-            handler.forget(); // Leak — lives for app lifetime
+            SCROLL_LISTENER_HANDLE.with(|slot| {
+                slot.borrow_mut().replace(ScrollListenerHandle {
+                    element: el,
+                    callback: handler,
+                });
+            });
         }
     });
 

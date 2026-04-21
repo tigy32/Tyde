@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -31,6 +33,29 @@ pub(crate) fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+pub(crate) fn resolve_login_shell_command_path(binary: &str) -> Option<PathBuf> {
+    let trimmed = binary.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let explicit_path = Path::new(trimmed);
+    if explicit_path.components().count() > 1 {
+        return explicit_path.is_file().then(|| explicit_path.to_path_buf());
+    }
+
+    #[cfg(unix)]
+    {
+        let shell = default_login_shell()?;
+        resolve_login_shell_command_path_with_shell(&shell, trimmed)
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 fn compute_resolved_child_process_path() -> Option<OsString> {
@@ -136,14 +161,11 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
                 if !status.success() {
                     return;
                 }
-                let output = match child.wait_with_output() {
-                    Ok(output) => output,
-                    Err(err) => {
-                        tracing::debug!("failed to collect login-shell PATH output: {err}");
-                        return;
-                    }
+                let stdout = match read_child_stdout(child, "login-shell PATH query") {
+                    Some(stdout) => stdout,
+                    None => return,
                 };
-                let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let trimmed = String::from_utf8_lossy(&stdout).trim().to_string();
                 if trimmed.is_empty() {
                     return;
                 }
@@ -183,6 +205,82 @@ fn default_login_shell() -> Option<String> {
         return Some("/bin/zsh".to_string());
     }
     Some("/bin/bash".to_string())
+}
+
+#[cfg(unix)]
+fn read_child_stdout(mut child: std::process::Child, context: &str) -> Option<Vec<u8>> {
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take()
+        && let Err(err) = pipe.read_to_end(&mut stdout)
+    {
+        tracing::debug!("failed to read stdout for {context}: {err}");
+        return None;
+    }
+    Some(stdout)
+}
+
+#[cfg(unix)]
+fn resolve_login_shell_command_path_with_shell(shell: &str, binary: &str) -> Option<PathBuf> {
+    let mut child = match Command::new(shell)
+        .arg("-lc")
+        .arg("command -v -- \"$TYDE_LOOKUP_BINARY\"")
+        .env("TYDE_LOOKUP_BINARY", binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::debug!(
+                "failed to resolve {} via login shell {}: {err}",
+                binary,
+                shell
+            );
+            return None;
+        }
+    };
+
+    let started = Instant::now();
+    let timeout = Duration::from_millis(750);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let stdout =
+                    String::from_utf8_lossy(&read_child_stdout(child, "login-shell resolution")?)
+                        .into_owned();
+                let resolved = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())?;
+                let resolved_path = PathBuf::from(resolved);
+                if !resolved_path.is_absolute() || !resolved_path.is_file() {
+                    return None;
+                }
+                return Some(resolved_path);
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::debug!("timed out resolving {} via login shell {}", binary, shell);
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "failed waiting for login-shell resolution of {} via {}: {err}",
+                    binary,
+                    shell
+                );
+                return None;
+            }
+        }
+    }
 }
 
 fn extend_common_user_bin_dirs(segments: &mut Vec<PathBuf>) {
@@ -234,5 +332,68 @@ fn find_matching_executable_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> 
     {
         let candidate = dir.join(binary);
         candidate.is_file().then_some(candidate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("write executable");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).expect("stat executable").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod executable");
+    }
+
+    #[cfg(unix)]
+    fn temp_test_dir() -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("tyde-process-env-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("create temp test dir");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_login_shell_command_path_uses_shell_reported_absolute_path() {
+        let dir = temp_test_dir();
+        let binary = dir.join("tycode-subprocess");
+        write_executable(&binary, "#!/bin/sh\nexit 0\n");
+
+        let shell = dir.join("fake-shell");
+        write_executable(
+            &shell,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"{}\"\n", binary.display()),
+        );
+
+        let resolved = resolve_login_shell_command_path_with_shell(
+            shell.to_str().expect("shell path utf-8"),
+            "tycode-subprocess",
+        );
+
+        assert_eq!(resolved, Some(binary));
+        fs::remove_dir_all(dir).expect("remove temp test dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_login_shell_command_path_rejects_non_absolute_output() {
+        let dir = temp_test_dir();
+        let shell = dir.join("fake-shell");
+        write_executable(&shell, "#!/bin/sh\nprintf 'tycode-subprocess\\n'\n");
+
+        let resolved = resolve_login_shell_command_path_with_shell(
+            shell.to_str().expect("shell path utf-8"),
+            "tycode-subprocess",
+        );
+
+        assert_eq!(resolved, None);
+        fs::remove_dir_all(dir).expect("remove temp test dir");
     }
 }

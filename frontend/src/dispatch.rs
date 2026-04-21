@@ -34,15 +34,22 @@ impl FrontendSeqValidator {
         }
     }
 
-    fn validate(&mut self, host_id: &str, stream: &StreamPath, seq: u64, kind: FrameKind) {
+    fn validate(
+        &mut self,
+        host_id: &str,
+        stream: &StreamPath,
+        seq: u64,
+        kind: FrameKind,
+    ) -> Result<(), String> {
         let key = (host_id.to_string(), stream.clone());
         let expected = self.expected.get(&key).copied().unwrap_or(0);
         if seq != expected {
-            panic!(
+            return Err(format!(
                 "sequence mismatch on host {host_id} stream {stream} kind {kind}: expected {expected}, got {seq}"
-            );
+            ));
         }
         self.expected.insert(key, expected + 1);
+        Ok(())
     }
 }
 
@@ -51,17 +58,44 @@ thread_local! {
     static INBOUND_PROTOCOL: RefCell<ProtocolValidator> = RefCell::new(ProtocolValidator::new());
 }
 
+fn report_dispatch_error(
+    _state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    kind: FrameKind,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    log::error!(
+        "frontend dispatch error host={} stream={} kind={}: {}",
+        host_id,
+        stream,
+        kind,
+        message
+    );
+}
+
 pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
-    INBOUND_SEQ.with(|validator| {
+    if let Err(error) = INBOUND_SEQ.with(|validator| {
         validator
             .borrow_mut()
-            .validate(host_id, &envelope.stream, envelope.seq, envelope.kind);
-    });
-    INBOUND_PROTOCOL.with(|validator| {
-        if let Err(error) = validator.borrow_mut().validate_envelope(&envelope) {
-            panic!("protocol violation: {error}");
-        }
-    });
+            .validate(host_id, &envelope.stream, envelope.seq, envelope.kind)
+    }) {
+        report_dispatch_error(state, host_id, &envelope.stream, envelope.kind, error);
+        return;
+    }
+    if let Err(error) =
+        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().validate_envelope(&envelope))
+    {
+        report_dispatch_error(
+            state,
+            host_id,
+            &envelope.stream,
+            envelope.kind,
+            format!("protocol violation: {error}"),
+        );
+        return;
+    }
 
     match envelope.kind {
         FrameKind::Welcome => {
@@ -99,7 +133,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 });
             }
             Err(error) => {
-                panic!("failed to parse reject payload: {error}");
+                report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse reject payload: {error}"),
+                );
             }
         },
         FrameKind::HostSettings => match envelope.parse_payload::<HostSettingsPayload>() {
@@ -116,7 +156,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     settings.insert(host_id.to_string(), payload.settings);
                 });
             }
-            Err(error) => panic!("failed to parse host_settings payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse host_settings payload: {error}"),
+            ),
         },
         FrameKind::BackendSetup => match envelope.parse_payload::<BackendSetupPayload>() {
             Ok(payload) => {
@@ -129,7 +175,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     setup.insert(host_id.to_string(), payload.backends);
                 });
             }
-            Err(error) => panic!("failed to parse backend_setup payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse backend_setup payload: {error}"),
+            ),
         },
         FrameKind::SessionSchemas => match envelope.parse_payload::<SessionSchemasPayload>() {
             Ok(payload) => {
@@ -144,7 +196,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     loaded.insert(host_id.to_string(), true);
                 });
             }
-            Err(error) => panic!("failed to parse session_schemas payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse session_schemas payload: {error}"),
+            ),
         },
         FrameKind::SessionSettings => {
             let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
@@ -157,7 +215,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         map.insert(agent_id, payload.values);
                     });
                 }
-                Err(error) => panic!("failed to parse session_settings payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse session_settings payload: {error}"),
+                ),
             }
         }
         FrameKind::QueuedMessages => {
@@ -177,7 +241,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         map.insert(agent_id, payload.messages);
                     });
                 }
-                Err(error) => panic!("failed to parse queued_messages payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse queued_messages payload: {error}"),
+                ),
             }
         }
         FrameKind::NewAgent => match envelope.parse_payload::<NewAgentPayload>() {
@@ -315,7 +385,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     });
                 }
             }
-            Err(error) => panic!("failed to parse new_agent payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse new_agent payload: {error}"),
+            ),
         },
         FrameKind::AgentStart => match envelope.parse_payload::<AgentStartPayload>() {
             Ok(payload) => {
@@ -328,15 +404,33 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 );
                 apply_agent_started(state, host_id, &payload.agent_id);
             }
-            Err(error) => panic!("failed to parse agent_start payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse agent_start payload: {error}"),
+            ),
         },
         FrameKind::AgentRenamed => match envelope.parse_payload::<AgentRenamedPayload>() {
             Ok(payload) => apply_agent_rename(state, host_id, payload),
-            Err(error) => panic!("failed to parse agent_renamed payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse agent_renamed payload: {error}"),
+            ),
         },
         FrameKind::AgentClosed => match envelope.parse_payload::<AgentClosedPayload>() {
             Ok(payload) => apply_agent_closed(state, host_id, payload.agent_id),
-            Err(error) => panic!("failed to parse agent_closed payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse agent_closed payload: {error}"),
+            ),
         },
         FrameKind::AgentError => match envelope.parse_payload::<AgentErrorPayload>() {
             Ok(payload) => {
@@ -377,7 +471,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     map.entry(error_agent_id).or_default().push(entry);
                 });
             }
-            Err(error) => panic!("failed to parse agent_error payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse agent_error payload: {error}"),
+            ),
         },
         FrameKind::ChatEvent => dispatch_chat_event(state, host_id, &envelope.stream, &envelope),
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
@@ -390,7 +490,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }));
                 });
             }
-            Err(error) => panic!("failed to parse session_list payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse session_list payload: {error}"),
+            ),
         },
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
@@ -429,7 +535,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     state.switch_active_project(None);
                 }
             }
-            Err(error) => panic!("failed to parse project_notify payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse project_notify payload: {error}"),
+            ),
         },
         FrameKind::ProjectFileList => {
             let Some(project_id) = resolve_project_id(&envelope.stream) else {
@@ -466,7 +578,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         }
                     });
                 }
-                Err(error) => panic!("failed to parse project_file_list payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_file_list payload: {error}"),
+                ),
             }
         }
         FrameKind::ProjectGitStatus => {
@@ -483,7 +601,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         git_status.insert(project_id, payload.roots);
                     });
                 }
-                Err(error) => panic!("failed to parse project_git_status payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_git_status payload: {error}"),
+                ),
             }
         }
         FrameKind::ProjectGitDiff => match envelope.parse_payload::<ProjectGitDiffPayload>() {
@@ -500,7 +624,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     );
                 });
             }
-            Err(error) => panic!("failed to parse project_git_diff payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse project_git_diff payload: {error}"),
+            ),
         },
         FrameKind::ProjectFileContents => {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
@@ -524,7 +654,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     });
                     state.open_tab(TabContent::File { path }, label, true);
                 }
-                Err(error) => panic!("failed to parse project_file_contents payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_file_contents payload: {error}"),
+                ),
             }
         }
         FrameKind::NewTerminal => match envelope.parse_payload::<NewTerminalPayload>() {
@@ -561,7 +697,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     state.pending_terminal_focus.set(None);
                 }
             }
-            Err(error) => panic!("failed to parse new_terminal payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse new_terminal payload: {error}"),
+            ),
         },
         FrameKind::TerminalStart => match envelope.parse_payload::<TerminalStartPayload>() {
             Ok(payload) => {
@@ -586,7 +728,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => panic!("failed to parse terminal_start payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse terminal_start payload: {error}"),
+            ),
         },
         FrameKind::TerminalOutput => match envelope.parse_payload::<TerminalOutputPayload>() {
             Ok(payload) => {
@@ -606,7 +754,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     crate::term_bridge::write(&tid, &payload.data);
                 }
             }
-            Err(error) => panic!("failed to parse terminal_output payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse terminal_output payload: {error}"),
+            ),
         },
         FrameKind::TerminalExit => match envelope.parse_payload::<TerminalExitPayload>() {
             Ok(payload) => {
@@ -627,7 +781,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => panic!("failed to parse terminal_exit payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse terminal_exit payload: {error}"),
+            ),
         },
         FrameKind::TerminalError => match envelope.parse_payload::<TerminalErrorPayload>() {
             Ok(payload) => {
@@ -642,21 +802,45 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     });
                 }
             }
-            Err(error) => panic!("failed to parse terminal_error payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse terminal_error payload: {error}"),
+            ),
         },
         FrameKind::HostBrowseOpened => match envelope.parse_payload::<HostBrowseOpenedPayload>() {
             Ok(payload) => dispatch_browse_opened(state, host_id, &envelope.stream, payload),
-            Err(error) => panic!("failed to parse host_browse_opened payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse host_browse_opened payload: {error}"),
+            ),
         },
         FrameKind::HostBrowseEntries => {
             match envelope.parse_payload::<HostBrowseEntriesPayload>() {
                 Ok(payload) => dispatch_browse_entries(state, host_id, &envelope.stream, payload),
-                Err(error) => panic!("failed to parse host_browse_entries payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse host_browse_entries payload: {error}"),
+                ),
             }
         }
         FrameKind::HostBrowseError => match envelope.parse_payload::<HostBrowseErrorPayload>() {
             Ok(payload) => dispatch_browse_error(state, host_id, &envelope.stream, payload),
-            Err(error) => panic!("failed to parse host_browse_error payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse host_browse_error payload: {error}"),
+            ),
         },
         FrameKind::CustomAgentNotify => {
             match envelope.parse_payload::<CustomAgentNotifyPayload>() {
@@ -673,7 +857,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         }
                     });
                 }
-                Err(error) => panic!("failed to parse custom_agent_notify payload: {error}"),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse custom_agent_notify payload: {error}"),
+                ),
             }
         }
         FrameKind::McpServerNotify => match envelope.parse_payload::<McpServerNotifyPayload>() {
@@ -690,7 +880,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => panic!("failed to parse mcp_server_notify payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse mcp_server_notify payload: {error}"),
+            ),
         },
         FrameKind::SteeringNotify => match envelope.parse_payload::<SteeringNotifyPayload>() {
             Ok(SteeringNotifyPayload::Upsert { steering }) => {
@@ -706,7 +902,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => panic!("failed to parse steering_notify payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse steering_notify payload: {error}"),
+            ),
         },
         FrameKind::SkillNotify => match envelope.parse_payload::<SkillNotifyPayload>() {
             Ok(SkillNotifyPayload::Upsert { skill }) => {
@@ -722,7 +924,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                 });
             }
-            Err(error) => panic!("failed to parse skill_notify payload: {error}"),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse skill_notify payload: {error}"),
+            ),
         },
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);

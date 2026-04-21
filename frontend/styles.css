@@ -233,6 +233,10 @@ details summary:focus:not(:focus-visible) {
 .status-text {
     font-size: 0.846rem;
     color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 40ch;
 }
 
 .header-right {
@@ -470,8 +474,7 @@ details summary:focus:not(:focus-visible) {
     transform: rotate(180deg);
 }
 
-.project-rail.expanded .rail-home,
-.project-rail.expanded .rail-add {
+.project-rail.expanded .rail-home {
     justify-content: flex-start;
     padding: 0 var(--space-2);
 }
@@ -3290,11 +3293,26 @@ kbd {
     gap: var(--space-2);
 }
 
+.agent-card-top-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    overflow: hidden;
+}
+
+.agent-card-top-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
 .agent-card-name {
     font-size: 0.923rem;
     font-weight: 600;
     color: var(--text-primary);
-    flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3325,16 +3343,14 @@ kbd {
 }
 
 .agent-card-action {
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.12s ease;
+    display: none;
 }
 
 .agent-card:hover .agent-card-action,
 .agent-card:focus-within .agent-card-action,
 .agent-card-action:focus {
-    opacity: 1;
-    pointer-events: auto;
+    display: inline-flex;
+    align-items: center;
 }
 
 .agent-card-status {
@@ -3385,16 +3401,40 @@ kbd {
     display: none;
 }
 
-.agent-child-count {
+.agent-card-child-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
     font-size: 0.769rem;
     color: var(--text-tertiary);
     background: var(--surface-3);
     border: 1px solid var(--border-primary);
     border-radius: 10px;
-    padding: 0 5px;
-    min-width: 18px;
-    text-align: center;
+    padding: 0 2px 0 6px;
     line-height: 1.4;
+}
+
+.agent-child-count {
+    text-align: center;
+    min-width: 12px;
+}
+
+.agent-card-collapse-toggle {
+    font-size: 0.65rem;
+    color: var(--text-tertiary);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    transition: color 0.15s;
+}
+
+.agent-card-collapse-toggle:hover {
+    color: var(--text-secondary);
 }
 
 /* ===== Session Cards ===== */
