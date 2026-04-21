@@ -4,13 +4,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub fn run() -> Result<(), String> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    if let Err(err) = super::logging::init_host_stdio_logging() {
+        eprintln!("warning: failed to initialize host stdio logging: {err}");
+    }
 
     tracing::info!("starting tyde host stdio mode");
 

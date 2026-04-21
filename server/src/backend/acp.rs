@@ -9,6 +9,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
+use crate::process_env;
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
 const ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
 
@@ -1007,6 +1008,9 @@ impl AcpRpc {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            if let Some(path) = process_env::resolved_child_process_path() {
+                cmd.env("PATH", path);
+            }
             if let Some(path) = spec
                 .local_cwd
                 .as_deref()

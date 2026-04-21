@@ -31,7 +31,7 @@ impl SkillStore {
             index_path,
             root_dir,
         };
-        let _ = store.read_index()?;
+        let _ = store.read_or_rebuild_index()?;
         Ok(store)
     }
 
@@ -60,13 +60,16 @@ impl SkillStore {
     }
 
     pub fn list(&self) -> Result<Vec<Skill>, String> {
-        let mut skills = self.read_index()?.into_values().collect::<Vec<_>>();
+        let mut skills = self
+            .read_or_rebuild_index()?
+            .into_values()
+            .collect::<Vec<_>>();
         skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
         Ok(skills)
     }
 
     pub fn get(&self, id: &SkillId) -> Option<Skill> {
-        self.read_index()
+        self.read_or_rebuild_index()
             .ok()
             .and_then(|records| records.get(&id.0).cloned())
     }
@@ -81,7 +84,7 @@ impl SkillStore {
     }
 
     pub fn sync_from_disk(&self) -> Result<SkillSyncResult, String> {
-        let previous = self.read_index()?;
+        let previous = self.read_or_rebuild_index()?;
         let next = self.scan_disk()?;
         self.save_index(&next)?;
 
@@ -102,6 +105,28 @@ impl SkillStore {
         deletes.sort_by(|left, right| left.0.cmp(&right.0));
 
         Ok(SkillSyncResult { upserts, deletes })
+    }
+
+    fn read_or_rebuild_index(&self) -> Result<HashMap<String, Skill>, String> {
+        if !self.index_path.is_file() {
+            let records = self.scan_disk()?;
+            self.save_index(&records)?;
+            return Ok(records);
+        }
+        match self.read_index() {
+            Ok(records) => Ok(records),
+            Err(err) => {
+                tracing::warn!(
+                    index = %self.index_path.display(),
+                    root_dir = %self.root_dir.display(),
+                    error = %err,
+                    "skills index invalid; rebuilding from disk"
+                );
+                let records = self.scan_disk()?;
+                self.save_index(&records)?;
+                Ok(records)
+            }
+        }
     }
 
     fn read_index(&self) -> Result<HashMap<String, Skill>, String> {
@@ -135,68 +160,42 @@ impl SkillStore {
         match std::fs::read_dir(&self.root_dir) {
             Ok(entries) => {
                 for entry in entries {
-                    let entry = entry.map_err(|err| {
-                        format!(
-                            "Failed to read skill directory entry under {}: {err}",
-                            self.root_dir.display()
-                        )
-                    })?;
-                    let file_type = entry.file_type().map_err(|err| {
-                        format!(
-                            "Failed to stat skill directory entry {}: {err}",
-                            entry.path().display()
-                        )
-                    })?;
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            tracing::warn!(
+                                root_dir = %self.root_dir.display(),
+                                error = %err,
+                                "failed to read skill directory entry; skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    let file_type = match entry.file_type() {
+                        Ok(file_type) => file_type,
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %entry.path().display(),
+                                error = %err,
+                                "failed to stat skill directory entry; skipping"
+                            );
+                            continue;
+                        }
+                    };
                     if !file_type.is_dir() {
                         continue;
                     }
 
                     let dir_name = entry.file_name().to_string_lossy().to_string();
-                    let metadata_path = entry.path().join(SKILL_METADATA_FILENAME);
-                    let body_path = entry.path().join(SKILL_BODY_FILENAME);
-                    if !metadata_path.is_file() {
-                        return Err(format!(
-                            "Skill directory {} is missing {}",
-                            entry.path().display(),
-                            SKILL_METADATA_FILENAME
-                        ));
-                    }
-                    if !body_path.is_file() {
-                        return Err(format!(
-                            "Skill directory {} is missing {}",
-                            entry.path().display(),
-                            SKILL_BODY_FILENAME
-                        ));
-                    }
-
-                    let skill = serde_json::from_str::<Skill>(
-                        &std::fs::read_to_string(&metadata_path).map_err(|err| {
-                            format!(
-                                "Failed to read skill metadata {}: {err}",
-                                metadata_path.display()
-                            )
-                        })?,
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "Failed to parse skill metadata {}: {err}",
-                            metadata_path.display()
-                        )
-                    })?;
-                    validate_skill(&skill)?;
-                    if skill.name != dir_name {
-                        return Err(format!(
-                            "Skill metadata {} name '{}' does not match directory '{}'",
-                            metadata_path.display(),
-                            skill.name,
-                            dir_name
-                        ));
-                    }
+                    let Some(skill) = load_skill_from_dir(&entry.path(), &dir_name) else {
+                        continue;
+                    };
                     if records.insert(skill.id.0.clone(), skill.clone()).is_some() {
-                        return Err(format!(
-                            "duplicate skill id {} discovered on disk",
-                            skill.id
-                        ));
+                        tracing::warn!(
+                            skill_id = %skill.id,
+                            path = %entry.path().display(),
+                            "duplicate skill id discovered on disk; skipping duplicate"
+                        );
                     }
                 }
             }
@@ -245,6 +244,72 @@ impl SkillStore {
     }
 }
 
+fn load_skill_from_dir(path: &std::path::Path, dir_name: &str) -> Option<Skill> {
+    let metadata_path = path.join(SKILL_METADATA_FILENAME);
+    let body_path = path.join(SKILL_BODY_FILENAME);
+
+    if !body_path.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "skill directory is missing {}; skipping",
+            SKILL_BODY_FILENAME
+        );
+        return None;
+    }
+
+    let skill = if metadata_path.is_file() {
+        let contents = match std::fs::read_to_string(&metadata_path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                tracing::warn!(
+                    path = %metadata_path.display(),
+                    error = %err,
+                    "failed to read skill metadata; skipping"
+                );
+                return None;
+            }
+        };
+        match serde_json::from_str::<Skill>(&contents) {
+            Ok(skill) => skill,
+            Err(err) => {
+                tracing::warn!(
+                    path = %metadata_path.display(),
+                    error = %err,
+                    "failed to parse skill metadata; skipping"
+                );
+                return None;
+            }
+        }
+    } else {
+        Skill {
+            id: SkillId(dir_name.to_string()),
+            name: dir_name.to_string(),
+            title: None,
+            description: None,
+        }
+    };
+
+    if let Err(err) = validate_skill(&skill) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "invalid skill metadata; skipping"
+        );
+        return None;
+    }
+    if skill.name != dir_name {
+        tracing::warn!(
+            path = %metadata_path.display(),
+            skill_name = %skill.name.as_str(),
+            dir_name = %dir_name,
+            "skill metadata name does not match directory name; skipping"
+        );
+        return None;
+    }
+
+    Some(skill)
+}
+
 fn validate_skill(skill: &Skill) -> Result<(), String> {
     if skill.id.0.trim().is_empty() {
         return Err("skill id must not be empty".to_string());
@@ -282,4 +347,114 @@ fn validate_skill(skill: &Skill) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("tyde-skill-store-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap_or_else(|err| {
+                panic!("failed to create test dir {}: {err}", path.display())
+            });
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_skill_body(root: &std::path::Path, name: &str, body: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|err| panic!("failed to create skill dir {}: {err}", dir.display()));
+        std::fs::write(dir.join(SKILL_BODY_FILENAME), body)
+            .unwrap_or_else(|err| panic!("failed to write skill body for {name}: {err}"));
+    }
+
+    #[test]
+    fn list_accepts_skill_without_metadata() {
+        let fixture = TestDir::new("metadata-optional");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "lint", "# lint\n");
+
+        let store = SkillStore::load(index_path, root_dir).expect("load skill store");
+        let skills = store.list().expect("list skills");
+
+        assert_eq!(
+            skills,
+            vec![Skill {
+                id: SkillId("lint".to_string()),
+                name: "lint".to_string(),
+                title: None,
+                description: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn list_skips_malformed_metadata_without_failing() {
+        let fixture = TestDir::new("skip-bad-metadata");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+
+        write_skill_body(&root_dir, "good-skill", "# good\n");
+        std::fs::write(
+            root_dir.join("good-skill").join(SKILL_METADATA_FILENAME),
+            serde_json::to_string_pretty(&Skill {
+                id: SkillId("good".to_string()),
+                name: "good-skill".to_string(),
+                title: Some("Good".to_string()),
+                description: Some("Works".to_string()),
+            })
+            .expect("serialize good metadata"),
+        )
+        .expect("write good metadata");
+
+        write_skill_body(&root_dir, "bad-skill", "# bad\n");
+        std::fs::write(
+            root_dir.join("bad-skill").join(SKILL_METADATA_FILENAME),
+            "{not-json",
+        )
+        .expect("write bad metadata");
+
+        let store = SkillStore::load(index_path, root_dir).expect("load skill store");
+        let skills = store.list().expect("list skills");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, SkillId("good".to_string()));
+        assert_eq!(skills[0].name, "good-skill");
+    }
+
+    #[test]
+    fn load_rebuilds_invalid_index_from_disk() {
+        let fixture = TestDir::new("rebuild-invalid-index");
+        let index_path = fixture.path.join("skills.json");
+        let root_dir = fixture.path.join("skills");
+        write_skill_body(&root_dir, "ops", "# ops\n");
+        std::fs::write(&index_path, "{ definitely-invalid-json").expect("write invalid index");
+
+        let store = SkillStore::load(index_path.clone(), root_dir).expect("load skill store");
+        let skill = store
+            .get(&SkillId("ops".to_string()))
+            .expect("expected rebuilt skill");
+
+        assert_eq!(skill.id, SkillId("ops".to_string()));
+        assert!(
+            std::fs::read_to_string(index_path)
+                .expect("read rebuilt index")
+                .contains("\"ops\"")
+        );
+    }
 }

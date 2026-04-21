@@ -309,12 +309,24 @@ impl HostHandle {
 
         let skills = {
             let store = state.skill_store.lock().await;
-            store
-                .sync_from_disk()
-                .unwrap_or_else(|err| panic!("failed to sync skills for host registration: {err}"));
-            store
-                .list()
-                .unwrap_or_else(|err| panic!("failed to list skills for host registration: {err}"))
+            if let Err(err) = store.sync_from_disk() {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    error = %err,
+                    "failed to sync skills for host registration; continuing with last known state"
+                );
+            }
+            match store.list() {
+                Ok(skills) => skills,
+                Err(err) => {
+                    tracing::warn!(
+                        host_stream = %host_path,
+                        error = %err,
+                        "failed to list skills for host registration; continuing without skills"
+                    );
+                    Vec::new()
+                }
+            }
         };
         for skill in skills {
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
@@ -1011,20 +1023,30 @@ impl HostHandle {
 
     pub(crate) async fn upsert_custom_agent(&self, payload: CustomAgentUpsertPayload) {
         let mut state = self.state.lock().await;
-        let skills = state.skill_store.lock().await.list().unwrap_or_else(|err| {
-            panic!("failed to list skills before custom agent upsert: {err}")
-        });
+        let skills = match state.skill_store.lock().await.list() {
+            Ok(skills) => skills,
+            Err(err) => {
+                tracing::warn!(
+                    custom_agent_id = %payload.custom_agent.id,
+                    error = %err,
+                    "failed to list skills before custom agent upsert; rejecting update"
+                );
+                return;
+            }
+        };
         let skill_ids = skills
             .into_iter()
             .map(|skill| skill.id)
             .collect::<HashSet<_>>();
         for skill_id in &payload.custom_agent.skill_ids {
-            assert!(
-                skill_ids.contains(skill_id),
-                "custom agent {} references missing skill {}",
-                payload.custom_agent.id,
-                skill_id
-            );
+            if !skill_ids.contains(skill_id) {
+                tracing::warn!(
+                    custom_agent_id = %payload.custom_agent.id,
+                    skill_id = %skill_id,
+                    "custom agent references missing skill; rejecting update"
+                );
+                return;
+            }
         }
 
         let mcp_servers = state
@@ -1109,12 +1131,13 @@ impl HostHandle {
 
     pub(crate) async fn refresh_skills(&self, _payload: SkillRefreshPayload) {
         let mut state = self.state.lock().await;
-        let sync = state
-            .skill_store
-            .lock()
-            .await
-            .sync_from_disk()
-            .unwrap_or_else(|err| panic!("failed to refresh skills: {err}"));
+        let sync = match state.skill_store.lock().await.sync_from_disk() {
+            Ok(sync) => sync,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to refresh skills");
+                return;
+            }
+        };
         for id in sync.deletes {
             fan_out_skill_notify(&mut state, SkillNotifyPayload::Delete { id }).await;
         }

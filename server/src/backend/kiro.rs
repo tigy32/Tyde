@@ -13,6 +13,7 @@ use crate::acp::{
     parse_tool_call_completion, parse_tool_call_request,
 };
 use crate::backend::{SessionCommand, StartupMcpServer, render_combined_spawn_instructions};
+use crate::process_env;
 use crate::subprocess::ImageAttachment;
 
 const KIRO_AGENT_NAME: &str = "kiro";
@@ -2623,20 +2624,7 @@ fn normalize_optional_string(value: &Value) -> Option<String> {
 }
 
 fn find_in_path(binary: &str) -> Option<String> {
-    let which_cmd = if cfg!(windows) { "where" } else { "which" };
-    let output = std::process::Command::new(which_cmd)
-        .arg(binary)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    if path.is_empty() { None } else { Some(path) }
+    process_env::find_executable_in_path(binary).map(|path| path.to_string_lossy().to_string())
 }
 
 /// Toolbox-style wrappers often symlink only the primary binary (kiro-cli)

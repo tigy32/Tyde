@@ -11,6 +11,7 @@ use tokio::process::Command;
 
 use crate::backend::codex::discover_models;
 use crate::browse_stream::host_platform;
+use crate::process_env;
 
 pub(crate) const TYCODE_VERSION: &str = "0.7.3";
 const TYCODE_RELEASE_BASE_URL: &str = "https://github.com/tigy32/Tycode/releases/download";
@@ -22,6 +23,10 @@ const TYCODE_SUBPROCESS_SHA256_AARCH64_UNKNOWN_LINUX_MUSL: &str =
     "4d776bdaa8388103135021805c0be8954a2aca88f2b357bc75647a32a1c5d9c3";
 const TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL: &str =
     "809e47d50f09dd0885b577e091bf2efc44850ed88a2dfdc457b1e3423759c94f";
+const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
+const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
+const GEMINI_CLI_CANDIDATES: &[&str] = &["gemini"];
+const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 
 pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
@@ -83,12 +88,10 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
 
     let probe = match kind {
         BackendKind::Tycode => probe_tycode_candidates(&tycode_probe_candidates()).await,
-        BackendKind::Kiro => {
-            probe_candidates(&["kiro-cli".to_string(), "kiro-cli-chat".to_string()]).await
-        }
-        BackendKind::Claude => probe_candidates(&["claude".to_string()]).await,
-        BackendKind::Codex => probe_candidates(&["codex".to_string()]).await,
-        BackendKind::Gemini => probe_candidates(&["gemini".to_string()]).await,
+        BackendKind::Kiro => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
+        BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
+        BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
+        BackendKind::Gemini => probe_candidates(&command_candidates(GEMINI_CLI_CANDIDATES)).await,
     };
 
     if kind == BackendKind::Codex && probe.installed {
@@ -173,12 +176,15 @@ async fn probe_command(command: &str) -> Option<Option<String>> {
 }
 
 async fn run_version_command(command: &str) -> Option<Option<(String, String)>> {
-    let mut child = Command::new(command)
+    let mut command = Command::new(command);
+    command
         .arg("--version")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
+    let mut child = command.spawn().ok()?;
     let mut stdout_pipe = child.stdout.take()?;
     let mut stderr_pipe = child.stderr.take()?;
 
@@ -204,6 +210,24 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     let _ = status;
     Some(Some((stdout, stderr)))
+}
+
+fn command_candidates(defaults: &[&str]) -> Vec<String> {
+    let mut candidates = Vec::<String>::new();
+    for default in defaults {
+        if let Some(path) = process_env::find_executable_in_path(default) {
+            let path = path.to_string_lossy().to_string();
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        }
+
+        let candidate = default.to_string();
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 fn parse_tycode_version_output(stdout: &str, stderr: &str) -> Option<String> {

@@ -3,6 +3,7 @@ mod dev_host;
 mod devtools;
 mod host_stdio;
 mod host_store;
+mod logging;
 mod router;
 
 use std::sync::Arc;
@@ -118,12 +119,9 @@ async fn submit_feedback(feedback: String) -> Result<(), String> {
 }
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    if let Err(err) = logging::init_gui_logging() {
+        eprintln!("warning: failed to initialize GUI logging: {err}");
+    }
 
     tracing::info!("starting tyde shell");
 

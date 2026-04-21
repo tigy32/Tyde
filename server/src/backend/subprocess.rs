@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::process_env;
 use crate::remote::parse_remote_workspace_roots;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +65,9 @@ impl SubprocessBridge {
             }
             if ephemeral {
                 cmd.arg("--ephemeral");
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                cmd.env("PATH", path);
             }
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())

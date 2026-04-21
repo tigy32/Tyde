@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
+use crate::process_env;
 use crate::remote::{
     parse_remote_workspace_roots, shell_quote_arg, shell_quote_command, ssh_control_args,
 };
@@ -522,6 +523,9 @@ impl GeminiInner {
             let mut cmd = Command::new("gemini");
             for arg in &cli_args {
                 cmd.arg(arg);
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                cmd.env("PATH", path);
             }
             cmd.current_dir(workspace_root)
                 .stdin(Stdio::null())
@@ -1676,6 +1680,16 @@ async fn forward_gemini_backend_event(
                 .and_then(Value::as_str)
                 .unwrap_or("Gemini backend error")
                 .to_string();
+            let session_started = session_id_sink
+                .lock()
+                .expect("gemini session_id mutex poisoned")
+                .is_some();
+            if !session_started && let Some(ready_tx) = ready_tx {
+                let mut ready_tx = ready_tx.lock().await;
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(message.clone()));
+                }
+            }
             if events_tx
                 .send(backend_error_message(message.clone()))
                 .await

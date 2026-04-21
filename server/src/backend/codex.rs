@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
+use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
@@ -4274,6 +4275,9 @@ impl CodexRpc {
             for override_key_value in &config_overrides {
                 cmd.arg("-c").arg(override_key_value);
             }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                cmd.env("PATH", path);
+            }
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -4682,6 +4686,9 @@ impl Backend for CodexBackend {
             command.arg("app-server").arg("--listen").arg("stdio://");
             for override_key_value in &startup_mcp_config_overrides {
                 command.arg("-c").arg(override_key_value);
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                command.env("PATH", path);
             }
             let mut child = match command
                 .stdin(std::process::Stdio::piped())

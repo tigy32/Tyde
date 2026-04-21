@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use protocol::ToolPolicy;
 
 use crate::backend::{AgentIdentity, SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
 #[cfg(test)]
 use crate::sub_agent::SubAgentHandle;
@@ -837,6 +838,9 @@ impl ClaudeInner {
             let mut cmd = Command::new("claude");
             for arg in &cli_args {
                 cmd.arg(arg);
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                cmd.env("PATH", path);
             }
             cmd.current_dir(workspace_root)
                 .stdin(std::process::Stdio::piped())
@@ -5047,6 +5051,13 @@ async fn forward_claude_backend_event(
                 .and_then(Value::as_str)
                 .unwrap_or("Claude backend error")
                 .to_string();
+            let session_started = session_id_sink
+                .lock()
+                .expect("claude session_id mutex poisoned")
+                .is_some();
+            if !session_started && let Some(ready_tx) = ready_tx {
+                signal_ready(ready_tx, Err(message.clone())).await;
+            }
             if events_tx
                 .send(backend_error_message(message.clone()))
                 .await
@@ -7850,5 +7861,42 @@ mod tests {
             Some(plan_content),
             "ExitPlanMode result should include plan_content from preceding Write"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_claude_backend_event_fails_ready_on_pre_session_error() {
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
+        let (events_tx, mut events_rx) = mpsc::channel::<ChatEvent>(4);
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+
+        let forwarded = forward_claude_backend_event(
+            json!({
+                "kind": "Error",
+                "data": "Failed to start Claude CLI: No such file or directory"
+            }),
+            &events_tx,
+            &session_id,
+            Some(&ready_tx),
+        )
+        .await;
+
+        assert!(forwarded, "expected backend error event to be forwarded");
+        assert_eq!(
+            ready_rx.await.expect("ready result"),
+            Err("Failed to start Claude CLI: No such file or directory".to_string())
+        );
+
+        let event = events_rx.recv().await.expect("forwarded chat event");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                assert!(matches!(message.sender, protocol::MessageSender::Error));
+                assert_eq!(
+                    message.content,
+                    "Failed to start Claude CLI: No such file or directory"
+                );
+            }
+            other => panic!("expected error chat event, got {other:?}"),
+        }
     }
 }

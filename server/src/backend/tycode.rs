@@ -20,6 +20,7 @@ use super::{
     StartupMcpTransport, empty_session_settings_schema, render_combined_spawn_instructions,
     setup::tycode_versioned_binary_path,
 };
+use crate::process_env;
 
 const BACKEND_INPUT_BUFFER: usize = 64;
 const BACKEND_EVENT_BUFFER: usize = 256;
@@ -166,6 +167,9 @@ impl Backend for TycodeBackend {
             command.arg("--workspace-roots").arg(&roots_json);
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                command.env("PATH", path);
             }
             command
                 .stdin(Stdio::piped())
@@ -493,6 +497,9 @@ impl Backend for TycodeBackend {
             command.arg("--workspace-roots").arg(&roots_json);
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                command.env("PATH", path);
             }
             command
                 .stdin(Stdio::piped())
