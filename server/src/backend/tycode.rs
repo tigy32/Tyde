@@ -101,20 +101,6 @@ fn materialize_tycode_customization(
     Ok(Some(root))
 }
 
-fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
-    ChatEvent::MessageAdded(ChatMessage {
-        timestamp: unix_now_ms(),
-        sender: MessageSender::User,
-        content,
-        reasoning: None,
-        tool_calls: Vec::new(),
-        model_info: None,
-        token_usage: None,
-        context_breakdown: None,
-        images,
-    })
-}
-
 impl Backend for TycodeBackend {
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         empty_session_settings_schema(BackendKind::Tycode)
@@ -126,7 +112,6 @@ impl Backend for TycodeBackend {
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
-        let initial_images = initial_input.images;
         let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -233,17 +218,6 @@ impl Backend for TycodeBackend {
                 }
             });
 
-            if events_tx
-                .send(backend_user_message(
-                    initial_message.clone(),
-                    initial_images.clone(),
-                ))
-                .await
-                .is_err()
-            {
-                let _ = ready_tx.send(Err("Tycode event stream closed during spawn".to_string()));
-                return;
-            }
             if stdin_tx
                 .send(TycodeStdinCommand::Json(
                     serde_json::json!({ "UserInput": initial_message }),
@@ -257,20 +231,11 @@ impl Backend for TycodeBackend {
 
             // Forward AgentInput to the stdin writer
             let stdin_tx2 = stdin_tx.clone();
-            let events_tx2 = events_tx.clone();
             tokio::spawn(async move {
                 while let Some(input) = input_rx.recv().await {
                     match input {
                         AgentInput::SendMessage(payload) => {
                             let message = payload.message;
-                            let images = payload.images;
-                            if events_tx2
-                                .send(backend_user_message(message.clone(), images))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
                             if stdin_tx2
                                 .send(TycodeStdinCommand::Json(
                                     serde_json::json!({ "UserInput": message }),
@@ -581,20 +546,11 @@ impl Backend for TycodeBackend {
             }
 
             let stdin_tx2 = stdin_tx.clone();
-            let events_tx2 = events_tx.clone();
             tokio::spawn(async move {
                 while let Some(input) = input_rx.recv().await {
                     match input {
                         AgentInput::SendMessage(payload) => {
                             let message = payload.message;
-                            let images = payload.images;
-                            if events_tx2
-                                .send(backend_user_message(message.clone(), images))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
                             if stdin_tx2
                                 .send(TycodeStdinCommand::Json(
                                     serde_json::json!({ "UserInput": message }),
