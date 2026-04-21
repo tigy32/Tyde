@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use anyhow::anyhow;
 use protocol::types::CloseAgentPayload;
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
@@ -15,8 +16,10 @@ use protocol::{
     SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
     TerminalResizePayload, TerminalSendPayload,
 };
+use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
 use crate::stream::Stream;
 
@@ -25,232 +28,140 @@ pub(crate) async fn route_client_envelope(
     connection_host_stream: &StreamPath,
     host_output_stream: &Stream,
     envelope: Envelope,
-) {
+) -> AppResult<()> {
     if envelope.stream == *connection_host_stream {
         match envelope.kind {
             FrameKind::SetSetting => {
-                let payload: SetSettingPayload = envelope
-                    .parse_payload()
-                    .expect("invalid set_setting payload");
-                host.set_setting(payload).await;
+                let payload: SetSettingPayload = parse_payload(&envelope, "set_setting")?;
+                host.set_setting(payload).await?;
             }
             FrameKind::SpawnAgent => {
-                let payload: SpawnAgentPayload = envelope
-                    .parse_payload()
-                    .expect("invalid spawn_agent payload");
-                if let Some(name) = payload.name.as_ref() {
-                    assert!(
-                        !name.trim().is_empty(),
-                        "spawn_agent name must not be empty when provided"
-                    );
-                }
-                match &payload.params {
-                    SpawnAgentParams::New {
-                        workspace_roots,
-                        prompt,
-                        images,
-                        ..
-                    } => {
-                        assert!(
-                            workspace_roots.iter().all(|root| !root.trim().is_empty()),
-                            "spawn_agent workspace roots must not contain empty values"
-                        );
-                        assert!(
-                            !prompt.trim().is_empty()
-                                || images.as_ref().is_some_and(|images| !images.is_empty()),
-                            "spawn_agent new prompt must not be empty unless images are attached"
-                        );
-                    }
-                    SpawnAgentParams::Resume { session_id, .. } => {
-                        assert!(
-                            !session_id.0.trim().is_empty(),
-                            "resume session_id must not be empty"
-                        );
-                    }
-                }
+                let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;
+                validate_spawn_agent(&payload)?;
                 host.spawn_agent(payload).await;
             }
             FrameKind::ListSessions => {
-                let _: ListSessionsPayload = envelope
-                    .parse_payload()
-                    .expect("invalid list_sessions payload");
-                host.list_sessions(host_output_stream).await;
+                let _: ListSessionsPayload = parse_payload(&envelope, "list_sessions")?;
+                host.list_sessions(host_output_stream).await?;
             }
             FrameKind::DeleteSession => {
-                let payload: DeleteSessionPayload = envelope
-                    .parse_payload()
-                    .expect("invalid delete_session payload");
-                host.delete_session(payload.session_id).await;
+                let payload: DeleteSessionPayload = parse_payload(&envelope, "delete_session")?;
+                ensure_non_empty(
+                    "delete_session",
+                    "session_id",
+                    payload.session_id.0.as_str(),
+                )?;
+                host.delete_session(payload.session_id).await?;
             }
             FrameKind::ProjectCreate => {
-                let payload: ProjectCreatePayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_create payload");
-                assert!(
-                    !payload.name.trim().is_empty(),
-                    "project_create name must not be empty"
-                );
-                validate_project_roots(&payload.roots);
-                host.create_project(payload).await;
+                let payload: ProjectCreatePayload = parse_payload(&envelope, "project_create")?;
+                ensure_non_empty("project_create", "name", payload.name.as_str())?;
+                validate_project_roots(&payload.roots)?;
+                host.create_project(payload).await?;
             }
             FrameKind::ProjectRename => {
-                let payload: ProjectRenamePayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_rename payload");
-                assert!(
-                    !payload.id.0.trim().is_empty(),
-                    "project_rename id must not be empty"
-                );
-                assert!(
-                    !payload.name.trim().is_empty(),
-                    "project_rename name must not be empty"
-                );
-                host.rename_project(payload).await;
+                let payload: ProjectRenamePayload = parse_payload(&envelope, "project_rename")?;
+                ensure_non_empty("project_rename", "id", payload.id.0.as_str())?;
+                ensure_non_empty("project_rename", "name", payload.name.as_str())?;
+                host.rename_project(payload).await?;
             }
             FrameKind::ProjectReorder => {
-                let payload: ProjectReorderPayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_reorder payload");
-                let mut seen_ids = HashSet::new();
-                for project_id in &payload.project_ids {
-                    assert!(
-                        !project_id.0.trim().is_empty(),
-                        "project_reorder ids must not be empty"
-                    );
-                    assert!(
-                        seen_ids.insert(project_id.0.clone()),
-                        "project_reorder contains duplicate id {}",
-                        project_id
-                    );
-                }
-                host.reorder_projects(payload).await;
+                let payload: ProjectReorderPayload = parse_payload(&envelope, "project_reorder")?;
+                validate_project_reorder(&payload)?;
+                host.reorder_projects(payload).await?;
             }
             FrameKind::ProjectAddRoot => {
-                let payload: ProjectAddRootPayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_add_root payload");
-                assert!(
-                    !payload.id.0.trim().is_empty(),
-                    "project_add_root id must not be empty"
-                );
-                assert!(
-                    !payload.root.trim().is_empty(),
-                    "project_add_root root must not be empty"
-                );
-                host.add_project_root(payload).await;
+                let payload: ProjectAddRootPayload = parse_payload(&envelope, "project_add_root")?;
+                ensure_non_empty("project_add_root", "id", payload.id.0.as_str())?;
+                ensure_non_empty("project_add_root", "root", payload.root.as_str())?;
+                host.add_project_root(payload).await?;
             }
             FrameKind::ProjectDelete => {
-                let payload: ProjectDeletePayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_delete payload");
-                assert!(
-                    !payload.id.0.trim().is_empty(),
-                    "project_delete id must not be empty"
-                );
-                host.delete_project(payload).await;
+                let payload: ProjectDeletePayload = parse_payload(&envelope, "project_delete")?;
+                ensure_non_empty("project_delete", "id", payload.id.0.as_str())?;
+                host.delete_project(payload).await?;
             }
             FrameKind::CustomAgentUpsert => {
-                let payload: CustomAgentUpsertPayload = envelope
-                    .parse_payload()
-                    .expect("invalid custom_agent_upsert payload");
-                host.upsert_custom_agent(payload).await;
+                let payload: CustomAgentUpsertPayload =
+                    parse_payload(&envelope, "custom_agent_upsert")?;
+                host.upsert_custom_agent(payload).await?;
             }
             FrameKind::CustomAgentDelete => {
-                let payload: CustomAgentDeletePayload = envelope
-                    .parse_payload()
-                    .expect("invalid custom_agent_delete payload");
-                host.delete_custom_agent(payload).await;
+                let payload: CustomAgentDeletePayload =
+                    parse_payload(&envelope, "custom_agent_delete")?;
+                host.delete_custom_agent(payload).await?;
             }
             FrameKind::SteeringUpsert => {
-                let payload: SteeringUpsertPayload = envelope
-                    .parse_payload()
-                    .expect("invalid steering_upsert payload");
-                host.upsert_steering(payload).await;
+                let payload: SteeringUpsertPayload = parse_payload(&envelope, "steering_upsert")?;
+                host.upsert_steering(payload).await?;
             }
             FrameKind::SteeringDelete => {
-                let payload: SteeringDeletePayload = envelope
-                    .parse_payload()
-                    .expect("invalid steering_delete payload");
-                host.delete_steering(payload).await;
+                let payload: SteeringDeletePayload = parse_payload(&envelope, "steering_delete")?;
+                host.delete_steering(payload).await?;
             }
             FrameKind::SkillRefresh => {
-                let payload: SkillRefreshPayload = envelope
-                    .parse_payload()
-                    .expect("invalid skill_refresh payload");
-                host.refresh_skills(payload).await;
+                let payload: SkillRefreshPayload = parse_payload(&envelope, "skill_refresh")?;
+                host.refresh_skills(payload).await?;
             }
             FrameKind::McpServerUpsert => {
-                let payload: McpServerUpsertPayload = envelope
-                    .parse_payload()
-                    .expect("invalid mcp_server_upsert payload");
-                host.upsert_mcp_server(payload).await;
+                let payload: McpServerUpsertPayload =
+                    parse_payload(&envelope, "mcp_server_upsert")?;
+                host.upsert_mcp_server(payload).await?;
             }
             FrameKind::McpServerDelete => {
-                let payload: McpServerDeletePayload = envelope
-                    .parse_payload()
-                    .expect("invalid mcp_server_delete payload");
-                host.delete_mcp_server(payload).await;
+                let payload: McpServerDeletePayload =
+                    parse_payload(&envelope, "mcp_server_delete")?;
+                host.delete_mcp_server(payload).await?;
             }
             FrameKind::HostBrowseStart => {
-                let payload: HostBrowseStartPayload = envelope
-                    .parse_payload()
-                    .expect("invalid host_browse_start payload");
-                assert!(
-                    payload.browse_stream.0.starts_with("/browse/"),
-                    "host_browse_start browse_stream must start with /browse/, got {}",
-                    payload.browse_stream
-                );
+                let payload: HostBrowseStartPayload =
+                    parse_payload(&envelope, "host_browse_start")?;
+                if !payload.browse_stream.0.starts_with("/browse/") {
+                    return Err(AppError::invalid(
+                        "host_browse_start",
+                        format!(
+                            "browse_stream must start with /browse/, got {}",
+                            payload.browse_stream
+                        ),
+                    ));
+                }
                 if let Some(initial) = payload.initial.as_ref() {
-                    assert!(
-                        !initial.0.trim().is_empty(),
-                        "host_browse_start initial must not be empty when provided"
-                    );
+                    ensure_non_empty("host_browse_start", "initial", initial.0.as_str())?;
                 }
                 host.open_browse_stream(connection_host_stream, host_output_stream, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::TerminalCreate => {
-                let payload: TerminalCreatePayload = envelope
-                    .parse_payload()
-                    .expect("invalid terminal_create payload");
-                assert!(
-                    payload.cols >= 2,
-                    "terminal_create cols must be at least 2, got {}",
-                    payload.cols
-                );
-                assert!(
-                    payload.rows >= 1,
-                    "terminal_create rows must be at least 1, got {}",
-                    payload.rows
-                );
+                let payload: TerminalCreatePayload = parse_payload(&envelope, "terminal_create")?;
+                validate_terminal_dimensions("terminal_create", payload.cols, payload.rows)?;
                 host.create_terminal(connection_host_stream, host_output_stream, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::RunBackendSetup => {
-                let payload: RunBackendSetupPayload = envelope
-                    .parse_payload()
-                    .expect("invalid run_backend_setup payload");
+                let payload: RunBackendSetupPayload =
+                    parse_payload(&envelope, "run_backend_setup")?;
                 host.run_backend_setup(connection_host_stream, host_output_stream, payload)
-                    .await;
+                    .await?;
             }
             other => {
-                panic!(
-                    "protocol violation: unexpected client frame kind {} on host stream {}",
-                    other, envelope.stream
-                );
+                return Err(AppError::protocol(
+                    "route_client_envelope",
+                    format!(
+                        "unexpected client frame kind {} on host stream {}",
+                        other, envelope.stream
+                    ),
+                ));
             }
         }
-        return;
+        return Ok(());
     }
 
     if envelope.stream.0.starts_with("/agent/") {
         match envelope.kind {
             FrameKind::SendMessage => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let payload: SendMessagePayload = envelope
-                    .parse_payload()
-                    .expect("invalid send_message payload");
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: SendMessagePayload = parse_payload(&envelope, "send_message")?;
 
                 let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
                     agent.send_input(AgentInput::SendMessage(payload)).await
@@ -265,10 +176,9 @@ pub(crate) async fn route_client_envelope(
             }
             FrameKind::EditQueuedMessage => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let payload: EditQueuedMessagePayload = envelope
-                    .parse_payload()
-                    .expect("invalid edit_queued_message payload");
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: EditQueuedMessagePayload =
+                    parse_payload(&envelope, "edit_queued_message")?;
 
                 let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
                     agent
@@ -285,10 +195,9 @@ pub(crate) async fn route_client_envelope(
             }
             FrameKind::CancelQueuedMessage => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let payload: CancelQueuedMessagePayload = envelope
-                    .parse_payload()
-                    .expect("invalid cancel_queued_message payload");
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: CancelQueuedMessagePayload =
+                    parse_payload(&envelope, "cancel_queued_message")?;
 
                 let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
                     agent
@@ -305,10 +214,9 @@ pub(crate) async fn route_client_envelope(
             }
             FrameKind::SendQueuedMessageNow => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let payload: SendQueuedMessageNowPayload = envelope
-                    .parse_payload()
-                    .expect("invalid send_queued_message_now payload");
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: SendQueuedMessageNowPayload =
+                    parse_payload(&envelope, "send_queued_message_now")?;
 
                 let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
                     agent
@@ -325,14 +233,9 @@ pub(crate) async fn route_client_envelope(
             }
             FrameKind::SetAgentName => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let payload: SetAgentNamePayload = envelope
-                    .parse_payload()
-                    .expect("invalid set_agent_name payload");
-                assert!(
-                    !payload.name.trim().is_empty(),
-                    "set_agent_name name must not be empty"
-                );
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: SetAgentNamePayload = parse_payload(&envelope, "set_agent_name")?;
+                ensure_non_empty("set_agent_name", "name", payload.name.as_str())?;
 
                 match host.agent_handle(&agent_id).await {
                     Some(agent) => match agent.set_name(payload.name).await {
@@ -351,9 +254,8 @@ pub(crate) async fn route_client_envelope(
             }
             FrameKind::Interrupt => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let _: InterruptPayload =
-                    envelope.parse_payload().expect("invalid interrupt payload");
+                let agent_id = parse_agent_id(&stream_path)?;
+                let _: InterruptPayload = parse_payload(&envelope, "interrupt")?;
 
                 let interrupted = host.interrupt_agent(&agent_id).await;
 
@@ -363,18 +265,15 @@ pub(crate) async fn route_client_envelope(
                 }
             }
             FrameKind::CloseAgent => {
-                let agent_id = parse_agent_id(&envelope.stream);
-                let _: CloseAgentPayload = envelope
-                    .parse_payload()
-                    .expect("invalid close_agent payload");
+                let agent_id = parse_agent_id(&envelope.stream)?;
+                let _: CloseAgentPayload = parse_payload(&envelope, "close_agent")?;
                 host.close_agent(&agent_id).await;
             }
             FrameKind::SetSessionSettings => {
                 let stream_path = envelope.stream.clone();
-                let agent_id = parse_agent_id(&stream_path);
-                let payload: SetSessionSettingsPayload = envelope
-                    .parse_payload()
-                    .expect("invalid set_session_settings payload");
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: SetSessionSettingsPayload =
+                    parse_payload(&envelope, "set_session_settings")?;
 
                 let sent = if let Some(agent) = host.agent_handle(&agent_id).await {
                     agent
@@ -390,304 +289,382 @@ pub(crate) async fn route_client_envelope(
                 }
             }
             other => {
-                panic!(
-                    "protocol violation: unexpected client frame kind {} on agent stream {}",
-                    other, envelope.stream
-                );
+                return Err(AppError::protocol(
+                    "route_client_envelope",
+                    format!(
+                        "unexpected client frame kind {} on agent stream {}",
+                        other, envelope.stream
+                    ),
+                ));
             }
         }
-        return;
+        return Ok(());
     }
 
     if envelope.stream.0.starts_with("/terminal/") {
         let stream_path = envelope.stream.clone();
-        let terminal_id = parse_terminal_id(&stream_path);
+        let terminal_id = parse_terminal_id(&stream_path)?;
 
         match envelope.kind {
             FrameKind::TerminalSend => {
-                let payload: TerminalSendPayload = envelope
-                    .parse_payload()
-                    .expect("invalid terminal_send payload");
+                let payload: TerminalSendPayload = parse_payload(&envelope, "terminal_send")?;
                 host.send_terminal_input(connection_host_stream, &terminal_id, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::TerminalResize => {
-                let payload: TerminalResizePayload = envelope
-                    .parse_payload()
-                    .expect("invalid terminal_resize payload");
-                assert!(
-                    payload.cols >= 2,
-                    "terminal_resize cols must be at least 2, got {}",
-                    payload.cols
-                );
-                assert!(
-                    payload.rows >= 1,
-                    "terminal_resize rows must be at least 1, got {}",
-                    payload.rows
-                );
+                let payload: TerminalResizePayload = parse_payload(&envelope, "terminal_resize")?;
+                validate_terminal_dimensions("terminal_resize", payload.cols, payload.rows)?;
                 host.resize_terminal(connection_host_stream, &terminal_id, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::TerminalClose => {
-                let _: TerminalClosePayload = envelope
-                    .parse_payload()
-                    .expect("invalid terminal_close payload");
+                let _: TerminalClosePayload = parse_payload(&envelope, "terminal_close")?;
                 host.close_terminal(connection_host_stream, &terminal_id)
-                    .await;
+                    .await?;
             }
             other => {
-                panic!(
-                    "protocol violation: unexpected client frame kind {} on terminal stream {}",
-                    other, envelope.stream
-                );
+                return Err(AppError::protocol(
+                    "route_client_envelope",
+                    format!(
+                        "unexpected client frame kind {} on terminal stream {}",
+                        other, envelope.stream
+                    ),
+                ));
             }
         }
-        return;
+        return Ok(());
     }
 
     if envelope.stream.0.starts_with("/project/") {
         let stream_path = envelope.stream.clone();
-        let project_id = parse_project_id(&stream_path);
+        let project_id = parse_project_id(&stream_path)?;
         let project_output_stream = host_output_stream.with_path(stream_path.clone());
 
         match envelope.kind {
             FrameKind::ProjectRefresh => {
-                let payload: ProjectRefreshPayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_refresh payload");
+                let payload: ProjectRefreshPayload = parse_payload(&envelope, "project_refresh")?;
                 host.refresh_project(
                     connection_host_stream,
                     project_output_stream,
                     project_id,
                     payload,
                 )
-                .await;
+                .await?;
             }
             FrameKind::ProjectListDir => {
-                let payload: ProjectListDirPayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_list_dir payload");
-                assert!(
-                    !payload.root.0.trim().is_empty(),
-                    "project_list_dir root must not be empty"
-                );
+                let payload: ProjectListDirPayload = parse_payload(&envelope, "project_list_dir")?;
+                ensure_non_empty("project_list_dir", "root", payload.root.0.as_str())?;
                 host.list_project_dir(&project_output_stream, project_id, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::ProjectReadFile => {
-                let payload: ProjectReadFilePayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_read_file payload");
-                assert!(
-                    !payload.path.root.0.trim().is_empty(),
-                    "project_read_file root must not be empty"
-                );
-                assert!(
-                    !payload.path.relative_path.trim().is_empty(),
-                    "project_read_file relative_path must not be empty"
-                );
+                let payload: ProjectReadFilePayload =
+                    parse_payload(&envelope, "project_read_file")?;
+                ensure_non_empty("project_read_file", "root", payload.path.root.0.as_str())?;
+                ensure_non_empty(
+                    "project_read_file",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
                 host.read_project_file(&project_output_stream, project_id, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::ProjectReadDiff => {
-                let payload: ProjectReadDiffPayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_read_diff payload");
-                assert!(
-                    !payload.root.0.trim().is_empty(),
-                    "project_read_diff root must not be empty"
-                );
+                let payload: ProjectReadDiffPayload =
+                    parse_payload(&envelope, "project_read_diff")?;
+                ensure_non_empty("project_read_diff", "root", payload.root.0.as_str())?;
                 if let Some(path) = &payload.path {
-                    assert!(
-                        !path.trim().is_empty(),
-                        "project_read_diff path must not be empty when provided"
-                    );
+                    ensure_non_empty("project_read_diff", "path", path.as_str())?;
                 }
                 host.read_project_diff(&project_output_stream, project_id, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::ProjectStageFile => {
-                let payload: ProjectStageFilePayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_stage_file payload");
-                assert!(
-                    !payload.path.root.0.trim().is_empty(),
-                    "project_stage_file root must not be empty"
-                );
-                assert!(
-                    !payload.path.relative_path.trim().is_empty(),
-                    "project_stage_file relative_path must not be empty"
-                );
+                let payload: ProjectStageFilePayload =
+                    parse_payload(&envelope, "project_stage_file")?;
+                ensure_non_empty("project_stage_file", "root", payload.path.root.0.as_str())?;
+                ensure_non_empty(
+                    "project_stage_file",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
                 host.stage_project_file(
                     connection_host_stream,
                     project_output_stream,
                     project_id,
                     payload,
                 )
-                .await;
+                .await?;
             }
             FrameKind::ProjectStageHunk => {
-                let payload: ProjectStageHunkPayload = envelope
-                    .parse_payload()
-                    .expect("invalid project_stage_hunk payload");
-                assert!(
-                    !payload.path.root.0.trim().is_empty(),
-                    "project_stage_hunk root must not be empty"
-                );
-                assert!(
-                    !payload.path.relative_path.trim().is_empty(),
-                    "project_stage_hunk relative_path must not be empty"
-                );
-                assert!(
-                    !payload.hunk_id.trim().is_empty(),
-                    "project_stage_hunk hunk_id must not be empty"
-                );
+                let payload: ProjectStageHunkPayload =
+                    parse_payload(&envelope, "project_stage_hunk")?;
+                ensure_non_empty("project_stage_hunk", "root", payload.path.root.0.as_str())?;
+                ensure_non_empty(
+                    "project_stage_hunk",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
+                ensure_non_empty("project_stage_hunk", "hunk_id", payload.hunk_id.as_str())?;
                 host.stage_project_hunk(
                     connection_host_stream,
                     project_output_stream,
                     project_id,
                     payload,
                 )
-                .await;
+                .await?;
             }
             other => {
-                panic!(
-                    "protocol violation: unexpected client frame kind {} on project stream {}",
-                    other, envelope.stream
-                );
+                return Err(AppError::protocol(
+                    "route_client_envelope",
+                    format!(
+                        "unexpected client frame kind {} on project stream {}",
+                        other, envelope.stream
+                    ),
+                ));
             }
         }
-        return;
+        return Ok(());
     }
 
     if envelope.stream.0.starts_with("/browse/") {
         let stream_path = envelope.stream.clone();
         match envelope.kind {
             FrameKind::HostBrowseList => {
-                let payload: HostBrowseListPayload = envelope
-                    .parse_payload()
-                    .expect("invalid host_browse_list payload");
-                assert!(
-                    !payload.path.0.trim().is_empty(),
-                    "host_browse_list path must not be empty"
-                );
+                let payload: HostBrowseListPayload = parse_payload(&envelope, "host_browse_list")?;
+                ensure_non_empty("host_browse_list", "path", payload.path.0.as_str())?;
                 host.list_browse_dir(connection_host_stream, &stream_path, payload)
-                    .await;
+                    .await?;
             }
             FrameKind::HostBrowseClose => {
-                let _: HostBrowseClosePayload = envelope
-                    .parse_payload()
-                    .expect("invalid host_browse_close payload");
+                let _: HostBrowseClosePayload = parse_payload(&envelope, "host_browse_close")?;
                 host.close_browse_stream(connection_host_stream, &stream_path)
                     .await;
             }
             other => {
-                panic!(
-                    "protocol violation: unexpected client frame kind {} on browse stream {}",
-                    other, envelope.stream
-                );
+                return Err(AppError::protocol(
+                    "route_client_envelope",
+                    format!(
+                        "unexpected client frame kind {} on browse stream {}",
+                        other, envelope.stream
+                    ),
+                ));
             }
         }
-        return;
+        return Ok(());
     }
 
-    panic!(
-        "protocol violation: unknown stream {} from client",
-        envelope.stream
-    );
+    Err(AppError::protocol(
+        "route_client_envelope",
+        format!("unknown stream {} from client", envelope.stream),
+    ))
 }
 
-fn parse_agent_id(stream: &StreamPath) -> AgentId {
-    let segments: Vec<&str> = stream.0.split('/').collect();
-    assert_eq!(
-        segments.len(),
-        4,
-        "agent stream must have format /agent/<agent_id>/<instance_id>, got {}",
-        stream
-    );
-    assert!(
-        segments.first() == Some(&""),
-        "agent stream must be absolute path, got {}",
-        stream
-    );
-    assert_eq!(
-        segments[1], "agent",
-        "send_message must target /agent/<agent_id>/<instance_id>, got {}",
-        stream
-    );
-
-    Uuid::parse_str(segments[2]).unwrap_or_else(|err| {
-        panic!(
-            "agent stream contains invalid agent_id UUID {} in {}: {}",
-            segments[2], stream, err
+fn parse_payload<T: DeserializeOwned>(
+    envelope: &Envelope,
+    operation: &'static str,
+) -> AppResult<T> {
+    envelope.parse_payload().map_err(|error| {
+        AppError::invalid_with_source(
+            operation,
+            format!("invalid {operation} payload: {error}"),
+            error,
         )
-    });
-    Uuid::parse_str(segments[3]).unwrap_or_else(|err| {
-        panic!(
-            "agent stream contains invalid instance_id UUID {} in {}: {}",
-            segments[3], stream, err
-        )
-    });
-
-    AgentId(segments[2].to_owned())
+    })
 }
 
-fn parse_project_id(stream: &StreamPath) -> ProjectId {
-    let segments: Vec<&str> = stream.0.split('/').collect();
-    assert_eq!(
-        segments.len(),
-        3,
-        "project stream must have format /project/<project_id>, got {}",
-        stream
-    );
-    assert!(
-        segments.first() == Some(&""),
-        "project stream must be absolute path, got {}",
-        stream
-    );
-    assert_eq!(
-        segments[1], "project",
-        "expected /project/<project_id> stream, got {}",
-        stream
-    );
+fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
+    if let Some(name) = payload.name.as_ref() {
+        ensure_non_empty("spawn_agent", "name", name)?;
+    }
 
-    Uuid::parse_str(segments[2]).unwrap_or_else(|err| {
-        panic!(
-            "project stream contains invalid project_id UUID {} in {}: {}",
-            segments[2], stream, err
-        )
-    });
+    match &payload.params {
+        SpawnAgentParams::New {
+            workspace_roots,
+            prompt,
+            images,
+            ..
+        } => {
+            for root in workspace_roots {
+                ensure_non_empty("spawn_agent", "workspace_root", root)?;
+            }
+            if prompt.trim().is_empty() && images.as_ref().is_none_or(|images| images.is_empty()) {
+                return Err(AppError::invalid(
+                    "spawn_agent",
+                    "new prompt must not be empty unless images are attached",
+                ));
+            }
+        }
+        SpawnAgentParams::Resume { session_id, .. } => {
+            ensure_non_empty("spawn_agent", "session_id", session_id.0.as_str())?;
+        }
+    }
 
-    ProjectId(segments[2].to_owned())
+    Ok(())
 }
 
-fn parse_terminal_id(stream: &StreamPath) -> TerminalId {
+fn validate_project_reorder(payload: &ProjectReorderPayload) -> AppResult<()> {
+    let mut seen_ids = HashSet::new();
+    for project_id in &payload.project_ids {
+        ensure_non_empty("project_reorder", "project_id", project_id.0.as_str())?;
+        if !seen_ids.insert(project_id.0.clone()) {
+            return Err(AppError::invalid(
+                "project_reorder",
+                format!("contains duplicate id {}", project_id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_dimensions(operation: &'static str, cols: u16, rows: u16) -> AppResult<()> {
+    if cols < 2 {
+        return Err(AppError::invalid(
+            operation,
+            format!("cols must be at least 2, got {cols}"),
+        ));
+    }
+    if rows < 1 {
+        return Err(AppError::invalid(
+            operation,
+            format!("rows must be at least 1, got {rows}"),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_non_empty(operation: &'static str, field: &'static str, value: &str) -> AppResult<()> {
+    if value.trim().is_empty() {
+        return Err(AppError::invalid(
+            operation,
+            format!("{field} must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_agent_id(stream: &StreamPath) -> AppResult<AgentId> {
     let segments: Vec<&str> = stream.0.split('/').collect();
-    assert_eq!(
-        segments.len(),
-        3,
-        "terminal stream must have format /terminal/<terminal_id>, got {}",
-        stream
-    );
-    assert!(
-        segments.first() == Some(&""),
-        "terminal stream must be absolute path, got {}",
-        stream
-    );
-    assert_eq!(
-        segments[1], "terminal",
-        "expected /terminal/<terminal_id> stream, got {}",
-        stream
-    );
+    if segments.len() != 4 {
+        return Err(AppError::protocol(
+            "parse_agent_stream",
+            format!(
+                "agent stream must have format /agent/<agent_id>/<instance_id>, got {}",
+                stream
+            ),
+        ));
+    }
+    if segments.first() != Some(&"") {
+        return Err(AppError::protocol(
+            "parse_agent_stream",
+            format!("agent stream must be absolute path, got {}", stream),
+        ));
+    }
+    if segments[1] != "agent" {
+        return Err(AppError::protocol(
+            "parse_agent_stream",
+            format!("expected /agent/<agent_id>/<instance_id>, got {}", stream),
+        ));
+    }
 
-    Uuid::parse_str(segments[2]).unwrap_or_else(|err| {
-        panic!(
-            "terminal stream contains invalid terminal_id UUID {} in {}: {}",
-            segments[2], stream, err
+    Uuid::parse_str(segments[2]).map_err(|error| {
+        AppError::protocol(
+            "parse_agent_stream",
+            format!(
+                "agent stream contains invalid agent_id UUID {} in {}",
+                segments[2], stream
+            ),
         )
-    });
+        .with_source(anyhow!(error))
+    })?;
+    Uuid::parse_str(segments[3]).map_err(|error| {
+        AppError::protocol(
+            "parse_agent_stream",
+            format!(
+                "agent stream contains invalid instance_id UUID {} in {}",
+                segments[3], stream
+            ),
+        )
+        .with_source(anyhow!(error))
+    })?;
 
-    TerminalId(segments[2].to_owned())
+    Ok(AgentId(segments[2].to_owned()))
+}
+
+fn parse_project_id(stream: &StreamPath) -> AppResult<ProjectId> {
+    let segments: Vec<&str> = stream.0.split('/').collect();
+    if segments.len() != 3 {
+        return Err(AppError::protocol(
+            "parse_project_stream",
+            format!(
+                "project stream must have format /project/<project_id>, got {}",
+                stream
+            ),
+        ));
+    }
+    if segments.first() != Some(&"") {
+        return Err(AppError::protocol(
+            "parse_project_stream",
+            format!("project stream must be absolute path, got {}", stream),
+        ));
+    }
+    if segments[1] != "project" {
+        return Err(AppError::protocol(
+            "parse_project_stream",
+            format!("expected /project/<project_id> stream, got {}", stream),
+        ));
+    }
+
+    Uuid::parse_str(segments[2]).map_err(|error| {
+        AppError::protocol(
+            "parse_project_stream",
+            format!(
+                "project stream contains invalid project_id UUID {} in {}",
+                segments[2], stream
+            ),
+        )
+        .with_source(anyhow!(error))
+    })?;
+
+    Ok(ProjectId(segments[2].to_owned()))
+}
+
+fn parse_terminal_id(stream: &StreamPath) -> AppResult<TerminalId> {
+    let segments: Vec<&str> = stream.0.split('/').collect();
+    if segments.len() != 3 {
+        return Err(AppError::protocol(
+            "parse_terminal_stream",
+            format!(
+                "terminal stream must have format /terminal/<terminal_id>, got {}",
+                stream
+            ),
+        ));
+    }
+    if segments.first() != Some(&"") {
+        return Err(AppError::protocol(
+            "parse_terminal_stream",
+            format!("terminal stream must be absolute path, got {}", stream),
+        ));
+    }
+    if segments[1] != "terminal" {
+        return Err(AppError::protocol(
+            "parse_terminal_stream",
+            format!("expected /terminal/<terminal_id> stream, got {}", stream),
+        ));
+    }
+
+    Uuid::parse_str(segments[2]).map_err(|error| {
+        AppError::protocol(
+            "parse_terminal_stream",
+            format!(
+                "terminal stream contains invalid terminal_id UUID {} in {}",
+                segments[2], stream
+            ),
+        )
+        .with_source(anyhow!(error))
+    })?;
+
+    Ok(TerminalId(segments[2].to_owned()))
 }
 
 async fn send_agent_not_running_error(stream: Stream, agent_id: AgentId) {
@@ -697,24 +674,38 @@ async fn send_agent_not_running_error(stream: Stream, agent_id: AgentId) {
         message: "agent not running".to_owned(),
         fatal: false,
     };
-    let payload = serde_json::to_value(&payload)
-        .expect("failed to serialize AgentError payload for stream error emission");
-    let _ = stream.send_value(FrameKind::AgentError, payload).await;
+    match serde_json::to_value(&payload) {
+        Ok(payload) => {
+            let _ = stream.send_value(FrameKind::AgentError, payload).await;
+        }
+        Err(error) => {
+            tracing::error!(
+                agent_id = %payload.agent_id,
+                error = %error,
+                "failed to serialize AgentError payload for stream error emission"
+            );
+        }
+    }
 }
 
-fn validate_project_roots(roots: &[String]) {
-    assert!(
-        !roots.is_empty(),
-        "project_create requires at least one root"
-    );
-    assert!(
-        roots.iter().all(|root| !root.trim().is_empty()),
-        "project roots must not contain empty values"
-    );
-
-    let mut seen = std::collections::HashSet::new();
-    for root in roots {
-        let inserted = seen.insert(root.as_str());
-        assert!(inserted, "project roots must be unique: {}", root);
+fn validate_project_roots(roots: &[String]) -> AppResult<()> {
+    if roots.is_empty() {
+        return Err(AppError::invalid(
+            "project_create",
+            "requires at least one root",
+        ));
     }
+
+    let mut seen = HashSet::new();
+    for root in roots {
+        ensure_non_empty("project_create", "root", root)?;
+        if !seen.insert(root.as_str()) {
+            return Err(AppError::invalid(
+                "project_create",
+                format!("roots must be unique: {}", root),
+            ));
+        }
+    }
+
+    Ok(())
 }

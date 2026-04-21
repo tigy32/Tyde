@@ -14,7 +14,7 @@ use protocol::{
     SteeringScope, ToolPolicy,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::send::{
     custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert, skill_refresh,
@@ -591,7 +591,7 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Add Remote Host"</label>
-            <p class="settings-description">"Configure a remote host that Tyde can connect to over SSH."</p>
+            <p class="settings-description">"Configure a remote host that Tyde can connect to over SSH. The default remote command is `tyde host --bridge-uds`, which expects a running remote `tyde host --uds` daemon."</p>
             <div class="settings-form">
                 <div class="settings-form-row">
                     <label class="settings-form-label">
@@ -620,7 +620,7 @@ fn HostsTab() -> impl IntoView {
                     <input
                         class="settings-text-input"
                         type="text"
-                        placeholder="tyde host --stdio"
+                        placeholder="tyde host --bridge-uds"
                         prop:value=move || remote_command_sig.get()
                         on:input=move |ev| remote_command_sig.set(event_target_value(&ev))
                     />
@@ -825,7 +825,8 @@ fn BackendsTab() -> impl IntoView {
                                     None
                                 } else {
                                     let Some(kind) = parse_backend_kind(&el.value()) else {
-                                        unreachable!("unknown backend value {} in select", el.value());
+                                        log::error!("unknown backend value {} in select", el.value());
+                                        return;
                                     };
                                     Some(kind)
                                 };
@@ -985,9 +986,8 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
             let target = ev.target().unwrap();
             let input: web_sys::HtmlInputElement = target.unchecked_into();
             let Some(settings) = state.selected_host_settings_untracked() else {
-                unreachable!(
-                    "backend toggle fired before host settings loaded; checkbox must be disabled"
-                );
+                log::error!("backend toggle fired before host settings loaded");
+                return;
             };
 
             let enabled_backends = all_backends()
@@ -1113,16 +1113,15 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
 
 fn send_run_backend_setup(state: &AppState, backend_kind: BackendKind, action: BackendSetupAction) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
-        unreachable!(
-            "send_run_backend_setup: Install/Sign-in buttons only appear when a host stream exists"
-        );
+        log::error!("send_run_backend_setup called without a selected host stream");
+        return;
     };
 
     state.bottom_dock.set(crate::state::DockVisibility::Visible);
     state.pending_terminal_focus.set(Some(host_id.clone()));
 
     spawn_local(async move {
-        send_frame(
+        if let Err(error) = send_frame(
             &host_id,
             host_stream,
             FrameKind::RunBackendSetup,
@@ -1132,7 +1131,9 @@ fn send_run_backend_setup(state: &AppState, backend_kind: BackendKind, action: B
             },
         )
         .await
-        .expect("failed to send RunBackendSetup");
+        {
+            log::error!("failed to send RunBackendSetup: {error}");
+        }
     });
 }
 
@@ -1156,18 +1157,21 @@ fn backend_setup_status_class(info: Option<&BackendSetupInfo>) -> &'static str {
 
 fn send_host_setting(state: &AppState, setting: HostSettingValue) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
-        unreachable!("send_host_setting: setting toggles are disabled when no host stream exists");
+        log::error!("send_host_setting called without a selected host stream");
+        return;
     };
 
     spawn_local(async move {
-        send_frame(
+        if let Err(error) = send_frame(
             &host_id,
             host_stream,
             FrameKind::SetSetting,
             &SetSettingPayload { setting },
         )
         .await
-        .expect("failed to send SetSetting");
+        {
+            log::error!("failed to send SetSetting: {error}");
+        }
     });
 }
 
@@ -1354,21 +1358,36 @@ impl CustomAgentForm {
         }
     }
 
-    fn to_custom_agent(&self) -> CustomAgent {
+    fn validate_and_build(&self) -> Result<CustomAgent, String> {
+        let name = self.name.get_untracked().trim().to_string();
+        if name.is_empty() {
+            return Err("Name is required.".to_string());
+        }
+
+        let description = self.description.get_untracked().trim().to_string();
+        if description.is_empty() {
+            return Err("Description is required.".to_string());
+        }
+
         let tool_policy = match self.tool_policy_kind.get_untracked() {
             ToolPolicyKind::Unrestricted => ToolPolicy::Unrestricted,
-            ToolPolicyKind::AllowList => ToolPolicy::AllowList {
-                tools: parse_tool_list(&self.tool_policy_tools.get_untracked()),
-            },
-            ToolPolicyKind::DenyList => ToolPolicy::DenyList {
-                tools: parse_tool_list(&self.tool_policy_tools.get_untracked()),
-            },
+            ToolPolicyKind::AllowList => {
+                let tools = parse_tool_list(&self.tool_policy_tools.get_untracked());
+                validate_tool_policy_tools(&tools)?;
+                ToolPolicy::AllowList { tools }
+            }
+            ToolPolicyKind::DenyList => {
+                let tools = parse_tool_list(&self.tool_policy_tools.get_untracked());
+                validate_tool_policy_tools(&tools)?;
+                ToolPolicy::DenyList { tools }
+            }
         };
+
         let instructions = self.instructions.get_untracked().trim().to_string();
-        CustomAgent {
+        Ok(CustomAgent {
             id: self.id.clone(),
-            name: self.name.get_untracked().trim().to_string(),
-            description: self.description.get_untracked().trim().to_string(),
+            name,
+            description,
             instructions: if instructions.is_empty() {
                 None
             } else {
@@ -1377,8 +1396,27 @@ impl CustomAgentForm {
             skill_ids: self.skill_ids.get_untracked(),
             mcp_server_ids: self.mcp_server_ids.get_untracked(),
             tool_policy,
+        })
+    }
+}
+
+fn validate_tool_policy_tools(tools: &[String]) -> Result<(), String> {
+    if tools.is_empty() {
+        return Err("Tool policy must include at least one tool.".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    for tool in tools {
+        let trimmed = tool.trim();
+        if trimmed.is_empty() {
+            return Err("Tool policy must not include blank tool names.".to_string());
+        }
+        if !seen.insert(trimmed.to_string()) {
+            return Err(format!("Tool policy contains duplicate tool '{trimmed}'."));
         }
     }
+
+    Ok(())
 }
 
 #[component]
@@ -1466,9 +1504,9 @@ fn CustomAgentsTab() -> impl IntoView {
             return;
         };
         spawn_local(async move {
-            custom_agent_delete(&host_id, host_stream, id)
-                .await
-                .expect("failed to send custom_agent_delete");
+            if let Err(error) = custom_agent_delete(&host_id, host_stream, id).await {
+                log::error!("failed to send custom_agent_delete: {error}");
+            }
         });
     });
 
@@ -1626,25 +1664,32 @@ fn CustomAgentEditor(
 
     let form_for_save = form.clone();
     let state_for_save = state.clone();
+    let error_sig_for_save = error_sig;
+    let editor_signal_for_save = editor_signal;
     let on_save = move |_| {
-        if form_for_save.name.get_untracked().trim().is_empty() {
-            error_sig.set(Some("Name is required.".to_string()));
-            return;
-        }
+        let custom_agent = match form_for_save.validate_and_build() {
+            Ok(custom_agent) => custom_agent,
+            Err(error) => {
+                error_sig_for_save.set(Some(error));
+                return;
+            }
+        };
         let Some(host_id) = state_for_save.selected_host_id.get_untracked() else {
-            unreachable!("save custom agent: editor opened without a selected host");
+            error_sig_for_save.set(Some("No host selected.".to_string()));
+            return;
         };
         let Some((host_id, host_stream)) = host_stream_with_id(&state_for_save, &host_id) else {
-            error_sig.set(Some("Host is not connected.".to_string()));
+            error_sig_for_save.set(Some("Host is not connected.".to_string()));
             return;
         };
-        error_sig.set(None);
-        let custom_agent = form_for_save.to_custom_agent();
-        editor_signal.set(None);
+        error_sig_for_save.set(None);
         spawn_local(async move {
-            custom_agent_upsert(&host_id, host_stream, custom_agent)
-                .await
-                .expect("failed to send custom_agent_upsert");
+            match custom_agent_upsert(&host_id, host_stream, custom_agent).await {
+                Ok(()) => editor_signal_for_save.set(None),
+                Err(error) => {
+                    error_sig_for_save.set(Some(format!("Failed to save custom agent: {error}")))
+                }
+            }
         });
     };
 
@@ -1989,9 +2034,9 @@ fn McpServersTab() -> impl IntoView {
             return;
         };
         spawn_local(async move {
-            mcp_server_delete(&host_id, host_stream, id)
-                .await
-                .expect("failed to send mcp_server_delete");
+            if let Err(error) = mcp_server_delete(&host_id, host_stream, id).await {
+                log::error!("failed to send mcp_server_delete: {error}");
+            }
         });
     });
 
@@ -2111,27 +2156,32 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
 
     let form_for_save = form.clone();
     let state_for_save = state.clone();
+    let error_sig_for_save = error_sig;
+    let editor_signal_for_save = editor_signal;
     let on_save = move |_| {
         let server = match form_for_save.validate_and_build() {
             Ok(server) => server,
             Err(err) => {
-                error_sig.set(Some(err));
+                error_sig_for_save.set(Some(err));
                 return;
             }
         };
         let Some(host_id) = state_for_save.selected_host_id.get_untracked() else {
-            error_sig.set(Some("No host selected".to_string()));
+            error_sig_for_save.set(Some("No host selected".to_string()));
             return;
         };
         let Some((host_id, host_stream)) = host_stream_with_id(&state_for_save, &host_id) else {
-            error_sig.set(Some("Host stream missing".to_string()));
+            error_sig_for_save.set(Some("Host stream missing".to_string()));
             return;
         };
-        editor_signal.set(None);
+        error_sig_for_save.set(None);
         spawn_local(async move {
-            mcp_server_upsert(&host_id, host_stream, server)
-                .await
-                .expect("failed to send mcp_server_upsert");
+            match mcp_server_upsert(&host_id, host_stream, server).await {
+                Ok(()) => editor_signal_for_save.set(None),
+                Err(error) => {
+                    error_sig_for_save.set(Some(format!("Failed to save MCP server: {error}")))
+                }
+            }
         });
     };
 
@@ -2342,9 +2392,9 @@ fn SteeringTab() -> impl IntoView {
             return;
         };
         spawn_local(async move {
-            steering_delete(&host_id, host_stream, id)
-                .await
-                .expect("failed to send steering_delete");
+            if let Err(error) = steering_delete(&host_id, host_stream, id).await {
+                log::error!("failed to send steering_delete: {error}");
+            }
         });
     });
 
@@ -2481,25 +2531,29 @@ fn SteeringEditor(
 
     let form_for_save = form.clone();
     let state_for_save = state.clone();
+    let steering_error_sig_for_save = steering_error_sig;
+    let editor_signal_for_save = editor_signal;
     let on_save = move |_| {
         if form_for_save.title.get_untracked().trim().is_empty() {
-            steering_error_sig.set(Some("Title is required.".to_string()));
+            steering_error_sig_for_save.set(Some("Title is required.".to_string()));
             return;
         }
         let Some(host_id) = state_for_save.selected_host_id.get_untracked() else {
-            unreachable!("save steering: editor opened without a selected host");
-        };
-        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_save, &host_id) else {
-            steering_error_sig.set(Some("Host is not connected.".to_string()));
+            steering_error_sig_for_save.set(Some("No host selected.".to_string()));
             return;
         };
-        steering_error_sig.set(None);
+        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_save, &host_id) else {
+            steering_error_sig_for_save.set(Some("Host is not connected.".to_string()));
+            return;
+        };
+        steering_error_sig_for_save.set(None);
         let steering = form_for_save.to_steering();
-        editor_signal.set(None);
         spawn_local(async move {
-            steering_upsert(&host_id, host_stream, steering)
-                .await
-                .expect("failed to send steering_upsert");
+            match steering_upsert(&host_id, host_stream, steering).await {
+                Ok(()) => editor_signal_for_save.set(None),
+                Err(error) => steering_error_sig_for_save
+                    .set(Some(format!("Failed to save steering: {error}"))),
+            }
         });
     };
 
@@ -2588,15 +2642,17 @@ fn SkillsTab() -> impl IntoView {
     let state_for_refresh_disabled = state.clone();
     let on_refresh = move |_| {
         let Some(host_id) = state_for_refresh.selected_host_id.get_untracked() else {
-            unreachable!("skills: Refresh button must be disabled when no host selected");
+            log::error!("skills: refresh clicked without a selected host");
+            return;
         };
         let Some((host_id, host_stream)) = host_stream_with_id(&state_for_refresh, &host_id) else {
-            unreachable!("skills: Refresh button must be disabled when host stream missing");
+            log::error!("skills: refresh clicked without a host stream");
+            return;
         };
         spawn_local(async move {
-            skill_refresh(&host_id, host_stream)
-                .await
-                .expect("failed to send skill_refresh");
+            if let Err(error) = skill_refresh(&host_id, host_stream).await {
+                log::error!("failed to send skill_refresh: {error}");
+            }
         });
     };
 

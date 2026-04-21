@@ -1,8 +1,10 @@
 mod bridge;
 mod dev_host;
 mod devtools;
+mod host_bridge_uds;
 mod host_stdio;
 mod host_store;
+mod host_uds;
 mod logging;
 mod router;
 
@@ -184,4 +186,12 @@ pub fn run() {
 
 pub fn run_host_stdio() -> Result<(), String> {
     host_stdio::run()
+}
+
+pub fn run_host_uds() -> Result<(), String> {
+    host_uds::run()
+}
+
+pub fn run_host_bridge_uds() -> Result<(), String> {
+    host_bridge_uds::run()
 }

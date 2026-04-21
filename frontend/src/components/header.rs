@@ -16,13 +16,18 @@ pub fn Header() -> impl IntoView {
 
         let selected = status_text_state.selected_host();
         let selected_status = status_text_state.selected_host_connection_status();
+        let selected_command_error = status_text_state.selected_host_command_error();
         let selected_label = selected
             .map(|host| host.label)
             .unwrap_or_else(|| "No host".to_string());
 
         match selected_status {
             ConnectionStatus::Connected => {
-                format!("{connected}/{total} hosts connected · {selected_label}")
+                let base = format!("{connected}/{total} hosts connected · {selected_label}");
+                match selected_command_error {
+                    Some(error) => format!("{base} · last error: {error}"),
+                    None => base,
+                }
             }
             ConnectionStatus::Connecting => format!("Connecting to {selected_label}"),
             ConnectionStatus::Disconnected => {

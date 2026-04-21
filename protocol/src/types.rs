@@ -238,6 +238,7 @@ pub enum FrameKind {
     HostBrowseOpened,
     HostBrowseEntries,
     HostBrowseError,
+    CommandError,
     SessionSchemas,
     SessionSettings,
 }
@@ -312,6 +313,7 @@ impl fmt::Display for FrameKind {
             Self::HostBrowseOpened => f.write_str("host_browse_opened"),
             Self::HostBrowseEntries => f.write_str("host_browse_entries"),
             Self::HostBrowseError => f.write_str("host_browse_error"),
+            Self::CommandError => f.write_str("command_error"),
             Self::SetSessionSettings => f.write_str("set_session_settings"),
             Self::SessionSchemas => f.write_str("session_schemas"),
             Self::SessionSettings => f.write_str("session_settings"),
@@ -1275,6 +1277,26 @@ pub enum TerminalErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalErrorPayload {
     pub code: TerminalErrorCode,
+    pub message: String,
+    pub fatal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandErrorCode {
+    InvalidInput,
+    NotFound,
+    Conflict,
+    Internal,
+    ProtocolViolation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandErrorPayload {
+    pub stream: StreamPath,
+    pub request_kind: FrameKind,
+    pub operation: String,
+    pub code: CommandErrorCode,
     pub message: String,
     pub fatal: bool,
 }

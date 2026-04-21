@@ -29,7 +29,8 @@ pub enum HostTransportConfig {
     /// exactly one of these, with id = `LOCAL_HOST_ID`.
     LocalEmbedded,
     /// Spawn `ssh <destination> [remote_command]` and speak NDJSON over its
-    /// stdio streams.
+    /// stdio streams. For persistent remote hosts, the remote command is a
+    /// thin bridge like `tyde host --bridge-uds`.
     SshStdio {
         ssh_destination: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

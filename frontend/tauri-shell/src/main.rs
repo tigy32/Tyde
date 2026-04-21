@@ -1,6 +1,8 @@
 enum CliMode {
     Gui,
     HostStdio,
+    HostUds,
+    HostBridgeUds,
     Help,
     Error(String),
 }
@@ -10,6 +12,18 @@ fn main() {
         CliMode::Gui => tauri_shell::run(),
         CliMode::HostStdio => {
             if let Err(err) = tauri_shell::run_host_stdio() {
+                eprintln!("ERROR: {err}");
+                std::process::exit(1);
+            }
+        }
+        CliMode::HostUds => {
+            if let Err(err) = tauri_shell::run_host_uds() {
+                eprintln!("ERROR: {err}");
+                std::process::exit(1);
+            }
+        }
+        CliMode::HostBridgeUds => {
+            if let Err(err) = tauri_shell::run_host_bridge_uds() {
                 eprintln!("ERROR: {err}");
                 std::process::exit(1);
             }
@@ -47,6 +61,14 @@ where
         return CliMode::HostStdio;
     }
 
+    if args.as_slice() == ["host", "--uds"] {
+        return CliMode::HostUds;
+    }
+
+    if args.as_slice() == ["host", "--bridge-uds"] {
+        return CliMode::HostBridgeUds;
+    }
+
     if args.len() == 2
         && args.iter().any(|arg| arg == "--headless")
         && args.iter().any(|arg| arg == "--stdio")
@@ -54,13 +76,29 @@ where
         return CliMode::HostStdio;
     }
 
+    if args.len() == 2
+        && args.iter().any(|arg| arg == "--headless")
+        && args.iter().any(|arg| arg == "--uds")
+    {
+        return CliMode::HostUds;
+    }
+
+    if args.len() == 2
+        && args.iter().any(|arg| arg == "--headless")
+        && args.iter().any(|arg| arg == "--bridge-uds")
+    {
+        return CliMode::HostBridgeUds;
+    }
+
     match args.as_slice() {
-        [host] if host == "host" => {
-            CliMode::Error("missing --stdio for host mode; use `tyde host --stdio`".to_owned())
-        }
-        [headless] if headless == "--headless" => {
-            CliMode::Error("headless mode requires --stdio; use `tyde host --stdio`".to_owned())
-        }
+        [host] if host == "host" => CliMode::Error(
+            "missing transport for host mode; use `tyde host --stdio`, `tyde host --uds`, or `tyde host --bridge-uds`"
+                .to_owned(),
+        ),
+        [headless] if headless == "--headless" => CliMode::Error(
+            "headless mode requires --stdio, --uds, or --bridge-uds; use `tyde host --stdio`, `tyde host --uds`, or `tyde host --bridge-uds`"
+                .to_owned(),
+        ),
         _ => CliMode::Error(format!("unknown arguments: {}", args.join(" "))),
     }
 }
@@ -69,7 +107,11 @@ fn print_usage() {
     println!("Usage:");
     println!("  tyde                    Run the Tyde desktop app");
     println!("  tyde host --stdio       Run a Tyde host over stdin/stdout");
+    println!("  tyde host --uds         Run a Tyde host over ~/.tyde/tyde.sock");
+    println!("  tyde host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
     println!("  tyde --headless --stdio Alias for `tyde host --stdio`");
+    println!("  tyde --headless --uds   Alias for `tyde host --uds`");
+    println!("  tyde --headless --bridge-uds Alias for `tyde host --bridge-uds`");
 }
 
 #[cfg(test)]
@@ -98,10 +140,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_host_uds_subcommand() {
+        assert!(matches!(
+            parse_cli_mode(vec!["host".to_string(), "--uds".to_string()]),
+            CliMode::HostUds
+        ));
+    }
+
+    #[test]
+    fn parses_host_bridge_uds_subcommand() {
+        assert!(matches!(
+            parse_cli_mode(vec!["host".to_string(), "--bridge-uds".to_string()]),
+            CliMode::HostBridgeUds
+        ));
+    }
+
+    #[test]
     fn parses_headless_stdio_alias() {
         assert!(matches!(
             parse_cli_mode(vec!["--headless".to_string(), "--stdio".to_string()]),
             CliMode::HostStdio
+        ));
+    }
+
+    #[test]
+    fn parses_headless_uds_alias() {
+        assert!(matches!(
+            parse_cli_mode(vec!["--headless".to_string(), "--uds".to_string()]),
+            CliMode::HostUds
+        ));
+    }
+
+    #[test]
+    fn parses_headless_bridge_uds_alias() {
+        assert!(matches!(
+            parse_cli_mode(vec!["--headless".to_string(), "--bridge-uds".to_string()]),
+            CliMode::HostBridgeUds
         ));
     }
 

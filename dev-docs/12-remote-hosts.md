@@ -260,7 +260,7 @@ pub enum HostTransportConfig {
         ssh_destination: String,
 
         /// Optional remote command override. If absent, the shell uses the
-        /// default Tyde host-stdio command.
+        /// default Tyde SSH bridge command (`tyde host --bridge-uds`).
         remote_command: Option<String>,
     },
 }
@@ -398,36 +398,71 @@ The important point is that both transports end up as the same raw line stream.
 Remote host support requires a remote Tyde host endpoint that speaks the normal
 Tyde wire protocol over a byte stream.
 
-For the first slice, the cleanest contract is:
+The transport seen by the shell remains:
 
 ```text
-ssh -T <destination> <tyde-host-stdio-command>
+ssh -T <destination> <remote_command>
 ```
 
-Where the remote command is something like:
+For a **persistent remote host**, `<remote_command>` should be a thin bridge:
 
-- `tyde-server host-stdio`
-- or `tyde host --stdio`
+```text
+tyde host --bridge-uds
+```
 
-The exact binary/CLI name can be decided separately, but the architectural
-requirement is clear:
+That bridge command:
 
-**the remote endpoint must be a real Tyde host server, not a remote Tauri shell
-and not a backend-specific SSH shim.**
+- connects to a long-lived remote Tyde host listening on a Unix socket
+- forwards SSH stdin -> socket
+- forwards socket -> SSH stdout
+- owns no product state and parses no Tyde frames
 
-This aligns directly with `02-protocol.md`, which already defines the transport
-in terms of a generic bidirectional byte stream carrying NDJSON frames.
+The long-lived remote host process is a separate command:
 
-### 9.1 Why stdio-over-SSH
+```text
+tyde host --uds
+```
 
-It fits the current architecture well:
+It listens on `~/.tyde/tyde.sock` by default, or `TYDE_SOCKET_PATH` when
+explicitly configured.
+
+This split is important:
+
+- the **authoritative host** is the long-lived `tyde host --uds` process
+- the **SSH-executed command** is only a transport bridge into that host
+
+That still satisfies the architecture:
+
+- the shell sees one bidirectional byte stream
+- the normal typed Tyde protocol flows unchanged over that stream
+- the bridge adds no business logic
+
+`tyde host --stdio` remains a valid explicit one-shot entrypoint for debugging
+or transient flows, but it is not the persistent-host contract.
+
+### 9.1 Why stdio-over-SSH remains the right shell transport
+
+Even with a persistent UDS host on the remote side, the desktop shell should
+still speak to it through SSH stdio:
 
 - one byte stream
 - no extra TCP exposure requirement
 - no protocol changes
 - easy to proxy in `tauri-shell`
+- no local-vs-remote branching in the frontend
 
-### 9.2 Remote path semantics
+### 9.2 Why the bridge must stay dumb
+
+The remote bridge is **not** a second server protocol and **not** a backend
+shim. It should only shuttle bytes between SSH stdio and the UDS socket.
+
+That preserves the rewrite boundary from `01-philosophy.md`:
+
+- server owns behavior
+- shell owns transport
+- bridge owns neither behavior nor state
+
+### 9.3 Remote path semantics
 
 Once connected to a remote host:
 
@@ -792,18 +827,23 @@ The host association only has to exist in the desktop aggregation layer.
 ### Slice 6: optional protocol/server follow-ups
 
 - optional server-native `HostId`
-- standalone remote host stdio command polish
+- standalone remote host UDS bridge command polish
 - reconnect policy and richer per-host status
 
 ---
 
 ## 18. Open Questions
 
-### 18.1 Remote host command name
+### 18.1 Remote host lifecycle management
 
-The architecture requires a remote Tyde host stdio entrypoint, but this repo
-does not yet define the exact binary/CLI shape. That needs a small follow-up
-decision.
+This document now assumes:
+
+- `tyde host --uds` starts the persistent host daemon
+- `tyde host --bridge-uds` is the SSH bridge command
+
+What remains open is whether the desktop product should later gain explicit UI
+for checking, starting, or supervising that remote daemon. This first design
+still assumes the daemon already exists or fails loudly when it does not.
 
 ### 18.2 Auto-reconnect policy
 

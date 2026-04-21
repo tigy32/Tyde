@@ -341,6 +341,7 @@ pub struct AppState {
     pub selected_host_id: RwSignal<Option<String>>,
     pub host_streams: RwSignal<HashMap<String, StreamPath>>,
     pub connection_statuses: RwSignal<HashMap<String, ConnectionStatus>>,
+    pub command_errors_by_host: RwSignal<HashMap<String, String>>,
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
@@ -399,6 +400,7 @@ impl AppState {
             selected_host_id: RwSignal::new(None),
             host_streams: RwSignal::new(HashMap::new()),
             connection_statuses: RwSignal::new(HashMap::new()),
+            command_errors_by_host: RwSignal::new(HashMap::new()),
             projects: RwSignal::new(Vec::new()),
             agents: RwSignal::new(Vec::new()),
             sessions: RwSignal::new(Vec::new()),
@@ -491,6 +493,11 @@ impl AppState {
             .get(&host_id)
             .cloned()
             .unwrap_or(ConnectionStatus::Disconnected)
+    }
+
+    pub fn selected_host_command_error(&self) -> Option<String> {
+        let host_id = self.selected_host_id.get()?;
+        self.command_errors_by_host.get().get(&host_id).cloned()
     }
 
     pub fn active_project_ref_untracked(&self) -> Option<ActiveProjectRef> {
@@ -586,6 +593,9 @@ impl AppState {
     pub fn clear_host_runtime(&self, host_id: &str) {
         self.host_streams.update(|streams| {
             streams.remove(host_id);
+        });
+        self.command_errors_by_host.update(|errors| {
+            errors.remove(host_id);
         });
         self.host_settings_by_host.update(|settings| {
             settings.remove(host_id);

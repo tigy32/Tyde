@@ -6,14 +6,15 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, BackendSetupPayload, ChatEvent, CustomAgentNotifyPayload, Envelope,
-    FrameKind, HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload,
-    HostSettingsPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
-    NewTerminalPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectPayload, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
+    AgentStartPayload, BackendSetupPayload, ChatEvent, CommandErrorPayload,
+    CustomAgentNotifyPayload, Envelope, FrameKind, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, ListSessionsPayload,
+    McpServerNotifyPayload, NewAgentPayload, NewTerminalPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
+    SteeringNotifyPayload, StreamPath, TerminalErrorPayload, TerminalExitPayload,
+    TerminalOutputPayload, TerminalStartPayload,
 };
 
 use crate::send::send_frame;
@@ -99,6 +100,9 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
 
     match envelope.kind {
         FrameKind::Welcome => {
+            state.command_errors_by_host.update(|errors| {
+                errors.remove(host_id);
+            });
             state.connection_statuses.update(|statuses| {
                 statuses.insert(host_id.to_string(), ConnectionStatus::Connected);
             });
@@ -139,6 +143,35 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse reject payload: {error}"),
+                );
+            }
+        },
+        FrameKind::CommandError => match envelope.parse_payload::<CommandErrorPayload>() {
+            Ok(payload) => {
+                let message = format!(
+                    "{} failed on {}: {}",
+                    payload.operation, payload.stream, payload.message
+                );
+                log::error!(
+                    "command error host={} request_kind={} operation={} request_stream={} code={:?}: {}",
+                    host_id,
+                    payload.request_kind,
+                    payload.operation,
+                    payload.stream,
+                    payload.code,
+                    payload.message
+                );
+                state.command_errors_by_host.update(|errors| {
+                    errors.insert(host_id.to_string(), message);
+                });
+            }
+            Err(error) => {
+                report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse command_error payload: {error}"),
                 );
             }
         },

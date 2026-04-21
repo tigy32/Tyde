@@ -97,15 +97,18 @@ and bug fixes that remove root causes instead of papering over them.
 ## No Fallbacks, No Inference
 
 - **NEVER implement fallback functionality.** If something fails, let it fail visibly — log it, show a notification, or let it propagate. Never silently swallow errors (`catch { return {}; }`, `if (!x) return;`, `unwrap_or_default()`).
+- **Propagate errors with context.** Return typed errors up the stack and attach enough detail to identify what failed, where, and why. An error that disappears is a bug.
 - **NEVER infer or guess parameters that should be known.** No heuristic lookups, no "find the most likely match", no auto-fill from context. If a value should be available, plumb it explicitly through the call chain.
 - **One call path, least branching possible, always works or errors.** If you find yourself writing "try A, fallback to B", stop — fix A instead.
 
-## Fail Fast, Fail Loud
+## Surface Errors, Don't Panic
 
-- **Sequence numbers on the wire.** Every message gets a monotonic sequence number. Assert ordering. If a message arrives out of order, that's a bug — crash and show what's wrong immediately.
-- **No compensation code for bugs.** Do not write code that attempts to recover from situations that shouldn't happen. If a sequence number gap occurs, panic with context — don't silently skip or reorder.
-- **Prefer crashing with diagnostics over silent degradation.** A crash with a clear error message is infinitely better than a complex web of bugs compensating for other bugs.
-- **Assertions everywhere.** `debug_assert!` in development, hard errors in protocol validation. If an invariant can be checked, check it.
+- **Do not swallow errors.** If an operation fails, propagate it to the layer that owns logging, protocol emission, or user-visible UI. Silent failure is never acceptable.
+- **Panic is not error handling.** Do not use `panic!`, `unwrap`, `expect`, or task crashes for normal runtime failures, invalid input, transport issues, subprocess failures, or remote-host problems.
+- **Surface errors explicitly at the boundary.** Server failures should become structured logs plus typed events, statuses, or notifications. Frontend failures should render explicit error states. Errors should be visible and diagnosable.
+- **Stop the failing operation, not the whole app.** If a stream, session, or connection becomes invalid, fail that unit with a clear error and context. Do not invent compensation logic, but do not take down unrelated parts of the system either.
+- **Sequence numbers on the wire.** Every message gets a monotonic sequence number. Validate ordering. If a message arrives out of order, surface a protocol/invariant error with full context and terminate the affected stream or connection — do not silently skip, reorder, or "fix up" the sequence.
+- **Assertions everywhere.** `debug_assert!` in development, explicit surfaced errors in production validation paths. If an invariant can be checked, check it.
 
 ## Events In, Events Out
 
@@ -147,7 +150,8 @@ The mental model: server events → `state.rs` signals → reactive view closure
 
 - Only make changes that are directly requested or clearly necessary.
 - Don't add features, refactor code, or make "improvements" beyond what was asked.
-- Don't add error handling for scenarios that can't happen.
+- Don't add speculative recovery code for scenarios that can't happen.
+- For real boundary failures (I/O, parsing, protocol, subprocess, remote host), return explicit errors and surface them.
 - Don't create helpers or abstractions for one-time operations.
 - Three similar lines of code is better than a premature abstraction.
 

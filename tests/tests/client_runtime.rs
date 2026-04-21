@@ -71,6 +71,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::ProjectNotify(_)
                 | HostEvent::NewTerminal(_)
                 | HostEvent::SessionSchemas(_)
+                | HostEvent::CommandError(_)
                 | HostEvent::CustomAgentNotify(_)
                 | HostEvent::SteeringNotify(_)
                 | HostEvent::SkillNotify(_)

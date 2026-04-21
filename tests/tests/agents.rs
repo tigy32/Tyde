@@ -4,9 +4,10 @@ use fixture::Fixture;
 use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
-    Envelope, FrameKind, ListSessionsPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectId, ProjectNotifyPayload,
-    ProjectRenamePayload, SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, ListSessionsPayload,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectId, ProjectNotifyPayload, ProjectRenamePayload, SessionListPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -73,6 +74,15 @@ async fn expect_chat_event(client: &mut client::Connection, context: &str) -> En
         }
         return env;
     }
+}
+
+async fn expect_command_error(
+    client: &mut client::Connection,
+    context: &str,
+) -> CommandErrorPayload {
+    let env = expect_kind(client, FrameKind::CommandError, context).await;
+    env.parse_payload()
+        .expect("failed to parse CommandErrorPayload")
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
@@ -2043,32 +2053,22 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
         .await
         .expect("project_delete write failed");
 
-    loop {
-        let event = fixture
-            .client
-            .next_event()
-            .await
-            .expect("next_event after rejected delete failed");
-        match event {
-            None => break,
-            Some(env)
-                if matches!(
-                    env.kind,
-                    FrameKind::SessionSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionList
-                ) =>
-            {
-                continue;
-            }
-            Some(env) => panic!(
-                "expected connection close after rejected delete, got kind={} stream={}",
-                env.kind, env.stream
-            ),
-        }
-    }
+    let error = expect_command_error(&mut fixture.client, "project delete rejection").await;
+    assert_eq!(error.operation, "project_delete");
+    assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("referenced by session"),
+        "unexpected project_delete error: {}",
+        error.message
+    );
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(150),
+        "connection should stay open after rejected project delete",
+    )
+    .await;
 
     let mut fresh_client = fixture.connect_fresh_host().await;
     match expect_project_notify(&mut fresh_client, "project survives rejected delete").await {
@@ -2078,7 +2078,7 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
 }
 
 #[tokio::test]
-async fn invalid_project_input_closes_the_connection() {
+async fn invalid_project_input_surfaces_command_error_and_keeps_connection_alive() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -2090,33 +2090,22 @@ async fn invalid_project_input_closes_the_connection() {
         .await
         .expect("project_create write failed");
 
-    loop {
-        match fixture
-            .client
-            .next_event()
-            .await
-            .expect("next_event after invalid project_create failed")
-        {
-            None => break,
-            Some(env)
-                if matches!(
-                    env.kind,
-                    FrameKind::SessionSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionList
-                        | FrameKind::HostSettings
-                ) =>
-            {
-                continue;
-            }
-            Some(env) => panic!(
-                "invalid project_create should terminate the connection, got: {} on {}",
-                env.kind, env.stream
-            ),
-        }
-    }
+    let error = expect_command_error(&mut fixture.client, "invalid project_create").await;
+    assert_eq!(error.operation, "project_create");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("roots must be unique"),
+        "unexpected project_create error: {}",
+        error.message
+    );
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(150),
+        "connection should stay open after invalid project_create",
+    )
+    .await;
 
     let mut fresh_client = fixture.connect_fresh_host().await;
     expect_no_event(

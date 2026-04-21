@@ -2,11 +2,12 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    Envelope, FileEntryOp, FrameKind, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    CommandErrorCode, CommandErrorPayload, Envelope, FileEntryOp, FrameKind, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDiffScope,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectListDirPayload, ProjectNotifyPayload, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
 };
 use std::fs;
 use std::path::Path;
@@ -71,6 +72,16 @@ async fn expect_project_notify(
     assert_eq!(env.kind, FrameKind::ProjectNotify);
     env.parse_payload()
         .expect("failed to parse ProjectNotifyPayload")
+}
+
+async fn expect_command_error(
+    client: &mut client::Connection,
+    context: &str,
+) -> CommandErrorPayload {
+    let env = expect_next_event(client, context).await;
+    assert_eq!(env.kind, FrameKind::CommandError);
+    env.parse_payload()
+        .expect("failed to parse CommandErrorPayload")
 }
 
 async fn expect_project_file_list(
@@ -453,7 +464,7 @@ async fn projects_persist_and_replay_from_fresh_host() {
 }
 
 #[tokio::test]
-async fn invalid_project_create_closes_the_connection() {
+async fn invalid_project_create_surfaces_command_error_and_keeps_connection_alive() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -465,33 +476,22 @@ async fn invalid_project_create_closes_the_connection() {
         .await
         .expect("project_create write failed");
 
-    loop {
-        match fixture
-            .client
-            .next_event()
-            .await
-            .expect("next_event after invalid project_create failed")
-        {
-            None => break,
-            Some(env)
-                if matches!(
-                    env.kind,
-                    FrameKind::HostSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionSettings
-                        | FrameKind::SessionList
-                ) =>
-            {
-                continue;
-            }
-            Some(env) => panic!(
-                "invalid project_create should terminate the connection, got: {} on {}",
-                env.kind, env.stream
-            ),
-        }
-    }
+    let error = expect_command_error(&mut fixture.client, "command error").await;
+    assert_eq!(error.operation, "project_create");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("roots must be unique"),
+        "unexpected project_create error: {}",
+        error.message
+    );
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(150),
+        "connection should stay open after invalid project_create",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -713,12 +713,14 @@ async fn project_read_file_outside_project_does_not_crash_host() {
         .await
         .expect("project_read_file failed");
 
-    expect_no_event(
-        &mut fixture.client,
-        Duration::from_millis(200),
-        "invalid absolute project read should not emit a file payload",
-    )
-    .await;
+    let error = expect_command_error(&mut fixture.client, "invalid absolute project read").await;
+    assert_eq!(error.operation, "project_read_file");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("project"),
+        "unexpected invalid absolute project read error: {}",
+        error.message
+    );
 
     fixture
         .client

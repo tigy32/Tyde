@@ -5,12 +5,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context, anyhow};
 use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentId, AgentOrigin, AgentStartPayload, BackendSetupPayload, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
     HostBrowseStartPayload, HostSettingsPayload, McpServerDeletePayload, McpServerNotifyPayload,
-    McpServerUpsertPayload, NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    McpServerUpsertPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectFileListPayload, ProjectGitStatusPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -41,6 +42,7 @@ use crate::backend::{
 };
 use crate::browse_stream;
 use crate::debug_mcp::DebugMcpHandle;
+use crate::error::{AppError, AppResult};
 use crate::project_stream::{
     ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing, build_file_list,
     build_git_status, read_diff, read_file, scan_raw_entries, spawn_project_subscription,
@@ -933,120 +935,137 @@ impl HostHandle {
         agent_id
     }
 
-    pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) {
+    pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) -> AppResult<()> {
+        const OPERATION: &str = "project_create";
         let mut state = self.state.lock().await;
         let project = state
             .project_store
             .lock()
             .await
             .create(payload.name, payload.roots)
-            .unwrap_or_else(|err| panic!("failed to create project: {err}"));
+            .map_err(|error| project_store_error(OPERATION, error))?;
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         start_project_subscriptions_for_all_hosts(&mut state, project_id).await;
+        Ok(())
     }
 
-    pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) {
+    pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {
+        const OPERATION: &str = "project_rename";
         let mut state = self.state.lock().await;
         let project = state
             .project_store
             .lock()
             .await
             .rename(&payload.id, payload.name)
-            .unwrap_or_else(|err| panic!("failed to rename project {}: {err}", payload.id));
+            .map_err(|error| project_store_error(OPERATION, error))?;
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        Ok(())
     }
 
-    pub(crate) async fn reorder_projects(&self, payload: ProjectReorderPayload) {
+    pub(crate) async fn reorder_projects(&self, payload: ProjectReorderPayload) -> AppResult<()> {
+        const OPERATION: &str = "project_reorder";
         let mut state = self.state.lock().await;
         let projects = state
             .project_store
             .lock()
             .await
             .reorder(payload.project_ids)
-            .unwrap_or_else(|err| panic!("failed to reorder projects: {err}"));
+            .map_err(|error| project_store_error(OPERATION, error))?;
         for project in projects {
             fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         }
+        Ok(())
     }
 
-    pub(crate) async fn add_project_root(&self, payload: ProjectAddRootPayload) {
+    pub(crate) async fn add_project_root(&self, payload: ProjectAddRootPayload) -> AppResult<()> {
+        const OPERATION: &str = "project_add_root";
         let mut state = self.state.lock().await;
         let project = state
             .project_store
             .lock()
             .await
             .add_root(&payload.id, payload.root)
-            .unwrap_or_else(|err| panic!("failed to add root to project {}: {err}", payload.id));
+            .map_err(|error| project_store_error(OPERATION, error))?;
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         start_project_subscriptions_for_all_hosts(&mut state, project_id).await;
+        Ok(())
     }
 
-    pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) {
+    pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) -> AppResult<()> {
+        const OPERATION: &str = "project_delete";
         let mut state = self.state.lock().await;
         let referenced_session = state
             .session_store
             .lock()
             .await
             .list()
-            .unwrap_or_else(|err| panic!("failed to list sessions before project delete: {err}"))
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .into_iter()
             .find(|record| record.project_id.as_ref() == Some(&payload.id));
         if let Some(session) = referenced_session {
-            panic!(
-                "cannot delete project {} while referenced by session {}",
-                payload.id, session.id
-            );
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot delete project {} while referenced by session {}",
+                    payload.id, session.id
+                ),
+            ));
         }
         let referenced_steering = state
             .steering_store
             .lock()
             .await
             .list()
-            .unwrap_or_else(|err| panic!("failed to list steering before project delete: {err}"))
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .into_iter()
             .find(|steering| matches!(&steering.scope, SteeringScope::Project(project_id) if project_id == &payload.id));
         if let Some(steering) = referenced_steering {
-            panic!(
-                "cannot delete project {} while referenced by steering {}",
-                payload.id, steering.id
-            );
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot delete project {} while referenced by steering {}",
+                    payload.id, steering.id
+                ),
+            ));
         }
         let project = state
             .project_store
             .lock()
             .await
             .delete(&payload.id)
-            .unwrap_or_else(|err| panic!("failed to delete project {}: {err}", payload.id));
+            .map_err(|error| project_store_error(OPERATION, error))?;
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Delete { project }).await;
+        Ok(())
     }
 
-    pub(crate) async fn upsert_custom_agent(&self, payload: CustomAgentUpsertPayload) {
+    pub(crate) async fn upsert_custom_agent(
+        &self,
+        payload: CustomAgentUpsertPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "custom_agent_upsert";
         let mut state = self.state.lock().await;
-        let skills = match state.skill_store.lock().await.list() {
-            Ok(skills) => skills,
-            Err(err) => {
-                tracing::warn!(
-                    custom_agent_id = %payload.custom_agent.id,
-                    error = %err,
-                    "failed to list skills before custom agent upsert; rejecting update"
-                );
-                return;
-            }
-        };
+        let custom_agent_id = payload.custom_agent.id.clone();
+        let skills = state
+            .skill_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let skill_ids = skills
             .into_iter()
             .map(|skill| skill.id)
             .collect::<HashSet<_>>();
         for skill_id in &payload.custom_agent.skill_ids {
             if !skill_ids.contains(skill_id) {
-                tracing::warn!(
-                    custom_agent_id = %payload.custom_agent.id,
-                    skill_id = %skill_id,
-                    "custom agent references missing skill; rejecting update"
-                );
-                return;
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!(
+                        "custom agent {} references missing skill {}",
+                        custom_agent_id, skill_id
+                    ),
+                ));
             }
         }
 
@@ -1055,20 +1074,21 @@ impl HostHandle {
             .lock()
             .await
             .list()
-            .unwrap_or_else(|err| {
-                panic!("failed to list MCP servers before custom agent upsert: {err}")
-            });
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let mcp_server_ids = mcp_servers
             .into_iter()
             .map(|mcp_server| mcp_server.id)
             .collect::<HashSet<_>>();
         for mcp_server_id in &payload.custom_agent.mcp_server_ids {
-            assert!(
-                mcp_server_ids.contains(mcp_server_id),
-                "custom agent {} references missing MCP server {}",
-                payload.custom_agent.id,
-                mcp_server_id
-            );
+            if !mcp_server_ids.contains(mcp_server_id) {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!(
+                        "custom agent {} references missing MCP server {}",
+                        custom_agent_id, mcp_server_id
+                    ),
+                ));
+            }
         }
 
         let custom_agent = state
@@ -1076,116 +1096,131 @@ impl HostHandle {
             .lock()
             .await
             .upsert(payload.custom_agent)
-            .unwrap_or_else(|err| panic!("failed to upsert custom agent: {err}"));
+            .map_err(|error| custom_agent_store_error(OPERATION, error))?;
         fan_out_custom_agent_notify(
             &mut state,
             CustomAgentNotifyPayload::Upsert { custom_agent },
         )
         .await;
+        Ok(())
     }
 
-    pub(crate) async fn delete_custom_agent(&self, payload: CustomAgentDeletePayload) {
+    pub(crate) async fn delete_custom_agent(
+        &self,
+        payload: CustomAgentDeletePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "custom_agent_delete";
         let mut state = self.state.lock().await;
         let id = state
             .custom_agent_store
             .lock()
             .await
             .delete(&payload.id)
-            .unwrap_or_else(|err| panic!("failed to delete custom agent {}: {err}", payload.id));
+            .map_err(|error| custom_agent_store_error(OPERATION, error))?;
         fan_out_custom_agent_notify(&mut state, CustomAgentNotifyPayload::Delete { id }).await;
+        Ok(())
     }
 
-    pub(crate) async fn upsert_steering(&self, payload: SteeringUpsertPayload) {
+    pub(crate) async fn upsert_steering(&self, payload: SteeringUpsertPayload) -> AppResult<()> {
+        const OPERATION: &str = "steering_upsert";
         let mut state = self.state.lock().await;
-        if let SteeringScope::Project(project_id) = &payload.steering.scope {
-            state
-                .project_store
-                .lock()
-                .await
-                .get(project_id)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "cannot upsert project-scoped steering {} for missing project {}",
-                        payload.steering.id, project_id
-                    )
-                });
+        if let SteeringScope::Project(project_id) = &payload.steering.scope
+            && !project_exists(&state.project_store, project_id, OPERATION).await?
+        {
+            return Err(AppError::not_found(
+                OPERATION,
+                format!(
+                    "cannot upsert project-scoped steering {} for missing project {}",
+                    payload.steering.id, project_id
+                ),
+            ));
         }
         let steering = state
             .steering_store
             .lock()
             .await
             .upsert(payload.steering)
-            .unwrap_or_else(|err| panic!("failed to upsert steering: {err}"));
+            .map_err(|error| steering_store_error(OPERATION, error))?;
         fan_out_steering_notify(&mut state, SteeringNotifyPayload::Upsert { steering }).await;
+        Ok(())
     }
 
-    pub(crate) async fn delete_steering(&self, payload: SteeringDeletePayload) {
+    pub(crate) async fn delete_steering(&self, payload: SteeringDeletePayload) -> AppResult<()> {
+        const OPERATION: &str = "steering_delete";
         let mut state = self.state.lock().await;
         let id = state
             .steering_store
             .lock()
             .await
             .delete(&payload.id)
-            .unwrap_or_else(|err| panic!("failed to delete steering {}: {err}", payload.id));
+            .map_err(|error| steering_store_error(OPERATION, error))?;
         fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
+        Ok(())
     }
 
-    pub(crate) async fn refresh_skills(&self, _payload: SkillRefreshPayload) {
+    pub(crate) async fn refresh_skills(&self, _payload: SkillRefreshPayload) -> AppResult<()> {
+        const OPERATION: &str = "skill_refresh";
         let mut state = self.state.lock().await;
-        let sync = match state.skill_store.lock().await.sync_from_disk() {
-            Ok(sync) => sync,
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to refresh skills");
-                return;
-            }
-        };
+        let sync = state
+            .skill_store
+            .lock()
+            .await
+            .sync_from_disk()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         for id in sync.deletes {
             fan_out_skill_notify(&mut state, SkillNotifyPayload::Delete { id }).await;
         }
         for skill in sync.upserts {
             fan_out_skill_notify(&mut state, SkillNotifyPayload::Upsert { skill }).await;
         }
+        Ok(())
     }
 
-    pub(crate) async fn upsert_mcp_server(&self, payload: McpServerUpsertPayload) {
+    pub(crate) async fn upsert_mcp_server(&self, payload: McpServerUpsertPayload) -> AppResult<()> {
+        const OPERATION: &str = "mcp_server_upsert";
         let mut state = self.state.lock().await;
         let mcp_server = state
             .mcp_server_store
             .lock()
             .await
             .upsert(payload.mcp_server)
-            .unwrap_or_else(|err| panic!("failed to upsert MCP server: {err}"));
+            .map_err(|error| mcp_server_store_error(OPERATION, error))?;
         fan_out_mcp_server_notify(&mut state, McpServerNotifyPayload::Upsert { mcp_server }).await;
+        Ok(())
     }
 
-    pub(crate) async fn delete_mcp_server(&self, payload: McpServerDeletePayload) {
+    pub(crate) async fn delete_mcp_server(&self, payload: McpServerDeletePayload) -> AppResult<()> {
+        const OPERATION: &str = "mcp_server_delete";
         let mut state = self.state.lock().await;
         let referenced_agent = state
             .custom_agent_store
             .lock()
             .await
             .list()
-            .unwrap_or_else(|err| {
-                panic!("failed to list custom agents before MCP server delete: {err}")
-            })
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
             .into_iter()
             .find(|custom_agent| custom_agent.mcp_server_ids.contains(&payload.id));
         if let Some(custom_agent) = referenced_agent {
-            panic!(
-                "cannot delete MCP server {} while referenced by custom agent {}",
-                payload.id, custom_agent.id
-            );
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot delete MCP server {} while it is referenced by custom agent {}",
+                    payload.id, custom_agent.id
+                ),
+            ));
         }
         let id = state
             .mcp_server_store
             .lock()
             .await
             .delete(&payload.id)
-            .unwrap_or_else(|err| panic!("failed to delete MCP server {}: {err}", payload.id));
+            .map_err(|error| mcp_server_store_error(OPERATION, error))?;
         fan_out_mcp_server_notify(&mut state, McpServerNotifyPayload::Delete { id }).await;
+        Ok(())
     }
 
-    pub(crate) async fn list_sessions(&self, host_output_stream: &Stream) {
+    pub(crate) async fn list_sessions(&self, host_output_stream: &Stream) -> AppResult<()> {
+        const OPERATION: &str = "list_sessions";
         let sessions = {
             let state = self.state.lock().await;
             state
@@ -1193,18 +1228,25 @@ impl HostHandle {
                 .lock()
                 .await
                 .summaries()
-                .unwrap_or_else(|err| panic!("failed to list sessions: {err}"))
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
         };
 
         let payload = SessionListPayload { sessions };
-        let payload = serde_json::to_value(&payload)
-            .expect("failed to serialize SessionList payload for host stream");
+        let payload = serde_json::to_value(&payload).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize SessionList payload for host stream",
+                error,
+            )
+        })?;
         let _ = host_output_stream
             .send_value(FrameKind::SessionList, payload)
             .await;
+        Ok(())
     }
 
-    pub(crate) async fn delete_session(&self, session_id: SessionId) {
+    pub(crate) async fn delete_session(&self, session_id: SessionId) -> AppResult<()> {
+        const OPERATION: &str = "delete_session";
         let session_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.session_store)
@@ -1213,8 +1255,9 @@ impl HostHandle {
             .lock()
             .await
             .delete(&session_id)
-            .unwrap_or_else(|err| panic!("failed to delete session {}: {err}", session_id));
+            .map_err(|error| session_store_error(OPERATION, error))?;
         self.fan_out_session_lists().await;
+        Ok(())
     }
 
     pub(crate) async fn fan_out_session_lists(&self) {
@@ -1222,7 +1265,8 @@ impl HostHandle {
         fan_out_session_lists(&mut state).await;
     }
 
-    pub(crate) async fn set_setting(&self, payload: SetSettingPayload) {
+    pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
+        const OPERATION: &str = "set_setting";
         let mut state = self.state.lock().await;
         let refresh_session_schemas = matches!(
             payload.setting,
@@ -1233,12 +1277,13 @@ impl HostHandle {
             .lock()
             .await
             .apply(payload.setting)
-            .unwrap_or_else(|err| panic!("failed to apply host setting: {err}"));
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         fan_out_host_settings(&mut state, settings).await;
         if refresh_session_schemas {
             drop(state);
             self.refresh_session_schemas().await;
         }
+        Ok(())
     }
 
     pub(crate) async fn fan_out_backend_setup(&self) {
@@ -1303,7 +1348,8 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         host_output_stream: &Stream,
         payload: RunBackendSetupPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "run_backend_setup";
         tracing::info!(
             connection_host_stream = %connection_host_stream,
             host_stream = %host_output_stream.path(),
@@ -1313,10 +1359,13 @@ impl HostHandle {
         );
         let Some(command) = setup::runnable_command(payload.backend_kind, payload.action).await
         else {
-            panic!(
-                "no runnable backend setup command for {:?} {:?}",
-                payload.backend_kind, payload.action
-            );
+            return Err(AppError::not_found(
+                OPERATION,
+                format!(
+                    "no runnable backend setup command for {:?} {:?}",
+                    payload.backend_kind, payload.action
+                ),
+            ));
         };
 
         let terminal = self
@@ -1329,7 +1378,7 @@ impl HostHandle {
                     rows: 28,
                 },
             )
-            .await;
+            .await?;
 
         if let Some(terminal) = terminal {
             tracing::info!(
@@ -1363,6 +1412,7 @@ impl HostHandle {
                 host.refresh_session_schemas().await;
             });
         }
+        Ok(())
     }
 
     pub(crate) async fn create_terminal(
@@ -1370,10 +1420,11 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         host_output_stream: &Stream,
         payload: TerminalCreatePayload,
-    ) {
+    ) -> AppResult<()> {
         let _ = self
             .create_terminal_internal(connection_host_stream, host_output_stream, payload)
-            .await;
+            .await?;
+        Ok(())
     }
 
     async fn create_terminal_internal(
@@ -1381,18 +1432,19 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         host_output_stream: &Stream,
         payload: TerminalCreatePayload,
-    ) -> Option<TerminalHandle> {
+    ) -> AppResult<Option<TerminalHandle>> {
+        const OPERATION: &str = "terminal_create";
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
-        let launch = resolve_terminal_launch(&project_store, payload).await;
+        let launch = resolve_terminal_launch(&project_store, payload).await?;
         let terminal_id = TerminalId(Uuid::new_v4().to_string());
         let terminal_stream_path = StreamPath(format!("/terminal/{}", terminal_id));
         let terminal_output_stream = host_output_stream.with_path(terminal_stream_path.clone());
         let terminal = create_terminal(launch, terminal_output_stream)
             .await
-            .unwrap_or_else(|err| panic!("failed to create terminal: {err}"));
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
 
         {
             let mut state = self.state.lock().await;
@@ -1400,24 +1452,35 @@ impl HostHandle {
                 (connection_host_stream.clone(), terminal_id),
                 terminal.clone(),
             );
-            assert!(
-                previous.is_none(),
-                "duplicate terminal registration for {}",
-                terminal_stream_path
-            );
+            if previous.is_some() {
+                return Err(AppError::internal_message(
+                    OPERATION,
+                    format!(
+                        "duplicate terminal registration for {}",
+                        terminal_stream_path
+                    ),
+                    anyhow!("duplicate terminal registration"),
+                ));
+            }
         }
 
-        let host_payload = serde_json::to_value(terminal.new_terminal_payload())
-            .expect("failed to serialize new terminal payload");
+        let host_payload =
+            serde_json::to_value(terminal.new_terminal_payload()).map_err(|error| {
+                AppError::internal_message(
+                    OPERATION,
+                    "failed to serialize new terminal payload",
+                    error,
+                )
+            })?;
         if host_output_stream
             .send_value(FrameKind::NewTerminal, host_payload)
             .await
             .is_err()
         {
-            return None;
+            return Ok(None);
         }
         let _ = terminal.emit_start().await;
-        Some(terminal)
+        Ok(Some(terminal))
     }
 
     pub(crate) async fn send_terminal_input(
@@ -1425,11 +1488,12 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         terminal_id: &TerminalId,
         payload: TerminalSendPayload,
-    ) {
+    ) -> AppResult<()> {
         let terminal = self
             .terminal_handle(connection_host_stream, terminal_id)
-            .await;
+            .await?;
         terminal.send(payload).await;
+        Ok(())
     }
 
     pub(crate) async fn resize_terminal(
@@ -1437,22 +1501,24 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         terminal_id: &TerminalId,
         payload: TerminalResizePayload,
-    ) {
+    ) -> AppResult<()> {
         let terminal = self
             .terminal_handle(connection_host_stream, terminal_id)
-            .await;
+            .await?;
         terminal.resize(payload.cols, payload.rows).await;
+        Ok(())
     }
 
     pub(crate) async fn close_terminal(
         &self,
         connection_host_stream: &StreamPath,
         terminal_id: &TerminalId,
-    ) {
+    ) -> AppResult<()> {
         let terminal = self
             .terminal_handle(connection_host_stream, terminal_id)
-            .await;
+            .await?;
         terminal.close().await;
+        Ok(())
     }
 
     pub(crate) async fn agent_handle(&self, agent_id: &AgentId) -> Option<AgentHandle> {
@@ -1816,13 +1882,18 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         host_output_stream: &Stream,
         payload: HostBrowseStartPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "host_browse_start";
         let browse_stream_path = payload.browse_stream;
-        assert!(
-            browse_stream_path.0.starts_with("/browse/"),
-            "browse stream must start with /browse/, got {}",
-            browse_stream_path
-        );
+        if !browse_stream_path.0.starts_with("/browse/") {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "browse stream must start with /browse/, got {}",
+                    browse_stream_path
+                ),
+            ));
+        }
         let browse_stream = host_output_stream.with_path(browse_stream_path.clone());
 
         {
@@ -1831,11 +1902,15 @@ impl HostHandle {
                 (connection_host_stream.clone(), browse_stream_path.clone()),
                 browse_stream.clone(),
             );
-            assert!(
-                previous.is_none(),
-                "duplicate browse stream registration for {}",
-                browse_stream_path
-            );
+            if previous.is_some() {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "duplicate browse stream registration for {}",
+                        browse_stream_path
+                    ),
+                ));
+            }
         }
 
         let initial = payload.initial.unwrap_or_else(browse_stream::home_dir);
@@ -1846,6 +1921,7 @@ impl HostHandle {
             Ok(entries) => browse_stream::emit_entries(&browse_stream, &entries).await,
             Err(error) => browse_stream::emit_error(&browse_stream, &error).await,
         }
+        Ok(())
     }
 
     pub(crate) async fn list_browse_dir(
@@ -1853,25 +1929,30 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         browse_stream_path: &StreamPath,
         payload: HostBrowseListPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "host_browse_list";
         let browse_stream = {
             let state = self.state.lock().await;
             state
                 .browse_streams
                 .get(&(connection_host_stream.clone(), browse_stream_path.clone()))
                 .cloned()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "browse stream {} is not owned by host stream {}",
-                        browse_stream_path, connection_host_stream
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        OPERATION,
+                        format!(
+                            "browse stream {} is not owned by host stream {}",
+                            browse_stream_path, connection_host_stream
+                        ),
                     )
-                })
+                })?
         };
 
         match browse_stream::list_dir(&payload.path, payload.include_hidden).await {
             Ok(entries) => browse_stream::emit_entries(&browse_stream, &entries).await,
             Err(error) => browse_stream::emit_error(&browse_stream, &error).await,
         }
+        Ok(())
     }
 
     pub(crate) async fn close_browse_stream(
@@ -1891,7 +1972,8 @@ impl HostHandle {
         project_output_stream: Stream,
         project_id: ProjectId,
         _payload: ProjectRefreshPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_refresh";
         let (project_store, subscription_state, new_subscription) = {
             let state = self.state.lock().await;
             let project_store = Arc::clone(&state.project_store);
@@ -1924,35 +2006,32 @@ impl HostHandle {
             (project_store, subscription_state, new_subscription)
         };
 
-        let project = project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .unwrap_or_else(|| panic!("cannot refresh missing project {}", project_id));
-        let raw_entries = scan_raw_entries(&project)
-            .unwrap_or_else(|err| panic!("failed to scan project entries: {err}"));
-        let file_list = build_file_list(&project)
-            .unwrap_or_else(|err| panic!("failed to build project file list: {err}"));
-        let git_status = build_git_status(&project)
-            .unwrap_or_else(|err| panic!("failed to build project git status: {err}"));
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        let raw_entries =
+            scan_raw_entries(&project).map_err(|error| project_command_error(OPERATION, error))?;
+        let file_list =
+            build_file_list(&project).map_err(|error| project_command_error(OPERATION, error))?;
+        let git_status =
+            build_git_status(&project).map_err(|error| project_command_error(OPERATION, error))?;
         sync_snapshot_state(&subscription_state, &raw_entries, &git_status).await;
         if emit_project_file_list(&project_output_stream, &file_list)
             .await
             .is_err()
         {
-            return;
+            return Ok(());
         }
         if emit_project_git_status(&project_output_stream, &git_status)
             .await
             .is_err()
         {
-            return;
+            return Ok(());
         }
 
         if let Some((key, subscription)) = new_subscription {
             let mut state = self.state.lock().await;
             state.project_streams.insert(key, subscription);
         }
+        Ok(())
     }
 
     pub(crate) async fn read_project_file(
@@ -1960,32 +2039,26 @@ impl HostHandle {
         project_output_stream: &Stream,
         project_id: ProjectId,
         payload: ProjectReadFilePayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_read_file";
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
-        let project = project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .unwrap_or_else(|| panic!("cannot read file from missing project {}", project_id));
-        let contents = match read_file(&project, payload) {
-            Ok(contents) => contents,
-            Err(err) => {
-                tracing::warn!(
-                    "failed to read project file for project {}: {}",
-                    project_id,
-                    err
-                );
-                return;
-            }
-        };
-        let payload = serde_json::to_value(&contents)
-            .expect("failed to serialize project file contents payload");
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        let contents = read_file(&project, payload)
+            .map_err(|error| project_command_error(OPERATION, error))?;
+        let payload = serde_json::to_value(&contents).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize project file contents payload",
+                error,
+            )
+        })?;
         let _ = project_output_stream
             .send_value(FrameKind::ProjectFileContents, payload)
             .await;
+        Ok(())
     }
 
     pub(crate) async fn list_project_dir(
@@ -1993,23 +2066,26 @@ impl HostHandle {
         project_output_stream: &Stream,
         project_id: ProjectId,
         payload: ProjectListDirPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_list_dir";
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
-        let project = project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .unwrap_or_else(|| panic!("cannot list dir in missing project {}", project_id));
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
         let listing = build_dir_listing(&project, &payload.root, &payload.path)
-            .unwrap_or_else(|err| panic!("failed to list project directory: {err}"));
-        let payload = serde_json::to_value(&listing)
-            .expect("failed to serialize project dir listing payload");
+            .map_err(|error| project_command_error(OPERATION, error))?;
+        let payload = serde_json::to_value(&listing).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize project dir listing payload",
+                error,
+            )
+        })?;
         let _ = project_output_stream
             .send_value(FrameKind::ProjectFileList, payload)
             .await;
+        Ok(())
     }
 
     pub(crate) async fn read_project_diff(
@@ -2017,23 +2093,26 @@ impl HostHandle {
         project_output_stream: &Stream,
         project_id: ProjectId,
         payload: ProjectReadDiffPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_read_diff";
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
-        let project = project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .unwrap_or_else(|| panic!("cannot read diff from missing project {}", project_id));
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
         let diff = read_diff(&project, payload)
-            .unwrap_or_else(|err| panic!("failed to read project diff: {err}"));
-        let payload =
-            serde_json::to_value(&diff).expect("failed to serialize project git diff payload");
+            .map_err(|error| project_command_error(OPERATION, error))?;
+        let payload = serde_json::to_value(&diff).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize project git diff payload",
+                error,
+            )
+        })?;
         let _ = project_output_stream
             .send_value(FrameKind::ProjectGitDiff, payload)
             .await;
+        Ok(())
     }
 
     pub(crate) async fn stage_project_file(
@@ -2042,25 +2121,23 @@ impl HostHandle {
         project_output_stream: Stream,
         project_id: ProjectId,
         payload: ProjectStageFilePayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_stage_file";
         let path = payload.path;
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
-        let project = project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .unwrap_or_else(|| panic!("cannot stage file in missing project {}", project_id));
-        stage_file(&project, &path).unwrap_or_else(|err| panic!("failed to stage file: {err}"));
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        stage_file(&project, &path).map_err(|error| project_command_error(OPERATION, error))?;
         self.refresh_after_project_mutation(
             connection_host_stream,
             project_output_stream.clone(),
             project_id,
             Some(path),
         )
-        .await;
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn stage_project_hunk(
@@ -2069,27 +2146,119 @@ impl HostHandle {
         project_output_stream: Stream,
         project_id: ProjectId,
         payload: ProjectStageHunkPayload,
-    ) {
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_stage_hunk";
         let path = payload.path;
         let hunk_id = payload.hunk_id;
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
         };
-        let project = project_store
-            .lock()
-            .await
-            .get(&project_id)
-            .unwrap_or_else(|| panic!("cannot stage hunk in missing project {}", project_id));
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
         stage_hunk(&project, &path, &hunk_id)
-            .unwrap_or_else(|err| panic!("failed to stage hunk: {err}"));
+            .map_err(|error| project_command_error(OPERATION, error))?;
         self.refresh_after_project_mutation(
             connection_host_stream,
             project_output_stream.clone(),
             project_id,
             Some(path),
         )
-        .await;
+        .await?;
+        Ok(())
+    }
+}
+
+async fn load_project(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+    operation: &'static str,
+) -> AppResult<Project> {
+    let projects = project_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| AppError::internal(operation, anyhow!(error)))?;
+    projects
+        .into_iter()
+        .find(|project| &project.id == project_id)
+        .ok_or_else(|| AppError::not_found(operation, format!("project {} not found", project_id)))
+}
+
+async fn project_exists(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+    operation: &'static str,
+) -> AppResult<bool> {
+    let projects = project_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| AppError::internal(operation, anyhow!(error)))?;
+    Ok(projects
+        .into_iter()
+        .any(|project| project.id == *project_id))
+}
+
+fn project_store_error(operation: &'static str, error: String) -> AppError {
+    if error.contains("missing project") {
+        AppError::not_found(operation, error)
+    } else if error.contains("already contains root") || error.contains("duplicate id") {
+        AppError::conflict(operation, error)
+    } else {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    }
+}
+
+fn custom_agent_store_error(operation: &'static str, error: String) -> AppError {
+    if error.contains("missing custom agent") {
+        AppError::not_found(operation, error)
+    } else if error.starts_with("Failed ") || error.starts_with("Invalid custom agent store") {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
+fn steering_store_error(operation: &'static str, error: String) -> AppError {
+    if error.contains("missing steering") {
+        AppError::not_found(operation, error)
+    } else if error.starts_with("Failed ") || error.starts_with("Invalid steering store") {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
+fn mcp_server_store_error(operation: &'static str, error: String) -> AppError {
+    if error.contains("missing MCP server") {
+        AppError::not_found(operation, error)
+    } else if error.contains("duplicate name") {
+        AppError::conflict(operation, error)
+    } else if error.starts_with("Failed ") || error.starts_with("Invalid MCP server store") {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
+fn session_store_error(operation: &'static str, error: String) -> AppError {
+    if error.starts_with("Failed ") {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
+fn project_command_error(operation: &'static str, error: String) -> AppError {
+    if error.starts_with("No unstaged diff exists") {
+        AppError::conflict(operation, error)
+    } else if error.starts_with("Failed to run git")
+        || error.starts_with("git ")
+        || error.starts_with("git output was not valid UTF-8")
+    {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
     }
 }
 
@@ -3046,14 +3215,14 @@ impl HostHandle {
         project_output_stream: Stream,
         project_id: ProjectId,
         path: Option<ProjectPath>,
-    ) {
+    ) -> AppResult<()> {
         self.refresh_project(
             connection_host_stream,
             project_output_stream.clone(),
             project_id.clone(),
             ProjectRefreshPayload::default(),
         )
-        .await;
+        .await?;
 
         if let Some(path) = path {
             let staged_diff = ProjectReadDiffPayload {
@@ -3062,7 +3231,7 @@ impl HostHandle {
                 path: Some(path.relative_path.clone()),
             };
             self.read_project_diff(&project_output_stream, project_id.clone(), staged_diff)
-                .await;
+                .await?;
 
             let unstaged_diff = ProjectReadDiffPayload {
                 root: path.root.clone(),
@@ -3070,24 +3239,29 @@ impl HostHandle {
                 path: Some(path.relative_path),
             };
             self.read_project_diff(&project_output_stream, project_id, unstaged_diff)
-                .await;
+                .await?;
         }
+
+        Ok(())
     }
 
     async fn terminal_handle(
         &self,
         connection_host_stream: &StreamPath,
         terminal_id: &TerminalId,
-    ) -> TerminalHandle {
+    ) -> AppResult<TerminalHandle> {
         let state = self.state.lock().await;
         state
             .terminal_streams
             .get(&(connection_host_stream.clone(), terminal_id.clone()))
             .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "terminal {} is not owned by host stream {}",
-                    terminal_id, connection_host_stream
+            .ok_or_else(|| {
+                AppError::not_found(
+                    "terminal_lookup",
+                    format!(
+                        "terminal {} is not owned by host stream {}",
+                        terminal_id, connection_host_stream
+                    ),
                 )
             })
     }
@@ -3116,66 +3290,71 @@ async fn emit_project_git_status(
 async fn resolve_terminal_launch(
     project_store: &Arc<Mutex<ProjectStore>>,
     payload: TerminalCreatePayload,
-) -> TerminalLaunchInfo {
+) -> AppResult<TerminalLaunchInfo> {
+    const OPERATION: &str = "terminal_create";
     match payload.target {
         TerminalLaunchTarget::HostDefault => {
             let cwd = std::env::current_dir()
-                .unwrap_or_else(|err| panic!("failed to resolve host default cwd: {err}"))
+                .context("failed to resolve host default cwd")
+                .map_err(|error| AppError::internal(OPERATION, error))?
                 .display()
                 .to_string();
-            TerminalLaunchInfo {
+            Ok(TerminalLaunchInfo {
                 project_id: None,
                 root: None,
                 cwd,
                 cols: payload.cols,
                 rows: payload.rows,
-            }
+            })
         }
         TerminalLaunchTarget::Project {
             project_id,
             root,
             relative_cwd,
         } => {
-            let project = project_store
-                .lock()
-                .await
-                .get(&project_id)
-                .unwrap_or_else(|| {
-                    panic!("cannot create terminal in missing project {}", project_id)
-                });
+            let project = load_project(project_store, &project_id, OPERATION).await?;
             let roots = project.roots.iter().cloned().collect::<HashSet<_>>();
-            assert!(
-                roots.contains(&root.0),
-                "cannot create terminal in root {} that is not part of project {}",
-                root,
-                project_id
-            );
+            if !roots.contains(&root.0) {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!(
+                        "cannot create terminal in root {} that is not part of project {}",
+                        root, project_id
+                    ),
+                ));
+            }
 
             let cwd = resolve_project_terminal_cwd(&root, relative_cwd.as_deref())
-                .unwrap_or_else(|err| panic!("invalid terminal launch path: {err}"));
-            TerminalLaunchInfo {
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            Ok(TerminalLaunchInfo {
                 project_id: Some(project_id),
                 root: Some(root),
                 cwd,
                 cols: payload.cols,
                 rows: payload.rows,
-            }
+            })
         }
         TerminalLaunchTarget::Path { cwd } => {
             let trimmed = cwd.trim();
-            assert!(!trimmed.is_empty(), "terminal path cwd must not be empty");
-            assert!(
-                Path::new(trimmed).is_absolute(),
-                "terminal path cwd must be absolute: {}",
-                trimmed
-            );
-            TerminalLaunchInfo {
+            if trimmed.is_empty() {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    "terminal path cwd must not be empty",
+                ));
+            }
+            if !Path::new(trimmed).is_absolute() {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!("terminal path cwd must be absolute: {}", trimmed),
+                ));
+            }
+            Ok(TerminalLaunchInfo {
                 project_id: None,
                 root: None,
                 cwd: trimmed.to_owned(),
                 cols: payload.cols,
                 rows: payload.rows,
-            }
+            })
         }
     }
 }
@@ -3200,11 +3379,9 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
     }
 
     let relative = Path::new(path);
-    assert!(
-        relative.is_relative(),
-        "terminal relative_cwd must be relative: {}",
-        path
-    );
+    if !relative.is_relative() {
+        return Err(format!("terminal relative_cwd must be relative: {}", path));
+    }
 
     for component in relative.components() {
         match component {

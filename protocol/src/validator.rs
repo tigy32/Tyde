@@ -4,15 +4,15 @@ use std::fmt;
 use crate::types::{CloseAgentPayload, NewTerminalPayload};
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
-    ChatEvent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
-    HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload, ProjectRenamePayload,
-    ProjectReorderPayload, RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
-    TerminalCreatePayload, ToolExecutionCompletedData, ToolRequest,
+    ChatEvent, CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBrowseClosePayload,
+    HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload,
+    ProjectRenamePayload, ProjectReorderPayload, RunBackendSetupPayload, SessionListPayload,
+    SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TerminalCreatePayload, ToolExecutionCompletedData, ToolRequest,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -141,6 +141,9 @@ impl ProtocolValidator {
             }
             FrameKind::SessionList => {
                 parse_host_payload::<SessionListPayload>(self, envelope, "SessionList")
+            }
+            FrameKind::CommandError => {
+                parse_host_payload::<CommandErrorPayload>(self, envelope, "CommandError")
             }
             FrameKind::ProjectNotify => {
                 parse_host_payload::<ProjectNotifyPayload>(self, envelope, "ProjectNotify")

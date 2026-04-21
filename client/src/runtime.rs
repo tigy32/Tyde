@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload, ChatEvent,
-    CustomAgentNotifyPayload, Envelope, FrameError, FrameKind, HostSettingsPayload,
-    InterruptPayload, ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload,
-    NewTerminalPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
-    StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
-    TerminalStartPayload, read_envelope, write_envelope,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameError, FrameKind,
+    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerNotifyPayload,
+    NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
+    SendMessagePayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload,
+    SteeringNotifyPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload,
+    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload,
+    TerminalSendPayload, TerminalStartPayload, read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -119,6 +119,7 @@ pub enum HostEvent {
     BackendSetup(BackendSetupPayload),
     SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
+    CommandError(CommandErrorPayload),
     ProjectNotify(ProjectNotifyPayload),
     CustomAgentNotify(CustomAgentNotifyPayload),
     SteeringNotify(SteeringNotifyPayload),
@@ -682,6 +683,14 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::SessionSchemas(payload)).await;
+            true
+        }
+        FrameKind::CommandError => {
+            let payload: CommandErrorPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::CommandError(payload)).await;
             true
         }
         FrameKind::AgentClosed => {

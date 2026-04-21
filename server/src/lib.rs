@@ -5,6 +5,7 @@ pub mod backend;
 pub(crate) mod browse_stream;
 pub(crate) mod connection;
 pub(crate) mod debug_mcp;
+pub(crate) mod error;
 pub(crate) mod host;
 pub(crate) mod process_env;
 pub(crate) mod project_stream;

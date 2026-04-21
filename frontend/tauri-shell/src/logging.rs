@@ -27,6 +27,14 @@ pub(crate) fn init_host_stdio_logging() -> Result<(), String> {
     init_logging(ConsoleTarget::Stderr, "tyde-host-stdio.log")
 }
 
+pub(crate) fn init_host_uds_logging() -> Result<(), String> {
+    init_logging(ConsoleTarget::Stderr, "tyde-host-uds.log")
+}
+
+pub(crate) fn init_host_bridge_uds_logging() -> Result<(), String> {
+    init_logging(ConsoleTarget::Stderr, "tyde-host-bridge-uds.log")
+}
+
 fn init_logging(console_target: ConsoleTarget, file_prefix: &str) -> Result<(), String> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let console_writer = match console_target {

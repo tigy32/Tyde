@@ -1,6 +1,9 @@
 use std::io;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use protocol::{
@@ -9,7 +12,7 @@ use protocol::{
 };
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
 
 use crate::connection::run_connection;
@@ -144,10 +147,11 @@ pub async fn listen_uds(
     host: HostHandle,
 ) -> io::Result<()> {
     let path = path.as_ref();
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    prepare_uds_path(path).await?;
 
+    let _cleanup = UdsPathCleanup {
+        path: path.to_path_buf(),
+    };
     let listener = UnixListener::bind(path)?;
     loop {
         let (stream, _) = listener.accept().await?;
@@ -178,4 +182,55 @@ async fn send_reject<W: AsyncWrite + Unpin>(
         .map_err(HandshakeError::InvalidPayload)?;
     write_envelope(writer, &envelope).await?;
     Ok(())
+}
+
+async fn prepare_uds_path(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("UDS path has no parent: {}", path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!("refusing to replace non-socket path at {}", path.display()),
+        ));
+    }
+
+    match UnixStream::connect(path).await {
+        Ok(_) => Err(io::Error::new(
+            ErrorKind::AddrInUse,
+            format!("UDS path is already in use: {}", path.display()),
+        )),
+        Err(err) if err.kind() == ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!(
+                "failed to probe existing UDS path {}: {err}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+struct UdsPathCleanup {
+    path: PathBuf,
+}
+
+impl Drop for UdsPathCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }

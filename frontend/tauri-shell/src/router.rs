@@ -11,7 +11,7 @@ use crate::bridge::{
 };
 use crate::host_store::HostTransportConfig;
 
-const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --stdio";
+const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
 
 #[derive(Clone)]
 pub struct ProxyRouterHandle {

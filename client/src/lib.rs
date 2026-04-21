@@ -9,23 +9,23 @@ mod runtime;
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
-    CancelQueuedMessagePayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload,
-    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload, NewTerminalPayload,
-    PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    RejectPayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TYDE_VERSION, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
-    TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
-    write_envelope,
+    CancelQueuedMessagePayload, CommandErrorPayload, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError,
+    FrameKind, HelloPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
+    NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
+    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    QueuedMessagesPayload, RejectPayload, SendMessagePayload, SendQueuedMessageNowPayload,
+    SeqValidator, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
+    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TerminalClosePayload, TerminalCreatePayload,
+    TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
+    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload,
+    read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::UnixStream;
@@ -585,6 +585,10 @@ impl Connection {
                 }
                 FrameKind::SessionSchemas => {
                     let _: SessionSchemasPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CommandError => {
+                    let _: CommandErrorPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::AgentClosed => {

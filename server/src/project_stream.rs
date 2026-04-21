@@ -53,29 +53,65 @@ pub(crate) fn spawn_project_subscription(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let project = project_store
-                .lock()
-                .await
-                .get(&project_id)
-                .unwrap_or_else(|| {
-                    panic!("project {} disappeared while stream was active", project_id)
-                });
+            let project = match load_subscription_project(&project_store, &project_id).await {
+                Ok(project) => project,
+                Err(error) => {
+                    tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription");
+                    return;
+                }
+            };
 
-            let current_raw = scan_raw_entries(&project)
-                .unwrap_or_else(|err| panic!("failed to scan project entries: {err}"));
-            let git_status = build_git_status(&project)
-                .unwrap_or_else(|err| panic!("failed to build project git status: {err}"));
+            let current_raw = match scan_raw_entries(&project) {
+                Ok(current_raw) => current_raw,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "stopping project subscription after file scan failure"
+                    );
+                    return;
+                }
+            };
+            let git_status = match build_git_status(&project) {
+                Ok(git_status) => git_status,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "stopping project subscription after git status failure"
+                    );
+                    return;
+                }
+            };
 
-            let git_json = serde_json::to_value(&git_status)
-                .expect("failed to serialize project git status snapshot");
+            let git_json = match serde_json::to_value(&git_status) {
+                Ok(git_json) => git_json,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "stopping project subscription after git status serialization failure"
+                    );
+                    return;
+                }
+            };
 
             let mut snapshot = state.lock().await;
 
             let file_diff = diff_file_entries(&snapshot.file_entries, &current_raw);
             if !file_diff.roots.is_empty() {
                 snapshot.file_entries = current_raw;
-                let file_json = serde_json::to_value(&file_diff)
-                    .expect("failed to serialize project file list diff");
+                let file_json = match serde_json::to_value(&file_diff) {
+                    Ok(file_json) => file_json,
+                    Err(error) => {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %error,
+                            "stopping project subscription after file diff serialization failure"
+                        );
+                        return;
+                    }
+                };
                 drop(snapshot);
                 if stream
                     .send_value(protocol::FrameKind::ProjectFileList, file_json)
@@ -103,6 +139,17 @@ pub(crate) fn spawn_project_subscription(
             sleep(PROJECT_POLL_INTERVAL).await;
         }
     })
+}
+
+async fn load_subscription_project(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+) -> Result<Project, String> {
+    let projects = project_store.lock().await.list()?;
+    projects
+        .into_iter()
+        .find(|project| &project.id == project_id)
+        .ok_or_else(|| format!("project {} disappeared while stream was active", project_id))
 }
 
 /// Default depth limit for initial file listings and polling.
@@ -437,10 +484,9 @@ pub(crate) fn stage_hunk(
     hunk_id: &str,
 ) -> Result<(), String> {
     validate_project_path(project, path)?;
-    assert!(
-        !hunk_id.trim().is_empty(),
-        "project_stage_hunk hunk_id must not be empty"
-    );
+    if hunk_id.trim().is_empty() {
+        return Err("project_stage_hunk hunk_id must not be empty".to_owned());
+    }
 
     let raw = run_git_mode(
         &path.root.0,
@@ -498,9 +544,16 @@ pub(crate) async fn sync_snapshot_state(
 ) {
     let mut snapshot = state.lock().await;
     snapshot.file_entries = raw_entries.clone();
-    snapshot.git_status = Some(
-        serde_json::to_value(git_status).expect("failed to serialize project git status snapshot"),
-    );
+    snapshot.git_status = match serde_json::to_value(git_status) {
+        Ok(git_status) => Some(git_status),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to serialize project git status snapshot"
+            );
+            None
+        }
+    };
 }
 
 fn collect_raw_entries(
@@ -527,13 +580,13 @@ fn collect_raw_entries(
             .map_err(|err| format!("Failed to stat path '{}': {err}", path.display()))?;
         let relative_path = path
             .strip_prefix(root)
-            .unwrap_or_else(|err| {
-                panic!(
+            .map_err(|err| {
+                format!(
                     "failed to strip root prefix from '{}': {}",
                     path.display(),
                     err
                 )
-            })
+            })?
             .to_string_lossy()
             .replace('\\', "/");
 

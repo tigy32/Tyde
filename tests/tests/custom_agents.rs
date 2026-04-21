@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentErrorPayload, AgentStartPayload, BackendKind, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentId, CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind,
-    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, NewAgentPayload, ProjectCreatePayload,
-    ProjectNotifyPayload, Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentParams, SpawnAgentPayload, Steering, SteeringDeletePayload, SteeringId,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, ToolPolicy,
+    AgentErrorPayload, AgentStartPayload, BackendKind, CommandErrorCode, CommandErrorPayload,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig, McpServerDeletePayload,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
+    NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, Skill, SkillId,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, Steering,
+    SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload,
+    ToolPolicy,
 };
 use serde_json::to_string_pretty;
 
@@ -37,6 +38,44 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             continue;
         }
         return env;
+    }
+}
+
+async fn expect_command_error(
+    client: &mut client::Connection,
+    context: &str,
+) -> CommandErrorPayload {
+    let env = expect_next_event(client, context).await;
+    assert_eq!(env.kind, FrameKind::CommandError);
+    env.parse_payload()
+        .expect("failed to parse CommandErrorPayload")
+}
+
+async fn expect_session_list(
+    client: &mut client::Connection,
+    context: &str,
+) -> protocol::SessionListPayload {
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+        ) {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::SessionList);
+        return env
+            .parse_payload()
+            .expect("failed to parse SessionListPayload");
     }
 }
 
@@ -367,6 +406,102 @@ async fn host_customization_upsert_delete_round_trip_and_notify() {
             id: skill.id.clone()
         }
     );
+}
+
+#[tokio::test]
+async fn invalid_custom_agent_upsert_with_blank_description_keeps_connection_alive() {
+    let mut fixture = Fixture::new().await;
+    let custom_agent = CustomAgent {
+        id: CustomAgentId("invalid-agent".to_string()),
+        name: "Invalid Agent".to_string(),
+        description: "   ".to_string(),
+        instructions: Some("still has instructions".to_string()),
+        skill_ids: Vec::new(),
+        mcp_server_ids: Vec::new(),
+        tool_policy: ToolPolicy::Unrestricted,
+    };
+
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload { custom_agent })
+        .await
+        .expect("custom_agent_upsert write failed");
+
+    fixture
+        .client
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .expect("list_sessions after invalid custom agent upsert failed");
+
+    let error = expect_command_error(&mut fixture.client, "command error").await;
+    assert_eq!(error.operation, "custom_agent_upsert");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("description must not be empty"),
+        "unexpected custom agent error: {}",
+        error.message
+    );
+
+    let list = expect_session_list(&mut fixture.client, "SessionList").await;
+    assert!(list.sessions.is_empty());
+}
+
+#[tokio::test]
+async fn deleting_referenced_mcp_server_keeps_connection_alive() {
+    let mut fixture = Fixture::new().await;
+    let mcp_server = sample_mcp_server("docs", "docs-server");
+    let custom_agent = sample_custom_agent(
+        "reviewer",
+        Vec::new(),
+        vec![mcp_server.id.clone()],
+        ToolPolicy::Unrestricted,
+    );
+
+    fixture
+        .client
+        .mcp_server_upsert(McpServerUpsertPayload {
+            mcp_server: mcp_server.clone(),
+        })
+        .await
+        .expect("mcp_server_upsert failed");
+    let _ = expect_next_event(&mut fixture.client, "McpServerNotify upsert").await;
+
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: custom_agent.clone(),
+        })
+        .await
+        .expect("custom_agent_upsert failed");
+    let _ = expect_next_event(&mut fixture.client, "CustomAgentNotify upsert").await;
+
+    fixture
+        .client
+        .mcp_server_delete(McpServerDeletePayload {
+            id: mcp_server.id.clone(),
+        })
+        .await
+        .expect("mcp_server_delete failed");
+
+    fixture
+        .client
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .expect("list_sessions after referenced MCP delete failed");
+
+    let error = expect_command_error(&mut fixture.client, "command error").await;
+    assert_eq!(error.operation, "mcp_server_delete");
+    assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("referenced by custom agent"),
+        "unexpected MCP delete error: {}",
+        error.message
+    );
+
+    let list = expect_session_list(&mut fixture.client, "SessionList").await;
+    assert!(list.sessions.is_empty());
 }
 
 #[tokio::test]
