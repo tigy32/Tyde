@@ -414,7 +414,13 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
                     on:click=move |_| open.set(false)
                 />
             </Show>
-            <div class="new-chat-button-wrap" style="position:relative;display:inline-flex;z-index:100;">
+            <div
+                class="new-chat-button-wrap"
+                style=move || {
+                    let base = "position:relative;display:inline-flex;";
+                    if open.get() { format!("{base}z-index:100;") } else { base.to_string() }
+                }
+            >
                 <button
                     class="action-btn primary"
                     style="border-radius:6px 0 0 6px;"

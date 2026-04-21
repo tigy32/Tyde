@@ -237,9 +237,8 @@ pub fn ChatView() -> impl IntoView {
                 </Show>
                 <div class="chat-messages-wrapper">
                     <div class="chat-messages" node_ref=scroll_ref>
-                        // Show welcome hint when chat is empty and no streaming
                         {move || {
-                            if !has_messages() && streaming().is_none() {
+                            if !has_messages() && streaming().is_none() && !agent_initializing() {
                                 Some(view! {
                                     <div class="chat-empty-hint">
                                         <p>"Type a message to start the conversation"</p>

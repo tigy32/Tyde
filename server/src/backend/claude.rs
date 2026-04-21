@@ -4890,6 +4890,218 @@ impl ClaudeBackend {
     pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
         let _ = self.subagent_emitter_tx.send(Some(emitter));
     }
+
+    pub(crate) async fn spawn_with_subagent_emitter(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+        emitter: Arc<dyn SubAgentEmitter>,
+    ) -> Result<(Self, EventStream), String> {
+        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, Some(emitter))
+            .await
+    }
+
+    async fn spawn_with_initial_emitter(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    ) -> Result<(Self, EventStream), String> {
+        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
+        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
+        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let session_id = Arc::new(std::sync::Mutex::new(None));
+        let session_id_task = Arc::clone(&session_id);
+        let (subagent_emitter_tx, mut subagent_emitter_rx) = watch::channel(initial_emitter);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+
+        tokio::spawn(async move {
+            let roots = if workspace_roots.is_empty() {
+                vec!["/tmp".to_string()]
+            } else {
+                workspace_roots
+            };
+            let steering_content = claude_steering_content(&config);
+            let agent_identity = claude_agent_identity(&config);
+            let (session, mut raw_events) = match ClaudeSession::spawn(
+                &roots,
+                None,
+                &config.startup_mcp_servers,
+                steering_content.as_deref(),
+                agent_identity.as_ref(),
+                config.resolved_spawn_config.tool_policy.clone(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!("Failed to spawn Claude session: {err}");
+                    let _ = ready_tx.send(Err(format!("Failed to spawn Claude session: {err}")));
+                    return;
+                }
+            };
+
+            let handle = session.command_handle();
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let effort_override = match resolved_settings.0.get("effort") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            if model_override.is_some() || effort_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                    "effort": effort_override,
+                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to configure Claude session: {err}");
+                    let _ =
+                        ready_tx.send(Err(format!("Failed to configure Claude session: {err}")));
+                    session.shutdown().await;
+                    return;
+                }
+            }
+
+            let maybe_emitter = subagent_emitter_rx.borrow().clone();
+            if let Some(emitter) = maybe_emitter {
+                session.set_subagent_emitter(emitter).await;
+            }
+
+            let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
+            let ready_tx_forward = Arc::clone(&ready_tx);
+            let session_id_forward = Arc::clone(&session_id_task);
+            let events_tx_forward = events_tx.clone();
+            let forward_task = tokio::spawn(async move {
+                while let Some(raw) = raw_events.recv().await {
+                    if !forward_claude_backend_event(
+                        raw,
+                        &events_tx_forward,
+                        &session_id_forward,
+                        Some(&ready_tx_forward),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                signal_ready(
+                    &ready_tx_forward,
+                    Err("Claude session ended before reporting a session_id".to_string()),
+                )
+                .await;
+            });
+
+            if let Err(err) = handle
+                .execute(SessionCommand::SendMessage {
+                    message: initial_input.message,
+                    images: protocol_images_to_attachments(initial_input.images),
+                })
+                .await
+            {
+                tracing::error!("Failed to send initial Claude prompt: {err}");
+                signal_ready(
+                    &ready_tx,
+                    Err(format!("Failed to send initial Claude prompt: {err}")),
+                )
+                .await;
+                session.shutdown().await;
+                let _ = forward_task.await;
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = input_rx.recv() => {
+                        let Some(input) = incoming else {
+                            break;
+                        };
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Claude follow-up: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update Claude session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else {
+                            break;
+                        };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt Claude turn: {err}");
+                            break;
+                        }
+                    }
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
+                        if let Some(emitter) = maybe_emitter {
+                            session.set_subagent_emitter(emitter).await;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+            let _ = forward_task.await;
+        });
+
+        match tokio::time::timeout(Duration::from_secs(120), ready_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err),
+            Ok(Err(_)) => return Err("Claude spawn initialization task ended early".to_string()),
+            Err(_) => return Err("Timed out waiting for Claude session_id".to_string()),
+        }
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id,
+                subagent_emitter_tx,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
 }
 
 fn claude_backend_defaults(
@@ -5138,201 +5350,7 @@ impl Backend for ClaudeBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
-        let session_id = Arc::new(std::sync::Mutex::new(None));
-        let session_id_task = Arc::clone(&session_id);
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-
-        tokio::spawn(async move {
-            let roots = if workspace_roots.is_empty() {
-                vec!["/tmp".to_string()]
-            } else {
-                workspace_roots
-            };
-            let steering_content = claude_steering_content(&config);
-            let agent_identity = claude_agent_identity(&config);
-            let (session, mut raw_events) = match ClaudeSession::spawn(
-                &roots,
-                None,
-                &config.startup_mcp_servers,
-                steering_content.as_deref(),
-                agent_identity.as_ref(),
-                config.resolved_spawn_config.tool_policy.clone(),
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    tracing::error!("Failed to spawn Claude session: {err}");
-                    let _ = ready_tx.send(Err(format!("Failed to spawn Claude session: {err}")));
-                    return;
-                }
-            };
-
-            let handle = session.command_handle();
-            let resolved_settings = resolve_session_settings(&config);
-            let model_override = match resolved_settings.0.get("model") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            let effort_override = match resolved_settings.0.get("effort") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            if model_override.is_some() || effort_override.is_some() {
-                let settings = json!({
-                    "model": model_override,
-                    "effort": effort_override,
-                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
-                });
-                if let Err(err) = handle
-                    .execute(SessionCommand::UpdateSettings {
-                        settings,
-                        persist: false,
-                    })
-                    .await
-                {
-                    tracing::error!("Failed to configure Claude session: {err}");
-                    let _ =
-                        ready_tx.send(Err(format!("Failed to configure Claude session: {err}")));
-                    session.shutdown().await;
-                    return;
-                }
-            }
-
-            let maybe_emitter = subagent_emitter_rx.borrow().clone();
-            if let Some(emitter) = maybe_emitter {
-                session.set_subagent_emitter(emitter).await;
-            }
-
-            let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
-            let ready_tx_forward = Arc::clone(&ready_tx);
-            let session_id_forward = Arc::clone(&session_id_task);
-            let events_tx_forward = events_tx.clone();
-            let forward_task = tokio::spawn(async move {
-                while let Some(raw) = raw_events.recv().await {
-                    if !forward_claude_backend_event(
-                        raw,
-                        &events_tx_forward,
-                        &session_id_forward,
-                        Some(&ready_tx_forward),
-                    )
-                    .await
-                    {
-                        return;
-                    }
-                }
-                signal_ready(
-                    &ready_tx_forward,
-                    Err("Claude session ended before reporting a session_id".to_string()),
-                )
-                .await;
-            });
-
-            if let Err(err) = handle
-                .execute(SessionCommand::SendMessage {
-                    message: initial_input.message,
-                    images: protocol_images_to_attachments(initial_input.images),
-                })
-                .await
-            {
-                tracing::error!("Failed to send initial Claude prompt: {err}");
-                signal_ready(
-                    &ready_tx,
-                    Err(format!("Failed to send initial Claude prompt: {err}")),
-                )
-                .await;
-                session.shutdown().await;
-                let _ = forward_task.await;
-                return;
-            }
-
-            loop {
-                tokio::select! {
-                        incoming = input_rx.recv() => {
-                            let Some(input) = incoming else {
-                                break;
-                            };
-                            match input {
-                                AgentInput::SendMessage(payload) => {
-                                    let images = protocol_images_to_attachments(payload.images);
-                                    if let Err(err) = handle
-                                        .execute(SessionCommand::SendMessage {
-                                            message: payload.message,
-                                            images,
-                                        })
-                                        .await
-                                    {
-                                        tracing::error!("Failed to send Claude follow-up: {err}");
-                                        break;
-                                    }
-                                }
-                                AgentInput::UpdateSessionSettings(payload) => {
-                                    if let Err(err) = handle
-                                        .execute(SessionCommand::UpdateSettings {
-                                            settings: session_settings_to_json(&payload.values),
-                                            persist: false,
-                                        })
-                                        .await
-                                    {
-                                        tracing::error!("Failed to update Claude session settings: {err}");
-                                        break;
-                                    }
-                                }
-                                AgentInput::EditQueuedMessage(_)
-                                | AgentInput::CancelQueuedMessage(_)
-                                | AgentInput::SendQueuedMessageNow(_) => {
-                                    panic!(
-                                        "queued-message inputs must be handled by the agent actor before reaching the backend"
-                                    );
-                                }
-                            }
-                        }
-                        interrupt = interrupt_rx.recv() => {
-                            let Some(()) = interrupt else {
-                                break;
-                            };
-                            if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
-                                tracing::error!("Failed to interrupt Claude turn: {err}");
-                                break;
-                            }
-                        }
-                        changed = subagent_emitter_rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                            let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                if let Some(emitter) = maybe_emitter {
-                                session.set_subagent_emitter(emitter).await;
-                            }
-                        }
-                    }
-            }
-
-            session.shutdown().await;
-            let _ = forward_task.await;
-        });
-
-        match tokio::time::timeout(Duration::from_secs(120), ready_rx).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(err))) => return Err(err),
-            Ok(Err(_)) => return Err("Claude spawn initialization task ended early".to_string()),
-            Err(_) => return Err("Timed out waiting for Claude session_id".to_string()),
-        }
-
-        Ok((
-            Self {
-                input_tx,
-                interrupt_tx,
-                session_id,
-                subagent_emitter_tx,
-            },
-            EventStream::new(events_rx),
-        ))
+        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, None).await
     }
 
     async fn resume(

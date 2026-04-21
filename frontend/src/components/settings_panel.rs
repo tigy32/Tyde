@@ -1382,9 +1382,54 @@ impl CustomAgentForm {
 }
 
 #[component]
+fn SettingsConfirmDialog(
+    title: String,
+    body: String,
+    confirm_label: String,
+    on_cancel: Callback<()>,
+    on_confirm: Callback<()>,
+) -> impl IntoView {
+    let cancel_on_backdrop = on_cancel;
+    let on_backdrop = move |_| cancel_on_backdrop.run(());
+
+    let cancel_on_keydown = on_cancel;
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() == "Escape" {
+            cancel_on_keydown.run(());
+        }
+    };
+
+    let cancel_on_click = on_cancel;
+    let on_cancel_click = move |_| cancel_on_click.run(());
+
+    let confirm_on_click = on_confirm;
+    let on_confirm_click = move |_| confirm_on_click.run(());
+
+    view! {
+        <div class="settings-confirm-overlay" on:click=on_backdrop on:keydown=on_keydown tabindex="0">
+            <div class="settings-confirm-modal" on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()>
+                <h3 class="settings-confirm-title">{title}</h3>
+                <p class="settings-confirm-description">{body}</p>
+                <div class="settings-form-footer">
+                    <button class="settings-btn" on:click=on_cancel_click>"Cancel"</button>
+                    <button class="settings-btn settings-btn-danger" on:click=on_confirm_click>
+                        {confirm_label}
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+type PendingCustomAgentDelete = (CustomAgentId, String);
+type PendingMcpDelete = (McpServerId, String);
+type PendingSteeringDelete = (SteeringId, String);
+
+#[component]
 fn CustomAgentsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let form: RwSignal<Option<CustomAgentForm>> = RwSignal::new(None);
+    let pending_delete: RwSignal<Option<PendingCustomAgentDelete>> = RwSignal::new(None);
 
     let state_for_rows = state.clone();
     let rows = Memo::new(move |_| {
@@ -1403,6 +1448,29 @@ fn CustomAgentsTab() -> impl IntoView {
     });
 
     let state_for_new_disabled = state.clone();
+    let pending_delete_for_cancel = pending_delete;
+    let on_cancel_delete = Callback::new(move |_| pending_delete_for_cancel.set(None));
+
+    let pending_delete_for_confirm = pending_delete;
+    let state_for_confirm_delete = state.clone();
+    let on_confirm_delete = Callback::new(move |_| {
+        let Some((id, _)) = pending_delete_for_confirm.get_untracked() else {
+            return;
+        };
+        pending_delete_for_confirm.set(None);
+        let Some(host_id) = state_for_confirm_delete.selected_host_id.get_untracked() else {
+            return;
+        };
+        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_confirm_delete, &host_id)
+        else {
+            return;
+        };
+        spawn_local(async move {
+            custom_agent_delete(&host_id, host_stream, id)
+                .await
+                .expect("failed to send custom_agent_delete");
+        });
+    });
 
     view! {
         <div class="settings-panel-header">
@@ -1436,7 +1504,7 @@ fn CustomAgentsTab() -> impl IntoView {
                         view! {
                             <>
                             {list.into_iter().map(|agent| view! {
-                                <CustomAgentRow agent=agent editor_signal=form />
+                                <CustomAgentRow agent=agent editor_signal=form delete_signal=pending_delete />
                             }).collect_view()}
                             </>
                         }.into_any()
@@ -1444,6 +1512,23 @@ fn CustomAgentsTab() -> impl IntoView {
                 }}
             </div>
         </div>
+
+        {move || {
+            pending_delete.get().map(|(_, name)| {
+                let on_cancel = on_cancel_delete;
+                let on_confirm = on_confirm_delete;
+                let body = format!("Delete custom agent \"{name}\"? This cannot be undone.");
+                view! {
+                    <SettingsConfirmDialog
+                        title="Delete custom agent".to_string()
+                        body=body
+                        confirm_label="Delete".to_string()
+                        on_cancel=on_cancel
+                        on_confirm=on_confirm
+                    />
+                }
+            })
+        }}
     }
 }
 
@@ -1451,8 +1536,8 @@ fn CustomAgentsTab() -> impl IntoView {
 fn CustomAgentRow(
     agent: CustomAgent,
     editor_signal: RwSignal<Option<CustomAgentForm>>,
+    delete_signal: RwSignal<Option<PendingCustomAgentDelete>>,
 ) -> impl IntoView {
-    let state = expect_context::<AppState>();
     let agent_for_edit = agent.clone();
     let on_edit = move |_| {
         editor_signal.set(Some(CustomAgentForm::from_agent(&agent_for_edit)));
@@ -1460,28 +1545,8 @@ fn CustomAgentRow(
 
     let agent_id_for_delete = agent.id.clone();
     let name_for_delete = agent.name.clone();
-    let state_for_delete = state.clone();
-    let on_delete = move |_| {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let msg = format!("Delete custom agent \"{}\"?", name_for_delete);
-        if !window.confirm_with_message(&msg).unwrap_or(false) {
-            return;
-        }
-        let Some(host_id) = state_for_delete.selected_host_id.get_untracked() else {
-            return;
-        };
-        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_delete, &host_id) else {
-            return;
-        };
-        let id = agent_id_for_delete.clone();
-        spawn_local(async move {
-            custom_agent_delete(&host_id, host_stream, id)
-                .await
-                .expect("failed to send custom_agent_delete");
-        });
-    };
+    let on_delete =
+        move |_| delete_signal.set(Some((agent_id_for_delete.clone(), name_for_delete.clone())));
 
     let description = if agent.description.is_empty() {
         "No description".to_string()
@@ -1887,6 +1952,7 @@ impl McpForm {
 fn McpServersTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let form: RwSignal<Option<McpForm>> = RwSignal::new(None);
+    let pending_delete: RwSignal<Option<PendingMcpDelete>> = RwSignal::new(None);
 
     let state_for_rows = state.clone();
     let rows = Memo::new(move |_| {
@@ -1905,6 +1971,29 @@ fn McpServersTab() -> impl IntoView {
     });
 
     let state_for_new_disabled = state.clone();
+    let pending_delete_for_cancel = pending_delete;
+    let on_cancel_delete = Callback::new(move |_| pending_delete_for_cancel.set(None));
+
+    let pending_delete_for_confirm = pending_delete;
+    let state_for_confirm_delete = state.clone();
+    let on_confirm_delete = Callback::new(move |_| {
+        let Some((id, _)) = pending_delete_for_confirm.get_untracked() else {
+            return;
+        };
+        pending_delete_for_confirm.set(None);
+        let Some(host_id) = state_for_confirm_delete.selected_host_id.get_untracked() else {
+            return;
+        };
+        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_confirm_delete, &host_id)
+        else {
+            return;
+        };
+        spawn_local(async move {
+            mcp_server_delete(&host_id, host_stream, id)
+                .await
+                .expect("failed to send mcp_server_delete");
+        });
+    });
 
     view! {
         <div class="settings-panel-header">
@@ -1938,7 +2027,7 @@ fn McpServersTab() -> impl IntoView {
                         view! {
                             <>
                             {list.into_iter().map(|server| view! {
-                                <McpRow server=server editor_signal=form />
+                                <McpRow server=server editor_signal=form delete_signal=pending_delete />
                             }).collect_view()}
                             </>
                         }.into_any()
@@ -1946,13 +2035,32 @@ fn McpServersTab() -> impl IntoView {
                 }}
             </div>
         </div>
+
+        {move || {
+            pending_delete.get().map(|(_, name)| {
+                let on_cancel = on_cancel_delete;
+                let on_confirm = on_confirm_delete;
+                let body = format!("Delete MCP server \"{name}\"? This cannot be undone.");
+                view! {
+                    <SettingsConfirmDialog
+                        title="Delete MCP server".to_string()
+                        body=body
+                        confirm_label="Delete".to_string()
+                        on_cancel=on_cancel
+                        on_confirm=on_confirm
+                    />
+                }
+            })
+        }}
     }
 }
 
 #[component]
-fn McpRow(server: McpServerConfig, editor_signal: RwSignal<Option<McpForm>>) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
+fn McpRow(
+    server: McpServerConfig,
+    editor_signal: RwSignal<Option<McpForm>>,
+    delete_signal: RwSignal<Option<PendingMcpDelete>>,
+) -> impl IntoView {
     let transport_label = match &server.transport {
         McpTransportConfig::Http { url, .. } => format!("HTTP · {url}"),
         McpTransportConfig::Stdio { command, .. } => format!("Stdio · {command}"),
@@ -1963,28 +2071,8 @@ fn McpRow(server: McpServerConfig, editor_signal: RwSignal<Option<McpForm>>) -> 
 
     let id_for_delete = server.id.clone();
     let name_for_delete = server.name.clone();
-    let state_for_delete = state.clone();
-    let on_delete = move |_| {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let msg = format!("Delete MCP server \"{}\"?", name_for_delete);
-        if !window.confirm_with_message(&msg).unwrap_or(false) {
-            return;
-        }
-        let Some(host_id) = state_for_delete.selected_host_id.get_untracked() else {
-            return;
-        };
-        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_delete, &host_id) else {
-            return;
-        };
-        let id = id_for_delete.clone();
-        spawn_local(async move {
-            mcp_server_delete(&host_id, host_stream, id)
-                .await
-                .expect("failed to send mcp_server_delete");
-        });
-    };
+    let on_delete =
+        move |_| delete_signal.set(Some((id_for_delete.clone(), name_for_delete.clone())));
 
     view! {
         <div class="host-card">
@@ -2217,6 +2305,7 @@ impl SteeringForm {
 fn SteeringTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let form: RwSignal<Option<SteeringForm>> = RwSignal::new(None);
+    let pending_delete: RwSignal<Option<PendingSteeringDelete>> = RwSignal::new(None);
 
     let state_for_rows = state.clone();
     let rows = Memo::new(move |_| {
@@ -2235,6 +2324,29 @@ fn SteeringTab() -> impl IntoView {
     });
 
     let state_for_new_disabled = state.clone();
+    let pending_delete_for_cancel = pending_delete;
+    let on_cancel_delete = Callback::new(move |_| pending_delete_for_cancel.set(None));
+
+    let pending_delete_for_confirm = pending_delete;
+    let state_for_confirm_delete = state.clone();
+    let on_confirm_delete = Callback::new(move |_| {
+        let Some((id, _)) = pending_delete_for_confirm.get_untracked() else {
+            return;
+        };
+        pending_delete_for_confirm.set(None);
+        let Some(host_id) = state_for_confirm_delete.selected_host_id.get_untracked() else {
+            return;
+        };
+        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_confirm_delete, &host_id)
+        else {
+            return;
+        };
+        spawn_local(async move {
+            steering_delete(&host_id, host_stream, id)
+                .await
+                .expect("failed to send steering_delete");
+        });
+    });
 
     view! {
         <div class="settings-panel-header">
@@ -2268,7 +2380,7 @@ fn SteeringTab() -> impl IntoView {
                         view! {
                             <>
                             {list.into_iter().map(|item| view! {
-                                <SteeringRow item=item editor_signal=form />
+                                <SteeringRow item=item editor_signal=form delete_signal=pending_delete />
                             }).collect_view()}
                             </>
                         }.into_any()
@@ -2276,13 +2388,32 @@ fn SteeringTab() -> impl IntoView {
                 }}
             </div>
         </div>
+
+        {move || {
+            pending_delete.get().map(|(_, title)| {
+                let on_cancel = on_cancel_delete;
+                let on_confirm = on_confirm_delete;
+                let body = format!("Delete steering \"{title}\"? This cannot be undone.");
+                view! {
+                    <SettingsConfirmDialog
+                        title="Delete steering".to_string()
+                        body=body
+                        confirm_label="Delete".to_string()
+                        on_cancel=on_cancel
+                        on_confirm=on_confirm
+                    />
+                }
+            })
+        }}
     }
 }
 
 #[component]
-fn SteeringRow(item: Steering, editor_signal: RwSignal<Option<SteeringForm>>) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
+fn SteeringRow(
+    item: Steering,
+    editor_signal: RwSignal<Option<SteeringForm>>,
+    delete_signal: RwSignal<Option<PendingSteeringDelete>>,
+) -> impl IntoView {
     let scope_label = match &item.scope {
         SteeringScope::Host => "Host".to_string(),
         SteeringScope::Project(id) => format!("Project · {}", id.0),
@@ -2292,35 +2423,14 @@ fn SteeringRow(item: Steering, editor_signal: RwSignal<Option<SteeringForm>>) ->
     let on_edit = move |_| editor_signal.set(Some(SteeringForm::from_steering(&item_for_edit)));
 
     let id_for_delete = item.id.clone();
-    let title_for_delete = item.title.clone();
-    let state_for_delete = state.clone();
-    let on_delete = move |_| {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let msg = format!("Delete steering \"{}\"?", title_for_delete);
-        if !window.confirm_with_message(&msg).unwrap_or(false) {
-            return;
-        }
-        let Some(host_id) = state_for_delete.selected_host_id.get_untracked() else {
-            return;
-        };
-        let Some((host_id, host_stream)) = host_stream_with_id(&state_for_delete, &host_id) else {
-            return;
-        };
-        let id = id_for_delete.clone();
-        spawn_local(async move {
-            steering_delete(&host_id, host_stream, id)
-                .await
-                .expect("failed to send steering_delete");
-        });
-    };
-
     let title_display = if item.title.is_empty() {
         "(untitled)".to_string()
     } else {
         item.title.clone()
     };
+    let title_for_delete = title_display.clone();
+    let on_delete =
+        move |_| delete_signal.set(Some((id_for_delete.clone(), title_for_delete.clone())));
 
     view! {
         <div class="host-card">

@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use fixture::Fixture;
 use protocol::{
-    BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
-    MessageSender, NewAgentPayload, ProtocolValidator, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
-    SessionSummary, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
-    StreamPath, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
+    AgentOrigin, AgentStartPayload, BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue,
+    ImageData, ListSessionsPayload, MessageSender, NewAgentPayload, ProtocolValidator,
+    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData,
+    ToolRequest, ToolRequestType,
 };
 use server::backend::Backend;
 
@@ -748,6 +749,31 @@ async fn expect_next_event_kind_on_stream(
     }
 }
 
+async fn expect_backend_native_child_for_parent(
+    client: &mut ValidatedConnection,
+    parent_agent_id: &protocol::AgentId,
+    context: &str,
+) -> NewAgentPayload {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for backend-native child for parent {} ({context})",
+            parent_agent_id
+        );
+        let env = expect_next_event(client, context).await;
+        if env.kind != FrameKind::NewAgent {
+            continue;
+        }
+        let payload: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+        if payload.origin == AgentOrigin::BackendNative
+            && payload.parent_agent_id.as_ref() == Some(parent_agent_id)
+        {
+            return payload;
+        }
+    }
+}
+
 async fn spawn_agent_via_protocol(
     client: &mut ValidatedConnection,
     workspace_roots: Vec<String>,
@@ -1009,6 +1035,118 @@ struct AssistantTurn {
     delta_count: usize,
 }
 
+struct AssistantTurnWithTyping {
+    final_text: String,
+    delta_count: usize,
+    saw_typing_true: bool,
+    saw_stream_start: bool,
+    saw_stream_end: bool,
+    saw_typing_false: bool,
+    events: Vec<&'static str>,
+}
+
+async fn expect_assistant_turn_with_typing_after_user_echo(
+    client: &mut ValidatedConnection,
+    agent_stream: &StreamPath,
+    prompt: &str,
+) -> AssistantTurnWithTyping {
+    let mut got_user_message_echo = false;
+    let mut saw_typing_true = false;
+    let mut saw_stream_start = false;
+    let mut saw_stream_end = false;
+    let mut saw_typing_false = false;
+    let mut streamed_text = String::new();
+    let mut final_text = None::<String>;
+    let mut delta_count = 0usize;
+    let mut events = Vec::new();
+
+    loop {
+        let env = expect_next_event(client, "follow-up typing/stream ChatEvent").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != *agent_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                events.push("MessageAdded");
+                if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                    got_user_message_echo = true;
+                } else if got_user_message_echo && matches!(message.sender, MessageSender::Error) {
+                    panic!(
+                        "backend returned error instead of assistant response for prompt {:?}: {}",
+                        prompt, message.content
+                    );
+                }
+            }
+            ChatEvent::TypingStatusChanged(true) => {
+                events.push("TypingStatusChanged(true)");
+                if got_user_message_echo && !saw_typing_true {
+                    saw_typing_true = true;
+                }
+            }
+            ChatEvent::StreamStart(_) => {
+                events.push("StreamStart");
+                if !got_user_message_echo {
+                    continue;
+                }
+                assert!(
+                    saw_typing_true,
+                    "StreamStart arrived before TypingStatusChanged(true) for prompt {:?}; events={events:?}",
+                    prompt
+                );
+                saw_stream_start = true;
+            }
+            ChatEvent::StreamDelta(delta) => {
+                events.push("StreamDelta");
+                if saw_stream_start {
+                    delta_count += 1;
+                    streamed_text.push_str(&delta.text);
+                }
+            }
+            ChatEvent::StreamEnd(data) => {
+                events.push("StreamEnd");
+                if !got_user_message_echo {
+                    continue;
+                }
+                assert!(
+                    saw_stream_start,
+                    "received StreamEnd before StreamStart for prompt {:?}; events={events:?}",
+                    prompt
+                );
+                saw_stream_end = true;
+                final_text = Some(if data.message.content.trim().is_empty() {
+                    streamed_text.clone()
+                } else {
+                    data.message.content
+                });
+                if saw_typing_false {
+                    break;
+                }
+            }
+            ChatEvent::TypingStatusChanged(false) => {
+                events.push("TypingStatusChanged(false)");
+                if got_user_message_echo && saw_typing_true {
+                    saw_typing_false = true;
+                    if saw_stream_end {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    AssistantTurnWithTyping {
+        final_text: final_text.expect("turn completed without final text"),
+        delta_count,
+        saw_typing_true,
+        saw_stream_start,
+        saw_stream_end,
+        saw_typing_false,
+        events,
+    }
+}
+
 struct ToolTurn {
     final_text: String,
     tool_requests: Vec<ToolRequest>,
@@ -1210,6 +1348,93 @@ async fn assert_backend_emits_typing_status(
         saw_typing_false,
         "expected TypingStatusChanged(false) for {backend_kind:?}"
     );
+}
+
+async fn assert_backend_emits_typing_and_streaming_on_follow_up_turns(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let workspace_roots = fixture.workspace_roots();
+    let prompts = [
+        "Reply with exactly TURN_ONE and nothing else.",
+        "Reply with exactly TURN_TWO and nothing else.",
+        "Reply with exactly TURN_THREE and nothing else.",
+    ];
+    let expected_markers = ["TURN_ONE", "TURN_TWO", "TURN_THREE"];
+
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "follow-up-thinking",
+        prompts[0],
+    )
+    .await;
+
+    let first_turn = expect_assistant_turn_with_typing_after_user_echo(
+        &mut fixture.client,
+        &agent_stream,
+        prompts[0],
+    )
+    .await;
+    assert!(
+        first_turn.final_text.contains(expected_markers[0]),
+        "expected first turn response to contain {:?} for {backend_kind:?}, got {:?}; events={:?}",
+        expected_markers[0],
+        first_turn.final_text,
+        first_turn.events
+    );
+    assert!(
+        first_turn.saw_typing_true
+            && first_turn.saw_stream_start
+            && first_turn.saw_stream_end
+            && first_turn.saw_typing_false,
+        "expected full typing/stream lifecycle on first turn for {backend_kind:?}; got events={:?}",
+        first_turn.events
+    );
+
+    for (prompt, expected_marker) in prompts[1..].iter().zip(expected_markers[1..].iter()) {
+        fixture
+            .client
+            .send_message(&agent_stream, (*prompt).to_string())
+            .await
+            .expect("send follow-up message");
+        let turn = expect_assistant_turn_with_typing_after_user_echo(
+            &mut fixture.client,
+            &agent_stream,
+            prompt,
+        )
+        .await;
+        assert!(
+            turn.final_text.contains(expected_marker),
+            "expected follow-up turn response to contain {:?} for {backend_kind:?}, got {:?}; events={:?}",
+            expected_marker,
+            turn.final_text,
+            turn.events
+        );
+        assert!(
+            turn.saw_typing_true
+                && turn.saw_stream_start
+                && turn.saw_stream_end
+                && turn.saw_typing_false,
+            "expected full typing/stream lifecycle on follow-up turn {:?} for {backend_kind:?}; got events={:?}",
+            prompt,
+            turn.events
+        );
+        assert!(
+            !turn.final_text.trim().is_empty(),
+            "expected non-empty follow-up response for {backend_kind:?}; events={:?}",
+            turn.events
+        );
+        if backend_kind != BackendKind::Gemini {
+            assert!(
+                turn.delta_count > 0,
+                "expected streamed deltas on follow-up turn {:?} for {backend_kind:?}; events={:?}",
+                prompt,
+                turn.events
+            );
+        }
+    }
 }
 
 async fn assert_backend_describes_image_input(
@@ -1815,6 +2040,101 @@ async fn real_backends_emit_typing_status() {
 }
 
 #[tokio::test]
+async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
+    let backend_kind = BackendKind::Claude;
+    if !backend_binary_available(backend_kind) {
+        eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+        return;
+    }
+    if !backend_runtime_available(backend_kind) {
+        eprintln!(
+            "SKIPPED: {} not runnable in current environment",
+            backend_label(backend_kind)
+        );
+        return;
+    }
+    if let Err(reason) = probe_backend_runtime(backend_kind).await {
+        eprintln!(
+            "SKIPPED: {} failed readiness probe: {}",
+            backend_label(backend_kind),
+            reason
+        );
+        return;
+    }
+
+    let handle = tokio::spawn(async move {
+        let mut fixture = RealBackendFixture::new().await;
+        let workspace_roots = fixture.workspace_roots();
+        let prompt = "Test harness: in your very first action, call the Task tool exactly once. Ask the sub-agent to read README.txt in the current working directory and reply with exactly the first line. Wait for that Task to finish. Afterward, reply exactly with: parent complete";
+
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some("claude-native-child-first-turn".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots,
+                    prompt: prompt.to_owned(),
+                    images: None,
+                    backend_kind,
+                    cost_hint: Some(SpawnCostHint::High),
+                    session_settings: None,
+                },
+            })
+            .await
+            .expect("spawn_agent failed");
+
+        let env =
+            expect_next_event_kind(&mut fixture.client, FrameKind::NewAgent, "parent NewAgent")
+                .await;
+        let parent_new: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+        assert_eq!(parent_new.origin, AgentOrigin::User);
+
+        let env = expect_next_event_kind_on_stream(
+            &mut fixture.client,
+            FrameKind::AgentStart,
+            &parent_new.instance_stream,
+            "parent AgentStart",
+        )
+        .await;
+        let parent_start: AgentStartPayload = env.parse_payload().expect("parse parent AgentStart");
+        assert_eq!(parent_start.agent_id, parent_new.agent_id);
+
+        let child_new = expect_backend_native_child_for_parent(
+            &mut fixture.client,
+            &parent_new.agent_id,
+            "backend-native child NewAgent",
+        )
+        .await;
+        assert_eq!(child_new.origin, AgentOrigin::BackendNative);
+        assert_eq!(
+            child_new.parent_agent_id.as_ref(),
+            Some(&parent_new.agent_id)
+        );
+
+        let env = expect_next_event_kind_on_stream(
+            &mut fixture.client,
+            FrameKind::AgentStart,
+            &child_new.instance_stream,
+            "backend-native child AgentStart",
+        )
+        .await;
+        let child_start: AgentStartPayload = env.parse_payload().expect("parse child AgentStart");
+        assert_eq!(child_start.origin, AgentOrigin::BackendNative);
+        assert_eq!(
+            child_start.parent_agent_id.as_ref(),
+            Some(&parent_new.agent_id)
+        );
+    });
+
+    if let Err(err) = handle.await {
+        panic!("{}: {}", backend_label(backend_kind), err);
+    }
+}
+
+#[tokio::test]
 async fn real_codex_emits_tool_events_for_file_copy() {
     let backends = [BackendKind::Codex];
     let mut failures = Vec::new();
@@ -1898,6 +2218,34 @@ async fn real_backends_interrupt_long_running_command() {
         "real backend interrupt failures:\n{}",
         failures.join("\n")
     );
+}
+
+#[tokio::test]
+async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
+    let backend_kind = BackendKind::Kiro;
+
+    if !backend_binary_available(backend_kind) {
+        eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+        return;
+    }
+    if !backend_runtime_available(backend_kind) {
+        eprintln!(
+            "SKIPPED: {} not runnable in current environment",
+            backend_label(backend_kind)
+        );
+        return;
+    }
+    if let Err(reason) = probe_backend_runtime(backend_kind).await {
+        eprintln!(
+            "SKIPPED: {} failed readiness probe: {}",
+            backend_label(backend_kind),
+            reason
+        );
+        return;
+    }
+
+    let mut fixture = RealBackendFixture::new().await;
+    assert_backend_emits_typing_and_streaming_on_follow_up_turns(&mut fixture, backend_kind).await;
 }
 
 #[tokio::test]

@@ -331,7 +331,6 @@ pub(crate) async fn generate_agent_name(
 /// Type-erased backend handle. The actor loop only needs `send()` — this lets
 /// us dispatch to any concrete `Backend` at spawn time and forget the type.
 trait BackendSender: Send + 'static {
-    fn session_id(&self) -> SessionId;
     fn send<'a>(
         &'a self,
         input: AgentInput,
@@ -341,10 +340,6 @@ trait BackendSender: Send + 'static {
 }
 
 impl<B: Backend> BackendSender for B {
-    fn session_id(&self) -> SessionId {
-        Backend::session_id(self)
-    }
-
     fn send<'a>(
         &'a self,
         input: AgentInput,
@@ -373,44 +368,51 @@ async fn spawn_backend(
     initial_input: SendMessagePayload,
     host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
 ) -> BackendSpawnResult {
-    let (backend, events): (BackendHandle, EventStream) = match backend_kind {
+    match backend_kind {
         BackendKind::Tycode => {
             let (b, events) = TycodeBackend::spawn(workspace_roots, config, initial_input).await?;
-            (Box::new(b), events)
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
         }
         BackendKind::Kiro => {
             let (b, events) = KiroBackend::spawn(workspace_roots, config, initial_input).await?;
-            (Box::new(b), events)
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
         }
         BackendKind::Claude => {
-            let (b, events) =
-                ClaudeBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
-            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
+            let emitter = Arc::new(HostSubAgentEmitter::new(
                 host_sub_agent_spawn_tx,
                 agent_id.clone(),
+                workspace_roots.clone(),
+            ));
+            let (b, events) = ClaudeBackend::spawn_with_subagent_emitter(
                 workspace_roots,
-            )))
-            .await;
-            (Box::new(b), events)
+                config,
+                initial_input,
+                emitter,
+            )
+            .await?;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
         }
         BackendKind::Codex => {
             let (b, events) =
                 CodexBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
+            let session_id = Backend::session_id(&b);
             b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
                 host_sub_agent_spawn_tx,
                 agent_id.clone(),
                 workspace_roots,
             )))
             .await;
-            (Box::new(b), events)
+            Ok((Box::new(b), events, session_id))
         }
         BackendKind::Gemini => {
             let (b, events) = GeminiBackend::spawn(workspace_roots, config, initial_input).await?;
-            (Box::new(b), events)
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
         }
-    };
-    let session_id = backend.session_id();
-    Ok((backend, events, session_id))
+    }
 }
 
 async fn resume_backend(
@@ -432,7 +434,7 @@ async fn resume_backend(
         }
         BackendKind::Claude => {
             let (b, events) =
-                ClaudeBackend::resume(workspace_roots.clone(), config, session_id).await?;
+                ClaudeBackend::resume(workspace_roots.clone(), config, session_id.clone()).await?;
             b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
                 host_sub_agent_spawn_tx,
                 agent_id.clone(),
@@ -443,7 +445,7 @@ async fn resume_backend(
         }
         BackendKind::Codex => {
             let (b, events) =
-                CodexBackend::resume(workspace_roots.clone(), config, session_id).await?;
+                CodexBackend::resume(workspace_roots.clone(), config, session_id.clone()).await?;
             b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
                 host_sub_agent_spawn_tx,
                 agent_id.clone(),
@@ -470,13 +472,13 @@ fn spawn_mock(
     Box::pin(async move {
         let (b, events) =
             MockBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
+        let sid = Backend::session_id(&b);
         b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
             host_sub_agent_spawn_tx,
             agent_id,
             workspace_roots,
         )))
         .await;
-        let sid = Backend::session_id(&b);
         Ok((Box::new(b) as BackendHandle, events, sid))
     })
 }
@@ -491,7 +493,7 @@ fn resume_mock(
         let (b, events) = MockBackend::resume(
             workspace_roots.clone(),
             BackendSpawnConfig::default(),
-            session_id,
+            session_id.clone(),
         )
         .await?;
         b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(

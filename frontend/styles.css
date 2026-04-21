@@ -1048,8 +1048,8 @@ details summary:focus:not(:focus-visible) {
 
 .center-content-scroll {
     display: flex;
-    align-items: center;
-    justify-content: center;
+    align-items: safe center;
+    justify-content: safe center;
     width: 100%;
     height: 100%;
     overflow: auto;
@@ -1302,6 +1302,7 @@ kbd {
     width: 100%;
     height: 100%;
     min-height: 0;
+    position: relative;
 }
 
 .chat-agent-header {
@@ -1416,10 +1417,15 @@ kbd {
 
 /* ===== Initializing Agent Overlay ===== */
 .chat-initializing-overlay {
+    position: absolute;
+    inset: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
+    justify-content: center;
     gap: var(--space-4);
+    background: var(--surface-base);
+    z-index: 5;
 }
 
 .chat-initializing-spinner {
@@ -4466,6 +4472,41 @@ kbd {
 
 .settings-panel-intro {
     margin-bottom: var(--space-5);
+}
+
+.settings-confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1100;
+}
+
+.settings-confirm-modal {
+    width: min(420px, calc(100vw - 32px));
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 20px;
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 10px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+.settings-confirm-title {
+    margin: 0;
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.settings-confirm-description {
+    margin: 0;
+    color: var(--text-secondary);
+    line-height: 1.5;
 }
 
 .settings-backend-header {

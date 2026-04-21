@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use protocol::types::AgentClosedPayload;
 use protocol::{
@@ -1665,6 +1666,29 @@ impl HostHandle {
         });
     }
 
+    async fn wait_for_parent_session_id(&self, parent_agent_id: &AgentId) -> SessionId {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(session_id) = self
+                .state
+                .lock()
+                .await
+                .agent_sessions
+                .get(parent_agent_id)
+                .cloned()
+            {
+                return session_id;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cannot resolve parent session for backend-native child {}",
+                parent_agent_id
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn spawn_backend_native_subagent(
         &self,
         request: &HostSubAgentSpawnRequest,
@@ -1678,7 +1702,7 @@ impl HostHandle {
             "host backend-native sub-agent spawn requested"
         );
 
-        let (session_store, parent_handle, parent_session_id) = {
+        let (session_store, parent_handle) = {
             let state = self.state.lock().await;
             let parent_handle = state
                 .registry
@@ -1689,22 +1713,11 @@ impl HostHandle {
                         request.parent_agent_id
                     )
                 });
-            let parent_session_id = state
-                .agent_sessions
-                .get(&request.parent_agent_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "cannot resolve parent session for backend-native child {}",
-                        request.parent_agent_id
-                    )
-                });
-            (
-                Arc::clone(&state.session_store),
-                parent_handle,
-                parent_session_id,
-            )
+            (Arc::clone(&state.session_store), parent_handle)
         };
+        let parent_session_id = self
+            .wait_for_parent_session_id(&request.parent_agent_id)
+            .await;
 
         let parent_start = parent_handle.snapshot().await.unwrap_or_else(|| {
             panic!(

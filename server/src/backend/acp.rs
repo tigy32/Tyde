@@ -13,7 +13,6 @@ use crate::process_env;
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
 const ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
 
-#[derive(Clone)]
 pub enum AcpInbound {
     Notification {
         method: String,
@@ -27,6 +26,9 @@ pub enum AcpInbound {
     Stderr(String),
     Closed {
         exit_code: Option<i32>,
+    },
+    Barrier {
+        ack: oneshot::Sender<()>,
     },
 }
 
@@ -83,6 +85,7 @@ impl AcpSpawnSpec {
 
 pub struct AcpBridge {
     rpc: AcpRpc,
+    inbound_tx: mpsc::UnboundedSender<AcpInbound>,
     terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminal>>>>,
     next_terminal_id: AtomicU64,
 }
@@ -92,10 +95,11 @@ impl AcpBridge {
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
-        let (rpc, inbound_rx) = AcpRpc::spawn(spec, ssh_host).await?;
+        let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, ssh_host).await?;
         Ok((
             Self {
                 rpc,
+                inbound_tx,
                 terminals: Mutex::new(HashMap::new()),
                 next_terminal_id: AtomicU64::new(1),
             },
@@ -117,6 +121,16 @@ impl AcpBridge {
 
     pub async fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<(), String> {
         self.rpc.respond_error(id, code, message).await
+    }
+
+    pub async fn sync_inbound(&self) -> Result<(), String> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inbound_tx
+            .send(AcpInbound::Barrier { ack: ack_tx })
+            .map_err(|_| "ACP inbound channel closed".to_string())?;
+        ack_rx
+            .await
+            .map_err(|_| "ACP inbound barrier dropped".to_string())
     }
 
     pub async fn handle_server_request(
@@ -992,7 +1006,14 @@ impl AcpRpc {
     async fn spawn(
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
+    ) -> Result<
+        (
+            Self,
+            mpsc::UnboundedSender<AcpInbound>,
+            mpsc::UnboundedReceiver<AcpInbound>,
+        ),
+        String,
+    > {
         let mut child = if let Some(host) = ssh_host {
             crate::remote::spawn_remote_process(
                 host,
@@ -1140,6 +1161,7 @@ impl AcpRpc {
                 next_id: AtomicU64::new(1),
                 child: child_ref,
             },
+            inbound_tx,
             inbound_rx,
         ))
     }

@@ -204,6 +204,16 @@ impl Backend for TycodeBackend {
                     return;
                 }
             };
+            let stderr = match child.stderr.take() {
+                Some(s) => s,
+                None => {
+                    tracing::error!("Failed to capture tycode-subprocess stderr");
+                    let _ = ready_tx
+                        .send(Err("Failed to capture tycode-subprocess stderr".to_string()));
+                    return;
+                }
+            };
+            let last_stderr_line = spawn_tycode_stderr_logger(stderr);
 
             // Spawn a task to forward follow-up messages to stdin
             let (stdin_tx, mut stdin_rx) =
@@ -441,9 +451,7 @@ impl Backend for TycodeBackend {
             }
 
             if let Some(ready_tx) = ready_tx.take() {
-                let _ = ready_tx.send(Err(
-                    "Tycode process exited before reporting a session_id".to_string()
-                ));
+                let _ = ready_tx.send(Err(tycode_startup_exit_error(&last_stderr_line)));
             }
         });
 
@@ -536,6 +544,14 @@ impl Backend for TycodeBackend {
                     return;
                 }
             };
+            let stderr = match child.stderr.take() {
+                Some(s) => s,
+                None => {
+                    tracing::error!("Failed to capture tycode-subprocess stderr for resume");
+                    return;
+                }
+            };
+            let _last_stderr_line = spawn_tycode_stderr_logger(stderr);
 
             let (stdin_tx, mut stdin_rx) =
                 mpsc::channel::<TycodeStdinCommand>(BACKEND_INPUT_BUFFER);
@@ -850,7 +866,39 @@ fn build_tycode_mcp_servers_json(startup_mcp_servers: &[StartupMcpServer]) -> Op
         return None;
     }
 
-    Some(serde_json::json!({ "mcpServers": servers }).to_string())
+    Some(Value::Object(servers).to_string())
+}
+
+fn spawn_tycode_stderr_logger(
+    stderr: tokio::process::ChildStderr,
+) -> Arc<std::sync::Mutex<Option<String>>> {
+    let last_stderr_line = Arc::new(std::sync::Mutex::new(None));
+    let sink = Arc::clone(&last_stderr_line);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            tracing::warn!("tycode-subprocess stderr: {trimmed}");
+            *sink.lock().expect("tycode stderr mutex poisoned") = Some(trimmed.to_string());
+        }
+    });
+    last_stderr_line
+}
+
+fn tycode_startup_exit_error(last_stderr_line: &Arc<std::sync::Mutex<Option<String>>>) -> String {
+    match last_stderr_line
+        .lock()
+        .expect("tycode stderr mutex poisoned")
+        .clone()
+    {
+        Some(stderr) => {
+            format!("Tycode process exited before reporting a session_id: {stderr}")
+        }
+        None => "Tycode process exited before reporting a session_id".to_string(),
+    }
 }
 
 fn tycode_session_started(value: &Value) -> Option<SessionId> {
@@ -1098,12 +1146,40 @@ mod tests {
         .expect("HTTP MCP config should serialize");
         let value: Value = serde_json::from_str(&json).expect("parse JSON");
         assert_eq!(
-            value["mcpServers"]["tyde-debug"]["url"],
+            value["tyde-debug"]["url"],
             Value::String("http://127.0.0.1:4123/mcp".to_string())
         );
         assert_eq!(
-            value["mcpServers"]["tyde-debug"]["headers"]["x-tyde-debug-repo-root"],
+            value["tyde-debug"]["headers"]["x-tyde-debug-repo-root"],
             Value::String("/tmp/project".to_string())
+        );
+    }
+
+    #[test]
+    fn build_tycode_mcp_servers_json_supports_stdio_servers() {
+        let json = build_tycode_mcp_servers_json(&[StartupMcpServer {
+            name: "context7".to_string(),
+            transport: StartupMcpTransport::Stdio {
+                command: "npx".to_string(),
+                args: vec!["@upstash/context7-mcp@latest".to_string()],
+                env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            },
+        }])
+        .expect("stdio MCP config should serialize");
+        let value: Value = serde_json::from_str(&json).expect("parse JSON");
+        assert_eq!(
+            value["context7"]["command"],
+            Value::String("npx".to_string())
+        );
+        assert_eq!(
+            value["context7"]["args"],
+            Value::Array(vec![Value::String(
+                "@upstash/context7-mcp@latest".to_string()
+            )])
+        );
+        assert_eq!(
+            value["context7"]["env"]["FOO"],
+            Value::String("bar".to_string())
         );
     }
 }

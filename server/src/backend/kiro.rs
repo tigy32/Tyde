@@ -397,6 +397,8 @@ impl KiroInner {
                     }
                 };
 
+                self.bridge.sync_inbound().await?;
+
                 if let Some(model) = extract_current_model(&response) {
                     let mut state = self.state.lock().await;
                     state.model = Some(model);
@@ -760,6 +762,9 @@ impl KiroInner {
                         let _ = self.bridge.respond_error(id, -32_000, &err).await;
                     }
                 }
+            }
+            AcpInbound::Barrier { ack } => {
+                let _ = ack.send(());
             }
         }
     }
@@ -3068,7 +3073,20 @@ impl Backend for KiroBackend {
                 let _ = tx.send(Ok(()));
             }
 
+            let events_tx_forward = events_tx_task.clone();
+            let forward_task = tokio::spawn(async move {
+                while let Some(raw) = raw_events.recv().await {
+                    if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                        && events_tx_forward.send(event).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+
+            let (command_error_tx, mut command_error_rx) = mpsc::unbounded_channel::<String>();
             let initial_handle = handle.clone();
+            let initial_command_error_tx = command_error_tx.clone();
             tokio::spawn(async move {
                 if let Err(err) = initial_handle
                     .execute(SessionCommand::SendMessage {
@@ -3077,20 +3095,19 @@ impl Backend for KiroBackend {
                     })
                     .await
                 {
-                    tracing::error!("Failed to send initial Kiro prompt: {err}");
+                    let _ = initial_command_error_tx
+                        .send(format!("Failed to send initial Kiro prompt: {err}"));
                 }
             });
 
             loop {
                 tokio::select! {
-                    incoming = raw_events.recv() => {
-                        let Some(raw) = incoming else {
+                    maybe_error = command_error_rx.recv() => {
+                        let Some(error) = maybe_error else {
                             break;
                         };
-                        if let Some(event) = map_kiro_value_to_chat_event(&raw)
-                            && events_tx_task.send(event).await.is_err() {
-                                break;
-                            }
+                        tracing::error!("{error}");
+                        break;
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else { break };
@@ -3098,16 +3115,21 @@ impl Backend for KiroBackend {
                             AgentInput::SendMessage(payload) => {
                                 let message = payload.message;
                                 let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message,
-                                        images,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send Kiro follow-up prompt: {err}");
-                                    break;
-                                }
+                                let handle = handle.clone();
+                                let command_error_tx = command_error_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = handle
+                                        .execute(SessionCommand::SendMessage {
+                                            message,
+                                            images,
+                                        })
+                                        .await
+                                    {
+                                        let _ = command_error_tx.send(format!(
+                                            "Failed to send Kiro follow-up prompt: {err}"
+                                        ));
+                                    }
+                                });
                             }
                             AgentInput::UpdateSessionSettings(payload) => {
                                 if let Err(err) = handle
@@ -3141,6 +3163,7 @@ impl Backend for KiroBackend {
             }
 
             session.shutdown().await;
+            let _ = forward_task.await;
         });
 
         match ready_rx.await {
@@ -3229,32 +3252,47 @@ impl Backend for KiroBackend {
                 return;
             }
 
+            let events_tx_forward = events_tx_task.clone();
+            let forward_task = tokio::spawn(async move {
+                while let Some(raw) = raw_events.recv().await {
+                    if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                        && events_tx_forward.send(event).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+
+            let (command_error_tx, mut command_error_rx) = mpsc::unbounded_channel::<String>();
             loop {
                 tokio::select! {
-                    incoming = raw_events.recv() => {
-                        let Some(raw) = incoming else {
+                    maybe_error = command_error_rx.recv() => {
+                        let Some(error) = maybe_error else {
                             break;
                         };
-                        if let Some(event) = map_kiro_value_to_chat_event(&raw)
-                            && events_tx_task.send(event).await.is_err() {
-                                break;
-                            }
+                        tracing::error!("{error}");
+                        break;
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else { break };
                         match input {
                             AgentInput::SendMessage(payload) => {
                                 let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message: payload.message,
-                                        images,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send resumed Kiro follow-up prompt: {err}");
-                                    break;
-                                }
+                                let handle = handle.clone();
+                                let command_error_tx = command_error_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = handle
+                                        .execute(SessionCommand::SendMessage {
+                                            message: payload.message,
+                                            images,
+                                        })
+                                        .await
+                                    {
+                                        let _ = command_error_tx.send(format!(
+                                            "Failed to send resumed Kiro follow-up prompt: {err}"
+                                        ));
+                                    }
+                                });
                             }
                             AgentInput::UpdateSessionSettings(payload) => {
                                 if let Err(err) = handle
@@ -3288,6 +3326,7 @@ impl Backend for KiroBackend {
             }
 
             session.shutdown().await;
+            let _ = forward_task.await;
         });
 
         Ok((
@@ -3473,6 +3512,8 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn extract_known_models_dedupes_case_variants() {
@@ -3609,5 +3650,129 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0]["path"], "hello.py");
         assert_eq!(files[0]["bytes"], 26);
+    }
+
+    fn write_fake_kiro_acp_program() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tyde-kiro-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake kiro tempdir");
+        let path = dir.join("fake-kiro-acp");
+        let script = r#"#!/bin/sh
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-test-session","models":{"currentModelId":"auto"}}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-test-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FAST_TURN_OK"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        std::fs::write(&path, script).expect("write fake kiro acp program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake kiro acp program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake kiro acp program");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn send_message_waits_for_prior_inbound_updates_before_finalizing_stream() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("tyde-kiro-workspace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create fake workspace");
+        let program = write_fake_kiro_acp_program();
+
+        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            None,
+            &[],
+            None,
+            Some(program.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("spawn fake kiro session");
+
+        let handle = session.command_handle();
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "hello".to_string(),
+                images: None,
+            })
+            .await
+            .expect("send fake kiro message");
+
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(25), raw_events.recv()).await {
+                Ok(Some(value)) => {
+                    let kind = value
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let is_typing_false = kind == "TypingStatusChanged"
+                        && value.get("data").and_then(Value::as_bool) == Some(false);
+                    events.push(value);
+                    if is_typing_false {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        let first_typing_true = events.iter().position(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                && event.get("data").and_then(Value::as_bool) == Some(true)
+        });
+        let stream_start = events
+            .iter()
+            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamStart"));
+        let stream_delta = events
+            .iter()
+            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamDelta"));
+        let stream_end = events
+            .iter()
+            .position(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"));
+        let typing_false = events.iter().position(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                && event.get("data").and_then(Value::as_bool) == Some(false)
+        });
+
+        assert!(
+            first_typing_true.is_some()
+                && stream_start.is_some()
+                && stream_delta.is_some()
+                && stream_end.is_some()
+                && typing_false.is_some(),
+            "expected full stream lifecycle after prompt completion, got {events:?}"
+        );
+        let first_typing_true = first_typing_true.expect("typing true checked above");
+        let stream_start = stream_start.expect("stream start checked above");
+        let stream_delta = stream_delta.expect("stream delta checked above");
+        let stream_end = stream_end.expect("stream end checked above");
+        let typing_false = typing_false.expect("typing false checked above");
+        assert!(
+            first_typing_true < stream_start
+                && stream_start < stream_delta
+                && stream_delta < stream_end
+                && stream_end < typing_false,
+            "expected ordered stream lifecycle after prompt completion, got {events:?}"
+        );
+        assert!(
+            !events[..stream_end].iter().any(|event| {
+                event.get("kind").and_then(Value::as_str) == Some("TypingStatusChanged")
+                    && event.get("data").and_then(Value::as_bool) == Some(false)
+            }),
+            "saw TypingStatusChanged(false) before StreamEnd: {events:?}"
+        );
+
+        session.shutdown().await;
     }
 }
