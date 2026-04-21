@@ -2947,7 +2947,6 @@ const BACKEND_AGENT_NAME: &str = "kiro";
 pub struct KiroBackend {
     input_tx: mpsc::Sender<AgentInput>,
     interrupt_tx: mpsc::Sender<()>,
-    events_tx: mpsc::Sender<ChatEvent>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
@@ -2979,20 +2978,6 @@ pub(crate) fn resolve_session_settings(
         &KiroBackend::session_settings_schema(),
         kiro_cost_hint_defaults,
     )
-}
-
-fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
-    ChatEvent::MessageAdded(ChatMessage {
-        timestamp: unix_now_ms(),
-        sender: MessageSender::User,
-        content,
-        reasoning: None,
-        tool_calls: Vec::new(),
-        model_info: None,
-        token_usage: None,
-        context_breakdown: None,
-        images,
-    })
 }
 
 impl Backend for KiroBackend {
@@ -3176,7 +3161,6 @@ impl Backend for KiroBackend {
             Self {
                 input_tx,
                 interrupt_tx,
-                events_tx: events_tx.clone(),
                 session_id,
             },
             EventStream::new(events_rx),
@@ -3333,7 +3317,6 @@ impl Backend for KiroBackend {
             Self {
                 input_tx,
                 interrupt_tx,
-                events_tx: events_tx.clone(),
                 session_id: known_session_id,
             },
             EventStream::new(events_rx),
@@ -3375,26 +3358,9 @@ impl Backend for KiroBackend {
 
     async fn send(&self, input: AgentInput) -> bool {
         match input {
-            AgentInput::SendMessage(payload) => {
-                let visible_message = payload.message.clone();
-                let visible_images = payload.images.clone();
-                let outbound = AgentInput::SendMessage(protocol::SendMessagePayload {
-                    message: payload.message,
-                    images: payload.images,
-                });
-
-                if self
-                    .events_tx
-                    .send(backend_user_message(visible_message, visible_images))
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
-
-                self.input_tx.send(outbound).await.is_ok()
+            input @ AgentInput::SendMessage(_) | input @ AgentInput::UpdateSessionSettings(_) => {
+                self.input_tx.send(input).await.is_ok()
             }
-            input @ AgentInput::UpdateSessionSettings(_) => self.input_tx.send(input).await.is_ok(),
             AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
             | AgentInput::SendQueuedMessageNow(_) => {

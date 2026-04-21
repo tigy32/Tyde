@@ -1437,6 +1437,86 @@ async fn assert_backend_emits_typing_and_streaming_on_follow_up_turns(
     }
 }
 
+async fn assert_backend_follow_up_user_echo_not_duplicated(
+    fixture: &mut RealBackendFixture,
+    backend_kind: BackendKind,
+) {
+    let workspace_roots = fixture.workspace_roots();
+    let first_prompt = "Reply with exactly FIRST_TURN and nothing else.";
+    let follow_up_prompt = "Reply with exactly SECOND_TURN and nothing else.";
+
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "follow-up-user-echo",
+        first_prompt,
+    )
+    .await;
+    let first_turn =
+        expect_assistant_turn_after_user_echo(&mut fixture.client, &agent_stream, first_prompt)
+            .await;
+    assert!(
+        first_turn.final_text.contains("FIRST_TURN"),
+        "expected first turn response for {backend_kind:?}, got {:?}",
+        first_turn.final_text
+    );
+
+    fixture
+        .client
+        .send_message(&agent_stream, follow_up_prompt.to_string())
+        .await
+        .expect("send follow-up message");
+
+    let mut user_echo_count = 0usize;
+    let mut got_stream_start = false;
+    let mut streamed_text = String::new();
+
+    loop {
+        let env = expect_next_event(&mut fixture.client, "follow-up user echo ChatEvent").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User)
+                    && message.content == follow_up_prompt
+                {
+                    user_echo_count += 1;
+                }
+            }
+            ChatEvent::StreamStart(_) => {
+                got_stream_start = true;
+            }
+            ChatEvent::StreamDelta(delta) => {
+                if got_stream_start {
+                    streamed_text.push_str(&delta.text);
+                }
+            }
+            ChatEvent::StreamEnd(data) => {
+                let final_text = if data.message.content.trim().is_empty() {
+                    streamed_text
+                } else {
+                    data.message.content
+                };
+                assert!(
+                    final_text.contains("SECOND_TURN"),
+                    "expected second turn response for {backend_kind:?}, got {:?}",
+                    final_text
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        user_echo_count, 1,
+        "expected exactly one follow-up MessageAdded(User) echo for {backend_kind:?}"
+    );
+}
+
 async fn assert_backend_describes_image_input(
     fixture: &mut RealBackendFixture,
     backend_kind: BackendKind,
@@ -2246,6 +2326,34 @@ async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
 
     let mut fixture = RealBackendFixture::new().await;
     assert_backend_emits_typing_and_streaming_on_follow_up_turns(&mut fixture, backend_kind).await;
+}
+
+#[tokio::test]
+async fn real_kiro_follow_up_user_message_echo_is_not_duplicated() {
+    let backend_kind = BackendKind::Kiro;
+
+    if !backend_binary_available(backend_kind) {
+        eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+        return;
+    }
+    if !backend_runtime_available(backend_kind) {
+        eprintln!(
+            "SKIPPED: {} not runnable in current environment",
+            backend_label(backend_kind)
+        );
+        return;
+    }
+    if let Err(reason) = probe_backend_runtime(backend_kind).await {
+        eprintln!(
+            "SKIPPED: {} failed readiness probe: {}",
+            backend_label(backend_kind),
+            reason
+        );
+        return;
+    }
+
+    let mut fixture = RealBackendFixture::new().await;
+    assert_backend_follow_up_user_echo_not_duplicated(&mut fixture, backend_kind).await;
 }
 
 #[tokio::test]
