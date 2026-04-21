@@ -13,3 +13,6 @@ frontend/dist/
 *.swp
 *.swo
 *~
+
+# Local tauri config overrides
+tauri.no-reload.conf.json
