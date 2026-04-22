@@ -10,9 +10,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, OperationCancelledData,
-    RetryAttemptData, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData, TaskList,
-    ToolExecutionCompletedData, ToolRequest,
+    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SessionId, StreamEndData,
+    StreamTextDeltaData,
 };
 
 use super::{
@@ -337,41 +336,9 @@ impl Backend for TycodeBackend {
                 }
 
                 for event in events {
-                    let mut outbound = Vec::with_capacity(2);
-
-                    match &event {
-                        ChatEvent::StreamStart(StreamStartData { .. }) => {
-                            stream_open = true;
-                            accumulated_text.clear();
-                        }
-                        ChatEvent::StreamDelta(StreamTextDeltaData { message_id, text }) => {
-                            if !stream_open {
-                                outbound
-                                    .push(synthetic_tycode_stream_start(message_id.clone(), None));
-                                stream_open = true;
-                                accumulated_text.clear();
-                            }
-                            accumulated_text.push_str(text);
-                        }
-                        ChatEvent::StreamEnd(StreamEndData { message }) => {
-                            if !stream_open {
-                                let model =
-                                    message.model_info.as_ref().map(|info| info.model.clone());
-                                outbound.push(synthetic_tycode_stream_start(
-                                    Some(format!("tycode-msg-{}", message.timestamp)),
-                                    model,
-                                ));
-                            }
-                            stream_open = false;
-                        }
-                        _ => {}
-                    }
-
-                    outbound.push(event);
-                    for outbound_event in outbound {
-                        if events_tx.send(outbound_event).await.is_err() {
-                            break;
-                        }
+                    update_tycode_stream_state(&event, &mut stream_open, &mut accumulated_text);
+                    if events_tx.send(event).await.is_err() {
+                        break;
                     }
                     if events_tx.is_closed() {
                         break;
@@ -623,22 +590,7 @@ impl Backend for TycodeBackend {
                 }
 
                 for event in events {
-                    match &event {
-                        ChatEvent::StreamStart(StreamStartData { .. }) => {
-                            stream_open = true;
-                            accumulated_text.clear();
-                        }
-                        ChatEvent::StreamDelta(StreamTextDeltaData { text, .. }) => {
-                            if stream_open {
-                                accumulated_text.push_str(text);
-                            }
-                        }
-                        ChatEvent::StreamEnd(_) => {
-                            stream_open = false;
-                        }
-                        _ => {}
-                    }
-
+                    update_tycode_stream_state(&event, &mut stream_open, &mut accumulated_text);
                     if events_tx.send(event).await.is_err() {
                         break;
                     }
@@ -869,14 +821,6 @@ fn tycode_session_started(value: &Value) -> Option<SessionId> {
         .map(|session_id| SessionId(session_id.to_string()))
 }
 
-fn synthetic_tycode_stream_start(message_id: Option<String>, model: Option<String>) -> ChatEvent {
-    ChatEvent::StreamStart(StreamStartData {
-        message_id,
-        agent: "tycode".to_string(),
-        model,
-    })
-}
-
 fn list_tycode_sessions() -> Result<Vec<BackendSession>, String> {
     let sessions_dir = tycode_sessions_dir()?;
     let entries = match fs::read_dir(&sessions_dir) {
@@ -967,110 +911,48 @@ fn extract_tycode_title(value: &Value) -> Option<String> {
 
 fn map_tycode_value_to_chat_events(value: &Value) -> Vec<ChatEvent> {
     if let Ok(event) = serde_json::from_value::<ChatEvent>(value.clone()) {
-        match event {
-            ChatEvent::MessageAdded(_) => {}
-            _ => return vec![event],
-        }
+        return vec![event];
     }
 
-    let kind = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let data = value.get("data").cloned().unwrap_or(Value::Null);
-
-    match kind {
-        "MessageAdded" => map_tycode_message_added(&data),
-        "TaskUpdate" => serde_json::from_value::<TaskList>(data)
-            .map(ChatEvent::TaskUpdate)
-            .into_iter()
-            .collect(),
-        "ToolRequest" => serde_json::from_value::<ToolRequest>(data)
-            .map(ChatEvent::ToolRequest)
-            .into_iter()
-            .collect(),
-        "ToolExecutionCompleted" => serde_json::from_value::<ToolExecutionCompletedData>(data)
-            .map(ChatEvent::ToolExecutionCompleted)
-            .into_iter()
-            .collect(),
-        "OperationCancelled" => serde_json::from_value::<OperationCancelledData>(data)
-            .map(ChatEvent::OperationCancelled)
-            .into_iter()
-            .collect(),
-        "RetryAttempt" => serde_json::from_value::<RetryAttemptData>(data)
-            .map(ChatEvent::RetryAttempt)
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn map_tycode_message_added(data: &Value) -> Vec<ChatEvent> {
-    let Some(sender) = parse_tycode_sender(data.get("sender")) else {
+    let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+        tracing::warn!(raw = %value, "Ignoring Tycode event without kind");
         return Vec::new();
     };
-    let content = data
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let timestamp = data
-        .get("timestamp")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(unix_now_ms);
 
-    let message = ChatMessage {
-        timestamp,
-        sender: sender.clone(),
-        content: content.clone(),
-        reasoning: None,
-        tool_calls: Vec::new(),
-        model_info: None,
-        token_usage: None,
-        context_breakdown: None,
-        images: None,
-    };
-
-    match sender {
-        MessageSender::Assistant { agent } => {
-            let message_id = Some(format!("tycode-msg-{timestamp}"));
-            let mut events = vec![ChatEvent::StreamStart(StreamStartData {
-                message_id: message_id.clone(),
-                agent,
-                model: None,
-            })];
-            if !content.is_empty() {
-                events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
-                    message_id: message_id.clone(),
-                    text: content,
-                }));
-            }
-            events.push(ChatEvent::StreamEnd(StreamEndData { message }));
-            events
+    match kind {
+        "Settings"
+        | "ConversationCleared"
+        | "SessionsList"
+        | "ProfilesList"
+        | "TimingUpdate"
+        | "ModuleSchemas"
+        | "SessionStarted"
+        | "Error" => Vec::new(),
+        other => {
+            tracing::warn!(kind = %other, raw = %value, "Ignoring unsupported Tycode event");
+            Vec::new()
         }
-        _ => vec![ChatEvent::MessageAdded(message)],
     }
 }
 
-fn parse_tycode_sender(sender: Option<&Value>) -> Option<MessageSender> {
-    let sender = sender?;
-    if let Some(name) = sender.as_str() {
-        return match name {
-            "User" => Some(MessageSender::User),
-            "System" => Some(MessageSender::System),
-            "Warning" => Some(MessageSender::Warning),
-            "Error" => Some(MessageSender::Error),
-            _ => None,
-        };
+fn update_tycode_stream_state(
+    event: &ChatEvent,
+    stream_open: &mut bool,
+    accumulated_text: &mut String,
+) {
+    match event {
+        ChatEvent::StreamStart(_) => {
+            *stream_open = true;
+            accumulated_text.clear();
+        }
+        ChatEvent::StreamDelta(StreamTextDeltaData { text, .. }) if *stream_open => {
+            accumulated_text.push_str(text);
+        }
+        ChatEvent::StreamEnd(_) => {
+            *stream_open = false;
+        }
+        _ => {}
     }
-
-    let assistant = sender.get("Assistant")?;
-    let agent = assistant
-        .get("agent")
-        .and_then(Value::as_str)
-        .unwrap_or("tycode")
-        .to_string();
-    Some(MessageSender::Assistant { agent })
 }
 
 fn unix_now_ms() -> u64 {
@@ -1136,6 +1018,87 @@ mod tests {
         assert_eq!(
             value["context7"]["env"]["FOO"],
             Value::String("bar".to_string())
+        );
+    }
+
+    #[test]
+    fn map_tycode_value_to_chat_events_passes_through_assistant_message_added() {
+        let value = serde_json::json!({
+            "kind": "MessageAdded",
+            "data": {
+                "timestamp": 1776827246365_u64,
+                "sender": {
+                    "Assistant": {
+                        "agent": "tycode"
+                    }
+                },
+                "content": "hello from tycode",
+                "reasoning": null,
+                "tool_calls": [],
+                "model_info": null,
+                "token_usage": null,
+                "context_breakdown": null,
+                "images": []
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert_eq!(
+            events.len(),
+            1,
+            "assistant message should stay a single event"
+        );
+
+        match &events[0] {
+            ChatEvent::MessageAdded(message) => {
+                assert_eq!(message.timestamp, 1776827246365_u64);
+                assert_eq!(message.content, "hello from tycode");
+                match &message.sender {
+                    MessageSender::Assistant { agent } => assert_eq!(agent, "tycode"),
+                    other => panic!("expected assistant sender, got {other:?}"),
+                }
+            }
+            other => panic!("expected MessageAdded pass-through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tycode_value_to_chat_events_passes_through_stream_start() {
+        let value = serde_json::json!({
+            "kind": "StreamStart",
+            "data": {
+                "message_id": "msg-1776827246365",
+                "agent": "tycode",
+                "model": "ClaudeSonnet46"
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            ChatEvent::StreamStart(data) => {
+                assert_eq!(data.message_id.as_deref(), Some("msg-1776827246365"));
+                assert_eq!(data.agent, "tycode");
+                assert_eq!(data.model.as_deref(), Some("ClaudeSonnet46"));
+            }
+            other => panic!("expected StreamStart pass-through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tycode_value_to_chat_events_ignores_session_started() {
+        let value = serde_json::json!({
+            "kind": "SessionStarted",
+            "data": {
+                "session_id": "session-123"
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert!(
+            events.is_empty(),
+            "SessionStarted should stay out of chat streams"
         );
     }
 }
