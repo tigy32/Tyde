@@ -5,13 +5,13 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::{connect_one_host, refresh_configured_hosts};
 use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
-use crate::state::AppState;
+use crate::state::{AppState, DiffViewMode};
 
 use protocol::{
     BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, CustomAgent,
-    CustomAgentId, FrameKind, HostSettingValue, McpServerConfig, McpServerId, McpTransportConfig,
-    ProjectId, RunBackendSetupPayload, SetSettingPayload, Skill, SkillId, Steering, SteeringId,
-    SteeringScope, ToolPolicy,
+    CustomAgentId, DiffContextMode, FrameKind, HostSettingValue, McpServerConfig, McpServerId,
+    McpTransportConfig, ProjectId, RunBackendSetupPayload, SetSettingPayload, Skill, SkillId,
+    Steering, SteeringId, SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -27,6 +27,88 @@ const STORAGE_THEME: &str = "tyde-theme";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
 const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
 const STORAGE_TABS_ENABLED: &str = "tyde-tabs-enabled";
+const STORAGE_DIFF_VIEW_MODE: &str = "tyde-diff-view-mode";
+const STORAGE_DIFF_CONTEXT_MODE: &str = "tyde-diff-context-mode";
+
+const DIFF_VIEW_MODE_UNIFIED: &str = "unified";
+const DIFF_VIEW_MODE_SIDE_BY_SIDE: &str = "side_by_side";
+const DIFF_CONTEXT_MODE_HUNKS: &str = "hunks";
+const DIFF_CONTEXT_MODE_FULL_FILE: &str = "full_file";
+
+fn diff_view_mode_to_str(mode: DiffViewMode) -> &'static str {
+    match mode {
+        DiffViewMode::Unified => DIFF_VIEW_MODE_UNIFIED,
+        DiffViewMode::SideBySide => DIFF_VIEW_MODE_SIDE_BY_SIDE,
+    }
+}
+
+fn diff_view_mode_from_str(s: &str) -> Option<DiffViewMode> {
+    match s {
+        DIFF_VIEW_MODE_UNIFIED => Some(DiffViewMode::Unified),
+        DIFF_VIEW_MODE_SIDE_BY_SIDE => Some(DiffViewMode::SideBySide),
+        _ => None,
+    }
+}
+
+fn diff_context_mode_to_str(mode: DiffContextMode) -> &'static str {
+    match mode {
+        DiffContextMode::Hunks => DIFF_CONTEXT_MODE_HUNKS,
+        DiffContextMode::FullFile => DIFF_CONTEXT_MODE_FULL_FILE,
+    }
+}
+
+fn diff_context_mode_from_str(s: &str) -> Option<DiffContextMode> {
+    match s {
+        DIFF_CONTEXT_MODE_HUNKS => Some(DiffContextMode::Hunks),
+        DIFF_CONTEXT_MODE_FULL_FILE => Some(DiffContextMode::FullFile),
+        _ => None,
+    }
+}
+
+pub fn persist_diff_view_mode(mode: DiffViewMode) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_DIFF_VIEW_MODE, diff_view_mode_to_str(mode));
+    }
+}
+
+pub fn persist_diff_context_mode(mode: DiffContextMode) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_DIFF_CONTEXT_MODE, diff_context_mode_to_str(mode));
+    }
+}
+
+#[cfg(test)]
+mod diff_pref_tests {
+    use super::*;
+
+    #[test]
+    fn diff_view_mode_roundtrip() {
+        for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+            let s = diff_view_mode_to_str(mode);
+            assert_eq!(diff_view_mode_from_str(s), Some(mode));
+        }
+    }
+
+    #[test]
+    fn diff_context_mode_roundtrip() {
+        for mode in [DiffContextMode::Hunks, DiffContextMode::FullFile] {
+            let s = diff_context_mode_to_str(mode);
+            assert_eq!(diff_context_mode_from_str(s), Some(mode));
+        }
+    }
+
+    #[test]
+    fn diff_view_mode_unknown_is_none() {
+        assert_eq!(diff_view_mode_from_str(""), None);
+        assert_eq!(diff_view_mode_from_str("bogus"), None);
+    }
+
+    #[test]
+    fn diff_context_mode_unknown_is_none() {
+        assert_eq!(diff_context_mode_from_str(""), None);
+        assert_eq!(diff_context_mode_from_str("bogus"), None);
+    }
+}
 
 const FONT_FAMILIES: &[(&str, &str, &str)] = &[
     (
@@ -128,6 +210,36 @@ pub fn restore_appearance(state: &AppState) {
         let enabled = tabs_str != "false";
         state.tabs_enabled.set(enabled);
     }
+
+    match storage.get_item(STORAGE_DIFF_VIEW_MODE) {
+        Ok(Some(raw)) => match diff_view_mode_from_str(&raw) {
+            Some(mode) => state.diff_view_mode.set(mode),
+            None => {
+                log::warn!(
+                    "unrecognized diff_view_mode in localStorage: {raw:?}; resetting to default"
+                );
+                let default = state.diff_view_mode.get_untracked();
+                persist_diff_view_mode(default);
+            }
+        },
+        Ok(None) => persist_diff_view_mode(state.diff_view_mode.get_untracked()),
+        Err(e) => log::warn!("failed to read diff_view_mode from localStorage: {e:?}"),
+    }
+
+    match storage.get_item(STORAGE_DIFF_CONTEXT_MODE) {
+        Ok(Some(raw)) => match diff_context_mode_from_str(&raw) {
+            Some(mode) => state.diff_context_mode.set(mode),
+            None => {
+                log::warn!(
+                    "unrecognized diff_context_mode in localStorage: {raw:?}; resetting to default"
+                );
+                let default = state.diff_context_mode.get_untracked();
+                persist_diff_context_mode(default);
+            }
+        },
+        Ok(None) => persist_diff_context_mode(state.diff_context_mode.get_untracked()),
+        Err(e) => log::warn!("failed to read diff_context_mode from localStorage: {e:?}"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,6 +299,12 @@ impl SettingsTab {
                 "Monospace",
                 "Tab Bar",
                 "Show a tab bar for managing multiple open views",
+                "Diff Layout",
+                "Unified",
+                "Side by Side",
+                "Diff Context",
+                "Hunks",
+                "Full File",
             ],
             Self::General => &[
                 "General",
@@ -310,6 +428,10 @@ pub fn SettingsPanel() -> impl IntoView {
                                     placeholder="Search settings..."
                                     prop:value=move || search_query.get()
                                     on:input=on_search
+                                    spellcheck="false"
+                                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                                    autocapitalize="none"
+                                    autocomplete="off"
                                 />
                             </div>
                             <div class="settings-nav-group">
@@ -602,6 +724,10 @@ fn HostsTab() -> impl IntoView {
                             placeholder="e.g. Workstation"
                             prop:value=move || label_sig.get()
                             on:input=move |ev| label_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                     <label class="settings-form-label">
@@ -612,6 +738,10 @@ fn HostsTab() -> impl IntoView {
                             placeholder="user@host"
                             prop:value=move || ssh_destination_sig.get()
                             on:input=move |ev| ssh_destination_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                 </div>
@@ -623,6 +753,10 @@ fn HostsTab() -> impl IntoView {
                         placeholder="tyde host --bridge-uds"
                         prop:value=move || remote_command_sig.get()
                         on:input=move |ev| remote_command_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
                 <div class="settings-form-footer">
@@ -753,6 +887,48 @@ fn AppearanceTab() -> impl IntoView {
                     />
                     <span class="settings-toggle-slider"></span>
                 </label>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Diff Layout"</label>
+            <p class="settings-description">"Choose how git diffs are displayed: a single column (Unified) or side by side."</p>
+            <div class="settings-segmented-control">
+                <button
+                    class=move || if state.diff_view_mode.get() == DiffViewMode::Unified { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.diff_view_mode.set(DiffViewMode::Unified);
+                        persist_diff_view_mode(DiffViewMode::Unified);
+                    }
+                >"Unified"</button>
+                <button
+                    class=move || if state.diff_view_mode.get() == DiffViewMode::SideBySide { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.diff_view_mode.set(DiffViewMode::SideBySide);
+                        persist_diff_view_mode(DiffViewMode::SideBySide);
+                    }
+                >"Side by Side"</button>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Diff Context"</label>
+            <p class="settings-description">"Show only changed hunks with surrounding context, or the full file."</p>
+            <div class="settings-segmented-control">
+                <button
+                    class=move || if state.diff_context_mode.get() == DiffContextMode::Hunks { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.diff_context_mode.set(DiffContextMode::Hunks);
+                        persist_diff_context_mode(DiffContextMode::Hunks);
+                    }
+                >"Hunks"</button>
+                <button
+                    class=move || if state.diff_context_mode.get() == DiffContextMode::FullFile { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.diff_context_mode.set(DiffContextMode::FullFile);
+                        persist_diff_context_mode(DiffContextMode::FullFile);
+                    }
+                >"Full File"</button>
             </div>
         </div>
     }
@@ -1720,6 +1896,10 @@ fn CustomAgentEditor(
                         type="text"
                         prop:value=move || name_sig.get()
                         on:input=move |ev| name_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
 
@@ -1730,6 +1910,10 @@ fn CustomAgentEditor(
                         type="text"
                         prop:value=move || description_sig.get()
                         on:input=move |ev| description_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
 
@@ -1740,6 +1924,10 @@ fn CustomAgentEditor(
                         rows="5"
                         prop:value=move || instructions_sig.get()
                         on:input=move |ev| instructions_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
 
@@ -1849,6 +2037,10 @@ fn CustomAgentEditor(
                             placeholder="bash, read, edit"
                             prop:value=move || tool_policy_tools_sig.get()
                             on:input=move |ev| tool_policy_tools_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                 </Show>
@@ -2216,6 +2408,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                         type="text"
                         prop:value=move || name_sig.get()
                         on:input=move |ev| name_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
 
@@ -2236,6 +2432,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                             placeholder="https://example.com/mcp"
                             prop:value=move || url_sig.get()
                             on:input=move |ev| url_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                     <label class="settings-form-label">
@@ -2245,6 +2445,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                             rows="3"
                             prop:value=move || headers_sig.get()
                             on:input=move |ev| headers_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                     <label class="settings-form-label">
@@ -2255,6 +2459,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                             placeholder="MY_TOKEN"
                             prop:value=move || bearer_sig.get()
                             on:input=move |ev| bearer_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                 </Show>
@@ -2268,6 +2476,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                             placeholder="/path/to/mcp-server"
                             prop:value=move || command_sig.get()
                             on:input=move |ev| command_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                     <label class="settings-form-label">
@@ -2277,6 +2489,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                             rows="3"
                             prop:value=move || args_sig.get()
                             on:input=move |ev| args_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                     <label class="settings-form-label">
@@ -2286,6 +2502,10 @@ fn McpEditor(form: McpForm, editor_signal: RwSignal<Option<McpForm>>) -> impl In
                             rows="3"
                             prop:value=move || env_sig.get()
                             on:input=move |ev| env_sig.set(event_target_value(&ev))
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </label>
                 </Show>
@@ -2590,6 +2810,10 @@ fn SteeringEditor(
                         type="text"
                         prop:value=move || title_sig.get()
                         on:input=move |ev| title_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
 
@@ -2600,6 +2824,10 @@ fn SteeringEditor(
                         rows="8"
                         prop:value=move || content_sig.get()
                         on:input=move |ev| content_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                 </label>
 

@@ -962,11 +962,19 @@ pub enum ProjectDiffScope {
     Staged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffContextMode {
+    Hunks,
+    FullFile,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectReadDiffPayload {
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
     pub path: Option<String>,
+    pub context_mode: DiffContextMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1068,6 +1076,7 @@ pub struct ProjectGitDiffPayload {
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
     pub path: Option<String>,
+    pub context_mode: DiffContextMode,
     pub files: Vec<ProjectGitDiffFile>,
 }
 
@@ -1080,7 +1089,10 @@ pub struct ProjectGitDiffFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectGitDiffHunk {
     pub hunk_id: String,
-    pub header: String,
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
     pub lines: Vec<ProjectGitDiffLine>,
 }
 
@@ -1088,6 +1100,8 @@ pub struct ProjectGitDiffHunk {
 pub struct ProjectGitDiffLine {
     pub kind: ProjectGitDiffLineKind,
     pub text: String,
+    pub old_line_number: Option<u32>,
+    pub new_line_number: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -20,8 +20,8 @@ use protocol::{
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
-    DiffViewState, OpenFile, ProjectInfo, SessionInfo, StreamingState, TabContent, TerminalInfo,
-    ToolRequestEntry, TransientEvent, sort_project_infos,
+    OpenFile, ProjectInfo, SessionInfo, StreamingState, TabContent, TerminalInfo, ToolRequestEntry,
+    TransientEvent, reduce_diff_response, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -646,16 +646,22 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         FrameKind::ProjectGitDiff => match envelope.parse_payload::<ProjectGitDiffPayload>() {
             Ok(payload) => {
                 let key = (payload.root.clone(), payload.scope);
-                state.diff_contents.update(|diffs| {
-                    diffs.insert(
-                        key,
-                        DiffViewState {
-                            root: payload.root,
-                            scope: payload.scope,
-                            files: payload.files,
-                        },
-                    );
-                });
+                let current = state
+                    .diff_contents
+                    .with_untracked(|diffs| diffs.get(&key).cloned());
+                match reduce_diff_response(current.as_ref(), payload) {
+                    Some(next) => {
+                        state.diff_contents.update(|diffs| {
+                            diffs.insert(key, next);
+                        });
+                    }
+                    None => {
+                        log::debug!(
+                            "ignoring stale/unmatched ProjectGitDiff payload for {:?}",
+                            key,
+                        );
+                    }
+                }
             }
             Err(error) => report_dispatch_error(
                 state,

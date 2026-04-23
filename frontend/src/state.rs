@@ -5,12 +5,19 @@ use crate::bridge::ConfiguredHost;
 use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
-    HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform, HostSettings,
-    McpServerConfig, McpServerId, Project, ProjectDiffScope, ProjectFileEntry, ProjectGitDiffFile,
-    ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootPath, QueuedMessageEntry,
-    SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
-    SteeringId, StreamPath, TaskList, TerminalId, ToolExecutionCompletedData, ToolRequest,
+    DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform,
+    HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope, ProjectFileEntry,
+    ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus,
+    ProjectRootPath, QueuedMessageEntry, SessionSchemaEntry, SessionSettingsValues, SessionSummary,
+    Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, TerminalId,
+    ToolExecutionCompletedData, ToolRequest,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffViewMode {
+    Unified,
+    SideBySide,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionStatus {
@@ -172,6 +179,58 @@ impl CenterZoneState {
     pub fn active_content(&self) -> Option<&TabContent> {
         self.active_tab().map(|t| &t.content)
     }
+
+    pub fn close_others(&mut self, id: TabId) {
+        self.tabs.retain(|t| t.id == id || !t.closeable);
+        if self.tabs.iter().any(|t| t.id == id) {
+            self.active_tab_id = Some(id);
+        }
+    }
+
+    pub fn close_to_right(&mut self, id: TabId) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let mut i = self.tabs.len();
+        while i > idx + 1 {
+            i -= 1;
+            if self.tabs[i].closeable {
+                self.tabs.remove(i);
+            }
+        }
+        if let Some(active) = self.active_tab_id {
+            if !self.tabs.iter().any(|t| t.id == active) {
+                self.active_tab_id = Some(id);
+            }
+        }
+    }
+
+    pub fn close_all(&mut self) {
+        self.tabs.retain(|t| !t.closeable);
+        if self.tabs.is_empty() {
+            let home_id = next_tab_id();
+            self.tabs.push(Tab {
+                id: home_id,
+                content: TabContent::Home,
+                label: "Home".to_string(),
+                closeable: false,
+            });
+            self.active_tab_id = Some(home_id);
+        } else {
+            let active_exists = self
+                .active_tab_id
+                .is_some_and(|a| self.tabs.iter().any(|t| t.id == a));
+            if !active_exists {
+                self.active_tab_id = Some(self.tabs[0].id);
+            }
+        }
+    }
+
+    pub fn rename_tab_label(&mut self, id: TabId, new_label: String) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.label = new_label;
+        }
+    }
 }
 
 impl Default for CenterZoneState {
@@ -211,7 +270,71 @@ pub struct OpenFile {
 pub struct DiffViewState {
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
+    pub path: Option<String>,
+    /// The context mode of the most recent *request* (not response). The
+    /// reactive re-request effect compares this to `AppState::diff_context_mode`
+    /// to decide whether to dispatch a new read, and the dispatch reducer
+    /// compares `payload.context_mode` to this to reject stale responses.
+    pub context_mode: DiffContextMode,
+    /// True between the time a `ProjectReadDiff` is dispatched and a matching
+    /// response arrives. The renderer shows a loading state when `pending` is
+    /// set so stale data doesn't sit on screen while a fresh request is in
+    /// flight.
+    pub pending: bool,
     pub files: Vec<ProjectGitDiffFile>,
+}
+
+impl DiffViewState {
+    /// Build the state to store when dispatching a fresh `ProjectReadDiff`.
+    /// If the previous entry is for the same `context_mode`, its `files` are
+    /// preserved to avoid flicker while refreshing. On a mode change, `files`
+    /// is cleared so stale data is not visible.
+    pub fn for_request(
+        previous: Option<&DiffViewState>,
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<String>,
+        context_mode: DiffContextMode,
+    ) -> DiffViewState {
+        let files = previous
+            .filter(|p| p.context_mode == context_mode)
+            .map(|p| p.files.clone())
+            .unwrap_or_default();
+        DiffViewState {
+            root,
+            scope,
+            path,
+            context_mode,
+            pending: true,
+            files,
+        }
+    }
+}
+
+/// Pure reducer for `ProjectGitDiff` responses. Returns `Some(new_state)` if
+/// the payload should replace the stored entry, or `None` if it should be
+/// ignored as stale.
+///
+/// A response is considered valid only when a matching request is still the
+/// latest one in flight — i.e. when `current.context_mode ==
+/// payload.context_mode`. If no entry exists (response without an outstanding
+/// request), the payload is ignored.
+pub fn reduce_diff_response(
+    current: Option<&DiffViewState>,
+    payload: ProjectGitDiffPayload,
+) -> Option<DiffViewState> {
+    let current = current?;
+    if current.context_mode != payload.context_mode {
+        return None;
+    }
+    Some(DiffViewState {
+        root: payload.root,
+        scope: payload.scope,
+        path: payload.path,
+        context_mode: payload.context_mode,
+        pending: false,
+        files: payload.files,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +446,27 @@ pub struct ActiveProjectRef {
     pub project_id: ProjectId,
 }
 
+/// Per-project filter state for the Agents panel. Stored per active project
+/// (keyed by `Option<ActiveProjectRef>`, where `None` represents the Home
+/// project) so user toggles persist across project switches for the life of
+/// the app.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentsPanelFilters {
+    pub hide_sub_agents: bool,
+    pub hide_inactive: bool,
+    pub show_other_projects: bool,
+}
+
+impl AgentsPanelFilters {
+    pub fn defaults_for(project: Option<&ActiveProjectRef>) -> Self {
+        Self {
+            hide_sub_agents: false,
+            hide_inactive: false,
+            show_other_projects: project.is_none(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveAgentRef {
     pub host_id: String,
@@ -387,10 +531,13 @@ pub struct AppState {
     pub font_size: RwSignal<u32>,
     pub theme: RwSignal<String>,
     pub font_family: RwSignal<String>,
+    pub diff_view_mode: RwSignal<DiffViewMode>,
+    pub diff_context_mode: RwSignal<DiffContextMode>,
     pub custom_agents: RwSignal<HashMap<String, HashMap<CustomAgentId, CustomAgent>>>,
     pub mcp_servers: RwSignal<HashMap<String, HashMap<McpServerId, McpServerConfig>>>,
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
     pub skills: RwSignal<HashMap<String, HashMap<SkillId, Skill>>>,
+    pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
 }
 
 impl AppState {
@@ -441,10 +588,13 @@ impl AppState {
             font_size: RwSignal::new(13),
             theme: RwSignal::new("dark".to_owned()),
             font_family: RwSignal::new("system".to_owned()),
+            diff_view_mode: RwSignal::new(DiffViewMode::Unified),
+            diff_context_mode: RwSignal::new(DiffContextMode::Hunks),
             custom_agents: RwSignal::new(HashMap::new()),
             mcp_servers: RwSignal::new(HashMap::new()),
             steering: RwSignal::new(HashMap::new()),
             skills: RwSignal::new(HashMap::new()),
+            agents_panel_filters: RwSignal::new(HashMap::new()),
         }
     }
 
@@ -710,5 +860,523 @@ impl AppState {
         if let Some(ar) = agent_ref {
             self.active_agent.set(ar);
         }
+    }
+
+    pub fn close_other_tabs(&self, id: TabId) {
+        let exists = self
+            .center_zone
+            .with_untracked(|cz| cz.tabs.iter().any(|t| t.id == id));
+        if !exists {
+            return;
+        }
+        let to_close: Vec<_> = self.center_zone.with_untracked(|cz| {
+            cz.tabs
+                .iter()
+                .filter(|t| t.id != id && t.closeable)
+                .map(|t| t.content.clone())
+                .collect()
+        });
+        for content in &to_close {
+            match content {
+                TabContent::File { path } => {
+                    let path = path.clone();
+                    self.open_files.update(|files| {
+                        files.remove(&path);
+                    });
+                }
+                TabContent::Diff { root, scope } => {
+                    let key = (root.clone(), *scope);
+                    self.diff_contents.update(|diffs| {
+                        diffs.remove(&key);
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.center_zone.update(|cz| cz.close_others(id));
+    }
+
+    pub fn close_tabs_to_right(&self, id: TabId) {
+        let exists = self
+            .center_zone
+            .with_untracked(|cz| cz.tabs.iter().any(|t| t.id == id));
+        if !exists {
+            return;
+        }
+        let to_close: Vec<_> = self.center_zone.with_untracked(|cz| {
+            let Some(idx) = cz.tabs.iter().position(|t| t.id == id) else {
+                return vec![];
+            };
+            cz.tabs[idx + 1..]
+                .iter()
+                .filter(|t| t.closeable)
+                .map(|t| t.content.clone())
+                .collect()
+        });
+        for content in &to_close {
+            match content {
+                TabContent::File { path } => {
+                    let path = path.clone();
+                    self.open_files.update(|files| {
+                        files.remove(&path);
+                    });
+                }
+                TabContent::Diff { root, scope } => {
+                    let key = (root.clone(), *scope);
+                    self.diff_contents.update(|diffs| {
+                        diffs.remove(&key);
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.center_zone.update(|cz| cz.close_to_right(id));
+    }
+
+    pub fn close_all_tabs(&self) {
+        let to_close: Vec<_> = self.center_zone.with_untracked(|cz| {
+            cz.tabs
+                .iter()
+                .filter(|t| t.closeable)
+                .map(|t| t.content.clone())
+                .collect()
+        });
+        for content in &to_close {
+            match content {
+                TabContent::File { path } => {
+                    let path = path.clone();
+                    self.open_files.update(|files| {
+                        files.remove(&path);
+                    });
+                }
+                TabContent::Diff { root, scope } => {
+                    let key = (root.clone(), *scope);
+                    self.diff_contents.update(|diffs| {
+                        diffs.remove(&key);
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.center_zone.update(|cz| cz.close_all());
+    }
+
+    pub fn rename_tab_label(&self, id: TabId, new_label: String) {
+        self.center_zone
+            .update(|cz| cz.rename_tab_label(id, new_label));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tab(content: TabContent, label: &str, closeable: bool) -> Tab {
+        Tab {
+            id: next_tab_id(),
+            content,
+            label: label.to_string(),
+            closeable,
+        }
+    }
+
+    #[test]
+    fn close_others_keeps_target_and_non_closeable() {
+        let home = make_tab(TabContent::Home, "Home", false);
+        let chat1 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 1", true);
+        let chat2 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 2", true);
+        let target_id = chat1.id;
+        let mut cz = CenterZoneState {
+            tabs: vec![home, chat1, chat2],
+            active_tab_id: None,
+        };
+        cz.close_others(target_id);
+        assert_eq!(cz.tabs.len(), 2);
+        assert!(cz.tabs.iter().any(|t| t.id == target_id));
+        assert!(cz.tabs.iter().any(|t| !t.closeable));
+        assert_eq!(cz.active_tab_id, Some(target_id));
+    }
+
+    #[test]
+    fn close_to_right_removes_closeable_tabs_after_target() {
+        let home = make_tab(TabContent::Home, "Home", false);
+        let chat1 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 1", true);
+        let chat2 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 2", true);
+        let chat3 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 3", true);
+        let target_id = chat1.id;
+        let mut cz = CenterZoneState {
+            tabs: vec![home, chat1, chat2, chat3],
+            active_tab_id: Some(target_id),
+        };
+        cz.close_to_right(target_id);
+        assert_eq!(cz.tabs.len(), 2);
+        assert!(cz.tabs.iter().any(|t| !t.closeable));
+        assert!(cz.tabs.iter().any(|t| t.id == target_id));
+        assert_eq!(cz.active_tab_id, Some(target_id));
+    }
+
+    #[test]
+    fn close_all_keeps_only_non_closeable() {
+        let home = make_tab(TabContent::Home, "Home", false);
+        let home_id = home.id;
+        let chat1 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 1", true);
+        let chat2 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 2", true);
+        let mut cz = CenterZoneState {
+            tabs: vec![home, chat1, chat2],
+            active_tab_id: None,
+        };
+        cz.close_all();
+        assert_eq!(cz.tabs.len(), 1);
+        assert!(matches!(cz.tabs[0].content, TabContent::Home));
+        assert_eq!(cz.active_tab_id, Some(home_id));
+    }
+
+    #[test]
+    fn rename_tab_label_only_changes_target() {
+        let home = make_tab(TabContent::Home, "Home", false);
+        let chat = make_tab(TabContent::Chat { agent_ref: None }, "Old Name", true);
+        let target_id = chat.id;
+        let mut cz = CenterZoneState {
+            tabs: vec![home, chat],
+            active_tab_id: None,
+        };
+        cz.rename_tab_label(target_id, "New Name".to_string());
+        assert_eq!(cz.tabs[0].label, "Home");
+        assert_eq!(cz.tabs[1].label, "New Name");
+    }
+
+    // ── Diff reducer / request-state tests ──────────────────────────────
+
+    fn mk_state(mode: DiffContextMode, pending: bool, files: Vec<&str>) -> DiffViewState {
+        DiffViewState {
+            root: ProjectRootPath("/r".to_string()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("a.rs".to_string()),
+            context_mode: mode,
+            pending,
+            files: files
+                .into_iter()
+                .map(|p| ProjectGitDiffFile {
+                    relative_path: p.to_string(),
+                    hunks: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    fn mk_payload(mode: DiffContextMode, files: Vec<&str>) -> ProjectGitDiffPayload {
+        ProjectGitDiffPayload {
+            root: ProjectRootPath("/r".to_string()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("a.rs".to_string()),
+            context_mode: mode,
+            files: files
+                .into_iter()
+                .map(|p| ProjectGitDiffFile {
+                    relative_path: p.to_string(),
+                    hunks: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn reduce_diff_response_matching_mode_clears_pending() {
+        let current = mk_state(DiffContextMode::Hunks, true, vec![]);
+        let payload = mk_payload(DiffContextMode::Hunks, vec!["a.rs"]);
+        let next = reduce_diff_response(Some(&current), payload).expect("should accept");
+        assert!(!next.pending);
+        assert_eq!(next.files.len(), 1);
+        assert_eq!(next.context_mode, DiffContextMode::Hunks);
+    }
+
+    #[test]
+    fn reduce_diff_response_rejects_stale_mode() {
+        let current = mk_state(DiffContextMode::FullFile, true, vec![]);
+        let payload = mk_payload(DiffContextMode::Hunks, vec!["a.rs"]);
+        assert!(reduce_diff_response(Some(&current), payload).is_none());
+    }
+
+    #[test]
+    fn reduce_diff_response_ignores_when_no_outstanding_request() {
+        let payload = mk_payload(DiffContextMode::Hunks, vec!["a.rs"]);
+        assert!(reduce_diff_response(None, payload).is_none());
+    }
+
+    #[test]
+    fn for_request_preserves_files_when_mode_unchanged() {
+        let prev = mk_state(DiffContextMode::Hunks, false, vec!["a.rs", "b.rs"]);
+        let next = DiffViewState::for_request(
+            Some(&prev),
+            prev.root.clone(),
+            prev.scope,
+            prev.path.clone(),
+            DiffContextMode::Hunks,
+        );
+        assert!(next.pending);
+        assert_eq!(next.files.len(), 2, "files kept across a same-mode refresh");
+    }
+
+    #[test]
+    fn for_request_clears_files_on_mode_change() {
+        let prev = mk_state(DiffContextMode::Hunks, false, vec!["a.rs"]);
+        let next = DiffViewState::for_request(
+            Some(&prev),
+            prev.root.clone(),
+            prev.scope,
+            prev.path.clone(),
+            DiffContextMode::FullFile,
+        );
+        assert!(next.pending);
+        assert!(
+            next.files.is_empty(),
+            "stale files must not render while a different-mode request is in flight"
+        );
+        assert_eq!(next.context_mode, DiffContextMode::FullFile);
+    }
+
+    #[test]
+    fn for_request_with_no_previous_starts_empty_pending() {
+        let next = DiffViewState::for_request(
+            None,
+            ProjectRootPath("/r".to_string()),
+            ProjectDiffScope::Staged,
+            Some("a.rs".to_string()),
+            DiffContextMode::Hunks,
+        );
+        assert!(next.pending);
+        assert!(next.files.is_empty());
+    }
+
+    // ── AppState-level batch-close tests ─────────────────────────────────
+
+    fn test_path(name: &str) -> ProjectPath {
+        ProjectPath {
+            root: ProjectRootPath(format!("/root/{name}")),
+            relative_path: format!("{name}.txt"),
+        }
+    }
+
+    fn test_diff_state(root: ProjectRootPath, scope: ProjectDiffScope) -> DiffViewState {
+        DiffViewState {
+            root: root.clone(),
+            scope,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![],
+        }
+    }
+
+    #[test]
+    fn close_other_tabs_cleans_backing_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            // Open a File tab and a Diff tab, keep Chat as the target
+            let file_path = test_path("file_a");
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::File {
+                        path: file_path.clone(),
+                    },
+                    "file_a.txt".to_string(),
+                    true,
+                );
+            });
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::Chat { agent_ref: None },
+                    "Chat".to_string(),
+                    true,
+                );
+            });
+            let target_id = state
+                .center_zone
+                .with_untracked(|cz| cz.active_tab_id.unwrap());
+            let diff_root = ProjectRootPath("/root/proj".to_string());
+            let diff_scope = ProjectDiffScope::Unstaged;
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::Diff {
+                        root: diff_root.clone(),
+                        scope: diff_scope,
+                    },
+                    "Diff".to_string(),
+                    true,
+                );
+            });
+
+            state.open_files.update(|m| {
+                m.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: None,
+                        is_binary: false,
+                    },
+                );
+            });
+            state.diff_contents.update(|m| {
+                m.insert(
+                    (diff_root.clone(), diff_scope),
+                    test_diff_state(diff_root.clone(), diff_scope),
+                );
+            });
+
+            state.close_other_tabs(target_id);
+
+            assert!(
+                !state
+                    .open_files
+                    .with_untracked(|m| m.contains_key(&file_path))
+            );
+            assert!(
+                !state
+                    .diff_contents
+                    .with_untracked(|m| m.contains_key(&(diff_root, diff_scope)))
+            );
+            state.center_zone.with_untracked(|cz| {
+                assert_eq!(cz.tabs.len(), 2);
+                assert!(cz.tabs.iter().any(|t| t.id == target_id));
+                assert!(cz.tabs.iter().any(|t| !t.closeable));
+            });
+        });
+    }
+
+    #[test]
+    fn close_tabs_to_right_cleans_backing_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::Chat { agent_ref: None },
+                    "Chat".to_string(),
+                    true,
+                );
+            });
+            let target_id = state
+                .center_zone
+                .with_untracked(|cz| cz.active_tab_id.unwrap());
+            let file_path = test_path("file_b");
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::File {
+                        path: file_path.clone(),
+                    },
+                    "file_b.txt".to_string(),
+                    true,
+                );
+            });
+            state.open_files.update(|m| {
+                m.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: None,
+                        is_binary: false,
+                    },
+                );
+            });
+
+            state.close_tabs_to_right(target_id);
+
+            assert!(
+                !state
+                    .open_files
+                    .with_untracked(|m| m.contains_key(&file_path))
+            );
+            state.center_zone.with_untracked(|cz| {
+                assert!(cz.tabs.iter().any(|t| t.id == target_id));
+                assert!(!cz.tabs.iter().any(|t| {
+                    matches!(&t.content, TabContent::File { path } if *path == file_path)
+                }));
+            });
+        });
+    }
+
+    #[test]
+    fn close_other_tabs_invalid_id_is_noop() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let file_path = test_path("file_c");
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::File {
+                        path: file_path.clone(),
+                    },
+                    "file_c.txt".to_string(),
+                    true,
+                );
+            });
+            state.open_files.update(|m| {
+                m.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: None,
+                        is_binary: false,
+                    },
+                );
+            });
+
+            let tab_count_before = state.center_zone.with_untracked(|cz| cz.tabs.len());
+            state.close_other_tabs(TabId(999_999));
+
+            assert_eq!(
+                state.center_zone.with_untracked(|cz| cz.tabs.len()),
+                tab_count_before
+            );
+            assert!(
+                state
+                    .open_files
+                    .with_untracked(|m| m.contains_key(&file_path))
+            );
+        });
+    }
+
+    #[test]
+    fn close_tabs_to_right_invalid_id_is_noop() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let file_path = test_path("file_d");
+            state.center_zone.update(|cz| {
+                cz.open(
+                    TabContent::File {
+                        path: file_path.clone(),
+                    },
+                    "file_d.txt".to_string(),
+                    true,
+                );
+            });
+            state.open_files.update(|m| {
+                m.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: None,
+                        is_binary: false,
+                    },
+                );
+            });
+
+            let tab_count_before = state.center_zone.with_untracked(|cz| cz.tabs.len());
+            state.close_tabs_to_right(TabId(999_998));
+
+            assert_eq!(
+                state.center_zone.with_untracked(|cz| cz.tabs.len()),
+                tab_count_before
+            );
+            assert!(
+                state
+                    .open_files
+                    .with_untracked(|m| m.contains_key(&file_path))
+            );
+        });
     }
 }

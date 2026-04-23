@@ -11,7 +11,7 @@ pub use types::{
     BackendSetupInfo, BackendSetupPayload, BackendSetupStatus, BootstrapData,
     CancelQueuedMessagePayload, ChatEvent, ChatMessage, CloseAgentPayload, CommandErrorCode,
     CommandErrorPayload, ContextBreakdown, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, DiffContextMode,
     EditQueuedMessagePayload, Envelope, FileEntryOp, FileInfo, FrameKind, HelloPayload,
     HostAbsPath, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseEntry,
     HostBrowseEntryError, HostBrowseErrorCode, HostBrowseErrorPayload, HostBrowseListPayload,

@@ -816,6 +816,10 @@ pub fn ChatInput() -> impl IntoView {
                     on:keydown=on_keydown
                     rows="1"
                     node_ref=textarea_ref
+                    spellcheck="false"
+                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                    autocapitalize="none"
+                    autocomplete="off"
                 />
                 <button
                     class="chat-send-btn chat-send-btn-text"

@@ -150,6 +150,10 @@ pub fn FileExplorer() -> impl IntoView {
                     placeholder="Filter files..."
                     prop:value=move || filter.get()
                     on:input=on_filter_input
+                    spellcheck="false"
+                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                    autocapitalize="none"
+                    autocomplete="off"
                 />
             </div>
             <div class="fe-tree">

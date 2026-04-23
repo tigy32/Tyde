@@ -240,6 +240,7 @@ pub fn SessionSettingsControls(
                                         min=min.to_string()
                                         max=max.to_string()
                                         step=step.to_string()
+                                        autocomplete="off"
                                     />
                                 }.into_any()
                             }

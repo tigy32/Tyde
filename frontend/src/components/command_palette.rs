@@ -314,6 +314,10 @@ pub fn CommandPalette() -> impl IntoView {
                             on:input=on_input
                             on:keydown=on_keydown
                             prop:value=move || input.get()
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                         <span class="cp-mode-badge">{mode_label}</span>
                     </div>

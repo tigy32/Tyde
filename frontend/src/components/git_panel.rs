@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::AppState;
+use crate::state::{AppState, DiffViewState};
 
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectGitChangeKind, ProjectGitFileStatus, ProjectPath,
@@ -256,12 +256,33 @@ fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
     };
     let project_id = active_project.project_id.clone();
     let stream = StreamPath(format!("/project/{}", project_id.0));
+    let context_mode = state.diff_context_mode.get_untracked();
+
+    // Insert a pending DiffViewState BEFORE dispatching. This is the source of
+    // truth for "what was most recently requested" — the reactive re-request
+    // effect compares the signal against this entry's `context_mode`, and the
+    // dispatch reducer rejects responses that don't match it. Without this,
+    // a context-mode flip before the first response arrives would leave the
+    // view empty with nothing to re-dispatch against.
+    let key = (root.clone(), scope);
+    state.diff_contents.update(|diffs| {
+        let previous = diffs.get(&key);
+        let next = DiffViewState::for_request(
+            previous,
+            root.clone(),
+            scope,
+            Some(path.clone()),
+            context_mode,
+        );
+        diffs.insert(key, next);
+    });
 
     spawn_local(async move {
         let payload = ProjectReadDiffPayload {
             root,
             scope,
             path: Some(path),
+            context_mode,
         };
         if let Err(e) = send_frame(
             &active_project.host_id,

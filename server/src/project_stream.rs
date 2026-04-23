@@ -1,18 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::collections::BTreeSet;
-
 use protocol::{
-    FileEntryOp, Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileEntry,
-    ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile,
-    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    DiffContextMode, FileEntryOp, Project, ProjectDiffScope, ProjectFileContentsPayload,
+    ProjectFileEntry, ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind,
+    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
+    ProjectRootPath,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -38,6 +37,14 @@ pub(crate) struct ProjectSnapshotState {
     /// Previous file entries per root, used to compute diffs.
     pub file_entries: BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
     pub git_status: Option<Value>,
+    pub diff_context_modes: HashMap<ProjectDiffRequestKey, DiffContextMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProjectDiffRequestKey {
+    pub root: ProjectRootPath,
+    pub scope: ProjectDiffScope,
+    pub path: Option<String>,
 }
 
 pub(crate) struct ProjectStreamSubscription {
@@ -450,7 +457,7 @@ where
         validate_relative_path(path)?;
     }
 
-    let mut args = vec!["diff"];
+    let mut args = vec!["diff", git_diff_context_arg(payload.context_mode)];
     if matches!(payload.scope, ProjectDiffScope::Staged) {
         args.push("--cached");
     }
@@ -460,11 +467,106 @@ where
     }
 
     let raw = run_git(&payload.root.0, &args, GitAccessMode::ReadOnly)?;
+    let mut files = parse_git_diff(&raw)?;
+    if matches!(payload.scope, ProjectDiffScope::Unstaged) {
+        let untracked_paths = list_untracked_paths_with_runner(
+            &payload.root.0,
+            payload.path.as_deref(),
+            &mut run_git,
+        )?;
+        for relative_path in untracked_paths {
+            files.push(build_untracked_diff_file(&payload.root.0, &relative_path)?);
+        }
+        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    }
+
     Ok(ProjectGitDiffPayload {
         root: payload.root,
         scope: payload.scope,
         path: payload.path,
-        files: parse_git_diff(&raw),
+        context_mode: payload.context_mode,
+        files,
+    })
+}
+
+fn git_diff_context_arg(context_mode: DiffContextMode) -> &'static str {
+    match context_mode {
+        DiffContextMode::Hunks => "-U3",
+        DiffContextMode::FullFile => "-U9999999",
+    }
+}
+
+fn list_untracked_paths_with_runner<F>(
+    root: &str,
+    path: Option<&str>,
+    run_git: &mut F,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut(&str, &[&str], GitAccessMode) -> Result<String, String>,
+{
+    if let Some(path) = path {
+        validate_relative_path(path)?;
+    }
+
+    let mut args = vec!["ls-files", "--others", "--exclude-standard"];
+    if let Some(path) = path {
+        args.push("--");
+        args.push(path);
+    }
+
+    let raw = run_git(root, &args, GitAccessMode::ReadOnly)?;
+    Ok(raw
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn build_untracked_diff_file(
+    root: &str,
+    relative_path: &str,
+) -> Result<ProjectGitDiffFile, String> {
+    validate_relative_path(relative_path)?;
+    let absolute_path = Path::new(root).join(relative_path);
+    let contents = match fs::read_to_string(&absolute_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(format!("binary file: {}", relative_path));
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read untracked file '{}' from '{}': {error}",
+                relative_path, root
+            ));
+        }
+    };
+
+    let hunks = if contents.is_empty() {
+        Vec::new()
+    } else {
+        let lines = contents
+            .lines()
+            .enumerate()
+            .map(|(index, line)| ProjectGitDiffLine {
+                kind: ProjectGitDiffLineKind::Added,
+                text: line.to_owned(),
+                old_line_number: None,
+                new_line_number: Some((index + 1) as u32),
+            })
+            .collect::<Vec<_>>();
+        vec![ProjectGitDiffHunk {
+            hunk_id: build_hunk_id(relative_path, 0),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: lines.len() as u32,
+            lines,
+        }]
+    };
+
+    Ok(ProjectGitDiffFile {
+        relative_path: relative_path.to_owned(),
+        hunks,
     })
 }
 
@@ -493,7 +595,7 @@ pub(crate) fn stage_hunk(
         &["diff", "--", &path.relative_path],
         GitAccessMode::ReadOnly,
     )?;
-    let parsed = parse_raw_git_diff(&raw);
+    let parsed = parse_raw_git_diff(&raw)?;
     let Some(file) = parsed
         .iter()
         .find(|file| file.relative_path == path.relative_path)
@@ -868,39 +970,42 @@ struct ParsedGitDiffFile {
 #[derive(Debug, Clone)]
 struct ParsedGitDiffHunk {
     header: String,
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
     lines: Vec<String>,
 }
 
-fn parse_git_diff(raw: &str) -> Vec<ProjectGitDiffFile> {
-    parse_raw_git_diff(raw)
+fn parse_git_diff(raw: &str) -> Result<Vec<ProjectGitDiffFile>, String> {
+    parse_raw_git_diff(raw)?
         .into_iter()
         .map(|file| {
             let relative_path = file.relative_path.clone();
-            ProjectGitDiffFile {
+            Ok(ProjectGitDiffFile {
                 relative_path: relative_path.clone(),
                 hunks: file
                     .hunks
                     .into_iter()
                     .enumerate()
-                    .map(|(index, hunk)| ProjectGitDiffHunk {
-                        hunk_id: build_hunk_id(&relative_path, index),
-                        header: hunk.header,
-                        lines: hunk
-                            .lines
-                            .into_iter()
-                            .map(|line| ProjectGitDiffLine {
-                                kind: classify_diff_line(&line),
-                                text: line,
-                            })
-                            .collect(),
+                    .map(|(index, hunk)| {
+                        let lines = project_git_diff_lines_for_hunk(&hunk);
+                        ProjectGitDiffHunk {
+                            hunk_id: build_hunk_id(&relative_path, index),
+                            old_start: hunk.old_start,
+                            old_count: hunk.old_count,
+                            new_start: hunk.new_start,
+                            new_count: hunk.new_count,
+                            lines,
+                        }
                     })
                     .collect(),
-            }
+            })
         })
         .collect()
 }
 
-fn parse_raw_git_diff(raw: &str) -> Vec<ParsedGitDiffFile> {
+fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
     let mut files = Vec::new();
     let mut current_file: Option<ParsedGitDiffFile> = None;
     let mut current_hunk: Option<ParsedGitDiffHunk> = None;
@@ -908,18 +1013,19 @@ fn parse_raw_git_diff(raw: &str) -> Vec<ParsedGitDiffFile> {
     for line in raw.lines() {
         if let Some(diff_line) = line.strip_prefix("diff --git ") {
             if let Some(hunk) = current_hunk.take() {
-                current_file
+                let file = current_file
                     .as_mut()
-                    .unwrap_or_else(|| panic!("hunk appeared before file in git diff"))
-                    .hunks
-                    .push(hunk);
+                    .ok_or_else(|| "hunk appeared before file in git diff".to_owned())?;
+                file.hunks.push(hunk);
             }
             if let Some(file) = current_file.take() {
                 files.push(file);
             }
 
             let parts: Vec<&str> = diff_line.split_whitespace().collect();
-            assert_eq!(parts.len(), 2, "invalid diff header '{}'", line);
+            if parts.len() != 2 {
+                return Err(format!("invalid diff header '{}'", line));
+            }
             current_file = Some(ParsedGitDiffFile {
                 relative_path: parse_diff_path(parts[0], parts[1]),
                 header_lines: vec![line.to_owned()],
@@ -930,14 +1036,18 @@ fn parse_raw_git_diff(raw: &str) -> Vec<ParsedGitDiffFile> {
 
         if line.starts_with("@@") {
             if let Some(hunk) = current_hunk.take() {
-                current_file
+                let file = current_file
                     .as_mut()
-                    .unwrap_or_else(|| panic!("hunk appeared before file in git diff"))
-                    .hunks
-                    .push(hunk);
+                    .ok_or_else(|| "hunk appeared before file in git diff".to_owned())?;
+                file.hunks.push(hunk);
             }
+            let (old_start, old_count, new_start, new_count) = parse_hunk_header(line)?;
             current_hunk = Some(ParsedGitDiffHunk {
                 header: line.to_owned(),
+                old_start,
+                old_count,
+                new_start,
+                new_count,
                 lines: Vec::new(),
             });
             continue;
@@ -954,17 +1064,16 @@ fn parse_raw_git_diff(raw: &str) -> Vec<ParsedGitDiffFile> {
     }
 
     if let Some(hunk) = current_hunk.take() {
-        current_file
+        let file = current_file
             .as_mut()
-            .unwrap_or_else(|| panic!("trailing hunk appeared before file in git diff"))
-            .hunks
-            .push(hunk);
+            .ok_or_else(|| "trailing hunk appeared before file in git diff".to_owned())?;
+        file.hunks.push(hunk);
     }
     if let Some(file) = current_file.take() {
         files.push(file);
     }
 
-    files
+    Ok(files)
 }
 
 fn parse_diff_path(a_path: &str, b_path: &str) -> String {
@@ -980,6 +1089,99 @@ fn build_hunk_id(relative_path: &str, index: usize) -> String {
     format!("{}::{}", relative_path, index)
 }
 
+fn project_git_diff_lines_for_hunk(hunk: &ParsedGitDiffHunk) -> Vec<ProjectGitDiffLine> {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+
+    hunk.lines
+        .iter()
+        .map(|line| {
+            let kind = classify_diff_line(line);
+            if is_git_no_newline_marker(line) {
+                return ProjectGitDiffLine {
+                    kind,
+                    text: line.to_owned(),
+                    old_line_number: None,
+                    new_line_number: None,
+                };
+            }
+
+            match kind {
+                ProjectGitDiffLineKind::Context => {
+                    let parsed = ProjectGitDiffLine {
+                        kind,
+                        text: strip_diff_line_prefix(line).to_owned(),
+                        old_line_number: Some(old_line),
+                        new_line_number: Some(new_line),
+                    };
+                    old_line += 1;
+                    new_line += 1;
+                    parsed
+                }
+                ProjectGitDiffLineKind::Added => {
+                    let parsed = ProjectGitDiffLine {
+                        kind,
+                        text: strip_diff_line_prefix(line).to_owned(),
+                        old_line_number: None,
+                        new_line_number: Some(new_line),
+                    };
+                    new_line += 1;
+                    parsed
+                }
+                ProjectGitDiffLineKind::Removed => {
+                    let parsed = ProjectGitDiffLine {
+                        kind,
+                        text: strip_diff_line_prefix(line).to_owned(),
+                        old_line_number: Some(old_line),
+                        new_line_number: None,
+                    };
+                    old_line += 1;
+                    parsed
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_hunk_header(header: &str) -> Result<(u32, u32, u32, u32), String> {
+    let ranges = header
+        .strip_prefix("@@ ")
+        .and_then(|rest| rest.split_once(" @@"))
+        .map(|(ranges, _)| ranges)
+        .ok_or_else(|| format!("invalid hunk header '{}'", header))?;
+    let mut parts = ranges.split_whitespace();
+    let old_range = parts
+        .next()
+        .ok_or_else(|| format!("missing old range in hunk header '{}'", header))?;
+    let new_range = parts
+        .next()
+        .ok_or_else(|| format!("missing new range in hunk header '{}'", header))?;
+    if parts.next().is_some() {
+        return Err(format!("invalid hunk header '{}'", header));
+    }
+
+    let (old_start, old_count) = parse_hunk_range(old_range, '-', header)?;
+    let (new_start, new_count) = parse_hunk_range(new_range, '+', header)?;
+    Ok((old_start, old_count, new_start, new_count))
+}
+
+fn parse_hunk_range(range: &str, prefix: char, header: &str) -> Result<(u32, u32), String> {
+    let trimmed = range
+        .strip_prefix(prefix)
+        .ok_or_else(|| format!("invalid hunk range '{}' in '{}'", range, header))?;
+    let (start, count) = match trimmed.split_once(',') {
+        Some((start, count)) => (start, count),
+        None => (trimmed, "1"),
+    };
+    let start = start
+        .parse::<u32>()
+        .map_err(|error| format!("invalid hunk start '{}' in '{}': {error}", range, header))?;
+    let count = count
+        .parse::<u32>()
+        .map_err(|error| format!("invalid hunk count '{}' in '{}': {error}", range, header))?;
+    Ok((start, count))
+}
+
 fn classify_diff_line(line: &str) -> ProjectGitDiffLineKind {
     match line.chars().next() {
         Some('+') => ProjectGitDiffLineKind::Added,
@@ -988,11 +1190,19 @@ fn classify_diff_line(line: &str) -> ProjectGitDiffLineKind {
     }
 }
 
+fn strip_diff_line_prefix(line: &str) -> &str {
+    line.strip_prefix(['+', '-', ' ']).unwrap_or(line)
+}
+
+fn is_git_no_newline_marker(line: &str) -> bool {
+    line.starts_with("\\ No newline at end of file")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use protocol::{ProjectDiffScope, ProjectId};
+    use protocol::{DiffContextMode, ProjectDiffScope, ProjectId};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1051,6 +1261,7 @@ mod tests {
                 root: ProjectRootPath("/repo".to_owned()),
                 scope: ProjectDiffScope::Unstaged,
                 path: Some("src/lib.rs".to_owned()),
+                context_mode: DiffContextMode::Hunks,
             },
             |root, args, access_mode| {
                 calls.push((
@@ -1065,14 +1276,175 @@ mod tests {
 
         assert_eq!(
             calls,
-            vec![(
-                "/repo".to_owned(),
-                vec!["diff".to_owned(), "--".to_owned(), "src/lib.rs".to_owned(),],
-                GitAccessMode::ReadOnly,
-            )]
+            vec![
+                (
+                    "/repo".to_owned(),
+                    vec![
+                        "diff".to_owned(),
+                        "-U3".to_owned(),
+                        "--".to_owned(),
+                        "src/lib.rs".to_owned(),
+                    ],
+                    GitAccessMode::ReadOnly,
+                ),
+                (
+                    "/repo".to_owned(),
+                    vec![
+                        "ls-files".to_owned(),
+                        "--others".to_owned(),
+                        "--exclude-standard".to_owned(),
+                        "--".to_owned(),
+                        "src/lib.rs".to_owned(),
+                    ],
+                    GitAccessMode::ReadOnly,
+                ),
+            ]
         );
         assert_eq!(diff.root.0, "/repo");
         assert_eq!(diff.path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(diff.context_mode, DiffContextMode::Hunks);
+    }
+
+    #[test]
+    fn list_untracked_paths_returns_correct_files() {
+        let mut calls = Vec::new();
+
+        let paths = list_untracked_paths_with_runner(
+            "/repo",
+            Some("src"),
+            &mut |root, args, access_mode| {
+                calls.push((
+                    root.to_owned(),
+                    args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+                    access_mode,
+                ));
+                Ok("src/new.rs\nsrc/other.rs\n".to_owned())
+            },
+        )
+        .expect("list_untracked_paths_with_runner should succeed");
+
+        assert_eq!(paths, vec!["src/new.rs", "src/other.rs"]);
+        assert_eq!(
+            calls,
+            vec![(
+                "/repo".to_owned(),
+                vec![
+                    "ls-files".to_owned(),
+                    "--others".to_owned(),
+                    "--exclude-standard".to_owned(),
+                    "--".to_owned(),
+                    "src".to_owned(),
+                ],
+                GitAccessMode::ReadOnly,
+            )]
+        );
+    }
+
+    #[test]
+    fn build_untracked_diff_file_all_added_lines() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let path = temp_dir.path().join("src").join("new.rs");
+        fs::create_dir_all(path.parent().expect("new.rs parent")).expect("create parent");
+        fs::write(&path, "first\nsecond\nthird\n").expect("write untracked file");
+
+        let diff = build_untracked_diff_file(
+            temp_dir.path().to_str().expect("tempdir path utf8"),
+            "src/new.rs",
+        )
+        .expect("build_untracked_diff_file should succeed");
+
+        assert_eq!(diff.relative_path, "src/new.rs");
+        assert_eq!(diff.hunks.len(), 1);
+        let hunk = &diff.hunks[0];
+        assert_eq!(hunk.hunk_id, "src/new.rs::0");
+        assert_eq!(hunk.old_start, 0);
+        assert_eq!(hunk.old_count, 0);
+        assert_eq!(hunk.new_start, 1);
+        assert_eq!(hunk.new_count, 3);
+        assert_eq!(hunk.lines.len(), 3);
+        for (index, line) in hunk.lines.iter().enumerate() {
+            assert_eq!(line.kind, ProjectGitDiffLineKind::Added);
+            assert_eq!(line.old_line_number, None);
+            assert_eq!(line.new_line_number, Some((index + 1) as u32));
+        }
+        assert_eq!(hunk.lines[0].text, "first");
+        assert_eq!(hunk.lines[1].text, "second");
+        assert_eq!(hunk.lines[2].text, "third");
+    }
+
+    #[test]
+    fn build_untracked_diff_file_missing_file_returns_err() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+
+        let error = build_untracked_diff_file(
+            temp_dir.path().to_str().expect("tempdir path utf8"),
+            "src/missing.rs",
+        )
+        .expect_err("missing file should error");
+
+        assert!(error.contains("Failed to read untracked file 'src/missing.rs'"));
+    }
+
+    #[test]
+    fn build_untracked_diff_file_binary_returns_err() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let path = temp_dir.path().join("binary.dat");
+        fs::write(&path, [0xff_u8, 0xfe_u8, 0x00_u8]).expect("write binary file");
+
+        let error = build_untracked_diff_file(
+            temp_dir.path().to_str().expect("tempdir path utf8"),
+            "binary.dat",
+        )
+        .expect_err("binary file should error");
+
+        assert_eq!(error, "binary file: binary.dat");
+    }
+
+    #[test]
+    fn parse_git_diff_emits_prefix_free_text_and_typed_line_numbers() {
+        let raw = "\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+index 83db48f..f735c2b 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1,3 +1,4 @@\n\
+ line1\n\
+-line2\n\
++line2 changed\n\
++line2 extra\n\
+ line3\n";
+
+        let files = parse_git_diff(raw).expect("parse_git_diff should succeed");
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.relative_path, "src/lib.rs");
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        assert_eq!(hunk.old_start, 1);
+        assert_eq!(hunk.old_count, 3);
+        assert_eq!(hunk.new_start, 1);
+        assert_eq!(hunk.new_count, 4);
+
+        assert_eq!(hunk.lines.len(), 5);
+        assert_eq!(hunk.lines[0].text, "line1");
+        assert_eq!(hunk.lines[0].old_line_number, Some(1));
+        assert_eq!(hunk.lines[0].new_line_number, Some(1));
+
+        assert_eq!(hunk.lines[1].text, "line2");
+        assert_eq!(hunk.lines[1].old_line_number, Some(2));
+        assert_eq!(hunk.lines[1].new_line_number, None);
+
+        assert_eq!(hunk.lines[2].text, "line2 changed");
+        assert_eq!(hunk.lines[2].old_line_number, None);
+        assert_eq!(hunk.lines[2].new_line_number, Some(2));
+
+        assert_eq!(hunk.lines[3].text, "line2 extra");
+        assert_eq!(hunk.lines[3].old_line_number, None);
+        assert_eq!(hunk.lines[3].new_line_number, Some(3));
+
+        assert_eq!(hunk.lines[4].text, "line3");
+        assert_eq!(hunk.lines[4].old_line_number, Some(3));
+        assert_eq!(hunk.lines[4].new_line_number, Some(4));
     }
 
     #[cfg(unix)]

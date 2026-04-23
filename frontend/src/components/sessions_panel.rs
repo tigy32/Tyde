@@ -7,7 +7,7 @@ use protocol::{
 };
 
 use crate::send::send_frame;
-use crate::state::{AppState, ConnectionStatus};
+use crate::state::{ActiveProjectRef, AppState, ConnectionStatus};
 
 fn backend_class(kind: BackendKind) -> &'static str {
     match kind {
@@ -67,16 +67,16 @@ fn session_id_short(s: &crate::state::SessionInfo) -> String {
 pub fn SessionsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
-    let hide_child_sessions = RwSignal::new(false);
+    let show_child_sessions = RwSignal::new(false);
     let filtered_sessions = Memo::new(move |_| {
         let sessions = state.sessions.get();
         let query = search.get().to_lowercase();
-        let hide_children = hide_child_sessions.get();
+        let show_children = show_child_sessions.get();
 
         sessions
             .into_iter()
             .filter(|s| {
-                if hide_children && s.summary.parent_id.is_some() {
+                if !show_children && s.summary.parent_id.is_some() {
                     return false;
                 }
                 if !query.is_empty() {
@@ -104,7 +104,7 @@ pub fn SessionsPanel() -> impl IntoView {
     };
 
     let toggle_children = move |_| {
-        hide_child_sessions.set(!hide_child_sessions.get());
+        show_child_sessions.set(!show_child_sessions.get());
     };
 
     let state_for_refresh = state.clone();
@@ -134,14 +134,18 @@ pub fn SessionsPanel() -> impl IntoView {
                     placeholder="Filter sessions..."
                     prop:value=search
                     on:input=on_search
+                    spellcheck="false"
+                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                    autocapitalize="none"
+                    autocomplete="off"
                 />
             </div>
             <div class="panel-filters">
                 <button
-                    class=move || if hide_child_sessions.get() { "filter-toggle active" } else { "filter-toggle" }
+                    class=move || if show_child_sessions.get() { "filter-toggle active" } else { "filter-toggle" }
                     on:click=toggle_children
                 >
-                    "Hide agent sessions"
+                    "Show sub-agents"
                 </button>
                 <button class="filter-toggle refresh-btn" on:click=on_refresh>
                     "Refresh"
@@ -211,10 +215,20 @@ fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl Int
     let resume_state = state.clone();
     let resume_sid = session_id.clone();
     let resume_host = session_host_id.clone();
+    let resume_project_id = session.summary.project_id.clone();
     let do_resume = std::rc::Rc::new(move || {
         let state = resume_state.clone();
         let sid = resume_sid.clone();
         let host_id = resume_host.clone();
+        // Switch to the session's project synchronously so the NewAgent event
+        // lands in the user's current view (upgrading the fresh "New Chat" tab
+        // into the resumed chat). Sessions without a project_id drop the user
+        // to the global/home view.
+        let target = resume_project_id.clone().map(|pid| ActiveProjectRef {
+            host_id: host_id.clone(),
+            project_id: pid,
+        });
+        state.switch_active_project(target);
         spawn_local(async move {
             if let Some(host_stream) = state.host_stream_untracked(&host_id) {
                 let payload = SpawnAgentPayload {

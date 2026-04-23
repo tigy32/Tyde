@@ -382,6 +382,10 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                         prop:value=move || address_input.get()
                         on:input=move |ev| address_input.set(event_target_value(&ev))
                         on:keydown=on_address_keydown
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
                     />
                     <button class="browser-btn" on:click=on_toggle_hidden>{hidden_label}</button>
                 </div>

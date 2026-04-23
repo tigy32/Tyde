@@ -376,8 +376,13 @@ pub(crate) async fn route_client_envelope(
                 if let Some(path) = &payload.path {
                     ensure_non_empty("project_read_diff", "path", path.as_str())?;
                 }
-                host.read_project_diff(&project_output_stream, project_id, payload)
-                    .await?;
+                host.read_project_diff(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
             }
             FrameKind::ProjectStageFile => {
                 let payload: ProjectStageFilePayload =

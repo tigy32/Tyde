@@ -92,6 +92,10 @@ pub fn FeedbackModal() -> impl IntoView {
                             prop:value=move || text.get()
                             prop:disabled=is_submitting
                             on:input=on_input
+                            spellcheck="false"
+                            {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                            autocapitalize="none"
+                            autocomplete="off"
                         />
                     </Show>
 

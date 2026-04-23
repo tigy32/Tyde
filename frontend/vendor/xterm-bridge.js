@@ -85,6 +85,12 @@
         }
 
         term.open(container);
+        if (term.textarea) {
+            term.textarea.setAttribute('spellcheck', 'false');
+            term.textarea.setAttribute('autocorrect', 'off');
+            term.textarea.setAttribute('autocapitalize', 'none');
+            term.textarea.setAttribute('autocomplete', 'off');
+        }
         if (fit) {
             try {
                 fit.fit();

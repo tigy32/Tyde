@@ -4409,6 +4409,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -5081,6 +5082,7 @@ dependencies = [
 name = "tauri-shell"
 version = "0.1.0"
 dependencies = [
+ "core-foundation-sys",
  "devtools-protocol",
  "host-config",
  "reqwest 0.12.28",

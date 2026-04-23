@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
@@ -6,7 +6,48 @@ use wasm_bindgen_futures::spawn_local;
 use protocol::{AgentId, FrameKind, SetAgentNamePayload};
 
 use crate::send::{close_agent, send_frame};
-use crate::state::{ActiveAgentRef, AgentInfo, AppState, TabContent};
+use crate::state::{
+    ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, StreamingState,
+    TabContent,
+};
+
+/// Pure predicate used by the Agents panel filter memo. Extracted so the
+/// filter behavior can be unit-tested without a Leptos runtime.
+pub fn agent_passes_filters(
+    agent: &AgentInfo,
+    filters: &AgentsPanelFilters,
+    active_project: Option<&ActiveProjectRef>,
+    streaming: &HashMap<AgentId, StreamingState>,
+    turn_active: &HashMap<AgentId, bool>,
+    lowercase_query: &str,
+) -> bool {
+    if filters.hide_sub_agents && agent.parent_agent_id.is_some() {
+        return false;
+    }
+    if filters.hide_inactive {
+        let is_active = !agent.started
+            || streaming.contains_key(&agent.agent_id)
+            || turn_active.get(&agent.agent_id).copied().unwrap_or(false);
+        if !is_active {
+            return false;
+        }
+    }
+    if !filters.show_other_projects {
+        let matches = match active_project {
+            None => agent.project_id.is_none(),
+            Some(ap) => {
+                agent.host_id == ap.host_id && agent.project_id.as_ref() == Some(&ap.project_id)
+            }
+        };
+        if !matches {
+            return false;
+        }
+    }
+    if !lowercase_query.is_empty() && !agent.name.to_lowercase().contains(lowercase_query) {
+        return false;
+    }
+    true
+}
 
 fn backend_class(kind: protocol::BackendKind) -> &'static str {
     match kind {
@@ -72,8 +113,6 @@ fn status_class(derived: &DerivedAgentState) -> &'static str {
 pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
-    let hide_inactive = RwSignal::new(false);
-    let hide_sub_agents = RwSignal::new(false);
     // Per-parent collapse state: parents whose children are hidden.
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
     // Editing state lives here so it survives agent list re-renders caused by
@@ -81,32 +120,52 @@ pub fn AgentsPanel() -> impl IntoView {
     let editing_agent: RwSignal<Option<protocol::AgentId>> = RwSignal::new(None);
     let edit_value: RwSignal<String> = RwSignal::new(String::new());
 
+    // Current filter values for the active project. Falls back to
+    // context-aware defaults when the user hasn't toggled anything yet for
+    // this project.
+    let filters_state = state.clone();
+    let current_filters = Memo::new(move |_| {
+        let active = filters_state.active_project.get();
+        let overrides = filters_state.agents_panel_filters.get();
+        overrides
+            .get(&active)
+            .cloned()
+            .unwrap_or_else(|| AgentsPanelFilters::defaults_for(active.as_ref()))
+    });
+
+    let update_filters = {
+        let state = state.clone();
+        move |mutate: Box<dyn FnOnce(&mut AgentsPanelFilters)>| {
+            let active = state.active_project.get_untracked();
+            state.agents_panel_filters.update(|map| {
+                let entry = map
+                    .entry(active.clone())
+                    .or_insert_with(|| AgentsPanelFilters::defaults_for(active.as_ref()));
+                mutate(entry);
+            });
+        }
+    };
+
+    let filter_state = state.clone();
     let filtered_agents = Memo::new(move |_| {
-        let agents = state.agents.get();
-        let streaming_map = state.streaming_text.get();
-        let turn_active_map = state.agent_turn_active.get();
+        let agents = filter_state.agents.get();
+        let streaming_map = filter_state.streaming_text.get();
+        let turn_active_map = filter_state.agent_turn_active.get();
+        let active_project = filter_state.active_project.get();
         let query = search.get().to_lowercase();
-        let hide_sub = hide_sub_agents.get();
-        let hide_done = hide_inactive.get();
+        let filters = current_filters.get();
 
         agents
             .into_iter()
             .filter(|a| {
-                if hide_sub && a.parent_agent_id.is_some() {
-                    return false;
-                }
-                if hide_done {
-                    let is_active = !a.started
-                        || streaming_map.contains_key(&a.agent_id)
-                        || turn_active_map.get(&a.agent_id).copied().unwrap_or(false);
-                    if !is_active {
-                        return false;
-                    }
-                }
-                if !query.is_empty() && !a.name.to_lowercase().contains(&query) {
-                    return false;
-                }
-                true
+                agent_passes_filters(
+                    a,
+                    &filters,
+                    active_project.as_ref(),
+                    &streaming_map,
+                    &turn_active_map,
+                    &query,
+                )
             })
             .collect::<Vec<_>>()
     });
@@ -149,11 +208,21 @@ pub fn AgentsPanel() -> impl IntoView {
     };
 
     let toggle_inactive = move |_| {
-        hide_inactive.set(!hide_inactive.get());
+        update_filters(Box::new(|f: &mut AgentsPanelFilters| {
+            f.hide_inactive = !f.hide_inactive;
+        }));
     };
 
     let toggle_sub = move |_| {
-        hide_sub_agents.set(!hide_sub_agents.get());
+        update_filters(Box::new(|f: &mut AgentsPanelFilters| {
+            f.hide_sub_agents = !f.hide_sub_agents;
+        }));
+    };
+
+    let toggle_other_projects = move |_| {
+        update_filters(Box::new(|f: &mut AgentsPanelFilters| {
+            f.show_other_projects = !f.show_other_projects;
+        }));
     };
 
     view! {
@@ -165,20 +234,30 @@ pub fn AgentsPanel() -> impl IntoView {
                     placeholder="Filter agents..."
                     prop:value=search
                     on:input=on_search
+                    spellcheck="false"
+                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                    autocapitalize="none"
+                    autocomplete="off"
                 />
             </div>
             <div class="panel-filters">
                 <button
-                    class=move || if hide_inactive.get() { "filter-toggle active" } else { "filter-toggle" }
+                    class=move || if current_filters.get().hide_inactive { "filter-toggle active" } else { "filter-toggle" }
                     on:click=toggle_inactive
                 >
                     "Hide inactive"
                 </button>
                 <button
-                    class=move || if hide_sub_agents.get() { "filter-toggle active" } else { "filter-toggle" }
+                    class=move || if current_filters.get().hide_sub_agents { "filter-toggle active" } else { "filter-toggle" }
                     on:click=toggle_sub
                 >
                     "Hide sub-agents"
+                </button>
+                <button
+                    class=move || if current_filters.get().show_other_projects { "filter-toggle active" } else { "filter-toggle" }
+                    on:click=toggle_other_projects
+                >
+                    "Show other projects"
                 </button>
             </div>
             <div class="panel-content">
@@ -471,6 +550,10 @@ fn agent_card(
                                 on:keydown=on_keydown
                                 on:blur=on_blur
                                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                                spellcheck="false"
+                                {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                                autocapitalize="none"
+                                autocomplete="off"
                             />
                         }.into_any()
                     } else {
@@ -550,5 +633,270 @@ fn agent_card(
                 <div class="agent-card-error">{msg}</div>
             })}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{AgentOrigin, BackendKind, ProjectId, StreamPath};
+
+    fn mk_agent(
+        name: &str,
+        host: &str,
+        project_id: Option<&str>,
+        parent: Option<&str>,
+        started: bool,
+    ) -> AgentInfo {
+        AgentInfo {
+            host_id: host.to_string(),
+            agent_id: AgentId(format!("agent-{name}")),
+            name: name.to_string(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Tycode,
+            workspace_roots: vec![],
+            project_id: project_id.map(|s| ProjectId(s.to_string())),
+            parent_agent_id: parent.map(|p| AgentId(p.to_string())),
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("s".to_string()),
+            started,
+            fatal_error: None,
+        }
+    }
+
+    fn active(host: &str, project: &str) -> ActiveProjectRef {
+        ActiveProjectRef {
+            host_id: host.to_string(),
+            project_id: ProjectId(project.to_string()),
+        }
+    }
+
+    fn no_runtime() -> (HashMap<AgentId, StreamingState>, HashMap<AgentId, bool>) {
+        (HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn hide_sub_agents_drops_children_keeps_parents() {
+        let parent = mk_agent("p", "h", Some("proj"), None, true);
+        let child = mk_agent("c", "h", Some("proj"), Some("agent-p"), true);
+        let (s, t) = no_runtime();
+        let filters = AgentsPanelFilters {
+            hide_sub_agents: true,
+            hide_inactive: false,
+            show_other_projects: true,
+        };
+        assert!(agent_passes_filters(
+            &parent,
+            &filters,
+            Some(&active("h", "proj")),
+            &s,
+            &t,
+            "",
+        ));
+        assert!(!agent_passes_filters(
+            &child,
+            &filters,
+            Some(&active("h", "proj")),
+            &s,
+            &t,
+            "",
+        ));
+    }
+
+    #[test]
+    fn hide_inactive_keeps_starting_streaming_and_turn_active() {
+        let filters = AgentsPanelFilters {
+            hide_sub_agents: false,
+            hide_inactive: true,
+            show_other_projects: true,
+        };
+
+        // Not yet started → treated as active (initializing).
+        let starting = mk_agent("starting", "h", None, None, false);
+        let (s, t) = no_runtime();
+        assert!(agent_passes_filters(&starting, &filters, None, &s, &t, ""));
+
+        // Started + streaming.
+        let streaming_agent = mk_agent("streaming", "h", None, None, true);
+        let mut stream_map: HashMap<AgentId, StreamingState> = HashMap::new();
+        stream_map.insert(
+            streaming_agent.agent_id.clone(),
+            StreamingState {
+                agent_name: "streaming".to_string(),
+                model: None,
+                text: leptos::prelude::ArcRwSignal::new(String::new()),
+                reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
+                tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
+            },
+        );
+        assert!(agent_passes_filters(
+            &streaming_agent,
+            &filters,
+            None,
+            &stream_map,
+            &t,
+            "",
+        ));
+
+        // Started + turn active.
+        let turn_agent = mk_agent("turn", "h", None, None, true);
+        let mut turn_map: HashMap<AgentId, bool> = HashMap::new();
+        turn_map.insert(turn_agent.agent_id.clone(), true);
+        let (s, _) = no_runtime();
+        assert!(agent_passes_filters(
+            &turn_agent,
+            &filters,
+            None,
+            &s,
+            &turn_map,
+            "",
+        ));
+
+        // Started, idle, not streaming → hidden.
+        let idle = mk_agent("idle", "h", None, None, true);
+        let (s, t) = no_runtime();
+        assert!(!agent_passes_filters(&idle, &filters, None, &s, &t, ""));
+    }
+
+    #[test]
+    fn show_other_projects_off_on_home_keeps_only_none_project() {
+        assert!(AgentsPanelFilters::defaults_for(None).show_other_projects);
+        // Override to simulate user turning it off on Home.
+        let filters = AgentsPanelFilters {
+            hide_sub_agents: false,
+            hide_inactive: false,
+            show_other_projects: false,
+        };
+        let home_agent = mk_agent("home", "h", None, None, true);
+        let project_agent = mk_agent("proj", "h", Some("p1"), None, true);
+        let (s, t) = no_runtime();
+        assert!(agent_passes_filters(
+            &home_agent,
+            &filters,
+            None,
+            &s,
+            &t,
+            ""
+        ));
+        assert!(!agent_passes_filters(
+            &project_agent,
+            &filters,
+            None,
+            &s,
+            &t,
+            ""
+        ));
+    }
+
+    #[test]
+    fn show_other_projects_off_in_project_requires_host_and_project_match() {
+        let filters = AgentsPanelFilters::defaults_for(Some(&active("h1", "p1")));
+        // Specific-project default is false.
+        assert!(!filters.show_other_projects);
+
+        let same = mk_agent("same", "h1", Some("p1"), None, true);
+        let other_project = mk_agent("other_p", "h1", Some("p2"), None, true);
+        let other_host = mk_agent("other_h", "h2", Some("p1"), None, true);
+        let home_agent = mk_agent("home", "h1", None, None, true);
+        let active_ref = active("h1", "p1");
+        let (s, t) = no_runtime();
+        assert!(agent_passes_filters(
+            &same,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            ""
+        ));
+        assert!(!agent_passes_filters(
+            &other_project,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            "",
+        ));
+        assert!(!agent_passes_filters(
+            &other_host,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            "",
+        ));
+        assert!(!agent_passes_filters(
+            &home_agent,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            "",
+        ));
+    }
+
+    #[test]
+    fn show_other_projects_on_bypasses_project_check() {
+        let filters = AgentsPanelFilters {
+            hide_sub_agents: false,
+            hide_inactive: false,
+            show_other_projects: true,
+        };
+        let other_project = mk_agent("other_p", "h1", Some("p2"), None, true);
+        let other_host = mk_agent("other_h", "h2", Some("p1"), None, true);
+        let home_agent = mk_agent("home", "h1", None, None, true);
+        let active_ref = active("h1", "p1");
+        let (s, t) = no_runtime();
+        assert!(agent_passes_filters(
+            &other_project,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            "",
+        ));
+        assert!(agent_passes_filters(
+            &other_host,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            "",
+        ));
+        assert!(agent_passes_filters(
+            &home_agent,
+            &filters,
+            Some(&active_ref),
+            &s,
+            &t,
+            "",
+        ));
+    }
+
+    #[test]
+    fn search_matches_case_insensitively() {
+        let filters = AgentsPanelFilters {
+            hide_sub_agents: false,
+            hide_inactive: false,
+            show_other_projects: true,
+        };
+        let agent = mk_agent("Foo Bar", "h", None, None, true);
+        let (s, t) = no_runtime();
+        assert!(agent_passes_filters(&agent, &filters, None, &s, &t, "foo"));
+        assert!(agent_passes_filters(&agent, &filters, None, &s, &t, "bar"));
+        assert!(!agent_passes_filters(&agent, &filters, None, &s, &t, "baz"));
+        // Empty query passes all.
+        assert!(agent_passes_filters(&agent, &filters, None, &s, &t, ""));
+    }
+
+    #[test]
+    fn defaults_for_home_shows_other_projects_true() {
+        assert!(AgentsPanelFilters::defaults_for(None).show_other_projects);
+    }
+
+    #[test]
+    fn defaults_for_specific_project_shows_other_projects_false() {
+        let ap = active("h", "p");
+        assert!(!AgentsPanelFilters::defaults_for(Some(&ap)).show_other_projects);
     }
 }

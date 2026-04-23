@@ -2,12 +2,12 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    CommandErrorCode, CommandErrorPayload, Envelope, FileEntryOp, FrameKind, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDiffScope,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectListDirPayload, ProjectNotifyPayload, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    CommandErrorCode, CommandErrorPayload, DiffContextMode, Envelope, FileEntryOp, FrameKind,
+    Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDiffScope,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
 };
 use std::fs;
 use std::path::Path;
@@ -122,6 +122,19 @@ async fn expect_project_git_diff(
     assert_eq!(env.kind, FrameKind::ProjectGitDiff);
     env.parse_payload()
         .expect("failed to parse ProjectGitDiffPayload")
+}
+
+async fn request_project_diff(
+    client: &mut client::Connection,
+    project_id: &protocol::ProjectId,
+    payload: ProjectReadDiffPayload,
+    context: &str,
+) -> ProjectGitDiffPayload {
+    client
+        .project_read_diff(project_id, payload)
+        .await
+        .expect("project_read_diff failed");
+    expect_project_git_diff(client, context).await
 }
 
 async fn create_project(
@@ -764,21 +777,20 @@ async fn project_read_diff_returns_unstaged_diff() {
     )
     .await;
 
-    fixture
-        .client
-        .project_read_diff(
-            &project.id,
-            ProjectReadDiffPayload {
-                root: protocol::ProjectRootPath(project.roots[0].clone()),
-                scope: ProjectDiffScope::Unstaged,
-                path: Some("src/main.rs".to_owned()),
-            },
-        )
-        .await
-        .expect("project_read_diff failed");
-
-    let diff = expect_project_git_diff(&mut fixture.client, "project git diff").await;
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "project git diff",
+    )
+    .await;
     assert_eq!(diff.scope, ProjectDiffScope::Unstaged);
+    assert_eq!(diff.context_mode, DiffContextMode::Hunks);
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].relative_path, "src/main.rs");
     assert_eq!(diff.files[0].hunks.len(), 1);
@@ -788,6 +800,435 @@ async fn project_read_diff_returns_unstaged_diff() {
             .iter()
             .any(|line| line.text.contains("println!(\"hello\")"))
     );
+}
+
+#[tokio::test]
+async fn project_read_diff_untracked_file_appears_as_all_added() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("read-diff-untracked", &[("src/main.rs", "fn main() {}\n")]);
+    write_file(&repo.path().join("src/new.rs"), "alpha\nbeta\ngamma\n");
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Untracked",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/new.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "untracked file diff",
+    )
+    .await;
+
+    assert_eq!(diff.scope, ProjectDiffScope::Unstaged);
+    assert_eq!(diff.files.len(), 1);
+    let file = &diff.files[0];
+    assert_eq!(file.relative_path, "src/new.rs");
+    assert_eq!(file.hunks.len(), 1);
+
+    let hunk = &file.hunks[0];
+    assert_eq!(hunk.old_start, 0);
+    assert_eq!(hunk.old_count, 0);
+    assert_eq!(hunk.new_start, 1);
+    assert_eq!(hunk.new_count, 3);
+    assert_eq!(hunk.lines.len(), 3);
+    let expected = ["alpha", "beta", "gamma"];
+    for (index, line) in hunk.lines.iter().enumerate() {
+        assert_eq!(line.kind, ProjectGitDiffLineKind::Added);
+        assert_eq!(line.text, expected[index]);
+        assert_eq!(line.old_line_number, None);
+        assert_eq!(line.new_line_number, Some((index + 1) as u32));
+    }
+}
+
+#[tokio::test]
+async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "read-diff-mixed",
+        &[("src/main.rs", "fn main() {\n    println!(\"hi\");\n}\n")],
+    );
+    write_file(
+        &repo.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    );
+    write_file(&repo.path().join("src/new.rs"), "pub fn added() {}\n");
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Mixed",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+        },
+        "mixed unstaged diff",
+    )
+    .await;
+
+    assert_eq!(diff.scope, ProjectDiffScope::Unstaged);
+    assert_eq!(diff.context_mode, DiffContextMode::Hunks);
+    let paths: Vec<&str> = diff
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["src/main.rs", "src/new.rs"]);
+
+    let modified = diff
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/main.rs")
+        .expect("missing modified tracked file");
+    assert_eq!(modified.hunks.len(), 1);
+    let modified_hunk = &modified.hunks[0];
+    assert_eq!(modified_hunk.old_start, 1);
+    assert_eq!(modified_hunk.old_count, 3);
+    assert_eq!(modified_hunk.new_start, 1);
+    assert_eq!(modified_hunk.new_count, 3);
+    assert_eq!(modified_hunk.lines.len(), 4);
+    assert_eq!(modified_hunk.lines[0].kind, ProjectGitDiffLineKind::Context);
+    assert_eq!(modified_hunk.lines[0].text, "fn main() {");
+    assert_eq!(modified_hunk.lines[0].old_line_number, Some(1));
+    assert_eq!(modified_hunk.lines[0].new_line_number, Some(1));
+    assert_eq!(modified_hunk.lines[1].kind, ProjectGitDiffLineKind::Removed);
+    assert_eq!(modified_hunk.lines[1].text, "    println!(\"hi\");");
+    assert_eq!(modified_hunk.lines[1].old_line_number, Some(2));
+    assert_eq!(modified_hunk.lines[1].new_line_number, None);
+    assert_eq!(modified_hunk.lines[2].kind, ProjectGitDiffLineKind::Added);
+    assert_eq!(modified_hunk.lines[2].text, "    println!(\"hello\");");
+    assert_eq!(modified_hunk.lines[2].old_line_number, None);
+    assert_eq!(modified_hunk.lines[2].new_line_number, Some(2));
+    assert_eq!(modified_hunk.lines[3].kind, ProjectGitDiffLineKind::Context);
+    assert_eq!(modified_hunk.lines[3].text, "}");
+    assert_eq!(modified_hunk.lines[3].old_line_number, Some(3));
+    assert_eq!(modified_hunk.lines[3].new_line_number, Some(3));
+
+    let untracked = diff
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/new.rs")
+        .expect("missing untracked file");
+    assert_eq!(untracked.hunks.len(), 1);
+    let untracked_hunk = &untracked.hunks[0];
+    assert_eq!(untracked_hunk.old_start, 0);
+    assert_eq!(untracked_hunk.old_count, 0);
+    assert_eq!(untracked_hunk.new_start, 1);
+    assert_eq!(untracked_hunk.new_count, 1);
+    assert_eq!(untracked_hunk.lines.len(), 1);
+    assert_eq!(untracked_hunk.lines[0].kind, ProjectGitDiffLineKind::Added);
+    assert_eq!(untracked_hunk.lines[0].text, "pub fn added() {}");
+    assert_eq!(untracked_hunk.lines[0].old_line_number, None);
+    assert_eq!(untracked_hunk.lines[0].new_line_number, Some(1));
+
+    let filtered_untracked = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/new.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "filtered untracked diff",
+    )
+    .await;
+
+    assert_eq!(filtered_untracked.scope, ProjectDiffScope::Unstaged);
+    assert_eq!(filtered_untracked.context_mode, DiffContextMode::Hunks);
+    assert_eq!(filtered_untracked.files.len(), 1);
+    let filtered_file = &filtered_untracked.files[0];
+    assert_eq!(filtered_file.relative_path, "src/new.rs");
+    assert_eq!(filtered_file.hunks.len(), 1);
+    let filtered_hunk = &filtered_file.hunks[0];
+    assert_eq!(filtered_hunk.old_start, 0);
+    assert_eq!(filtered_hunk.old_count, 0);
+    assert_eq!(filtered_hunk.new_start, 1);
+    assert_eq!(filtered_hunk.new_count, 1);
+    assert_eq!(filtered_hunk.lines.len(), 1);
+    assert_eq!(filtered_hunk.lines[0].kind, ProjectGitDiffLineKind::Added);
+    assert_eq!(filtered_hunk.lines[0].text, "pub fn added() {}");
+    assert_eq!(filtered_hunk.lines[0].old_line_number, None);
+    assert_eq!(filtered_hunk.lines[0].new_line_number, Some(1));
+}
+
+#[tokio::test]
+async fn project_read_diff_staged_scope_excludes_untracked() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("read-diff-staged", &[("src/main.rs", "fn main() {}\n")]);
+    write_file(&repo.path().join("src/new.rs"), "pub fn added() {}\n");
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Staged",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Staged,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+        },
+        "staged diff excludes untracked",
+    )
+    .await;
+
+    assert_eq!(diff.scope, ProjectDiffScope::Staged);
+    assert!(diff.files.is_empty());
+}
+
+#[tokio::test]
+async fn project_read_diff_hunks_mode_returns_typed_line_numbers() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "read-diff-hunks-mode",
+        &[(
+            "src/main.rs",
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n",
+        )],
+    );
+    write_file(
+        &repo.path().join("src/main.rs"),
+        "line1\nline2\nline2 inserted\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline11 inserted\nline12\n",
+    );
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Hunks Mode",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "hunks mode diff",
+    )
+    .await;
+
+    assert_eq!(diff.context_mode, DiffContextMode::Hunks);
+    assert_eq!(diff.files.len(), 1);
+    let file = &diff.files[0];
+    assert_eq!(file.hunks.len(), 2);
+
+    let first_hunk = &file.hunks[0];
+    assert_eq!(first_hunk.old_start, 1);
+    assert_eq!(first_hunk.old_count, 5);
+    assert_eq!(first_hunk.new_start, 1);
+    assert_eq!(first_hunk.new_count, 6);
+    assert_eq!(first_hunk.lines.len(), 6);
+    assert_eq!(first_hunk.lines[0].kind, ProjectGitDiffLineKind::Context);
+    assert_eq!(first_hunk.lines[0].text, "line1");
+    assert_eq!(first_hunk.lines[0].old_line_number, Some(1));
+    assert_eq!(first_hunk.lines[0].new_line_number, Some(1));
+    assert_eq!(first_hunk.lines[1].kind, ProjectGitDiffLineKind::Context);
+    assert_eq!(first_hunk.lines[1].text, "line2");
+    assert_eq!(first_hunk.lines[1].old_line_number, Some(2));
+    assert_eq!(first_hunk.lines[1].new_line_number, Some(2));
+    assert_eq!(first_hunk.lines[2].kind, ProjectGitDiffLineKind::Added);
+    assert_eq!(first_hunk.lines[2].text, "line2 inserted");
+    assert_eq!(first_hunk.lines[2].old_line_number, None);
+    assert_eq!(first_hunk.lines[2].new_line_number, Some(3));
+    assert_eq!(first_hunk.lines[5].text, "line5");
+    assert_eq!(first_hunk.lines[5].old_line_number, Some(5));
+    assert_eq!(first_hunk.lines[5].new_line_number, Some(6));
+
+    let second_hunk = &file.hunks[1];
+    assert_eq!(second_hunk.old_start, 9);
+    assert_eq!(second_hunk.old_count, 4);
+    assert_eq!(second_hunk.new_start, 10);
+    assert_eq!(second_hunk.new_count, 5);
+    assert_eq!(second_hunk.lines.len(), 5);
+    assert_eq!(second_hunk.lines[0].text, "line9");
+    assert_eq!(second_hunk.lines[0].old_line_number, Some(9));
+    assert_eq!(second_hunk.lines[0].new_line_number, Some(10));
+    assert_eq!(second_hunk.lines[3].kind, ProjectGitDiffLineKind::Added);
+    assert_eq!(second_hunk.lines[3].text, "line11 inserted");
+    assert_eq!(second_hunk.lines[3].old_line_number, None);
+    assert_eq!(second_hunk.lines[3].new_line_number, Some(13));
+    assert_eq!(second_hunk.lines[4].text, "line12");
+    assert_eq!(second_hunk.lines[4].old_line_number, Some(12));
+    assert_eq!(second_hunk.lines[4].new_line_number, Some(14));
+
+    for hunk in &file.hunks {
+        let old_numbers: Vec<u32> = hunk
+            .lines
+            .iter()
+            .filter_map(|line| line.old_line_number)
+            .collect();
+        let new_numbers: Vec<u32> = hunk
+            .lines
+            .iter()
+            .filter_map(|line| line.new_line_number)
+            .collect();
+        assert!(old_numbers.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(new_numbers.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}
+
+#[tokio::test]
+async fn project_read_diff_full_file_mode_returns_single_hunk_spanning_file() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "read-diff-full-file-mode",
+        &[(
+            "src/main.rs",
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n",
+        )],
+    );
+    let updated_contents = "line1\nline2\nline2 inserted\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline11 inserted\nline12\n";
+    write_file(&repo.path().join("src/main.rs"), updated_contents);
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Full File Mode",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::FullFile,
+        },
+        "full file mode diff",
+    )
+    .await;
+
+    assert_eq!(diff.context_mode, DiffContextMode::FullFile);
+    assert_eq!(diff.files.len(), 1);
+    let file = &diff.files[0];
+    assert_eq!(file.hunks.len(), 1);
+    let hunk = &file.hunks[0];
+    assert_eq!(hunk.old_start, 1);
+    assert_eq!(hunk.old_count, 12);
+    assert_eq!(hunk.new_start, 1);
+    assert_eq!(hunk.new_count, 14);
+    assert_eq!(hunk.lines.len(), 14);
+}
+
+#[tokio::test]
+async fn project_read_diff_payload_echoes_context_mode() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "read-diff-echo-mode",
+        &[(
+            "src/main.rs",
+            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n",
+        )],
+    );
+    write_file(
+        &repo.path().join("src/main.rs"),
+        "line1\nline2\nline2 inserted\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline11 inserted\nline12\n",
+    );
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Read Diff Echo Mode",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let hunks_diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "echo hunks mode diff",
+    )
+    .await;
+    assert_eq!(hunks_diff.context_mode, DiffContextMode::Hunks);
+    assert_eq!(hunks_diff.files.len(), 1);
+    assert_eq!(hunks_diff.files[0].relative_path, "src/main.rs");
+    assert_eq!(hunks_diff.files[0].hunks.len(), 2);
+    assert_eq!(hunks_diff.files[0].hunks[0].old_start, 1);
+    assert_eq!(hunks_diff.files[0].hunks[0].old_count, 5);
+    assert_eq!(hunks_diff.files[0].hunks[0].new_start, 1);
+    assert_eq!(hunks_diff.files[0].hunks[0].new_count, 6);
+    assert_eq!(hunks_diff.files[0].hunks[0].lines[2].text, "line2 inserted");
+    assert_eq!(
+        hunks_diff.files[0].hunks[0].lines[2].new_line_number,
+        Some(3)
+    );
+    assert_eq!(hunks_diff.files[0].hunks[1].old_start, 9);
+    assert_eq!(hunks_diff.files[0].hunks[1].old_count, 4);
+    assert_eq!(hunks_diff.files[0].hunks[1].new_start, 10);
+    assert_eq!(hunks_diff.files[0].hunks[1].new_count, 5);
+    assert_eq!(
+        hunks_diff.files[0].hunks[1].lines[3].text,
+        "line11 inserted"
+    );
+    assert_eq!(
+        hunks_diff.files[0].hunks[1].lines[3].new_line_number,
+        Some(13)
+    );
+
+    let full_file_diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::FullFile,
+        },
+        "echo full file mode diff",
+    )
+    .await;
+    assert_eq!(full_file_diff.context_mode, DiffContextMode::FullFile);
+    assert_eq!(full_file_diff.files.len(), 1);
+    assert_eq!(full_file_diff.files[0].relative_path, "src/main.rs");
+    assert_eq!(full_file_diff.files[0].hunks.len(), 1);
+    let full_file_hunk = &full_file_diff.files[0].hunks[0];
+    assert_eq!(full_file_hunk.old_start, 1);
+    assert_eq!(full_file_hunk.old_count, 12);
+    assert_eq!(full_file_hunk.new_start, 1);
+    assert_eq!(full_file_hunk.new_count, 14);
+    assert_eq!(full_file_hunk.lines.len(), 14);
+    assert_eq!(full_file_hunk.lines[0].text, "line1");
+    assert_eq!(full_file_hunk.lines[0].old_line_number, Some(1));
+    assert_eq!(full_file_hunk.lines[0].new_line_number, Some(1));
+    assert_eq!(full_file_hunk.lines[2].text, "line2 inserted");
+    assert_eq!(full_file_hunk.lines[2].old_line_number, None);
+    assert_eq!(full_file_hunk.lines[2].new_line_number, Some(3));
+    assert_eq!(full_file_hunk.lines[12].text, "line11 inserted");
+    assert_eq!(full_file_hunk.lines[12].old_line_number, None);
+    assert_eq!(full_file_hunk.lines[12].new_line_number, Some(13));
 }
 
 #[tokio::test]
@@ -831,12 +1272,33 @@ async fn project_stage_file_updates_git_status_and_diffs() {
     assert!(git_status.roots[0].files[0].staged.is_some());
     assert!(git_status.roots[0].files[0].unstaged.is_none());
 
-    let staged = expect_project_git_diff(&mut fixture.client, "staged diff after stage file").await;
+    let staged = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Staged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "staged diff after stage file",
+    )
+    .await;
     assert_eq!(staged.scope, ProjectDiffScope::Staged);
     assert_eq!(staged.files.len(), 1);
 
-    let unstaged =
-        expect_project_git_diff(&mut fixture.client, "unstaged diff after stage file").await;
+    let unstaged = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "unstaged diff after stage file",
+    )
+    .await;
     assert_eq!(unstaged.scope, ProjectDiffScope::Unstaged);
     assert!(unstaged.files.is_empty());
 }
@@ -863,22 +1325,34 @@ async fn project_stage_hunk_stages_only_one_hunk() {
     )
     .await;
 
-    fixture
-        .client
-        .project_read_diff(
-            &project.id,
-            ProjectReadDiffPayload {
-                root: protocol::ProjectRootPath(project.roots[0].clone()),
-                scope: ProjectDiffScope::Unstaged,
-                path: Some("src/main.rs".to_owned()),
-            },
-        )
-        .await
-        .expect("initial project_read_diff failed");
-    let diff = expect_project_git_diff(&mut fixture.client, "initial hunk diff").await;
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "initial hunk diff",
+    )
+    .await;
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].hunks.len(), 2);
     let first_hunk = diff.files[0].hunks[0].hunk_id.clone();
+    let staged_before = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            scope: ProjectDiffScope::Staged,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+        },
+        "initial staged diff before stage hunk",
+    )
+    .await;
+    assert!(staged_before.files.is_empty());
 
     fixture
         .client

@@ -12,8 +12,8 @@ use protocol::{
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
     HostBrowseStartPayload, HostSettingsPayload, McpServerDeletePayload, McpServerNotifyPayload,
     McpServerUpsertPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectFileListPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectDeletePayload, ProjectDiffScope, ProjectFileListPayload, ProjectGitStatusPayload,
+    ProjectId, ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, RunBackendSetupPayload,
     SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
@@ -44,9 +44,9 @@ use crate::browse_stream;
 use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
 use crate::project_stream::{
-    ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing, build_file_list,
-    build_git_status, read_diff, read_file, scan_raw_entries, spawn_project_subscription,
-    stage_file, stage_hunk, sync_snapshot_state,
+    ProjectDiffRequestKey, ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing,
+    build_file_list, build_git_status, read_diff, read_file, scan_raw_entries,
+    spawn_project_subscription, stage_file, stage_hunk, sync_snapshot_state,
 };
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
@@ -2034,6 +2034,70 @@ impl HostHandle {
         Ok(())
     }
 
+    async fn project_subscription_state(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+    ) -> Option<Arc<Mutex<ProjectSnapshotState>>> {
+        let state = self.state.lock().await;
+        state
+            .project_streams
+            .get(&(
+                connection_host_stream.clone(),
+                project_output_stream.path().clone(),
+            ))
+            .map(|subscription| Arc::clone(&subscription.state))
+    }
+
+    async fn remember_project_diff_context_mode(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        root: &ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<&str>,
+        context_mode: protocol::DiffContextMode,
+    ) {
+        let Some(subscription_state) = self
+            .project_subscription_state(connection_host_stream, project_output_stream)
+            .await
+        else {
+            return;
+        };
+
+        let mut snapshot = subscription_state.lock().await;
+        snapshot.diff_context_modes.insert(
+            ProjectDiffRequestKey {
+                root: root.clone(),
+                scope,
+                path: path.map(ToOwned::to_owned),
+            },
+            context_mode,
+        );
+    }
+
+    async fn remembered_project_diff_context_mode(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        root: &ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<&str>,
+    ) -> Option<protocol::DiffContextMode> {
+        let subscription_state = self
+            .project_subscription_state(connection_host_stream, project_output_stream)
+            .await?;
+        let snapshot = subscription_state.lock().await;
+        snapshot
+            .diff_context_modes
+            .get(&ProjectDiffRequestKey {
+                root: root.clone(),
+                scope,
+                path: path.map(ToOwned::to_owned),
+            })
+            .copied()
+    }
+
     pub(crate) async fn read_project_file(
         &self,
         project_output_stream: &Stream,
@@ -2090,6 +2154,7 @@ impl HostHandle {
 
     pub(crate) async fn read_project_diff(
         &self,
+        connection_host_stream: &StreamPath,
         project_output_stream: &Stream,
         project_id: ProjectId,
         payload: ProjectReadDiffPayload,
@@ -2102,6 +2167,15 @@ impl HostHandle {
         let project = load_project(&project_store, &project_id, OPERATION).await?;
         let diff = read_diff(&project, payload)
             .map_err(|error| project_command_error(OPERATION, error))?;
+        self.remember_project_diff_context_mode(
+            connection_host_stream,
+            project_output_stream,
+            &diff.root,
+            diff.scope,
+            diff.path.as_deref(),
+            diff.context_mode,
+        )
+        .await;
         let payload = serde_json::to_value(&diff).map_err(|error| {
             AppError::internal_message(
                 OPERATION,
@@ -2255,6 +2329,12 @@ fn project_command_error(operation: &'static str, error: String) -> AppError {
     } else if error.starts_with("Failed to run git")
         || error.starts_with("git ")
         || error.starts_with("git output was not valid UTF-8")
+        || error.starts_with("Failed to read untracked file")
+        || error.starts_with("invalid diff header")
+        || error.starts_with("invalid hunk")
+        || error.starts_with("missing old range in hunk header")
+        || error.starts_with("missing new range in hunk header")
+        || error.contains("appeared before file in git diff")
     {
         AppError::internal_message(operation, error.clone(), anyhow!(error))
     } else {
@@ -3225,21 +3305,55 @@ impl HostHandle {
         .await?;
 
         if let Some(path) = path {
-            let staged_diff = ProjectReadDiffPayload {
-                root: path.root.clone(),
-                scope: protocol::ProjectDiffScope::Staged,
-                path: Some(path.relative_path.clone()),
-            };
-            self.read_project_diff(&project_output_stream, project_id.clone(), staged_diff)
+            let staged_context_mode = self
+                .remembered_project_diff_context_mode(
+                    connection_host_stream,
+                    &project_output_stream,
+                    &path.root,
+                    ProjectDiffScope::Staged,
+                    Some(path.relative_path.as_str()),
+                )
+                .await;
+            if let Some(context_mode) = staged_context_mode {
+                let staged_diff = ProjectReadDiffPayload {
+                    root: path.root.clone(),
+                    scope: ProjectDiffScope::Staged,
+                    path: Some(path.relative_path.clone()),
+                    context_mode,
+                };
+                self.read_project_diff(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id.clone(),
+                    staged_diff,
+                )
                 .await?;
+            }
 
-            let unstaged_diff = ProjectReadDiffPayload {
-                root: path.root.clone(),
-                scope: protocol::ProjectDiffScope::Unstaged,
-                path: Some(path.relative_path),
-            };
-            self.read_project_diff(&project_output_stream, project_id, unstaged_diff)
+            let unstaged_context_mode = self
+                .remembered_project_diff_context_mode(
+                    connection_host_stream,
+                    &project_output_stream,
+                    &path.root,
+                    ProjectDiffScope::Unstaged,
+                    Some(path.relative_path.as_str()),
+                )
+                .await;
+            if let Some(context_mode) = unstaged_context_mode {
+                let unstaged_diff = ProjectReadDiffPayload {
+                    root: path.root.clone(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: Some(path.relative_path),
+                    context_mode,
+                };
+                self.read_project_diff(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    unstaged_diff,
+                )
                 .await?;
+            }
         }
 
         Ok(())

@@ -4017,6 +4017,55 @@ kbd {
     padding-right: var(--space-2);
 }
 
+.diff-toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-2) var(--space-4);
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border-primary);
+    flex-shrink: 0;
+}
+
+.diff-toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.diff-toolbar-label {
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.diff-row-sbs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.diff-row-sbs:last-child {
+    border-bottom: none;
+}
+
+.diff-col-sbs {
+    min-width: 0;
+    overflow: hidden;
+    border-right: 1px solid var(--border-primary);
+}
+
+.diff-col-sbs:last-child {
+    border-right: none;
+}
+
+.diff-line-empty {
+    min-height: 20px;
+    background: var(--surface-0);
+    opacity: 0.5;
+}
+
 /* ===== Transient Notices (kept for backward compat but now rendered as cards) ===== */
 
 /* ===== Command Palette ===== */
@@ -5356,4 +5405,51 @@ kbd {
 .settings-feedback-link:hover {
     color: var(--text-primary);
     background: var(--surface-hover);
+}
+
+/* ===== Tab Context Menu ===== */
+.context-menu {
+    position: fixed;
+    z-index: 1001;
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    padding: 3px;
+    min-width: 180px;
+    display: flex;
+    flex-direction: column;
+    animation: menu-in 0.1s ease-out;
+}
+
+.context-menu-item {
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    font-size: 0.8rem;
+    font-weight: 400;
+    line-height: 1;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.08s;
+}
+
+.context-menu-item:hover {
+    background: var(--surface-hover);
+    color: var(--text-bright);
+}
+
+.tab-rename-input {
+    font-size: 0.923rem;
+    font-family: inherit;
+    color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--accent-primary);
+    border-radius: 3px;
+    padding: 1px 4px;
+    max-width: 130px;
+    outline: none;
 }
