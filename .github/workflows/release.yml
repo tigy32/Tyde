@@ -34,7 +34,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes ''
+            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA"
           else
             gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA"
           fi
