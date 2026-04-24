@@ -4,7 +4,8 @@
 //! *configured hosts* — the user's list of local/remote endpoints and the
 //! transport used to reach each one. They are persisted by the shell to
 //! `~/.tyde/configured_hosts.json` and also serialized across the
-//! `tauri::invoke` boundary to the WASM frontend.
+//! `tauri::invoke` boundary to the WASM frontend. The only protocol type reused
+//! here is `Version`, so semver values stay strongly typed everywhere.
 //!
 //! Per `dev-docs/01-philosophy.md` there must be one source of truth for any
 //! wire-crossing type. These types intentionally live in their own tiny crate
@@ -13,13 +14,41 @@
 //!
 //! NOTE: This is *not* the Tyde wire protocol (see `dev-docs/02-protocol.md`).
 //! These types are shell-owned transport/UI config per
-//! `dev-docs/12-remote-hosts.md`; the protocol crate is reserved for NDJSON
-//! envelope framing over a connected host.
+//! `dev-docs/12-remote-hosts.md`; they are not NDJSON frame payloads for a
+//! connected host.
 
+use protocol::Version;
 use serde::{Deserialize, Serialize};
 
 /// Identifier for the always-present local embedded host.
 pub const LOCAL_HOST_ID: &str = "local";
+
+/// Which Tyde release the shell should install for a managed remote host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TydeReleaseTarget {
+    /// Resolve the current latest GitHub release at lifecycle time.
+    #[default]
+    Latest,
+    /// Install and launch one exact release version.
+    Version { version: Version },
+}
+
+/// Who owns the remote Tyde daemon lifecycle for an SSH host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteHostLifecycleConfig {
+    /// The user-provided remote command is responsible for reaching a Tyde host.
+    #[default]
+    Manual,
+    /// The desktop shell may install versioned Tyde binaries under
+    /// `~/.tyde/bin/<version>/tyde`, maintain `~/.tyde/bin/current`, and launch
+    /// the remote `tyde host --uds` daemon when needed.
+    ManagedTyde {
+        #[serde(default)]
+        release: TydeReleaseTarget,
+    },
+}
 
 /// How the shell should reach a configured host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +64,8 @@ pub enum HostTransportConfig {
         ssh_destination: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote_command: Option<String>,
+        #[serde(default)]
+        lifecycle: RemoteHostLifecycleConfig,
     },
 }
 
@@ -117,4 +148,90 @@ pub struct HostDisconnectedEvent {
 pub struct HostErrorEvent {
     pub host_id: String,
     pub message: String,
+}
+
+/// The remote operating system/architecture pair probed over SSH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePlatform {
+    pub os: RemoteOperatingSystem,
+    pub arch: RemoteArchitecture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOperatingSystem {
+    Linux,
+    Macos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteArchitecture {
+    X86_64,
+    Aarch64,
+}
+
+/// Running-state information for the managed remote daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteTydeRunningState {
+    NotRunning,
+    /// Running daemon launched by Tyde's managed lifecycle path.
+    Managed {
+        version: Version,
+    },
+    /// A socket exists, but the shell cannot prove it owns the daemon.
+    UnknownSocket,
+}
+
+/// Point-in-time status of a managed remote Tyde installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteHostLifecycleSnapshot {
+    pub target_version: Version,
+    pub installed_target: bool,
+    pub current_link_version: Option<Version>,
+    pub running: RemoteTydeRunningState,
+    pub platform: RemotePlatform,
+}
+
+/// Concrete lifecycle step surfaced to the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteHostLifecycleStep {
+    ProbePlatform,
+    ResolveRelease,
+    ProbeInstallation,
+    DownloadAsset,
+    InstallBinary,
+    StopOldServer,
+    LaunchServer,
+    VerifyRunning,
+    Connect,
+}
+
+/// UI-visible lifecycle status for a configured host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteHostLifecycleStatus {
+    Idle,
+    Running {
+        step: RemoteHostLifecycleStep,
+        target_version: Option<Version>,
+    },
+    Snapshot {
+        snapshot: RemoteHostLifecycleSnapshot,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Tauri event payload: managed remote lifecycle state changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLifecycleEvent {
+    pub host_id: String,
+    pub status: RemoteHostLifecycleStatus,
 }

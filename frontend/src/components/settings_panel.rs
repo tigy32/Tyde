@@ -506,6 +506,22 @@ fn HostsTab() -> impl IntoView {
                 error_sig.set(Some("Label and SSH destination are required.".to_string()));
                 return;
             }
+            let remote_command = if remote_command.is_empty() {
+                None
+            } else {
+                Some(remote_command)
+            };
+            let lifecycle = if remote_command.is_none() {
+                bridge::RemoteHostLifecycleConfig::ManagedTyde {
+                    release: bridge::TydeReleaseTarget::Latest,
+                }
+            } else {
+                bridge::RemoteHostLifecycleConfig::Manual
+            };
+            let should_prepare_managed = matches!(
+                &lifecycle,
+                bridge::RemoteHostLifecycleConfig::ManagedTyde { .. }
+            );
 
             let state = state.clone();
             spawn_local(async move {
@@ -514,11 +530,8 @@ fn HostsTab() -> impl IntoView {
                     label,
                     transport: BridgeHostTransportConfig::SshStdio {
                         ssh_destination,
-                        remote_command: if remote_command.is_empty() {
-                            None
-                        } else {
-                            Some(remote_command)
-                        },
+                        remote_command,
+                        lifecycle,
                     },
                     auto_connect,
                 })
@@ -548,7 +561,36 @@ fn HostsTab() -> impl IntoView {
                         };
                         refresh_configured_hosts(&state).await;
                         if let Some(host_id) = new_host_id {
-                            connect_one_host(state.clone(), host_id).await;
+                            if should_prepare_managed {
+                                match bridge::ensure_configured_host_ready(host_id.clone()).await {
+                                    Ok(snapshot) => {
+                                        state.host_lifecycle_statuses.update(|statuses| {
+                                            statuses.insert(
+                                                host_id.clone(),
+                                                bridge::RemoteHostLifecycleStatus::Snapshot {
+                                                    snapshot,
+                                                },
+                                            );
+                                        });
+                                        connect_one_host(state.clone(), host_id).await;
+                                    }
+                                    Err(error) => {
+                                        error_sig.set(Some(format!(
+                                            "Failed to prepare remote host: {error}"
+                                        )));
+                                        state.host_lifecycle_statuses.update(|statuses| {
+                                            statuses.insert(
+                                                host_id,
+                                                bridge::RemoteHostLifecycleStatus::Error {
+                                                    message: error,
+                                                },
+                                            );
+                                        });
+                                    }
+                                }
+                            } else {
+                                connect_one_host(state.clone(), host_id).await;
+                            }
                         }
                     }
                     Err(e) => error_sig.set(Some(format!("Failed to add host: {e}"))),
@@ -588,11 +630,12 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Configured Hosts"</label>
-            <p class="settings-description">"The embedded local host is always present and connected automatically."</p>
+            <p class="settings-description">"The embedded local host is always present. Managed SSH hosts install Tyde under ~/.tyde/bin/<version>/tyde and launch ~/.tyde/bin/current/tyde when needed."</p>
             <div class="settings-host-list">
                 {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
                     let host_id = host.id.clone();
                     let is_local = matches!(host.transport, BridgeHostTransportConfig::LocalEmbedded);
+                    let is_managed_remote = is_managed_remote_host(&host.transport);
                     let host_id_for_connect = host_id.clone();
                     let host_id_for_disconnect = host_id.clone();
                     let host_id_for_remove = host_id.clone();
@@ -610,6 +653,12 @@ fn HostsTab() -> impl IntoView {
                     };
                     let is_connected = matches!(status, crate::state::ConnectionStatus::Connected);
                     let is_connecting = matches!(status, crate::state::ConnectionStatus::Connecting);
+                    let lifecycle_status = state_for_configured_hosts
+                        .host_lifecycle_statuses
+                        .get()
+                        .get(&host_id)
+                        .cloned()
+                        .unwrap_or(bridge::RemoteHostLifecycleStatus::Idle);
                     let connect_state = state.clone();
                     let disconnect_state = state.clone();
                     let remove_state = state.clone();
@@ -638,6 +687,12 @@ fn HostsTab() -> impl IntoView {
                                     <span class=format!("status-dot {status_class}")></span>
                                     <span class="status-text">{status_text}</span>
                                 </div>
+                                {is_managed_remote.then(|| {
+                                    let lifecycle_text = lifecycle_status_text(&lifecycle_status);
+                                    view! {
+                                        <p class="host-card-transport">{format!("Tyde server: {lifecycle_text}")}</p>
+                                    }
+                                })}
                             </div>
                             <div class="host-card-actions">
                                 {(!is_local).then(|| {
@@ -664,6 +719,44 @@ fn HostsTab() -> impl IntoView {
                                                 }
                                             >
                                                 "Disconnect"
+                                            </button>
+                                        }.into_any()
+                                    } else if is_managed_remote {
+                                        let lifecycle_status = lifecycle_status.clone();
+                                        let label = managed_lifecycle_button_label(&lifecycle_status);
+                                        let disabled = is_connecting || managed_lifecycle_button_disabled(&lifecycle_status);
+                                        view! {
+                                            <button
+                                                class="settings-btn settings-btn-primary"
+                                                disabled=disabled
+                                                on:click=move |_| {
+                                                    let state = connect_state.clone();
+                                                    let host_id = host_id_for_connect.clone();
+                                                    spawn_local(async move {
+                                                        match bridge::ensure_configured_host_ready(host_id.clone()).await {
+                                                            Ok(snapshot) => {
+                                                                state.host_lifecycle_statuses.update(|statuses| {
+                                                                    statuses.insert(
+                                                                        host_id.clone(),
+                                                                        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot },
+                                                                    );
+                                                                });
+                                                                connect_one_host(state, host_id).await;
+                                                            }
+                                                            Err(error) => {
+                                                                error_sig.set(Some(format!("Failed to prepare remote host: {error}")));
+                                                                state.host_lifecycle_statuses.update(|statuses| {
+                                                                    statuses.insert(
+                                                                        host_id,
+                                                                        bridge::RemoteHostLifecycleStatus::Error { message: error },
+                                                                    );
+                                                                });
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            >
+                                                {label}
                                             </button>
                                         }.into_any()
                                     } else {
@@ -713,7 +806,7 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Add Remote Host"</label>
-            <p class="settings-description">"Configure a remote host that Tyde can connect to over SSH. The default remote command is `tyde host --bridge-uds`, which expects a running remote `tyde host --uds` daemon."</p>
+            <p class="settings-description">"Configure a remote host over SSH. Leave Remote command blank for managed install/launch from GitHub releases. Set Remote command only for a manual bridge command."</p>
             <div class="settings-form">
                 <div class="settings-form-row">
                     <label class="settings-form-label">
@@ -783,6 +876,100 @@ fn HostsTab() -> impl IntoView {
             </div>
         </div>
     }
+}
+
+fn is_managed_remote_host(transport: &BridgeHostTransportConfig) -> bool {
+    matches!(
+        transport,
+        BridgeHostTransportConfig::SshStdio {
+            lifecycle: bridge::RemoteHostLifecycleConfig::ManagedTyde { .. },
+            ..
+        }
+    )
+}
+
+fn lifecycle_status_text(status: &bridge::RemoteHostLifecycleStatus) -> String {
+    match status {
+        bridge::RemoteHostLifecycleStatus::Idle => "not checked".to_string(),
+        bridge::RemoteHostLifecycleStatus::Running {
+            step,
+            target_version,
+        } => match target_version {
+            Some(version) => format!("{} v{}", lifecycle_step_label(*step), version),
+            None => lifecycle_step_label(*step).to_string(),
+        },
+        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => {
+            let target = snapshot.target_version;
+            match &snapshot.running {
+                bridge::RemoteTydeRunningState::Managed { version } if *version == target => {
+                    format!("v{version} running")
+                }
+                bridge::RemoteTydeRunningState::Managed { version } => {
+                    format!("v{version} running; v{target} available")
+                }
+                bridge::RemoteTydeRunningState::UnknownSocket => {
+                    "running, unmanaged socket".to_string()
+                }
+                bridge::RemoteTydeRunningState::NotRunning if snapshot.installed_target => {
+                    format!("v{target} installed, not running")
+                }
+                bridge::RemoteTydeRunningState::NotRunning => {
+                    format!("v{target} not installed")
+                }
+            }
+        }
+        bridge::RemoteHostLifecycleStatus::Error { message } => format!("error: {message}"),
+    }
+}
+
+fn lifecycle_step_label(step: bridge::RemoteHostLifecycleStep) -> &'static str {
+    match step {
+        bridge::RemoteHostLifecycleStep::ProbePlatform => "Checking platform",
+        bridge::RemoteHostLifecycleStep::ResolveRelease => "Resolving release",
+        bridge::RemoteHostLifecycleStep::ProbeInstallation => "Checking install",
+        bridge::RemoteHostLifecycleStep::DownloadAsset => "Downloading",
+        bridge::RemoteHostLifecycleStep::InstallBinary => "Installing",
+        bridge::RemoteHostLifecycleStep::StopOldServer => "Stopping old server",
+        bridge::RemoteHostLifecycleStep::LaunchServer => "Launching",
+        bridge::RemoteHostLifecycleStep::VerifyRunning => "Verifying",
+        bridge::RemoteHostLifecycleStep::Connect => "Ready",
+    }
+}
+
+fn managed_lifecycle_button_label(status: &bridge::RemoteHostLifecycleStatus) -> String {
+    match status {
+        bridge::RemoteHostLifecycleStatus::Running { step, .. } => {
+            lifecycle_step_label(*step).to_string()
+        }
+        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => match &snapshot.running {
+            bridge::RemoteTydeRunningState::Managed { version }
+                if *version == snapshot.target_version =>
+            {
+                "Connect".to_string()
+            }
+            bridge::RemoteTydeRunningState::Managed { .. } => "Upgrade & Relaunch".to_string(),
+            bridge::RemoteTydeRunningState::UnknownSocket => "Unmanaged Server".to_string(),
+            bridge::RemoteTydeRunningState::NotRunning if snapshot.installed_target => {
+                "Launch".to_string()
+            }
+            bridge::RemoteTydeRunningState::NotRunning => "Install & Launch".to_string(),
+        },
+        bridge::RemoteHostLifecycleStatus::Error { .. }
+        | bridge::RemoteHostLifecycleStatus::Idle => "Install & Launch".to_string(),
+    }
+}
+
+fn managed_lifecycle_button_disabled(status: &bridge::RemoteHostLifecycleStatus) -> bool {
+    matches!(
+        status,
+        bridge::RemoteHostLifecycleStatus::Running { .. }
+            | bridge::RemoteHostLifecycleStatus::Snapshot {
+                snapshot: bridge::RemoteHostLifecycleSnapshot {
+                    running: bridge::RemoteTydeRunningState::UnknownSocket,
+                    ..
+                }
+            }
+    )
 }
 
 #[component]

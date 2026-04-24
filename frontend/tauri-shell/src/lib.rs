@@ -6,11 +6,13 @@ mod host_stdio;
 mod host_store;
 mod host_uds;
 mod logging;
+mod remote_bootstrap;
 mod router;
 
 use std::sync::Arc;
 
 use devtools_protocol::UiDebugResponseSubmission;
+use host_config::RemoteHostLifecycleSnapshot;
 use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
 use tauri::Manager;
@@ -188,6 +190,32 @@ async fn send_host_line(
 }
 
 #[tauri::command]
+async fn probe_configured_host_lifecycle(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ShellState>,
+    host_id: String,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let configured_host = state
+        .host_store
+        .get(&host_id)?
+        .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
+    remote_bootstrap::probe_configured_host_lifecycle(app, configured_host).await
+}
+
+#[tauri::command]
+async fn ensure_configured_host_ready(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ShellState>,
+    host_id: String,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let configured_host = state
+        .host_store
+        .get(&host_id)?
+        .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
+    remote_bootstrap::ensure_configured_host_ready(app, configured_host).await
+}
+
+#[tauri::command]
 fn list_configured_hosts(
     state: tauri::State<'_, ShellState>,
 ) -> Result<ConfiguredHostStore, String> {
@@ -307,6 +335,8 @@ pub fn run() {
             connect_host,
             disconnect_host,
             send_host_line,
+            probe_configured_host_lifecycle,
+            ensure_configured_host_ready,
             list_configured_hosts,
             upsert_configured_host,
             remove_configured_host,
@@ -325,6 +355,14 @@ pub fn run_host_stdio() -> Result<(), String> {
 
 pub fn run_host_uds() -> Result<(), String> {
     host_uds::run()
+}
+
+pub fn run_host_status_uds() -> Result<(), String> {
+    host_uds::status()
+}
+
+pub fn run_host_launch_uds() -> Result<(), String> {
+    host_uds::launch()
 }
 
 pub fn run_host_bridge_uds() -> Result<(), String> {

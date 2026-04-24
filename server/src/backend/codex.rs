@@ -342,23 +342,7 @@ pub async fn discover_models() {
         .cloned()
         .unwrap_or_default();
 
-    let models = raw_models
-        .into_iter()
-        .filter_map(|model| {
-            let id = model
-                .get("model")
-                .or_else(|| model.get("id"))
-                .and_then(Value::as_str)?;
-            let label = model
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or(id);
-            Some(protocol::SelectOption {
-                value: id.to_string(),
-                label: label.to_string(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let models = codex_model_options_from_raw(&raw_models);
 
     if models.is_empty() {
         tracing::warn!("Codex model discovery: model/list returned no models");
@@ -366,6 +350,93 @@ pub async fn discover_models() {
     }
 
     let _ = DISCOVERED_MODELS.set(models);
+}
+
+fn codex_model_options_from_raw(raw_models: &[Value]) -> Vec<protocol::SelectOption> {
+    let mut models = raw_models
+        .iter()
+        .filter_map(codex_model_option_from_raw)
+        .collect::<Vec<_>>();
+
+    models.sort_by(|a, b| compare_codex_model_ids_for_display(&a.value, &b.value));
+    models.dedup_by(|a, b| a.value.eq_ignore_ascii_case(&b.value));
+    models
+}
+
+fn codex_model_option_from_raw(model: &Value) -> Option<protocol::SelectOption> {
+    let id = model
+        .get("model")
+        .or_else(|| model.get("id"))
+        .and_then(Value::as_str)?
+        .trim();
+    if id.is_empty() {
+        return None;
+    }
+
+    Some(protocol::SelectOption {
+        value: id.to_string(),
+        // Codex's displayName casing is not currently normalized across entries
+        // (for example, `gpt-...` and `GPT-...` can appear in one response).
+        // The model id is the canonical value we send back to Codex, so use it as
+        // the label too and normalize only display casing.
+        label: codex_model_label_from_id(id),
+    })
+}
+
+fn codex_model_label_from_id(id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
+fn compare_codex_model_ids_for_display(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_numbers = numeric_components(a);
+    let b_numbers = numeric_components(b);
+
+    for (a_number, b_number) in a_numbers.iter().zip(b_numbers.iter()) {
+        match b_number.cmp(a_number) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+
+    match a_numbers.len().cmp(&b_numbers.len()) {
+        // More numeric components are treated as a more specific/newer version:
+        // e.g. `gpt-5.1` sorts before `gpt-5`.
+        std::cmp::Ordering::Greater => return std::cmp::Ordering::Less,
+        std::cmp::Ordering::Less => return std::cmp::Ordering::Greater,
+        std::cmp::Ordering::Equal => {}
+    }
+
+    let a_normalized = a.to_ascii_lowercase();
+    let b_normalized = b.to_ascii_lowercase();
+    match a_normalized.cmp(&b_normalized) {
+        std::cmp::Ordering::Equal => a.cmp(b),
+        ordering => ordering,
+    }
+}
+
+fn numeric_components(value: &str) -> Vec<u64> {
+    let mut components = Vec::new();
+    let mut current: Option<u64> = None;
+
+    for byte in value.bytes() {
+        if byte.is_ascii_digit() {
+            let digit = u64::from(byte - b'0');
+            current = Some(
+                current
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit),
+            );
+        } else if let Some(number) = current.take() {
+            components.push(number);
+        }
+    }
+
+    if let Some(number) = current {
+        components.push(number);
+    }
+
+    components
 }
 
 #[derive(Clone)]
@@ -5678,6 +5749,94 @@ mod tests {
 
     fn live_test_log(msg: &str) {
         eprintln!("[live-codex-test] {msg}");
+    }
+
+    #[test]
+    fn codex_model_options_use_canonical_labels_and_version_sort() {
+        let raw_models = vec![
+            json!({
+                "id": "gpt-5.4",
+                "model": "gpt-5.4",
+                "displayName": "gpt-5.4",
+            }),
+            json!({
+                "id": "gpt-5.5",
+                "model": "gpt-5.5",
+                "displayName": "GPT-5.5",
+            }),
+            json!({
+                "id": "gpt-5.4-mini",
+                "model": "gpt-5.4-mini",
+                "displayName": "GPT-5.4-Mini",
+            }),
+            json!({
+                "id": "gpt-5.3-codex",
+                "model": "gpt-5.3-codex",
+                "displayName": "gpt-5.3-codex",
+            }),
+            json!({
+                "id": "gpt-5.3-codex-spark",
+                "model": "gpt-5.3-codex-spark",
+                "displayName": "GPT-5.3-Codex-Spark",
+            }),
+            json!({
+                "id": "gpt-5.2",
+                "model": "gpt-5.2",
+                "displayName": "gpt-5.2",
+            }),
+        ];
+
+        let options = codex_model_options_from_raw(&raw_models);
+
+        assert_eq!(
+            options,
+            vec![
+                protocol::SelectOption {
+                    value: "gpt-5.5".to_string(),
+                    label: "gpt-5.5".to_string(),
+                },
+                protocol::SelectOption {
+                    value: "gpt-5.4".to_string(),
+                    label: "gpt-5.4".to_string(),
+                },
+                protocol::SelectOption {
+                    value: "gpt-5.4-mini".to_string(),
+                    label: "gpt-5.4-mini".to_string(),
+                },
+                protocol::SelectOption {
+                    value: "gpt-5.3-codex".to_string(),
+                    label: "gpt-5.3-codex".to_string(),
+                },
+                protocol::SelectOption {
+                    value: "gpt-5.3-codex-spark".to_string(),
+                    label: "gpt-5.3-codex-spark".to_string(),
+                },
+                protocol::SelectOption {
+                    value: "gpt-5.2".to_string(),
+                    label: "gpt-5.2".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_model_version_sort_handles_multi_digit_components() {
+        let raw_models = vec![
+            json!({ "model": "gpt-5.9" }),
+            json!({ "model": "gpt-5.10" }),
+            json!({ "model": "gpt-5.10-mini" }),
+            json!({ "model": "gpt-5" }),
+        ];
+
+        let values = codex_model_options_from_raw(&raw_models)
+            .into_iter()
+            .map(|option| option.value)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec!["gpt-5.10", "gpt-5.10-mini", "gpt-5.9", "gpt-5"]
+        );
     }
 
     fn summarize_live_event(event: &Value) -> String {

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 pub use host_config::{
     ConfiguredHost, ConfiguredHostStore, HostTransportConfig, LOCAL_HOST_ID,
-    UpsertConfiguredHostRequest,
+    RemoteHostLifecycleConfig, UpsertConfiguredHostRequest,
 };
 
 const HOST_STORE_PATH_ENV: &str = "TYDE_CONFIGURED_HOST_STORE_PATH";
@@ -256,6 +256,7 @@ fn validate_transport(transport: &HostTransportConfig) -> Result<(), String> {
         HostTransportConfig::SshStdio {
             ssh_destination,
             remote_command,
+            lifecycle,
         } => {
             if ssh_destination.trim().is_empty() {
                 return Err("ssh_destination must not be empty".to_string());
@@ -265,6 +266,14 @@ fn validate_transport(transport: &HostTransportConfig) -> Result<(), String> {
                 .is_some_and(|command| command.trim().is_empty())
             {
                 return Err("remote_command must not be blank when provided".to_string());
+            }
+            if matches!(lifecycle, RemoteHostLifecycleConfig::ManagedTyde { .. })
+                && remote_command.is_some()
+            {
+                return Err(
+                    "managed Tyde remote hosts must use the shell-derived bridge command"
+                        .to_string(),
+                );
             }
             Ok(())
         }

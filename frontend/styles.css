@@ -4066,6 +4066,165 @@ kbd {
     opacity: 0.5;
 }
 
+/* ===== Find Bar ===== */
+.find-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border-primary);
+    flex-shrink: 0;
+}
+
+.find-input {
+    width: 180px;
+    max-width: 28vw;
+    height: 24px;
+    padding: 0 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-size: 0.846rem;
+    font-family: var(--font-mono);
+    outline: none;
+}
+
+.find-input:focus {
+    border-color: var(--accent-primary);
+}
+
+.find-toggle-btn {
+    min-width: 24px;
+    height: 24px;
+    padding: 0 6px;
+    background: var(--surface-0);
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.769rem;
+    line-height: 1;
+}
+
+.find-toggle-btn:hover {
+    background: var(--surface-2);
+    color: var(--text-primary);
+}
+
+.find-toggle-btn.active {
+    background: color-mix(in srgb, var(--accent-primary) 18%, var(--surface-0));
+    border-color: color-mix(in srgb, var(--accent-primary) 55%, var(--border-primary));
+    color: var(--text-primary);
+}
+
+.find-count {
+    min-width: 34px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 0.769rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.find-count-error {
+    color: var(--error);
+}
+
+.find-nav-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-0);
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.923rem;
+    line-height: 1;
+}
+
+.find-nav-btn:hover {
+    background: var(--surface-2);
+    color: var(--text-primary);
+}
+
+.find-nav-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.find-close-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-0);
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.923rem;
+    line-height: 1;
+}
+
+.find-close-btn:hover {
+    background: var(--surface-2);
+    color: var(--text-primary);
+}
+
+/* Search hit: line-level highlight for matching lines */
+.find-hit {
+    background: rgba(56, 139, 253, 0.08) !important;
+}
+
+/* Active match: highlighted more strongly with an outline */
+.find-hit-active {
+    background: rgba(56, 139, 253, 0.2) !important;
+    outline: 1px solid rgba(56, 139, 253, 0.45);
+    outline-offset: -1px;
+}
+
+/* Inline match spans within matched text */
+.find-inline-match {
+    background: rgba(56, 139, 253, 0.28);
+    border-radius: 2px;
+}
+
+/* ===== File View Lines ===== */
+.file-line {
+    display: flex;
+    line-height: 20px;
+    min-height: 20px;
+}
+
+.file-line-num {
+    width: 48px;
+    min-width: 48px;
+    text-align: right;
+    padding-right: var(--space-2);
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+    user-select: none;
+    border-right: 1px solid var(--border-primary);
+    flex-shrink: 0;
+}
+
+.file-line code {
+    flex: 1;
+    min-width: 0;
+    padding-left: var(--space-2);
+    white-space: pre;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+}
+
 /* ===== Transient Notices (kept for backward compat but now rendered as cards) ===== */
 
 /* ===== Command Palette ===== */

@@ -19,7 +19,7 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 const DEBUG_REPO_ROOT_ENV: &str = "TYDE_DEBUG_REPO_ROOT";
-const START_TIMEOUT: Duration = Duration::from_secs(120);
+const START_TIMEOUT: Duration = Duration::from_secs(105);
 
 #[derive(Clone, Debug)]
 pub struct DebugServerConfig {
@@ -197,16 +197,19 @@ impl ToolCallResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartInstanceToolInput {
     project_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StopInstanceToolInput {
     instance_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvaluateToolInput {
     instance_id: String,
     expression: String,
@@ -366,7 +369,7 @@ async fn start_instance(
         started_at_ms: now_ms(),
     };
 
-    if let Err(err) = wait_for_instance_ready(&record).await {
+    if let Err(err) = wait_for_instance_ready(&mut record).await {
         let _ = record.child.kill().await;
         let _ = tokio::fs::remove_file(&record.config_path).await;
         return Err(err);
@@ -453,9 +456,25 @@ async fn evaluate_instance(
     }
 }
 
-async fn wait_for_instance_ready(record: &DevInstanceRecord) -> Result<(), String> {
+async fn wait_for_instance_ready(record: &mut DevInstanceRecord) -> Result<(), String> {
     let started = tokio::time::Instant::now();
     loop {
+        match record.child.try_wait() {
+            Ok(Some(exit_status)) => {
+                return Err(format!(
+                    "dev instance {} exited before ready: {exit_status}",
+                    record.instance_id
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(format!(
+                    "failed to read dev instance {} process status: {err}",
+                    record.instance_id
+                ));
+            }
+        }
+
         if started.elapsed() > START_TIMEOUT {
             return Err(format!(
                 "timed out waiting for dev instance {} to become ready",
@@ -584,12 +603,14 @@ fn write_dev_config(
     instance_id: &str,
 ) -> Result<PathBuf, String> {
     let source_path = repo_root.join("frontend/tauri-shell/tauri.conf.json");
+    let trunk_command_path = repo_root.join("tools/trunk-command.mjs");
     let contents = std::fs::read_to_string(&source_path)
         .map_err(|err| format!("failed to read {}: {err}", source_path.display()))?;
     let mut json: Value = serde_json::from_str(&contents)
         .map_err(|err| format!("failed to parse {}: {err}", source_path.display()))?;
     json["build"]["beforeDevCommand"] = Value::String(format!(
-        "trunk serve --port {frontend_port} --config frontend/Trunk.toml"
+        "node {} serve --port {frontend_port} --no-autoreload",
+        shell_single_quote(&trunk_command_path.display().to_string())
     ));
     json["build"]["devUrl"] = Value::String(format!("http://127.0.0.1:{frontend_port}"));
 
@@ -616,6 +637,10 @@ fn tauri_dev_command(repo_root: &Path, config_path: &Path) -> Result<Command, St
     };
     command.arg("--config").arg(config_path);
     Ok(command)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn now_ms() -> u64 {
@@ -819,6 +844,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn evaluate_tool_input_rejects_unknown_fields() {
+        let mut args = Map::new();
+        args.insert("instance_id".to_string(), json!("instance"));
+        args.insert("expression".to_string(), json!("return 1"));
+        args.insert("timeoutMs".to_string(), json!(1000));
+
+        let err = parse_tool_input::<EvaluateToolInput>(Some(args))
+            .expect_err("unknown tool argument should be rejected");
+        assert!(
+            err.contains("unknown field") && err.contains("timeoutMs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn write_dev_config_overrides_frontend_port() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -833,7 +873,10 @@ mod tests {
         );
         assert_eq!(
             json["build"]["beforeDevCommand"],
-            Value::String("trunk serve --port 17777 --config frontend/Trunk.toml".to_string())
+            Value::String(format!(
+                "node '{}' serve --port 17777 --no-autoreload",
+                repo_root.join("tools/trunk-command.mjs").display()
+            ))
         );
         let _ = std::fs::remove_file(path);
     }

@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crate::bridge::ConfiguredHost;
+use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
@@ -198,10 +198,10 @@ impl CenterZoneState {
                 self.tabs.remove(i);
             }
         }
-        if let Some(active) = self.active_tab_id {
-            if !self.tabs.iter().any(|t| t.id == active) {
-                self.active_tab_id = Some(id);
-            }
+        if let Some(active) = self.active_tab_id
+            && !self.tabs.iter().any(|t| t.id == active)
+        {
+            self.active_tab_id = Some(id);
         }
     }
 
@@ -485,6 +485,7 @@ pub struct AppState {
     pub selected_host_id: RwSignal<Option<String>>,
     pub host_streams: RwSignal<HashMap<String, StreamPath>>,
     pub connection_statuses: RwSignal<HashMap<String, ConnectionStatus>>,
+    pub host_lifecycle_statuses: RwSignal<HashMap<String, RemoteHostLifecycleStatus>>,
     pub command_errors_by_host: RwSignal<HashMap<String, String>>,
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub agents: RwSignal<Vec<AgentInfo>>,
@@ -514,6 +515,7 @@ pub struct AppState {
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
     pub feedback_open: RwSignal<bool>,
+    pub find_bar_open: RwSignal<bool>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
@@ -547,6 +549,7 @@ impl AppState {
             selected_host_id: RwSignal::new(None),
             host_streams: RwSignal::new(HashMap::new()),
             connection_statuses: RwSignal::new(HashMap::new()),
+            host_lifecycle_statuses: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
             projects: RwSignal::new(Vec::new()),
             agents: RwSignal::new(Vec::new()),
@@ -574,6 +577,7 @@ impl AppState {
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
             feedback_open: RwSignal::new(false),
+            find_bar_open: RwSignal::new(false),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
@@ -746,6 +750,9 @@ impl AppState {
         });
         self.command_errors_by_host.update(|errors| {
             errors.remove(host_id);
+        });
+        self.host_lifecycle_statuses.update(|statuses| {
+            statuses.remove(host_id);
         });
         self.host_settings_by_host.update(|settings| {
             settings.remove(host_id);

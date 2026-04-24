@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
 use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, DiffViewState};
 
@@ -159,19 +160,46 @@ fn set_diff_context_mode(signal: RwSignal<DiffContextMode>, mode: DiffContextMod
 
 #[component]
 fn DiffContent(diff: DiffViewState) -> impl IntoView {
+    let state = expect_context::<AppState>();
     let scope_label = match diff.scope {
         ProjectDiffScope::Staged => "staged",
         ProjectDiffScope::Unstaged => "unstaged",
     };
 
+    // Flatten all diff lines into a searchable list and compute per-hunk
+    // starting offsets so each rendered line knows its flat search index.
+    let mut searchable_lines: Vec<String> = Vec::new();
+    let mut file_hunk_offsets: Vec<Vec<usize>> = Vec::new();
+    for file in &diff.files {
+        let mut hunk_offsets = Vec::new();
+        for hunk in &file.hunks {
+            hunk_offsets.push(searchable_lines.len());
+            for line in &hunk.lines {
+                searchable_lines.push(line.text.clone());
+            }
+        }
+        file_hunk_offsets.push(hunk_offsets);
+    }
+
+    let find_state = FindState::new(searchable_lines);
+    provide_context(find_state);
+
     view! {
         <div class="diff-content">
+            {move || {
+                if state.find_bar_open.get() {
+                    Some(view! { <FindBar /> })
+                } else {
+                    None
+                }
+            }}
             <div class="diff-file-header">
                 <span class="diff-file-path">{diff.root.to_string()}</span>
                 <span class="diff-scope-badge">{scope_label}</span>
             </div>
-            {diff.files.into_iter().map(|file| {
-                view! { <DiffFileView file=file scope_label=scope_label context_mode=diff.context_mode /> }
+            {diff.files.into_iter().enumerate().map(|(fi, file)| {
+                let hunk_offsets = file_hunk_offsets[fi].clone();
+                view! { <DiffFileView file=file scope_label=scope_label context_mode=diff.context_mode hunk_offsets=hunk_offsets /> }
             }).collect::<Vec<_>>()}
         </div>
     }
@@ -182,6 +210,7 @@ fn DiffFileView(
     file: ProjectGitDiffFile,
     scope_label: &'static str,
     context_mode: DiffContextMode,
+    hunk_offsets: Vec<usize>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let view_mode_sig = state.diff_view_mode;
@@ -193,16 +222,17 @@ fn DiffFileView(
                 <span class="diff-scope-badge">{scope_label}</span>
             </div>
             <div class="diff-hunks">
-                {file.hunks.into_iter().map(|hunk| {
+                {file.hunks.into_iter().enumerate().map(|(hi, hunk)| {
+                    let offset = hunk_offsets[hi];
                     let hunk_for_unified = hunk.clone();
                     let hunk_for_side = hunk;
                     view! {
                         {move || match view_mode_sig.get() {
                             DiffViewMode::Unified => view! {
-                                <UnifiedHunk hunk=hunk_for_unified.clone() context_mode=context_mode />
+                                <UnifiedHunk hunk=hunk_for_unified.clone() context_mode=context_mode line_offset=offset />
                             }.into_any(),
                             DiffViewMode::SideBySide => view! {
-                                <SideBySideHunk hunk=hunk_for_side.clone() context_mode=context_mode />
+                                <SideBySideHunk hunk=hunk_for_side.clone() context_mode=context_mode line_offset=offset />
                             }.into_any(),
                         }}
                     }
@@ -236,7 +266,12 @@ fn line_prefix(kind: ProjectGitDiffLineKind) -> &'static str {
 }
 
 #[component]
-fn UnifiedHunk(hunk: ProjectGitDiffHunk, context_mode: DiffContextMode) -> impl IntoView {
+fn UnifiedHunk(
+    hunk: ProjectGitDiffHunk,
+    context_mode: DiffContextMode,
+    line_offset: usize,
+) -> impl IntoView {
+    let find = use_context::<FindState>();
     let header = hunk_header_label(&hunk);
     let show_header = context_mode == DiffContextMode::Hunks;
     view! {
@@ -244,17 +279,27 @@ fn UnifiedHunk(hunk: ProjectGitDiffHunk, context_mode: DiffContextMode) -> impl 
             {show_header.then(|| view! {
                 <div class="diff-hunk-header">{header}</div>
             })}
-            {hunk.lines.into_iter().map(|line| {
-                let class = line_class(line.kind);
+            {hunk.lines.into_iter().enumerate().map(|(i, line)| {
+                let search_idx = line_offset + i;
+                let base_class = line_class(line.kind);
                 let prefix = line_prefix(line.kind);
                 let old_str = line.old_line_number.map(|n| n.to_string()).unwrap_or_default();
                 let new_str = line.new_line_number.map(|n| n.to_string()).unwrap_or_default();
+                let text = line.text;
+                let find_for_class = find.clone();
+                let find_for_text = find.clone();
                 view! {
-                    <div class=class>
+                    <div
+                        class=move || diff_line_class(base_class, search_idx, &find_for_class)
+                        attr:data-find-idx=search_idx
+                    >
                         <span class="diff-gutter diff-gutter-old">{old_str}</span>
                         <span class="diff-gutter diff-gutter-new">{new_str}</span>
                         <span class="diff-prefix">{prefix}</span>
-                        <span class="diff-text">{line.text}</span>
+                        {move || {
+                            let result: AnyView = render_diff_text(&text, search_idx, &find_for_text);
+                            result
+                        }}
                     </div>
                 }
             }).collect::<Vec<_>>()}
@@ -291,8 +336,8 @@ pub fn pair_lines_side_by_side(lines: Vec<ProjectGitDiffLine>) -> Vec<SideBySide
                  added: &mut Vec<ProjectGitDiffLine>,
                  rows: &mut Vec<SideBySideRow>| {
         let pair_count = removed.len().min(added.len());
-        let rem_iter: Vec<_> = removed.drain(..).collect();
-        let add_iter: Vec<_> = added.drain(..).collect();
+        let rem_iter = std::mem::take(removed);
+        let add_iter = std::mem::take(added);
         let mut rem_it = rem_iter.into_iter();
         let mut add_it = add_iter.into_iter();
         for _ in 0..pair_count {
@@ -358,24 +403,94 @@ pub fn pair_lines_side_by_side(lines: Vec<ProjectGitDiffLine>) -> Vec<SideBySide
     rows
 }
 
+/// Compute search indices for each cell in the paired side-by-side rows.
+///
+/// Returns `Vec<(Option<usize>, Option<usize>)>` — one entry per row,
+/// giving the flat search index of the left and right cell respectively.
+fn sbs_search_indices(
+    lines: &[ProjectGitDiffLine],
+    line_offset: usize,
+) -> Vec<(Option<usize>, Option<usize>)> {
+    // Partition original line indices by kind.
+    let mut removed_idx: Vec<usize> = Vec::new();
+    let mut added_idx: Vec<usize> = Vec::new();
+    let mut context_idx: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        match line.kind {
+            ProjectGitDiffLineKind::Removed => removed_idx.push(line_offset + i),
+            ProjectGitDiffLineKind::Added => added_idx.push(line_offset + i),
+            ProjectGitDiffLineKind::Context => context_idx.push(line_offset + i),
+        }
+    }
+
+    // Replay the same pairing logic to assign indices to rows.
+    let rows = pair_lines_side_by_side(lines.to_vec());
+    let mut ri = 0usize;
+    let mut ai = 0usize;
+    let mut ci = 0usize;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let is_context = row
+            .left
+            .as_ref()
+            .is_some_and(|c| c.kind == ProjectGitDiffLineKind::Context);
+        if is_context {
+            let idx = context_idx.get(ci).copied();
+            ci += 1;
+            out.push((idx, idx));
+        } else {
+            let li = row.left.as_ref().and_then(|c| {
+                if c.kind == ProjectGitDiffLineKind::Removed {
+                    let idx = removed_idx.get(ri).copied();
+                    ri += 1;
+                    idx
+                } else {
+                    None
+                }
+            });
+            let r_idx = row.right.as_ref().and_then(|c| {
+                if c.kind == ProjectGitDiffLineKind::Added {
+                    let idx = added_idx.get(ai).copied();
+                    ai += 1;
+                    idx
+                } else {
+                    None
+                }
+            });
+            out.push((li, r_idx));
+        }
+    }
+    out
+}
+
 #[component]
-fn SideBySideHunk(hunk: ProjectGitDiffHunk, context_mode: DiffContextMode) -> impl IntoView {
+fn SideBySideHunk(
+    hunk: ProjectGitDiffHunk,
+    context_mode: DiffContextMode,
+    line_offset: usize,
+) -> impl IntoView {
+    let find = use_context::<FindState>();
     let header = hunk_header_label(&hunk);
     let show_header = context_mode == DiffContextMode::Hunks;
+
+    let indices = sbs_search_indices(&hunk.lines, line_offset);
     let rows = pair_lines_side_by_side(hunk.lines);
+
     view! {
         <div class="diff-hunk diff-hunk-side-by-side">
             {show_header.then(|| view! {
                 <div class="diff-hunk-header">{header}</div>
             })}
-            {rows.into_iter().map(|row| {
+            {rows.into_iter().zip(indices).map(|(row, (left_idx, right_idx))| {
+                let find_l = find.clone();
+                let find_r = find.clone();
                 view! {
                     <div class="diff-row-sbs">
                         <div class="diff-col-sbs diff-col-left">
-                            {render_cell(row.left)}
+                            {render_cell_search(row.left, left_idx, find_l)}
                         </div>
                         <div class="diff-col-sbs diff-col-right">
-                            {render_cell(row.right)}
+                            {render_cell_search(row.right, right_idx, find_r)}
                         </div>
                     </div>
                 }
@@ -384,23 +499,75 @@ fn SideBySideHunk(hunk: ProjectGitDiffHunk, context_mode: DiffContextMode) -> im
     }
 }
 
-fn render_cell(cell: Option<SideBySideCell>) -> impl IntoView {
+fn render_cell_search(
+    cell: Option<SideBySideCell>,
+    search_idx: Option<usize>,
+    find: Option<FindState>,
+) -> AnyView {
     match cell {
         Some(c) => {
-            let class = line_class(c.kind);
+            let base_class = line_class(c.kind);
             let prefix = line_prefix(c.kind);
             let num = c.line_number.map(|n| n.to_string()).unwrap_or_default();
+            let text = c.text;
+            let find_for_class = find.clone();
+            let find_for_text = find;
+            let idx_str = search_idx.map(|i| i.to_string()).unwrap_or_default();
             view! {
-                <div class=class>
+                <div
+                    class=move || {
+                        if let (Some(idx), Some(find)) = (search_idx, &find_for_class) {
+                            diff_line_class(base_class, idx, &Some(find.clone()))
+                        } else {
+                            base_class.to_string()
+                        }
+                    }
+                    attr:data-find-idx=idx_str
+                >
                     <span class="diff-gutter">{num}</span>
                     <span class="diff-prefix">{prefix}</span>
-                    <span class="diff-text">{c.text}</span>
+                    {move || {
+                        let result: AnyView = if let Some(idx) = search_idx {
+                            render_diff_text(&text, idx, &find_for_text)
+                        } else {
+                            view! { <span class="diff-text">{text.clone()}</span> }.into_any()
+                        };
+                        result
+                    }}
                 </div>
             }
             .into_any()
         }
         None => view! { <div class="diff-line diff-line-empty"></div> }.into_any(),
     }
+}
+
+// ── Search-aware rendering helpers ──────────────────────────────────────
+
+fn diff_line_class(base: &'static str, search_idx: usize, find: &Option<FindState>) -> String {
+    let Some(find) = find else {
+        return base.to_string();
+    };
+    let results = find.results.get();
+    if !results.match_set.contains(&search_idx) {
+        return base.to_string();
+    }
+    let active = find.active_index.get();
+    if active >= 0 && results.match_lines.get(active as usize) == Some(&search_idx) {
+        format!("{base} find-hit-active")
+    } else {
+        format!("{base} find-hit")
+    }
+}
+
+fn render_diff_text(text: &str, search_idx: usize, find: &Option<FindState>) -> AnyView {
+    if let Some(find) = find {
+        let results = find.results.get();
+        if let Some(ranges) = results.ranges_by_line.get(&search_idx) {
+            return render_text_with_highlights(text, ranges).into_any();
+        }
+    }
+    view! { <span class="diff-text">{text.to_owned()}</span> }.into_any()
 }
 
 #[cfg(test)]

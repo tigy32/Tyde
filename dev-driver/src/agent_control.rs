@@ -917,6 +917,7 @@ impl From<CostHintInput> for SpawnCostHint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentToolInput {
     workspace_roots: Vec<String>,
     prompt: String,
@@ -928,6 +929,7 @@ struct SpawnAgentToolInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunAgentToolInput {
     workspace_roots: Vec<String>,
     prompt: String,
@@ -979,18 +981,21 @@ impl From<&RunAgentToolInput> for SpawnRequestInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AwaitAgentsToolInput {
     agent_ids: Option<Vec<String>>,
     timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SendAgentMessageToolInput {
     agent_id: String,
     message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CancelAgentToolInput {
     agent_id: String,
     timeout_ms: Option<u64>,
@@ -1630,6 +1635,21 @@ mod tests {
                 .expect("spawn mock host"),
             tempdir,
         )
+    }
+
+    #[test]
+    fn spawn_tool_input_rejects_unknown_fields() {
+        let mut args = Map::new();
+        args.insert("workspace_roots".to_string(), json!(["/tmp/test"]));
+        args.insert("prompt".to_string(), json!("hello"));
+        args.insert("backendKind".to_string(), json!("tycode"));
+
+        let err = parse_tool_input::<SpawnAgentToolInput>(Some(args))
+            .expect_err("unknown tool argument should be rejected");
+        assert!(
+            err.contains("unknown field") && err.contains("backendKind"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

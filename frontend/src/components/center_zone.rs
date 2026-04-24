@@ -124,10 +124,10 @@ fn TabContextMenu(
     // on_cleanup can use a plain fn pointer (required to be Send+Sync by Leptos).
     clear_esc_listener();
     let esc_cb = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
-        if let Ok(kev) = ev.dyn_into::<web_sys::KeyboardEvent>() {
-            if kev.key() == "Escape" {
-                context_menu.set(None);
-            }
+        if let Ok(kev) = ev.dyn_into::<web_sys::KeyboardEvent>()
+            && kev.key() == "Escape"
+        {
+            context_menu.set(None);
         }
     });
     let window = web_sys::window().unwrap();

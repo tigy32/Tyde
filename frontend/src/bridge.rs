@@ -8,7 +8,9 @@ use wasm_bindgen_futures::JsFuture;
 // verbatim with the Tauri shell. Re-export them for downstream modules.
 pub use host_config::{
     ConfiguredHost, ConfiguredHostStore, HostDisconnectedEvent, HostErrorEvent, HostIdRequest,
-    HostLineEvent, HostTransportConfig, SendHostLineRequest, SetSelectedHostRequest,
+    HostLifecycleEvent, HostLineEvent, HostTransportConfig, RemoteHostLifecycleConfig,
+    RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus, RemoteHostLifecycleStep,
+    RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest, TydeReleaseTarget,
     UpsertConfiguredHostRequest,
 };
 
@@ -106,6 +108,17 @@ pub async fn send_host_line(request: SendHostLineRequest) -> Result<(), String> 
     Ok(())
 }
 
+pub async fn ensure_configured_host_ready(
+    host_id: String,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&HostIdRequest { host_id }).map_err(|e| e.to_string())?;
+    let value = tauri_invoke("ensure_configured_host_ready", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
 pub async fn submit_feedback(feedback: String) -> Result<(), String> {
     #[derive(serde::Serialize)]
     struct Args {
@@ -184,6 +197,21 @@ pub async fn listen_host_error(
         {
             Ok(event) => callback(event.payload),
             Err(error) => log::error!("failed to parse host-error event: {error}"),
+        },
+    )
+    .await
+}
+
+pub async fn listen_host_lifecycle(
+    callback: impl Fn(HostLifecycleEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://host-lifecycle",
+        move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<HostLifecycleEvent>>(
+            val,
+        ) {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host-lifecycle event: {error}"),
         },
     )
     .await

@@ -90,6 +90,7 @@ impl From<CostHintInput> for SpawnCostHint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentToolInput {
     workspace_roots: Vec<String>,
     prompt: String,
@@ -101,6 +102,7 @@ struct SpawnAgentToolInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RunAgentToolInput {
     workspace_roots: Vec<String>,
     prompt: String,
@@ -113,17 +115,20 @@ struct RunAgentToolInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SendAgentMessageToolInput {
     agent_id: String,
     message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CancelAgentToolInput {
     agent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EmptyToolInput {}
 
 #[derive(Debug, Serialize)]

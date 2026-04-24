@@ -3,4 +3,5 @@ name = "host-config"
 edition.workspace = true
 
 [dependencies]
+protocol = { path = "../protocol", default-features = false }
 serde.workspace = true

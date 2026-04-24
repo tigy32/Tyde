@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -12,11 +13,47 @@ pub const TYDE_VERSION: Version = Version {
     patch: 0,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Version {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl FromStr for Version {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trimmed = value.strip_prefix('v').unwrap_or(value);
+        let mut parts = trimmed.split('.');
+        let major = parse_version_component(parts.next(), "major")?;
+        let minor = parse_version_component(parts.next(), "minor")?;
+        let patch = parse_version_component(parts.next(), "patch")?;
+        if parts.next().is_some() {
+            return Err(format!("version has too many components: {value}"));
+        }
+        Ok(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+fn parse_version_component(component: Option<&str>, name: &str) -> Result<u32, String> {
+    let component = component.ok_or_else(|| format!("version is missing {name} component"))?;
+    if component.is_empty() {
+        return Err(format!("version has empty {name} component"));
+    }
+    component
+        .parse::<u32>()
+        .map_err(|err| format!("invalid {name} version component {component:?}: {err}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

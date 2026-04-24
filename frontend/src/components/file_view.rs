@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use crate::components::find_bar::{FindBar, FindState};
 use crate::highlight::highlight_code_blocks;
 use crate::state::{AppState, TabContent};
 
@@ -31,12 +32,6 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                         } else {
                             f.contents.unwrap_or_else(|| "(file not found)".to_owned())
                         };
-                        let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
-                        Effect::new(move |_| {
-                            if let Some(el) = pre_ref.get() {
-                                highlight_code_blocks(&el);
-                            }
-                        });
                         let on_close = move |_| {
                             let state = expect_context::<AppState>();
                             let tab_id = state.center_zone.with_untracked(|cz| {
@@ -48,12 +43,48 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                 state.close_tab(id);
                             }
                         };
+
+                        let lines: Vec<String> = content.lines().map(|l| l.to_owned()).collect();
+                        let find_state = FindState::new(lines.clone());
+                        provide_context(find_state.clone());
+
+                        let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
+                        Effect::new(move |_| {
+                            if let Some(el) = pre_ref.get() {
+                                highlight_code_blocks(&el);
+                            }
+                        });
+
+                        let find_bar_open = state.find_bar_open;
+
                         view! {
                             <div class="file-view-header">
                                 <span class="file-view-path">{path_display}</span>
                                 <button class="file-view-close" on:click=on_close title="Close">"×"</button>
                             </div>
-                            <pre class="file-view-content" node_ref=pre_ref><code class=lang_class>{content}</code></pre>
+                            {move || {
+                                if find_bar_open.get() {
+                                    Some(view! { <FindBar /> })
+                                } else {
+                                    None
+                                }
+                            }}
+                            <pre class="file-view-content" node_ref=pre_ref>
+                                {lines.iter().enumerate().map(|(i, line_text)| {
+                                    let text = line_text.clone();
+                                    let lang = lang_class.clone();
+                                    let find = find_state.clone();
+                                    view! {
+                                        <div
+                                            class=move || file_line_class(i, &find)
+                                            attr:data-find-idx=i
+                                        >
+                                            <span class="file-line-num">{i + 1}</span>
+                                            <code class=lang.clone()>{text}{"\n"}</code>
+                                        </div>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </pre>
                         }.into_any()
                     }
                     None => view! {
@@ -62,6 +93,19 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                 }
             }}
         </div>
+    }
+}
+
+fn file_line_class(line_idx: usize, find: &FindState) -> &'static str {
+    let results = find.results.get();
+    if !results.match_set.contains(&line_idx) {
+        return "file-line";
+    }
+    let active = find.active_index.get();
+    if active >= 0 && results.match_lines.get(active as usize) == Some(&line_idx) {
+        "file-line find-hit-active"
+    } else {
+        "file-line find-hit"
     }
 }
 

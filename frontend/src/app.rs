@@ -118,6 +118,10 @@ fn install_keydown_listener(state: AppState) {
                 ev.prevent_default();
                 state.settings_open.update(|v| *v = !*v);
             }
+            "f" if ctrl_or_meta => {
+                ev.prevent_default();
+                state.find_bar_open.update(|v| *v = !*v);
+            }
             "n" if ctrl_or_meta => {
                 ev.prevent_default();
                 crate::actions::begin_new_chat(&state, None);
@@ -127,6 +131,8 @@ fn install_keydown_listener(state: AppState) {
                     state.command_palette_open.set(false);
                 } else if state.settings_open.get_untracked() {
                     state.settings_open.set(false);
+                } else if state.find_bar_open.get_untracked() {
+                    state.find_bar_open.set(false);
                 }
             }
             _ => {}
@@ -515,7 +521,7 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
 }
 
 async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenHandle>, String> {
-    let mut handles = Vec::with_capacity(3);
+    let mut handles = Vec::with_capacity(4);
 
     let line_state = state.clone();
     handles.push(
@@ -592,6 +598,16 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
         .await?,
     );
 
+    let lifecycle_state = state.clone();
+    handles.push(
+        bridge::listen_host_lifecycle(move |event| {
+            lifecycle_state.host_lifecycle_statuses.update(|statuses| {
+                statuses.insert(event.host_id, event.status);
+            });
+        })
+        .await?,
+    );
+
     Ok(handles)
 }
 
@@ -607,6 +623,9 @@ pub async fn refresh_configured_hosts(state: &AppState) {
                         .entry(host.id.clone())
                         .or_insert(ConnectionStatus::Disconnected);
                 }
+            });
+            state.host_lifecycle_statuses.update(|statuses| {
+                statuses.retain(|host_id, _| store.hosts.iter().any(|host| &host.id == host_id));
             });
         }
         Err(error) => {

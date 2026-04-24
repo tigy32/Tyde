@@ -847,6 +847,56 @@ async fn agent_control_http_infers_parent_agent_id_from_request_url() {
 }
 
 #[tokio::test]
+async fn agent_control_http_rejects_unknown_tool_arguments() {
+    let fixture = Fixture::new().await;
+    let base_url = fixture.agent_control_http_url().await;
+
+    let response = post_json(
+        &base_url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_spawn_agent",
+                "arguments": {
+                    "workspace_roots": ["/tmp/reject-unknown-args"],
+                    "prompt": "this should not spawn",
+                    "backendKind": "tycode",
+                    "name": "unknown-args-child"
+                }
+            }
+        }),
+    )
+    .await;
+
+    let rpc_error = response.get("error").is_some();
+    let tool_error = response
+        .get("result")
+        .and_then(|result| {
+            result
+                .get("isError")
+                .or_else(|| result.get("is_error"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false);
+    assert!(
+        rpc_error || tool_error,
+        "unknown tool arguments must be rejected, got {response}"
+    );
+    assert!(
+        response.to_string().contains("backendKind")
+            || response.to_string().contains("unknown field")
+            || response.to_string().contains("invalid"),
+        "rejection should mention invalid/unknown argument, got {response}"
+    );
+    assert!(
+        fixture.agent_ids().await.is_empty(),
+        "unknown tool arguments must not fall back to the default backend and spawn an agent"
+    );
+}
+
+#[tokio::test]
 async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments() {
     let mut fixture = Fixture::new().await;
 

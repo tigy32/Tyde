@@ -9,7 +9,7 @@ use crate::bridge::{
     HOST_DISCONNECTED_EVENT, HOST_ERROR_EVENT, HOST_LINE_EVENT, HostDisconnectedEvent,
     HostErrorEvent, HostLineEvent,
 };
-use crate::host_store::HostTransportConfig;
+use crate::host_store::{HostTransportConfig, RemoteHostLifecycleConfig};
 
 const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
 
@@ -386,8 +386,14 @@ async fn setup_connection_transport(
         HostTransportConfig::SshStdio {
             ssh_destination,
             remote_command,
+            lifecycle,
         } => {
-            let command = remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string());
+            let command = match lifecycle {
+                RemoteHostLifecycleConfig::Manual => {
+                    remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string())
+                }
+                RemoteHostLifecycleConfig::ManagedTyde { .. } => managed_remote_bridge_command(),
+            };
             let mut child = Command::new("ssh");
             child
                 .arg("-T")
@@ -447,4 +453,18 @@ async fn setup_connection_transport(
             })
         }
     }
+}
+
+fn managed_remote_bridge_command() -> String {
+    r#"set -eu
+mkdir -p "$HOME/.tyde/logs"
+bin="$HOME/.tyde/bin/current/tyde"
+if [ ! -x "$bin" ]; then
+  echo "managed Tyde bridge binary is not executable: $bin" >&2
+  exit 1
+fi
+export TYDE_SOCKET_PATH="$HOME/.tyde/tyde.sock"
+exec "$bin" host --bridge-uds 2>> "$HOME/.tyde/logs/tyde-host-bridge-uds.log"
+"#
+    .to_string()
 }

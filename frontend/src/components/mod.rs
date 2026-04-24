@@ -10,6 +10,7 @@ pub mod dock_zone;
 pub mod feedback_modal;
 pub mod file_explorer;
 pub mod file_view;
+pub mod find_bar;
 pub mod git_panel;
 pub mod header;
 pub mod home_view;
