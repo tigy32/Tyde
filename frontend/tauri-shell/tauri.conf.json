@@ -4,8 +4,8 @@
   "version": "0.8.0",
   "identifier": "com.tyde.app",
   "build": {
-    "beforeDevCommand": "ROOT=$(git rev-parse --show-toplevel) && trunk serve --port 1420 --config \"$ROOT/frontend/Trunk.toml\"",
-    "beforeBuildCommand": "ROOT=$(git rev-parse --show-toplevel) && trunk build --release --config \"$ROOT/frontend/Trunk.toml\"",
+    "beforeDevCommand": "node ../tools/trunk-command.mjs serve --port 1420",
+    "beforeBuildCommand": "node ../tools/trunk-command.mjs build --release",
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:1420"
   },

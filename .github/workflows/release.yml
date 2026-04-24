@@ -14,21 +14,54 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify release version matches tag
+        run: python tools/check_release_version.py "$RELEASE_TAG"
+
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes ''
+          else
+            gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA"
+          fi
+
   build:
+    needs: create-release
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
+          - platform: macos-15
             rust-target: aarch64-apple-darwin
-          - platform: macos-latest
+            tauri-args: --target aarch64-apple-darwin --bundles app
+          - platform: macos-15-intel
             rust-target: x86_64-apple-darwin
+            tauri-args: --target x86_64-apple-darwin --bundles app
           - platform: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
+            tauri-args: --target x86_64-unknown-linux-gnu
           - platform: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
+            tauri-args: --target aarch64-unknown-linux-gnu
           - platform: windows-latest
             rust-target: x86_64-pc-windows-msvc
+            tauri-args: --target x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
 
@@ -41,13 +74,14 @@ jobs:
           python-version: '3.x'
 
       - name: Verify release version matches tag
-        run: python tools/check_release_version.py "${{ github.event.inputs.version || github.ref_name }}"
+        run: python tools/check_release_version.py "$RELEASE_TAG"
 
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
+            curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
             librsvg2-dev patchelf
 
       - name: Install macOS tools
@@ -79,71 +113,153 @@ jobs:
         with:
           workspaces: . -> target
 
-      - name: Import Apple certificate
-        if: startsWith(matrix.platform, 'macos') && env.APPLE_CERTIFICATE != ''
+      - name: Validate Apple signing secrets
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY_CONTENT APPLE_API_KEY APPLE_API_ISSUER; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::Missing required Apple signing secret(s): %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+      - name: Import Apple certificate
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
 
-          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$CERTIFICATE_PATH"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: \
-            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security list-keychain -d user -s $KEYCHAIN_PATH
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY"
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+              | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' \
+              | head -n 1)
+          fi
+
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            echo "::error::Could not find a Developer ID Application signing identity in APPLE_CERTIFICATE"
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+            exit 1
+          fi
+
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
       - name: Write Apple API key
-        if: startsWith(matrix.platform, 'macos') && env.APPLE_API_KEY_CONTENT != ''
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
         env:
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
           mkdir -p "$RUNNER_TEMP/private_keys"
-          echo "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+          API_KEY_PATH="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
 
-      - name: Import Windows certificate
-        if: matrix.platform == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
+      - name: Configure Windows signing
+        if: matrix.platform == 'windows-latest'
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host "WINDOWS_CERTIFICATE is not set; Windows artifacts will be built unsigned."
+            exit 0
+          }
+
+          $missing = @()
+          foreach ($name in @("WINDOWS_CERTIFICATE_PASSWORD", "WINDOWS_CERTIFICATE_THUMBPRINT")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing required Windows signing secret(s): $($missing -join ', ')"
+            exit 1
+          }
+
           New-Item -ItemType directory -Path certificate
           Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
           certutil -decode certificate/tempCert.txt certificate/certificate.pfx
-          Remove-Item -path certificate -include tempCert.txt
+          Remove-Item certificate/tempCert.txt
           Import-PfxCertificate -FilePath certificate/certificate.pfx `
             -CertStoreLocation Cert:\CurrentUser\My `
             -Password (ConvertTo-SecureString `
               -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText)
 
-      - name: Build with Tauri
+          $thumbprint = ($env:WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+          Set-Content -Path frontend/tauri-shell/tauri.windows.conf.json -Value $config
+
+      - name: Build macOS app with Tauri
+        if: startsWith(matrix.platform, 'macos')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        with:
+          projectPath: frontend/tauri-shell
+          tauriScript: npx --prefix ../.. tauri
+          args: ${{ matrix.tauri-args }}
+
+      - name: Build with Tauri and upload release bundles
+        if: "!startsWith(matrix.platform, 'macos')"
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_PATH: ${{ runner.temp }}/private_keys/AuthKey_${{ secrets.APPLE_API_KEY }}.p8
         with:
           projectPath: frontend/tauri-shell
-          tagName: ${{ github.event.inputs.version || github.ref_name }}
-          releaseName: Tyde ${{ github.event.inputs.version || github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: Tyde ${{ env.RELEASE_TAG }}
           releaseBody: ''
           releaseDraft: true
           prerelease: false
           tauriScript: npx --prefix ../.. tauri
-          args: --target ${{ matrix.rust-target }}
+          args: ${{ matrix.tauri-args }}
 
-      - name: Package headless Tyde server binary
-        if: matrix.platform != 'windows-latest'
+      - name: Package Linux headless Tyde binary
+        if: startsWith(matrix.platform, 'ubuntu')
         shell: bash
         run: |
           BIN_DIR="target/${{ matrix.rust-target }}/release"
@@ -157,13 +273,63 @@ jobs:
           tar -cJf "$ARCHIVE" -C "$BIN_DIR" "$BIN_NAME"
           echo "HEADLESS_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
+      - name: Package signed macOS headless Tyde binary
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          BIN_DIR="target/${{ matrix.rust-target }}/release"
+          BIN_NAME="tyde"
+          BIN_PATH="$BIN_DIR/$BIN_NAME"
+          if [[ ! -x "$BIN_PATH" ]]; then
+            echo "Expected executable not found at $BIN_PATH"
+            exit 1
+          fi
+
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN_PATH"
+          codesign --verify --strict --verbose=2 "$BIN_PATH"
+
+          ARCHIVE="$RUNNER_TEMP/tyde-${{ matrix.rust-target }}.zip"
+          ditto -c -k --keepParent "$BIN_PATH" "$ARCHIVE"
+
+          xcrun notarytool submit "$ARCHIVE" \
+            --issuer "$APPLE_API_ISSUER" \
+            --key-id "$APPLE_API_KEY" \
+            --key "$APPLE_API_KEY_PATH" \
+            --wait
+
+          echo "HEADLESS_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package Windows headless Tyde binary
+        if: matrix.platform == 'windows-latest'
+        run: |
+          $binDir = "target/${{ matrix.rust-target }}/release"
+          $binPath = Join-Path $binDir "tyde.exe"
+          if (!(Test-Path $binPath)) {
+            Write-Error "Expected executable not found at $binPath"
+            exit 1
+          }
+          $archive = Join-Path $env:RUNNER_TEMP "tyde-${{ matrix.rust-target }}.zip"
+          Compress-Archive -Path $binPath -DestinationPath $archive -Force
+          "HEADLESS_ARCHIVE=$archive" >> $env:GITHUB_ENV
+
       - name: Upload headless Tyde server binary
         if: matrix.platform != 'windows-latest'
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.event.inputs.version || github.ref_name }} "$HEADLESS_ARCHIVE" --clobber
+          gh release upload "$RELEASE_TAG" "$HEADLESS_ARCHIVE" --clobber
+
+      - name: Upload Windows headless Tyde server binary
+        if: matrix.platform == 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload $env:RELEASE_TAG $env:HEADLESS_ARCHIVE --clobber
 
       - name: Rebuild macOS DMG
         if: startsWith(matrix.platform, 'macos')
@@ -171,13 +337,20 @@ jobs:
         run: |
           BUNDLE_DIR="target/${{ matrix.rust-target }}/release/bundle"
           APP_BUNDLE=$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' | head -1)
+          if [[ -z "$APP_BUNDLE" ]]; then
+            echo "Expected .app bundle not found in $BUNDLE_DIR/macos"
+            exit 1
+          fi
           APP_NAME=$(basename "$APP_BUNDLE" .app)
           DMG_DIR="$BUNDLE_DIR/dmg"
+          VERSION="${RELEASE_TAG#v}"
+          DMG_PATH="$DMG_DIR/${APP_NAME}_${VERSION}_${{ matrix.rust-target }}.dmg"
 
+          mkdir -p "$DMG_DIR"
           rm -f "$DMG_DIR"/*.dmg
 
           STAGING=$(mktemp -d)
-          cp -R "$APP_BUNDLE" "$STAGING/"
+          ditto "$APP_BUNDLE" "$STAGING/$APP_NAME.app"
 
           create-dmg \
             --volname "$APP_NAME" \
@@ -187,7 +360,7 @@ jobs:
             --icon "$APP_NAME.app" 180 220 \
             --app-drop-link 480 220 \
             --no-internet-enable \
-            "$DMG_DIR/${APP_NAME}_${{ matrix.rust-target }}.dmg" \
+            "$DMG_PATH" \
             "$STAGING" || DMG_EXIT=$?
 
           rm -rf "$STAGING"
@@ -197,36 +370,34 @@ jobs:
             exit 1
           fi
 
+          echo "MACOS_DMG=$DMG_PATH" >> "$GITHUB_ENV"
+
       - name: Sign and notarize DMG
-        if: startsWith(matrix.platform, 'macos') && env.APPLE_SIGNING_IDENTITY != ''
+        if: startsWith(matrix.platform, 'macos')
         shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
-          BUNDLE_DIR="target/${{ matrix.rust-target }}/release/bundle"
-          DMG=$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$MACOS_DMG"
 
-          codesign --force --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
-
-          xcrun notarytool submit "$DMG" \
+          xcrun notarytool submit "$MACOS_DMG" \
             --issuer "$APPLE_API_ISSUER" \
             --key-id "$APPLE_API_KEY" \
-            --key "$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8" \
+            --key "$APPLE_API_KEY_PATH" \
             --wait
 
-          xcrun stapler staple "$DMG"
+          xcrun stapler staple "$MACOS_DMG"
+          xcrun stapler validate "$MACOS_DMG"
+          spctl -a -t open --context context:primary-signature -v "$MACOS_DMG"
 
       - name: Upload macOS DMG to release
-        if: startsWith(matrix.platform, 'macos') && env.APPLE_SIGNING_IDENTITY != ''
+        if: startsWith(matrix.platform, 'macos')
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BUNDLE_DIR="target/${{ matrix.rust-target }}/release/bundle"
-          DMG=$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' | head -1)
-          gh release upload ${{ github.event.inputs.version || github.ref_name }} "$DMG" --clobber
+          gh release upload "$RELEASE_TAG" "$MACOS_DMG" --clobber
 
       - name: Generate Linux checksums
         if: startsWith(matrix.platform, 'ubuntu')
@@ -237,8 +408,17 @@ jobs:
             [ -f "$f" ] && sha256sum "$f" > "${f}.sha256"
           done
 
-      - name: Cleanup macOS keychain
-        if: startsWith(matrix.platform, 'macos') && env.APPLE_CERTIFICATE != '' && always()
+      - name: Upload Linux checksums
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-        run: security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUNDLE_DIR="target/${{ matrix.rust-target }}/release/bundle"
+          for f in "$BUNDLE_DIR"/appimage/*.sha256 "$BUNDLE_DIR"/deb/*.sha256; do
+            [ -f "$f" ] && gh release upload "$RELEASE_TAG" "$f" --clobber
+          done
+
+      - name: Cleanup macOS keychain
+        if: startsWith(matrix.platform, 'macos') && always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
