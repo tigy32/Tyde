@@ -27,7 +27,7 @@ jobs:
           python-version: '3.x'
 
       - name: Verify release version matches tag
-        run: python tools/check_release_version.py "$RELEASE_TAG"
+        run: python tools/check_release_version.py "${{ env.RELEASE_TAG }}"
 
       - name: Create draft release
         env:
@@ -74,7 +74,7 @@ jobs:
           python-version: '3.x'
 
       - name: Verify release version matches tag
-        run: python tools/check_release_version.py "$RELEASE_TAG"
+        run: python tools/check_release_version.py "${{ env.RELEASE_TAG }}"
 
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu')
