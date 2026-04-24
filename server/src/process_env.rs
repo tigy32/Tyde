@@ -3,8 +3,10 @@ use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Option<OsString>> = OnceLock::new();

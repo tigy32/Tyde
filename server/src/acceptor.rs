@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,9 +13,11 @@ use protocol::{
 };
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
 
+#[cfg(unix)]
 use crate::connection::run_connection;
 use crate::{Connection, HostHandle, ServerConfig};
 
@@ -146,30 +149,44 @@ pub async fn listen_uds(
     config: ServerConfig,
     host: HostHandle,
 ) -> io::Result<()> {
-    let path = path.as_ref();
-    prepare_uds_path(path).await?;
+    #[cfg(unix)]
+    {
+        let path = path.as_ref();
+        prepare_uds_path(path).await?;
 
-    let _cleanup = UdsPathCleanup {
-        path: path.to_path_buf(),
-    };
-    let listener = UnixListener::bind(path)?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let host = host.clone();
+        let _cleanup = UdsPathCleanup {
+            path: path.to_path_buf(),
+        };
+        let listener = UnixListener::bind(path)?;
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let host = host.clone();
 
-        tokio::spawn(async move {
-            let connection = match accept(&config, stream).await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    tracing::error!("handshake failed: {err:?}");
-                    return;
+            tokio::spawn(async move {
+                let connection = match accept(&config, stream).await {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        tracing::error!("handshake failed: {err:?}");
+                        return;
+                    }
+                };
+
+                if let Err(err) = run_connection(connection, host).await {
+                    tracing::error!("connection loop failed: {err:?}");
                 }
-            };
+            });
+        }
+    }
 
-            if let Err(err) = run_connection(connection, host).await {
-                tracing::error!("connection loop failed: {err:?}");
-            }
-        });
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        let _ = config;
+        let _ = host;
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "Unix domain sockets are not supported on this platform",
+        ))
     }
 }
 
@@ -184,6 +201,7 @@ async fn send_reject<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn prepare_uds_path(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -225,10 +243,12 @@ async fn prepare_uds_path(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 struct UdsPathCleanup {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for UdsPathCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);

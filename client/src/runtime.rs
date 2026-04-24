@@ -168,10 +168,23 @@ pub async fn connect_uds_host_endpoint(
     path: impl AsRef<std::path::Path>,
     config: &ClientConfig,
 ) -> Result<HostEndpoint, HandshakeError> {
-    let stream = tokio::net::UnixStream::connect(path)
-        .await
-        .map_err(|err| HandshakeError::Frame(FrameError::Io(err)))?;
-    connect_host_endpoint(config, stream).await
+    #[cfg(unix)]
+    {
+        let stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|err| HandshakeError::Frame(FrameError::Io(err)))?;
+        connect_host_endpoint(config, stream).await
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        let _ = config;
+        Err(HandshakeError::Frame(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Unix domain sockets are not supported on this platform",
+        ))))
+    }
 }
 
 impl HostEvents {

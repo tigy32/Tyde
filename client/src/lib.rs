@@ -28,6 +28,7 @@ use protocol::{
     read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -971,10 +972,23 @@ pub async fn connect_uds(
     path: impl AsRef<Path>,
     config: &ClientConfig,
 ) -> Result<Connection, HandshakeError> {
-    let stream = UnixStream::connect(path)
-        .await
-        .map_err(|err| HandshakeError::Frame(FrameError::Io(err)))?;
-    connect(config, stream).await
+    #[cfg(unix)]
+    {
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|err| HandshakeError::Frame(FrameError::Io(err)))?;
+        connect(config, stream).await
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        let _ = config;
+        Err(HandshakeError::Frame(FrameError::Io(io::Error::new(
+            ErrorKind::Unsupported,
+            "Unix domain sockets are not supported on this platform",
+        ))))
+    }
 }
 
 pub(crate) async fn connect_parts<S>(
