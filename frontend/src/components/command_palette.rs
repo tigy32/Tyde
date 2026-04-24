@@ -4,9 +4,9 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
 use crate::send::send_frame;
-use crate::state::{AppState, DockVisibility, TabContent};
+use crate::state::{AppState, DockVisibility, TabContent, root_display_name};
 
-use protocol::{FrameKind, ProjectFileKind, ProjectRefreshPayload, StreamPath};
+use protocol::{FrameKind, ProjectFileKind, ProjectPath, ProjectRefreshPayload, StreamPath};
 
 #[derive(Clone, Debug)]
 struct CommandEntry {
@@ -65,8 +65,15 @@ const COMMANDS: &[CommandEntry] = &[
 
 #[derive(Clone, Debug, PartialEq)]
 enum PaletteResult {
-    File { name: String, path: String },
-    Command { entry_index: usize },
+    File {
+        name: String,
+        path: ProjectPath,
+        display_path: String,
+        root_label: String,
+    },
+    Command {
+        entry_index: usize,
+    },
 }
 
 fn fuzzy_score(query: &str, target: &str) -> Option<u32> {
@@ -167,7 +174,7 @@ fn do_select(results: Memo<Vec<PaletteResult>>, idx: usize) {
     }
     match &items[idx] {
         PaletteResult::File { path, .. } => {
-            crate::actions::open_file(&state, path);
+            crate::actions::open_file(&state, path.clone());
         }
         PaletteResult::Command { entry_index } => {
             execute_command(&state, COMMANDS[*entry_index].id);
@@ -181,6 +188,7 @@ pub fn CommandPalette() -> impl IntoView {
     let state = expect_context::<AppState>();
     let open = state.command_palette_open;
     let file_tree = state.file_tree;
+    let active_project = state.active_project;
 
     let input = RwSignal::new(String::new());
     let selected_index = RwSignal::new(0usize);
@@ -213,29 +221,55 @@ pub fn CommandPalette() -> impl IntoView {
         } else {
             let query = query_raw.trim();
             let tree = file_tree.get();
-            let mut scored: Vec<(String, String, u32)> = Vec::new();
-            for (_pid, entries) in tree.iter() {
-                for entry in entries {
-                    if entry.kind != ProjectFileKind::File {
-                        continue;
-                    }
-                    let path = &entry.relative_path;
-                    let file_name = path.rsplit('/').next().unwrap_or(path);
-                    let score = if query.is_empty() {
-                        Some(0)
-                    } else {
-                        fuzzy_score(query, file_name).or_else(|| fuzzy_score(query, path))
-                    };
-                    if let Some(s) = score {
-                        scored.push((file_name.to_owned(), path.clone(), s));
+            let Some(active_project) = active_project.get() else {
+                return Vec::new();
+            };
+            let mut scored: Vec<(String, ProjectPath, String, String, u32)> = Vec::new();
+            if let Some(root_listings) = tree.get(&active_project.project_id) {
+                for root_listing in root_listings {
+                    let root_label = root_display_name(&root_listing.root);
+                    for entry in &root_listing.entries {
+                        if entry.kind != ProjectFileKind::File {
+                            continue;
+                        }
+                        let path = &entry.relative_path;
+                        let file_name = path.rsplit('/').next().unwrap_or(path);
+                        let score = if query.is_empty() {
+                            Some(0)
+                        } else {
+                            fuzzy_score(query, file_name).or_else(|| fuzzy_score(query, path))
+                        };
+                        if let Some(s) = score {
+                            scored.push((
+                                file_name.to_owned(),
+                                ProjectPath {
+                                    root: root_listing.root.clone(),
+                                    relative_path: path.clone(),
+                                },
+                                path.clone(),
+                                root_label.clone(),
+                                s,
+                            ));
+                        }
                     }
                 }
             }
-            scored.sort_by(|a, b| b.2.cmp(&a.2));
+            scored.sort_by(|a, b| {
+                b.4.cmp(&a.4)
+                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
             scored
                 .into_iter()
                 .take(10)
-                .map(|(name, path, _)| PaletteResult::File { name, path })
+                .map(
+                    |(name, path, display_path, root_label, _)| PaletteResult::File {
+                        name,
+                        path,
+                        display_path,
+                        root_label,
+                    },
+                )
                 .collect()
         }
     });
@@ -330,7 +364,12 @@ pub fn CommandPalette() -> impl IntoView {
                                     do_select(results, idx);
                                 };
                                 match result {
-                                    PaletteResult::File { name, path } => {
+                                    PaletteResult::File {
+                                        name,
+                                        display_path,
+                                        root_label,
+                                        ..
+                                    } => {
                                         view! {
                                             <div
                                                 class="cp-result-item"
@@ -338,7 +377,8 @@ pub fn CommandPalette() -> impl IntoView {
                                                 on:click=on_click
                                             >
                                                 <span class="cp-file-name">{name}</span>
-                                                <span class="cp-file-path">{path}</span>
+                                                <span class="cp-root-label">{root_label}</span>
+                                                <span class="cp-file-path">{display_path}</span>
                                             </div>
                                         }.into_any()
                                     }

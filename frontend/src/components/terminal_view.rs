@@ -3,12 +3,12 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, DockVisibility, TerminalInfo};
+use crate::state::{AppState, DockVisibility, TerminalInfo, root_display_name};
 use crate::term_bridge;
 
 use protocol::{
-    FrameKind, TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
-    TerminalResizePayload, TerminalSendPayload,
+    FrameKind, ProjectRootPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
 };
 
 #[component]
@@ -48,16 +48,40 @@ pub fn TerminalView() -> impl IntoView {
 fn TerminalTabBar() -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_can_create = state.clone();
+    let selected_root = RwSignal::new(None::<ProjectRootPath>);
+
+    let terminal_roots = Memo::new(move |_| {
+        let active_project = state_for_can_create.active_project.get()?;
+        let project = state_for_can_create
+            .projects
+            .get()
+            .into_iter()
+            .find(|project| {
+                project.host_id == active_project.host_id
+                    && project.project.id == active_project.project_id
+            })?;
+        Some(
+            project
+                .project
+                .roots
+                .into_iter()
+                .map(ProjectRootPath)
+                .collect::<Vec<_>>(),
+        )
+    });
 
     let can_create_terminal = move || {
-        let active_project = state_for_can_create.active_project.get()?;
-        let project = state_for_can_create.active_project_info_untracked()?;
-        let root = project.project.roots.first().cloned()?;
+        let active_project = state.active_project.get()?;
+        let roots = terminal_roots.get()?;
+        let root = selected_root
+            .get()
+            .filter(|selected| roots.iter().any(|root| root == selected))
+            .or_else(|| roots.first().cloned())?;
         Some((active_project, root))
     };
 
     let state_for_new_terminal = state.clone();
-    let can_create_terminal_for_new = can_create_terminal.clone();
+    let can_create_terminal_for_new = can_create_terminal;
     let on_new_terminal = move |_| {
         let (active_project, root) = match can_create_terminal_for_new() {
             Some(v) => v,
@@ -71,7 +95,7 @@ fn TerminalTabBar() -> impl IntoView {
 
         let target = TerminalLaunchTarget::Project {
             project_id: active_project.project_id,
-            root: protocol::ProjectRootPath(root),
+            root,
             relative_cwd: None,
         };
 
@@ -96,6 +120,9 @@ fn TerminalTabBar() -> impl IntoView {
 
     let btn_disabled = move || can_create_terminal().is_none();
     let state_for_tabs = state.clone();
+    let root_options = terminal_roots;
+    let selected_root_for_value = selected_root;
+    let selected_root_for_change = selected_root;
 
     view! {
         <div class="terminal-tab-bar">
@@ -108,6 +135,37 @@ fn TerminalTabBar() -> impl IntoView {
                     <TerminalTab host_id=term.host_id terminal_id=term.terminal_id />
                 </For>
             </div>
+            <Show when=move || root_options.get().is_some_and(|roots| roots.len() > 1)>
+                <select
+                    class="terminal-root-select"
+                    prop:value=move || {
+                        selected_root_for_value
+                            .get()
+                            .map(|root| root.0)
+                            .or_else(|| root_options.get().and_then(|roots| roots.first().map(|root| root.0.clone())))
+                            .unwrap_or_default()
+                    }
+                    on:change=move |ev| {
+                        selected_root_for_change.set(Some(ProjectRootPath(event_target_value(&ev))));
+                    }
+                    title="Terminal root"
+                >
+                    {move || {
+                        root_options
+                            .get()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|root| {
+                                let value = root.0.clone();
+                                let label = root_display_name(&root);
+                                view! {
+                                    <option value=value>{label}</option>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </select>
+            </Show>
             <button
                 class="terminal-new-btn"
                 on:click=on_new_terminal
@@ -138,7 +196,13 @@ fn TerminalTab(host_id: String, terminal_id: TerminalId) -> impl IntoView {
     let term_for_label = term.clone();
     let tid_for_label = terminal_id.clone();
     let label = move || match term_for_label() {
-        Some(t) if !t.shell.is_empty() => t.shell,
+        Some(t) if !t.shell.is_empty() => {
+            if let Some(root) = &t.root {
+                format!("{} · {}", root_display_name(root), t.shell)
+            } else {
+                t.shell
+            }
+        }
         _ => format!("Terminal {}", short_id(&tid_for_label)),
     };
 
@@ -266,7 +330,13 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
 
     let lookup_for_info = lookup.clone();
     let info_text = move || match lookup_for_info() {
-        Some(t) if !t.cwd.is_empty() => format!("{} - {}", t.shell, t.cwd),
+        Some(t) if !t.cwd.is_empty() => {
+            if let Some(root) = &t.root {
+                format!("{} · {} - {}", root_display_name(root), t.shell, t.cwd)
+            } else {
+                format!("{} - {}", t.shell, t.cwd)
+            }
+        }
         _ => "Starting...".to_string(),
     };
 

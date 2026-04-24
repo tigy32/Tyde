@@ -3570,6 +3570,27 @@ kbd {
     color: var(--text-primary);
 }
 
+.fe-add-root {
+    height: 22px;
+    padding: 0 var(--space-2);
+    margin-left: var(--space-2);
+    border-radius: 4px;
+    font-size: 0.769rem;
+    font-weight: 600;
+    color: var(--text-tertiary);
+    flex-shrink: 0;
+}
+
+.fe-add-root:hover:not(:disabled) {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+}
+
+.fe-add-root:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
 .fe-search {
     padding: var(--space-2);
     border-bottom: 1px solid var(--border-primary);
@@ -3579,6 +3600,22 @@ kbd {
     flex: 1;
     overflow-y: auto;
     padding: var(--space-1) 0;
+}
+
+.fe-root-header {
+    padding: var(--space-2) var(--space-3) var(--space-1);
+    color: var(--text-secondary);
+    font-size: 0.769rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fe-root-name {
+    font-family: var(--font-mono);
 }
 
 .fe-dir-group {
@@ -3710,6 +3747,34 @@ kbd {
 .gp-root-section {
     display: flex;
     flex-direction: column;
+}
+
+.gp-root-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3) var(--space-1);
+    color: var(--text-secondary);
+    font-size: 0.769rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.gp-root-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+}
+
+.gp-root-branch {
+    margin-left: auto;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    text-transform: none;
 }
 
 .gp-section {
@@ -4331,6 +4396,20 @@ kbd {
     font-weight: 600;
     font-size: 1rem;
     color: var(--text-primary);
+}
+
+.cp-root-label {
+    flex-shrink: 0;
+    max-width: 140px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--surface-3);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 0.769rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .cp-file-path {
@@ -5153,6 +5232,24 @@ kbd {
 
 .terminal-new-btn:hover {
     color: var(--text-bright);
+}
+
+.terminal-root-select {
+    max-width: 160px;
+    margin: 4px var(--space-1);
+    padding: 0 var(--space-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--surface-1);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 0.769rem;
+    outline: none;
+}
+
+.terminal-root-select:focus {
+    border-color: var(--accent-primary);
+    color: var(--text-primary);
 }
 
 .terminal-body {

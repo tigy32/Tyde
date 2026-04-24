@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewState};
+use crate::state::{AppState, DiffViewState, root_display_name};
 
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectGitChangeKind, ProjectGitFileStatus, ProjectPath,
@@ -33,9 +33,17 @@ pub fn GitPanel() -> impl IntoView {
                 <span class="gp-branch">
                     {move || {
                         git_roots.get()
-                            .and_then(|roots| roots.first().cloned())
-                            .and_then(|r| r.branch.clone())
-                            .map(|b| format!("\u{238b} {b}"))
+                            .map(|roots| {
+                                if roots.len() == 1 {
+                                    roots
+                                        .first()
+                                        .and_then(|r| r.branch.clone())
+                                        .map(|b| format!("\u{238b} {b}"))
+                                        .unwrap_or_else(|| "\u{238b} --".to_owned())
+                                } else {
+                                    format!("\u{238b} {} roots", roots.len())
+                                }
+                            })
                             .unwrap_or_else(|| "\u{238b} --".to_owned())
                     }}
                 </span>
@@ -101,9 +109,16 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
     let root_for_staged = root_path.clone();
     let root_for_unstaged = root_path.clone();
     let root_for_untracked = root_path;
+    let root_label = root_display_name(&root.root);
+    let root_title = root.root.0.clone();
+    let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
 
     view! {
         <div class="gp-root-section">
+            <div class="gp-root-header" title=root_title>
+                <span class="gp-root-name">{root_label}</span>
+                <span class="gp-root-branch">{branch_label}</span>
+            </div>
             <Show when=move || has_staged>
                 <GitFileSection
                     title=format!("Staged Changes [{staged_count}]")
@@ -241,7 +256,11 @@ fn change_kind_class(kind: Option<ProjectGitChangeKind>) -> &'static str {
 
 fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
     let state = expect_context::<AppState>();
-    let label = format!("Diff: {}", path.rsplit('/').next().unwrap_or(&path));
+    let label = format!(
+        "Diff: {}/{}",
+        root_display_name(&root),
+        path.rsplit('/').next().unwrap_or(&path)
+    );
     state.open_tab(
         crate::state::TabContent::Diff {
             root: root.clone(),

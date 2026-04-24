@@ -239,6 +239,9 @@ fn resolve_chat_file_href(href: &str, project_roots: &[String]) -> Option<Projec
         return None;
     }
 
+    if project_roots.len() != 1 {
+        return None;
+    }
     let root = project_roots.first()?.clone();
     Some(ProjectPath {
         root: ProjectRootPath(root),

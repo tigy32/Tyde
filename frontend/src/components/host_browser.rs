@@ -3,7 +3,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     FrameKind, HostAbsPath, HostBrowseClosePayload, HostBrowseListPayload, HostBrowseStartPayload,
-    ProjectCreatePayload, ProjectFileKind, StreamPath,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectFileKind, StreamPath,
 };
 
 use crate::send::send_frame;
@@ -19,12 +19,29 @@ pub fn open_project_browser(state: &AppState) {
         log::error!("cannot open browser without a selected connected host");
         return;
     };
+    open_browser_for(state, host_id, BrowsePurpose::OpenProject);
+}
 
+pub fn open_add_root_browser(state: &AppState) {
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        log::error!("cannot add a root without an active project");
+        return;
+    };
+    open_browser_for(
+        state,
+        active_project.host_id,
+        BrowsePurpose::AddRoot {
+            project_id: active_project.project_id,
+        },
+    );
+}
+
+fn open_browser_for(state: &AppState, host_id: String, purpose: BrowsePurpose) {
     let browse_stream = new_browse_stream();
     let dialog = BrowseDialogState {
         host_id: host_id.clone(),
         browse_stream: browse_stream.clone(),
-        purpose: BrowsePurpose::OpenProject,
+        purpose,
         include_hidden: ArcRwSignal::new(false),
         platform: ArcRwSignal::new(None),
         separator: ArcRwSignal::new('/'),
@@ -37,8 +54,7 @@ pub fn open_project_browser(state: &AppState) {
     };
     state.browse_dialog.set(Some(dialog));
 
-    let host_stream_path = state.host_stream_untracked(&host_id);
-    let Some(host_stream_path) = host_stream_path else {
+    let Some(host_stream_path) = state.host_stream_untracked(&host_id) else {
         log::error!("host {host_id} has no active host stream");
         state.browse_dialog.set(None);
         return;
@@ -223,11 +239,12 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let state_for_confirm = state.clone();
     let current_path_for_confirm = current_path.clone();
     let dialog_purpose = dialog.purpose.clone();
+    let dialog_host_id_for_confirm = dialog.host_id.clone();
     let on_confirm = move |_| {
         let Some(path) = current_path_for_confirm.get_untracked() else {
             return;
         };
-        match dialog_purpose {
+        match dialog_purpose.clone() {
             BrowsePurpose::OpenProject => {
                 let name = path
                     .0
@@ -235,10 +252,9 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     .find(|segment| !segment.is_empty())
                     .unwrap_or(&path.0)
                     .to_owned();
-                let Some((host_id, host_stream)) =
-                    state_for_confirm.selected_host_stream_untracked()
-                else {
-                    log::error!("cannot create project without a selected connected host");
+                let host_id = dialog_host_id_for_confirm.clone();
+                let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
+                    log::error!("cannot create project without a connected dialog host");
                     return;
                 };
                 spawn_local(async move {
@@ -254,6 +270,29 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     .await
                     {
                         log::error!("failed to send ProjectCreate: {error}");
+                    }
+                });
+                close_dialog(&state_for_confirm);
+            }
+            BrowsePurpose::AddRoot { project_id } => {
+                let host_id = dialog_host_id_for_confirm.clone();
+                let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
+                    log::error!("cannot add root without a connected dialog host");
+                    return;
+                };
+                spawn_local(async move {
+                    if let Err(error) = send_frame(
+                        &host_id,
+                        host_stream,
+                        FrameKind::ProjectAddRoot,
+                        &ProjectAddRootPayload {
+                            id: project_id,
+                            root: path.0,
+                        },
+                    )
+                    .await
+                    {
+                        log::error!("failed to send ProjectAddRoot: {error}");
                     }
                 });
                 close_dialog(&state_for_confirm);
@@ -366,6 +405,11 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
         move || current_path.get().is_some()
     };
 
+    let confirm_label = match &dialog.purpose {
+        BrowsePurpose::OpenProject => "Open Project Here",
+        BrowsePurpose::AddRoot { .. } => "Add Root",
+    };
+
     view! {
         <div class="browser-backdrop" on:click=on_backdrop on:keydown=on_modal_keydown tabindex="0">
             <div class="browser-modal" on:click=|ev| ev.stop_propagation()>
@@ -399,7 +443,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                         class="browser-btn browser-btn-primary"
                         on:click=on_confirm
                         disabled=move || !can_confirm()
-                    >"Open Project Here"</button>
+                    >{confirm_label}</button>
                 </div>
             </div>
         </div>

@@ -4,12 +4,13 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::open_file;
+use crate::components::host_browser::open_add_root_browser;
 use crate::send::send_frame;
-use crate::state::AppState;
+use crate::state::{AppState, display_path_name, root_display_name};
 
 use protocol::{
-    FrameKind, ProjectFileEntry, ProjectFileKind, ProjectListDirPayload, ProjectRootPath,
-    StreamPath,
+    FrameKind, ProjectFileEntry, ProjectFileKind, ProjectListDirPayload, ProjectPath,
+    ProjectRootPath, StreamPath,
 };
 
 /// A node in the file tree built from the flat entry list.
@@ -106,13 +107,39 @@ pub fn FileExplorer() -> impl IntoView {
     let tree = Memo::new(move |_| {
         let pid = state.active_project.get()?.project_id;
         let file_map = state.file_tree.get();
-        let entries = file_map.get(&pid)?;
-        Some(build_tree(entries))
+        let roots = file_map.get(&pid)?;
+        Some(
+            roots
+                .iter()
+                .map(|root| (root.root.clone(), build_tree(&root.entries)))
+                .collect::<Vec<_>>(),
+        )
     });
 
-    let project_root = Memo::new(move |_| {
-        let project = state.active_project_info_untracked()?;
-        project.project.roots.first().cloned()
+    let project_header = Memo::new(move |_| {
+        let active = state.active_project.get()?;
+        state
+            .projects
+            .get()
+            .into_iter()
+            .find(|project| {
+                project.host_id == active.host_id && project.project.id == active.project_id
+            })
+            .map(|project| {
+                let root_count = project.project.roots.len();
+                let title = project.project.roots.join("\n");
+                let label = if root_count == 1 {
+                    project
+                        .project
+                        .roots
+                        .first()
+                        .map(|root| display_path_name(root))
+                        .unwrap_or_else(|| project.project.name.clone())
+                } else {
+                    format!("{} · {root_count} roots", project.project.name)
+                };
+                (label, title)
+            })
     });
 
     let on_filter_input = move |ev: leptos::ev::Event| {
@@ -123,18 +150,28 @@ pub fn FileExplorer() -> impl IntoView {
         show_hidden.update(|v| *v = !*v);
     };
 
+    let state_for_add_root = state.clone();
+    let on_add_root = move |_| open_add_root_browser(&state_for_add_root);
+    let add_root_disabled = move || state.active_project.get().is_none();
+
     view! {
         <div class="file-explorer">
             <div class="fe-header">
-                <span class="fe-breadcrumb" title=move || project_root.get().unwrap_or_default()>
+                <span class="fe-breadcrumb" title=move || project_header.get().map(|(_, title)| title).unwrap_or_default()>
                     {move || {
-                        project_root.get()
-                            .map(|r| {
-                                r.rsplit('/').next().unwrap_or(&r).to_owned()
-                            })
+                        project_header.get()
+                            .map(|(label, _)| label)
                             .unwrap_or_else(|| "No project".to_owned())
                     }}
                 </span>
+                <button
+                    class="fe-add-root"
+                    title="Add workspace root"
+                    on:click=on_add_root
+                    disabled=add_root_disabled
+                >
+                    "+ root"
+                </button>
                 <button
                     class="fe-toggle-hidden"
                     title="Toggle hidden files"
@@ -159,10 +196,15 @@ pub fn FileExplorer() -> impl IntoView {
             <div class="fe-tree">
                 {move || {
                     match tree.get() {
-                        Some(nodes) => {
+                        Some(root_trees) => {
                             let filter_val = filter.get().to_lowercase();
                             let hidden = show_hidden.get();
-                            render_nodes(nodes, 0, &filter_val, hidden, expanded_dirs)
+                            root_trees
+                                .into_iter()
+                                .flat_map(|(root, nodes)| {
+                                    render_root_section(root, nodes, &filter_val, hidden, expanded_dirs)
+                                })
+                                .collect::<Vec<_>>()
                         }
                         None => vec![
                             view! {
@@ -177,20 +219,14 @@ pub fn FileExplorer() -> impl IntoView {
 }
 
 /// Send a ProjectListDir request so the server returns 2 levels of entries under `dir_path`.
-fn request_dir_listing(state: &AppState, dir_relative_path: &str) {
+fn request_dir_listing(state: &AppState, root: ProjectRootPath, dir_relative_path: &str) {
     let Some(active_project) = state.active_project_ref_untracked() else {
         return;
     };
     let project_id = active_project.project_id.clone();
-    let Some(project) = state.active_project_info_untracked() else {
-        return;
-    };
-    let Some(root) = project.project.roots.first().cloned() else {
-        return;
-    };
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = ProjectListDirPayload {
-        root: ProjectRootPath(root),
+        root,
         path: dir_relative_path.to_owned(),
     };
     spawn_local(async move {
@@ -207,7 +243,41 @@ fn request_dir_listing(state: &AppState, dir_relative_path: &str) {
     });
 }
 
+fn render_root_section(
+    root: ProjectRootPath,
+    nodes: Vec<TreeNode>,
+    filter: &str,
+    show_hidden: bool,
+    expanded_dirs: RwSignal<HashSet<String>>,
+) -> Vec<AnyView> {
+    let mut views = Vec::new();
+    let root_label = root_display_name(&root);
+    let root_title = root.0.clone();
+    views.push(
+        view! {
+            <div class="fe-root-header" title=root_title>
+                <span class="fe-root-name">{root_label}</span>
+            </div>
+        }
+        .into_any(),
+    );
+    views.extend(render_nodes(
+        root,
+        nodes,
+        0,
+        filter,
+        show_hidden,
+        expanded_dirs,
+    ));
+    views
+}
+
+fn expanded_key(root: &ProjectRootPath, relative_path: &str) -> String {
+    format!("{}\u{0}{relative_path}", root.0)
+}
+
 fn render_nodes(
+    root: ProjectRootPath,
     nodes: Vec<TreeNode>,
     depth: usize,
     filter: &str,
@@ -237,12 +307,14 @@ fn render_nodes(
                     let dir_path = node.relative_path.clone();
                     let children = node.children.clone();
                     let filter_owned = filter.to_owned();
+                    let root_for_expand = root.clone();
+                    let key = expanded_key(&root_for_expand, &dir_path);
                     let is_expanded = {
-                        let dir_path = dir_path.clone();
-                        Signal::derive(move || {
-                            expanded_dirs.with(|set| set.contains(&dir_path))
-                        })
+                        let key = key.clone();
+                        Signal::derive(move || expanded_dirs.with(|set| set.contains(&key)))
                     };
+                    let root_for_click = root.clone();
+                    let root_for_children = root.clone();
 
                     view! {
                         <div class="fe-dir-group">
@@ -251,19 +323,21 @@ fn render_nodes(
                                 style=format!("padding-left: {}px", indent + 4)
                                 on:click={
                                     let dir_path = dir_path.clone();
+                                    let root = root_for_click.clone();
+                                    let key = key.clone();
                                     move |_| {
                                         let opening = !expanded_dirs
-                                            .with_untracked(|set| set.contains(&dir_path));
+                                            .with_untracked(|set| set.contains(&key));
                                         expanded_dirs.update(|set| {
                                             if opening {
-                                                set.insert(dir_path.clone());
+                                                set.insert(key.clone());
                                             } else {
-                                                set.remove(&dir_path);
+                                                set.remove(&key);
                                             }
                                         });
                                         if opening {
                                             let state = expect_context::<AppState>();
-                                            request_dir_listing(&state, &dir_path);
+                                            request_dir_listing(&state, root.clone(), &dir_path);
                                         }
                                     }
                                 }
@@ -276,7 +350,8 @@ fn render_nodes(
                                 {
                                     let children = children.clone();
                                     let filter_owned = filter_owned.clone();
-                                    move || render_nodes(children.clone(), depth + 1, &filter_owned, show_hidden, expanded_dirs)
+                                    let root = root_for_children.clone();
+                                    move || render_nodes(root.clone(), children.clone(), depth + 1, &filter_owned, show_hidden, expanded_dirs)
                                 }
                             </Show>
                         </div>
@@ -286,9 +361,16 @@ fn render_nodes(
                 _ => {
                     let icon = file_type_icon(&node.name);
                     let path = node.relative_path.clone();
+                    let root_for_click = root.clone();
                     let on_click = move |_| {
                         let state = expect_context::<AppState>();
-                        open_file(&state, &path);
+                        open_file(
+                            &state,
+                            ProjectPath {
+                                root: root_for_click.clone(),
+                                relative_path: path.clone(),
+                            },
+                        );
                     };
                     view! {
                         <button

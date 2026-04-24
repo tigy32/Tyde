@@ -21,7 +21,7 @@ use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
     OpenFile, ProjectInfo, SessionInfo, StreamingState, TabContent, TerminalInfo, ToolRequestEntry,
-    TransientEvent, reduce_diff_response, sort_project_infos,
+    TransientEvent, reduce_diff_response, root_display_name, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -586,29 +586,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             };
             match envelope.parse_payload::<ProjectFileListPayload>() {
                 Ok(payload) => {
-                    let diff_entries: Vec<_> = payload
-                        .roots
-                        .into_iter()
-                        .flat_map(|root| root.entries)
-                        .collect();
                     state.file_tree.update(|file_tree| {
-                        let existing = file_tree.entry(project_id.clone()).or_default();
-                        for entry in diff_entries {
-                            match entry.op {
-                                protocol::FileEntryOp::Add => {
-                                    if !existing.iter().any(|existing| {
-                                        existing.relative_path == entry.relative_path
-                                    }) {
-                                        existing.push(entry);
-                                    }
-                                }
-                                protocol::FileEntryOp::Remove => {
-                                    existing.retain(|existing| {
-                                        existing.relative_path != entry.relative_path
-                                    });
-                                }
-                            }
-                        }
+                        apply_project_file_list(file_tree, project_id, payload);
                     });
                 }
                 Err(error) => report_dispatch_error(
@@ -675,12 +654,20 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
                 Ok(payload) => {
                     let path = payload.path.clone();
-                    let label = path
+                    let base_label = path
                         .relative_path
                         .rsplit('/')
                         .next()
                         .unwrap_or(&path.relative_path)
                         .to_string();
+                    let multi_root = state
+                        .active_project_info_untracked()
+                        .is_some_and(|project| project.project.roots.len() > 1);
+                    let label = if multi_root {
+                        format!("{base_label} · {}", root_display_name(&path.root))
+                    } else {
+                        base_label
+                    };
                     state.open_files.update(|files| {
                         files.insert(
                             path.clone(),
@@ -709,6 +696,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     terminal_id: payload.terminal_id,
                     stream: payload.stream,
                     project_id: None,
+                    root: None,
                     cwd: String::new(),
                     shell: String::new(),
                     cols: 80,
@@ -759,6 +747,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         terminal.host_id == host_id && terminal.stream == envelope.stream
                     }) {
                         terminal.project_id = payload.project_id;
+                        terminal.root = payload.root;
                         terminal.cwd = payload.cwd;
                         terminal.shell = payload.shell;
                         terminal.cols = payload.cols;
@@ -974,6 +963,49 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
         }
+    }
+}
+
+fn apply_project_file_list(
+    file_tree: &mut HashMap<ProjectId, Vec<protocol::ProjectRootListing>>,
+    project_id: ProjectId,
+    payload: ProjectFileListPayload,
+) {
+    let existing_roots = file_tree.entry(project_id).or_default();
+    for incoming_root in payload.roots {
+        let root_index = existing_roots
+            .iter()
+            .position(|existing| existing.root == incoming_root.root)
+            .unwrap_or_else(|| {
+                existing_roots.push(protocol::ProjectRootListing {
+                    root: incoming_root.root.clone(),
+                    entries: Vec::new(),
+                });
+                existing_roots.len() - 1
+            });
+        let existing_root = &mut existing_roots[root_index];
+
+        for entry in incoming_root.entries {
+            match entry.op {
+                protocol::FileEntryOp::Add => {
+                    if !existing_root
+                        .entries
+                        .iter()
+                        .any(|existing| existing.relative_path == entry.relative_path)
+                    {
+                        existing_root.entries.push(entry);
+                    }
+                }
+                protocol::FileEntryOp::Remove => {
+                    existing_root
+                        .entries
+                        .retain(|existing| existing.relative_path != entry.relative_path);
+                }
+            }
+        }
+        existing_root
+            .entries
+            .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     }
 }
 
@@ -1493,5 +1525,104 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                     });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{FileEntryOp, ProjectFileEntry, ProjectFileKind, ProjectRootPath};
+
+    fn file_entry(relative_path: &str, op: FileEntryOp) -> ProjectFileEntry {
+        ProjectFileEntry {
+            relative_path: relative_path.to_owned(),
+            kind: ProjectFileKind::File,
+            op,
+        }
+    }
+
+    fn root_listing(root: &str, entries: Vec<ProjectFileEntry>) -> protocol::ProjectRootListing {
+        protocol::ProjectRootListing {
+            root: ProjectRootPath(root.to_owned()),
+            entries,
+        }
+    }
+
+    #[test]
+    fn file_list_preserves_same_relative_path_in_different_roots() {
+        let project_id = ProjectId("project".to_owned());
+        let mut file_tree = HashMap::new();
+
+        apply_project_file_list(
+            &mut file_tree,
+            project_id.clone(),
+            ProjectFileListPayload {
+                incremental: false,
+                roots: vec![
+                    root_listing(
+                        "/repo/root-a",
+                        vec![file_entry("same.txt", FileEntryOp::Add)],
+                    ),
+                    root_listing(
+                        "/repo/root-b",
+                        vec![file_entry("same.txt", FileEntryOp::Add)],
+                    ),
+                ],
+            },
+        );
+
+        let roots = file_tree.get(&project_id).expect("project file tree");
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].root.0, "/repo/root-a");
+        assert_eq!(roots[1].root.0, "/repo/root-b");
+        assert_eq!(roots[0].entries[0].relative_path, "same.txt");
+        assert_eq!(roots[1].entries[0].relative_path, "same.txt");
+    }
+
+    #[test]
+    fn file_list_remove_is_scoped_to_root() {
+        let project_id = ProjectId("project".to_owned());
+        let mut file_tree = HashMap::new();
+
+        apply_project_file_list(
+            &mut file_tree,
+            project_id.clone(),
+            ProjectFileListPayload {
+                incremental: false,
+                roots: vec![
+                    root_listing(
+                        "/repo/root-a",
+                        vec![file_entry("same.txt", FileEntryOp::Add)],
+                    ),
+                    root_listing(
+                        "/repo/root-b",
+                        vec![file_entry("same.txt", FileEntryOp::Add)],
+                    ),
+                ],
+            },
+        );
+        apply_project_file_list(
+            &mut file_tree,
+            project_id.clone(),
+            ProjectFileListPayload {
+                incremental: true,
+                roots: vec![root_listing(
+                    "/repo/root-a",
+                    vec![file_entry("same.txt", FileEntryOp::Remove)],
+                )],
+            },
+        );
+
+        let roots = file_tree.get(&project_id).expect("project file tree");
+        let root_a = roots
+            .iter()
+            .find(|root| root.root.0 == "/repo/root-a")
+            .expect("root-a");
+        let root_b = roots
+            .iter()
+            .find(|root| root.root.0 == "/repo/root-b")
+            .expect("root-b");
+        assert!(root_a.entries.is_empty());
+        assert_eq!(root_b.entries[0].relative_path, "same.txt");
     }
 }

@@ -6,7 +6,7 @@ use crate::state::{AppState, TabContent, sort_project_infos};
 
 use protocol::{
     BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload, ProjectId, ProjectPath,
-    ProjectReadFilePayload, ProjectReorderPayload, ProjectRootPath, SessionSettingsValues,
+    ProjectReadFilePayload, ProjectReorderPayload, SessionSettingsValues,
     SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 
@@ -134,23 +134,8 @@ pub fn spawn_new_chat(
     });
 }
 
-pub fn open_file(state: &AppState, relative_path: &str) {
-    let Some(project) = state.active_project_info_untracked() else {
-        log::error!("open_file: active project not found");
-        return;
-    };
-    let Some(root) = project.project.roots.first().cloned() else {
-        log::error!("open_file: project has no roots");
-        return;
-    };
-
-    open_project_path(
-        state,
-        ProjectPath {
-            root: ProjectRootPath(root),
-            relative_path: relative_path.to_owned(),
-        },
-    );
+pub fn open_file(state: &AppState, path: ProjectPath) {
+    open_project_path(state, path);
 }
 
 pub fn open_project_path(state: &AppState, path: ProjectPath) {

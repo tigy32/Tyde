@@ -6,8 +6,8 @@ use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
     DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform,
-    HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope, ProjectFileEntry,
-    ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus,
+    HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope, ProjectGitDiffFile,
+    ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
     ProjectRootPath, QueuedMessageEntry, SessionSchemaEntry, SessionSettingsValues, SessionSummary,
     Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, TerminalId,
     ToolExecutionCompletedData, ToolRequest,
@@ -352,6 +352,7 @@ pub struct TerminalInfo {
     pub terminal_id: TerminalId,
     pub stream: StreamPath,
     pub project_id: Option<ProjectId>,
+    pub root: Option<ProjectRootPath>,
     pub cwd: String,
     pub shell: String,
     pub cols: u16,
@@ -387,6 +388,20 @@ pub struct ProjectInfo {
     pub project: Project,
 }
 
+pub fn root_display_name(root: &ProjectRootPath) -> String {
+    display_path_name(&root.0)
+}
+
+pub fn display_path_name(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
 pub fn sort_project_infos(projects: &mut [ProjectInfo]) {
     projects.sort_by(|left, right| {
         left.host_id
@@ -408,6 +423,7 @@ pub struct SessionInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowsePurpose {
     OpenProject,
+    AddRoot { project_id: ProjectId },
 }
 
 #[derive(Clone, Debug)]
@@ -501,7 +517,7 @@ pub struct AppState {
     pub left_dock: RwSignal<DockVisibility>,
     pub right_dock: RwSignal<DockVisibility>,
     pub bottom_dock: RwSignal<DockVisibility>,
-    pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectFileEntry>>>,
+    pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
     pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
     pub diff_contents: RwSignal<HashMap<(ProjectRootPath, ProjectDiffScope), DiffViewState>>,
