@@ -1,13 +1,15 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::window;
 
 use crate::send::send_frame;
 use crate::state::{AppState, DiffViewState, root_display_name};
 
 use protocol::{
-    FrameKind, ProjectDiffScope, ProjectGitChangeKind, ProjectGitFileStatus, ProjectPath,
-    ProjectReadDiffPayload, ProjectRefreshPayload, ProjectRootGitStatus, ProjectRootPath,
-    ProjectStageFilePayload, StreamPath,
+    FrameKind, ProjectDiffScope, ProjectDiscardFilePayload, ProjectGitChangeKind,
+    ProjectGitCommitPayload, ProjectGitFileStatus, ProjectPath, ProjectReadDiffPayload,
+    ProjectRefreshPayload, ProjectRootGitStatus, ProjectRootPath, ProjectStageFilePayload,
+    ProjectUnstageFilePayload, StreamPath,
 };
 
 #[component]
@@ -108,18 +110,64 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
 
     let root_for_staged = root_path.clone();
     let root_for_unstaged = root_path.clone();
-    let root_for_untracked = root_path;
+    let root_for_untracked = root_path.clone();
+    let root_for_commit = root_path;
     let root_label = root_display_name(&root.root);
     let root_title = root.root.0.clone();
     let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
+
+    let ahead_behind = if root.ahead > 0 || root.behind > 0 {
+        let mut parts = Vec::new();
+        if root.ahead > 0 {
+            parts.push(format!("\u{2191}{}", root.ahead));
+        }
+        if root.behind > 0 {
+            parts.push(format!("\u{2193}{}", root.behind));
+        }
+        Some(parts.join(" "))
+    } else {
+        None
+    };
+
+    let commit_message = RwSignal::new(String::new());
 
     view! {
         <div class="gp-root-section">
             <div class="gp-root-header" title=root_title>
                 <span class="gp-root-name">{root_label}</span>
                 <span class="gp-root-branch">{branch_label}</span>
+                {ahead_behind.map(|ab| view! {
+                    <span class="gp-root-ahead-behind">{ab}</span>
+                })}
             </div>
             <Show when=move || has_staged>
+                <div class="gp-commit-area">
+                    <textarea
+                        class="gp-commit-input"
+                        placeholder="Commit message"
+                        rows="3"
+                        prop:value=move || commit_message.get()
+                        on:input=move |ev| {
+                            commit_message.set(event_target_value(&ev));
+                        }
+                    />
+                    <button
+                        class="gp-commit-btn"
+                        disabled=move || commit_message.get().trim().is_empty()
+                        on:click={
+                            let root = root_for_commit.clone();
+                            move |_| {
+                                let msg = commit_message.get();
+                                if !msg.trim().is_empty() {
+                                    send_commit(root.clone(), msg);
+                                    commit_message.set(String::new());
+                                }
+                            }
+                        }
+                    >
+                        "Commit"
+                    </button>
+                </div>
                 <GitFileSection
                     title=format!("Staged Changes [{staged_count}]")
                     files=staged.clone()
@@ -127,6 +175,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     scope=ProjectDiffScope::Staged
                     root_path=root_for_staged.clone()
                     show_stage_btn=false
+                    show_unstage_btn=true
+                    show_discard_btn=false
                 />
             </Show>
             <Show when=move || has_unstaged>
@@ -137,6 +187,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     scope=ProjectDiffScope::Unstaged
                     root_path=root_for_unstaged.clone()
                     show_stage_btn=true
+                    show_unstage_btn=false
+                    show_discard_btn=true
                 />
             </Show>
             <Show when=move || has_untracked>
@@ -147,6 +199,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     scope=ProjectDiffScope::Unstaged
                     root_path=root_for_untracked.clone()
                     show_stage_btn=true
+                    show_unstage_btn=false
+                    show_discard_btn=true
                 />
             </Show>
         </div>
@@ -161,15 +215,59 @@ fn GitFileSection(
     scope: ProjectDiffScope,
     root_path: ProjectRootPath,
     show_stage_btn: bool,
+    show_unstage_btn: bool,
+    show_discard_btn: bool,
 ) -> impl IntoView {
     let toggle = move |_| expanded.update(|v| *v = !*v);
 
+    // Bulk action data
+    let bulk_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
+    let bulk_root = root_path.clone();
+
     view! {
         <div class="gp-section">
-            <button class="gp-section-header" on:click=toggle>
-                <span class="fe-chevron">{move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
-                <span class="gp-section-title">{title}</span>
-            </button>
+            <div class="gp-section-header-row">
+                <button class="gp-section-header" on:click=toggle>
+                    <span class="fe-chevron">{move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
+                    <span class="gp-section-title">{title}</span>
+                </button>
+                <div class="gp-section-actions">
+                    {show_stage_btn.then(|| {
+                        let root = bulk_root.clone();
+                        let paths = bulk_paths.clone();
+                        view! {
+                            <button
+                                class="gp-section-action"
+                                title="Stage all"
+                                on:click=move |_| {
+                                    for path in &paths {
+                                        stage_file(root.clone(), path.clone());
+                                    }
+                                }
+                            >
+                                "++"
+                            </button>
+                        }
+                    })}
+                    {show_unstage_btn.then(|| {
+                        let root = bulk_root.clone();
+                        let paths = bulk_paths.clone();
+                        view! {
+                            <button
+                                class="gp-section-action"
+                                title="Unstage all"
+                                on:click=move |_| {
+                                    for path in &paths {
+                                        unstage_file(root.clone(), path.clone());
+                                    }
+                                }
+                            >
+                                "\u{2212}\u{2212}"
+                            </button>
+                        }
+                    })}
+                </div>
+            </div>
             <Show when=move || expanded.get()>
                 <div class="gp-section-files">
                     {files.iter().map(|file| {
@@ -194,6 +292,10 @@ fn GitFileSection(
                         let path_for_click = path.clone();
                         let root_for_stage = root_path.clone();
                         let path_for_stage = path.clone();
+                        let root_for_unstage = root_path.clone();
+                        let path_for_unstage = path.clone();
+                        let root_for_discard = root_path.clone();
+                        let path_for_discard = path.clone();
 
                         view! {
                             <div class="gp-file-row">
@@ -206,21 +308,53 @@ fn GitFileSection(
                                     <span class=icon_class>{icon}</span>
                                     <span class="gp-file-path">{path.clone()}</span>
                                 </button>
-                                {show_stage_btn.then(|| {
-                                    let root = root_for_stage.clone();
-                                    let path = path_for_stage.clone();
-                                    view! {
-                                        <button
-                                            class="gp-stage-btn"
-                                            title="Stage file"
-                                            on:click=move |_| {
-                                                stage_file(root.clone(), path.clone());
-                                            }
-                                        >
-                                            "+"
-                                        </button>
-                                    }
-                                })}
+                                <div class="gp-file-actions">
+                                    {show_discard_btn.then(|| {
+                                        let root = root_for_discard.clone();
+                                        let path = path_for_discard.clone();
+                                        view! {
+                                            <button
+                                                class="gp-discard-btn"
+                                                title="Discard changes"
+                                                on:click=move |_| {
+                                                    discard_file(root.clone(), path.clone());
+                                                }
+                                            >
+                                                "\u{2715}"
+                                            </button>
+                                        }
+                                    })}
+                                    {show_stage_btn.then(|| {
+                                        let root = root_for_stage.clone();
+                                        let path = path_for_stage.clone();
+                                        view! {
+                                            <button
+                                                class="gp-stage-btn"
+                                                title="Stage file"
+                                                on:click=move |_| {
+                                                    stage_file(root.clone(), path.clone());
+                                                }
+                                            >
+                                                "+"
+                                            </button>
+                                        }
+                                    })}
+                                    {show_unstage_btn.then(|| {
+                                        let root = root_for_unstage.clone();
+                                        let path = path_for_unstage.clone();
+                                        view! {
+                                            <button
+                                                class="gp-unstage-btn"
+                                                title="Unstage file"
+                                                on:click=move |_| {
+                                                    unstage_file(root.clone(), path.clone());
+                                                }
+                                            >
+                                                "\u{2212}"
+                                            </button>
+                                        }
+                                    })}
+                                </div>
                             </div>
                         }
                     }).collect::<Vec<_>>()}
@@ -341,6 +475,89 @@ fn stage_file(root: ProjectRootPath, path: String) {
         .await
         {
             log::error!("failed to send ProjectStageFile: {e}");
+        }
+    });
+}
+
+fn unstage_file(root: ProjectRootPath, path: String) {
+    let state = expect_context::<AppState>();
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let project_id = active_project.project_id.clone();
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    spawn_local(async move {
+        let payload = ProjectUnstageFilePayload {
+            path: ProjectPath {
+                root,
+                relative_path: path,
+            },
+        };
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectUnstageFile,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send ProjectUnstageFile: {e}");
+        }
+    });
+}
+
+fn discard_file(root: ProjectRootPath, path: String) {
+    let Some(win) = window() else { return };
+    let message = format!("Discard changes to \"{}\"? This cannot be undone.", path);
+    match win.confirm_with_message(&message) {
+        Ok(true) => {}
+        _ => return,
+    }
+
+    let state = expect_context::<AppState>();
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let project_id = active_project.project_id.clone();
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    spawn_local(async move {
+        let payload = ProjectDiscardFilePayload {
+            path: ProjectPath {
+                root,
+                relative_path: path,
+            },
+        };
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectDiscardFile,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send ProjectDiscardFile: {e}");
+        }
+    });
+}
+
+fn send_commit(root: ProjectRootPath, message: String) {
+    let state = expect_context::<AppState>();
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let project_id = active_project.project_id.clone();
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    spawn_local(async move {
+        let payload = ProjectGitCommitPayload { root, message };
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectGitCommit,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send ProjectGitCommit: {e}");
         }
     });
 }

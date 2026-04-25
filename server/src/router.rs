@@ -8,9 +8,10 @@ use protocol::{
     EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
     McpServerUpsertPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectId, ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
-    ProjectStageHunkPayload, RunBackendSetupPayload, SendMessagePayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
@@ -412,6 +413,53 @@ pub(crate) async fn route_client_envelope(
                 )?;
                 ensure_non_empty("project_stage_hunk", "hunk_id", payload.hunk_id.as_str())?;
                 host.stage_project_hunk(
+                    connection_host_stream,
+                    project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::ProjectUnstageFile => {
+                let payload: ProjectUnstageFilePayload =
+                    parse_payload(&envelope, "project_unstage_file")?;
+                ensure_non_empty("project_unstage_file", "root", payload.path.root.0.as_str())?;
+                ensure_non_empty(
+                    "project_unstage_file",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
+                host.unstage_project_file(
+                    connection_host_stream,
+                    project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::ProjectDiscardFile => {
+                let payload: ProjectDiscardFilePayload =
+                    parse_payload(&envelope, "project_discard_file")?;
+                ensure_non_empty("project_discard_file", "root", payload.path.root.0.as_str())?;
+                ensure_non_empty(
+                    "project_discard_file",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
+                host.discard_project_file(
+                    connection_host_stream,
+                    project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::ProjectGitCommit => {
+                let payload: ProjectGitCommitPayload =
+                    parse_payload(&envelope, "project_git_commit")?;
+                ensure_non_empty("project_git_commit", "root", payload.root.0.as_str())?;
+                ensure_non_empty("project_git_commit", "message", payload.message.as_str())?;
+                host.commit_project(
                     connection_host_stream,
                     project_output_stream,
                     project_id,

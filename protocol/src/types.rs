@@ -236,6 +236,9 @@ pub enum FrameKind {
     ProjectReadFile,
     ProjectStageFile,
     ProjectStageHunk,
+    ProjectUnstageFile,
+    ProjectDiscardFile,
+    ProjectGitCommit,
     ProjectListDir,
     HostBrowseStart,
     HostBrowseList,
@@ -267,6 +270,7 @@ pub enum FrameKind {
     ProjectGitStatus,
     ProjectFileContents,
     ProjectGitDiff,
+    ProjectGitCommitResult,
     NewTerminal,
     TerminalStart,
     TerminalOutput,
@@ -315,6 +319,9 @@ impl fmt::Display for FrameKind {
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
             Self::ProjectStageHunk => f.write_str("project_stage_hunk"),
+            Self::ProjectUnstageFile => f.write_str("project_unstage_file"),
+            Self::ProjectDiscardFile => f.write_str("project_discard_file"),
+            Self::ProjectGitCommit => f.write_str("project_git_commit"),
             Self::ProjectListDir => f.write_str("project_list_dir"),
             Self::HostBrowseStart => f.write_str("host_browse_start"),
             Self::HostBrowseList => f.write_str("host_browse_list"),
@@ -342,6 +349,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectGitStatus => f.write_str("project_git_status"),
             Self::ProjectFileContents => f.write_str("project_file_contents"),
             Self::ProjectGitDiff => f.write_str("project_git_diff"),
+            Self::ProjectGitCommitResult => f.write_str("project_git_commit_result"),
             Self::NewTerminal => f.write_str("new_terminal"),
             Self::TerminalStart => f.write_str("terminal_start"),
             Self::TerminalOutput => f.write_str("terminal_output"),
@@ -1023,6 +1031,28 @@ pub struct ProjectStageFilePayload {
 pub struct ProjectStageHunkPayload {
     pub path: ProjectPath,
     pub hunk_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectUnstageFilePayload {
+    pub path: ProjectPath,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDiscardFilePayload {
+    pub path: ProjectPath,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectGitCommitPayload {
+    pub root: ProjectRootPath,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectGitCommitResultPayload {
+    pub root: ProjectRootPath,
+    pub commit_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

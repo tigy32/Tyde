@@ -34,6 +34,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::SessionList
+                | FrameKind::ProjectGitStatus
+                | FrameKind::ProjectFileList
         ) {
             continue;
         }
@@ -69,6 +71,8 @@ async fn expect_session_list(
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::ProjectGitStatus
+                | FrameKind::ProjectFileList
         ) {
             continue;
         }
@@ -116,6 +120,8 @@ async fn wait_for_session_list(
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::ProjectGitStatus
+                | FrameKind::ProjectFileList
         ) {
             continue;
         }

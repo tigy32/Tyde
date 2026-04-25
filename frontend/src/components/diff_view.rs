@@ -7,8 +7,8 @@ use crate::state::{AppState, DiffViewMode, DiffViewState};
 
 use protocol::{
     DiffContextMode, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectReadDiffPayload, ProjectRootPath,
-    StreamPath,
+    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectPath, ProjectReadDiffPayload,
+    ProjectRootPath, ProjectStageHunkPayload, StreamPath,
 };
 
 #[component]
@@ -158,6 +158,34 @@ fn set_diff_context_mode(signal: RwSignal<DiffContextMode>, mode: DiffContextMod
     crate::components::settings_panel::persist_diff_context_mode(mode);
 }
 
+fn stage_hunk(root: ProjectRootPath, relative_path: String, hunk_id: String) {
+    let state = expect_context::<AppState>();
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let project_id = active_project.project_id.clone();
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    spawn_local(async move {
+        let payload = ProjectStageHunkPayload {
+            path: ProjectPath {
+                root,
+                relative_path,
+            },
+            hunk_id,
+        };
+        if let Err(e) = send_frame(
+            &active_project.host_id,
+            stream,
+            FrameKind::ProjectStageHunk,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send ProjectStageHunk: {e}");
+        }
+    });
+}
+
 #[component]
 fn DiffContent(diff: DiffViewState) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -199,7 +227,8 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
             </div>
             {diff.files.into_iter().enumerate().map(|(fi, file)| {
                 let hunk_offsets = file_hunk_offsets[fi].clone();
-                view! { <DiffFileView file=file scope_label=scope_label context_mode=diff.context_mode hunk_offsets=hunk_offsets /> }
+                let root = diff.root.clone();
+                view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets /> }
             }).collect::<Vec<_>>()}
         </div>
     }
@@ -209,11 +238,14 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
 fn DiffFileView(
     file: ProjectGitDiffFile,
     scope_label: &'static str,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
     context_mode: DiffContextMode,
     hunk_offsets: Vec<usize>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let view_mode_sig = state.diff_view_mode;
+    let relative_path = file.relative_path.clone();
 
     view! {
         <div class="diff-file">
@@ -226,13 +258,17 @@ fn DiffFileView(
                     let offset = hunk_offsets[hi];
                     let hunk_for_unified = hunk.clone();
                     let hunk_for_side = hunk;
+                    let root_u = root.clone();
+                    let root_s = root.clone();
+                    let path_u = relative_path.clone();
+                    let path_s = relative_path.clone();
                     view! {
                         {move || match view_mode_sig.get() {
                             DiffViewMode::Unified => view! {
-                                <UnifiedHunk hunk=hunk_for_unified.clone() context_mode=context_mode line_offset=offset />
+                                <UnifiedHunk hunk=hunk_for_unified.clone() context_mode=context_mode line_offset=offset scope=scope root=root_u.clone() relative_path=path_u.clone() />
                             }.into_any(),
                             DiffViewMode::SideBySide => view! {
-                                <SideBySideHunk hunk=hunk_for_side.clone() context_mode=context_mode line_offset=offset />
+                                <SideBySideHunk hunk=hunk_for_side.clone() context_mode=context_mode line_offset=offset scope=scope root=root_s.clone() relative_path=path_s.clone() />
                             }.into_any(),
                         }}
                     }
@@ -270,14 +306,42 @@ fn UnifiedHunk(
     hunk: ProjectGitDiffHunk,
     context_mode: DiffContextMode,
     line_offset: usize,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
 ) -> impl IntoView {
     let find = use_context::<FindState>();
     let header = hunk_header_label(&hunk);
     let show_header = context_mode == DiffContextMode::Hunks;
+    let show_stage = scope == ProjectDiffScope::Unstaged;
+    let hunk_id = hunk.hunk_id.clone();
     view! {
         <div class="diff-hunk">
-            {show_header.then(|| view! {
-                <div class="diff-hunk-header">{header}</div>
+            {show_header.then(|| {
+                let stage_root = root.clone();
+                let stage_path = relative_path.clone();
+                let stage_hunk_id = hunk_id.clone();
+                view! {
+                    <div class="diff-hunk-header">
+                        {header}
+                        {show_stage.then(move || {
+                            let r = stage_root.clone();
+                            let p = stage_path.clone();
+                            let h = stage_hunk_id.clone();
+                            view! {
+                                <button
+                                    class="diff-hunk-stage-btn"
+                                    title="Stage hunk"
+                                    on:click=move |_| {
+                                        stage_hunk(r.clone(), p.clone(), h.clone());
+                                    }
+                                >
+                                    "+"
+                                </button>
+                            }
+                        })}
+                    </div>
+                }
             })}
             {hunk.lines.into_iter().enumerate().map(|(i, line)| {
                 let search_idx = line_offset + i;
@@ -468,18 +532,46 @@ fn SideBySideHunk(
     hunk: ProjectGitDiffHunk,
     context_mode: DiffContextMode,
     line_offset: usize,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
 ) -> impl IntoView {
     let find = use_context::<FindState>();
     let header = hunk_header_label(&hunk);
     let show_header = context_mode == DiffContextMode::Hunks;
+    let show_stage = scope == ProjectDiffScope::Unstaged;
+    let hunk_id = hunk.hunk_id.clone();
 
     let indices = sbs_search_indices(&hunk.lines, line_offset);
     let rows = pair_lines_side_by_side(hunk.lines);
 
     view! {
         <div class="diff-hunk diff-hunk-side-by-side">
-            {show_header.then(|| view! {
-                <div class="diff-hunk-header">{header}</div>
+            {show_header.then(|| {
+                let stage_root = root.clone();
+                let stage_path = relative_path.clone();
+                let stage_hunk_id = hunk_id.clone();
+                view! {
+                    <div class="diff-hunk-header">
+                        {header}
+                        {show_stage.then(move || {
+                            let r = stage_root.clone();
+                            let p = stage_path.clone();
+                            let h = stage_hunk_id.clone();
+                            view! {
+                                <button
+                                    class="diff-hunk-stage-btn"
+                                    title="Stage hunk"
+                                    on:click=move |_| {
+                                        stage_hunk(r.clone(), p.clone(), h.clone());
+                                    }
+                                >
+                                    "+"
+                                </button>
+                            }
+                        })}
+                    </div>
+                }
             })}
             {rows.into_iter().zip(indices).map(|(row, (left_idx, right_idx))| {
                 let find_l = find.clone();

@@ -10,11 +10,11 @@ use protocol::{
     CustomAgentNotifyPayload, Envelope, FrameKind, HostBrowseEntriesPayload,
     HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, ListSessionsPayload,
     McpServerNotifyPayload, NewAgentPayload, NewTerminalPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
-    SteeringNotifyPayload, StreamPath, TerminalErrorPayload, TerminalExitPayload,
-    TerminalOutputPayload, TerminalStartPayload,
+    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectPayload, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
+    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
 };
 
 use crate::send::send_frame;
@@ -650,6 +650,24 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse project_git_diff payload: {error}"),
             ),
         },
+        FrameKind::ProjectGitCommitResult => {
+            match envelope.parse_payload::<ProjectGitCommitResultPayload>() {
+                Ok(payload) => {
+                    log::info!(
+                        "commit created on root {}: {}",
+                        payload.root,
+                        payload.commit_hash
+                    );
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_git_commit_result payload: {error}"),
+                ),
+            }
+        }
         FrameKind::ProjectFileContents => {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
                 Ok(payload) => {

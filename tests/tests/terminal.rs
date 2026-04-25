@@ -32,6 +32,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::SessionList
+                | FrameKind::ProjectFileList
+                | FrameKind::ProjectGitStatus
         ) {
             continue;
         }
@@ -54,6 +56,8 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                         | FrameKind::QueuedMessages
                         | FrameKind::SessionSettings
                         | FrameKind::SessionList
+                        | FrameKind::ProjectFileList
+                        | FrameKind::ProjectGitStatus
                 ) =>
             {
                 continue;

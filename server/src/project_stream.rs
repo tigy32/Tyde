@@ -331,11 +331,25 @@ where
     let mut roots = Vec::with_capacity(project.roots.len());
 
     for root in &project.roots {
-        let output = run_git(
+        let output = match run_git(
             root,
             &["status", "--porcelain=v2", "--branch"],
             GitAccessMode::ReadOnly,
-        )?;
+        ) {
+            Ok(output) => output,
+            Err(err) if err.contains("not a git repository") => {
+                roots.push(ProjectRootGitStatus {
+                    root: ProjectRootPath(root.clone()),
+                    branch: None,
+                    ahead: 0,
+                    behind: 0,
+                    clean: true,
+                    files: Vec::new(),
+                });
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let mut branch = None;
         let mut ahead = 0;
         let mut behind = 0;
@@ -637,6 +651,65 @@ pub(crate) fn stage_hunk(
         GitAccessMode::Mutating,
     )?;
     Ok(())
+}
+
+pub(crate) fn unstage_file(project: &Project, path: &ProjectPath) -> Result<(), String> {
+    validate_project_path(project, path)?;
+    let result = run_git_mode(
+        &path.root.0,
+        &["restore", "--staged", "--", &path.relative_path],
+        GitAccessMode::Mutating,
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) if err.contains("bad default revision") || err.contains("unknown revision") => {
+            // Empty repo with no HEAD: restore --staged fails. Use rm --cached.
+            run_git_mode(
+                &path.root.0,
+                &["rm", "--cached", "--", &path.relative_path],
+                GitAccessMode::Mutating,
+            )?;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn discard_file(project: &Project, path: &ProjectPath) -> Result<(), String> {
+    validate_project_path(project, path)?;
+    // checkout restores tracked files; clean removes untracked files.
+    // One will fail harmlessly depending on file state.
+    let checkout_ok = run_git_mode(
+        &path.root.0,
+        &["checkout", "--", &path.relative_path],
+        GitAccessMode::Mutating,
+    )
+    .is_ok();
+    let clean_ok = run_git_mode(
+        &path.root.0,
+        &["clean", "-f", "--", &path.relative_path],
+        GitAccessMode::Mutating,
+    )
+    .is_ok();
+    if checkout_ok || clean_ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to discard changes for '{}'",
+            path.relative_path
+        ))
+    }
+}
+
+pub(crate) fn commit(
+    project: &Project,
+    root: &ProjectRootPath,
+    message: &str,
+) -> Result<String, String> {
+    validate_root(project, root)?;
+    run_git_mode(&root.0, &["commit", "-m", message], GitAccessMode::Mutating)?;
+    let hash = run_git_mode(&root.0, &["rev-parse", "HEAD"], GitAccessMode::ReadOnly)?;
+    Ok(hash.trim().to_owned())
 }
 
 pub(crate) async fn sync_snapshot_state(

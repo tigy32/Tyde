@@ -12,15 +12,16 @@ use protocol::{
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
     HostBrowseStartPayload, HostSettingsPayload, McpServerDeletePayload, McpServerNotifyPayload,
     McpServerUpsertPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDiffScope, ProjectFileListPayload, ProjectGitStatusPayload,
-    ProjectId, ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectDeletePayload, ProjectDiffScope, ProjectDiscardFilePayload, ProjectFileListPayload,
+    ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, RunBackendSetupPayload,
-    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringScope, SteeringUpsertPayload, StreamPath, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
+    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    RunBackendSetupPayload, SessionId, SessionListPayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TerminalCreatePayload,
+    TerminalId, TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -45,8 +46,9 @@ use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing,
-    build_file_list, build_git_status, read_diff, read_file, scan_raw_entries,
-    spawn_project_subscription, stage_file, stage_hunk, sync_snapshot_state,
+    build_file_list, build_git_status, commit, discard_file, read_diff, read_file,
+    scan_raw_entries, spawn_project_subscription, stage_file, stage_hunk, sync_snapshot_state,
+    unstage_file,
 };
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
@@ -2236,6 +2238,97 @@ impl HostHandle {
             project_output_stream.clone(),
             project_id,
             Some(path),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn unstage_project_file(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: Stream,
+        project_id: ProjectId,
+        payload: ProjectUnstageFilePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_unstage_file";
+        let path = payload.path;
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        unstage_file(&project, &path).map_err(|error| project_command_error(OPERATION, error))?;
+        self.refresh_after_project_mutation(
+            connection_host_stream,
+            project_output_stream.clone(),
+            project_id,
+            Some(path),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn discard_project_file(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: Stream,
+        project_id: ProjectId,
+        payload: ProjectDiscardFilePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_discard_file";
+        let path = payload.path;
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        discard_file(&project, &path).map_err(|error| project_command_error(OPERATION, error))?;
+        self.refresh_after_project_mutation(
+            connection_host_stream,
+            project_output_stream.clone(),
+            project_id,
+            Some(path),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn commit_project(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: Stream,
+        project_id: ProjectId,
+        payload: ProjectGitCommitPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_git_commit";
+        let root = payload.root;
+        let message = payload.message;
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        let commit_hash = commit(&project, &root, &message)
+            .map_err(|error| project_command_error(OPERATION, error))?;
+        let result_payload = ProjectGitCommitResultPayload {
+            root: root.clone(),
+            commit_hash,
+        };
+        let result_payload = serde_json::to_value(&result_payload).map_err(|error| {
+            AppError::internal_message(
+                OPERATION,
+                "failed to serialize project git commit result payload",
+                error,
+            )
+        })?;
+        let _ = project_output_stream
+            .send_value(FrameKind::ProjectGitCommitResult, result_payload)
+            .await;
+        self.refresh_after_project_mutation(
+            connection_host_stream,
+            project_output_stream.clone(),
+            project_id,
+            None,
         )
         .await?;
         Ok(())
