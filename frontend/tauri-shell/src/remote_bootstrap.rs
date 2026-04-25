@@ -320,19 +320,19 @@ fn release_asset_name(
 ) -> Result<(String, ReleaseAssetKind), String> {
     match (platform.os, platform.arch) {
         (RemoteOperatingSystem::Linux, RemoteArchitecture::X86_64) => Ok((
-            "tyde-x86_64-unknown-linux-gnu.tar.xz".to_string(),
+            "tyde-server-x86_64-unknown-linux-gnu.tar.xz".to_string(),
             ReleaseAssetKind::TarXz,
         )),
         (RemoteOperatingSystem::Linux, RemoteArchitecture::Aarch64) => Ok((
-            "tyde-aarch64-unknown-linux-gnu.tar.xz".to_string(),
+            "tyde-server-aarch64-unknown-linux-gnu.tar.xz".to_string(),
             ReleaseAssetKind::TarXz,
         )),
         (RemoteOperatingSystem::Macos, RemoteArchitecture::X86_64) => Ok((
-            "tyde-x86_64-apple-darwin.zip".to_string(),
+            "tyde-server-x86_64-apple-darwin.zip".to_string(),
             ReleaseAssetKind::Zip,
         )),
         (RemoteOperatingSystem::Macos, RemoteArchitecture::Aarch64) => Ok((
-            "tyde-aarch64-apple-darwin.zip".to_string(),
+            "tyde-server-aarch64-apple-darwin.zip".to_string(),
             ReleaseAssetKind::Zip,
         )),
     }
@@ -372,15 +372,15 @@ fn extract_tyde_from_tar_xz(archive: &[u8]) -> Result<Vec<u8>, String> {
             .path()
             .map_err(|err| format!("failed to read Tyde tar entry path: {err}"))?
             .to_path_buf();
-        if path.file_name().is_some_and(|name| name == "tyde") {
+        if path.file_name().is_some_and(|name| name == "tyde-server") {
             let mut bytes = Vec::new();
             entry
                 .read_to_end(&mut bytes)
-                .map_err(|err| format!("failed to extract Tyde binary from tar.xz: {err}"))?;
+                .map_err(|err| format!("failed to extract tyde-server from tar.xz: {err}"))?;
             return Ok(bytes);
         }
     }
-    Err("Tyde tar.xz asset did not contain a tyde binary".to_string())
+    Err("Tyde tar.xz asset did not contain a tyde-server binary".to_string())
 }
 
 fn extract_tyde_from_zip(archive: &[u8]) -> Result<Vec<u8>, String> {
@@ -392,14 +392,14 @@ fn extract_tyde_from_zip(archive: &[u8]) -> Result<Vec<u8>, String> {
             .by_index(index)
             .map_err(|err| format!("failed to read Tyde zip entry {index}: {err}"))?;
         let name = file.name().to_string();
-        if name == "tyde" || name.ends_with("/tyde") {
+        if name == "tyde-server" || name.ends_with("/tyde-server") {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
-                .map_err(|err| format!("failed to extract Tyde binary from zip: {err}"))?;
+                .map_err(|err| format!("failed to extract tyde-server from zip: {err}"))?;
             return Ok(bytes);
         }
     }
-    Err("Tyde zip asset did not contain a tyde binary".to_string())
+    Err("Tyde zip asset did not contain a tyde-server binary".to_string())
 }
 
 async fn probe_platform(ssh_destination: &str) -> Result<RemotePlatform, String> {
@@ -445,7 +445,7 @@ async fn probe_snapshot(
     let command = format!(
         r#"set -eu
 target_version={target_version}
-if [ -x "$HOME/.tyde/bin/$target_version/tyde" ]; then
+if [ -x "$HOME/.tyde/bin/$target_version/tyde-server" ]; then
   echo installed_target=1
 else
   echo installed_target=0
@@ -557,10 +557,10 @@ async fn install_binary(
 version={version}
 install_dir="$HOME/.tyde/bin/$version"
 mkdir -p "$install_dir" "$HOME/.tyde/logs" "$HOME/.tyde/run"
-tmp="$install_dir/tyde.tmp.$$"
+tmp="$install_dir/tyde-server.tmp.$$"
 cat > "$tmp"
 chmod 755 "$tmp"
-mv "$tmp" "$install_dir/tyde"
+mv "$tmp" "$install_dir/tyde-server"
 ln -sfn "$version" "$HOME/.tyde/bin/current"
 "#
     );
@@ -598,16 +598,22 @@ async fn launch_server(ssh_destination: &str, version: Version) -> Result<(), St
     let command = format!(
         r#"set -eu
 version={version}
-bin="$HOME/.tyde/bin/$version/tyde"
+bin="$HOME/.tyde/bin/$version/tyde-server"
 socket="$HOME/.tyde/tyde.sock"
 pid_file="$HOME/.tyde/run/tyde-host.pid"
 version_file="$HOME/.tyde/run/tyde-host-version"
 log_file="$HOME/.tyde/logs/tyde-host-$version.log"
 mkdir -p "$HOME/.tyde/logs" "$HOME/.tyde/run"
 if [ ! -x "$bin" ]; then
-  echo "managed Tyde binary is not executable: $bin" >&2
+  echo "managed tyde-server binary is not executable: $bin" >&2
   exit 1
 fi
+tail_launch_log() {{
+  if [ -f "$log_file" ]; then
+    echo "last tyde-server launch log lines from $log_file:" >&2
+    tail -n 80 "$log_file" >&2 || true
+  fi
+}}
 nohup "$bin" host --uds >> "$log_file" 2>&1 < /dev/null &
 pid=$!
 printf '%s\n' "$pid" > "$pid_file"
@@ -619,13 +625,15 @@ while [ "$i" -lt 50 ]; do
     exit 0
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "managed Tyde host process exited before socket became ready; see $log_file" >&2
+    echo "managed tyde-server process exited before socket became ready" >&2
+    tail_launch_log
     exit 1
   fi
   i=$((i + 1))
   sleep 0.1
 done
-echo "managed Tyde host did not create $socket; see $log_file" >&2
+echo "managed tyde-server did not create $socket" >&2
+tail_launch_log
 exit 1
 "#
     );
@@ -673,11 +681,11 @@ async fn ssh_with_stdin(
     stdin
         .write_all(stdin_bytes)
         .await
-        .map_err(|err| format!("failed to write Tyde binary to ssh stdin: {err}"))?;
+        .map_err(|err| format!("failed to write tyde-server binary to ssh stdin: {err}"))?;
     stdin
         .shutdown()
         .await
-        .map_err(|err| format!("failed to close ssh stdin for Tyde binary upload: {err}"))?;
+        .map_err(|err| format!("failed to close ssh stdin for tyde-server upload: {err}"))?;
     drop(stdin);
 
     let output = child
@@ -786,14 +794,14 @@ mod tests {
         assert_eq!(
             release_asset_name(linux_x64, version).unwrap(),
             (
-                "tyde-x86_64-unknown-linux-gnu.tar.xz".to_string(),
+                "tyde-server-x86_64-unknown-linux-gnu.tar.xz".to_string(),
                 ReleaseAssetKind::TarXz
             )
         );
         assert_eq!(
             release_asset_name(mac_arm, version).unwrap(),
             (
-                "tyde-aarch64-apple-darwin.zip".to_string(),
+                "tyde-server-aarch64-apple-darwin.zip".to_string(),
                 ReleaseAssetKind::Zip
             )
         );

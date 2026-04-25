@@ -5152,7 +5152,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-shell"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "core-foundation-sys",
  "devtools-protocol",
@@ -5733,6 +5733,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tyde-server"
+version = "0.8.1"
+dependencies = [
+ "server",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

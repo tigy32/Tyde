@@ -458,7 +458,7 @@ async fn setup_connection_transport(
 fn managed_remote_bridge_command() -> String {
     r#"set -eu
 mkdir -p "$HOME/.tyde/logs"
-bin="$HOME/.tyde/bin/current/tyde"
+bin="$HOME/.tyde/bin/current/tyde-server"
 if [ ! -x "$bin" ]; then
   echo "managed Tyde bridge binary is not executable: $bin" >&2
   exit 1

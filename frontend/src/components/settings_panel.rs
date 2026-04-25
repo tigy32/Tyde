@@ -630,7 +630,7 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Configured Hosts"</label>
-            <p class="settings-description">"The embedded local host is always present. Managed SSH hosts install Tyde under ~/.tyde/bin/<version>/tyde and launch ~/.tyde/bin/current/tyde when needed."</p>
+            <p class="settings-description">"The embedded local host is always present. Managed SSH hosts install Tyde Server under ~/.tyde/bin/<version>/tyde-server and launch ~/.tyde/bin/current/tyde-server when needed."</p>
             <div class="settings-host-list">
                 {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
                     let host_id = host.id.clone();

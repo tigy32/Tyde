@@ -1,0 +1,14 @@
+[package]
+name = "tyde-server"
+version = "0.8.1"
+edition.workspace = true
+
+[[bin]]
+name = "tyde-server"
+path = "src/main.rs"
+
+[dependencies]
+server = { path = "../server" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

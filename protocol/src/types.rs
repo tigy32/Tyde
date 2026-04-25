@@ -9,8 +9,8 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
-    minor: 1,
-    patch: 0,
+    minor: 8,
+    patch: 1,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

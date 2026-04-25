@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g. v0.8.0)'
+        description: 'Version tag (e.g. v0.8.1)'
         required: true
 
 permissions:
@@ -232,6 +232,9 @@ jobs:
           } | ConvertTo-Json -Depth 5
           Set-Content -Path frontend/tauri-shell/tauri.windows.conf.json -Value $config
 
+      - name: Build headless Tyde Server binary
+        run: cargo build --release --target ${{ matrix.rust-target }} -p tyde-server --bin tyde-server
+
       - name: Build macOS app with Tauri
         if: startsWith(matrix.platform, 'macos')
         uses: tauri-apps/tauri-action@v0
@@ -263,13 +266,13 @@ jobs:
         shell: bash
         run: |
           BIN_DIR="target/${{ matrix.rust-target }}/release"
-          BIN_NAME="tyde"
+          BIN_NAME="tyde-server"
           BIN_PATH="$BIN_DIR/$BIN_NAME"
           if [[ ! -x "$BIN_PATH" ]]; then
             echo "Expected executable not found at $BIN_PATH"
             exit 1
           fi
-          ARCHIVE="$RUNNER_TEMP/tyde-${{ matrix.rust-target }}.tar.xz"
+          ARCHIVE="$RUNNER_TEMP/tyde-server-${{ matrix.rust-target }}.tar.xz"
           tar -cJf "$ARCHIVE" -C "$BIN_DIR" "$BIN_NAME"
           echo "HEADLESS_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
@@ -281,7 +284,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
           BIN_DIR="target/${{ matrix.rust-target }}/release"
-          BIN_NAME="tyde"
+          BIN_NAME="tyde-server"
           BIN_PATH="$BIN_DIR/$BIN_NAME"
           if [[ ! -x "$BIN_PATH" ]]; then
             echo "Expected executable not found at $BIN_PATH"
@@ -292,7 +295,7 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" "$BIN_PATH"
           codesign --verify --strict --verbose=2 "$BIN_PATH"
 
-          ARCHIVE="$RUNNER_TEMP/tyde-${{ matrix.rust-target }}.zip"
+          ARCHIVE="$RUNNER_TEMP/tyde-server-${{ matrix.rust-target }}.zip"
           ditto -c -k --keepParent "$BIN_PATH" "$ARCHIVE"
 
           xcrun notarytool submit "$ARCHIVE" \
@@ -307,12 +310,12 @@ jobs:
         if: matrix.platform == 'windows-latest'
         run: |
           $binDir = "target/${{ matrix.rust-target }}/release"
-          $binPath = Join-Path $binDir "tyde.exe"
+          $binPath = Join-Path $binDir "tyde-server.exe"
           if (!(Test-Path $binPath)) {
             Write-Error "Expected executable not found at $binPath"
             exit 1
           }
-          $archive = Join-Path $env:RUNNER_TEMP "tyde-${{ matrix.rust-target }}.zip"
+          $archive = Join-Path $env:RUNNER_TEMP "tyde-server-${{ matrix.rust-target }}.zip"
           Compress-Archive -Path $binPath -DestinationPath $archive -Force
           "HEADLESS_ARCHIVE=$archive" >> $env:GITHUB_ENV
 

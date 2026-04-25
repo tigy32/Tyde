@@ -40,6 +40,9 @@ def main() -> int:
         "frontend/tauri-shell/Cargo.toml": read_cargo_package_version(
             repo_root / "frontend/tauri-shell/Cargo.toml"
         ),
+        "tyde-server/Cargo.toml": read_cargo_package_version(
+            repo_root / "tyde-server/Cargo.toml"
+        ),
         "frontend/tauri-shell/tauri.conf.json": read_json_version(
             repo_root / "frontend/tauri-shell/tauri.conf.json"
         ),
