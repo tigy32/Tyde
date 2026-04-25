@@ -283,7 +283,6 @@ async fn resolve_release(target: &TydeReleaseTarget) -> Result<ReleaseInfo, Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseAssetKind {
-    TarXz,
     Zip,
 }
 
@@ -320,12 +319,12 @@ fn release_asset_name(
 ) -> Result<(String, ReleaseAssetKind), String> {
     match (platform.os, platform.arch) {
         (RemoteOperatingSystem::Linux, RemoteArchitecture::X86_64) => Ok((
-            "tyde-server-x86_64-unknown-linux-gnu.tar.xz".to_string(),
-            ReleaseAssetKind::TarXz,
+            "tyde-server-x86_64-unknown-linux-musl.zip".to_string(),
+            ReleaseAssetKind::Zip,
         )),
         (RemoteOperatingSystem::Linux, RemoteArchitecture::Aarch64) => Ok((
-            "tyde-server-aarch64-unknown-linux-gnu.tar.xz".to_string(),
-            ReleaseAssetKind::TarXz,
+            "tyde-server-aarch64-unknown-linux-musl.zip".to_string(),
+            ReleaseAssetKind::Zip,
         )),
         (RemoteOperatingSystem::Macos, RemoteArchitecture::X86_64) => Ok((
             "tyde-server-x86_64-apple-darwin.zip".to_string(),
@@ -355,32 +354,8 @@ async fn download_asset(url: &str) -> Result<Vec<u8>, String> {
 
 fn extract_tyde_binary(archive: &[u8], kind: ReleaseAssetKind) -> Result<Vec<u8>, String> {
     match kind {
-        ReleaseAssetKind::TarXz => extract_tyde_from_tar_xz(archive),
         ReleaseAssetKind::Zip => extract_tyde_from_zip(archive),
     }
-}
-
-fn extract_tyde_from_tar_xz(archive: &[u8]) -> Result<Vec<u8>, String> {
-    let decoder = xz2::read::XzDecoder::new(Cursor::new(archive));
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|err| format!("failed to read Tyde tar.xz entries: {err}"))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|err| format!("failed to read Tyde tar entry: {err}"))?;
-        let path = entry
-            .path()
-            .map_err(|err| format!("failed to read Tyde tar entry path: {err}"))?
-            .to_path_buf();
-        if path.file_name().is_some_and(|name| name == "tyde-server") {
-            let mut bytes = Vec::new();
-            entry
-                .read_to_end(&mut bytes)
-                .map_err(|err| format!("failed to extract tyde-server from tar.xz: {err}"))?;
-            return Ok(bytes);
-        }
-    }
-    Err("Tyde tar.xz asset did not contain a tyde-server binary".to_string())
 }
 
 fn extract_tyde_from_zip(archive: &[u8]) -> Result<Vec<u8>, String> {
@@ -794,8 +769,8 @@ mod tests {
         assert_eq!(
             release_asset_name(linux_x64, version).unwrap(),
             (
-                "tyde-server-x86_64-unknown-linux-gnu.tar.xz".to_string(),
-                ReleaseAssetKind::TarXz
+                "tyde-server-x86_64-unknown-linux-musl.zip".to_string(),
+                ReleaseAssetKind::Zip
             )
         );
         assert_eq!(

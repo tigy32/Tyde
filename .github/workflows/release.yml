@@ -49,18 +49,23 @@ jobs:
         include:
           - platform: macos-15
             rust-target: aarch64-apple-darwin
+            server-target: aarch64-apple-darwin
             tauri-args: --target aarch64-apple-darwin --bundles app
           - platform: macos-15-intel
             rust-target: x86_64-apple-darwin
+            server-target: x86_64-apple-darwin
             tauri-args: --target x86_64-apple-darwin --bundles app
           - platform: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
+            server-target: x86_64-unknown-linux-musl
             tauri-args: --target x86_64-unknown-linux-gnu
           - platform: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
+            server-target: aarch64-unknown-linux-musl
             tauri-args: --target aarch64-unknown-linux-gnu
           - platform: windows-latest
             rust-target: x86_64-pc-windows-msvc
+            server-target: x86_64-pc-windows-msvc
             tauri-args: --target x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
@@ -82,7 +87,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
             curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf
+            librsvg2-dev patchelf musl-tools zip
 
       - name: Install macOS tools
         if: startsWith(matrix.platform, 'macos')
@@ -100,7 +105,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rust-target }}
+          targets: ${{ matrix.rust-target }},${{ matrix.server-target }}
 
       - name: Install wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -233,7 +238,7 @@ jobs:
           Set-Content -Path frontend/tauri-shell/tauri.windows.conf.json -Value $config
 
       - name: Build headless Tyde Server binary
-        run: cargo build --release --target ${{ matrix.rust-target }} -p tyde-server --bin tyde-server
+        run: cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server
 
       - name: Build macOS app with Tauri
         if: startsWith(matrix.platform, 'macos')
@@ -265,15 +270,15 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         shell: bash
         run: |
-          BIN_DIR="target/${{ matrix.rust-target }}/release"
+          BIN_DIR="target/${{ matrix.server-target }}/release"
           BIN_NAME="tyde-server"
           BIN_PATH="$BIN_DIR/$BIN_NAME"
           if [[ ! -x "$BIN_PATH" ]]; then
             echo "Expected executable not found at $BIN_PATH"
             exit 1
           fi
-          ARCHIVE="$RUNNER_TEMP/tyde-server-${{ matrix.rust-target }}.tar.xz"
-          tar -cJf "$ARCHIVE" -C "$BIN_DIR" "$BIN_NAME"
+          ARCHIVE="$RUNNER_TEMP/tyde-server-${{ matrix.server-target }}.zip"
+          (cd "$BIN_DIR" && zip -q -9 "$ARCHIVE" "$BIN_NAME")
           echo "HEADLESS_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package signed macOS headless Tyde binary
@@ -283,7 +288,7 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
-          BIN_DIR="target/${{ matrix.rust-target }}/release"
+          BIN_DIR="target/${{ matrix.server-target }}/release"
           BIN_NAME="tyde-server"
           BIN_PATH="$BIN_DIR/$BIN_NAME"
           if [[ ! -x "$BIN_PATH" ]]; then
@@ -295,7 +300,7 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" "$BIN_PATH"
           codesign --verify --strict --verbose=2 "$BIN_PATH"
 
-          ARCHIVE="$RUNNER_TEMP/tyde-server-${{ matrix.rust-target }}.zip"
+          ARCHIVE="$RUNNER_TEMP/tyde-server-${{ matrix.server-target }}.zip"
           ditto -c -k --keepParent "$BIN_PATH" "$ARCHIVE"
 
           xcrun notarytool submit "$ARCHIVE" \
@@ -309,13 +314,13 @@ jobs:
       - name: Package Windows headless Tyde binary
         if: matrix.platform == 'windows-latest'
         run: |
-          $binDir = "target/${{ matrix.rust-target }}/release"
+          $binDir = "target/${{ matrix.server-target }}/release"
           $binPath = Join-Path $binDir "tyde-server.exe"
           if (!(Test-Path $binPath)) {
             Write-Error "Expected executable not found at $binPath"
             exit 1
           }
-          $archive = Join-Path $env:RUNNER_TEMP "tyde-server-${{ matrix.rust-target }}.zip"
+          $archive = Join-Path $env:RUNNER_TEMP "tyde-server-${{ matrix.server-target }}.zip"
           Compress-Archive -Path $binPath -DestinationPath $archive -Force
           "HEADLESS_ARCHIVE=$archive" >> $env:GITHUB_ENV
 
