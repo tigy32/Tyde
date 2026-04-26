@@ -761,6 +761,43 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        // Drop chat-related per-agent state for every agent on this host before
+        // we forget the agent list itself. Without this, a reconnect re-replays
+        // every event and the dispatcher appends duplicate messages onto the
+        // already-cached vectors.
+        let agent_ids: Vec<AgentId> = self.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .filter(|agent| agent.host_id == host_id)
+                .map(|agent| agent.agent_id.clone())
+                .collect()
+        });
+        if !agent_ids.is_empty() {
+            let drop_set: std::collections::HashSet<AgentId> =
+                agent_ids.iter().cloned().collect();
+            self.chat_messages.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.streaming_text.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.task_lists.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.transient_events.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.agent_message_queue.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.agent_turn_active.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.agent_session_settings.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+        }
+
         self.host_streams.update(|streams| {
             streams.remove(host_id);
         });
@@ -1358,6 +1395,144 @@ mod tests {
                 state
                     .open_files
                     .with_untracked(|m| m.contains_key(&file_path))
+            );
+        });
+    }
+
+    #[test]
+    fn clear_host_runtime_drops_chat_state_for_host_agents() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            let host_a = "host-a";
+            let host_b = "host-b";
+            let agent_a1 = AgentId("a1".to_owned());
+            let agent_a2 = AgentId("a2".to_owned());
+            let agent_b1 = AgentId("b1".to_owned());
+
+            let mk_agent = |host: &str, id: &AgentId| AgentInfo {
+                host_id: host.to_owned(),
+                agent_id: id.clone(),
+                name: format!("{}/{}", host, id.0),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Tycode,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath(format!("/agents/{}", id.0)),
+                started: true,
+                fatal_error: None,
+            };
+
+            state.agents.update(|agents| {
+                agents.push(mk_agent(host_a, &agent_a1));
+                agents.push(mk_agent(host_a, &agent_a2));
+                agents.push(mk_agent(host_b, &agent_b1));
+            });
+
+            let mk_msg = || ChatMessageEntry {
+                message: ChatMessage {
+                    timestamp: 0,
+                    sender: protocol::MessageSender::User,
+                    content: "hi".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+                tool_requests: Vec::new(),
+            };
+
+            for id in [&agent_a1, &agent_a2, &agent_b1] {
+                state.chat_messages.update(|m| {
+                    m.insert(id.clone(), vec![mk_msg()]);
+                });
+                state.task_lists.update(|m| {
+                    m.insert(
+                        id.clone(),
+                        TaskList {
+                            title: String::new(),
+                            tasks: Vec::new(),
+                        },
+                    );
+                });
+                state.transient_events.update(|m| {
+                    m.insert(id.clone(), Vec::new());
+                });
+                state.agent_message_queue.update(|m| {
+                    m.insert(id.clone(), Vec::new());
+                });
+                state.agent_turn_active.update(|m| {
+                    m.insert(id.clone(), true);
+                });
+                state.agent_session_settings.update(|m| {
+                    m.insert(id.clone(), SessionSettingsValues::default());
+                });
+            }
+
+            state.clear_host_runtime(host_a);
+
+            // host_a's agents are forgotten across every per-agent map.
+            for id in [&agent_a1, &agent_a2] {
+                assert!(
+                    !state
+                        .chat_messages
+                        .with_untracked(|m| m.contains_key(id)),
+                    "chat_messages still has dropped agent {}",
+                    id.0
+                );
+                assert!(
+                    !state.task_lists.with_untracked(|m| m.contains_key(id)),
+                    "task_lists still has dropped agent {}",
+                    id.0
+                );
+                assert!(
+                    !state
+                        .transient_events
+                        .with_untracked(|m| m.contains_key(id)),
+                    "transient_events still has dropped agent {}",
+                    id.0
+                );
+                assert!(
+                    !state
+                        .agent_message_queue
+                        .with_untracked(|m| m.contains_key(id)),
+                    "agent_message_queue still has dropped agent {}",
+                    id.0
+                );
+                assert!(
+                    !state
+                        .agent_turn_active
+                        .with_untracked(|m| m.contains_key(id)),
+                    "agent_turn_active still has dropped agent {}",
+                    id.0
+                );
+                assert!(
+                    !state
+                        .agent_session_settings
+                        .with_untracked(|m| m.contains_key(id)),
+                    "agent_session_settings still has dropped agent {}",
+                    id.0
+                );
+            }
+
+            // host_b's agent is untouched.
+            assert!(
+                state
+                    .chat_messages
+                    .with_untracked(|m| m.contains_key(&agent_b1)),
+                "host_b agent's chat_messages must survive"
+            );
+            assert!(
+                state
+                    .task_lists
+                    .with_untracked(|m| m.contains_key(&agent_b1)),
+                "host_b agent's task_lists must survive"
             );
         });
     }
