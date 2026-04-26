@@ -15,23 +15,33 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Clipboard",
+    "CssStyleDeclaration",
     "DataTransfer",
+    "Document",
+    "DomRect",
     "DragEvent",
     "Element",
     "EventTarget",
     "File",
     "FileList",
     "FileReader",
+    "HtmlBodyElement",
     "HtmlElement",
+    "HtmlHeadElement",
+    "HtmlStyleElement",
     "HtmlTextAreaElement",
     "Navigator",
     "Node",
     "NodeList",
     "ProgressEvent",
     "Storage",
+    "Window",
     "console",
 ] }
 log = "0.4"
 console_log = "1"
 console_error_panic_hook = "0.1"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
