@@ -531,7 +531,7 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
         bridge::listen_host_line(move |event| {
             match serde_json::from_str::<Envelope>(&event.line) {
                 Ok(envelope) => {
-                    log::info!(
+                    log::trace!(
                         "host_frame_rx host={} stream={} seq={} kind={}",
                         event.host_id,
                         envelope.stream,

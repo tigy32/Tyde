@@ -500,9 +500,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     },
                     tool_requests: Vec::new(),
                 };
-                state.chat_messages.update(|map| {
-                    map.entry(error_agent_id).or_default().push(entry);
-                });
+                state.push_chat_entry(error_agent_id, entry);
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -1154,7 +1152,10 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.agents.update(|agents| {
         agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
     });
-    state.chat_messages.update(|map| {
+    state.chat_rows.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.chat_tool_rows.update(|map| {
         map.remove(&agent_id);
     });
     state.streaming_text.update(|map| {
@@ -1259,7 +1260,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
 
     match event {
         ChatEvent::TypingStatusChanged(typing) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=typing active={}",
                 host_id,
                 agent_id,
@@ -1279,7 +1280,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::MessageAdded(message) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=message_added sender={:?} text_len={}",
                 host_id,
                 agent_id,
@@ -1290,12 +1291,10 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                 message,
                 tool_requests: Vec::new(),
             };
-            state.chat_messages.update(|messages| {
-                messages.entry(agent_id.clone()).or_default().push(entry);
-            });
+            state.push_chat_entry(agent_id.clone(), entry);
         }
         ChatEvent::StreamStart(data) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=stream_start message_id={:?} model={:?}",
                 host_id,
                 agent_id,
@@ -1317,7 +1316,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
         ChatEvent::StreamDelta(data) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=stream_delta message_id={:?} text_len={}",
                 host_id,
                 agent_id,
@@ -1332,7 +1331,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             }
         }
         ChatEvent::StreamReasoningDelta(data) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=reasoning_delta message_id={:?} text_len={}",
                 host_id,
                 agent_id,
@@ -1349,7 +1348,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             }
         }
         ChatEvent::StreamEnd(data) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=stream_end text_len={} tool_calls={}",
                 host_id,
                 agent_id,
@@ -1386,12 +1385,10 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                 message: data.message,
                 tool_requests,
             };
-            state.chat_messages.update(|messages| {
-                messages.entry(agent_id.clone()).or_default().push(entry);
-            });
+            state.push_chat_entry(agent_id.clone(), entry);
         }
         ChatEvent::ToolRequest(request) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=tool_request tool_call_id={} tool_name={}",
                 host_id,
                 agent_id,
@@ -1413,26 +1410,23 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                     .update(|tools| tools.push(tool_entry));
                 return;
             }
-            state.chat_messages.update(|messages| {
-                if let Some(agent_messages) = messages.get_mut(&agent_id) {
-                    if let Some(last) = agent_messages.last_mut() {
-                        last.tool_requests.push(tool_entry);
-                    } else {
-                        log::error!(
-                            "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — no messages exist yet",
-                            tool_name, tool_call_id, host_id, agent_id
-                        );
-                    }
-                } else {
-                    log::error!(
-                        "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — agent has no message list",
-                        tool_name, tool_call_id, host_id, agent_id
-                    );
-                }
-            });
+            if let Some(row) = state.last_chat_row_untracked(&agent_id) {
+                row.entry.update(|entry| {
+                    entry.tool_requests.push(tool_entry);
+                });
+                state.index_chat_tool_row(&agent_id, tool_call_id, row.id);
+            } else {
+                log::error!(
+                    "TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — agent has no message row",
+                    tool_name,
+                    tool_call_id,
+                    host_id,
+                    agent_id
+                );
+            }
         }
         ChatEvent::ToolExecutionCompleted(data) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=tool_execution_completed tool_call_id={} tool_name={} success={}",
                 host_id,
                 agent_id,
@@ -1460,32 +1454,32 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                     return;
                 }
             }
-            state.chat_messages.update(|messages| {
-                if let Some(agent_messages) = messages.get_mut(&agent_id) {
-                    for message in agent_messages.iter_mut().rev() {
-                        if let Some(tool) = message
-                            .tool_requests
-                            .iter_mut()
-                            .find(|tool| tool.request.tool_call_id == call_id)
-                        {
-                            tool.result = Some(data);
-                            return;
-                        }
+            if let Some(row) = state.chat_row_for_tool_untracked(&agent_id, &call_id) {
+                let mut matched = false;
+                row.entry.update(|entry| {
+                    if let Some(tool) = entry
+                        .tool_requests
+                        .iter_mut()
+                        .find(|tool| tool.request.tool_call_id == call_id)
+                    {
+                        tool.result = Some(data.clone());
+                        matched = true;
                     }
-                    log::error!(
-                        "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for host {} agent {} — no matching request found",
-                        tool_name, call_id, host_id, agent_id
-                    );
-                } else {
-                    log::error!(
-                        "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for host {} agent {} — agent has no message list",
-                        tool_name, call_id, host_id, agent_id
-                    );
+                });
+                if matched {
+                    return;
                 }
-            });
+            }
+            log::error!(
+                "TOOL RESULT ORPHANED: completion for tool '{}' (call_id={}) for host {} agent {} — no matching request found",
+                tool_name,
+                call_id,
+                host_id,
+                agent_id
+            );
         }
         ChatEvent::TaskUpdate(task_list) => {
-            log::info!(
+            log::trace!(
                 "dispatch chat_event host={} agent_id={} type=task_update items={}",
                 host_id,
                 agent_id,

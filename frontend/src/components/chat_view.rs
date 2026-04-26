@@ -6,7 +6,7 @@ use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::task_list::TaskListView;
-use crate::state::{ActiveAgentRef, AppState, TransientEvent};
+use crate::state::{ActiveAgentRef, AppState, ChatRowHandle, TransientEvent};
 
 use protocol::BackendKind;
 
@@ -32,17 +32,18 @@ pub fn ChatView(
 
     let messages_len: Memo<usize> = Memo::new(move |_| match active_agent_id() {
         Some(id) => state
-            .chat_messages
+            .chat_rows
             .with(|m| m.get(&id).map(|v| v.len()).unwrap_or(0)),
         None => 0,
     });
 
-    let row_keys = move || -> Vec<(protocol::AgentId, usize)> {
+    let row_handles = move || -> Vec<ChatRowHandle> {
         let Some(id) = active_agent_id() else {
             return Vec::new();
         };
-        let len = messages_len.get();
-        (0..len).map(|i| (id.clone(), i)).collect()
+        state
+            .chat_rows
+            .with(|m| m.get(&id).cloned().unwrap_or_default())
     };
 
     let streaming = move || {
@@ -64,9 +65,10 @@ pub fn ChatView(
     // most recent assistant turn" — typically a single iteration.
     let context_breakdown: Signal<Option<protocol::ContextBreakdown>> = Signal::derive(move || {
         let id = active_agent_id()?;
-        state.chat_messages.with(|m| {
-            let messages = m.get(&id)?;
-            for entry in messages.iter().rev() {
+        state.chat_rows.with(|m| {
+            let rows = m.get(&id)?;
+            for row in rows.iter().rev() {
+                let entry = row.entry.get();
                 let is_assistant = matches!(
                     entry.message.sender,
                     protocol::MessageSender::Assistant { .. }
@@ -157,7 +159,7 @@ pub fn ChatView(
 
     // Auto-scroll effect: whenever the message count or streaming text grows,
     // scroll to bottom (only if the user hasn't scrolled up). Scoped to the
-    // *length* of messages — not the full Vec — so unrelated chat_messages
+    // *length* of messages — not the full Vec — so unrelated chat row
     // updates (e.g. tool_request mutations to existing rows) don't trigger a
     // scroll.
     Effect::new(move |_| {
@@ -249,11 +251,11 @@ pub fn ChatView(
                         }}
 
                         <For
-                            each=move || row_keys()
-                            key=|k| k.clone()
-                            let:k
+                            each=move || row_handles()
+                            key=|row| row.id
+                            let:row
                         >
-                            <ChatMessageView agent_id=k.0 idx=k.1 />
+                            <ChatMessageView row=row />
                         </For>
 
                         // Transient events (retry, cancel) rendered as cards
@@ -414,13 +416,13 @@ mod wasm_tests {
             // ChatView reads its own `agent_ref` Signal prop directly; we
             // don't need to populate the global `active_agent` Memo for the
             // test to exercise the keyed-list behaviour.
-            state.chat_messages.update(|m| {
+            state.chat_rows.update(|m| {
                 m.insert(
                     agent_id_for_mount.clone(),
                     vec![
-                        mk_user_msg("first"),
-                        mk_user_msg("second"),
-                        mk_user_msg("third"),
+                        ChatRowHandle::new(mk_user_msg("first")),
+                        ChatRowHandle::new(mk_user_msg("second")),
+                        ChatRowHandle::new(mk_user_msg("third")),
                     ],
                 );
             });
@@ -449,11 +451,7 @@ mod wasm_tests {
             .as_ref()
             .cloned()
             .expect("state captured");
-        state.chat_messages.update(|m| {
-            m.entry(agent_id.clone())
-                .or_default()
-                .push(mk_user_msg("fourth"));
-        });
+        state.push_chat_entry(agent_id.clone(), mk_user_msg("fourth"));
 
         next_tick().await;
 

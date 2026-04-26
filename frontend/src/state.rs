@@ -259,6 +259,41 @@ pub struct ToolRequestEntry {
     pub result: Option<ToolExecutionCompletedData>,
 }
 
+// ── Chat transcript rows ────────────────────────────────────────────────
+
+thread_local! {
+    static NEXT_CHAT_ROW_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChatRowId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ToolCallId(pub String);
+
+fn next_chat_row_id() -> ChatRowId {
+    NEXT_CHAT_ROW_ID.with(|cell| {
+        let id = cell.get();
+        cell.set(id + 1);
+        ChatRowId(id)
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatRowHandle {
+    pub id: ChatRowId,
+    pub entry: ArcRwSignal<ChatMessageEntry>,
+}
+
+impl ChatRowHandle {
+    pub fn new(entry: ChatMessageEntry) -> Self {
+        Self {
+            id: next_chat_row_id(),
+            entry: ArcRwSignal::new(entry),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenFile {
     pub path: ProjectPath,
@@ -512,7 +547,8 @@ pub struct AppState {
     /// to change which agent is "active", change the active chat tab via
     /// `activate_tab` / `open_tab` / `close_tab`.
     pub active_agent: Memo<Option<ActiveAgentRef>>,
-    pub chat_messages: RwSignal<HashMap<AgentId, Vec<ChatMessageEntry>>>,
+    pub chat_rows: RwSignal<HashMap<AgentId, Vec<ChatRowHandle>>>,
+    pub chat_tool_rows: RwSignal<HashMap<AgentId, HashMap<ToolCallId, ChatRowId>>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
@@ -586,7 +622,8 @@ impl AppState {
             sessions: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
             active_agent,
-            chat_messages: RwSignal::new(HashMap::new()),
+            chat_rows: RwSignal::new(HashMap::new()),
+            chat_tool_rows: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
@@ -648,6 +685,74 @@ impl AppState {
         let host_id = self.selected_host_id.get_untracked()?;
         let stream = self.host_stream_untracked(&host_id)?;
         Some((host_id, stream))
+    }
+
+    pub fn push_chat_entry(&self, agent_id: AgentId, entry: ChatMessageEntry) -> ChatRowHandle {
+        let handle = ChatRowHandle::new(entry);
+        let indexed_tool_call_ids = handle.entry.with_untracked(|entry| {
+            entry
+                .tool_requests
+                .iter()
+                .map(|tool| tool.request.tool_call_id.clone())
+                .collect::<Vec<_>>()
+        });
+
+        self.chat_rows.update(|rows| {
+            rows.entry(agent_id.clone())
+                .or_default()
+                .push(handle.clone());
+        });
+
+        if !indexed_tool_call_ids.is_empty() {
+            self.chat_tool_rows.update(|indexes| {
+                let agent_index = indexes.entry(agent_id).or_default();
+                for tool_call_id in indexed_tool_call_ids {
+                    agent_index.insert(ToolCallId(tool_call_id), handle.id);
+                }
+            });
+        }
+
+        handle
+    }
+
+    pub fn last_chat_row_untracked(&self, agent_id: &AgentId) -> Option<ChatRowHandle> {
+        self.chat_rows
+            .with_untracked(|rows| rows.get(agent_id).and_then(|rows| rows.last().cloned()))
+    }
+
+    pub fn chat_row_by_id_untracked(
+        &self,
+        agent_id: &AgentId,
+        row_id: ChatRowId,
+    ) -> Option<ChatRowHandle> {
+        self.chat_rows.with_untracked(|rows| {
+            rows.get(agent_id)
+                .and_then(|rows| rows.iter().find(|row| row.id == row_id).cloned())
+        })
+    }
+
+    pub fn index_chat_tool_row(&self, agent_id: &AgentId, tool_call_id: String, row_id: ChatRowId) {
+        self.chat_tool_rows.update(|indexes| {
+            indexes
+                .entry(agent_id.clone())
+                .or_default()
+                .insert(ToolCallId(tool_call_id), row_id);
+        });
+    }
+
+    pub fn chat_row_for_tool_untracked(
+        &self,
+        agent_id: &AgentId,
+        tool_call_id: &str,
+    ) -> Option<ChatRowHandle> {
+        let row_id = self.chat_tool_rows.with_untracked(|indexes| {
+            indexes.get(agent_id).and_then(|agent_index| {
+                agent_index
+                    .get(&ToolCallId(tool_call_id.to_owned()))
+                    .copied()
+            })
+        })?;
+        self.chat_row_by_id_untracked(agent_id, row_id)
     }
 
     pub fn selected_host_settings(&self) -> Option<HostSettings> {
@@ -786,7 +891,10 @@ impl AppState {
         });
         if !agent_ids.is_empty() {
             let drop_set: std::collections::HashSet<AgentId> = agent_ids.iter().cloned().collect();
-            self.chat_messages.update(|map| {
+            self.chat_rows.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.chat_tool_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.streaming_text.update(|map| {
@@ -1502,8 +1610,8 @@ mod tests {
             };
 
             for id in [&agent_a1, &agent_a2, &agent_b1] {
-                state.chat_messages.update(|m| {
-                    m.insert(id.clone(), vec![mk_msg()]);
+                state.chat_rows.update(|m| {
+                    m.insert(id.clone(), vec![ChatRowHandle::new(mk_msg())]);
                 });
                 state.task_lists.update(|m| {
                     m.insert(
@@ -1533,8 +1641,8 @@ mod tests {
             // host_a's agents are forgotten across every per-agent map.
             for id in [&agent_a1, &agent_a2] {
                 assert!(
-                    !state.chat_messages.with_untracked(|m| m.contains_key(id)),
-                    "chat_messages still has dropped agent {}",
+                    !state.chat_rows.with_untracked(|m| m.contains_key(id)),
+                    "chat_rows still has dropped agent {}",
                     id.0
                 );
                 assert!(
@@ -1575,9 +1683,9 @@ mod tests {
             // host_b's agent is untouched.
             assert!(
                 state
-                    .chat_messages
+                    .chat_rows
                     .with_untracked(|m| m.contains_key(&agent_b1)),
-                "host_b agent's chat_messages must survive"
+                "host_b agent's chat_rows must survive"
             );
             assert!(
                 state

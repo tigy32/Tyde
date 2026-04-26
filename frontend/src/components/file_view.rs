@@ -1,10 +1,37 @@
+use std::sync::Arc;
+
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::components::find_bar::{FindBar, FindState};
 use crate::highlight::highlight_code_blocks;
 use crate::state::{AppState, TabContent};
 
 use protocol::ProjectPath;
+
+/// Below this line count we render every line up-front — no spacers, no
+/// scroll math. This keeps the small-file path identical in DOM shape to
+/// the pre-virtualization implementation, so existing layout assertions
+/// (`renders_lines_single_spaced`) survive unchanged. Above this threshold
+/// we switch on viewport windowing.
+const VIRTUALIZE_THRESHOLD: usize = 200;
+
+/// Number of buffer lines to render outside the visible viewport on each
+/// side, smoothing scroll without rendering the whole file.
+const OVERSCAN_LINES: f64 = 50.0;
+
+/// Initial estimate for a single rendered line's height in pixels. Used
+/// before the first paint completes and we can measure the real value via
+/// `offset_height`. Picking a non-zero default lets virtualization engage
+/// on the very first render of a large file rather than rendering every
+/// line once and then narrowing — a typical monospace line at the default
+/// font size is ~16-20px.
+const INITIAL_LINE_HEIGHT_ESTIMATE: f64 = 18.0;
+
+/// Initial estimate for the viewport height before measurement. Combined
+/// with `INITIAL_LINE_HEIGHT_ESTIMATE` and `OVERSCAN_LINES` it bounds the
+/// first-paint render to ~80-100 lines for any file size.
+const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
 
 #[component]
 pub fn FileView(path: ProjectPath) -> impl IntoView {
@@ -44,18 +71,89 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                             }
                         };
 
-                        let lines: Vec<String> = content.lines().map(|l| l.to_owned()).collect();
-                        let find_state = FindState::new(lines.clone());
+                        let lines: Arc<Vec<String>> =
+                            Arc::new(content.lines().map(|l| l.to_owned()).collect());
+                        let total = lines.len();
+                        let find_state = FindState::new((*lines).clone());
                         provide_context(find_state.clone());
 
                         let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
+
+                        // Virtualization geometry. Pre-seed the line and
+                        // viewport heights with reasonable estimates so the
+                        // very first render of a large file already uses a
+                        // bounded window. The measurement Effect below
+                        // refines both values once layout is real.
+                        let scroll_top = RwSignal::new(0.0_f64);
+                        let viewport_height =
+                            RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
+                        let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+
+                        // Measure the geometry once after first paint. The
+                        // Effect re-runs if the underlying signals fire
+                        // (rare here — only the initial mount).
                         Effect::new(move |_| {
+                            let Some(el) = pre_ref.get() else { return };
+                            let vh = el.client_height() as f64;
+                            if vh > 0.0 {
+                                viewport_height.set(vh);
+                            }
+                            if let Ok(Some(line_el)) = el.query_selector(".file-line")
+                                && let Some(html_el) =
+                                    line_el.dyn_ref::<web_sys::HtmlElement>()
+                            {
+                                let lh = html_el.offset_height() as f64;
+                                if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
+                                    line_height.set(lh);
+                                }
+                            }
+                        });
+
+                        let on_scroll = move |_: web_sys::Event| {
+                            if let Some(el) = pre_ref.get() {
+                                scroll_top.set(el.scroll_top() as f64);
+                            }
+                        };
+
+                        // Visible window in line-index space. Small files
+                        // render everything (start=0, end=total) so spacers
+                        // stay at 0px and the pre-virtualization DOM shape
+                        // is preserved. Larger files use the seeded
+                        // (then measured) line_height to bound the window
+                        // from the very first render.
+                        let visible_window: Memo<(usize, usize)> =
+                            Memo::new(move |_| {
+                                if total < VIRTUALIZE_THRESHOLD {
+                                    return (0, total);
+                                }
+                                let lh = line_height.get();
+                                let st = scroll_top.get();
+                                let vh = viewport_height.get();
+                                let start_f =
+                                    ((st - OVERSCAN_LINES * lh) / lh).floor().max(0.0);
+                                let end_f = ((st + vh + OVERSCAN_LINES * lh) / lh)
+                                    .ceil()
+                                    .min(total as f64);
+                                (start_f as usize, end_f as usize)
+                            });
+
+                        // Re-highlight on visible-window change so newly
+                        // scrolled-in lines pick up syntax colors. The
+                        // `:not(.hljs)` selector inside `highlight_code_blocks`
+                        // skips already-highlighted blocks, so this is
+                        // idempotent across re-runs.
+                        Effect::new(move |_| {
+                            let _ = visible_window.get();
                             if let Some(el) = pre_ref.get() {
                                 highlight_code_blocks(&el);
                             }
                         });
 
                         let find_bar_open = state.find_bar_open;
+
+                        let lines_for_render = lines.clone();
+                        let lang_for_render = lang_class.clone();
+                        let find_for_render = find_state.clone();
 
                         view! {
                             <div class="file-view-header">
@@ -69,21 +167,60 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                     None
                                 }
                             }}
-                            <pre class="file-view-content" node_ref=pre_ref>
-                                {lines.iter().enumerate().map(|(i, line_text)| {
-                                    let text = line_text.clone();
-                                    let lang = lang_class.clone();
-                                    let find = find_state.clone();
+                            <pre
+                                class="file-view-content"
+                                node_ref=pre_ref
+                                on:scroll=on_scroll
+                            >
+                                {move || {
+                                    let (start, end) = visible_window.get();
+                                    let lh = line_height.get();
+                                    let top_height = start as f64 * lh;
+                                    let bottom_height =
+                                        (total.saturating_sub(end)) as f64 * lh;
+
+                                    let top_spacer = (top_height > 0.0).then(|| {
+                                        view! {
+                                            <div
+                                                class="file-view-spacer"
+                                                style=format!("height: {top_height}px;")
+                                            ></div>
+                                        }
+                                    });
+                                    let bottom_spacer = (bottom_height > 0.0).then(|| {
+                                        view! {
+                                            <div
+                                                class="file-view-spacer"
+                                                style=format!("height: {bottom_height}px;")
+                                            ></div>
+                                        }
+                                    });
+
+                                    let visible: Vec<_> = (start..end)
+                                        .map(|i| {
+                                            let text = lines_for_render[i].clone();
+                                            let lang = lang_for_render.clone();
+                                            let find = find_for_render.clone();
+                                            view! {
+                                                <div
+                                                    class=move || file_line_class(i, &find)
+                                                    attr:data-find-idx=i
+                                                >
+                                                    <span class="file-line-num">{i + 1}</span>
+                                                    <code class=lang.clone()>{text}</code>
+                                                </div>
+                                            }
+                                        })
+                                        .collect();
+
                                     view! {
-                                        <div
-                                            class=move || file_line_class(i, &find)
-                                            attr:data-find-idx=i
-                                        >
-                                            <span class="file-line-num">{i + 1}</span>
-                                            <code class=lang.clone()>{text}</code>
-                                        </div>
+                                        <>
+                                            {top_spacer}
+                                            {visible}
+                                            {bottom_spacer}
+                                        </>
                                     }
-                                }).collect::<Vec<_>>()}
+                                }}
                             </pre>
                         }.into_any()
                     }
@@ -189,15 +326,41 @@ mod wasm_tests {
     /// assertions reflect real styling.
     const PROD_STYLES: &str = include_str!("../../styles.css");
 
+    /// Vendor hljs theme — once `highlight_code_blocks` runs in production,
+    /// every line's `<code>` gets the `.hljs` class and this stylesheet
+    /// kicks in. Loading it in tests means our geometry assertions reflect
+    /// the same cascade users see, not a hljs-free subset of it.
+    const HLJS_THEME: &str = include_str!("../../vendor/hljs-theme.css");
+
     fn ensure_styles_loaded() {
         let document = web_sys::window().unwrap().document().unwrap();
-        if document.get_element_by_id("test-prod-styles").is_some() {
-            return;
+        if document.get_element_by_id("test-prod-styles").is_none() {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles");
+            style.set_text_content(Some(HLJS_THEME));
+            document.head().unwrap().append_child(&style).unwrap();
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-app");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
         }
-        let style = document.create_element("style").unwrap();
-        style.set_id("test-prod-styles");
-        style.set_text_content(Some(PROD_STYLES));
-        document.head().unwrap().append_child(&style).unwrap();
+    }
+
+    /// Apply the `.hljs` class to every rendered line `<code>`, matching
+    /// what `hljs.highlightElement` does in production. The vendor JS isn't
+    /// loaded in tests, so without this the `pre code.hljs` cascade is
+    /// invisible to assertions.
+    fn apply_hljs_class(container: &HtmlElement) {
+        let nodes = container.query_selector_all(".file-line code").unwrap();
+        for i in 0..nodes.length() {
+            if let Some(node) = nodes.item(i)
+                && let Ok(el) = node.dyn_into::<Element>()
+            {
+                let existing = el.get_attribute("class").unwrap_or_default();
+                el.set_attribute("class", &format!("{existing} hljs"))
+                    .unwrap();
+            }
+        }
     }
 
     /// Create a fresh, sized container appended to the document body so child
@@ -230,6 +393,16 @@ mod wasm_tests {
         (0..nodes.length())
             .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
             .collect()
+    }
+
+    /// Count rendered line rows, ignoring virtualization spacers. Spacers
+    /// have the `file-view-spacer` class and are only present for files
+    /// large enough to engage windowing.
+    fn rendered_line_count(container: &HtmlElement) -> usize {
+        container
+            .query_selector_all(".file-view-content > .file-line")
+            .unwrap()
+            .length() as usize
     }
 
     /// Yield to the browser event loop so reactive effects flush and the DOM
@@ -337,5 +510,126 @@ mod wasm_tests {
                 "row {i} rendered text does not match source line exactly"
             );
         }
+
+        // Repeat the geometry assertion *after* simulating hljs running.
+        // In production, `highlight_code_blocks` adds the `.hljs` class to
+        // every line's `<code>`, which activates the vendor theme rule
+        // `pre code.hljs { display: block; padding: 1em }`. Without our
+        // `.file-line code.hljs` override, every line grows by ~32px of
+        // vertical padding — rows AND gaps both scale, so the gap/height
+        // ratio stays ~1, but the absolute row height balloons. That's
+        // what the user sees as "double-spaced," so we must guard the
+        // absolute height too, not just the ratio.
+        let baseline_row_height = row_height;
+        apply_hljs_class(&container);
+        next_tick().await;
+
+        let rows = line_rows(&container);
+        let row0 = rows[0].get_bounding_client_rect();
+        let row1 = rows[1].get_bounding_client_rect();
+        let hljs_row_height = row0.height();
+        let hljs_gap = row1.top() - row0.top();
+        let hljs_ratio = hljs_gap / hljs_row_height;
+        assert!(
+            (0.95..=1.10).contains(&hljs_ratio),
+            "lines are not single-spaced after hljs class applied: \
+             gap={hljs_gap:.2}px, row_height={hljs_row_height:.2}px, \
+             ratio={hljs_ratio:.2}"
+        );
+        let height_ratio = hljs_row_height / baseline_row_height;
+        assert!(
+            (0.9..=1.2).contains(&height_ratio),
+            "row height grew after hljs class applied: baseline={baseline_row_height:.2}px, \
+             with-hljs={hljs_row_height:.2}px, ratio={height_ratio:.2} — \
+             likely a `pre code.hljs` cascade leaking through"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn large_file_only_renders_visible_window() {
+        ensure_styles_loaded();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "big.txt".to_owned(),
+        };
+        // 5000 lines — comfortably above VIRTUALIZE_THRESHOLD (200).
+        let total_lines = 5000;
+        let content: String = (0..total_lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <FileView path=mount_path.clone() /> }
+        });
+
+        // Virtualization must engage on the very first paint — pre-seeded
+        // line/viewport height estimates bound the window before any
+        // measurement Effect runs.
+        next_tick().await;
+
+        let rendered_first_paint = rendered_line_count(&container);
+        assert!(
+            rendered_first_paint > 0,
+            "expected some lines to render on first paint, got {rendered_first_paint}"
+        );
+        assert!(
+            rendered_first_paint < total_lines / 4,
+            "virtualization did not engage on first paint: rendered={rendered_first_paint} \
+             out of {total_lines} total lines"
+        );
+
+        // Subsequent ticks let the measurement Effect refine the geometry;
+        // the rendered count should stay bounded.
+        next_tick().await;
+        let rendered = rendered_line_count(&container);
+        assert!(
+            rendered < total_lines / 4,
+            "virtualization regressed after measurement: rendered={rendered} \
+             out of {total_lines} total lines"
+        );
+
+        // The two spacer divs preserve scrollbar geometry: the `<pre>`'s
+        // total scrollable height should be roughly total_lines * line_height.
+        let pre = container
+            .query_selector(".file-view-content")
+            .unwrap()
+            .expect("pre present")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let row = container
+            .query_selector(".file-view-content > .file-line")
+            .unwrap()
+            .expect("at least one rendered line")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let row_height = row.offset_height() as f64;
+        let scroll_height = pre.scroll_height() as f64;
+        let expected_total = row_height * total_lines as f64;
+        // Allow a generous tolerance: scroll_height includes spacer rounding
+        // and any padding on the `<pre>` itself.
+        let ratio = scroll_height / expected_total;
+        assert!(
+            (0.9..=1.15).contains(&ratio),
+            "scroll geometry is wrong: scroll_height={scroll_height:.0}px, \
+             expected≈{expected_total:.0}px (row_height={row_height:.1}px × \
+             {total_lines} lines), ratio={ratio:.3}"
+        );
     }
 }

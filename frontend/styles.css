@@ -4300,13 +4300,16 @@ kbd {
     flex-shrink: 0;
 }
 
-.file-line code {
+.file-line code,
+.file-line code.hljs {
     flex: 1;
     min-width: 0;
-    padding-left: var(--space-2);
+    padding: 0 0 0 var(--space-2);
     white-space: pre;
     font-family: var(--font-mono);
     color: var(--text-primary);
+    background: transparent;
+    overflow-x: visible;
 }
 
 /* ===== Transient Notices (kept for backward compat but now rendered as cards) ===== */

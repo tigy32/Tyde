@@ -1,43 +1,24 @@
 use leptos::prelude::*;
-use protocol::{AgentId, MessageSender};
+use protocol::MessageSender;
 
 use crate::components::tool_card::ToolCardView;
 use crate::highlight::highlight_code_blocks;
 use crate::markdown::render_markdown;
-use crate::state::{AppState, ChatMessageEntry};
+use crate::state::ChatRowHandle;
 
-/// Render a single chat row, addressed by `(agent_id, idx)` so the keyed
-/// `<For>` in `ChatView` can preserve row identity across appends. The row
-/// reads the underlying `ChatMessageEntry` reactively from `state.chat_messages`,
-/// so in-place mutations (e.g. `ToolRequest` adding tool cards to an existing
-/// message — see `dispatch.rs::ChatEvent::ToolRequest`) project through.
+/// Render a single chat row from its row-local signal.
 ///
-/// `agent_id` and `idx` are fixed at row creation: an agent switch produces a
-/// fresh key and remounts. Within a single agent, appends preserve the rows
-/// 0..len() and only mount the new tail row.
+/// `ChatView` keys rows by stable `ChatRowId` and passes the row handle into
+/// this component. Appending a sibling row updates the row list, but existing
+/// `ChatMessageView`s only subscribe to their own `ArcRwSignal`, so long
+/// history replay does not wake every already-mounted row.
 #[component]
-pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
-    let state = expect_context::<AppState>();
+pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
+    let entry = row.entry;
 
-    // Source of truth for this row. Re-fires on any chat_messages update for
-    // this agent — but the per-field Memos below short-circuit when their
-    // narrow inputs are unchanged, so unrelated updates (e.g. another row's
-    // tool_request) do not re-render markdown or rebuild static fields.
-    let entry_agent_id = agent_id.clone();
-    let entry: Signal<Option<ChatMessageEntry>> = Signal::derive(move || {
-        state
-            .chat_messages
-            .with(|m| m.get(&entry_agent_id).and_then(|v| v.get(idx).cloned()))
-    });
-
-    // Card class / sender label / role flags. These can change only if the
-    // entry at this (agent_id, idx) is replaced — which today only happens at
-    // clear_host_runtime, which drops the whole agent and unmounts the row.
-    // We still derive them through Memos so the view stays a clean projection.
+    let entry_for_meta = entry.clone();
     let card_meta: Memo<(String, String, bool, bool)> = Memo::new(move |_| {
-        let Some(e) = entry.get() else {
-            return ("chat-card".to_owned(), String::new(), false, false);
-        };
+        let e = entry_for_meta.get();
         match &e.message.sender {
             MessageSender::User => (
                 "chat-card chat-card-user".to_owned(),
@@ -72,13 +53,9 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
         }
     });
 
-    // Memo on (is_user, content): tuple of primitives with PartialEq, so the
-    // Memo short-circuits when neither changes. For finalized messages this
-    // computes once; for sibling chat_messages updates it returns cached.
+    let entry_for_content = entry.clone();
     let content_data: Memo<(bool, String)> = Memo::new(move |_| {
-        let Some(e) = entry.get() else {
-            return (false, String::new());
-        };
+        let e = entry_for_content.get();
         let is_user = matches!(e.message.sender, MessageSender::User);
         (is_user, e.message.content)
     });
@@ -99,28 +76,21 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
         }
     });
 
-    let timestamp_memo: Memo<u64> =
-        Memo::new(move |_| entry.get().map(|e| e.message.timestamp).unwrap_or(0));
+    let entry_for_timestamp = entry.clone();
+    let timestamp_memo: Memo<u64> = Memo::new(move |_| entry_for_timestamp.get().message.timestamp);
 
-    let model_memo: Memo<Option<String>> = Memo::new(move |_| {
-        entry
-            .get()
-            .and_then(|e| e.message.model_info.map(|mi| mi.model))
-    });
+    let entry_for_model = entry.clone();
+    let model_memo: Memo<Option<String>> =
+        Memo::new(move |_| entry_for_model.get().message.model_info.map(|mi| mi.model));
 
     let copy_state = RwSignal::new("copy");
 
-    // Copy the *current* content at click time, not a row-creation snapshot.
-    let on_copy_agent = agent_id.clone();
+    let entry_for_copy = entry.clone();
     let on_copy = move |_| {
-        let state = expect_context::<AppState>();
-        let Some(text) = state.chat_messages.with_untracked(|m| {
-            m.get(&on_copy_agent)
-                .and_then(|v| v.get(idx))
-                .map(|e| e.message.content.clone())
-        }) else {
+        let text = entry_for_copy.with_untracked(|entry| entry.message.content.clone());
+        if text.is_empty() {
             return;
-        };
+        }
         let cs = copy_state;
         wasm_bindgen_futures::spawn_local(async move {
             let window = web_sys::window().unwrap();
@@ -150,15 +120,17 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
     };
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
-    // Re-highlight whenever the rendered HTML actually changes (Memo guarantees
-    // this only fires when content changes, not on sibling chat_messages
-    // updates).
     Effect::new(move |_| {
         let _ = content_html.get();
         if let Some(el) = body_ref.get() {
             highlight_code_blocks(&el);
         }
     });
+
+    let entry_for_reasoning = entry.clone();
+    let entry_for_images = entry.clone();
+    let entry_for_tools = entry.clone();
+    let entry_for_footer = entry.clone();
 
     view! {
         <div class=move || card_meta.with(|(c, _, _, _)| c.clone())>
@@ -172,7 +144,7 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
 
             // Reasoning (collapsible)
             {move || {
-                entry.get().and_then(|e| e.message.reasoning).map(|r| {
+                entry_for_reasoning.get().message.reasoning.map(|r| {
                     let text = r.text;
                     let token_count = r.tokens;
                     view! {
@@ -208,7 +180,7 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
 
             // Images
             {move || {
-                entry.get().and_then(|e| e.message.images).and_then(|imgs| {
+                entry_for_images.get().message.images.and_then(|imgs| {
                     if imgs.is_empty() {
                         return None;
                     }
@@ -225,10 +197,10 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
                 })
             }}
 
-            // Tool cards — read reactively because ToolRequest events mutate
-            // the in-place tool_requests vec (see dispatch.rs:1424).
+            // Tool cards — read only this row's signal, so tool updates do not
+            // invalidate sibling rows.
             {move || {
-                let tools = entry.get().map(|e| e.tool_requests).unwrap_or_default();
+                let tools = entry_for_tools.get().tool_requests;
                 if tools.is_empty() {
                     return None;
                 }
@@ -247,7 +219,7 @@ pub fn ChatMessageView(agent_id: AgentId, idx: usize) -> impl IntoView {
                 if !is_assistant {
                     return None;
                 }
-                let e = entry.get()?;
+                let e = entry_for_footer.get();
                 let model_display = e.message.model_info.as_ref().map(|mi| mi.model.clone());
                 let agent_display = match &e.message.sender {
                     MessageSender::Assistant { agent } => agent.clone(),
