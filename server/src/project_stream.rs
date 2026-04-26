@@ -5,25 +5,27 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use protocol::{
-    DiffContextMode, FileEntryOp, Project, ProjectDiffScope, ProjectFileContentsPayload,
-    ProjectFileEntry, ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind,
-    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath,
+    CommandErrorCode, CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
+    ProjectDiffScope, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
+    ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile, ProjectGitDiffHunk,
+    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
+    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, StreamPath,
 };
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 
 use crate::store::project::ProjectStore;
 use crate::stream::Stream;
 
-const PROJECT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A (relative_path, kind) pair used for diffing file listings between polls.
+/// A (relative_path, kind) pair used for comparing file listings between snapshots.
 pub(crate) type RawFileEntry = (String, ProjectFileKind);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,10 +36,10 @@ enum GitAccessMode {
 
 #[derive(Debug, Default)]
 pub(crate) struct ProjectSnapshotState {
-    /// Previous file entries per root, used to compute diffs.
+    /// Previous file entries per root, used to decide whether a new full snapshot is needed.
     pub file_entries: BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
     pub git_status: Option<Value>,
-    pub diff_context_modes: HashMap<ProjectDiffRequestKey, DiffContextMode>,
+    pub diff_context_modes: HashMap<(StreamPath, ProjectDiffRequestKey), DiffContextMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -49,103 +51,143 @@ pub(crate) struct ProjectDiffRequestKey {
 
 pub(crate) struct ProjectStreamSubscription {
     pub task: JoinHandle<()>,
-    pub state: Arc<Mutex<ProjectSnapshotState>>,
+    pub handle: ProjectStreamHandle,
 }
 
-pub(crate) fn spawn_project_subscription(
+#[derive(Clone)]
+pub(crate) struct ProjectStreamHandle {
+    tx: mpsc::Sender<ProjectStreamCommand>,
+}
+
+enum ProjectStreamCommand {
+    AddSubscriber {
+        host_path: StreamPath,
+        stream: Stream,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    RemoveSubscriber {
+        host_path: StreamPath,
+    },
+    Refresh {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    RememberDiffContext {
+        host_path: StreamPath,
+        key: ProjectDiffRequestKey,
+        context_mode: DiffContextMode,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Default)]
+struct PendingProjectUpdate {
+    files: bool,
+    git: bool,
+}
+
+impl PendingProjectUpdate {
+    fn is_empty(&self) -> bool {
+        !self.files && !self.git
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.files |= other.files;
+        self.git |= other.git;
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+impl ProjectStreamHandle {
+    pub(crate) async fn add_subscriber(
+        &self,
+        host_path: StreamPath,
+        stream: Stream,
+    ) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::AddSubscriber {
+                host_path,
+                stream,
+                reply,
+            })
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) async fn remove_subscriber(&self, host_path: StreamPath) {
+        let _ = self
+            .tx
+            .send(ProjectStreamCommand::RemoveSubscriber { host_path })
+            .await;
+    }
+
+    pub(crate) async fn refresh(&self) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::Refresh { reply })
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) async fn remember_diff_context_mode(
+        &self,
+        host_path: StreamPath,
+        key: ProjectDiffRequestKey,
+        context_mode: DiffContextMode,
+    ) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::RememberDiffContext {
+                host_path,
+                key,
+                context_mode,
+                reply,
+            })
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+}
+
+pub(crate) async fn spawn_project_subscription(
     project_store: Arc<Mutex<ProjectStore>>,
     project_id: ProjectId,
-    stream: Stream,
-    state: Arc<Mutex<ProjectSnapshotState>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let project = match load_subscription_project(&project_store, &project_id).await {
-                Ok(project) => project,
-                Err(error) => {
-                    tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription");
-                    return;
-                }
-            };
+) -> Result<ProjectStreamSubscription, String> {
+    let project = load_subscription_project(&project_store, &project_id).await?;
+    let (watch_tx, watch_rx) = mpsc::unbounded_channel();
+    let watcher = create_project_watcher(&project, watch_tx.clone())?;
+    let watched_roots = project.roots.clone();
+    let snapshot = initialize_snapshot(&project)?;
+    let (command_tx, command_rx) = mpsc::channel(16);
+    let handle = ProjectStreamHandle { tx: command_tx };
 
-            let current_raw = match scan_raw_entries(&project) {
-                Ok(current_raw) => current_raw,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = %project_id,
-                        error = %error,
-                        "stopping project subscription after file scan failure"
-                    );
-                    return;
-                }
-            };
-            let git_status = match build_git_status(&project) {
-                Ok(git_status) => git_status,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = %project_id,
-                        error = %error,
-                        "stopping project subscription after git status failure"
-                    );
-                    return;
-                }
-            };
+    let task = tokio::spawn(async move {
+        run_project_subscription(
+            project_store,
+            project_id,
+            project,
+            snapshot,
+            watcher,
+            watched_roots,
+            watch_tx,
+            watch_rx,
+            command_rx,
+        )
+        .await;
+    });
 
-            let git_json = match serde_json::to_value(&git_status) {
-                Ok(git_json) => git_json,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = %project_id,
-                        error = %error,
-                        "stopping project subscription after git status serialization failure"
-                    );
-                    return;
-                }
-            };
-
-            let mut snapshot = state.lock().await;
-
-            let file_diff = diff_file_entries(&snapshot.file_entries, &current_raw);
-            if !file_diff.roots.is_empty() {
-                snapshot.file_entries = current_raw;
-                let file_json = match serde_json::to_value(&file_diff) {
-                    Ok(file_json) => file_json,
-                    Err(error) => {
-                        tracing::warn!(
-                            project_id = %project_id,
-                            error = %error,
-                            "stopping project subscription after file diff serialization failure"
-                        );
-                        return;
-                    }
-                };
-                drop(snapshot);
-                if stream
-                    .send_value(protocol::FrameKind::ProjectFileList, file_json)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                snapshot = state.lock().await;
-            }
-
-            let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
-            if git_changed {
-                snapshot.git_status = Some(git_json.clone());
-                drop(snapshot);
-                if stream
-                    .send_value(protocol::FrameKind::ProjectGitStatus, git_json)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
-            sleep(PROJECT_POLL_INTERVAL).await;
-        }
-    })
+    Ok(ProjectStreamSubscription { task, handle })
 }
 
 async fn load_subscription_project(
@@ -159,7 +201,488 @@ async fn load_subscription_project(
         .ok_or_else(|| format!("project {} disappeared while stream was active", project_id))
 }
 
-/// Default depth limit for initial file listings and polling.
+fn create_project_watcher(
+    project: &Project,
+    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+) -> Result<RecommendedWatcher, String> {
+    let mut watcher = RecommendedWatcher::new(
+        move |result| {
+            let _ = watch_tx.send(result);
+        },
+        Config::default(),
+    )
+    .map_err(|error| format!("failed to create project filesystem watcher: {error}"))?;
+
+    for root in &project.roots {
+        watcher
+            .watch(Path::new(root), RecursiveMode::Recursive)
+            .map_err(|error| format!("failed to watch project root '{}': {error}", root))?;
+    }
+
+    Ok(watcher)
+}
+
+fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String> {
+    let mut snapshot = ProjectSnapshotState {
+        file_entries: scan_raw_entries(project)?,
+        ..Default::default()
+    };
+    let git_status = build_git_status(project)?;
+    snapshot.git_status = Some(serialize_git_status(&git_status)?);
+    Ok(snapshot)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_project_subscription(
+    project_store: Arc<Mutex<ProjectStore>>,
+    project_id: ProjectId,
+    mut project: Project,
+    mut snapshot: ProjectSnapshotState,
+    mut watcher: RecommendedWatcher,
+    mut watched_roots: Vec<String>,
+    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+    mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
+    mut command_rx: mpsc::Receiver<ProjectStreamCommand>,
+) {
+    let mut subscribers = HashMap::<StreamPath, Stream>::new();
+    let mut pending_update = PendingProjectUpdate::default();
+    let mut debounce_active = false;
+    let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
+    let mut git_poll = interval_at(
+        Instant::now() + GIT_STATUS_POLL_INTERVAL,
+        GIT_STATUS_POLL_INTERVAL,
+    );
+    git_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            maybe_command = command_rx.recv() => {
+                let Some(command) = maybe_command else {
+                    return;
+                };
+                match command {
+                    ProjectStreamCommand::AddSubscriber { host_path, stream, reply } => {
+                        use std::collections::hash_map::Entry;
+                        match subscribers.entry(host_path.clone()) {
+                            Entry::Occupied(mut e) => {
+                                e.insert(stream);
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert(stream.clone());
+                            }
+                        }
+                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot).await;
+                        if result.is_err() {
+                            subscribers.remove(&host_path);
+                            snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
+                        }
+                        let _ = reply.send(result);
+                    }
+                    ProjectStreamCommand::RemoveSubscriber { host_path } => {
+                        subscribers.remove(&host_path);
+                        snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
+                    }
+                    ProjectStreamCommand::Refresh { reply } => {
+                        let result = refresh_full(
+                            &project_store,
+                            &project_id,
+                            &mut project,
+                            &mut snapshot,
+                            &mut watcher,
+                            &mut watched_roots,
+                            watch_tx.clone(),
+                            &mut subscribers,
+                        ).await;
+                        let _ = reply.send(result);
+                    }
+                    ProjectStreamCommand::RememberDiffContext { host_path, key, context_mode, reply } => {
+                        snapshot.diff_context_modes.insert((host_path, key), context_mode);
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            }
+            maybe_event = watch_rx.recv() => {
+                let Some(event_result) = maybe_event else {
+                    emit_fatal_project_stream_error(
+                        &mut subscribers,
+                        "project_watch",
+                        "project filesystem watcher stopped unexpectedly".to_owned(),
+                    ).await;
+                    return;
+                };
+
+                match event_result {
+                    Ok(event) => {
+                        let refresh = classify_watch_event(&event);
+                        if !refresh.is_empty() {
+                            pending_update.merge(refresh);
+                            debounce_active = true;
+                            debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("project filesystem watcher failed: {error}");
+                        tracing::warn!(project_id = %project_id, error = %message, "stopping project subscription");
+                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", message).await;
+                        return;
+                    }
+                }
+            }
+            _ = &mut debounce_sleep, if debounce_active => {
+                debounce_active = false;
+                let refresh = pending_update.take();
+                if let Err(error) = refresh_incremental(
+                    &project_store,
+                    &project_id,
+                    &mut project,
+                    &mut snapshot,
+                    &mut watcher,
+                    &mut watched_roots,
+                    watch_tx.clone(),
+                    &mut subscribers,
+                    refresh.files,
+                    refresh.git,
+                ).await {
+                    tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after debounced refresh failure");
+                    emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
+                    return;
+                }
+            }
+            _ = git_poll.tick() => {
+                if let Err(error) = refresh_incremental(
+                    &project_store,
+                    &project_id,
+                    &mut project,
+                    &mut snapshot,
+                    &mut watcher,
+                    &mut watched_roots,
+                    watch_tx.clone(),
+                    &mut subscribers,
+                    false,
+                    true,
+                ).await {
+                    tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after git status refresh failure");
+                    emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_full(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+    project: &mut Project,
+    snapshot: &mut ProjectSnapshotState,
+    watcher: &mut RecommendedWatcher,
+    watched_roots: &mut Vec<String>,
+    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+    subscribers: &mut HashMap<StreamPath, Stream>,
+) -> Result<(), String> {
+    let latest_project = load_subscription_project(project_store, project_id).await?;
+    ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
+
+    let raw_entries = scan_raw_entries(&latest_project)?;
+    let file_list = full_file_list_from_raw(&latest_project, &raw_entries);
+    let git_status = build_git_status(&latest_project)?;
+    let git_json = serialize_git_status(&git_status)?;
+
+    *project = latest_project;
+    snapshot.file_entries = raw_entries;
+    snapshot.git_status = Some(git_json);
+
+    fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
+    fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+    refresh_remembered_diffs(project, snapshot, subscribers).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_incremental(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+    project: &mut Project,
+    snapshot: &mut ProjectSnapshotState,
+    watcher: &mut RecommendedWatcher,
+    watched_roots: &mut Vec<String>,
+    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+    subscribers: &mut HashMap<StreamPath, Stream>,
+    files_changed: bool,
+    git_changed: bool,
+) -> Result<(), String> {
+    if !files_changed && !git_changed {
+        return Ok(());
+    }
+
+    let latest_project = load_subscription_project(project_store, project_id).await?;
+    ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
+    *project = latest_project;
+
+    if files_changed {
+        let current_raw = scan_raw_entries(project)?;
+        if snapshot.file_entries != current_raw {
+            snapshot.file_entries = current_raw;
+            let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
+            fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
+        }
+    }
+
+    if git_changed {
+        let git_status = build_git_status(project)?;
+        let git_json = serialize_git_status(&git_status)?;
+        if snapshot.git_status.as_ref() != Some(&git_json) {
+            snapshot.git_status = Some(git_json);
+            fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+            refresh_remembered_diffs(project, snapshot, subscribers).await;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_watched_roots(
+    project: &Project,
+    watcher: &mut RecommendedWatcher,
+    watched_roots: &mut Vec<String>,
+    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+) -> Result<(), String> {
+    if *watched_roots == project.roots {
+        return Ok(());
+    }
+
+    *watcher = create_project_watcher(project, watch_tx)?;
+    *watched_roots = project.roots.clone();
+    Ok(())
+}
+
+fn classify_watch_event(event: &Event) -> PendingProjectUpdate {
+    let mut refresh = PendingProjectUpdate::default();
+    for path in &event.paths {
+        if is_git_head_or_index(path) {
+            refresh.git = true;
+        } else if !is_inside_git(path) {
+            refresh.files = true;
+            refresh.git = true;
+        }
+    }
+    refresh
+}
+
+fn is_inside_git(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, Component::Normal(name) if name == std::ffi::OsStr::new(".git"))
+    })
+}
+
+fn is_git_head_or_index(path: &Path) -> bool {
+    let mut saw_git = false;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        if saw_git {
+            return name == std::ffi::OsStr::new("HEAD") || name == std::ffi::OsStr::new("index");
+        }
+        saw_git = name == std::ffi::OsStr::new(".git");
+    }
+    false
+}
+
+fn full_file_list_from_raw(
+    project: &Project,
+    raw_entries: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
+) -> ProjectFileListPayload {
+    let roots = project
+        .roots
+        .iter()
+        .map(|root| {
+            let root = ProjectRootPath(root.clone());
+            let entries = raw_entries
+                .get(&root)
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .map(|(path, kind)| ProjectFileEntry {
+                    relative_path: path.clone(),
+                    kind: *kind,
+                    op: FileEntryOp::Add,
+                })
+                .collect();
+            ProjectRootListing { root, entries }
+        })
+        .collect();
+    ProjectFileListPayload {
+        incremental: false,
+        roots,
+    }
+}
+
+fn serialize_git_status(git_status: &ProjectGitStatusPayload) -> Result<Value, String> {
+    serde_json::to_value(git_status)
+        .map_err(|error| format!("failed to serialize project git status: {error}"))
+}
+
+async fn emit_snapshot_to_stream(
+    stream: &Stream,
+    project: &Project,
+    snapshot: &ProjectSnapshotState,
+) -> Result<(), String> {
+    let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
+    send_payload(stream, FrameKind::ProjectFileList, &file_list).await?;
+    let Some(git_status) = snapshot.git_status.clone() else {
+        return Err("project git status snapshot was not initialized".to_owned());
+    };
+    stream
+        .send_value(FrameKind::ProjectGitStatus, git_status)
+        .await
+        .map_err(|_| "project stream closed".to_owned())
+}
+
+async fn fan_out_payload<T: serde::Serialize>(
+    subscribers: &mut HashMap<StreamPath, Stream>,
+    kind: FrameKind,
+    payload: &T,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(payload)
+        .map_err(|error| format!("failed to serialize {kind} payload: {error}"))?;
+    fan_out_value(subscribers, kind, payload).await;
+    Ok(())
+}
+
+async fn fan_out_value(
+    subscribers: &mut HashMap<StreamPath, Stream>,
+    kind: FrameKind,
+    payload: Value,
+) {
+    let mut dead = Vec::new();
+    for (host_path, stream) in subscribers.iter() {
+        if stream.send_value(kind, payload.clone()).await.is_err() {
+            dead.push(host_path.clone());
+        }
+    }
+    for host_path in dead {
+        subscribers.remove(&host_path);
+    }
+}
+
+async fn refresh_remembered_diffs(
+    project: &Project,
+    snapshot: &ProjectSnapshotState,
+    subscribers: &HashMap<StreamPath, Stream>,
+) {
+    let mut remembered = snapshot
+        .diff_context_modes
+        .iter()
+        .map(|((host_path, key), context_mode)| (host_path.clone(), key.clone(), *context_mode))
+        .collect::<Vec<_>>();
+    remembered.sort_by(|(host_a, key_a, _), (host_b, key_b, _)| {
+        host_a
+            .0
+            .cmp(&host_b.0)
+            .then_with(|| key_a.root.0.cmp(&key_b.root.0))
+            .then_with(|| diff_scope_sort_key(key_a.scope).cmp(&diff_scope_sort_key(key_b.scope)))
+            .then_with(|| key_a.path.cmp(&key_b.path))
+    });
+
+    for (host_path, key, context_mode) in remembered {
+        let Some(stream) = subscribers.get(&host_path) else {
+            continue;
+        };
+        let payload = ProjectReadDiffPayload {
+            root: key.root.clone(),
+            scope: key.scope,
+            path: key.path.clone(),
+            context_mode,
+        };
+        match read_diff(project, payload) {
+            Ok(diff) => {
+                let _ = send_payload(stream, FrameKind::ProjectGitDiff, &diff).await;
+            }
+            Err(error) => {
+                emit_project_command_error(
+                    stream,
+                    FrameKind::ProjectReadDiff,
+                    "project_read_diff",
+                    error,
+                    false,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+fn diff_scope_sort_key(scope: ProjectDiffScope) -> u8 {
+    match scope {
+        ProjectDiffScope::Staged => 0,
+        ProjectDiffScope::Unstaged => 1,
+    }
+}
+
+async fn send_payload<T: serde::Serialize>(
+    stream: &Stream,
+    kind: FrameKind,
+    payload: &T,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(payload)
+        .map_err(|error| format!("failed to serialize {kind} payload: {error}"))?;
+    stream
+        .send_value(kind, payload)
+        .await
+        .map_err(|_| "project stream closed".to_owned())
+}
+
+async fn emit_fatal_project_stream_error(
+    subscribers: &mut HashMap<StreamPath, Stream>,
+    operation: &str,
+    message: String,
+) {
+    let streams = subscribers.values().cloned().collect::<Vec<_>>();
+    for stream in streams {
+        emit_project_command_error(
+            &stream,
+            FrameKind::ProjectFileList,
+            operation,
+            message.clone(),
+            true,
+        )
+        .await;
+    }
+    subscribers.clear();
+}
+
+async fn emit_project_command_error(
+    stream: &Stream,
+    request_kind: FrameKind,
+    operation: &str,
+    message: String,
+    fatal: bool,
+) {
+    let payload = CommandErrorPayload {
+        stream: stream.path().clone(),
+        request_kind,
+        operation: operation.to_owned(),
+        code: CommandErrorCode::Internal,
+        message,
+        fatal,
+    };
+    match serde_json::to_value(payload) {
+        Ok(payload) => {
+            let _ = stream.send_value(FrameKind::CommandError, payload).await;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to serialize project stream error payload"
+            );
+        }
+    }
+}
+
+/// Default depth limit for initial and watched file listings.
 /// Directories at this depth are listed but not recursed into.
 const DEFAULT_FILE_LIST_DEPTH: usize = 2;
 
@@ -187,89 +710,6 @@ fn scan_raw_entries_with_depth(
         result.insert(ProjectRootPath(root.clone()), raw.into_iter().collect());
     }
     Ok(result)
-}
-
-/// Build an all-Add file list payload, preserving project root order.
-pub(crate) fn build_file_list(project: &Project) -> Result<ProjectFileListPayload, String> {
-    let mut roots = Vec::with_capacity(project.roots.len());
-    for root in &project.roots {
-        let root_path = Path::new(root);
-        let metadata = fs::metadata(root_path)
-            .map_err(|err| format!("Failed to stat project root '{}': {err}", root))?;
-        if !metadata.is_dir() {
-            return Err(format!("Project root '{}' is not a directory", root));
-        }
-        let mut raw = Vec::new();
-        collect_raw_entries(root_path, root_path, &mut raw, 0, DEFAULT_FILE_LIST_DEPTH)?;
-        raw.sort();
-        let entries = raw
-            .into_iter()
-            .map(|(path, kind)| ProjectFileEntry {
-                relative_path: path,
-                kind,
-                op: FileEntryOp::Add,
-            })
-            .collect();
-        roots.push(ProjectRootListing {
-            root: ProjectRootPath(root.clone()),
-            entries,
-        });
-    }
-    Ok(ProjectFileListPayload {
-        incremental: false,
-        roots,
-    })
-}
-
-/// Diff previous vs current raw entries and produce a payload with Add/Remove ops.
-/// Returns a payload with empty roots if nothing changed.
-fn diff_file_entries(
-    previous: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
-    current: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
-) -> ProjectFileListPayload {
-    let mut roots = Vec::new();
-    // All roots that appear in either previous or current
-    let all_roots: BTreeSet<&ProjectRootPath> = previous.keys().chain(current.keys()).collect();
-
-    for root in all_roots {
-        let prev_entries = previous.get(root);
-        let curr_entries = current.get(root);
-        let empty = BTreeSet::new();
-        let prev = prev_entries.unwrap_or(&empty);
-        let curr = curr_entries.unwrap_or(&empty);
-
-        if prev == curr {
-            continue;
-        }
-
-        let mut entries = Vec::new();
-        // Removed entries: in previous but not in current
-        for (path, kind) in prev.difference(curr) {
-            entries.push(ProjectFileEntry {
-                relative_path: path.clone(),
-                kind: *kind,
-                op: FileEntryOp::Remove,
-            });
-        }
-        // Added entries: in current but not in previous
-        for (path, kind) in curr.difference(prev) {
-            entries.push(ProjectFileEntry {
-                relative_path: path.clone(),
-                kind: *kind,
-                op: FileEntryOp::Add,
-            });
-        }
-        entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-        roots.push(ProjectRootListing {
-            root: root.clone(),
-            entries,
-        });
-    }
-
-    ProjectFileListPayload {
-        incremental: false,
-        roots,
-    }
 }
 
 /// List entries within a specific subdirectory of a root (all Add ops).
@@ -710,25 +1150,6 @@ pub(crate) fn commit(
     run_git_mode(&root.0, &["commit", "-m", message], GitAccessMode::Mutating)?;
     let hash = run_git_mode(&root.0, &["rev-parse", "HEAD"], GitAccessMode::ReadOnly)?;
     Ok(hash.trim().to_owned())
-}
-
-pub(crate) async fn sync_snapshot_state(
-    state: &Arc<Mutex<ProjectSnapshotState>>,
-    raw_entries: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
-    git_status: &ProjectGitStatusPayload,
-) {
-    let mut snapshot = state.lock().await;
-    snapshot.file_entries = raw_entries.clone();
-    snapshot.git_status = match serde_json::to_value(git_status) {
-        Ok(git_status) => Some(git_status),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "failed to serialize project git status snapshot"
-            );
-            None
-        }
-    };
 }
 
 fn collect_raw_entries(

@@ -157,17 +157,15 @@ async fn create_project(
 }
 
 /// Create a project with real filesystem roots.
-/// Drains the proactive file list + git status events that the server
-/// now pushes automatically after project creation.
+/// Drains the server-pushed initial file list + git status.
 async fn create_project_with_real_roots(
     client: &mut client::Connection,
     name: &str,
     roots: Vec<String>,
 ) -> Project {
     let project = create_project(client, name, roots).await;
-    // Server proactively pushes file list and git status for real roots
-    let _ = expect_project_file_list(client, "proactive file list after create").await;
-    let _ = expect_project_git_status(client, "proactive git status after create").await;
+    let _ = expect_project_file_list(client, "initial server-pushed file list").await;
+    let _ = expect_project_git_status(client, "initial server-pushed git status").await;
     project
 }
 
@@ -508,13 +506,13 @@ async fn invalid_project_create_surfaces_command_error_and_keeps_connection_aliv
 }
 
 #[tokio::test]
-async fn late_joining_client_gets_proactive_file_list_for_real_projects() {
+async fn late_joining_client_gets_server_pushed_project_state() {
     let mut fixture = Fixture::new().await;
-    let repo = init_git_repo("late-proactive", &[("src/lib.rs", "pub fn a() {}\n")]);
+    let repo = init_git_repo("late-push", &[("src/lib.rs", "pub fn a() {}\n")]);
 
-    let project = create_project_with_real_roots(
+    let project = create_project(
         &mut fixture.client,
-        "Late Proactive",
+        "Late Push",
         vec![repo.path().to_string_lossy().to_string()],
     )
     .await;
@@ -529,8 +527,10 @@ async fn late_joining_client_gets_proactive_file_list_for_real_projects() {
         other => panic!("expected upsert, got {other:?}"),
     }
 
-    // And proactive file list + git status for real roots
-    let file_list = expect_project_file_list(&mut late_client, "late proactive file list").await;
+    // Project state is server-pushed on subscription replay; the frontend does
+    // not request a refresh.
+    let file_list =
+        expect_project_file_list(&mut late_client, "late server-pushed file list").await;
     assert_eq!(file_list.roots.len(), 1);
     assert!(
         file_list.roots[0]
@@ -539,26 +539,27 @@ async fn late_joining_client_gets_proactive_file_list_for_real_projects() {
             .any(|entry| entry.relative_path == "src/lib.rs")
     );
 
-    let git_status = expect_project_git_status(&mut late_client, "late proactive git status").await;
+    let git_status =
+        expect_project_git_status(&mut late_client, "late server-pushed git status").await;
     assert_eq!(git_status.roots.len(), 1);
     assert!(git_status.roots[0].clean);
 }
 
 #[tokio::test]
-async fn create_project_proactively_pushes_file_list_and_git_status() {
+async fn create_project_pushes_file_list_and_git_status() {
     let mut fixture = Fixture::new().await;
-    let repo = init_git_repo("proactive", &[("src/lib.rs", "pub fn a() {}\n")]);
+    let repo = init_git_repo("server-push", &[("src/lib.rs", "pub fn a() {}\n")]);
 
     let project = create_project(
         &mut fixture.client,
-        "Proactive",
+        "Server Push",
         vec![repo.path().to_string_lossy().to_string()],
     )
     .await;
 
-    // Server should proactively push file list and git status without a project_refresh
+    // Server owns project state and pushes it after the project is created.
     let file_list =
-        expect_project_file_list(&mut fixture.client, "proactive file list after create").await;
+        expect_project_file_list(&mut fixture.client, "server-pushed file list after create").await;
     assert_eq!(file_list.roots.len(), 1);
     assert_eq!(file_list.roots[0].root.0, project.roots[0]);
     assert!(
@@ -569,18 +570,19 @@ async fn create_project_proactively_pushes_file_list_and_git_status() {
     );
 
     let git_status =
-        expect_project_git_status(&mut fixture.client, "proactive git status after create").await;
+        expect_project_git_status(&mut fixture.client, "server-pushed git status after create")
+            .await;
     assert_eq!(git_status.roots.len(), 1);
     assert!(git_status.roots[0].clean);
 }
 
 #[tokio::test]
-async fn project_refresh_emits_file_list_and_git_status_for_all_roots() {
+async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     let mut fixture = Fixture::new().await;
     let repo_a = init_git_repo("repo-a", &[("src/lib.rs", "pub fn a() {}\n")]);
     let repo_b = init_git_repo("repo-b", &[("app/main.rs", "fn main() {}\n")]);
 
-    let project = create_project_with_real_roots(
+    let project = create_project(
         &mut fixture.client,
         "Multi Root",
         vec![
@@ -590,13 +592,8 @@ async fn project_refresh_emits_file_list_and_git_status_for_all_roots() {
     )
     .await;
 
-    fixture
-        .client
-        .project_refresh(&project.id)
-        .await
-        .expect("project_refresh failed");
-
-    let file_list = expect_project_file_list(&mut fixture.client, "project file list").await;
+    let file_list =
+        expect_project_file_list(&mut fixture.client, "server-pushed project file list").await;
     assert_eq!(file_list.roots.len(), 2);
     assert_eq!(file_list.roots[0].root.0, project.roots[0]);
     assert_eq!(file_list.roots[1].root.0, project.roots[1]);
@@ -1433,21 +1430,17 @@ async fn project_list_dir_returns_deeper_entries() {
         ],
     );
 
-    let project = create_project_with_real_roots(
+    let project = create_project(
         &mut fixture.client,
         "List Dir",
         vec![repo.path().to_string_lossy().to_string()],
     )
     .await;
 
-    // Re-request via ProjectRefresh to get a known baseline.
-    fixture
-        .client
-        .project_refresh(&project.id)
-        .await
-        .expect("project_refresh failed");
-    let baseline = expect_project_file_list(&mut fixture.client, "baseline file list").await;
-    let _ = expect_project_git_status(&mut fixture.client, "baseline git status").await;
+    let baseline =
+        expect_project_file_list(&mut fixture.client, "server-pushed baseline file list").await;
+    let _ =
+        expect_project_git_status(&mut fixture.client, "server-pushed baseline git status").await;
     let paths: Vec<&str> = baseline.roots[0]
         .entries
         .iter()
@@ -1503,7 +1496,7 @@ async fn project_list_dir_returns_deeper_entries() {
 }
 
 #[tokio::test]
-async fn live_poll_sends_remove_op_for_deleted_files() {
+async fn live_watcher_sends_full_snapshot_after_deleted_files() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo(
         "delete-poll",
@@ -1517,68 +1510,52 @@ async fn live_poll_sends_remove_op_for_deleted_files() {
     )
     .await;
 
-    // Delete a file — the next poll diff should contain a Remove op for it
+    // Delete a file — the debounced watcher should send a fresh full snapshot without it.
     fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
 
     let file_list = expect_project_file_list(&mut fixture.client, "file list after deletion").await;
     let entries = &file_list.roots[0].entries;
 
-    // The diff should contain exactly one Remove for remove_me.rs
-    let removed: Vec<&str> = entries
-        .iter()
-        .filter(|e| e.op == FileEntryOp::Remove)
-        .map(|e| e.relative_path.as_str())
-        .collect();
-    assert_eq!(
-        removed,
-        vec!["remove_me.rs"],
-        "expected Remove op for remove_me.rs, got {removed:?}"
-    );
-
-    // No Add ops should be present (nothing was added)
-    let added: Vec<&str> = entries
-        .iter()
-        .filter(|e| e.op == FileEntryOp::Add)
-        .map(|e| e.relative_path.as_str())
-        .collect();
     assert!(
-        added.is_empty(),
-        "no files were added, but got Add ops for {added:?}"
+        entries.iter().any(|e| e.relative_path == "keep.rs"),
+        "keep.rs should remain in the full snapshot: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e.relative_path == "remove_me.rs"),
+        "remove_me.rs should be absent from the full snapshot: {entries:?}"
+    );
+    assert!(
+        entries.iter().all(|e| e.op == FileEntryOp::Add),
+        "full snapshots contain only Add entries: {entries:?}"
     );
 }
 
 #[tokio::test]
-async fn full_refresh_sends_all_add_ops() {
+async fn server_pushed_snapshots_send_all_add_ops() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("refresh-ops", &[("lib.rs", "// lib\n")]);
 
-    let project = create_project_with_real_roots(
+    let _project = create_project(
         &mut fixture.client,
-        "Refresh Ops",
+        "Snapshot Ops",
         vec![repo.path().to_string_lossy().to_string()],
     )
     .await;
 
-    fixture
-        .client
-        .project_refresh(&project.id)
-        .await
-        .expect("project_refresh failed");
-
-    let file_list = expect_project_file_list(&mut fixture.client, "refresh file list").await;
+    let file_list = expect_project_file_list(&mut fixture.client, "server-pushed file list").await;
     assert!(
         file_list.roots[0]
             .entries
             .iter()
             .all(|e| e.op == FileEntryOp::Add),
-        "project_refresh file list should contain only Add ops"
+        "server-pushed file list should contain only Add ops"
     );
     assert!(
         file_list.roots[0]
             .entries
             .iter()
             .any(|e| e.relative_path == "lib.rs"),
-        "lib.rs should be present in refresh listing"
+        "lib.rs should be present in server-pushed listing"
     );
-    let _ = expect_project_git_status(&mut fixture.client, "refresh git status").await;
+    let _ = expect_project_git_status(&mut fixture.client, "server-pushed git status").await;
 }

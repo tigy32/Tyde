@@ -23,8 +23,9 @@ It owns:
 - frontend state derived from protocol events
 - all UI behavior and rendering
 
-If the frontend wants to send `hello`, `spawn_agent`, `project_refresh`, or any
-future protocol frame, the `frontend` crate builds that message itself.
+If the frontend wants to send `hello`, `spawn_agent`, project user-intent
+events, or any future protocol frame, the `frontend` crate builds that message
+itself.
 
 ### `tauri-shell`
 

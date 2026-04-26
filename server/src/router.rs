@@ -9,13 +9,13 @@ use protocol::{
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
     McpServerUpsertPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, RunBackendSetupPayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
-    TerminalResizePayload, TerminalSendPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -342,21 +342,16 @@ pub(crate) async fn route_client_envelope(
         let project_output_stream = host_output_stream.with_path(stream_path.clone());
 
         match envelope.kind {
-            FrameKind::ProjectRefresh => {
-                let payload: ProjectRefreshPayload = parse_payload(&envelope, "project_refresh")?;
-                host.refresh_project(
+            FrameKind::ProjectListDir => {
+                let payload: ProjectListDirPayload = parse_payload(&envelope, "project_list_dir")?;
+                ensure_non_empty("project_list_dir", "root", payload.root.0.as_str())?;
+                host.list_project_dir(
                     connection_host_stream,
-                    project_output_stream,
+                    &project_output_stream,
                     project_id,
                     payload,
                 )
                 .await?;
-            }
-            FrameKind::ProjectListDir => {
-                let payload: ProjectListDirPayload = parse_payload(&envelope, "project_list_dir")?;
-                ensure_non_empty("project_list_dir", "root", payload.root.0.as_str())?;
-                host.list_project_dir(&project_output_stream, project_id, payload)
-                    .await?;
             }
             FrameKind::ProjectReadFile => {
                 let payload: ProjectReadFilePayload =
@@ -367,8 +362,13 @@ pub(crate) async fn route_client_envelope(
                     "relative_path",
                     payload.path.relative_path.as_str(),
                 )?;
-                host.read_project_file(&project_output_stream, project_id, payload)
-                    .await?;
+                host.read_project_file(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
             }
             FrameKind::ProjectReadDiff => {
                 let payload: ProjectReadDiffPayload =

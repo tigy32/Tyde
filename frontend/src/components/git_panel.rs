@@ -8,8 +8,8 @@ use crate::state::{AppState, DiffViewState, root_display_name};
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectDiscardFilePayload, ProjectGitChangeKind,
     ProjectGitCommitPayload, ProjectGitFileStatus, ProjectPath, ProjectReadDiffPayload,
-    ProjectRefreshPayload, ProjectRootGitStatus, ProjectRootPath, ProjectStageFilePayload,
-    ProjectUnstageFilePayload, StreamPath,
+    ProjectRootGitStatus, ProjectRootPath, ProjectStageFilePayload, ProjectUnstageFilePayload,
+    StreamPath,
 };
 
 #[component]
@@ -21,13 +21,6 @@ pub fn GitPanel() -> impl IntoView {
         let map = state.git_status.get();
         map.get(&pid).cloned()
     });
-
-    let refresh = move |_| {
-        let state = state.clone();
-        spawn_local(async move {
-            send_project_refresh(&state).await;
-        });
-    };
 
     view! {
         <div class="git-panel">
@@ -46,12 +39,9 @@ pub fn GitPanel() -> impl IntoView {
                                     format!("\u{238b} {} roots", roots.len())
                                 }
                             })
-                            .unwrap_or_else(|| "\u{238b} --".to_owned())
+                        .unwrap_or_else(|| "\u{238b} --".to_owned())
                     }}
                 </span>
-                <button class="gp-refresh" title="Refresh" on:click=refresh>
-                    "\u{21bb}"
-                </button>
             </div>
             <div class="gp-content">
                 {move || {
@@ -560,23 +550,4 @@ fn send_commit(root: ProjectRootPath, message: String) {
             log::error!("failed to send ProjectGitCommit: {e}");
         }
     });
-}
-
-async fn send_project_refresh(state: &AppState) {
-    let Some(active_project) = state.active_project_ref_untracked() else {
-        return;
-    };
-    let project_id = active_project.project_id.clone();
-    let stream = StreamPath(format!("/project/{}", project_id.0));
-    let payload = ProjectRefreshPayload {};
-    if let Err(e) = send_frame(
-        &active_project.host_id,
-        stream,
-        FrameKind::ProjectRefresh,
-        &payload,
-    )
-    .await
-    {
-        log::error!("failed to send ProjectRefresh: {e}");
-    }
 }

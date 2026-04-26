@@ -49,12 +49,11 @@ Example:
 
 Rules:
 
-- The stream is client-initiated.
+- The stream is server-published for each project on each host connection.
 - `project_id` is the project identity from `ProjectId`.
 - There is one project stream per project per connection.
-- The stream remains open for the lifetime of the connection or until the
-  client stops using it.
-- All commands and state updates for that project flow on this stream.
+- The stream remains open for the lifetime of the connection.
+- User intent events and state updates for that project flow on this stream.
 
 Why no per-subscriber instance ID:
 
@@ -120,22 +119,23 @@ global status.
 
 The project stream is event-driven like the rest of Tyde.
 
-The client sends input events on `/project/<project_id>`.
+The client may send user intent events on `/project/<project_id>`.
 The server emits output events on `/project/<project_id>`.
 
 There are no request IDs and no request/response pairing.
 
 Instead:
 
-- read commands carry enough context that the resulting output event can be
-  understood on its own
-- refresh and live change notifications use the same output event shapes
+- user intent events carry enough context that resulting output events can be
+  understood on their own
+- initial snapshots and live change notifications use the same output event
+  shapes
 - the UI renders the latest state it has received
 
 This means the server is free to emit:
 
-- `project_file_list` after `project_refresh`
-- `project_git_status` after `project_refresh`
+- `project_file_list` when a project is replayed
+- `project_git_status` when a project is replayed
 - another `project_git_status` later because the repo changed
 - another `project_file_list` later because filesystem contents changed
 
@@ -147,25 +147,9 @@ The frontend reacts to state. It does not assume one output per input.
 
 These are sent on `/project/<project_id>`.
 
-### 5.1 `project_refresh`
+### 5.1 `project_read_file`
 
-Forces the server to rescan the project and emit fresh current-state snapshots.
-
-```rust
-pub struct ProjectRefreshPayload {}
-```
-
-Expected outputs:
-
-- `project_file_list`
-- `project_git_status`
-- `project_error` on failure
-
-The server may emit them in that order consistently for predictability.
-
-### 5.2 `project_read_file`
-
-Requests file contents for one file.
+Declares that the user wants to view one file.
 
 ```rust
 pub struct ProjectReadFilePayload {
@@ -178,9 +162,9 @@ Expected output:
 - `project_file_contents`
 - `project_error` on failure
 
-### 5.3 `project_read_diff`
+### 5.2 `project_read_diff`
 
-Requests a git diff for one root and scope.
+Declares that the user wants to view a git diff for one root and scope.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,7 +191,7 @@ Expected output:
 - `project_git_diff`
 - `project_error` on failure
 
-### 5.4 `project_stage_file`
+### 5.3 `project_stage_file`
 
 Stages one file within one root.
 
@@ -224,7 +208,7 @@ Expected outputs:
   diff view
 - `project_error` on failure
 
-### 5.5 `project_stage_hunk`
+### 5.4 `project_stage_hunk`
 
 Stages one hunk within one file.
 
@@ -343,7 +327,7 @@ without parsing raw git output.
 
 ### 6.3 `project_file_contents`
 
-Contents for one file read request.
+Contents for one file view intent.
 
 ```rust
 pub struct ProjectFileContentsPayload {
@@ -413,7 +397,7 @@ Important:
 
 ### 6.5 `project_error`
 
-Reports project-stream request failures and subscription failures that occur
+Reports project-stream user-intent failures and subscription failures that occur
 after the stream is valid and established.
 
 ```rust
@@ -465,7 +449,7 @@ pub struct ProjectErrorPayload {
 
 Rules:
 
-- `fatal: false` means the specific request failed but the stream remains open.
+- `fatal: false` means the specific user intent failed but the stream remains open.
 - `fatal: true` means the project stream is dead. No further events are emitted
   on `/project/<project_id>` after the error.
 - `project_error` is for operational failures, not protocol violations.
@@ -482,25 +466,25 @@ Examples:
 
 ---
 
-## 7. Refresh and Live Updates
+## 7. Initial Snapshots and Live Updates
 
 The project stream is both:
 
-- a command stream for reads and mutations
+- a user-intent stream for reads/views and mutations
 - a subscription stream for live project state
 
 ### 7.1 Initial usage
 
 Recommended client flow:
 
-1. open `/project/<project_id>`
-2. send `project_refresh`
-3. render the resulting `project_file_list` and `project_git_status`
-4. send `project_read_file` or `project_read_diff` as the user navigates
+1. receive `ProjectNotify::Upsert`
+2. render the server-pushed `project_file_list` and `project_git_status`
+3. send user intent events such as `project_read_file` or `project_read_diff`
+   as the user navigates
 
 ### 7.2 Live changes
 
-After refresh, the server watches the project's roots for:
+The server watches the project's roots for:
 
 - filesystem changes
 - git status changes
@@ -510,8 +494,8 @@ When relevant state changes, it emits fresh snapshots on the same stream:
 - `project_file_list`
 - `project_git_status`
 
-This uses the same event model as explicit refresh. No separate "changed"
-events are needed initially.
+This uses the same event model as initial replay. No frontend refresh event and
+no separate "changed" events are needed initially.
 
 ### 7.3 Why snapshots instead of incremental patches
 
@@ -573,7 +557,7 @@ These must emit `project_error`, not panic the whole server:
 
 Default classification:
 
-- request-specific failures -> `fatal: false`
+- user-intent-specific failures -> `fatal: false`
 - stream-wide subscription failures -> `fatal: true`
 
 ### 9.2 Fatal project-stream failures
@@ -582,7 +566,7 @@ The server emits `project_error { fatal: true }` and closes the stream
 logically when:
 
 - the project disappears while the subscription is active
-- the live watch / poll loop cannot continue safely
+- the live watch loop cannot continue safely
 - server-side state for that subscription is no longer usable
 
 After a fatal `project_error`, the client must treat the project stream as
@@ -602,7 +586,7 @@ These are still protocol bugs and should panic with diagnostics:
 - silently ignore bad paths
 - guess another root
 - return partial success and pretend the request worked
-- crash the whole host because one project request hit a routine filesystem or
+- crash the whole host because one project input hit a routine filesystem or
   git error
 
 ---

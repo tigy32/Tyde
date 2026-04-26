@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -231,7 +231,6 @@ pub enum FrameKind {
     SkillRefresh,
     McpServerUpsert,
     McpServerDelete,
-    ProjectRefresh,
     ProjectReadDiff,
     ProjectReadFile,
     ProjectStageFile,
@@ -314,7 +313,6 @@ impl fmt::Display for FrameKind {
             Self::SkillRefresh => f.write_str("skill_refresh"),
             Self::McpServerUpsert => f.write_str("mcp_server_upsert"),
             Self::McpServerDelete => f.write_str("mcp_server_delete"),
-            Self::ProjectRefresh => f.write_str("project_refresh"),
             Self::ProjectReadDiff => f.write_str("project_read_diff"),
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
@@ -991,9 +989,6 @@ pub struct ProjectPath {
     pub root: ProjectRootPath,
     pub relative_path: String,
 }
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProjectRefreshPayload {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectReadFilePayload {

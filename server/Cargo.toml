@@ -13,6 +13,7 @@ devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
 axum = "0.8"
 base64 = "0.22"
+notify = "8"
 portable-pty = "0.8"
 rmcp = { version = "0.15.0", default-features = false, features = ["macros", "schemars", "server", "transport-streamable-http-server"] }
 serde.workspace = true

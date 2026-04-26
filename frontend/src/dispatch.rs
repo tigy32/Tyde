@@ -989,6 +989,11 @@ fn apply_project_file_list(
     project_id: ProjectId,
     payload: ProjectFileListPayload,
 ) {
+    if !payload.incremental {
+        file_tree.insert(project_id, payload.roots);
+        return;
+    }
+
     let existing_roots = file_tree.entry(project_id).or_default();
     for incoming_root in payload.roots {
         let root_index = existing_roots

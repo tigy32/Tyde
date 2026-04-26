@@ -9,13 +9,13 @@ use protocol::{
     NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    SendMessagePayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload,
-    SteeringNotifyPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload,
-    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload,
-    TerminalSendPayload, TerminalStartPayload, read_envelope, write_envelope,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
+    StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
+    TerminalStartPayload, read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -327,16 +327,6 @@ impl AgentCommands {
 }
 
 impl ProjectCommands {
-    pub async fn refresh(&self) -> Result<(), ClientError> {
-        self.shared
-            .send(
-                self.stream.clone(),
-                FrameKind::ProjectRefresh,
-                &ProjectRefreshPayload::default(),
-            )
-            .await
-    }
-
     pub async fn read_file(&self, payload: ProjectReadFilePayload) -> Result<(), ClientError> {
         self.shared
             .send(self.stream.clone(), FrameKind::ProjectReadFile, &payload)

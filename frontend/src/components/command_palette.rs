@@ -1,12 +1,10 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
-use crate::send::send_frame;
 use crate::state::{AppState, DockVisibility, TabContent, root_display_name};
 
-use protocol::{FrameKind, ProjectFileKind, ProjectPath, ProjectRefreshPayload, StreamPath};
+use protocol::{ProjectFileKind, ProjectPath};
 
 #[derive(Clone, Debug)]
 struct CommandEntry {
@@ -50,11 +48,6 @@ const COMMANDS: &[CommandEntry] = &[
         name: "Open Settings",
         shortcut: Some("Ctrl+,"),
         id: "open_settings",
-    },
-    CommandEntry {
-        name: "Refresh Project",
-        shortcut: None,
-        id: "refresh_project",
     },
     CommandEntry {
         name: "Send Feedback",
@@ -141,24 +134,6 @@ fn execute_command(state: &AppState, id: &str) {
         "send_feedback" => {
             state.command_palette_open.set(false);
             state.feedback_open.set(true);
-        }
-        "refresh_project" => {
-            let active_project = state.active_project_ref_untracked();
-            if let Some(active_project) = active_project {
-                spawn_local(async move {
-                    let stream = StreamPath(format!("/project/{}", active_project.project_id.0));
-                    if let Err(e) = send_frame(
-                        &active_project.host_id,
-                        stream,
-                        FrameKind::ProjectRefresh,
-                        &ProjectRefreshPayload {},
-                    )
-                    .await
-                    {
-                        log::error!("failed to send ProjectRefresh: {e}");
-                    }
-                });
-            }
         }
         _ => log::warn!("unknown command: {id}"),
     }

@@ -12,16 +12,16 @@ use protocol::{
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
     HostBrowseStartPayload, HostSettingsPayload, McpServerDeletePayload, McpServerNotifyPayload,
     McpServerUpsertPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDiffScope, ProjectDiscardFilePayload, ProjectFileListPayload,
-    ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRefreshPayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    RunBackendSetupPayload, SessionId, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TerminalCreatePayload,
-    TerminalId, TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
+    ProjectDeletePayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
+    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, RunBackendSetupPayload, SessionId, SessionListPayload,
+    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
+    TerminalSendPayload,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -45,9 +45,8 @@ use crate::browse_stream;
 use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
 use crate::project_stream::{
-    ProjectDiffRequestKey, ProjectSnapshotState, ProjectStreamSubscription, build_dir_listing,
-    build_file_list, build_git_status, commit, discard_file, read_diff, read_file,
-    scan_raw_entries, spawn_project_subscription, stage_file, stage_hunk, sync_snapshot_state,
+    ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, build_dir_listing,
+    commit, discard_file, read_diff, read_file, spawn_project_subscription, stage_file, stage_hunk,
     unstage_file,
 };
 use crate::store::custom_agents::CustomAgentStore;
@@ -119,7 +118,7 @@ pub(crate) struct HostState {
     kiro_session_schema: KiroSessionSchemaState,
     kiro_probe_program: Option<String>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
-    project_streams: HashMap<(StreamPath, StreamPath), ProjectStreamSubscription>,
+    project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
 }
@@ -260,7 +259,10 @@ impl HostHandle {
             .await
             .list()
             .unwrap_or_else(|err| panic!("failed to list projects for host registration: {err}"));
-        let project_ids: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
+        let project_ids = projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect::<Vec<_>>();
         for project in projects {
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
@@ -279,10 +281,17 @@ impl HostHandle {
                 return;
             }
         }
-
-        // Start project subscriptions for all projects on this new host stream
         for project_id in project_ids {
-            start_project_subscription_for_host(&mut state, &host_path, project_id).await;
+            if let Err(error) =
+                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
+            {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to subscribe host to project stream during registration"
+                );
+            }
         }
 
         let mcp_servers = state
@@ -437,21 +446,14 @@ impl HostHandle {
     }
 
     pub(crate) async fn unregister_host_stream(&self, path: &StreamPath) {
-        let terminals = {
+        let (project_handles, terminals) = {
             let mut state = self.state.lock().await;
             state.host_streams.remove(path);
-            let project_stream_keys = state
+            let project_handles = state
                 .project_streams
-                .keys()
-                .filter(|(host_stream, _)| host_stream == path)
-                .cloned()
+                .values()
+                .map(|subscription| subscription.handle.clone())
                 .collect::<Vec<_>>();
-            for key in project_stream_keys {
-                let Some(subscription) = state.project_streams.remove(&key) else {
-                    continue;
-                };
-                subscription.task.abort();
-            }
 
             let browse_keys = state
                 .browse_streams
@@ -476,8 +478,12 @@ impl HostHandle {
                 };
                 terminals.push(terminal);
             }
-            terminals
+            (project_handles, terminals)
         };
+
+        for handle in project_handles {
+            handle.remove_subscriber(path.clone()).await;
+        }
 
         for terminal in terminals {
             terminal.close().await;
@@ -948,7 +954,26 @@ impl HostHandle {
             .map_err(|error| project_store_error(OPERATION, error))?;
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
-        start_project_subscriptions_for_all_hosts(&mut state, project_id).await;
+        if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to start project actor after project creation"
+            );
+        }
+        let host_paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
+        for host_path in host_paths {
+            if let Err(error) =
+                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
+            {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to subscribe host to project stream after project creation"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -991,7 +1016,27 @@ impl HostHandle {
             .map_err(|error| project_store_error(OPERATION, error))?;
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
-        start_project_subscriptions_for_all_hosts(&mut state, project_id).await;
+        let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to start project actor after adding project root"
+                );
+                None
+            }
+        };
+        drop(state);
+        if let Some(handle) = handle
+            && let Err(error) = handle.refresh().await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to refresh project actor after adding project root"
+            );
+        }
         Ok(())
     }
 
@@ -1038,6 +1083,9 @@ impl HostHandle {
             .await
             .delete(&payload.id)
             .map_err(|error| project_store_error(OPERATION, error))?;
+        if let Some(subscription) = state.project_streams.remove(&payload.id) {
+            subscription.task.abort();
+        }
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Delete { project }).await;
         Ok(())
     }
@@ -1968,145 +2016,42 @@ impl HostHandle {
             .remove(&(connection_host_stream.clone(), browse_stream_path.clone()));
     }
 
-    pub(crate) async fn refresh_project(
+    async fn ensure_host_project_subscription(
         &self,
         connection_host_stream: &StreamPath,
-        project_output_stream: Stream,
+        project_output_stream: &Stream,
         project_id: ProjectId,
-        _payload: ProjectRefreshPayload,
-    ) -> AppResult<()> {
-        const OPERATION: &str = "project_refresh";
-        let (project_store, subscription_state, new_subscription) = {
-            let state = self.state.lock().await;
-            let project_store = Arc::clone(&state.project_store);
-            let key = (
+        operation: &'static str,
+    ) -> AppResult<ProjectStreamHandle> {
+        let mut state = self.state.lock().await;
+        let handle = ensure_project_actor(&mut state, project_id)
+            .await
+            .map_err(|error| project_command_error(operation, error))?;
+        handle
+            .add_subscriber(
                 connection_host_stream.clone(),
-                project_output_stream.path().clone(),
-            );
-            let subscription_state = state
-                .project_streams
-                .get(&key)
-                .map(|subscription| Arc::clone(&subscription.state))
-                .unwrap_or_else(|| Arc::new(Mutex::new(ProjectSnapshotState::default())));
-            let new_subscription = if state.project_streams.contains_key(&key) {
-                None
-            } else {
-                let task = spawn_project_subscription(
-                    Arc::clone(&project_store),
-                    project_id.clone(),
-                    project_output_stream.clone(),
-                    Arc::clone(&subscription_state),
-                );
-                Some((
-                    key,
-                    ProjectStreamSubscription {
-                        task,
-                        state: Arc::clone(&subscription_state),
-                    },
-                ))
-            };
-            (project_store, subscription_state, new_subscription)
-        };
-
-        let project = load_project(&project_store, &project_id, OPERATION).await?;
-        let raw_entries =
-            scan_raw_entries(&project).map_err(|error| project_command_error(OPERATION, error))?;
-        let file_list =
-            build_file_list(&project).map_err(|error| project_command_error(OPERATION, error))?;
-        let git_status =
-            build_git_status(&project).map_err(|error| project_command_error(OPERATION, error))?;
-        sync_snapshot_state(&subscription_state, &raw_entries, &git_status).await;
-        if emit_project_file_list(&project_output_stream, &file_list)
+                project_output_stream.clone(),
+            )
             .await
-            .is_err()
-        {
-            return Ok(());
-        }
-        if emit_project_git_status(&project_output_stream, &git_status)
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        if let Some((key, subscription)) = new_subscription {
-            let mut state = self.state.lock().await;
-            state.project_streams.insert(key, subscription);
-        }
-        Ok(())
-    }
-
-    async fn project_subscription_state(
-        &self,
-        connection_host_stream: &StreamPath,
-        project_output_stream: &Stream,
-    ) -> Option<Arc<Mutex<ProjectSnapshotState>>> {
-        let state = self.state.lock().await;
-        state
-            .project_streams
-            .get(&(
-                connection_host_stream.clone(),
-                project_output_stream.path().clone(),
-            ))
-            .map(|subscription| Arc::clone(&subscription.state))
-    }
-
-    async fn remember_project_diff_context_mode(
-        &self,
-        connection_host_stream: &StreamPath,
-        project_output_stream: &Stream,
-        root: &ProjectRootPath,
-        scope: ProjectDiffScope,
-        path: Option<&str>,
-        context_mode: protocol::DiffContextMode,
-    ) {
-        let Some(subscription_state) = self
-            .project_subscription_state(connection_host_stream, project_output_stream)
-            .await
-        else {
-            return;
-        };
-
-        let mut snapshot = subscription_state.lock().await;
-        snapshot.diff_context_modes.insert(
-            ProjectDiffRequestKey {
-                root: root.clone(),
-                scope,
-                path: path.map(ToOwned::to_owned),
-            },
-            context_mode,
-        );
-    }
-
-    async fn remembered_project_diff_context_mode(
-        &self,
-        connection_host_stream: &StreamPath,
-        project_output_stream: &Stream,
-        root: &ProjectRootPath,
-        scope: ProjectDiffScope,
-        path: Option<&str>,
-    ) -> Option<protocol::DiffContextMode> {
-        let subscription_state = self
-            .project_subscription_state(connection_host_stream, project_output_stream)
-            .await?;
-        let snapshot = subscription_state.lock().await;
-        snapshot
-            .diff_context_modes
-            .get(&ProjectDiffRequestKey {
-                root: root.clone(),
-                scope,
-                path: path.map(ToOwned::to_owned),
-            })
-            .copied()
+            .map_err(|error| project_command_error(operation, error))?;
+        Ok(handle)
     }
 
     pub(crate) async fn read_project_file(
         &self,
+        connection_host_stream: &StreamPath,
         project_output_stream: &Stream,
         project_id: ProjectId,
         payload: ProjectReadFilePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "project_read_file";
+        self.ensure_host_project_subscription(
+            connection_host_stream,
+            project_output_stream,
+            project_id.clone(),
+            OPERATION,
+        )
+        .await?;
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
@@ -2129,11 +2074,19 @@ impl HostHandle {
 
     pub(crate) async fn list_project_dir(
         &self,
+        connection_host_stream: &StreamPath,
         project_output_stream: &Stream,
         project_id: ProjectId,
         payload: ProjectListDirPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "project_list_dir";
+        self.ensure_host_project_subscription(
+            connection_host_stream,
+            project_output_stream,
+            project_id.clone(),
+            OPERATION,
+        )
+        .await?;
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
@@ -2162,6 +2115,14 @@ impl HostHandle {
         payload: ProjectReadDiffPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "project_read_diff";
+        let handle = self
+            .ensure_host_project_subscription(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                OPERATION,
+            )
+            .await?;
         let project_store = {
             let state = self.state.lock().await;
             Arc::clone(&state.project_store)
@@ -2169,15 +2130,18 @@ impl HostHandle {
         let project = load_project(&project_store, &project_id, OPERATION).await?;
         let diff = read_diff(&project, payload)
             .map_err(|error| project_command_error(OPERATION, error))?;
-        self.remember_project_diff_context_mode(
-            connection_host_stream,
-            project_output_stream,
-            &diff.root,
-            diff.scope,
-            diff.path.as_deref(),
-            diff.context_mode,
-        )
-        .await;
+        handle
+            .remember_diff_context_mode(
+                connection_host_stream.clone(),
+                ProjectDiffRequestKey {
+                    root: diff.root.clone(),
+                    scope: diff.scope,
+                    path: diff.path.clone(),
+                },
+                diff.context_mode,
+            )
+            .await
+            .map_err(|error| project_command_error(OPERATION, error))?;
         let payload = serde_json::to_value(&diff).map_err(|error| {
             AppError::internal_message(
                 OPERATION,
@@ -3049,101 +3013,46 @@ async fn fan_out_mcp_server_notify(state: &mut HostState, payload: McpServerNoti
     }
 }
 
-/// Start project subscriptions for a project across all connected host streams.
-/// Performs the initial filesystem walk and sends the first file list + git status.
-async fn start_project_subscriptions_for_all_hosts(state: &mut HostState, project_id: ProjectId) {
-    let host_paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
-    for host_path in host_paths {
-        start_project_subscription_for_host(state, &host_path, project_id.clone()).await;
-    }
+fn project_stream_path(project_id: &ProjectId) -> StreamPath {
+    StreamPath(format!("/project/{}", project_id.0))
 }
 
-/// Start a project subscription for a single host stream (if one doesn't already exist).
-/// Sends the initial file list + git status immediately.
-async fn start_project_subscription_for_host(
+async fn ensure_project_actor(
+    state: &mut HostState,
+    project_id: ProjectId,
+) -> Result<ProjectStreamHandle, String> {
+    if let Some(subscription) = state.project_streams.get(&project_id)
+        && !subscription.task.is_finished()
+    {
+        return Ok(subscription.handle.clone());
+    }
+
+    if let Some(subscription) = state.project_streams.remove(&project_id) {
+        subscription.task.abort();
+    }
+
+    let subscription =
+        spawn_project_subscription(Arc::clone(&state.project_store), project_id.clone()).await?;
+    let handle = subscription.handle.clone();
+    state.project_streams.insert(project_id, subscription);
+    Ok(handle)
+}
+
+async fn subscribe_host_to_project(
     state: &mut HostState,
     host_path: &StreamPath,
     project_id: ProjectId,
-) {
-    let project_stream_path = StreamPath(format!("/project/{}", project_id.0));
-    let key = (host_path.clone(), project_stream_path.clone());
-
-    if state.project_streams.contains_key(&key) {
-        return;
-    }
-
+) -> Result<(), String> {
     let Some(subscriber) = state.host_streams.get(host_path) else {
-        return;
+        return Ok(());
     };
-    let project_output_stream = subscriber.stream.with_path(project_stream_path);
-
-    let project_store = Arc::clone(&state.project_store);
-    let project = match project_store.lock().await.get(&project_id) {
-        Some(p) => p,
-        None => return,
-    };
-
-    let subscription_state = Arc::new(Mutex::new(ProjectSnapshotState::default()));
-
-    let raw_entries = match scan_raw_entries(&project) {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!(
-                "failed to scan initial file entries for project {}: {err}",
-                project_id
-            );
-            return;
-        }
-    };
-    let file_list = match build_file_list(&project) {
-        Ok(fl) => fl,
-        Err(err) => {
-            eprintln!(
-                "failed to build initial file list for project {}: {err}",
-                project_id
-            );
-            return;
-        }
-    };
-    let git_status = match build_git_status(&project) {
-        Ok(gs) => gs,
-        Err(err) => {
-            eprintln!(
-                "failed to build initial git status for project {}: {err}",
-                project_id
-            );
-            return;
-        }
-    };
-
-    sync_snapshot_state(&subscription_state, &raw_entries, &git_status).await;
-
-    if emit_project_file_list(&project_output_stream, &file_list)
+    let project_output_stream = subscriber
+        .stream
+        .with_path(project_stream_path(&project_id));
+    let handle = ensure_project_actor(state, project_id).await?;
+    handle
+        .add_subscriber(host_path.clone(), project_output_stream)
         .await
-        .is_err()
-    {
-        return;
-    }
-    if emit_project_git_status(&project_output_stream, &git_status)
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let task = spawn_project_subscription(
-        project_store,
-        project_id,
-        project_output_stream,
-        Arc::clone(&subscription_state),
-    );
-    state.project_streams.insert(
-        key,
-        ProjectStreamSubscription {
-            task,
-            state: subscription_state,
-        },
-    );
 }
 
 async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {
@@ -3387,68 +3296,20 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         project_output_stream: Stream,
         project_id: ProjectId,
-        path: Option<ProjectPath>,
+        _path: Option<ProjectPath>,
     ) -> AppResult<()> {
-        self.refresh_project(
-            connection_host_stream,
-            project_output_stream.clone(),
-            project_id.clone(),
-            ProjectRefreshPayload::default(),
-        )
-        .await?;
-
-        if let Some(path) = path {
-            let staged_context_mode = self
-                .remembered_project_diff_context_mode(
-                    connection_host_stream,
-                    &project_output_stream,
-                    &path.root,
-                    ProjectDiffScope::Staged,
-                    Some(path.relative_path.as_str()),
-                )
-                .await;
-            if let Some(context_mode) = staged_context_mode {
-                let staged_diff = ProjectReadDiffPayload {
-                    root: path.root.clone(),
-                    scope: ProjectDiffScope::Staged,
-                    path: Some(path.relative_path.clone()),
-                    context_mode,
-                };
-                self.read_project_diff(
-                    connection_host_stream,
-                    &project_output_stream,
-                    project_id.clone(),
-                    staged_diff,
-                )
-                .await?;
-            }
-
-            let unstaged_context_mode = self
-                .remembered_project_diff_context_mode(
-                    connection_host_stream,
-                    &project_output_stream,
-                    &path.root,
-                    ProjectDiffScope::Unstaged,
-                    Some(path.relative_path.as_str()),
-                )
-                .await;
-            if let Some(context_mode) = unstaged_context_mode {
-                let unstaged_diff = ProjectReadDiffPayload {
-                    root: path.root.clone(),
-                    scope: ProjectDiffScope::Unstaged,
-                    path: Some(path.relative_path),
-                    context_mode,
-                };
-                self.read_project_diff(
-                    connection_host_stream,
-                    &project_output_stream,
-                    project_id,
-                    unstaged_diff,
-                )
-                .await?;
-            }
-        }
-
+        let handle = self
+            .ensure_host_project_subscription(
+                connection_host_stream,
+                &project_output_stream,
+                project_id,
+                "project_mutation_refresh",
+            )
+            .await?;
+        handle
+            .refresh()
+            .await
+            .map_err(|error| project_command_error("project_mutation_refresh", error))?;
         Ok(())
     }
 
@@ -3472,26 +3333,6 @@ impl HostHandle {
                 )
             })
     }
-}
-
-async fn emit_project_file_list(
-    stream: &Stream,
-    payload: &ProjectFileListPayload,
-) -> Result<(), StreamClosed> {
-    let payload =
-        serde_json::to_value(payload).expect("failed to serialize project file list payload");
-    stream.send_value(FrameKind::ProjectFileList, payload).await
-}
-
-async fn emit_project_git_status(
-    stream: &Stream,
-    payload: &ProjectGitStatusPayload,
-) -> Result<(), StreamClosed> {
-    let payload =
-        serde_json::to_value(payload).expect("failed to serialize project git status payload");
-    stream
-        .send_value(FrameKind::ProjectGitStatus, payload)
-        .await
 }
 
 async fn resolve_terminal_launch(
