@@ -5,8 +5,9 @@ use wasm_bindgen::closure::Closure;
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
+use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
-use crate::state::{ActiveAgentRef, AppState, ChatRowHandle, TransientEvent};
+use crate::state::{ActiveAgentRef, AppState, ChatRowHandle, ToolOutputMode, TransientEvent};
 
 use protocol::BackendKind;
 
@@ -189,6 +190,8 @@ pub fn ChatView(
 
     let has_messages = move || messages_len.get() > 0;
 
+    // (ToolOutputModeToggle is defined below.)
+
     view! {
         <div class="chat-view">
             <Show
@@ -221,6 +224,7 @@ pub fn ChatView(
                         };
                         view! { <span class=badge_class>{label}</span> }
                     })}
+                    <ToolOutputModeToggle />
                 </div>
                 {move || {
                     view! {
@@ -316,6 +320,45 @@ pub fn ChatView(
             </Show>
             <ChatInput />
         </div>
+    }
+}
+
+/// Cycle button for the global tool-output verbosity setting. Lives on the
+/// chat header next to the backend badge. Reads and writes
+/// `state.tool_output_mode` directly (frontend-local, persisted to
+/// localStorage); never goes through the protocol.
+#[component]
+fn ToolOutputModeToggle() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let mode = state.tool_output_mode;
+
+    let label = move || match mode.get() {
+        ToolOutputMode::Summary => "\u{2298}",
+        ToolOutputMode::Compact => "\u{25d0}",
+        ToolOutputMode::Full => "\u{25c9}",
+    };
+    let title = move || match mode.get() {
+        ToolOutputMode::Summary => "Tool output: summary (click to switch to compact)",
+        ToolOutputMode::Compact => "Tool output: compact (click to switch to full)",
+        ToolOutputMode::Full => "Tool output: full (click to switch to summary)",
+    };
+
+    let on_click = move |_| {
+        let next = match mode.get_untracked() {
+            ToolOutputMode::Summary => ToolOutputMode::Compact,
+            ToolOutputMode::Compact => ToolOutputMode::Full,
+            ToolOutputMode::Full => ToolOutputMode::Summary,
+        };
+        mode.set(next);
+        persist_tool_output_mode(next);
+    };
+
+    view! {
+        <button
+            class="tool-output-mode-toggle"
+            title=title
+            on:click=on_click
+        >{label}</button>
     }
 }
 

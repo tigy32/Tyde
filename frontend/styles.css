@@ -5731,3 +5731,177 @@ kbd {
     max-width: 130px;
     outline: none;
 }
+
+/* ── Tool output mode toggle (chat header) ───────────────────────────── */
+.tool-output-mode-toggle {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 0.846rem;
+    cursor: pointer;
+    line-height: 1.4;
+}
+
+.tool-output-mode-toggle:hover {
+    background: var(--surface-1);
+    color: var(--text-primary);
+}
+
+/* ── Show-more toggle inside tool cards ──────────────────────────────── */
+.tool-show-more {
+    margin-top: var(--space-1);
+    background: transparent;
+    border: 1px solid var(--border-primary);
+    color: var(--text-tertiary);
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 0.769rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.tool-show-more:hover {
+    color: var(--text-primary);
+    background: var(--surface-1);
+}
+
+/* ── Pre-blocks inside tool cards (run_command / errors / docs) ──────── */
+.tool-pre-block {
+    margin-top: var(--space-1);
+}
+
+.tool-pre-block pre,
+pre.tool-result-stdout,
+pre.tool-result-stderr,
+pre.tool-result-docs-content,
+pre.tool-error-pre,
+pre.tool-raw-args,
+pre.tool-raw-result {
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+    background: var(--surface-base);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: var(--space-2);
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+}
+
+pre.tool-result-stderr,
+pre.tool-error-pre {
+    color: var(--error);
+}
+
+.tool-exit-code {
+    font-family: var(--font-mono);
+    font-size: 0.769rem;
+    margin-right: var(--space-2);
+}
+
+.tool-exit-code.exit-success {
+    color: var(--success);
+}
+
+.tool-exit-code.exit-failure {
+    color: var(--error);
+}
+
+/* ── Inline diff lines (modify_file) ─────────────────────────────────── */
+.inline-diff-line {
+    display: flex;
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+}
+
+.inline-diff-context {
+    color: var(--text-secondary);
+}
+
+.inline-diff-added {
+    background: rgba(78, 201, 176, 0.1);
+    color: var(--success);
+}
+
+.inline-diff-removed {
+    background: rgba(244, 135, 113, 0.1);
+    color: var(--error);
+}
+
+.inline-diff-hunk {
+    color: var(--text-tertiary);
+    background: var(--surface-base);
+}
+
+/* ── Misc tool-card bits ─────────────────────────────────────────────── */
+.tool-meta-line {
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+    margin-top: var(--space-1);
+}
+
+.tool-result-search-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+}
+
+.tool-result-type-badge {
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.tool-result-file {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 0.923rem;
+}
+
+.tool-result-file-path {
+    color: var(--info);
+}
+
+.tool-result-file-sep,
+.tool-result-file-size {
+    color: var(--text-tertiary);
+    font-size: 0.846rem;
+}
+
+.tool-result-error {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.tool-error-icon {
+    color: var(--error);
+}
+
+.tool-error-short {
+    color: var(--error);
+    font-weight: 500;
+}
+
+.tool-error-details summary {
+    cursor: pointer;
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+}
+
+.tool-result-docs-section summary,
+.tool-result-other-section summary {
+    cursor: pointer;
+    font-size: 0.846rem;
+    color: var(--text-tertiary);
+    margin-bottom: var(--space-1);
+}

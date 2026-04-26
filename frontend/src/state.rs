@@ -19,6 +19,19 @@ pub enum DiffViewMode {
     SideBySide,
 }
 
+/// How verbose tool-call cards render in the chat.
+///
+/// `Summary` collapses the body to header-only; `Compact` shows previews with
+/// per-tool caps and an expand toggle; `Full` shows everything inline.
+/// Persisted to `localStorage` via `persist_tool_output_mode` —
+/// pure presentation, never sent over the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    Summary,
+    Compact,
+    Full,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionStatus {
     Disconnected,
@@ -591,6 +604,7 @@ pub struct AppState {
     pub font_family: RwSignal<String>,
     pub diff_view_mode: RwSignal<DiffViewMode>,
     pub diff_context_mode: RwSignal<DiffContextMode>,
+    pub tool_output_mode: RwSignal<ToolOutputMode>,
     pub custom_agents: RwSignal<HashMap<String, HashMap<CustomAgentId, CustomAgent>>>,
     pub mcp_servers: RwSignal<HashMap<String, HashMap<McpServerId, McpServerConfig>>>,
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
@@ -661,6 +675,7 @@ impl AppState {
             font_family: RwSignal::new("system".to_owned()),
             diff_view_mode: RwSignal::new(DiffViewMode::Unified),
             diff_context_mode: RwSignal::new(DiffContextMode::Hunks),
+            tool_output_mode: RwSignal::new(ToolOutputMode::Compact),
             custom_agents: RwSignal::new(HashMap::new()),
             mcp_servers: RwSignal::new(HashMap::new()),
             steering: RwSignal::new(HashMap::new()),

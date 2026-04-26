@@ -5,7 +5,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::{connect_one_host, refresh_configured_hosts};
 use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewMode};
+use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
     BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, CustomAgent,
@@ -29,11 +29,15 @@ const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
 const STORAGE_TABS_ENABLED: &str = "tyde-tabs-enabled";
 const STORAGE_DIFF_VIEW_MODE: &str = "tyde-diff-view-mode";
 const STORAGE_DIFF_CONTEXT_MODE: &str = "tyde-diff-context-mode";
+const STORAGE_TOOL_OUTPUT_MODE: &str = "tyde-tool-output-mode";
 
 const DIFF_VIEW_MODE_UNIFIED: &str = "unified";
 const DIFF_VIEW_MODE_SIDE_BY_SIDE: &str = "side_by_side";
 const DIFF_CONTEXT_MODE_HUNKS: &str = "hunks";
 const DIFF_CONTEXT_MODE_FULL_FILE: &str = "full_file";
+const TOOL_OUTPUT_MODE_SUMMARY: &str = "summary";
+const TOOL_OUTPUT_MODE_COMPACT: &str = "compact";
+const TOOL_OUTPUT_MODE_FULL: &str = "full";
 
 fn diff_view_mode_to_str(mode: DiffViewMode) -> &'static str {
     match mode {
@@ -77,6 +81,29 @@ pub fn persist_diff_context_mode(mode: DiffContextMode) {
     }
 }
 
+fn tool_output_mode_to_str(mode: ToolOutputMode) -> &'static str {
+    match mode {
+        ToolOutputMode::Summary => TOOL_OUTPUT_MODE_SUMMARY,
+        ToolOutputMode::Compact => TOOL_OUTPUT_MODE_COMPACT,
+        ToolOutputMode::Full => TOOL_OUTPUT_MODE_FULL,
+    }
+}
+
+fn tool_output_mode_from_str(s: &str) -> Option<ToolOutputMode> {
+    match s {
+        TOOL_OUTPUT_MODE_SUMMARY => Some(ToolOutputMode::Summary),
+        TOOL_OUTPUT_MODE_COMPACT => Some(ToolOutputMode::Compact),
+        TOOL_OUTPUT_MODE_FULL => Some(ToolOutputMode::Full),
+        _ => None,
+    }
+}
+
+pub fn persist_tool_output_mode(mode: ToolOutputMode) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_TOOL_OUTPUT_MODE, tool_output_mode_to_str(mode));
+    }
+}
+
 #[cfg(test)]
 mod diff_pref_tests {
     use super::*;
@@ -107,6 +134,24 @@ mod diff_pref_tests {
     fn diff_context_mode_unknown_is_none() {
         assert_eq!(diff_context_mode_from_str(""), None);
         assert_eq!(diff_context_mode_from_str("bogus"), None);
+    }
+
+    #[test]
+    fn tool_output_mode_roundtrip() {
+        for mode in [
+            ToolOutputMode::Summary,
+            ToolOutputMode::Compact,
+            ToolOutputMode::Full,
+        ] {
+            let s = tool_output_mode_to_str(mode);
+            assert_eq!(tool_output_mode_from_str(s), Some(mode));
+        }
+    }
+
+    #[test]
+    fn tool_output_mode_unknown_is_none() {
+        assert_eq!(tool_output_mode_from_str(""), None);
+        assert_eq!(tool_output_mode_from_str("bogus"), None);
     }
 }
 
@@ -240,6 +285,21 @@ pub fn restore_appearance(state: &AppState) {
         Ok(None) => persist_diff_context_mode(state.diff_context_mode.get_untracked()),
         Err(e) => log::warn!("failed to read diff_context_mode from localStorage: {e:?}"),
     }
+
+    match storage.get_item(STORAGE_TOOL_OUTPUT_MODE) {
+        Ok(Some(raw)) => match tool_output_mode_from_str(&raw) {
+            Some(mode) => state.tool_output_mode.set(mode),
+            None => {
+                log::warn!(
+                    "unrecognized tool_output_mode in localStorage: {raw:?}; resetting to default"
+                );
+                let default = state.tool_output_mode.get_untracked();
+                persist_tool_output_mode(default);
+            }
+        },
+        Ok(None) => persist_tool_output_mode(state.tool_output_mode.get_untracked()),
+        Err(e) => log::warn!("failed to read tool_output_mode from localStorage: {e:?}"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -305,6 +365,10 @@ impl SettingsTab {
                 "Diff Context",
                 "Hunks",
                 "Full File",
+                "Tool Output",
+                "Summary",
+                "Compact",
+                "Full",
             ],
             Self::General => &[
                 "General",
@@ -1116,6 +1180,34 @@ fn AppearanceTab() -> impl IntoView {
                         persist_diff_context_mode(DiffContextMode::FullFile);
                     }
                 >"Full File"</button>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Tool Output"</label>
+            <p class="settings-description">"Choose how much of each tool call is shown in chat: a header-only summary, a compact preview with caps, or the full output."</p>
+            <div class="settings-segmented-control">
+                <button
+                    class=move || if state.tool_output_mode.get() == ToolOutputMode::Summary { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.tool_output_mode.set(ToolOutputMode::Summary);
+                        persist_tool_output_mode(ToolOutputMode::Summary);
+                    }
+                >"Summary"</button>
+                <button
+                    class=move || if state.tool_output_mode.get() == ToolOutputMode::Compact { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.tool_output_mode.set(ToolOutputMode::Compact);
+                        persist_tool_output_mode(ToolOutputMode::Compact);
+                    }
+                >"Compact"</button>
+                <button
+                    class=move || if state.tool_output_mode.get() == ToolOutputMode::Full { "segment active" } else { "segment" }
+                    on:click=move |_| {
+                        state.tool_output_mode.set(ToolOutputMode::Full);
+                        persist_tool_output_mode(ToolOutputMode::Full);
+                    }
+                >"Full"</button>
             </div>
         </div>
     }
