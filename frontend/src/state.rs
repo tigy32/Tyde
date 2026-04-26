@@ -773,8 +773,7 @@ impl AppState {
                 .collect()
         });
         if !agent_ids.is_empty() {
-            let drop_set: std::collections::HashSet<AgentId> =
-                agent_ids.iter().cloned().collect();
+            let drop_set: std::collections::HashSet<AgentId> = agent_ids.iter().cloned().collect();
             self.chat_messages.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
@@ -1480,9 +1479,7 @@ mod tests {
             // host_a's agents are forgotten across every per-agent map.
             for id in [&agent_a1, &agent_a2] {
                 assert!(
-                    !state
-                        .chat_messages
-                        .with_untracked(|m| m.contains_key(id)),
+                    !state.chat_messages.with_untracked(|m| m.contains_key(id)),
                     "chat_messages still has dropped agent {}",
                     id.0
                 );

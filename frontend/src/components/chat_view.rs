@@ -43,12 +43,25 @@ pub fn ChatView() -> impl IntoView {
 
     let has_agent = move || state.active_agent.get().is_some();
 
-    let messages = move || -> Vec<crate::state::ChatMessageEntry> {
-        let Some(active_agent) = state.active_agent.get() else {
+    // Reactive identifier of the chat the row list belongs to. Combined with
+    // `idx` it forms the keyed `<For>` row identity below: switching agents
+    // changes every key (clean remount), appending a message preserves rows
+    // 0..len() and only mounts the new tail row.
+    let active_agent_id = move || state.active_agent.get().map(|a| a.agent_id);
+
+    let messages_len: Memo<usize> = Memo::new(move |_| match active_agent_id() {
+        Some(id) => state
+            .chat_messages
+            .with(|m| m.get(&id).map(|v| v.len()).unwrap_or(0)),
+        None => 0,
+    });
+
+    let row_keys = move || -> Vec<(protocol::AgentId, usize)> {
+        let Some(id) = active_agent_id() else {
             return Vec::new();
         };
-        let map = state.chat_messages.get();
-        map.get(&active_agent.agent_id).cloned().unwrap_or_default()
+        let len = messages_len.get();
+        (0..len).map(|i| (id.clone(), i)).collect()
     };
 
     let streaming = move || {
@@ -63,29 +76,33 @@ pub fn ChatView() -> impl IntoView {
         map.get(&agent_id).cloned()
     };
 
-    let context_breakdown = move || {
-        let mut latest_breakdown = None;
-        for entry in messages().into_iter().rev() {
-            let is_assistant = matches!(
-                entry.message.sender,
-                protocol::MessageSender::Assistant { .. }
-            );
-            if !is_assistant {
-                continue;
+    // Walk back from the latest message to find the most recent assistant
+    // message that carries a context_breakdown. `ContextBreakdown` does not
+    // implement `PartialEq`, so we use a derived Signal rather than a Memo.
+    // Each read still walks the vec, but it's bounded by "messages up to the
+    // most recent assistant turn" — typically a single iteration.
+    let context_breakdown: Signal<Option<protocol::ContextBreakdown>> = Signal::derive(move || {
+        let id = active_agent_id()?;
+        state.chat_messages.with(|m| {
+            let messages = m.get(&id)?;
+            for entry in messages.iter().rev() {
+                let is_assistant = matches!(
+                    entry.message.sender,
+                    protocol::MessageSender::Assistant { .. }
+                );
+                if !is_assistant {
+                    continue;
+                }
+                if let Some(breakdown) = entry.message.context_breakdown.clone() {
+                    return Some(breakdown);
+                }
+                if entry.message.tool_calls.is_empty() {
+                    return None;
+                }
             }
-
-            if let Some(breakdown) = entry.message.context_breakdown.clone() {
-                latest_breakdown = Some(breakdown);
-                break;
-            }
-
-            if entry.message.tool_calls.is_empty() {
-                latest_breakdown = None;
-                break;
-            }
-        }
-        latest_breakdown
-    };
+            None
+        })
+    });
 
     let transient_events = move || {
         let agent_id = state.active_agent.get()?.agent_id;
@@ -159,12 +176,15 @@ pub fn ChatView() -> impl IntoView {
         }
     });
 
-    // Auto-scroll effect: whenever messages or streaming change, scroll to bottom
-    // (only if user hasn't scrolled up)
+    // Auto-scroll effect: whenever the message count or streaming text grows,
+    // scroll to bottom (only if the user hasn't scrolled up). Scoped to the
+    // *length* of messages — not the full Vec — so unrelated chat_messages
+    // updates (e.g. tool_request mutations to existing rows) don't trigger a
+    // scroll.
     Effect::new(move |_| {
-        let _msgs = messages();
-        let _stream = streaming();
-        if let Some(ss) = _stream.as_ref() {
+        let _len = messages_len.get();
+        let stream = streaming();
+        if let Some(ss) = stream.as_ref() {
             let _ = ss.text.get();
             let _ = ss.reasoning.get();
         }
@@ -186,7 +206,7 @@ pub fn ChatView() -> impl IntoView {
         }
     };
 
-    let has_messages = move || !messages().is_empty();
+    let has_messages = move || messages_len.get() > 0;
 
     view! {
         <div class="chat-view">
@@ -225,7 +245,7 @@ pub fn ChatView() -> impl IntoView {
                     view! {
                         <TaskListView
                             task_list=task_list()
-                            context_breakdown=context_breakdown()
+                            context_breakdown=context_breakdown.get()
                         />
                     }
                 }}
@@ -249,11 +269,13 @@ pub fn ChatView() -> impl IntoView {
                             }
                         }}
 
-                        {move || {
-                            messages().into_iter().map(|entry| {
-                                view! { <ChatMessageView entry=entry /> }
-                            }).collect::<Vec<_>>()
-                        }}
+                        <For
+                            each=move || row_keys()
+                            key=|k| k.clone()
+                            let:k
+                        >
+                            <ChatMessageView agent_id=k.0 idx=k.1 />
+                        </For>
 
                         // Transient events (retry, cancel) rendered as cards
                         {move || {
@@ -313,5 +335,171 @@ pub fn ChatView() -> impl IntoView {
             </Show>
             <ChatInput />
         </div>
+    }
+}
+
+/// Render-layer tests for `ChatView`'s keyed message list.
+///
+/// Asserts on what the user perceives — DOM identity across an append. The
+/// keyed `<For>` over `(agent_id, idx)` should preserve existing rows when a
+/// new message is appended (only the new tail row mounts), and the in-place
+/// reactive lookup inside `ChatMessageView` should project tool-request
+/// mutations onto an existing row without re-mounting it.
+///
+/// Run with: `tools/run-wasm-tests.sh wasm_tests::` (the script handles
+/// chromedriver and `wasm-bindgen-cli` setup automatically — see CLAUDE.md).
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::{ActiveAgentRef, AppState, ChatMessageEntry};
+    use leptos::mount::mount_to;
+    use protocol::{AgentId, ChatMessage, MessageSender};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::{Element, HtmlElement};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 800px; height: 600px; \
+                 display: flex; flex-direction: column;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    fn message_rows(container: &HtmlElement) -> Vec<Element> {
+        // Each `<ChatMessageView>` renders a top-level `<div class="chat-card ...">`
+        // — match by the stable `chat-card` class to find the rendered rows
+        // independently of the per-sender modifier classes.
+        let nodes = container
+            .query_selector_all(".chat-messages > .chat-card")
+            .unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
+            .collect()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn mk_user_msg(text: &str) -> ChatMessageEntry {
+        ChatMessageEntry {
+            message: ChatMessage {
+                timestamp: 0,
+                sender: MessageSender::User,
+                content: text.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+            tool_requests: Vec::new(),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn appending_a_message_preserves_existing_row_identity() {
+        let agent_id = AgentId("agent-1".to_owned());
+        let host_id = "host-a".to_owned();
+
+        // Bind a separate handle to the state so we can mutate it after mount.
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let setup_handle = state_handle.clone();
+
+        let container = make_container();
+        let agent_id_for_mount = agent_id.clone();
+        let host_id_for_mount = host_id.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_agent.set(Some(ActiveAgentRef {
+                host_id: host_id_for_mount.clone(),
+                agent_id: agent_id_for_mount.clone(),
+            }));
+            state.chat_messages.update(|m| {
+                m.insert(
+                    agent_id_for_mount.clone(),
+                    vec![
+                        mk_user_msg("first"),
+                        mk_user_msg("second"),
+                        mk_user_msg("third"),
+                    ],
+                );
+            });
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ChatView /> }
+        });
+
+        next_tick().await;
+
+        let rows_before = message_rows(&container);
+        assert_eq!(
+            rows_before.len(),
+            3,
+            "expected 3 rendered rows pre-append, got {}",
+            rows_before.len()
+        );
+        let row0_before: Element = rows_before[0].clone();
+        let row2_before: Element = rows_before[2].clone();
+
+        // Append a 4th message — the keyed `<For>` should add a single row at
+        // the tail and leave rows 0..3 in place.
+        let state = state_handle
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("state captured");
+        state.chat_messages.update(|m| {
+            m.entry(agent_id.clone())
+                .or_default()
+                .push(mk_user_msg("fourth"));
+        });
+
+        next_tick().await;
+
+        let rows_after = message_rows(&container);
+        assert_eq!(
+            rows_after.len(),
+            4,
+            "expected 4 rendered rows post-append, got {}",
+            rows_after.len()
+        );
+
+        // Row identity for the existing rows must survive — proves the keyed
+        // `<For>` actually keyed (and didn't rebuild the list).
+        assert!(
+            row0_before.is_same_node(Some(&rows_after[0])),
+            "row 0 was remounted on append — keyed <For> failed"
+        );
+        assert!(
+            row2_before.is_same_node(Some(&rows_after[2])),
+            "row 2 was remounted on append — keyed <For> failed"
+        );
+        // Row 3 is the freshly mounted tail.
+        assert_eq!(
+            rows_after[3]
+                .text_content()
+                .unwrap_or_default()
+                .contains("fourth"),
+            true,
+            "newly appended row should display the appended content"
+        );
     }
 }
