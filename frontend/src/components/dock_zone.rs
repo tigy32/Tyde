@@ -42,6 +42,25 @@ fn RightDock() -> impl IntoView {
         }
     };
 
+    // Mount-and-hide both panels so per-component state (selection, scroll
+    // position, expanded rows) survives a tab switch. Switching tabs only
+    // toggles CSS visibility — no remount, no reactive subscription
+    // teardown.
+    let agents_style = move || {
+        if active_tab.get() == RightTab::Agents {
+            ""
+        } else {
+            "display: none;"
+        }
+    };
+    let sessions_style = move || {
+        if active_tab.get() == RightTab::Sessions {
+            ""
+        } else {
+            "display: none;"
+        }
+    };
+
     view! {
         <div class="dock-inner">
             <div class="dock-tab-bar">
@@ -53,10 +72,12 @@ fn RightDock() -> impl IntoView {
                 </button>
             </div>
             <div class="dock-tab-content">
-                {move || match active_tab.get() {
-                    RightTab::Agents => view! { <AgentsPanel /> }.into_any(),
-                    RightTab::Sessions => view! { <SessionsPanel /> }.into_any(),
-                }}
+                <div class="dock-tab-mount" style=agents_style>
+                    <AgentsPanel />
+                </div>
+                <div class="dock-tab-mount" style=sessions_style>
+                    <SessionsPanel />
+                </div>
             </div>
         </div>
     }
@@ -82,6 +103,21 @@ fn LeftDock() -> impl IntoView {
         }
     };
 
+    let files_style = move || {
+        if active_tab.get() == LeftTab::Files {
+            ""
+        } else {
+            "display: none;"
+        }
+    };
+    let git_style = move || {
+        if active_tab.get() == LeftTab::Git {
+            ""
+        } else {
+            "display: none;"
+        }
+    };
+
     view! {
         <div class="dock-inner">
             <div class="dock-tab-bar">
@@ -93,10 +129,12 @@ fn LeftDock() -> impl IntoView {
                 </button>
             </div>
             <div class="dock-tab-content">
-                {move || match active_tab.get() {
-                    LeftTab::Files => view! { <FileExplorer /> }.into_any(),
-                    LeftTab::Git => view! { <GitPanel /> }.into_any(),
-                }}
+                <div class="dock-tab-mount" style=files_style>
+                    <FileExplorer />
+                </div>
+                <div class="dock-tab-mount" style=git_style>
+                    <GitPanel />
+                </div>
             </div>
         </div>
     }

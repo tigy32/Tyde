@@ -450,7 +450,6 @@ pub struct BrowseDialogState {
 #[derive(Clone, Debug, Default)]
 pub struct ProjectViewMemory {
     pub center_zone: Option<CenterZoneState>,
-    pub active_agent: Option<ActiveAgentRef>,
     pub active_terminal: Option<ActiveTerminalRef>,
     pub open_files: HashMap<ProjectPath, OpenFile>,
     pub diff_contents: HashMap<(ProjectRootPath, ProjectDiffScope), DiffViewState>,
@@ -507,7 +506,12 @@ pub struct AppState {
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
-    pub active_agent: RwSignal<Option<ActiveAgentRef>>,
+    /// Derived from `center_zone.active_tab_id` — when the active tab is a
+    /// `Chat`, this projects its `agent_ref`; otherwise `None`. Read-only by
+    /// design (philosophy doc rule against derived state stored as a signal):
+    /// to change which agent is "active", change the active chat tab via
+    /// `activate_tab` / `open_tab` / `close_tab`.
+    pub active_agent: Memo<Option<ActiveAgentRef>>,
     pub chat_messages: RwSignal<HashMap<AgentId, Vec<ChatMessageEntry>>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
     pub chat_input: RwSignal<String>,
@@ -560,6 +564,16 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let center_zone: RwSignal<CenterZoneState> = RwSignal::new(CenterZoneState::default());
+        let active_agent: Memo<Option<ActiveAgentRef>> = Memo::new(move |_| {
+            center_zone.with(|cz| {
+                cz.active_tab().and_then(|tab| match &tab.content {
+                    TabContent::Chat { agent_ref } => agent_ref.clone(),
+                    _ => None,
+                })
+            })
+        });
+
         Self {
             configured_hosts: RwSignal::new(Vec::new()),
             selected_host_id: RwSignal::new(None),
@@ -571,12 +585,12 @@ impl AppState {
             agents: RwSignal::new(Vec::new()),
             sessions: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
-            active_agent: RwSignal::new(None),
+            active_agent,
             chat_messages: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
-            center_zone: RwSignal::new(CenterZoneState::default()),
+            center_zone,
             tabs_enabled: RwSignal::new(true),
             left_dock: RwSignal::new(DockVisibility::Visible),
             right_dock: RwSignal::new(DockVisibility::Visible),
@@ -687,7 +701,6 @@ impl AppState {
         if let Some(outgoing) = current {
             let snapshot = ProjectViewMemory {
                 center_zone: Some(self.center_zone.get_untracked()),
-                active_agent: self.active_agent.get_untracked(),
                 active_terminal: self.active_terminal.get_untracked(),
                 open_files: self.open_files.get_untracked(),
                 diff_contents: self.diff_contents.get_untracked(),
@@ -704,10 +717,11 @@ impl AppState {
 
         self.active_project.set(next.clone());
 
+        // active_agent is a Memo derived from center_zone — restoring center_zone
+        // implicitly restores it.
         match (next.is_some(), restored) {
             (true, Some(memory)) => {
                 self.center_zone.set(memory.center_zone.unwrap_or_default());
-                self.active_agent.set(memory.active_agent);
                 self.active_terminal.set(memory.active_terminal);
                 self.open_files.set(memory.open_files);
                 self.diff_contents.set(memory.diff_contents);
@@ -720,14 +734,12 @@ impl AppState {
                     true,
                 );
                 self.center_zone.set(cz);
-                self.active_agent.set(None);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
                 self.diff_contents.set(HashMap::new());
             }
             (false, _) => {
                 self.center_zone.set(CenterZoneState::default());
-                self.active_agent.set(None);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
                 self.diff_contents.set(HashMap::new());
@@ -849,14 +861,9 @@ impl AppState {
         {
             self.switch_active_project(None);
         }
-        if self
-            .active_agent
-            .get_untracked()
-            .as_ref()
-            .is_some_and(|active| active.host_id == host_id)
-        {
-            self.active_agent.set(None);
-        }
+        // active_agent is a Memo over center_zone; we cannot clear it directly.
+        // Stale Chat tabs referencing the disconnected host are a known
+        // follow-up bug (deferred from the perf plan).
         if self
             .active_terminal
             .get_untracked()
@@ -908,17 +915,9 @@ impl AppState {
     }
 
     pub fn activate_tab(&self, id: TabId) {
+        // active_agent derives from center_zone via a Memo, so the tab change
+        // here propagates without a manual sync.
         self.center_zone.update(|cz| cz.activate(id));
-        // Sync active_agent when switching to a chat tab
-        let agent_ref = self.center_zone.with_untracked(|cz| {
-            cz.active_tab().and_then(|tab| match &tab.content {
-                TabContent::Chat { agent_ref } => Some(agent_ref.clone()),
-                _ => None,
-            })
-        });
-        if let Some(ar) = agent_ref {
-            self.active_agent.set(ar);
-        }
     }
 
     pub fn close_other_tabs(&self, id: TabId) {
@@ -1395,6 +1394,61 @@ mod tests {
                     .open_files
                     .with_untracked(|m| m.contains_key(&file_path))
             );
+        });
+    }
+
+    #[test]
+    fn active_agent_is_derived_from_active_chat_tab() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            let agent_a = ActiveAgentRef {
+                host_id: "host".to_owned(),
+                agent_id: AgentId("a".to_owned()),
+            };
+            let agent_b = ActiveAgentRef {
+                host_id: "host".to_owned(),
+                agent_id: AgentId("b".to_owned()),
+            };
+
+            // Memo starts as None (no chat tab yet).
+            assert_eq!(state.active_agent.get_untracked(), None);
+
+            state.open_tab(
+                TabContent::Chat {
+                    agent_ref: Some(agent_a.clone()),
+                },
+                "A".to_owned(),
+                true,
+            );
+            assert_eq!(state.active_agent.get_untracked(), Some(agent_a.clone()));
+
+            let a_tab_id = state
+                .center_zone
+                .with_untracked(|cz| cz.active_tab_id.expect("A tab active"));
+
+            state.open_tab(
+                TabContent::Chat {
+                    agent_ref: Some(agent_b.clone()),
+                },
+                "B".to_owned(),
+                true,
+            );
+            assert_eq!(state.active_agent.get_untracked(), Some(agent_b.clone()));
+
+            // Closing the active B tab should fall back to A — and the Memo
+            // must reflect that, not stay stale on B.
+            let b_tab_id = state
+                .center_zone
+                .with_untracked(|cz| cz.active_tab_id.expect("B tab active"));
+            state.close_tab(b_tab_id);
+            assert_eq!(state.active_agent.get_untracked(), Some(agent_a.clone()));
+
+            // Closing A leaves only the Home tab (re-created by close()),
+            // which is not a Chat — so active_agent is None.
+            state.close_tab(a_tab_id);
+            assert_eq!(state.active_agent.get_untracked(), None);
         });
     }
 

@@ -1055,6 +1055,15 @@ details summary:focus:not(:focus-visible) {
     overflow: auto;
 }
 
+.tab-mount {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
 .view-editor {
     display: flex;
     align-items: center;
@@ -3171,6 +3180,16 @@ kbd {
 .dock-tab-content {
     flex: 1;
     min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.dock-tab-mount {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
 }
 

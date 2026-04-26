@@ -351,8 +351,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     .unwrap_or_else(|| "Chat".to_string());
 
                 if target_project == active_project {
-                    state.active_agent.set(Some(new_active_agent.clone()));
-                    // Upgrade a "New Chat" tab if one exists, otherwise open new
+                    // active_agent is now a Memo over center_zone — the update
+                    // below drives it.
                     state.center_zone.update(|cz| {
                         let new_chat = TabContent::Chat { agent_ref: None };
                         if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
@@ -376,7 +376,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // Stash into that project's memory so switching over shows it.
                     state.project_view_memory.update(|map| {
                         let slot = map.entry(target).or_default();
-                        slot.active_agent = Some(new_active_agent.clone());
                         let cz = slot.center_zone.get_or_insert_with(Default::default);
                         let new_chat = TabContent::Chat { agent_ref: None };
                         if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
@@ -397,7 +396,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     });
                 } else {
                     // No project context — fall through to global behavior.
-                    state.active_agent.set(Some(new_active_agent.clone()));
+                    // active_agent is a Memo over center_zone; the update below
+                    // drives it.
                     state.center_zone.update(|cz| {
                         let new_chat = TabContent::Chat { agent_ref: None };
                         if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
@@ -1171,14 +1171,8 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
         map.remove(&agent_id);
     });
 
-    let was_active = state.active_agent.with_untracked(|a| {
-        a.as_ref()
-            .is_some_and(|a| a.host_id == host_id && a.agent_id == agent_id)
-    });
-    if was_active {
-        state.active_agent.set(None);
-    }
-
+    // active_agent is a Memo over center_zone — closing the chat tabs below
+    // drives it to None for this agent.
     state
         .center_zone
         .update(|cz| close_agent_tabs(cz, host_id, &agent_id));
@@ -1186,13 +1180,6 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
         for memory in memories.values_mut() {
             if let Some(center_zone) = memory.center_zone.as_mut() {
                 close_agent_tabs(center_zone, host_id, &agent_id);
-            }
-            if memory
-                .active_agent
-                .as_ref()
-                .is_some_and(|a| a.host_id == host_id && a.agent_id == agent_id)
-            {
-                memory.active_agent = None;
             }
         }
     });

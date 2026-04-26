@@ -19,12 +19,13 @@ pub fn begin_new_chat_with(
     backend_override: Option<BackendKind>,
     custom_agent_id: Option<CustomAgentId>,
 ) {
-    state.active_agent.set(None);
     state.draft_backend_override.set(backend_override);
     state.draft_custom_agent_id.set(custom_agent_id);
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());
+    // Opening (and activating) the new chat tab drives `active_agent` to None
+    // via the Memo derived from `center_zone`.
     state.open_tab(
         TabContent::Chat { agent_ref: None },
         "New Chat".to_string(),

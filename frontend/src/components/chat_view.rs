@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -8,46 +6,29 @@ use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::task_list::TaskListView;
-use crate::state::{AppState, TransientEvent};
+use crate::state::{ActiveAgentRef, AppState, TransientEvent};
 
 use protocol::BackendKind;
 
-struct ScrollListenerHandle {
-    element: web_sys::HtmlDivElement,
-    callback: Closure<dyn Fn()>,
-}
-
-impl ScrollListenerHandle {
-    fn remove(self) {
-        let _ = self
-            .element
-            .remove_event_listener_with_callback("scroll", self.callback.as_ref().unchecked_ref());
-    }
-}
-
-thread_local! {
-    static SCROLL_LISTENER_HANDLE: RefCell<Option<ScrollListenerHandle>> = const { RefCell::new(None) };
-}
-
-fn clear_scroll_listener() {
-    SCROLL_LISTENER_HANDLE.with(|slot| {
-        if let Some(handle) = slot.borrow_mut().take() {
-            handle.remove();
-        }
-    });
-}
-
 #[component]
-pub fn ChatView() -> impl IntoView {
+pub fn ChatView(
+    /// Per-instance binding to a chat — typically derived from a tab's
+    /// `TabContent::Chat { agent_ref }` so each tab has its own view that
+    /// stays mounted even when the tab is hidden via CSS. Passed as a Signal
+    /// so the view tracks the rare in-place mutation where a "New Chat" tab's
+    /// agent_ref upgrades from `None` to the spawned agent (see
+    /// `dispatch.rs` agent-creation handling).
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let has_agent = move || state.active_agent.get().is_some();
+    let has_agent = move || agent_ref.get().is_some();
 
     // Reactive identifier of the chat the row list belongs to. Combined with
     // `idx` it forms the keyed `<For>` row identity below: switching agents
     // changes every key (clean remount), appending a message preserves rows
     // 0..len() and only mounts the new tail row.
-    let active_agent_id = move || state.active_agent.get().map(|a| a.agent_id);
+    let active_agent_id = move || agent_ref.get().map(|a| a.agent_id);
 
     let messages_len: Memo<usize> = Memo::new(move |_| match active_agent_id() {
         Some(id) => state
@@ -65,13 +46,13 @@ pub fn ChatView() -> impl IntoView {
     };
 
     let streaming = move || {
-        let agent_id = state.active_agent.get()?.agent_id;
+        let agent_id = agent_ref.get()?.agent_id;
         let map = state.streaming_text.get();
         map.get(&agent_id).cloned()
     };
 
     let task_list = move || {
-        let agent_id = state.active_agent.get()?.agent_id;
+        let agent_id = agent_ref.get()?.agent_id;
         let map = state.task_lists.get();
         map.get(&agent_id).cloned()
     };
@@ -105,13 +86,13 @@ pub fn ChatView() -> impl IntoView {
     });
 
     let transient_events = move || {
-        let agent_id = state.active_agent.get()?.agent_id;
+        let agent_id = agent_ref.get()?.agent_id;
         let map = state.transient_events.get();
         map.get(&agent_id).cloned()
     };
 
     let agent_name = move || -> String {
-        let Some(active_agent) = state.active_agent.get() else {
+        let Some(active_agent) = agent_ref.get() else {
             return String::new();
         };
         let agents = state.agents.get();
@@ -125,7 +106,7 @@ pub fn ChatView() -> impl IntoView {
     };
 
     let agent_backend = move || -> Option<BackendKind> {
-        let active_agent = state.active_agent.get()?;
+        let active_agent = agent_ref.get()?;
         let agents = state.agents.get();
         agents
             .iter()
@@ -134,7 +115,7 @@ pub fn ChatView() -> impl IntoView {
     };
 
     let agent_initializing = move || -> bool {
-        let active_agent = match state.active_agent.get() {
+        let active_agent = match agent_ref.get() {
             Some(active_agent) => active_agent,
             None => return false,
         };
@@ -149,12 +130,15 @@ pub fn ChatView() -> impl IntoView {
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
     let show_scroll_btn = RwSignal::new(false);
-    on_cleanup(clear_scroll_listener);
 
-    // Track user scroll position to detect manual scroll-up
+    // Per-instance scroll listener. Multiple `ChatView`s may exist
+    // simultaneously (one per chat tab, mounted-and-hidden), so we cannot use
+    // a thread-local single-slot handle. We forget the Closure so it survives
+    // for the lifetime of the underlying scroll element; when the component
+    // unmounts, the DOM element is removed and the listener is collected with
+    // it. One leaked Closure per chat-tab mount is bounded and acceptable.
     let scroll_ref_for_handler = scroll_ref;
     Effect::new(move |_| {
-        clear_scroll_listener();
         if let Some(el) = scroll_ref_for_handler.get() {
             let el_clone = el.clone();
             let handler = Closure::<dyn Fn()>::new(move || {
@@ -167,12 +151,7 @@ pub fn ChatView() -> impl IntoView {
                 show_scroll_btn.set(!is_near_bottom);
             });
             let _ = el.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
-            SCROLL_LISTENER_HANDLE.with(|slot| {
-                slot.borrow_mut().replace(ScrollListenerHandle {
-                    element: el,
-                    callback: handler,
-                });
-            });
+            handler.forget();
         }
     });
 
@@ -428,10 +407,13 @@ mod wasm_tests {
         let host_id_for_mount = host_id.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            state.active_agent.set(Some(ActiveAgentRef {
+            let bound = ActiveAgentRef {
                 host_id: host_id_for_mount.clone(),
                 agent_id: agent_id_for_mount.clone(),
-            }));
+            };
+            // ChatView reads its own `agent_ref` Signal prop directly; we
+            // don't need to populate the global `active_agent` Memo for the
+            // test to exercise the keyed-list behaviour.
             state.chat_messages.update(|m| {
                 m.insert(
                     agent_id_for_mount.clone(),
@@ -444,7 +426,8 @@ mod wasm_tests {
             });
             *setup_handle.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <ChatView /> }
+            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
+            view! { <ChatView agent_ref=agent_ref_signal /> }
         });
 
         next_tick().await;

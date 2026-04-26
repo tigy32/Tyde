@@ -343,6 +343,131 @@ fn TabButton(
     }
 }
 
+/// Tab content variant discriminant. We track this as a `Memo` so the
+/// inner-view closure inside `TabMount` only re-runs (and tears down /
+/// remounts the underlying component) when the variant actually flips —
+/// not on every `center_zone` update or in-place payload change. This
+/// matters for tabs-disabled mode, where `replace_active` mutates the
+/// active tab's content under the same `TabId`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabKind {
+    Home,
+    Chat,
+    File,
+    Diff,
+    Missing,
+}
+
+/// Mount a single tab's content and toggle CSS visibility based on whether
+/// the tab is currently active. This preserves component-local state
+/// (scroll position, find state, syntax highlight cache) across tab
+/// switches — the previous implementation rebuilt the active tab's view
+/// tree on every `center_zone` update, which is what made tab switching
+/// feel sluggish.
+///
+/// The variant tracker handles tabs-disabled mode where `replace_active`
+/// can mutate the active tab from one variant to another (Home → File,
+/// Chat → Diff, etc.) without changing `TabId`. When the variant flips,
+/// the inner closure re-runs and the previous component is unmounted.
+#[component]
+fn TabMount(tab_id: TabId) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let is_active = move || {
+        state
+            .center_zone
+            .with(|cz| cz.active_tab_id == Some(tab_id))
+    };
+
+    let tab_kind: Memo<TabKind> = Memo::new(move |_| {
+        state.center_zone.with(|cz| {
+            match cz.tabs.iter().find(|t| t.id == tab_id).map(|t| &t.content) {
+                Some(TabContent::Home) => TabKind::Home,
+                Some(TabContent::Chat { .. }) => TabKind::Chat,
+                Some(TabContent::File { .. }) => TabKind::File,
+                Some(TabContent::Diff { .. }) => TabKind::Diff,
+                None => TabKind::Missing,
+            }
+        })
+    });
+
+    view! {
+        <div
+            class="tab-mount"
+            style=move || if is_active() { "" } else { "display: none;" }
+        >
+            {move || {
+                match tab_kind.get() {
+                    TabKind::Home => view! {
+                        <div class="center-content-scroll">
+                            <HomeView />
+                        </div>
+                    }.into_any(),
+                    TabKind::Chat => {
+                        // Per-tab agent_ref Signal — re-derives on the
+                        // in-place `agent_ref` payload upgrade for "New
+                        // Chat" tabs without remounting the ChatView.
+                        let agent_ref_signal: Signal<Option<crate::state::ActiveAgentRef>> =
+                            Signal::derive(move || {
+                                state.center_zone.with(|cz| {
+                                    match cz
+                                        .tabs
+                                        .iter()
+                                        .find(|t| t.id == tab_id)
+                                        .map(|t| &t.content)
+                                    {
+                                        Some(TabContent::Chat { agent_ref }) => agent_ref.clone(),
+                                        _ => None,
+                                    }
+                                })
+                            });
+                        view! { <ChatView agent_ref=agent_ref_signal /> }.into_any()
+                    }
+                    TabKind::File => {
+                        // Snapshot the path at the moment the variant
+                        // becomes File. File tab content is immutable for
+                        // a given TabId, so this snapshot stays valid for
+                        // the lifetime of the variant.
+                        let path = state.center_zone.with_untracked(|cz| {
+                            cz.tabs
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                                .and_then(|t| match &t.content {
+                                    TabContent::File { path } => Some(path.clone()),
+                                    _ => None,
+                                })
+                        });
+                        match path {
+                            Some(path) => view! { <FileView path=path /> }.into_any(),
+                            None => view! { <div></div> }.into_any(),
+                        }
+                    }
+                    TabKind::Diff => {
+                        let resolved = state.center_zone.with_untracked(|cz| {
+                            cz.tabs
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                                .and_then(|t| match &t.content {
+                                    TabContent::Diff { root, scope } => {
+                                        Some((root.clone(), *scope))
+                                    }
+                                    _ => None,
+                                })
+                        });
+                        match resolved {
+                            Some((root, scope)) => {
+                                view! { <DiffView root=root scope=scope /> }.into_any()
+                            }
+                            None => view! { <div></div> }.into_any(),
+                        }
+                    }
+                    TabKind::Missing => view! { <div></div> }.into_any(),
+                }
+            }}
+        </div>
+    }
+}
+
 #[component]
 pub fn CenterZone() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -464,31 +589,22 @@ pub fn CenterZone() -> impl IntoView {
                 </div>
             </div>
             <div class="center-content">
+                <For
+                    each=move || tab_ids()
+                    key=|id| *id
+                    let:tab_id
+                >
+                    <TabMount tab_id=tab_id />
+                </For>
                 {move || {
-                    let cz = state.center_zone.get();
-                    let active_tab = cz.active_tab_id
-                        .and_then(|id| cz.tabs.iter().find(|t| t.id == id));
-                    match active_tab.map(|t| &t.content) {
-                        Some(TabContent::Home) => view! {
+                    if tab_ids().is_empty() {
+                        Some(view! {
                             <div class="center-content-scroll">
                                 <HomeView />
                             </div>
-                        }.into_any(),
-                        Some(TabContent::Chat { agent_ref }) => {
-                            state.active_agent.set(agent_ref.clone());
-                            view! { <ChatView /> }.into_any()
-                        }
-                        Some(TabContent::File { path }) => {
-                            view! { <FileView path=path.clone() /> }.into_any()
-                        }
-                        Some(TabContent::Diff { root, scope }) => {
-                            view! { <DiffView root=root.clone() scope=*scope /> }.into_any()
-                        }
-                        None => view! {
-                            <div class="center-content-scroll">
-                                <HomeView />
-                            </div>
-                        }.into_any(),
+                        })
+                    } else {
+                        None
                     }
                 }}
             </div>

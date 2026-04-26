@@ -348,7 +348,8 @@ fn agent_card(
             host_id: click_host_id.clone(),
             agent_id: click_id.clone(),
         };
-        state_for_click.active_agent.set(Some(agent_ref.clone()));
+        // Opening (and activating) the chat tab drives `active_agent` to this
+        // agent via the Memo derived from `center_zone`.
         state_for_click.open_tab(
             TabContent::Chat {
                 agent_ref: Some(agent_ref),
@@ -369,7 +370,8 @@ fn agent_card(
                 host_id: kd_host.clone(),
                 agent_id: kd_id.clone(),
             };
-            kd_state.active_agent.set(Some(agent_ref.clone()));
+            // active_agent is a Memo over center_zone; opening the tab drives
+            // it.
             kd_state.open_tab(
                 TabContent::Chat {
                     agent_ref: Some(agent_ref),
