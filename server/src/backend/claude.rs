@@ -254,6 +254,8 @@ struct ClaudeStdoutSummary {
     tool_name_by_id: HashMap<String, String>,
     tool_call_by_id: HashMap<String, ClaudeToolCall>,
     tool_modify_preview_by_id: HashMap<String, ClaudeModifyPreview>,
+    unresolved_tool_requests: HashMap<String, String>,
+    auto_closed_tool_requests: HashSet<String>,
     tool_io_bytes: u64,
     reasoning_bytes: u64,
     emitted_phase_count: u64,
@@ -1405,8 +1407,13 @@ impl ClaudeInner {
                 Some(context_breakdown),
             );
             for tool_call in &phase.tool_calls {
-                self.emit_tool_request(tool_call);
+                emit_tool_request_with_tracking(summary, self, tool_call);
             }
+            auto_close_unresolved_tool_requests(
+                summary,
+                self,
+                "Claude ended the turn before returning a result for this streamed tool request.",
+            );
             return true;
         }
 
@@ -1428,6 +1435,11 @@ impl ClaudeInner {
                 }
                 self.emit_placeholder_stream_end(selected_model, Some(context_breakdown));
             }
+            auto_close_unresolved_tool_requests(
+                summary,
+                self,
+                "Claude ended the turn before returning a result for this streamed tool request.",
+            );
             return true;
         }
 
@@ -1442,6 +1454,15 @@ impl ClaudeInner {
                 selected_model.as_deref(),
             );
             self.emit_placeholder_stream_end(selected_model, Some(context_breakdown));
+        }
+
+        if !summary.unresolved_tool_requests.is_empty() {
+            auto_close_unresolved_tool_requests(
+                summary,
+                self,
+                "Claude ended the turn before returning a result for this streamed tool request.",
+            );
+            return true;
         }
 
         false
@@ -2328,6 +2349,7 @@ fn consume_assistant_message(
 
     if has_payload && !is_duplicate {
         maybe_emit_next_stream_start(
+            summary,
             segment,
             inner,
             base_message_id,
@@ -2399,6 +2421,27 @@ fn consume_user_tool_result(
         &summary.tool_call_by_id,
     );
     for completion in completions {
+        if summary
+            .auto_closed_tool_requests
+            .contains(&completion.tool_call_id)
+        {
+            tracing::debug!(
+                tool_call_id = completion.tool_call_id,
+                "skipping Claude tool completion after synthetic auto-close"
+            );
+            continue;
+        }
+        if summary
+            .unresolved_tool_requests
+            .remove(&completion.tool_call_id)
+            .is_none()
+        {
+            tracing::debug!(
+                tool_call_id = completion.tool_call_id,
+                "skipping Claude tool completion without emitted ToolRequest"
+            );
+            continue;
+        }
         inner.emit_tool_execution_completed(
             &completion.tool_call_id,
             &completion.tool_name,
@@ -2447,6 +2490,7 @@ fn phase_has_pending_output(summary: &ClaudeStdoutSummary, segment: &SegmentStat
 }
 
 fn maybe_emit_next_stream_start(
+    summary: &mut ClaudeStdoutSummary,
     segment: &mut SegmentState,
     inner: &ClaudeInner,
     base_message_id: &str,
@@ -2457,6 +2501,11 @@ fn maybe_emit_next_stream_start(
         return;
     }
 
+    auto_close_unresolved_tool_requests(
+        summary,
+        inner,
+        "Claude started a new assistant response before returning a result for this streamed tool request.",
+    );
     segment.segment_index += 1;
     *current_message_id = format!("{base_message_id}-seg-{}", segment.segment_index);
     inner.emit_stream_start(current_message_id, model);
@@ -2546,12 +2595,47 @@ fn close_current_phase(
             None,
         );
         for tool_call in &phase.tool_calls {
-            inner.emit_tool_request(tool_call);
+            emit_tool_request_with_tracking(summary, inner, tool_call);
         }
     }
 
     reset_phase_state(summary, segment);
     segment.awaiting_stream_start = true;
+}
+
+fn emit_tool_request_with_tracking(
+    summary: &mut ClaudeStdoutSummary,
+    inner: &ClaudeInner,
+    tool_call: &ClaudeToolCall,
+) {
+    inner.emit_tool_request(tool_call);
+    summary
+        .unresolved_tool_requests
+        .insert(tool_call.id.clone(), tool_call.name.clone());
+}
+
+fn auto_close_unresolved_tool_requests(
+    summary: &mut ClaudeStdoutSummary,
+    inner: &ClaudeInner,
+    message: &str,
+) {
+    let unresolved = std::mem::take(&mut summary.unresolved_tool_requests);
+    for (tool_call_id, tool_name) in unresolved {
+        summary
+            .auto_closed_tool_requests
+            .insert(tool_call_id.clone());
+        inner.emit_tool_execution_completed(
+            &tool_call_id,
+            &tool_name,
+            false,
+            json!({
+                "kind": "Error",
+                "short_message": "Tool result missing",
+                "detailed_message": message,
+            }),
+            Some(message.to_string()),
+        );
+    }
 }
 
 fn content_block_index(event: &Value) -> Option<u64> {
@@ -2672,6 +2756,7 @@ fn consume_stream_event(
                 segment.current_claude_message_id = Some(message_id);
             }
             maybe_emit_next_stream_start(
+                summary,
                 segment,
                 inner,
                 base_message_id,
@@ -2695,6 +2780,7 @@ fn consume_stream_event(
             if block_type == "text" {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
                     maybe_emit_next_stream_start(
+                        summary,
                         segment,
                         inner,
                         base_message_id,
@@ -2708,6 +2794,7 @@ fn consume_stream_event(
             } else if is_reasoning_marker(block_type) {
                 if let Some(text) = extract_reasoning_text(block) {
                     maybe_emit_next_stream_start(
+                        summary,
                         segment,
                         inner,
                         base_message_id,
@@ -2722,6 +2809,7 @@ fn consume_stream_event(
                 && let Some(tool_call) = extract_tool_call_from_block(block)
             {
                 maybe_emit_next_stream_start(
+                    summary,
                     segment,
                     inner,
                     base_message_id,
@@ -2765,6 +2853,7 @@ fn consume_stream_event(
                 "text_delta" => {
                     if let Some(text) = delta.get("text").and_then(Value::as_str) {
                         maybe_emit_next_stream_start(
+                            summary,
                             segment,
                             inner,
                             base_message_id,
@@ -2779,6 +2868,7 @@ fn consume_stream_event(
                 _ if is_reasoning_marker(delta_type) => {
                     if let Some(text) = extract_reasoning_text(delta) {
                         maybe_emit_next_stream_start(
+                            summary,
                             segment,
                             inner,
                             base_message_id,
@@ -2821,6 +2911,7 @@ fn consume_stream_event(
         _ if is_reasoning_marker(event_type) => {
             if let Some(text) = extract_reasoning_text(event) {
                 maybe_emit_next_stream_start(
+                    summary,
                     segment,
                     inner,
                     base_message_id,
@@ -4154,18 +4245,45 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
     let mut restored = Vec::new();
     let mut last_cumulative_usage = None;
     let mut conversation_bytes_total = 0u64;
+    let parsed_values = contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        })
+        .collect::<Vec<_>>();
+
     let mut tool_name_by_id = HashMap::<String, String>::new();
     let mut tool_call_by_id = HashMap::<String, ClaudeToolCall>::new();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for value in &parsed_values {
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let value = match serde_json::from_str::<Value>(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Some(message) = value.get("message").and_then(Value::as_object) else {
+            continue;
         };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
 
+        let message_value = Value::Object(message.clone());
+        for tool_call in extract_tool_calls_from_message(&message_value) {
+            let tool_call_id = tool_call.id.clone();
+            tool_name_by_id.insert(tool_call_id.clone(), tool_call.name.clone());
+            tool_call_by_id.insert(tool_call_id, tool_call);
+        }
+    }
+
+    let mut emitted_tool_requests = HashSet::<String>::new();
+    let mut pending_tool_requests = HashMap::<String, ClaudeToolCall>::new();
+    let mut auto_closed_tool_requests = HashSet::<String>::new();
+    let mut deferred_completions = Vec::<ClaudeReplayToolExecution>::new();
+    let mut last_emitted_assistant_message_id = None::<String>;
+
+    for value in parsed_values {
         let line_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -4205,33 +4323,58 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
         } else {
             Vec::new()
         };
-        for tool_call in &tool_calls {
-            tool_name_by_id.insert(tool_call.id.clone(), tool_call.name.clone());
-            tool_call_by_id.insert(tool_call.id.clone(), tool_call.clone());
-        }
         let message_tool_calls: Vec<Value> = tool_calls
             .iter()
             .map(|tool_call| {
                 json!({
-                    "id": tool_call.id,
-                    "name": tool_call.name,
-                    "arguments": tool_call.arguments,
+                    "id": tool_call.id.clone(),
+                    "name": tool_call.name.clone(),
+                    "arguments": tool_call.arguments.clone(),
                 })
             })
             .collect();
+        let assistant_message_id = if role == "assistant" {
+            message
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(normalize_nonempty)
+        } else {
+            None
+        };
+        let same_assistant_message = role == "assistant"
+            && assistant_message_id.is_some()
+            && assistant_message_id == last_emitted_assistant_message_id;
+        // Claude can write one assistant response as multiple JSONL rows with
+        // the same message id, especially one pure tool_use row per tool. The
+        // frontend protocol treats those as one assistant turn: additional tool
+        // requests may arrive while earlier requests from the same turn are
+        // pending, but a second assistant MessageAdded may not.
+        let has_assistant_message_content = !text.trim().is_empty()
+            || !images.is_empty()
+            || !message_tool_calls.is_empty()
+            || reasoning_text
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty());
+        let is_tool_only_assistant_continuation = same_assistant_message
+            && text.trim().is_empty()
+            && images.is_empty()
+            && reasoning_text
+                .as_ref()
+                .is_none_or(|value| value.trim().is_empty())
+            && !message_tool_calls.is_empty();
 
         let should_emit_message = if role == "assistant" {
-            !text.trim().is_empty()
-                || !images.is_empty()
-                || !message_tool_calls.is_empty()
-                || reasoning_text
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty())
+            has_assistant_message_content && !is_tool_only_assistant_continuation
         } else {
             !text.trim().is_empty() || !images.is_empty()
         };
 
         if should_emit_message {
+            flush_unresolved_replay_tool_requests(
+                &mut restored,
+                &mut pending_tool_requests,
+                &mut auto_closed_tool_requests,
+            );
             conversation_bytes_total = conversation_bytes_total
                 .saturating_add(estimate_message_history_bytes(&text, &images));
             let sender = if role == "assistant" {
@@ -4258,11 +4401,34 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
                 "context_breakdown": Value::Null,
                 "images": images,
             })));
+            if role == "assistant" {
+                last_emitted_assistant_message_id = assistant_message_id;
+            } else {
+                last_emitted_assistant_message_id = None;
+            }
         }
 
         if role == "assistant" {
+            let current_tool_call_ids = tool_calls
+                .iter()
+                .map(|tool_call| tool_call.id.clone())
+                .collect::<HashSet<_>>();
             for tool_call in tool_calls {
+                emitted_tool_requests.insert(tool_call.id.clone());
+                pending_tool_requests.insert(tool_call.id.clone(), tool_call.clone());
                 restored.push(ClaudeHistoryReplayItem::ToolRequest(tool_call));
+            }
+            if !current_tool_call_ids.is_empty() {
+                let mut still_deferred = Vec::new();
+                for completion in deferred_completions.drain(..) {
+                    if current_tool_call_ids.contains(&completion.tool_call_id) {
+                        pending_tool_requests.remove(&completion.tool_call_id);
+                        restored.push(ClaudeHistoryReplayItem::ToolExecutionCompleted(completion));
+                    } else {
+                        still_deferred.push(completion);
+                    }
+                }
+                deferred_completions = still_deferred;
             }
         }
 
@@ -4271,14 +4437,74 @@ fn parse_claude_session_replay(contents: &str) -> ClaudeSessionReplay {
             &tool_name_by_id,
             &tool_call_by_id,
         ) {
-            restored.push(ClaudeHistoryReplayItem::ToolExecutionCompleted(completion));
+            if !tool_call_by_id.contains_key(&completion.tool_call_id) {
+                continue;
+            }
+            if auto_closed_tool_requests.contains(&completion.tool_call_id) {
+                continue;
+            }
+            if emitted_tool_requests.contains(&completion.tool_call_id) {
+                pending_tool_requests.remove(&completion.tool_call_id);
+                restored.push(ClaudeHistoryReplayItem::ToolExecutionCompleted(completion));
+            } else {
+                deferred_completions.push(completion);
+            }
         }
+    }
+
+    flush_unresolved_replay_tool_requests(
+        &mut restored,
+        &mut pending_tool_requests,
+        &mut auto_closed_tool_requests,
+    );
+
+    if !deferred_completions.is_empty() {
+        tracing::debug!(
+            count = deferred_completions.len(),
+            "skipping Claude replay tool completions whose requests were never replayed"
+        );
     }
 
     ClaudeSessionReplay {
         items: restored,
         last_cumulative_usage,
         conversation_bytes_total,
+    }
+}
+
+fn flush_unresolved_replay_tool_requests(
+    restored: &mut Vec<ClaudeHistoryReplayItem>,
+    pending_tool_requests: &mut HashMap<String, ClaudeToolCall>,
+    auto_closed_tool_requests: &mut HashSet<String>,
+) {
+    if pending_tool_requests.is_empty() {
+        return;
+    }
+
+    let mut pending = pending_tool_requests
+        .drain()
+        .map(|(_, tool_call)| tool_call)
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| left.id.cmp(&right.id));
+
+    for tool_call in pending {
+        auto_closed_tool_requests.insert(tool_call.id.clone());
+        restored.push(ClaudeHistoryReplayItem::ToolExecutionCompleted(
+            ClaudeReplayToolExecution {
+                tool_call_id: tool_call.id,
+                tool_name: tool_call.name,
+                success: false,
+                tool_result: json!({
+                    "kind": "Error",
+                    "short_message": "Tool execution was interrupted",
+                    "detailed_message": "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.",
+                }),
+                error: Some(
+                    "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted."
+                        .to_string(),
+                ),
+            },
+        ));
     }
 }
 
@@ -5940,6 +6166,341 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_claude_session_history_defers_out_of_order_tool_result_until_request() {
+        let tool_id = "toolu_out_of_order";
+        let assistant_uuid = "assistant-tool-use";
+        let contents = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "user",
+                "uuid": "tool-result",
+                "parentUuid": assistant_uuid,
+                "sourceToolAssistantUUID": assistant_uuid,
+                "timestamp": "2026-04-26T19:37:44.099Z",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": [
+                                { "type": "text", "text": "Found 1 file\nrelay-protocol/src/lib.rs" }
+                            ]
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": assistant_uuid,
+                "timestamp": "2026-04-26T19:37:44.091Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Grep",
+                            "input": {
+                                "pattern": "MobilePairingQrPayload",
+                                "path": "/Users/mike/Tyde2/relay-protocol/src",
+                                "output_mode": "files_with_matches"
+                            }
+                        }
+                    ]
+                }
+            })
+        );
+
+        let replay = parse_claude_session_history_contents(&contents);
+        assert_eq!(replay.len(), 3);
+
+        match &replay[0] {
+            ClaudeHistoryReplayItem::Message(message) => {
+                let tool_calls = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .expect("message tool_calls");
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(
+                    tool_calls[0].get("id").and_then(Value::as_str),
+                    Some(tool_id)
+                );
+            }
+            _ => panic!("first replay item should be assistant message"),
+        }
+
+        let tool_request = match &replay[1] {
+            ClaudeHistoryReplayItem::ToolRequest(tool_call) => tool_call,
+            _ => panic!("second replay item should be tool request"),
+        };
+        assert_eq!(tool_request.id, tool_id);
+        assert_eq!(tool_request.name, "Grep");
+
+        let completion = match &replay[2] {
+            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => completion,
+            _ => panic!("third replay item should be tool completion"),
+        };
+        assert!(completion.success);
+        assert_eq!(completion.tool_call_id, tool_id);
+        assert_eq!(completion.tool_name, "Grep");
+    }
+
+    #[test]
+    fn parse_claude_session_history_skips_tool_result_without_matching_request() {
+        let contents = format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_missing",
+                            "content": [{ "type": "text", "text": "orphaned result" }]
+                        }
+                    ]
+                }
+            })
+        );
+
+        let replay = parse_claude_session_history_contents(&contents);
+        assert!(
+            replay.is_empty(),
+            "orphaned tool results should not replay as unknown completions"
+        );
+    }
+
+    #[test]
+    fn parse_claude_session_history_auto_closes_abandoned_tool_before_user_message() {
+        let tool_id = "toolu_abandoned";
+        let contents = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_abandoned",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Bash",
+                            "input": { "command": "sleep 10" }
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "interrupting with a new prompt" }
+                    ]
+                }
+            })
+        );
+
+        let replay = parse_claude_session_history_contents(&contents);
+        assert_eq!(replay.len(), 4);
+
+        assert!(matches!(&replay[0], ClaudeHistoryReplayItem::Message(_)));
+        assert!(matches!(
+            &replay[1],
+            ClaudeHistoryReplayItem::ToolRequest(_)
+        ));
+        let completion = match &replay[2] {
+            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => completion,
+            _ => panic!("third replay item should auto-close the abandoned tool"),
+        };
+        assert_eq!(completion.tool_call_id, tool_id);
+        assert_eq!(completion.tool_name, "Bash");
+        assert!(!completion.success);
+        assert_eq!(
+            completion.tool_result.get("kind").and_then(Value::as_str),
+            Some("Error")
+        );
+        assert!(matches!(&replay[3], ClaudeHistoryReplayItem::Message(_)));
+    }
+
+    #[test]
+    fn parse_claude_session_history_suppresses_late_result_after_auto_close() {
+        let tool_id = "toolu_late_result";
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_late_result",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Bash",
+                            "input": { "command": "sleep 10" }
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "new prompt before result arrives" }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": "late output"
+                        }
+                    ]
+                }
+            })
+        );
+
+        let replay = parse_claude_session_history_contents(&contents);
+        let completions = replay
+            .iter()
+            .filter(|item| matches!(item, ClaudeHistoryReplayItem::ToolExecutionCompleted(_)))
+            .count();
+        assert_eq!(completions, 1, "late completion should be suppressed");
+
+        let completion = replay.iter().find_map(|item| match item {
+            ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => Some(completion),
+            _ => None,
+        });
+        let completion = completion.expect("synthetic completion");
+        assert_eq!(completion.tool_call_id, tool_id);
+        assert!(!completion.success);
+    }
+
+    #[test]
+    fn parse_claude_session_history_replays_split_assistant_tools_as_one_turn() {
+        let contents = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_split",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "checking several things" }
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_split",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_a",
+                            "name": "Bash",
+                            "input": { "command": "git log --oneline -1" }
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_split",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_b",
+                            "name": "Bash",
+                            "input": { "command": "git status --short" }
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_b", "content": "clean" }
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_split",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_c",
+                            "name": "Grep",
+                            "input": { "pattern": "needle", "path": "/tmp" }
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_a", "content": "abc123" }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_c", "content": "match" }
+                    ]
+                }
+            })
+        );
+
+        let replay = parse_claude_session_history_contents(&contents);
+        let messages = replay
+            .iter()
+            .filter(|item| matches!(item, ClaudeHistoryReplayItem::Message(_)))
+            .count();
+        let requests = replay
+            .iter()
+            .filter(|item| matches!(item, ClaudeHistoryReplayItem::ToolRequest(_)))
+            .count();
+        let completions = replay
+            .iter()
+            .filter_map(|item| match item {
+                ClaudeHistoryReplayItem::ToolExecutionCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages, 1);
+        assert_eq!(requests, 3);
+        assert_eq!(completions.len(), 3);
+        assert!(
+            completions.iter().all(|completion| completion.success),
+            "split same-message tool calls should not be auto-closed"
+        );
+    }
+
     #[tokio::test]
     async fn top_level_assistant_boundaries_emit_separate_stream_ends_with_cumulative_usage() {
         let (inner, mut rx) = make_test_inner();
@@ -6236,6 +6797,167 @@ mod tests {
                 .and_then(|data| data.get("message_id"))
                 .and_then(Value::as_str),
             Some("claude-msg-1-seg-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_streamed_tool_request_is_auto_closed_before_next_stream_start() {
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-1".to_string();
+        let mut current_id = base_id.clone();
+
+        inner.emit_stream_start(&base_id, None);
+        assert_eq!(
+            event_kind(&rx.recv().await.expect("initial stream start")),
+            Some("StreamStart")
+        );
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "assistant-msg-1",
+                        "model": "claude-opus-4-6"
+                    }
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_orphan",
+                        "name": "Grep",
+                        "input": {
+                            "pattern": "needle",
+                            "path": "/tmp"
+                        }
+                    }
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_stop"
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        let stream_end = rx.recv().await.expect("stream end for tool phase");
+        assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
+        assert_eq!(
+            stream_end_tool_call_ids(&stream_end),
+            vec!["toolu_orphan".to_string()]
+        );
+
+        let tool_request = rx.recv().await.expect("tool request");
+        assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
+        assert_eq!(
+            tool_request
+                .get("data")
+                .and_then(|data| data.get("tool_call_id"))
+                .and_then(Value::as_str),
+            Some("toolu_orphan")
+        );
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "id": "assistant-msg-2",
+                        "model": "claude-opus-4-6"
+                    }
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+
+        let auto_completion = rx
+            .recv()
+            .await
+            .expect("synthetic tool completion before next stream");
+        assert_eq!(event_kind(&auto_completion), Some("ToolExecutionCompleted"));
+        assert_eq!(
+            auto_completion
+                .get("data")
+                .and_then(|data| data.get("tool_call_id"))
+                .and_then(Value::as_str),
+            Some("toolu_orphan")
+        );
+        assert_eq!(
+            auto_completion
+                .get("data")
+                .and_then(|data| data.get("success"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let next_stream_start = rx.recv().await.expect("next stream start");
+        assert_eq!(event_kind(&next_stream_start), Some("StreamStart"));
+        assert_eq!(
+            next_stream_start
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .and_then(Value::as_str),
+            Some("claude-msg-1-seg-1")
+        );
+
+        consume_claude_stream_value(
+            &json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_orphan",
+                            "content": "late result"
+                        }
+                    ]
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "late real completion after synthetic auto-close should be suppressed"
         );
     }
 
