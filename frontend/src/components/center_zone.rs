@@ -481,7 +481,7 @@ pub fn CenterZone() -> impl IntoView {
     let is_connected_state = state.clone();
     let is_connected = Memo::new(move |_| {
         matches!(
-            is_connected_state.selected_host_connection_status(),
+            is_connected_state.chat_context_connection_status(),
             ConnectionStatus::Connected
         )
     });
@@ -489,7 +489,7 @@ pub fn CenterZone() -> impl IntoView {
     let enabled_backends_state = state.clone();
     let enabled_backends = Memo::new(move |_| {
         enabled_backends_state
-            .selected_host_settings()
+            .chat_context_host_settings()
             .map(|s| s.enabled_backends)
             .unwrap_or_default()
     });

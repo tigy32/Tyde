@@ -692,6 +692,68 @@ impl AppState {
             .find(|host| host.id == selected)
     }
 
+    /// Host that the currently visible chat controls should operate on.
+    ///
+    /// This intentionally differs from `selected_host_id`, which is the host
+    /// selected in Settings. Existing chats are bound to their agent host; new
+    /// chats opened while a project is active are bound to that project's host;
+    /// only global/Home chats fall back to the Settings-selected host.
+    pub fn chat_context_host_id(&self) -> Option<String> {
+        if let Some(active_agent) = self.active_agent.get() {
+            return Some(active_agent.host_id);
+        }
+        if let Some(active_project) = self.active_project.get() {
+            return Some(active_project.host_id);
+        }
+        self.selected_host_id.get()
+    }
+
+    pub fn chat_context_host_id_untracked(&self) -> Option<String> {
+        if let Some(active_agent) = self.active_agent.get_untracked() {
+            return Some(active_agent.host_id);
+        }
+        if let Some(active_project) = self.active_project.get_untracked() {
+            return Some(active_project.host_id);
+        }
+        self.selected_host_id.get_untracked()
+    }
+
+    pub fn connection_status_for_host(&self, host_id: &str) -> ConnectionStatus {
+        self.connection_statuses
+            .get()
+            .get(host_id)
+            .cloned()
+            .unwrap_or(ConnectionStatus::Disconnected)
+    }
+
+    pub fn host_settings(&self, host_id: &str) -> Option<HostSettings> {
+        self.host_settings_by_host.get().get(host_id).cloned()
+    }
+
+    pub fn host_settings_untracked(&self, host_id: &str) -> Option<HostSettings> {
+        self.host_settings_by_host
+            .get_untracked()
+            .get(host_id)
+            .cloned()
+    }
+
+    pub fn chat_context_connection_status(&self) -> ConnectionStatus {
+        let Some(host_id) = self.chat_context_host_id() else {
+            return ConnectionStatus::Disconnected;
+        };
+        self.connection_status_for_host(&host_id)
+    }
+
+    pub fn chat_context_host_settings(&self) -> Option<HostSettings> {
+        let host_id = self.chat_context_host_id()?;
+        self.host_settings(&host_id)
+    }
+
+    pub fn chat_context_host_settings_untracked(&self) -> Option<HostSettings> {
+        let host_id = self.chat_context_host_id_untracked()?;
+        self.host_settings_untracked(&host_id)
+    }
+
     pub fn host_stream_untracked(&self, host_id: &str) -> Option<StreamPath> {
         self.host_streams.get_untracked().get(host_id).cloned()
     }
@@ -1572,6 +1634,90 @@ mod tests {
             // which is not a Chat — so active_agent is None.
             state.close_tab(a_tab_id);
             assert_eq!(state.active_agent.get_untracked(), None);
+        });
+    }
+
+    #[test]
+    fn chat_context_prefers_active_project_over_settings_selected_host() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            state.selected_host_id.set(Some("host-b".to_owned()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert("host-a".to_owned(), ConnectionStatus::Connected);
+                statuses.insert("host-b".to_owned(), ConnectionStatus::Disconnected);
+            });
+            state.host_settings_by_host.update(|settings| {
+                settings.insert(
+                    "host-a".to_owned(),
+                    HostSettings {
+                        enabled_backends: vec![BackendKind::Claude],
+                        default_backend: Some(BackendKind::Claude),
+                        tyde_debug_mcp_enabled: false,
+                        tyde_agent_control_mcp_enabled: true,
+                    },
+                );
+                settings.insert(
+                    "host-b".to_owned(),
+                    HostSettings {
+                        enabled_backends: vec![BackendKind::Gemini],
+                        default_backend: Some(BackendKind::Gemini),
+                        tyde_debug_mcp_enabled: false,
+                        tyde_agent_control_mcp_enabled: true,
+                    },
+                );
+            });
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host-a".to_owned(),
+                project_id: ProjectId("project-a".to_owned()),
+            }));
+
+            assert_eq!(
+                state.chat_context_host_id_untracked(),
+                Some("host-a".to_owned())
+            );
+            assert_eq!(
+                state.chat_context_connection_status(),
+                ConnectionStatus::Connected
+            );
+            assert_eq!(
+                state
+                    .chat_context_host_settings_untracked()
+                    .and_then(|settings| settings.default_backend),
+                Some(BackendKind::Claude)
+            );
+        });
+    }
+
+    #[test]
+    fn chat_context_prefers_active_agent_over_active_project() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            state.selected_host_id.set(Some("host-b".to_owned()));
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "host-a".to_owned(),
+                project_id: ProjectId("project-a".to_owned()),
+            }));
+
+            let agent_ref = ActiveAgentRef {
+                host_id: "host-c".to_owned(),
+                agent_id: AgentId("agent-c".to_owned()),
+            };
+            state.open_tab(
+                TabContent::Chat {
+                    agent_ref: Some(agent_ref),
+                },
+                "Agent C".to_owned(),
+                true,
+            );
+
+            assert_eq!(
+                state.chat_context_host_id_untracked(),
+                Some("host-c".to_owned())
+            );
         });
     }
 

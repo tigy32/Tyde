@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 
 use crate::actions::{begin_new_chat, begin_new_chat_with};
-use crate::state::{AgentInfo, AppState};
+use crate::state::{AgentInfo, AppState, ConnectionStatus};
 
 use protocol::{BackendKind, CustomAgent};
 
@@ -27,7 +27,12 @@ pub fn HomeView() -> impl IntoView {
     let active_tab = RwSignal::new(HomeTab::Projects);
 
     let connected_state = state.clone();
-    let connected = Memo::new(move |_| connected_state.active_connection_count() > 0);
+    let connected = Memo::new(move |_| {
+        matches!(
+            connected_state.chat_context_connection_status(),
+            ConnectionStatus::Connected
+        )
+    });
     let state_for_hosts = state.clone();
 
     let tab_class = move |target: HomeTab| {
@@ -385,14 +390,14 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
     let state_for_menu = state.clone();
     let enabled_backends = Memo::new(move |_| {
         state_for_menu
-            .selected_host_settings()
+            .chat_context_host_settings()
             .map(|s| s.enabled_backends)
             .unwrap_or_default()
     });
 
     let state_for_agents = state.clone();
     let custom_agents_for_host = Memo::new(move |_| {
-        let Some(host_id) = state_for_agents.selected_host_id.get() else {
+        let Some(host_id) = state_for_agents.chat_context_host_id() else {
             return Vec::<CustomAgent>::new();
         };
         let mut agents: Vec<CustomAgent> = state_for_agents

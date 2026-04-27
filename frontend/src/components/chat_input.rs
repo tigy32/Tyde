@@ -150,13 +150,16 @@ fn selected_backend_kind(state: &AppState) -> Option<BackendKind> {
         }
     }
 
-    state
-        .selected_host_settings_untracked()
-        .and_then(|settings| {
-            settings
-                .default_backend
-                .or_else(|| settings.enabled_backends.first().copied())
-        })
+    let draft = state.draft_backend_override.get_untracked();
+    draft.or_else(|| {
+        state
+            .chat_context_host_settings_untracked()
+            .and_then(|settings| {
+                settings
+                    .default_backend
+                    .or_else(|| settings.enabled_backends.first().copied())
+            })
+    })
 }
 
 fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
@@ -170,10 +173,13 @@ fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
         }
     }
 
-    state.selected_host_settings().and_then(|settings| {
-        settings
-            .default_backend
-            .or_else(|| settings.enabled_backends.first().copied())
+    let draft = state.draft_backend_override.get();
+    draft.or_else(|| {
+        state.chat_context_host_settings().and_then(|settings| {
+            settings
+                .default_backend
+                .or_else(|| settings.enabled_backends.first().copied())
+        })
     })
 }
 
@@ -476,7 +482,7 @@ pub fn ChatInput() -> impl IntoView {
     let ui_images = pending_images;
     let ui_mode = Memo::new(move |_| {
         let is_connected = matches!(
-            ui_state.selected_host_connection_status(),
+            ui_state.chat_context_connection_status(),
             ConnectionStatus::Connected
         );
         let has_text = !ui_state.chat_input.get().trim().is_empty();
@@ -557,7 +563,7 @@ pub fn ChatInput() -> impl IntoView {
     let submit_on_enter_images = pending_images;
     let submit_on_enter_mode = move || {
         matches!(
-            submit_on_enter_state.selected_host_connection_status(),
+            submit_on_enter_state.chat_context_connection_status(),
             ConnectionStatus::Connected
         ) && (!submit_on_enter_state.chat_input.get().trim().is_empty()
             || !submit_on_enter_images.get().is_empty())

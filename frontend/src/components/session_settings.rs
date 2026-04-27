@@ -267,8 +267,8 @@ pub fn SessionSettingsBar() -> impl IntoView {
                     })?;
                 Some((agent_ref.host_id, agent.backend_kind))
             } else {
-                let host_id = state.selected_host_id.get()?;
-                let settings = state.host_settings_by_host.get().get(&host_id).cloned()?;
+                let host_id = state.chat_context_host_id()?;
+                let settings = state.host_settings(&host_id)?;
                 let backend_kind = state.draft_backend_override.get().or_else(|| {
                     settings
                         .default_backend
