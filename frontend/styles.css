@@ -3902,6 +3902,130 @@ kbd {
     color: var(--success);
 }
 
+.gp-discard-btn,
+.gp-unstage-btn {
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text-tertiary);
+    background: none;
+    border: none;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.gp-discard-btn:hover {
+    background: var(--surface-3);
+    color: var(--error);
+}
+
+.gp-unstage-btn:hover {
+    background: var(--surface-3);
+    color: var(--warning);
+}
+
+.gp-file-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    flex-shrink: 0;
+}
+
+.gp-section-header-row {
+    display: flex;
+    align-items: center;
+    width: 100%;
+}
+
+.gp-section-header-row .gp-section-header {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+}
+
+.gp-section-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding-right: var(--space-3);
+    flex-shrink: 0;
+}
+
+.gp-section-action {
+    min-width: 24px;
+    height: 20px;
+    padding: 0 var(--space-1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+    font-weight: 700;
+    color: var(--text-tertiary);
+    background: none;
+    border: none;
+    cursor: pointer;
+}
+
+.gp-section-action:hover {
+    background: var(--surface-3);
+    color: var(--text-primary);
+}
+
+.gp-commit-area {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+}
+
+.gp-commit-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: var(--space-2);
+    font-family: var(--font-mono);
+    font-size: 0.923rem;
+    color: var(--text-primary);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    resize: vertical;
+}
+
+.gp-commit-input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+}
+
+.gp-commit-btn {
+    align-self: flex-end;
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.846rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--surface-3);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.gp-commit-btn:hover:not(:disabled) {
+    background: var(--accent-primary);
+    color: var(--text-bright);
+    border-color: var(--accent-primary);
+}
+
+.gp-commit-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 /* ===== File Viewer ===== */
 .file-view {
     display: flex;
