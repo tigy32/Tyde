@@ -243,7 +243,7 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
         file_hunk_offsets.push(hunk_offsets);
     }
 
-    let find_state = FindState::new(searchable_lines);
+    let find_state = FindState::from_owned(searchable_lines);
     provide_context(find_state);
 
     // Compute each file's rendered-row offset (its row index in the global

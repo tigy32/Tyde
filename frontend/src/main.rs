@@ -4,6 +4,7 @@ mod bridge;
 mod components;
 mod devtools;
 mod dispatch;
+mod line_source;
 mod markdown;
 mod send;
 mod state;

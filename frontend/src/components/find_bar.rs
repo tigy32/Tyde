@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
+use crate::line_source::{FileLines, LineSource};
 use crate::state::AppState;
 
 // ── Search data ────────────────────────────────────────────────────────
@@ -33,9 +34,13 @@ pub struct FindState {
 
 impl FindState {
     /// Build a new `FindState` whose `results` memo searches over the
-    /// supplied (non-reactive) line list whenever the query or toggle
-    /// signals change.
-    pub fn new(lines: Vec<String>) -> Self {
+    /// supplied line source whenever the query or toggle signals change.
+    ///
+    /// Pass any `LineSource` flavor: `LineSource::File(FileLines)` for
+    /// the file viewer (zero per-line allocation; lines are sliced from
+    /// an `Arc<str>` of the whole file), or `LineSource::Owned` for the
+    /// diff viewer (which builds its searchable line list eagerly).
+    pub fn new(lines: LineSource) -> Self {
         let query = RwSignal::new(String::new());
         let case_sensitive = RwSignal::new(false);
         let whole_word = RwSignal::new(false);
@@ -61,6 +66,18 @@ impl FindState {
             error,
             results,
         }
+    }
+
+    /// Convenience for the file viewer: build from a whole-file string.
+    pub fn from_file(content: &str) -> (Self, FileLines) {
+        let f = FileLines::new(content);
+        (Self::new(LineSource::File(f.clone())), f)
+    }
+
+    /// Convenience for callers that already have a `Vec<String>` (e.g.
+    /// the diff viewer's flattened search index).
+    pub fn from_owned(lines: Vec<String>) -> Self {
+        Self::new(LineSource::Owned(std::sync::Arc::new(lines)))
     }
 }
 
@@ -393,7 +410,7 @@ fn scroll_to_find_line(line_index: usize) {
 }
 
 fn compute_matches(
-    lines: &[String],
+    lines: &LineSource,
     query: &str,
     case_sensitive: bool,
     whole_word: bool,
@@ -418,7 +435,9 @@ fn compute_matches(
     };
 
     let mut result = SearchResults::default();
-    for (i, line) in lines.iter().enumerate() {
+    let n = lines.len();
+    for i in 0..n {
+        let line = lines.line(i);
         let ranges = find_ranges_in_line(line, &regex);
         if !ranges.is_empty() {
             result.match_lines.push(i);

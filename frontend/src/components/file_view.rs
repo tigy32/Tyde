@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -84,10 +82,16 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                             }
                         };
 
-                        let lines: Arc<Vec<String>> =
-                            Arc::new(content.lines().map(|l| l.to_owned()).collect());
+                        // Hold the entire file content as a single
+                        // `Arc<str>` plus a per-line byte-offset table.
+                        // This is critical for huge files: the previous
+                        // `content.lines().map(|l| l.to_owned()).collect()`
+                        // allocated one `String` per line (50 000 allocs
+                        // for a 50K-line file), which takes seconds in
+                        // debug-build wasm. `FileLines::new` does two
+                        // allocations total, regardless of line count.
+                        let (find_state, lines) = FindState::from_file(&content);
                         let total = lines.len();
-                        let find_state = FindState::new((*lines).clone());
                         provide_context(find_state.clone());
 
                         // Async syntax highlighting. We don't tokenize on
@@ -156,11 +160,9 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                     }
                                     let end = (i + HIGHLIGHT_CHUNK_LINES)
                                         .min(lines_for_task.len());
-                                    let chunk_tokens: Vec<LineTokens> =
-                                        lines_for_task[i..end]
-                                            .iter()
-                                            .map(|l| hl.highlight_one(l))
-                                            .collect();
+                                    let chunk_tokens: Vec<LineTokens> = (i..end)
+                                        .map(|j| hl.highlight_one(lines_for_task.line(j)))
+                                        .collect();
                                     if gen_for_task.get_untracked() != my_gen {
                                         return;
                                     }
@@ -302,7 +304,7 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                     let:i
                                 >
                                     {
-                                        let text = lines_for_render[i].clone();
+                                        let text = lines_for_render.line(i).to_owned();
                                         let highlighted_for_row = highlighted_for_render.clone();
                                         let find = find_for_render.clone();
                                         view! {
