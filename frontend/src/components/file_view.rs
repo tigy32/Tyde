@@ -138,15 +138,18 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                             });
 
                         // Re-highlight on visible-window change so newly
-                        // scrolled-in lines pick up syntax colors. The
-                        // `:not(.hljs)` selector inside `highlight_code_blocks`
-                        // skips already-highlighted blocks, so this is
-                        // idempotent across re-runs.
+                        // scrolled-in lines pick up syntax colors. Defer one
+                        // rAF tick so `<For>` has actually committed its
+                        // newly-mounted child DOM before we walk for
+                        // `code:not(.hljs)`; otherwise the Effect runs
+                        // alongside the signal update and misses lines that
+                        // are still pending mount.
                         Effect::new(move |_| {
                             let _ = visible_window.get();
-                            if let Some(el) = pre_ref.get() {
+                            let Some(el) = pre_ref.get() else { return };
+                            leptos::prelude::request_animation_frame(move || {
                                 highlight_code_blocks(&el);
-                            }
+                            });
                         });
 
                         let find_bar_open = state.find_bar_open;
@@ -172,54 +175,64 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                 node_ref=pre_ref
                                 on:scroll=on_scroll
                             >
+                                // Spacers are siblings of `<For>`, not inside the
+                                // same reactive closure — otherwise the outer
+                                // closure rerunning would tear down and recreate
+                                // the `<For>` itself, defeating keyed DOM
+                                // preservation.
                                 {move || {
-                                    let (start, end) = visible_window.get();
-                                    let lh = line_height.get();
-                                    let top_height = start as f64 * lh;
-                                    let bottom_height =
-                                        (total.saturating_sub(end)) as f64 * lh;
-
-                                    let top_spacer = (top_height > 0.0).then(|| {
-                                        view! {
-                                            <div
-                                                class="file-view-spacer"
-                                                style=format!("height: {top_height}px;")
-                                            ></div>
-                                        }
-                                    });
-                                    let bottom_spacer = (bottom_height > 0.0).then(|| {
-                                        view! {
-                                            <div
-                                                class="file-view-spacer"
-                                                style=format!("height: {bottom_height}px;")
-                                            ></div>
-                                        }
-                                    });
-
-                                    let visible: Vec<_> = (start..end)
-                                        .map(|i| {
-                                            let text = lines_for_render[i].clone();
-                                            let lang = lang_for_render.clone();
-                                            let find = find_for_render.clone();
-                                            view! {
-                                                <div
-                                                    class=move || file_line_class(i, &find)
-                                                    attr:data-find-idx=i
-                                                >
-                                                    <span class="file-line-num">{i + 1}</span>
-                                                    <code class=lang.clone()>{text}</code>
-                                                </div>
-                                            }
-                                        })
-                                        .collect();
-
-                                    view! {
-                                        <>
-                                            {top_spacer}
-                                            {visible}
-                                            {bottom_spacer}
-                                        </>
+                                    let (start, _) = visible_window.get();
+                                    let h = start as f64 * line_height.get();
+                                    (h > 0.0).then(|| view! {
+                                        <div
+                                            class="file-view-spacer"
+                                            style=format!("height: {h}px;")
+                                        ></div>
+                                    })
+                                }}
+                                <For
+                                    each=move || {
+                                        let (s, e) = visible_window.get();
+                                        (s..e).collect::<Vec<usize>>()
                                     }
+                                    key=|i| *i
+                                    let:i
+                                >
+                                    {
+                                        // Each line's DOM is keyed by its
+                                        // permanent line index, so hljs's
+                                        // imperative DOM mutations (which detach
+                                        // the original `<code>` text node from
+                                        // Leptos's reactive ownership) can never
+                                        // be repurposed for a different source
+                                        // line. Without this, scrolling silently
+                                        // failed to update `<code>` text content
+                                        // because Leptos was writing into a
+                                        // detached text node.
+                                        let text = lines_for_render[i].clone();
+                                        let lang = lang_for_render.clone();
+                                        let find = find_for_render.clone();
+                                        view! {
+                                            <div
+                                                class=move || file_line_class(i, &find)
+                                                attr:data-find-idx=i
+                                            >
+                                                <span class="file-line-num">{i + 1}</span>
+                                                <code class=lang>{text}</code>
+                                            </div>
+                                        }
+                                    }
+                                </For>
+                                {move || {
+                                    let (_, end) = visible_window.get();
+                                    let h = total.saturating_sub(end) as f64
+                                        * line_height.get();
+                                    (h > 0.0).then(|| view! {
+                                        <div
+                                            class="file-view-spacer"
+                                            style=format!("height: {h}px;")
+                                        ></div>
+                                    })
                                 }}
                             </pre>
                         }.into_any()
