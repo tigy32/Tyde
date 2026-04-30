@@ -7,6 +7,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
 use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, DiffViewState};
+use crate::syntax_highlight::{LineTokens, color_to_css, compute_hunk_tokens, syntax_for_path};
 
 use protocol::{
     DiffContextMode, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk,
@@ -319,6 +320,9 @@ enum SbsSide {
     Right,
 }
 
+/// Per-hunk dual highlight: `(old_per_line, new_per_line)`.
+type DualHunkTokens = (Vec<Option<LineTokens>>, Vec<Option<LineTokens>>);
+
 fn render_sbs_panes(
     file: ProjectGitDiffFile,
     hunk_offsets: Vec<usize>,
@@ -330,6 +334,19 @@ fn render_sbs_panes(
 ) -> AnyView {
     let pair_ref = NodeRef::<leptos::html::Div>::new();
 
+    // Compute per-hunk dual syntax tokens **once** for the file, then share
+    // between left and right panes. Without this both panes would re-tokenize
+    // independently, doubling syntect work and amplifying first-render stall.
+    let syntax = syntax_for_path(&relative_path);
+    let hunk_tokens: Vec<DualHunkTokens> = file
+        .hunks
+        .iter()
+        .map(|hunk| match syntax {
+            Some(syn) => crate::syntax_highlight::compute_hunk_tokens_dual(hunk, syn),
+            None => (vec![None; hunk.lines.len()], vec![None; hunk.lines.len()]),
+        })
+        .collect();
+
     let file_left = file.clone();
     let file_right = file.clone();
     let offsets_left = hunk_offsets.clone();
@@ -338,6 +355,8 @@ fn render_sbs_panes(
     let root_right = root.clone();
     let path_left = relative_path.clone();
     let path_right = relative_path.clone();
+    let tokens_left = hunk_tokens.clone();
+    let tokens_right = hunk_tokens;
 
     let left_style = move || {
         let pct = (split.get() * 100.0).clamp(0.0, 100.0);
@@ -360,6 +379,7 @@ fn render_sbs_panes(
                     scope,
                     root_left,
                     path_left,
+                    tokens_left,
                 )}
             </div>
             <div
@@ -376,6 +396,7 @@ fn render_sbs_panes(
                     scope,
                     root_right,
                     path_right,
+                    tokens_right,
                 )}
             </div>
         </div>
@@ -383,6 +404,7 @@ fn render_sbs_panes(
     .into_any()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_sbs_pane_content(
     side: SbsSide,
     file: ProjectGitDiffFile,
@@ -391,6 +413,7 @@ fn render_sbs_pane_content(
     scope: ProjectDiffScope,
     root: ProjectRootPath,
     relative_path: String,
+    hunk_tokens: Vec<DualHunkTokens>,
 ) -> AnyView {
     let find = use_context::<FindState>();
     let show_stage_btn = scope == ProjectDiffScope::Unstaged && side == SbsSide::Right;
@@ -403,7 +426,8 @@ fn render_sbs_pane_content(
         let hunk_id = hunk.hunk_id.clone();
         let lines = hunk.lines.clone();
         let indices = sbs_search_indices(&lines, line_offset);
-        let rows = pair_lines_side_by_side(lines);
+        let (old_tokens, new_tokens) = hunk_tokens[hi].clone();
+        let rows = pair_lines_side_by_side_with_tokens(lines, old_tokens, new_tokens);
 
         let cell_views: Vec<AnyView> = rows
             .into_iter()
@@ -609,6 +633,10 @@ fn UnifiedHunk(
     let show_header = context_mode == DiffContextMode::Hunks;
     let show_stage = scope == ProjectDiffScope::Unstaged;
     let hunk_id = hunk.hunk_id.clone();
+    let token_lines: Vec<Option<LineTokens>> = match syntax_for_path(&relative_path) {
+        Some(syn) => compute_hunk_tokens(&hunk, syn),
+        None => vec![None; hunk.lines.len()],
+    };
     view! {
         <div class="diff-hunk">
             {show_header.then(|| {
@@ -637,7 +665,7 @@ fn UnifiedHunk(
                     </div>
                 }
             })}
-            {hunk.lines.into_iter().enumerate().map(|(i, line)| {
+            {hunk.lines.into_iter().zip(token_lines).enumerate().map(|(i, (line, tokens))| {
                 let search_idx = line_offset + i;
                 let base_class = line_class(line.kind);
                 let prefix = line_prefix(line.kind);
@@ -655,7 +683,7 @@ fn UnifiedHunk(
                         <span class="diff-gutter diff-gutter-new">{new_str}</span>
                         <span class="diff-prefix">{prefix}</span>
                         {move || {
-                            let result: AnyView = render_diff_text(&text, search_idx, &find_for_text);
+                            let result: AnyView = render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text);
                             result
                         }}
                     </div>
@@ -677,69 +705,97 @@ pub struct SideBySideCell {
     pub kind: ProjectGitDiffLineKind,
     pub line_number: Option<u32>,
     pub text: String,
+    pub tokens: Option<LineTokens>,
 }
 
-/// Pair the lines of a single hunk into side-by-side rows.
-///
-/// Algorithm: walk lines in order; collect consecutive Removed into a left-run
-/// and Added into a right-run. On a Context line (or end of hunk), flush the
-/// runs: zip their overlap into paired rows and emit the remainder as
-/// half-empty rows. Context lines become rows with the same text on both sides.
+/// Convenience wrapper used by tests; pairs lines with no syntax tokens.
 pub fn pair_lines_side_by_side(lines: Vec<ProjectGitDiffLine>) -> Vec<SideBySideRow> {
+    let n = lines.len();
+    pair_lines_side_by_side_with_tokens(lines, vec![None; n], vec![None; n])
+}
+
+/// Pair the lines of a single hunk into side-by-side rows, attaching the
+/// matching old-side / new-side syntax tokens to each cell.
+///
+/// `old_tokens[i]` and `new_tokens[i]` correspond to `lines[i]`. For Removed
+/// lines only `old_tokens[i]` should be `Some`; for Added only `new_tokens[i]`;
+/// Context lines may have both populated (with potentially different state).
+///
+/// Pairing algorithm: walk lines in order; collect consecutive Removed into a
+/// left-run and Added into a right-run. On a Context line (or end of hunk),
+/// flush the runs: zip their overlap into paired rows and emit the remainder
+/// as half-empty rows. Context lines become rows with text on both sides.
+pub fn pair_lines_side_by_side_with_tokens(
+    lines: Vec<ProjectGitDiffLine>,
+    old_tokens: Vec<Option<LineTokens>>,
+    new_tokens: Vec<Option<LineTokens>>,
+) -> Vec<SideBySideRow> {
+    debug_assert_eq!(lines.len(), old_tokens.len());
+    debug_assert_eq!(lines.len(), new_tokens.len());
+
+    type Entry = (ProjectGitDiffLine, Option<LineTokens>, Option<LineTokens>);
+
     let mut rows: Vec<SideBySideRow> = Vec::new();
-    let mut removed: Vec<ProjectGitDiffLine> = Vec::new();
-    let mut added: Vec<ProjectGitDiffLine> = Vec::new();
+    let mut removed: Vec<Entry> = Vec::new();
+    let mut added: Vec<Entry> = Vec::new();
 
-    let flush = |removed: &mut Vec<ProjectGitDiffLine>,
-                 added: &mut Vec<ProjectGitDiffLine>,
-                 rows: &mut Vec<SideBySideRow>| {
-        let pair_count = removed.len().min(added.len());
-        let rem_iter = std::mem::take(removed);
-        let add_iter = std::mem::take(added);
-        let mut rem_it = rem_iter.into_iter();
-        let mut add_it = add_iter.into_iter();
-        for _ in 0..pair_count {
-            let r = rem_it.next().expect("removed run underflow");
-            let a = add_it.next().expect("added run underflow");
-            rows.push(SideBySideRow {
-                left: Some(SideBySideCell {
-                    kind: r.kind,
-                    line_number: r.old_line_number,
-                    text: r.text,
-                }),
-                right: Some(SideBySideCell {
-                    kind: a.kind,
-                    line_number: a.new_line_number,
-                    text: a.text,
-                }),
-            });
-        }
-        for r in rem_it {
-            rows.push(SideBySideRow {
-                left: Some(SideBySideCell {
-                    kind: r.kind,
-                    line_number: r.old_line_number,
-                    text: r.text,
-                }),
-                right: None,
-            });
-        }
-        for a in add_it {
-            rows.push(SideBySideRow {
-                left: None,
-                right: Some(SideBySideCell {
-                    kind: a.kind,
-                    line_number: a.new_line_number,
-                    text: a.text,
-                }),
-            });
-        }
-    };
+    let flush =
+        |removed: &mut Vec<Entry>, added: &mut Vec<Entry>, rows: &mut Vec<SideBySideRow>| {
+            let pair_count = removed.len().min(added.len());
+            let rem_iter = std::mem::take(removed);
+            let add_iter = std::mem::take(added);
+            let mut rem_it = rem_iter.into_iter();
+            let mut add_it = add_iter.into_iter();
+            for _ in 0..pair_count {
+                let (r, r_old, _r_new) = rem_it.next().expect("removed run underflow");
+                let (a, _a_old, a_new) = add_it.next().expect("added run underflow");
+                rows.push(SideBySideRow {
+                    left: Some(SideBySideCell {
+                        kind: r.kind,
+                        line_number: r.old_line_number,
+                        text: r.text,
+                        tokens: r_old,
+                    }),
+                    right: Some(SideBySideCell {
+                        kind: a.kind,
+                        line_number: a.new_line_number,
+                        text: a.text,
+                        tokens: a_new,
+                    }),
+                });
+            }
+            for (r, r_old, _) in rem_it {
+                rows.push(SideBySideRow {
+                    left: Some(SideBySideCell {
+                        kind: r.kind,
+                        line_number: r.old_line_number,
+                        text: r.text,
+                        tokens: r_old,
+                    }),
+                    right: None,
+                });
+            }
+            for (a, _, a_new) in add_it {
+                rows.push(SideBySideRow {
+                    left: None,
+                    right: Some(SideBySideCell {
+                        kind: a.kind,
+                        line_number: a.new_line_number,
+                        text: a.text,
+                        tokens: a_new,
+                    }),
+                });
+            }
+        };
 
-    for line in lines {
+    for ((line, old_tok), new_tok) in lines
+        .into_iter()
+        .zip(old_tokens.into_iter())
+        .zip(new_tokens.into_iter())
+    {
         match line.kind {
-            ProjectGitDiffLineKind::Removed => removed.push(line),
-            ProjectGitDiffLineKind::Added => added.push(line),
+            ProjectGitDiffLineKind::Removed => removed.push((line, old_tok, new_tok)),
+            ProjectGitDiffLineKind::Added => added.push((line, old_tok, new_tok)),
             ProjectGitDiffLineKind::Context => {
                 flush(&mut removed, &mut added, &mut rows);
                 rows.push(SideBySideRow {
@@ -747,11 +803,13 @@ pub fn pair_lines_side_by_side(lines: Vec<ProjectGitDiffLine>) -> Vec<SideBySide
                         kind: ProjectGitDiffLineKind::Context,
                         line_number: line.old_line_number,
                         text: line.text.clone(),
+                        tokens: old_tok,
                     }),
                     right: Some(SideBySideCell {
                         kind: ProjectGitDiffLineKind::Context,
                         line_number: line.new_line_number,
                         text: line.text,
+                        tokens: new_tok,
                     }),
                 });
             }
@@ -832,6 +890,7 @@ fn render_cell_search(
             let prefix = line_prefix(c.kind);
             let num = c.line_number.map(|n| n.to_string()).unwrap_or_default();
             let text = c.text;
+            let tokens = c.tokens;
             let find_for_class = find.clone();
             let find_for_text = find;
             let idx_str = search_idx.map(|i| i.to_string()).unwrap_or_default();
@@ -849,10 +908,9 @@ fn render_cell_search(
                     <span class="diff-gutter">{num}</span>
                     <span class="diff-prefix">{prefix}</span>
                     {move || {
-                        let result: AnyView = if let Some(idx) = search_idx {
-                            render_diff_text(&text, idx, &find_for_text)
-                        } else {
-                            view! { <span class="diff-text">{text.clone()}</span> }.into_any()
+                        let result: AnyView = match search_idx {
+                            Some(idx) => render_diff_text(&text, tokens.as_ref(), idx, &find_for_text),
+                            None => render_diff_text_plain(&text, tokens.as_ref()),
                         };
                         result
                     }}
@@ -882,14 +940,110 @@ fn diff_line_class(base: &'static str, search_idx: usize, find: &Option<FindStat
     }
 }
 
-fn render_diff_text(text: &str, search_idx: usize, find: &Option<FindState>) -> AnyView {
-    if let Some(find) = find {
-        let results = find.results.get();
-        if let Some(ranges) = results.ranges_by_line.get(&search_idx) {
-            return render_text_with_highlights(text, ranges).into_any();
-        }
+fn render_diff_text(
+    text: &str,
+    tokens: Option<&LineTokens>,
+    search_idx: usize,
+    find: &Option<FindState>,
+) -> AnyView {
+    let find_ranges: Option<Vec<(usize, usize)>> = find.as_ref().and_then(|f| {
+        let results = f.results.get();
+        results.ranges_by_line.get(&search_idx).cloned()
+    });
+    match (tokens, find_ranges) {
+        (None, None) => view! { <span class="diff-text">{text.to_owned()}</span> }.into_any(),
+        (None, Some(ranges)) => render_text_with_highlights(text, &ranges).into_any(),
+        (Some(toks), None) => render_tokens(toks).into_any(),
+        (Some(toks), Some(ranges)) => render_tokens_with_find(text, toks, &ranges).into_any(),
     }
-    view! { <span class="diff-text">{text.to_owned()}</span> }.into_any()
+}
+
+fn render_diff_text_plain(text: &str, tokens: Option<&LineTokens>) -> AnyView {
+    match tokens {
+        Some(toks) => render_tokens(toks).into_any(),
+        None => view! { <span class="diff-text">{text.to_owned()}</span> }.into_any(),
+    }
+}
+
+/// Render syntax tokens as colored `<span>` children inside a `.diff-text`
+/// wrapper. Uses inline `style="color:#…"` so we don't have to ship a syntect
+/// theme stylesheet — we keep one bundled theme in `syntax_highlight::THEME`.
+fn render_tokens(tokens: &LineTokens) -> impl IntoView + use<> {
+    let spans: Vec<AnyView> = tokens
+        .iter()
+        .map(|t| {
+            let style = format!("color:{}", color_to_css(t.fg));
+            let txt = t.text.clone();
+            view! { <span style=style>{txt}</span> }.into_any()
+        })
+        .collect();
+    view! { <span class="diff-text">{spans}</span> }
+}
+
+/// Render syntax tokens AND inline find-bar match highlighting on the same
+/// line. Walks tokens by byte offset; for each token, splits any overlapping
+/// find ranges into nested `<span class="find-inline-match">` siblings while
+/// keeping the token's color. Find ranges are pre-clipped to the line in
+/// `find_bar`; byte offsets correspond to the concatenated text of all
+/// `tokens[i].text` (which equals `text`).
+///
+/// Safety/robustness:
+/// - Each slice index is snapped to the nearest UTF-8 char boundary at-or-before,
+///   guarding against `find_bar` ranges that may currently come from JS UTF-16
+///   `lastIndex` offsets (TODO upstream: convert JS offsets to Rust byte
+///   offsets at source).
+/// - Overlapping find ranges are tolerated: the running cursor `p` keeps each
+///   byte appearing at most once.
+fn render_tokens_with_find(
+    text: &str,
+    tokens: &LineTokens,
+    find_ranges: &[(usize, usize)],
+) -> impl IntoView + use<> {
+    let mut fragments: Vec<AnyView> = Vec::new();
+    let mut byte_pos: usize = 0;
+    for tok in tokens {
+        let tok_start = byte_pos;
+        let tok_end = byte_pos + tok.text.len();
+        let style = format!("color:{}", color_to_css(tok.fg));
+
+        let mut sub: Vec<AnyView> = Vec::new();
+        let mut p = tok_start;
+        for &(rs, re) in find_ranges {
+            // Clamp to current cursor (`p`) so overlapping ranges don't
+            // duplicate bytes, and to the token bounds.
+            let s = snap_char_boundary(text, rs.max(p).max(tok_start));
+            let e = snap_char_boundary(text, re.min(tok_end));
+            if s >= e {
+                continue;
+            }
+            if s > p {
+                let slice = text[p..s].to_owned();
+                sub.push(view! { <>{slice}</> }.into_any());
+            }
+            let slice = text[s..e].to_owned();
+            sub.push(view! { <span class="find-inline-match">{slice}</span> }.into_any());
+            p = e;
+        }
+        if p < tok_end {
+            let slice = text[p..tok_end].to_owned();
+            sub.push(view! { <>{slice}</> }.into_any());
+        }
+        fragments.push(view! { <span style=style>{sub}</span> }.into_any());
+        byte_pos = tok_end;
+    }
+    view! { <span class="diff-text">{fragments}</span> }
+}
+
+/// Round `idx` down to the nearest valid UTF-8 char boundary in `text`.
+/// Idempotent on already-aligned indices and on `text.len()`.
+fn snap_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 #[cfg(test)]
@@ -1004,5 +1158,209 @@ mod tests {
         assert_eq!(rows[3].right.as_ref().unwrap().text, "z");
         // c3
         assert_eq!(rows[4].right.as_ref().unwrap().text, "c3");
+    }
+
+    #[test]
+    fn compute_hunk_tokens_returns_some_for_known_language() {
+        use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
+        use protocol::ProjectGitDiffHunk;
+
+        let syntax = syntax_for_path("hello.rs").expect("rust syntax bundled");
+        let hunk = ProjectGitDiffHunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 2,
+            hunk_id: "h1".to_owned(),
+            lines: vec![
+                line(ProjectGitDiffLineKind::Added, None, Some(1), "fn main() {}"),
+                line(
+                    ProjectGitDiffLineKind::Added,
+                    None,
+                    Some(2),
+                    "let x: u32 = 1;",
+                ),
+            ],
+        };
+        let tokens = compute_hunk_tokens(&hunk, syntax);
+        assert_eq!(tokens.len(), 2);
+        let first = tokens[0].as_ref().expect("rust line should highlight");
+        // syntect emits at least one token per source line
+        assert!(!first.is_empty());
+        // tokens reconstruct the original line
+        let joined: String = first.iter().map(|t| t.text.clone()).collect();
+        assert_eq!(joined, "fn main() {}");
+        // at least one token has a non-default color (i.e. we're actually
+        // colorizing, not falling back to plain text)
+        let any_colored = tokens
+            .iter()
+            .flatten()
+            .flat_map(|line_toks| line_toks.iter())
+            .any(|t| t.fg.r != 0 || t.fg.g != 0 || t.fg.b != 0);
+        assert!(any_colored, "expected at least one colored token");
+    }
+
+    #[test]
+    fn syntax_for_path_returns_none_for_unknown() {
+        use crate::syntax_highlight::syntax_for_path;
+        // Unknown extensions must fall back to plain text (None) rather than
+        // panic or default to some random syntax.
+        assert!(syntax_for_path("project/file.thisextdoesnotexist").is_none());
+    }
+
+    #[test]
+    fn snap_char_boundary_handles_multibyte() {
+        // "é" is 2 bytes in UTF-8 (0xC3 0xA9). An offset of 1 is mid-codepoint.
+        let s = "éx";
+        assert_eq!(snap_char_boundary(s, 0), 0);
+        assert_eq!(snap_char_boundary(s, 1), 0); // snap back to char start
+        assert_eq!(snap_char_boundary(s, 2), 2);
+        assert_eq!(snap_char_boundary(s, 3), 3);
+        assert_eq!(snap_char_boundary(s, 99), s.len()); // past end → end
+    }
+
+    #[test]
+    fn compute_hunk_tokens_dual_pure_added() {
+        // All-added hunk: every old-side entry is None, every new-side entry
+        // is Some.
+        use crate::syntax_highlight::{compute_hunk_tokens_dual, syntax_for_path};
+        use protocol::ProjectGitDiffHunk;
+
+        let syntax = syntax_for_path("foo.rs").unwrap();
+        let hunk = ProjectGitDiffHunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 2,
+            hunk_id: "h".into(),
+            lines: vec![
+                line(ProjectGitDiffLineKind::Added, None, Some(1), "fn main() {}"),
+                line(ProjectGitDiffLineKind::Added, None, Some(2), "let x = 1;"),
+            ],
+        };
+        let (old, new) = compute_hunk_tokens_dual(&hunk, syntax);
+        assert_eq!(old.len(), 2);
+        assert_eq!(new.len(), 2);
+        assert!(old.iter().all(|o| o.is_none()));
+        assert!(new.iter().all(|n| n.is_some()));
+    }
+
+    #[test]
+    fn compute_hunk_tokens_dual_pure_removed() {
+        use crate::syntax_highlight::{compute_hunk_tokens_dual, syntax_for_path};
+        use protocol::ProjectGitDiffHunk;
+
+        let syntax = syntax_for_path("foo.rs").unwrap();
+        let hunk = ProjectGitDiffHunk {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 0,
+            hunk_id: "h".into(),
+            lines: vec![
+                line(
+                    ProjectGitDiffLineKind::Removed,
+                    Some(1),
+                    None,
+                    "fn old() {}",
+                ),
+                line(ProjectGitDiffLineKind::Removed, Some(2), None, "let y = 2;"),
+            ],
+        };
+        let (old, new) = compute_hunk_tokens_dual(&hunk, syntax);
+        assert!(old.iter().all(|o| o.is_some()));
+        assert!(new.iter().all(|n| n.is_none()));
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
+    use leptos::mount::mount_to;
+    use protocol::ProjectGitDiffHunk;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 800px; height: 600px;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// A line of Rust source rendered by the diff view's per-line render path
+    /// must produce DOM children with inline `style="color:#…"` so users
+    /// actually see syntax colors. Asserting at the rendered-output level
+    /// (rather than on internal class names) keeps the test resilient to
+    /// future refactors of `render_tokens`.
+    #[wasm_bindgen_test]
+    async fn rust_line_renders_colored_spans() {
+        let syntax = syntax_for_path("foo.rs").expect("rust syntax bundled");
+        let hunk = ProjectGitDiffHunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            hunk_id: "h1".to_owned(),
+            lines: vec![ProjectGitDiffLine {
+                kind: ProjectGitDiffLineKind::Added,
+                text: "fn main() {}".to_owned(),
+                old_line_number: None,
+                new_line_number: Some(1),
+            }],
+        };
+        let tokens = compute_hunk_tokens(&hunk, syntax);
+        let toks = tokens[0].clone().expect("rust line tokenizes");
+
+        let container = make_container();
+        let container_for_mount = container.clone();
+        let _handle = mount_to(container_for_mount, move || render_tokens(&toks));
+        next_tick().await;
+
+        let nodes = container.query_selector_all("span[style]").unwrap();
+        assert!(
+            nodes.length() > 0,
+            "expected at least one styled span in rendered output"
+        );
+        let mut found_color = false;
+        for i in 0..nodes.length() {
+            if let Some(node) = nodes.item(i) {
+                let el: web_sys::Element = node.dyn_into().unwrap();
+                let style = el.get_attribute("style").unwrap_or_default();
+                if style.contains("color:") {
+                    found_color = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_color,
+            "expected at least one span to have a color: in its style attribute"
+        );
+
+        // Concatenated text content of the rendered output must match the
+        // original line — rendering must not corrupt or duplicate source.
+        let rendered_text = container.text_content().unwrap_or_default();
+        assert_eq!(rendered_text, "fn main() {}");
     }
 }

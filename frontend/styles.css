@@ -2764,9 +2764,9 @@ kbd {
     background: var(--surface-base);
 }
 
-/* Reset inline-code styling inside code blocks so hljs tokens show through. */
-.chat-card-body pre code,
-.chat-card-body pre code.hljs {
+/* Reset inline-code styling inside code blocks; syntect emits inline styles
+   on each token, but we still want a consistent base font/line-height. */
+.chat-card-body pre code {
     font-family: var(--font-mono);
     font-size: 0.923rem;
     line-height: 1.5;
@@ -4523,8 +4523,7 @@ kbd {
     flex-shrink: 0;
 }
 
-.file-line code,
-.file-line code.hljs {
+.file-line code {
     flex: 1;
     min-width: 0;
     padding: 0 0 0 var(--space-2);

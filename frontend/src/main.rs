@@ -4,10 +4,10 @@ mod bridge;
 mod components;
 mod devtools;
 mod dispatch;
-mod highlight;
 mod markdown;
 mod send;
 mod state;
+mod syntax_highlight;
 mod term_bridge;
 
 use leptos::prelude::*;

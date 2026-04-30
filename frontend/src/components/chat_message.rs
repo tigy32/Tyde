@@ -2,7 +2,6 @@ use leptos::prelude::*;
 use protocol::MessageSender;
 
 use crate::components::tool_card::ToolCardView;
-use crate::highlight::highlight_code_blocks;
 use crate::markdown::render_markdown;
 use crate::state::ChatRowHandle;
 
@@ -120,12 +119,6 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
     };
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
-    Effect::new(move |_| {
-        let _ = content_html.get();
-        if let Some(el) = body_ref.get() {
-            highlight_code_blocks(&el);
-        }
-    });
 
     let entry_for_reasoning = entry.clone();
     let entry_for_images = entry.clone();

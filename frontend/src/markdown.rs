@@ -1,12 +1,15 @@
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
+use crate::syntax_highlight::{highlight_to_html, syntax_for_lang_token};
+
 /// Render agent/assistant markdown to HTML.
 ///
 /// - GFM extensions: tables, strikethrough, task lists, footnotes.
 /// - Raw HTML in the source is downgraded to escaped text to prevent XSS.
 /// - Fenced code blocks are wrapped in `.md-code-block` with a language label
-///   and a copy button; the inner `<code>` gets `class="language-XXX"` so
-///   highlight.js can pick it up.
+///   and a copy button; the inner `<code>` body is pre-tokenized by syntect
+///   into colored `<span>`s emitted directly into the HTML, so no client-side
+///   DOM mutation is needed.
 pub fn render_markdown(input: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -48,17 +51,23 @@ pub fn render_markdown(input: &str) -> String {
 
 fn build_code_block(lang: &str, code: &str) -> String {
     let code_trimmed = code.strip_suffix('\n').unwrap_or(code);
-    let lang_label = if lang.is_empty() {
+    // Fenced info strings can carry trailing modifiers (e.g. ```rust ignore`,
+    // ```rust no_run`), so the actual language is just the first whitespace-
+    // separated token. pulldown-cmark's own HTML renderer splits the same way.
+    let lang_token = lang.split_whitespace().next().unwrap_or("");
+    let lang_label = if lang_token.is_empty() {
         "text".to_owned()
     } else {
-        escape_html(lang)
+        escape_html(lang_token)
     };
-    let lang_class = if lang.is_empty() {
-        String::new()
-    } else {
-        format!(" class=\"language-{}\"", escape_attr(lang))
+    // Pre-render the code body. If syntect knows the language, emit colored
+    // spans directly; otherwise just escape the plain text. Either way the
+    // produced HTML is safe to inline — `escape_html` runs over every chunk
+    // we don't control.
+    let code_html = match syntax_for_lang_token(lang_token) {
+        Some(syn) => highlight_to_html(code_trimmed, syn),
+        None => escape_html(code_trimmed),
     };
-    let code_escaped = escape_html(code_trimmed);
 
     format!(
         "<div class=\"md-code-block\">\
@@ -66,7 +75,7 @@ fn build_code_block(lang: &str, code: &str) -> String {
          <span class=\"md-code-lang\">{lang_label}</span>\
          <button class=\"md-copy-code\" onclick=\"(() => {{ const c = this.closest('.md-code-block').querySelector('code'); navigator.clipboard.writeText(c.textContent).then(() => {{ this.textContent='\u{2713}'; setTimeout(() => this.textContent='Copy', 1200); }}); }})()\">Copy</button>\
          </div>\
-         <pre><code{lang_class}>{code_escaped}</code></pre>\
+         <pre><code class=\"md-code\">{code_html}</code></pre>\
          </div>"
     )
 }
@@ -86,6 +95,40 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-fn escape_attr(s: &str) -> String {
-    escape_html(s)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fenced_info_string_with_modifier_still_highlights_as_rust() {
+        // ```rust ignore``` — pulldown-cmark passes the whole "rust ignore"
+        // string. We must split on whitespace and take the first token,
+        // otherwise common docs/test fences fall back to plain text.
+        let html = render_markdown("```rust ignore\nfn main() {}\n```\n");
+        assert!(
+            html.contains("<span style=\"color:"),
+            "expected syntect-emitted span; got: {html}"
+        );
+        // The visible language label should be just "rust", not "rust ignore".
+        assert!(
+            html.contains(">rust</span>"),
+            "expected language label to be just 'rust'; got: {html}"
+        );
+    }
+
+    #[test]
+    fn unknown_language_falls_back_to_escaped_text() {
+        let html = render_markdown("```nosuchlang\n<x> & y\n```\n");
+        // No styled spans emitted.
+        assert!(!html.contains("color:#"), "did not expect colored spans");
+        // HTML special chars escaped inside the code body.
+        assert!(html.contains("&lt;x&gt; &amp; y"));
+    }
+
+    #[test]
+    fn no_language_renders_as_plain_text() {
+        let html = render_markdown("```\nplain code\n```\n");
+        assert!(!html.contains("color:#"));
+        assert!(html.contains("plain code"));
+    }
 }

@@ -1,7 +1,6 @@
 use leptos::prelude::*;
 
 use crate::components::tool_card::ToolCardView;
-use crate::highlight::highlight_code_blocks;
 use crate::markdown::render_markdown;
 use crate::state::StreamingState;
 
@@ -14,15 +13,6 @@ pub fn ChatStreamingView(streaming: StreamingState) -> impl IntoView {
     let model = streaming.model;
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
-    {
-        let text = text.clone();
-        Effect::new(move |_| {
-            let _ = text.get(); // re-run when streaming text updates
-            if let Some(el) = body_ref.get() {
-                highlight_code_blocks(&el);
-            }
-        });
-    }
 
     view! {
         <div class="chat-card chat-card-assistant chat-card-streaming">

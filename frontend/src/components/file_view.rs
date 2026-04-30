@@ -4,8 +4,8 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::components::find_bar::{FindBar, FindState};
-use crate::highlight::highlight_code_blocks;
 use crate::state::{AppState, TabContent};
+use crate::syntax_highlight::{LineTokens, color_to_css, highlight_text, syntax_for_path};
 
 use protocol::ProjectPath;
 
@@ -53,12 +53,26 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                 match file_info() {
                     Some(f) => {
                         let path_display = format!("{}/{}", f.path.root.0, f.path.relative_path);
-                        let lang_class = lang_class_from_path(&f.path.relative_path);
                         let content = if f.is_binary {
                             "(binary file)".to_owned()
                         } else {
                             f.contents.unwrap_or_else(|| "(file not found)".to_owned())
                         };
+
+                        // Highlight the whole file once with persistent
+                        // syntect state so multi-line constructs (block
+                        // comments, raw strings) color correctly across the
+                        // virtualized window. Falls back to None for unknown
+                        // languages or files over the line cap; rendering
+                        // then degrades to plain text per line.
+                        let highlighted: Arc<Vec<Option<LineTokens>>> = Arc::new(
+                            match syntax_for_path(&f.path.relative_path) {
+                                Some(syn) => highlight_text(&content, syn)
+                                    .map(|v| v.into_iter().map(Some).collect())
+                                    .unwrap_or_default(),
+                                None => Vec::new(),
+                            },
+                        );
                         let on_close = move |_| {
                             let state = expect_context::<AppState>();
                             let tab_id = state.center_zone.with_untracked(|cz| {
@@ -137,25 +151,10 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                 (start_f as usize, end_f as usize)
                             });
 
-                        // Re-highlight on visible-window change so newly
-                        // scrolled-in lines pick up syntax colors. Defer one
-                        // rAF tick so `<For>` has actually committed its
-                        // newly-mounted child DOM before we walk for
-                        // `code:not(.hljs)`; otherwise the Effect runs
-                        // alongside the signal update and misses lines that
-                        // are still pending mount.
-                        Effect::new(move |_| {
-                            let _ = visible_window.get();
-                            let Some(el) = pre_ref.get() else { return };
-                            leptos::prelude::request_animation_frame(move || {
-                                highlight_code_blocks(&el);
-                            });
-                        });
-
                         let find_bar_open = state.find_bar_open;
 
                         let lines_for_render = lines.clone();
-                        let lang_for_render = lang_class.clone();
+                        let highlighted_for_render = highlighted.clone();
                         let find_for_render = find_state.clone();
 
                         view! {
@@ -199,18 +198,10 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                     let:i
                                 >
                                     {
-                                        // Each line's DOM is keyed by its
-                                        // permanent line index, so hljs's
-                                        // imperative DOM mutations (which detach
-                                        // the original `<code>` text node from
-                                        // Leptos's reactive ownership) can never
-                                        // be repurposed for a different source
-                                        // line. Without this, scrolling silently
-                                        // failed to update `<code>` text content
-                                        // because Leptos was writing into a
-                                        // detached text node.
                                         let text = lines_for_render[i].clone();
-                                        let lang = lang_for_render.clone();
+                                        let tokens = highlighted_for_render
+                                            .get(i)
+                                            .and_then(|t| t.clone());
                                         let find = find_for_render.clone();
                                         view! {
                                             <div
@@ -218,7 +209,7 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                                 attr:data-find-idx=i
                                             >
                                                 <span class="file-line-num">{i + 1}</span>
-                                                <code class=lang>{text}</code>
+                                                {render_file_line_content(text, tokens)}
                                             </div>
                                         }
                                     }
@@ -259,57 +250,23 @@ fn file_line_class(line_idx: usize, find: &FindState) -> &'static str {
     }
 }
 
-fn lang_class_from_path(path: &str) -> String {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    let lang = match ext {
-        "rs" => "rust",
-        "js" | "mjs" | "cjs" => "javascript",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "tsx",
-        "jsx" => "javascript",
-        "py" => "python",
-        "rb" => "ruby",
-        "go" => "go",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
-        "cs" => "csharp",
-        "swift" => "swift",
-        "kt" | "kts" => "kotlin",
-        "sh" | "bash" | "zsh" => "bash",
-        "json" => "json",
-        "yaml" | "yml" => "yaml",
-        "toml" => "toml",
-        "xml" => "xml",
-        "html" | "htm" => "html",
-        "css" => "css",
-        "scss" => "scss",
-        "sql" => "sql",
-        "md" | "markdown" => "markdown",
-        "dockerfile" => "dockerfile",
-        "makefile" => "makefile",
-        "r" => "r",
-        "lua" => "lua",
-        "zig" => "zig",
-        "ex" | "exs" => "elixir",
-        "erl" => "erlang",
-        "hs" => "haskell",
-        "ml" | "mli" => "ocaml",
-        "php" => "php",
-        "pl" | "pm" => "perl",
-        "dart" => "dart",
-        "scala" => "scala",
-        "clj" | "cljs" => "clojure",
-        "vim" => "vim",
-        "tf" => "hcl",
-        "proto" => "protobuf",
-        "graphql" | "gql" => "graphql",
-        _ => "",
-    };
-    if lang.is_empty() {
-        String::new()
-    } else {
-        format!("language-{lang}")
+/// Render a file line's text inside the row. Emits a `<code>` element so
+/// monospace/whitespace styling stays scoped, with either pre-tokenized
+/// colored spans or a single plain-text node when no tokens are available
+/// (unknown language, or file over the highlight cap).
+fn render_file_line_content(text: String, tokens: Option<LineTokens>) -> AnyView {
+    match tokens {
+        Some(toks) if !toks.is_empty() => {
+            let spans: Vec<AnyView> = toks
+                .into_iter()
+                .map(|t| {
+                    let style = format!("color:{}", color_to_css(t.fg));
+                    view! { <span style=style>{t.text}</span> }.into_any()
+                })
+                .collect();
+            view! { <code class="file-line-code">{spans}</code> }.into_any()
+        }
+        _ => view! { <code class="file-line-code">{text}</code> }.into_any(),
     }
 }
 
@@ -339,40 +296,13 @@ mod wasm_tests {
     /// assertions reflect real styling.
     const PROD_STYLES: &str = include_str!("../../styles.css");
 
-    /// Vendor hljs theme — once `highlight_code_blocks` runs in production,
-    /// every line's `<code>` gets the `.hljs` class and this stylesheet
-    /// kicks in. Loading it in tests means our geometry assertions reflect
-    /// the same cascade users see, not a hljs-free subset of it.
-    const HLJS_THEME: &str = include_str!("../../vendor/hljs-theme.css");
-
     fn ensure_styles_loaded() {
         let document = web_sys::window().unwrap().document().unwrap();
-        if document.get_element_by_id("test-prod-styles").is_none() {
-            let style = document.create_element("style").unwrap();
-            style.set_id("test-prod-styles");
-            style.set_text_content(Some(HLJS_THEME));
-            document.head().unwrap().append_child(&style).unwrap();
+        if document.get_element_by_id("test-prod-styles-app").is_none() {
             let style = document.create_element("style").unwrap();
             style.set_id("test-prod-styles-app");
             style.set_text_content(Some(PROD_STYLES));
             document.head().unwrap().append_child(&style).unwrap();
-        }
-    }
-
-    /// Apply the `.hljs` class to every rendered line `<code>`, matching
-    /// what `hljs.highlightElement` does in production. The vendor JS isn't
-    /// loaded in tests, so without this the `pre code.hljs` cascade is
-    /// invisible to assertions.
-    fn apply_hljs_class(container: &HtmlElement) {
-        let nodes = container.query_selector_all(".file-line code").unwrap();
-        for i in 0..nodes.length() {
-            if let Some(node) = nodes.item(i)
-                && let Ok(el) = node.dyn_into::<Element>()
-            {
-                let existing = el.get_attribute("class").unwrap_or_default();
-                el.set_attribute("class", &format!("{existing} hljs"))
-                    .unwrap();
-            }
         }
     }
 
@@ -523,39 +453,72 @@ mod wasm_tests {
                 "row {i} rendered text does not match source line exactly"
             );
         }
+    }
 
-        // Repeat the geometry assertion *after* simulating hljs running.
-        // In production, `highlight_code_blocks` adds the `.hljs` class to
-        // every line's `<code>`, which activates the vendor theme rule
-        // `pre code.hljs { display: block; padding: 1em }`. Without our
-        // `.file-line code.hljs` override, every line grows by ~32px of
-        // vertical padding — rows AND gaps both scale, so the gap/height
-        // ratio stays ~1, but the absolute row height balloons. That's
-        // what the user sees as "double-spaced," so we must guard the
-        // absolute height too, not just the ratio.
-        let baseline_row_height = row_height;
-        apply_hljs_class(&container);
+    #[wasm_bindgen_test]
+    async fn syntax_highlighted_line_renders_styled_spans() {
+        // FileView with a Rust file should produce per-token styled spans,
+        // sourced from syntect rather than runtime DOM mutation. Asserts on
+        // visible rendering: at least one inline `style="color:..."` exists,
+        // and the line's text content reconstructs the source exactly.
+        ensure_styles_loaded();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let content = "fn main() {}";
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <FileView path=mount_path.clone() /> }
+        });
         next_tick().await;
 
-        let rows = line_rows(&container);
-        let row0 = rows[0].get_bounding_client_rect();
-        let row1 = rows[1].get_bounding_client_rect();
-        let hljs_row_height = row0.height();
-        let hljs_gap = row1.top() - row0.top();
-        let hljs_ratio = hljs_gap / hljs_row_height;
+        let nodes = container
+            .query_selector_all(".file-line code span[style]")
+            .unwrap();
         assert!(
-            (0.95..=1.10).contains(&hljs_ratio),
-            "lines are not single-spaced after hljs class applied: \
-             gap={hljs_gap:.2}px, row_height={hljs_row_height:.2}px, \
-             ratio={hljs_ratio:.2}"
+            nodes.length() > 0,
+            "expected at least one styled span in the rendered file line"
         );
-        let height_ratio = hljs_row_height / baseline_row_height;
-        assert!(
-            (0.9..=1.2).contains(&height_ratio),
-            "row height grew after hljs class applied: baseline={baseline_row_height:.2}px, \
-             with-hljs={hljs_row_height:.2}px, ratio={height_ratio:.2} — \
-             likely a `pre code.hljs` cascade leaking through"
-        );
+        let mut found_color = false;
+        for i in 0..nodes.length() {
+            if let Some(n) = nodes.item(i) {
+                let el: Element = n.dyn_into().unwrap();
+                if el
+                    .get_attribute("style")
+                    .unwrap_or_default()
+                    .contains("color:")
+                {
+                    found_color = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_color, "no span had a `color:` style");
+
+        let code_text = container
+            .query_selector(".file-line code")
+            .unwrap()
+            .expect("file-line code element present")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(code_text, content);
     }
 
     #[wasm_bindgen_test]
