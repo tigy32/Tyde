@@ -4150,6 +4150,13 @@ kbd {
     flex: 1;
     overflow-y: auto;
     padding: 0;
+    /* Disable macOS rubber-band/elastic overscroll on this container.
+       Without this, over-scrolling past the top makes the sticky
+       `.diff-file-header` bounce down with the content — visually the
+       header drifts away from its pinned position which looks broken
+       on Mac. `none` removes the bounce on this scroll container only;
+       elastic scroll on the rest of the app is unaffected. */
+    overscroll-behavior-y: none;
 }
 
 .diff-file {
