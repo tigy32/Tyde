@@ -3,17 +3,17 @@ mod fixture;
 use fixture::Fixture;
 use protocol::types::AgentClosedPayload;
 use protocol::{
-    AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
-    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, ListSessionsPayload,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectId, ProjectNotifyPayload, ProjectRenamePayload, SessionListPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath,
+    AgentControlStatus, AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    BackendKind, ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
+    ListSessionsPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload,
+    SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tyde_dev_driver::agent_control::SpawnRequest;
+use tyde_dev_driver::agent_control::{AgentControlHandle, SpawnRequest};
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
@@ -254,19 +254,44 @@ async fn expect_project_notify(
         .expect("failed to parse ProjectNotifyPayload")
 }
 
-fn assert_completed_agent_result(
-    result: &tyde_dev_driver::agent_control::AgentResult,
+fn assert_awaited_agent_idle(result: &tyde_dev_driver::agent_control::AwaitAgentStatus) {
+    assert_eq!(result.status, AgentControlStatus::Idle);
+}
+
+async fn assert_read_agent_contains(
+    control: &AgentControlHandle,
+    agent_id: &str,
+    after_seq: Option<u64>,
     expected_text: &str,
-) {
-    assert_eq!(result.status, "idle");
+) -> Option<u64> {
+    let read = control
+        .read_agent(protocol::AgentId(agent_id.to_string()), after_seq, None)
+        .await
+        .expect("agent control read should succeed");
     assert!(
-        result
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains(expected_text)),
-        "expected completed result message to contain '{expected_text}', got {:?}",
-        result.message
+        read.events
+            .iter()
+            .any(|event| chat_event_contains(event, expected_text)),
+        "expected read output to contain '{expected_text}', got {:?}",
+        read.events
     );
+    read.next_after_seq
+}
+
+fn chat_event_contains(event: &Envelope, expected_text: &str) -> bool {
+    if event.kind != FrameKind::ChatEvent {
+        return false;
+    }
+    let chat_event: ChatEvent = event
+        .parse_payload()
+        .expect("agent read ChatEvent should parse");
+    match chat_event {
+        ChatEvent::StreamEnd(data) => data.message.content.contains(expected_text),
+        ChatEvent::OperationCancelled(data) => data.message.contains(expected_text),
+        ChatEvent::MessageAdded(message) => message.content.contains(expected_text),
+        ChatEvent::StreamDelta(delta) => delta.text.contains(expected_text),
+        _ => false,
+    }
 }
 
 const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
@@ -706,21 +731,20 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
         )
         .await
         .expect("agent control await should succeed");
-    assert!(awaited.still_running.is_empty());
+    assert!(awaited.still_thinking.is_empty());
     assert_eq!(awaited.ready.len(), 1);
-    assert_completed_agent_result(
-        &awaited.ready[0],
+    assert_awaited_agent_idle(&awaited.ready[0]);
+    let cursor = assert_read_agent_contains(
+        &control,
+        &spawned.agent_id,
+        None,
         "mock backend response to: agent control hello",
-    );
+    )
+    .await;
 
     let listed_after_wait = control.list_agents().await;
     assert_eq!(listed_after_wait.len(), 1);
-    assert_eq!(listed_after_wait[0].status, "idle");
-    assert!(
-        listed_after_wait[0].last_message.as_deref().is_some_and(
-            |message| message.contains("mock backend response to: agent control hello")
-        )
-    );
+    assert_eq!(listed_after_wait[0].status, AgentControlStatus::Idle);
 
     control
         .send_message(
@@ -737,28 +761,20 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
         )
         .await
         .expect("agent control follow-up await should succeed");
-    assert!(awaited_follow_up.still_running.is_empty());
+    assert!(awaited_follow_up.still_thinking.is_empty());
     assert_eq!(awaited_follow_up.ready.len(), 1);
-    assert_completed_agent_result(
-        &awaited_follow_up.ready[0],
+    assert_awaited_agent_idle(&awaited_follow_up.ready[0]);
+    assert_read_agent_contains(
+        &control,
+        &spawned.agent_id,
+        cursor,
         "mock backend response to: agent control follow up",
-    );
+    )
+    .await;
 
     let listed_after_follow_up = control.list_agents().await;
     assert_eq!(listed_after_follow_up.len(), 1);
-    assert_eq!(listed_after_follow_up[0].status, "idle");
-    assert!(
-        listed_after_follow_up[0]
-            .last_message
-            .as_deref()
-            .is_some_and(
-                |message| message.contains("mock backend response to: agent control follow up")
-            )
-    );
-    assert!(
-        listed_after_follow_up[0].summary.is_some(),
-        "agent control list should surface a summary once a turn completes"
-    );
+    assert_eq!(listed_after_follow_up[0].status, AgentControlStatus::Idle);
 }
 
 #[tokio::test]

@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 
 use client::ClientConfig;
 use protocol::{
-    AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
-    FrameKind, HostSettings, HostSettingsPayload, NewAgentPayload, ProjectId, SendMessagePayload,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath,
+    AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
+    BackendKind, ChatEvent, Envelope, FrameKind, HostSettings, HostSettingsPayload,
+    NewAgentPayload, ProjectId, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -20,6 +21,8 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_READ_LIMIT: usize = 100;
+const MAX_READ_LIMIT: usize = 1_000;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_QUIET_PERIOD: Duration = Duration::from_millis(50);
 const WALL_TIMEOUT_MULTIPLIER: u64 = 10;
@@ -44,9 +47,9 @@ struct AgentState {
     turn_completed: bool,
     /// Set when a fatal AgentError arrives.
     terminated: bool,
-    last_message: Option<String>,
     last_error: Option<String>,
     activity_counter: u64,
+    event_log: Vec<Envelope>,
 }
 
 impl AgentState {
@@ -56,14 +59,14 @@ impl AgentState {
         !self.terminated && (self.is_thinking || !self.turn_completed)
     }
 
-    /// Derived status string for MCP API responses.
-    fn status_label(&self) -> &'static str {
-        if self.terminated {
-            "terminated"
-        } else if self.is_thinking {
-            "thinking"
+    /// Derived status for MCP API responses.
+    fn status(&self) -> AgentControlStatus {
+        if self.terminated && self.last_error.is_some() {
+            AgentControlStatus::Failed
+        } else if self.is_active() {
+            AgentControlStatus::Thinking
         } else {
-            "idle"
+            AgentControlStatus::Idle
         }
     }
 }
@@ -286,11 +289,52 @@ impl AgentControlHandle {
         agents
     }
 
+    pub async fn read_agent(
+        &self,
+        agent_id: AgentId,
+        after_seq: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<ReadAgentResult, String> {
+        let limit = limit
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_READ_LIMIT);
+        if limit == 0 {
+            return Err("limit must be greater than zero".to_string());
+        }
+        if limit > MAX_READ_LIMIT {
+            return Err(format!("limit must be <= {MAX_READ_LIMIT}"));
+        }
+
+        let snapshot = self.snapshot();
+        let agent = snapshot
+            .agents
+            .get(&agent_id)
+            .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
+        let events = agent
+            .event_log
+            .iter()
+            .filter(|event| after_seq.is_none_or(|seq| event.seq > seq))
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_after_seq = events.last().map(|event| event.seq).or(after_seq);
+
+        Ok(ReadAgentResult {
+            agent_id: agent_id.0,
+            events,
+            next_after_seq,
+        })
+    }
+
     pub async fn await_agents(
         &self,
         requested_ids: Option<Vec<AgentId>>,
         timeout_ms: Option<u64>,
     ) -> Result<AwaitAgentsResult, String> {
+        if requested_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
+            return Err("agent_ids must contain at least one agent_id".to_string());
+        }
+
         let idle_timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS));
         let wall_timeout = Duration::from_millis(
             timeout_ms
@@ -308,12 +352,12 @@ impl AgentControlHandle {
             let snapshot = snapshot_rx.borrow().clone();
             let watched_ids = resolve_watched_ids(&snapshot, requested_ids.as_deref())?;
             let ready = ready_agents_from_snapshot(&snapshot, &watched_ids);
-            let still_running = still_running_agent_ids(&snapshot, &watched_ids);
+            let still_thinking = still_thinking_agents_from_snapshot(&snapshot, &watched_ids);
 
-            if !ready.is_empty() || still_running.is_empty() {
+            if !ready.is_empty() || still_thinking.is_empty() {
                 return Ok(AwaitAgentsResult {
                     ready,
-                    still_running,
+                    still_thinking,
                 });
             }
 
@@ -344,7 +388,10 @@ impl AgentControlHandle {
                     let watched_ids = resolve_watched_ids(&snapshot, requested_ids.as_deref())?;
                     return Ok(AwaitAgentsResult {
                         ready: ready_agents_from_snapshot(&snapshot, &watched_ids),
-                        still_running: still_running_agent_ids(&snapshot, &watched_ids),
+                        still_thinking: still_thinking_agents_from_snapshot(
+                            &snapshot,
+                            &watched_ids,
+                        ),
                     });
                 }
             }
@@ -367,22 +414,26 @@ pub struct SpawnRequest {
 pub struct SpawnAgentResult {
     pub agent_id: String,
     pub name: String,
-    pub status: String,
+    pub status: AgentControlStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AgentResult {
+pub struct AwaitAgentStatus {
     pub agent_id: String,
-    pub status: String,
-    pub message: Option<String>,
-    pub error: Option<String>,
-    pub summary: Option<String>,
+    pub status: AgentControlStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AwaitAgentsResult {
-    pub ready: Vec<AgentResult>,
-    pub still_running: Vec<String>,
+    pub ready: Vec<AwaitAgentStatus>,
+    pub still_thinking: Vec<AwaitAgentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadAgentResult {
+    pub agent_id: String,
+    pub events: Vec<Envelope>,
+    pub next_after_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -390,23 +441,17 @@ pub struct AgentOverview {
     pub agent_id: String,
     pub name: String,
     pub backend_kind: BackendKind,
-    pub status: String,
+    pub status: AgentControlStatus,
     pub workspace_roots: Vec<String>,
     pub parent_agent_id: Option<String>,
     pub project_id: Option<String>,
     pub created_at_ms: u64,
-    pub last_message: Option<String>,
-    pub error: Option<String>,
-    pub summary: Option<String>,
 }
 
-fn agent_result_from_state(state: &AgentState) -> AgentResult {
-    AgentResult {
+fn await_status_from_state(state: &AgentState) -> AwaitAgentStatus {
+    AwaitAgentStatus {
         agent_id: state.agent_id.0.clone(),
-        status: state.status_label().to_string(),
-        message: state.last_message.clone(),
-        error: state.last_error.clone(),
-        summary: summary_from(state.last_message.as_deref(), state.last_error.as_deref()),
+        status: state.status(),
     }
 }
 
@@ -415,27 +460,11 @@ fn agent_overview_from_state(state: &AgentState) -> AgentOverview {
         agent_id: state.agent_id.0.clone(),
         name: state.name.clone(),
         backend_kind: state.backend_kind,
-        status: state.status_label().to_string(),
+        status: state.status(),
         workspace_roots: state.workspace_roots.clone(),
         parent_agent_id: state.parent_agent_id.as_ref().map(|value| value.0.clone()),
         project_id: state.project_id.as_ref().map(|value| value.0.clone()),
         created_at_ms: state.created_at_ms,
-        last_message: state.last_message.clone(),
-        error: state.last_error.clone(),
-        summary: summary_from(state.last_message.as_deref(), state.last_error.as_deref()),
-    }
-}
-
-fn summary_from(message: Option<&str>, error: Option<&str>) -> Option<String> {
-    let source = message.filter(|value| !value.trim().is_empty()).or(error)?;
-    let line = source.lines().next().unwrap_or(source).trim();
-    if line.is_empty() {
-        return None;
-    }
-    if line.len() <= 160 {
-        Some(line.to_string())
-    } else {
-        Some(format!("{}...", &line[..157]))
     }
 }
 
@@ -482,21 +511,24 @@ fn watched_activity_map(
 fn ready_agents_from_snapshot(
     snapshot: &SnapshotState,
     watched_ids: &[AgentId],
-) -> Vec<AgentResult> {
+) -> Vec<AwaitAgentStatus> {
     watched_ids
         .iter()
         .filter_map(|agent_id| snapshot.agents.get(agent_id))
         .filter(|agent| !agent.is_active())
-        .map(agent_result_from_state)
+        .map(await_status_from_state)
         .collect()
 }
 
-fn still_running_agent_ids(snapshot: &SnapshotState, watched_ids: &[AgentId]) -> Vec<String> {
+fn still_thinking_agents_from_snapshot(
+    snapshot: &SnapshotState,
+    watched_ids: &[AgentId],
+) -> Vec<AwaitAgentStatus> {
     watched_ids
         .iter()
         .filter_map(|agent_id| snapshot.agents.get(agent_id))
         .filter(|agent| agent.is_active())
-        .map(|agent| agent.agent_id.0.clone())
+        .map(await_status_from_state)
         .collect()
 }
 
@@ -614,16 +646,16 @@ async fn run_runtime(
                                 .expect("validated NewAgent payload should parse");
                             if let Some(pending) = state.pending_spawn.take() {
                                 if pending.matches(&payload) {
-                                    let status_label = state
+                                    let agent_status = state
                                         .snapshot
                                         .agents
                                         .get(&payload.agent_id)
-                                        .map(|agent| agent.status_label())
-                                        .unwrap_or("thinking");
+                                        .map(|agent| agent.status())
+                                        .unwrap_or(AgentControlStatus::Thinking);
                                     let _ = pending.reply.send(Ok(SpawnAgentResult {
                                         agent_id: payload.agent_id.0.clone(),
                                         name: payload.name,
-                                        status: status_label.to_string(),
+                                        status: agent_status,
                                     }));
                                 } else {
                                     state.pending_spawn = Some(pending);
@@ -733,9 +765,9 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                     is_thinking: false,
                     turn_completed: false,
                     terminated: false,
-                    last_message: None,
                     last_error: None,
                     activity_counter: activity,
+                    event_log: Vec::new(),
                 },
             );
         }
@@ -765,6 +797,7 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 )
             });
             agent.activity_counter = agent.activity_counter.saturating_add(1);
+            agent.event_log.push(envelope.clone());
             match payload {
                 ChatEvent::TypingStatusChanged(typing) => {
                     agent.is_thinking = typing;
@@ -773,14 +806,12 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                     agent.last_error = None;
                 }
                 ChatEvent::StreamDelta(_) | ChatEvent::StreamReasoningDelta(_) => {}
-                ChatEvent::StreamEnd(data) => {
+                ChatEvent::StreamEnd(_) => {
                     agent.turn_completed = true;
-                    agent.last_message = Some(data.message.content);
                     agent.last_error = None;
                 }
-                ChatEvent::OperationCancelled(data) => {
+                ChatEvent::OperationCancelled(_) => {
                     agent.turn_completed = true;
-                    agent.last_message = Some(data.message);
                 }
                 ChatEvent::MessageAdded(_)
                 | ChatEvent::ToolRequest(_)
@@ -831,6 +862,7 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                     )
                 });
             agent.activity_counter = agent.activity_counter.saturating_add(1);
+            agent.event_log.push(envelope.clone());
             agent.last_error = Some(payload.message.clone());
             if payload.fatal || payload.message == "agent not running" {
                 agent.is_thinking = false;
@@ -928,19 +960,6 @@ struct SpawnAgentToolInput {
     cost_hint: Option<CostHintInput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunAgentToolInput {
-    workspace_roots: Vec<String>,
-    prompt: String,
-    backend_kind: Option<BackendKindInput>,
-    parent_agent_id: Option<String>,
-    project_id: Option<String>,
-    name: Option<String>,
-    cost_hint: Option<CostHintInput>,
-    timeout_ms: Option<u64>,
-}
-
 #[derive(Debug, Clone)]
 struct SpawnRequestInput {
     workspace_roots: Vec<String>,
@@ -966,24 +985,10 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
     }
 }
 
-impl From<&RunAgentToolInput> for SpawnRequestInput {
-    fn from(value: &RunAgentToolInput) -> Self {
-        Self {
-            workspace_roots: value.workspace_roots.clone(),
-            prompt: value.prompt.clone(),
-            backend_kind: value.backend_kind,
-            parent_agent_id: value.parent_agent_id.clone(),
-            project_id: value.project_id.clone(),
-            name: value.name.clone(),
-            cost_hint: value.cost_hint,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AwaitAgentsToolInput {
-    agent_ids: Option<Vec<String>>,
+    agent_ids: Vec<String>,
     timeout_ms: Option<u64>,
 }
 
@@ -996,9 +1001,10 @@ struct SendAgentMessageToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CancelAgentToolInput {
+struct ReadAgentToolInput {
     agent_id: String,
-    timeout_ms: Option<u64>,
+    after_seq: Option<u64>,
+    limit: Option<u32>,
 }
 
 fn parse_agent_id(input: &str) -> Result<AgentId, String> {
@@ -1179,28 +1185,23 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "tyde_spawn_agent",
-            description: "Spawn a Tyde agent and return immediately with its agent_id. Use this when you want to launch multiple agents in parallel and then wait for them with tyde_await_agent.",
+            description: "Spawn a Tyde agent and return immediately with its agent_id. Use tyde_await_agents to wait and tyde_read_agent to read output.",
             input_schema: spawn_agent_schema(),
         },
         ToolDefinition {
-            name: "tyde_run_agent",
-            description: "Spawn a Tyde agent and block until its next turn completes, is cancelled, or fails. Returns the latest message and status.",
-            input_schema: run_agent_schema(),
+            name: "tyde_await_agents",
+            description: "Block until one or more watched agents become idle or failed. Returns statuses only.",
+            input_schema: await_agent_schema(),
         },
         ToolDefinition {
-            name: "tyde_await_agent",
-            description: "Block until one or more watched agents stop running. Returns the ready agents and the IDs that are still running. If agent_ids is omitted, watches all currently running agents.",
-            input_schema: await_agent_schema(),
+            name: "tyde_read_agent",
+            description: "Read output events from an existing Tyde agent.",
+            input_schema: read_agent_schema(),
         },
         ToolDefinition {
             name: "tyde_send_agent_message",
             description: "Send a follow-up message to an existing Tyde agent.",
             input_schema: send_message_schema(),
-        },
-        ToolDefinition {
-            name: "tyde_cancel_agent",
-            description: "Interrupt a running Tyde agent and then wait for its next non-running state.",
-            input_schema: cancel_agent_schema(),
         },
         ToolDefinition {
             name: "tyde_list_agents",
@@ -1245,12 +1246,6 @@ fn spawn_agent_schema() -> Value {
     })
 }
 
-fn run_agent_schema() -> Value {
-    let mut schema = spawn_agent_schema();
-    schema["properties"]["timeout_ms"] = json!({ "type": "integer", "minimum": 0 });
-    schema
-}
-
 fn await_agent_schema() -> Value {
     json!({
         "type": "object",
@@ -1258,6 +1253,20 @@ fn await_agent_schema() -> Value {
             "agent_ids": { "type": "array", "items": { "type": "string" } },
             "timeout_ms": { "type": "integer", "minimum": 0 }
         },
+        "required": ["agent_ids"],
+        "additionalProperties": false
+    })
+}
+
+fn read_agent_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent_id": { "type": "string" },
+            "after_seq": { "type": "integer", "minimum": 0 },
+            "limit": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["agent_id"],
         "additionalProperties": false
     })
 }
@@ -1270,18 +1279,6 @@ fn send_message_schema() -> Value {
             "message": { "type": "string" }
         },
         "required": ["agent_id", "message"],
-        "additionalProperties": false
-    })
-}
-
-fn cancel_agent_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "agent_id": { "type": "string" },
-            "timeout_ms": { "type": "integer", "minimum": 0 }
-        },
-        "required": ["agent_id"],
         "additionalProperties": false
     })
 }
@@ -1302,57 +1299,39 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
                 Err(err) => ToolCallResult::text_error(err),
             }
         }
-        "tyde_run_agent" => {
-            let input = match parse_tool_input::<RunAgentToolInput>(params.arguments) {
-                Ok(input) => input,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            let request = match build_spawn_request(&control.snapshot(), (&input).into()) {
-                Ok(request) => request,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            let spawned = match control.spawn_agent(request).await {
-                Ok(result) => result,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            match control
-                .await_agents(
-                    Some(vec![AgentId(spawned.agent_id.clone())]),
-                    input.timeout_ms,
-                )
-                .await
-            {
-                Ok(result) => {
-                    ToolCallResult::json(result.ready.into_iter().next().unwrap_or(AgentResult {
-                        agent_id: spawned.agent_id,
-                        status: "thinking".to_string(),
-                        message: None,
-                        error: None,
-                        summary: None,
-                    }))
-                }
-                Err(err) => ToolCallResult::text_error(err),
-            }
-        }
-        "tyde_await_agent" => {
+        "tyde_await_agents" => {
             let input = match parse_tool_input::<AwaitAgentsToolInput>(params.arguments) {
                 Ok(input) => input,
                 Err(err) => return ToolCallResult::text_error(err),
             };
-            let agent_ids = match input.agent_ids {
-                Some(values) => {
-                    let mut parsed = Vec::with_capacity(values.len());
-                    for value in values {
-                        match parse_agent_id(&value) {
-                            Ok(agent_id) => parsed.push(agent_id),
-                            Err(err) => return ToolCallResult::text_error(err),
-                        }
-                    }
-                    Some(parsed)
+            let mut agent_ids = Vec::with_capacity(input.agent_ids.len());
+            for value in input.agent_ids {
+                match parse_agent_id(&value) {
+                    Ok(agent_id) => agent_ids.push(agent_id),
+                    Err(err) => return ToolCallResult::text_error(err),
                 }
-                None => None,
+            }
+            match control
+                .await_agents(Some(agent_ids), input.timeout_ms)
+                .await
+            {
+                Ok(result) => ToolCallResult::json(result),
+                Err(err) => ToolCallResult::text_error(err),
+            }
+        }
+        "tyde_read_agent" => {
+            let input = match parse_tool_input::<ReadAgentToolInput>(params.arguments) {
+                Ok(input) => input,
+                Err(err) => return ToolCallResult::text_error(err),
             };
-            match control.await_agents(agent_ids, input.timeout_ms).await {
+            let agent_id = match parse_agent_id(&input.agent_id) {
+                Ok(agent_id) => agent_id,
+                Err(err) => return ToolCallResult::text_error(err),
+            };
+            match control
+                .read_agent(agent_id, input.after_seq, input.limit)
+                .await
+            {
                 Ok(result) => ToolCallResult::json(result),
                 Err(err) => ToolCallResult::text_error(err),
             }
@@ -1371,34 +1350,6 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
             }
             match control.send_message(agent_id, input.message).await {
                 Ok(()) => ToolCallResult::json(json!({ "ok": true })),
-                Err(err) => ToolCallResult::text_error(err),
-            }
-        }
-        "tyde_cancel_agent" => {
-            let input = match parse_tool_input::<CancelAgentToolInput>(params.arguments) {
-                Ok(input) => input,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            let agent_id = match parse_agent_id(&input.agent_id) {
-                Ok(agent_id) => agent_id,
-                Err(err) => return ToolCallResult::text_error(err),
-            };
-            if let Err(err) = control.interrupt(agent_id.clone()).await {
-                return ToolCallResult::text_error(err);
-            }
-            match control
-                .await_agents(Some(vec![agent_id]), input.timeout_ms.or(Some(10_000)))
-                .await
-            {
-                Ok(result) => {
-                    ToolCallResult::json(result.ready.into_iter().next().unwrap_or(AgentResult {
-                        agent_id: input.agent_id,
-                        status: "thinking".to_string(),
-                        message: None,
-                        error: None,
-                        summary: None,
-                    }))
-                }
                 Err(err) => ToolCallResult::text_error(err),
             }
         }
@@ -1438,7 +1389,7 @@ async fn handle_request<W: AsyncWrite + Unpin>(
                             name: "tyde-agent-control",
                             version: "0.0.0",
                         },
-                        instructions: "Tools for orchestrating Tyde2 coding agents over the real Tyde host protocol. Use tyde_run_agent for one-shot tasks and tyde_spawn_agent + tyde_await_agent for fan-out workflows.".to_string(),
+                        instructions: "Tools for orchestrating Tyde2 coding agents over the real Tyde host protocol. Spawn agents, await idle/failed status, and read output explicitly with tyde_read_agent.".to_string(),
                     },
                 },
             )
@@ -1637,6 +1588,36 @@ mod tests {
         )
     }
 
+    async fn read_agent_contains(
+        control: &AgentControlHandle,
+        agent_id: AgentId,
+        after_seq: Option<u64>,
+        expected_text: &str,
+    ) -> Option<u64> {
+        let read = control
+            .read_agent(agent_id, after_seq, None)
+            .await
+            .expect("read_agent should succeed");
+        assert!(
+            read.events.iter().any(|event| {
+                if event.kind != FrameKind::ChatEvent {
+                    return false;
+                }
+                let event: ChatEvent = event.parse_payload().expect("ChatEvent should parse");
+                match event {
+                    ChatEvent::StreamEnd(data) => data.message.content.contains(expected_text),
+                    ChatEvent::OperationCancelled(data) => data.message.contains(expected_text),
+                    ChatEvent::MessageAdded(message) => message.content.contains(expected_text),
+                    ChatEvent::StreamDelta(delta) => delta.text.contains(expected_text),
+                    _ => false,
+                }
+            }),
+            "expected read output to contain {expected_text:?}, got {:?}",
+            read.events
+        );
+        read.next_after_seq
+    }
+
     #[test]
     fn spawn_tool_input_rejects_unknown_fields() {
         let mut args = Map::new();
@@ -1653,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_agent_returns_completed_turn() {
+    async fn await_agents_then_read_returns_completed_turn() {
         let (host, _tempdir) = test_host();
         let control = connect_runtime(host).await;
         let request = SpawnRequest {
@@ -1676,13 +1657,14 @@ mod tests {
             .expect("await should succeed");
 
         let result = awaited.ready.first().expect("agent should be ready");
-        assert_eq!(result.status, "idle");
-        assert!(
-            result
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("mock backend response to: hello"))
-        );
+        assert_eq!(result.status, AgentControlStatus::Idle);
+        read_agent_contains(
+            &control,
+            AgentId(spawned.agent_id.clone()),
+            None,
+            "mock backend response to: hello",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1708,6 +1690,13 @@ mod tests {
             .await_agents(Some(vec![agent_id.clone()]), Some(5_000))
             .await
             .expect("initial await should succeed");
+        let cursor = read_agent_contains(
+            &control,
+            agent_id.clone(),
+            None,
+            "mock backend response to: first",
+        )
+        .await;
 
         control
             .send_message(agent_id.clone(), "follow up".to_string())
@@ -1719,16 +1708,18 @@ mod tests {
             .expect("follow-up await should succeed");
 
         let result = awaited.ready.first().expect("agent should be ready");
-        assert!(
-            result
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("mock backend response to: follow up"))
-        );
+        assert_eq!(result.status, AgentControlStatus::Idle);
+        read_agent_contains(
+            &control,
+            agent_id.clone(),
+            cursor,
+            "mock backend response to: follow up",
+        )
+        .await;
 
         let agents = control.list_agents().await;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].agent_id, agent_id.0);
-        assert_eq!(agents[0].status, "idle");
+        assert_eq!(agents[0].status, AgentControlStatus::Idle);
     }
 }

@@ -13,7 +13,7 @@ External MCP control surface for Tyde2 agents. This builds on:
 
 The old Tyde had a genuinely useful capability: an MCP client such as Codex or
 Claude Code could ask Tyde to spawn other agents, wait for them, message them,
-and cancel them.
+and inspect their output.
 
 That enabled workflows like:
 
@@ -44,7 +44,9 @@ The legacy server exposed these tools:
 - `tyde_cancel_agent`
 - `tyde_list_agents`
 
-Those names were good. The main problem was where the server lived.
+Some names remain useful, but the Tyde2 surface intentionally drops the
+synchronous run/cancel tools and makes output reads explicit. The other main
+problem was where the server lived.
 
 ---
 
@@ -194,59 +196,148 @@ TydeAgentControlMcpEnabled { enabled: bool }
 
 ## MCP Surface
 
-The first slice keeps the legacy tool names because they were good:
+The MCP surface is deliberately small. Output is never coupled to user-message
+queues, list responses, spawn responses, or await responses. The only way to
+read agent output is `tyde_read_agent`.
 
-- `tyde_run_agent`
+Tools:
+
 - `tyde_spawn_agent`
-- `tyde_send_agent_message`
-- `tyde_cancel_agent`
 - `tyde_list_agents`
+- `tyde_await_agents`
+- `tyde_send_agent_message`
+- `tyde_read_agent`
 
-### Input Shape
+There is no `run` convenience tool and no MCP `cancel` tool in this surface.
+Clients compose the primitives explicitly: spawn, await status, then read output.
 
-`tyde_spawn_agent` and `tyde_run_agent` should accept:
+### Status Model
+
+Tool-visible agent status is the protocol `AgentControlStatus` enum with exactly three values:
+
+- `thinking`: the agent has not completed the current turn, or has not emitted
+  its initial completion yet
+- `idle`: the agent is available for more input
+- `failed`: the agent reached a terminal failure
+
+Statuses are metadata only. They must not carry final messages, summaries, or
+error text.
+
+### Tool Semantics
+
+#### `tyde_spawn_agent`
+
+Spawns an agent and returns immediately with metadata:
+
+- `agent_id`
+- `name`
+- `status`
+
+Input:
 
 - `workspace_roots`
 - `prompt`
 - `backend_kind?`
+- `parent_agent_id?`
 - `project_id?`
 - `name?`
 - `cost_hint?`
 
-`backend_kind` is optional only if the host has an explicit `default_backend`
-in `HostSettings`.
+`backend_kind` is optional only if the host has an explicit `default_backend` in
+`HostSettings`. If the request arrives from an injected child-agent MCP URL, the
+server can infer the parent agent id from the request URL/header; an explicit
+`parent_agent_id` may still be supplied by trusted host-side callers.
 
-`parent_agent_id` is not a tool argument. The server injects the loopback MCP
-URL per agent as `/mcp?agent_id=<agent-id>`, and the HTTP handler infers the
-caller from that request URL.
+#### `tyde_list_agents`
 
-### Output Shape
+Lists spawned agents and their current status. It returns metadata only:
 
-Agents are long-lived and reusable. A completed turn does **not** mean the
-agent is gone. The server derives tool-level status from its own agent records:
+- `agent_id`
+- `name`
+- `backend_kind`
+- `origin`
+- `status`
+- `workspace_roots`
+- `parent_agent_id`
+- `project_id`
+- `created_at_ms`
 
-- `running`: currently in an active streamed turn
-- `completed`: most recent turn reached `StreamEnd`; agent is idle and can take
-  more input
-- `cancelled`: latest observed turn emitted `OperationCancelled`
-- `failed`: latest fatal `AgentError`
+It must not include latest messages, errors, summaries, or output snippets.
 
-That preserves the old workflow semantics without pretending agents are
-one-shot jobs.
+#### `tyde_await_agents`
 
----
+Waits like `select(2)` over the supplied agent ids. It returns when any watched
+agent becomes non-`thinking`, or when the timeout expires.
+
+Input:
+
+- `agent_ids`
+- `timeout_ms?`
+
+Output:
+
+- `ready`: watched agents whose status is `idle` or `failed`
+- `still_thinking`: watched agents that are still `thinking`
+
+It returns status only. Call `tyde_read_agent` to inspect output.
+
+#### `tyde_send_agent_message`
+
+Sends a follow-up message to an existing agent. This does not return agent
+output.
+
+Input:
+
+- `agent_id`
+- `message`
+
+#### `tyde_read_agent`
+
+Reads output events from one agent. This is the sole output-reading primitive.
+
+Input:
+
+- `agent_id`
+- `after_seq?`
+- `limit?`
+
+Output:
+
+- `agent_id`
+- `events`
+- `next_after_seq`
+
+The event stream uses protocol `Envelope` values directly. Readable output is
+limited to agent output events, currently `ChatEvent` and `AgentError` frames.
+
+### No Child-Completion Queue Injection
+
+Child completion notices must not be auto-enqueued onto a parent as synthetic
+follow-up/user messages. That was the coupling that made queued user messages and
+child-agent output interleave unpredictably.
+
+Parent agents that need child results should use the explicit MCP flow:
+
+1. `tyde_spawn_agent`
+2. `tyde_await_agents`
+3. `tyde_read_agent`
+4. `tyde_send_agent_message` if the parent wants to incorporate the result into
+   a later turn
+
+The server still owns all agent state and all output events; it just no longer
+converts child output into hidden parent input.
 
 ## Implementation
 
 ### Server Structure
 
-Create `server/src/agent_control_mcp.rs` following the same pattern as
+`server/src/agent_control_mcp.rs` follows the same embedded-loopback pattern as
 `server/src/debug_mcp.rs`:
 
 - `start_server()` returns an `AgentControlMcpHandle` with the HTTP URL
 - loopback-only bind, reject non-loopback peers
-- JSON-RPC 2.0 MCP protocol
-- tool dispatch routes to agent lifecycle operations on the `HostHandle`
+- MCP tool dispatch routes to `HostHandle` / agent actor operations
+- tool responses use protocol types directly where protocol events are returned
 
 ### Startup MCP Injection
 
@@ -266,106 +357,35 @@ if settings.tyde_agent_control_mcp_enabled {
 }
 ```
 
-### Auto-propagation
+### Agent Output Storage
 
-Child completion notices are **not** a separate MCP wait surface anymore.
-Instead, the server auto-enqueues them onto the parent's queued-message state.
-
-Rules:
-
-- When a child reaches idle because `TypingStatusChanged(false)` arrives after
-  a `StreamEnd`, and the child has `parent_agent_id`, the server formats a
-  completion notice and enqueues it as a normal queued follow-up on the parent.
-- When a child emits `OperationCancelled` or enters a fatal `AgentError`, the
-  server enqueues the same notice shape with outcome `cancelled` or `failed`.
-- Idle with no final output does not enqueue anything.
-- If the parent is already idle, the actor still enqueues first and then
-  immediately dispatches the queued message so the parent auto-resumes.
-- Backend-native relay sub-agents use the host-owned
-  `HostSubAgentEmitter::on_subagent_completed` callback to emit the same notice
-  format into the parent's queue path.
-
-Exact preamble:
-
-```text
-[TYDE CHILD AGENT UPDATE]
-This is an automatic system-generated child completion notice, not a user instruction.
-Child name: {child_name}
-Child id: {child_id}
-Child state: idle
-Child outcome: {completed|cancelled|failed}
-
-Child message:
-{verbatim final message or synthesized status text}
-[END TYDE CHILD AGENT UPDATE]
-```
-
-This keeps the queued-message model server-owned and avoids a separate
-tool-level wait/control protocol for fan-out completions.
-
-### `tyde_run_agent`
-
-`tyde_run_agent` remains as the synchronous one-shot convenience:
-
-1. spawn
-2. wait for that agent's next non-running state
-3. return the derived result
+Agent actors already own their event logs. `tyde_read_agent` asks the relevant
+actor for output envelopes after an optional sequence number and with an explicit
+limit. This keeps output reads actor-owned and avoids hidden host/UI caches.
 
 ### Advantage Over External Driver
 
-Because the server owns agent state directly, the implementation is simpler:
+Because the server owns agent state directly, the embedded implementation stays
+simple:
 
-- no protocol connection bootstrapping
-- no snapshot derivation from event streams
+- no protocol connection bootstrapping for the production MCP surface
+- no snapshot derivation from client-side event streams
 - no bootstrap quiescence window
-- no external process lifecycle
-- direct access to agent records, status, and history
-- child completion propagation can use internal actor commands instead of
-  reconstructing parent/child coordination in the MCP caller
-
----
+- direct access to agent records, status, and actor-owned event history
+- no synthetic parent queued-message path for child output
 
 ## Non-Goals For This Slice
 
-The first implementation does **not** try to rebuild every legacy integration
+This implementation does **not** try to rebuild every legacy integration
 feature.
 
 Specifically out of scope:
 
 - persisted UI toggles beyond `HostSettings` (no separate config file)
 - tool-policy enforcement in the MCP server
-- automatic MCP injection into spawned backend sessions (agents spawned by
-  agents — that is a future recursive capability)
 - remote control / SSH tunneling
-
-Those can come later, but they are separate features.
-
-The first slice is:
-
-- embedded loopback HTTP MCP server in `tyde-server`
-- `HostSettings` toggle (default on)
-- startup MCP injection into agents
-- useful spawn/run/message/cancel/list tools
-
----
-
-## Migration From `tyde-dev-driver agent-control`
-
-The existing `dev-driver/src/agent_control.rs` implementation has the right
-tool semantics and wait logic. The migration is:
-
-1. Move the tool definitions and dispatch logic into
-   `server/src/agent_control_mcp.rs`, adapting from protocol-event-derived
-   state to direct server state access.
-2. Replace the `client::Connection` + `SnapshotState` pattern with direct
-   `HostHandle` calls for agent lifecycle.
-3. Replace protocol-event-based child waiting with server-internal queued
-   completion propagation plus the retained `tyde_run_agent` one-shot wait.
-4. Remove the `agent-control` subcommand from `tyde-dev-driver`.
-5. Remove the `TYDE_AGENT_CONTROL_HOST_BIND_ADDR` env var and related shell
-   loopback endpoint code (if any was added for agent control specifically).
-
----
+- synchronous spawn-and-read convenience tools
+- MCP cancellation tools
 
 ## Future Work
 
@@ -387,6 +407,7 @@ Agent control MCP follows the same pattern as debug MCP:
 - `HostSettings.tyde_agent_control_mcp_enabled` (default: true)
 - no external process, no shell involvement, no separate protocol connection
 - server has direct access to agent lifecycle — simpler implementation
+- explicit await/read flow; no child-output injection into parent user queues
 
 That keeps the workflow power while staying aligned with the rewrite
 philosophy and the proven debug MCP pattern.

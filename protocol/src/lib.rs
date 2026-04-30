@@ -6,9 +6,9 @@ pub mod validator;
 #[cfg(feature = "framing")]
 pub use framing::{FrameError, read_envelope, write_envelope};
 pub use types::{
-    AgentClosedPayload, AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendKind, BackendSetupAction, BackendSetupCommand,
-    BackendSetupInfo, BackendSetupPayload, BackendSetupStatus, BootstrapData,
+    AgentClosedPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentId, AgentInput,
+    AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, BackendSetupAction,
+    BackendSetupCommand, BackendSetupInfo, BackendSetupPayload, BackendSetupStatus, BootstrapData,
     CancelQueuedMessagePayload, ChatEvent, ChatMessage, CloseAgentPayload, CommandErrorCode,
     CommandErrorPayload, ContextBreakdown, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, DiffContextMode,

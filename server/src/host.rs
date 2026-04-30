@@ -67,25 +67,6 @@ struct HostSubscriber {
     stream: Stream,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChildCompletionOutcome {
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ChildCompletionNotice {
-    pub parent_id: AgentId,
-    pub child_id: AgentId,
-    pub child_name: String,
-    pub outcome: ChildCompletionOutcome,
-    pub message_text: String,
-}
-
-pub(crate) type HostChildCompletionNoticeTx = mpsc::UnboundedSender<ChildCompletionNotice>;
-pub(crate) type HostChildCompletionNoticeRx = mpsc::UnboundedReceiver<ChildCompletionNotice>;
-
 #[derive(Clone, Debug, Default)]
 pub struct HostRuntimeConfig {
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -111,7 +92,6 @@ pub(crate) struct HostState {
     pub skill_store: Arc<Mutex<SkillStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
-    pub child_completion_tx: HostChildCompletionNoticeTx,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
@@ -891,13 +871,10 @@ impl HostHandle {
         let (start, agent_handle, startup_rx, host_streams) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
-            let child_completion_tx = state.child_completion_tx.clone();
-            let spawned = state.registry.spawn(
-                request,
-                Arc::clone(&session_store),
-                sub_agent_spawn_tx,
-                child_completion_tx,
-            );
+            let spawned =
+                state
+                    .registry
+                    .spawn(request, Arc::clone(&session_store), sub_agent_spawn_tx);
             let host_streams = state
                 .host_streams
                 .iter()
@@ -2550,8 +2527,6 @@ fn spawn_host_inner(
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
     let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
         mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
-    let (child_completion_tx, child_completion_rx) =
-        mpsc::unbounded_channel::<ChildCompletionNotice>();
     let debug_mcp = match crate::debug_mcp::start_server(runtime_config.debug_mcp_bind_addr) {
         Ok(handle) => handle,
         Err(err) if runtime_config.debug_mcp_bind_addr.is_none() => {
@@ -2580,7 +2555,6 @@ fn spawn_host_inner(
             skill_store: Arc::new(Mutex::new(skill_store)),
             agent_sessions: HashMap::new(),
             sub_agent_spawn_tx,
-            child_completion_tx,
             use_mock_backend,
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
@@ -2617,7 +2591,6 @@ fn spawn_host_inner(
         .agent_control_mcp = agent_control_mcp;
 
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
-    spawn_child_completion_notice_task(host.clone(), child_completion_rx);
 
     Ok(host)
 }
@@ -2645,116 +2618,6 @@ fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
             runtime.block_on(worker);
         })
         .expect("failed to spawn host sub-agent worker thread");
-}
-
-fn spawn_child_completion_notice_task(host: HostHandle, mut rx: HostChildCompletionNoticeRx) {
-    let worker = async move {
-        while let Some(notice) = rx.recv().await {
-            process_child_completion_notice(&host, notice).await;
-        }
-    };
-
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(worker);
-        return;
-    }
-
-    std::thread::Builder::new()
-        .name("tyde-child-completions".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build child completion runtime");
-            runtime.block_on(worker);
-        })
-        .expect("failed to spawn child completion worker thread");
-}
-
-async fn process_child_completion_notice(host: &HostHandle, mut notice: ChildCompletionNotice) {
-    let (parent_handle, parent_status, parent_start, child_start) = {
-        let state = host.state.lock().await;
-        (
-            state.registry.agent_handle(&notice.parent_id),
-            state.registry.agent_status_handle(&notice.parent_id),
-            state.registry.agent_handle(&notice.parent_id),
-            state.registry.agent_handle(&notice.child_id),
-        )
-    };
-
-    let Some(parent_handle) = parent_handle else {
-        tracing::warn!(
-            parent_agent_id = %notice.parent_id,
-            child_agent_id = %notice.child_id,
-            "dropping child completion notice because parent agent no longer exists"
-        );
-        return;
-    };
-
-    let Some(parent_status_handle) = parent_status else {
-        tracing::warn!(
-            parent_agent_id = %notice.parent_id,
-            child_agent_id = %notice.child_id,
-            "dropping child completion notice because parent status is missing"
-        );
-        return;
-    };
-    let parent_status = parent_status_handle.snapshot().await;
-    if parent_status.terminated {
-        tracing::warn!(
-            parent_agent_id = %notice.parent_id,
-            child_agent_id = %notice.child_id,
-            "dropping child completion notice because parent agent is terminated"
-        );
-        return;
-    }
-
-    if let Some(parent_start_handle) = parent_start
-        && let Some(parent_snapshot) = parent_start_handle.snapshot().await
-        && parent_snapshot.origin == AgentOrigin::BackendNative
-    {
-        tracing::warn!(
-            parent_agent_id = %notice.parent_id,
-            child_agent_id = %notice.child_id,
-            "dropping child completion notice because backend-native relay parents do not accept auto follow-ups"
-        );
-        return;
-    }
-
-    if notice.child_name.trim().is_empty()
-        && let Some(child_handle) = child_start
-        && let Some(child_snapshot) = child_handle.snapshot().await
-    {
-        notice.child_name = child_snapshot.name;
-    }
-
-    if notice.child_name.trim().is_empty() {
-        notice.child_name = "unknown-child".to_string();
-    }
-
-    if !parent_handle
-        .enqueue_auto_follow_up(format_child_completion_notice(&notice))
-        .await
-    {
-        tracing::warn!(
-            parent_agent_id = %notice.parent_id,
-            child_agent_id = %notice.child_id,
-            "dropping child completion notice because parent agent is no longer accepting input"
-        );
-    }
-}
-
-fn format_child_completion_notice(notice: &ChildCompletionNotice) -> String {
-    let outcome = match notice.outcome {
-        ChildCompletionOutcome::Completed => "completed",
-        ChildCompletionOutcome::Cancelled => "cancelled",
-        ChildCompletionOutcome::Failed => "failed",
-    };
-
-    format!(
-        "[TYDE CHILD AGENT UPDATE]\nThis is an automatic system-generated child completion notice, not a user instruction.\nChild name: {}\nChild id: {}\nChild state: idle\nChild outcome: {}\n\nChild message:\n{}\n[END TYDE CHILD AGENT UPDATE]",
-        notice.child_name, notice.child_id, outcome, notice.message_text,
-    )
 }
 
 pub(crate) fn startup_mcp_servers_for_settings(

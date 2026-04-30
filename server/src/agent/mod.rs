@@ -24,9 +24,7 @@ use crate::backend::{
     apply_session_settings_update, resolve_backend_session_settings,
     validate_session_settings_values,
 };
-use crate::host::{
-    ChildCompletionNotice, ChildCompletionOutcome, HostChildCompletionNoticeTx, HostSubAgentEmitter,
-};
+use crate::host::HostSubAgentEmitter;
 use crate::store::session::SessionStore;
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
@@ -52,8 +50,6 @@ struct TerminalFailureContext<'a> {
     event_log: &'a mut Vec<Envelope>,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<QueuedMessageEntry>,
-    start: &'a AgentStartPayload,
-    child_completion_tx: &'a HostChildCompletionNoticeTx,
 }
 
 struct AgentNameChangeContext<'a> {
@@ -67,9 +63,6 @@ struct AgentNameChangeContext<'a> {
 
 enum AgentCommand {
     SendInput(AgentInput),
-    EnqueueAutoFollowUp {
-        message: String,
-    },
     SetName {
         name: String,
         persistence: AgentNamePersistence,
@@ -77,6 +70,11 @@ enum AgentCommand {
     },
     Snapshot {
         reply: oneshot::Sender<AgentStartPayload>,
+    },
+    ReadOutput {
+        after_seq: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Vec<Envelope>>,
     },
     Interrupt,
     Close {
@@ -152,6 +150,23 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
+    pub async fn read_output(&self, after_seq: Option<u64>, limit: usize) -> Option<Vec<Envelope>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReadOutput {
+                after_seq,
+                limit,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
     pub async fn interrupt(&self) -> bool {
         if !self.accepting_input.load(Ordering::SeqCst) {
             return false;
@@ -175,27 +190,6 @@ impl AgentHandle {
 
     pub async fn attach(&self, stream: Stream) -> bool {
         self.tx.send(AgentCommand::Attach(stream)).await.is_ok()
-    }
-
-    pub async fn enqueue_auto_follow_up(&self, message: String) -> bool {
-        if !self.accepting_input.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.tx
-            .send(AgentCommand::EnqueueAutoFollowUp { message })
-            .await
-            .is_ok()
-    }
-}
-
-#[derive(Default)]
-struct TurnLocalCompletionState {
-    completed_message: Option<String>,
-}
-
-impl TurnLocalCompletionState {
-    fn reset(&mut self) {
-        self.completed_message = None;
     }
 }
 
@@ -512,7 +506,6 @@ pub(crate) fn spawn_agent_actor(
     request: ResolvedSpawnRequest,
     session_store: Arc<Mutex<SessionStore>>,
     host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
-    child_completion_tx: HostChildCompletionNoticeTx,
     status_handle: registry::AgentStatusHandle,
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
     let (tx, mut rx) = mpsc::channel::<AgentCommand>(COMMAND_BUFFER);
@@ -566,7 +559,6 @@ pub(crate) fn spawn_agent_actor(
             },
         );
         let mut queue = VecDeque::new();
-        let mut turn_completion = TurnLocalCompletionState::default();
         let is_new_spawn = resume_session_id.is_none();
 
         let startup_result: Result<
@@ -656,8 +648,6 @@ pub(crate) fn spawn_agent_actor(
                         event_log: &mut event_log,
                         subscribers: &mut subscribers,
                         queue: &mut queue,
-                        start: &current_start,
-                        child_completion_tx: &child_completion_tx,
                     },
                     &payload,
                 )
@@ -755,7 +745,6 @@ pub(crate) fn spawn_agent_actor(
                     .is_some_and(|images| !images.is_empty())
         }) {
             in_turn = true;
-            turn_completion.reset();
             if !backend
                 .as_ref()
                 .expect("backend must exist after successful startup")
@@ -776,8 +765,6 @@ pub(crate) fn spawn_agent_actor(
                         event_log: &mut event_log,
                         subscribers: &mut subscribers,
                         queue: &mut queue,
-                        start: &current_start,
-                        child_completion_tx: &child_completion_tx,
                     },
                     &payload,
                 )
@@ -824,8 +811,6 @@ pub(crate) fn spawn_agent_actor(
                                 event_log: &mut event_log,
                                 subscribers: &mut subscribers,
                                 queue: &mut queue,
-                                start: &current_start,
-                                child_completion_tx: &child_completion_tx,
                             },
                             &payload,
                         )
@@ -859,20 +844,16 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::StreamStart(_) => {
                             active_stream_text.clear();
-                            turn_completion.reset();
                             status_handle.update(|s| {
                                 s.last_error = None;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
                         ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
-                        ChatEvent::StreamEnd(data) => {
+                        ChatEvent::StreamEnd(_) => {
                             active_stream_text.clear();
-                            let msg = data.message.content.clone();
-                            turn_completion.completed_message = Some(msg.clone());
                             status_handle.update(|s| {
                                 s.turn_completed = true;
-                                s.last_message = Some(msg);
                                 s.last_error = None;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -881,20 +862,15 @@ pub(crate) fn spawn_agent_actor(
                             let typing = *typing;
                             if !typing {
                                 in_turn = false;
-                            } else {
-                                turn_completion.reset();
                             }
                             status_handle.update(|s| {
                                 s.is_thinking = typing;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
-                        ChatEvent::OperationCancelled(data) => {
-                            let msg = data.message.clone();
-                            turn_completion.reset();
+                        ChatEvent::OperationCancelled(_) => {
                             status_handle.update(|s| {
                                 s.turn_completed = true;
-                                s.last_message = Some(msg);
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -921,28 +897,6 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await;
 
-                    if let ChatEvent::OperationCancelled(data) = &event {
-                        maybe_emit_child_completion_notice(
-                            &child_completion_tx,
-                            &current_start,
-                            ChildCompletionOutcome::Cancelled,
-                            data.message.clone(),
-                        );
-                    }
-
-                    if matches!(event, ChatEvent::TypingStatusChanged(false))
-                        && let Some(message_text) = turn_completion
-                            .completed_message
-                            .take()
-                            .filter(|message| !message.trim().is_empty())
-                    {
-                        maybe_emit_child_completion_notice(
-                            &child_completion_tx,
-                            &current_start,
-                            ChildCompletionOutcome::Completed,
-                            message_text,
-                        );
-                    }
 
                     if matches!(event, ChatEvent::TypingStatusChanged(false))
                         && matches!(lifecycle, ActorLifecycle::Closing)
@@ -973,7 +927,6 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await;
                         in_turn = true;
-                        turn_completion.reset();
                         if !backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
@@ -994,8 +947,6 @@ pub(crate) fn spawn_agent_actor(
                                     event_log: &mut event_log,
                                     subscribers: &mut subscribers,
                                     queue: &mut queue,
-                                    start: &current_start,
-                                    child_completion_tx: &child_completion_tx,
                                 },
                                 &payload,
                             )
@@ -1040,7 +991,6 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                     } else {
                                         in_turn = true;
-                                        turn_completion.reset();
                                         if !backend
                                             .as_ref()
                                             .expect("backend must exist while actor is running")
@@ -1061,8 +1011,6 @@ pub(crate) fn spawn_agent_actor(
                                                     event_log: &mut event_log,
                                                     subscribers: &mut subscribers,
                                                     queue: &mut queue,
-                                                    start: &current_start,
-                                                    child_completion_tx: &child_completion_tx,
                                                 },
                                                 &payload,
                                             )
@@ -1195,7 +1143,6 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await;
                                     in_turn = true;
-                                    turn_completion.reset();
                                     if !backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
@@ -1218,8 +1165,6 @@ pub(crate) fn spawn_agent_actor(
                                                 event_log: &mut event_log,
                                                 subscribers: &mut subscribers,
                                                 queue: &mut queue,
-                                                start: &current_start,
-                                                child_completion_tx: &child_completion_tx,
                                             },
                                             &payload,
                                         )
@@ -1314,80 +1259,6 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                         }
-                        AgentCommand::EnqueueAutoFollowUp { message } => {
-                            if matches!(lifecycle, ActorLifecycle::Closing) {
-                                continue;
-                            }
-                            queue.push_back(QueuedMessageEntry {
-                                id: QueuedMessageId(Uuid::new_v4().to_string()),
-                                message,
-                                images: Vec::new(),
-                            });
-                            update_queued_messages_snapshot(
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &queue,
-                            )
-                            .await;
-
-                            if in_turn {
-                                continue;
-                            }
-
-                            let queued = queue
-                                .pop_front()
-                                .expect("queue front must exist after auto-follow-up enqueue");
-                            update_queued_messages_snapshot(
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &queue,
-                            )
-                            .await;
-                            in_turn = true;
-                            turn_completion.reset();
-                            if !backend
-                                .as_ref()
-                                .expect("backend must exist while actor is running")
-                                .send(AgentInput::SendMessage(queued_message_to_send_payload(
-                                    queued,
-                                )))
-                                .await
-                            {
-                                let payload = AgentErrorPayload {
-                                    agent_id: current_start.agent_id.clone(),
-                                    code: AgentErrorCode::Internal,
-                                    message: "agent backend closed".to_owned(),
-                                    fatal: true,
-                                };
-                                enter_terminal_failure(
-                                    TerminalFailureContext {
-                                        accepting_input: &accepting_input_task,
-                                        status_handle: &status_handle,
-                                        canonical_stream: &canonical_stream,
-                                        event_log: &mut event_log,
-                                        subscribers: &mut subscribers,
-                                        queue: &mut queue,
-                                        start: &current_start,
-                                        child_completion_tx: &child_completion_tx,
-                                    },
-                                    &payload,
-                                )
-                                .await;
-                                park_terminal_agent(
-                                    &session_store,
-                                    current_session_id.as_ref(),
-                                    &mut pending_alias,
-                                    &mut current_start,
-                                    &mut event_log,
-                                    &mut subscribers,
-                                    &mut rx,
-                                )
-                                .await;
-                                return;
-                            }
-                        }
                         AgentCommand::SetName {
                             name,
                             persistence,
@@ -1410,6 +1281,13 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::Snapshot { reply } => {
                             let _ = reply.send(current_start.clone());
+                        }
+                        AgentCommand::ReadOutput {
+                            after_seq,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
                         AgentCommand::Interrupt => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
@@ -1569,12 +1447,10 @@ pub(crate) fn spawn_relay_agent_actor(
                             }).await;
                         }
                         ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
-                        ChatEvent::StreamEnd(data) => {
+                        ChatEvent::StreamEnd(_) => {
                             active_stream_text.clear();
-                            let msg = data.message.content.clone();
                             status_handle.update(|s| {
                                 s.turn_completed = true;
-                                s.last_message = Some(msg);
                                 s.last_error = None;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -1587,11 +1463,9 @@ pub(crate) fn spawn_relay_agent_actor(
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
-                        ChatEvent::OperationCancelled(data) => {
-                            let msg = data.message.clone();
+                        ChatEvent::OperationCancelled(_) => {
                             status_handle.update(|s| {
                                 s.turn_completed = true;
-                                s.last_message = Some(msg);
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -1627,9 +1501,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
                     match command {
-                        AgentCommand::SendInput(_)
-                        | AgentCommand::Interrupt
-                        | AgentCommand::EnqueueAutoFollowUp { .. } => {
+                        AgentCommand::SendInput(_) | AgentCommand::Interrupt => {
                             let payload = relay_input_rejected_payload(&current_start.agent_id);
                             append_event(
                                 &canonical_stream,
@@ -1662,6 +1534,13 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::Snapshot { reply } => {
                             let _ = reply.send(current_start.clone());
+                        }
+                        AgentCommand::ReadOutput {
+                            after_seq,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
@@ -1740,33 +1619,6 @@ fn relay_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
     }
 }
 
-fn maybe_emit_child_completion_notice(
-    child_completion_tx: &HostChildCompletionNoticeTx,
-    start: &AgentStartPayload,
-    outcome: ChildCompletionOutcome,
-    message_text: String,
-) {
-    let Some(parent_id) = start.parent_agent_id.clone() else {
-        return;
-    };
-    if start.origin == AgentOrigin::BackendNative {
-        // Backend-native children deliver their final response to the parent
-        // through the backend's own tool-result mechanism; Tyde does not enqueue
-        // a separate completion notice.
-        return;
-    }
-    if message_text.trim().is_empty() {
-        return;
-    }
-    let _ = child_completion_tx.send(ChildCompletionNotice {
-        parent_id,
-        child_id: start.agent_id.clone(),
-        child_name: start.name.clone(),
-        outcome,
-        message_text,
-    });
-}
-
 async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &AgentErrorPayload) {
     context.accepting_input.store(false, Ordering::SeqCst);
     context.queue.clear();
@@ -1795,14 +1647,6 @@ async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &A
         payload,
     )
     .await;
-    if payload.fatal {
-        maybe_emit_child_completion_notice(
-            context.child_completion_tx,
-            context.start,
-            ChildCompletionOutcome::Failed,
-            payload.message.clone(),
-        );
-    }
 }
 
 async fn park_terminal_agent(
@@ -1842,6 +1686,13 @@ async fn park_terminal_agent(
             AgentCommand::Snapshot { reply } => {
                 let _ = reply.send(current_start.clone());
             }
+            AgentCommand::ReadOutput {
+                after_seq,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(output_events_since(event_log, after_seq, limit));
+            }
             AgentCommand::Attach(stream) => {
                 attach_subscriber(event_log, subscribers, stream).await;
             }
@@ -1849,9 +1700,7 @@ async fn park_terminal_agent(
                 let _ = reply.send(());
                 break;
             }
-            AgentCommand::SendInput(_)
-            | AgentCommand::Interrupt
-            | AgentCommand::EnqueueAutoFollowUp { .. } => {}
+            AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
         }
     }
 }
@@ -2042,6 +1891,20 @@ async fn append_event<T: serde::Serialize>(
     .expect("failed to serialize protocol payload in agent actor");
     event_log.push(event.clone());
     broadcast_event(subscribers, &event).await;
+}
+
+fn output_events_since(
+    event_log: &[Envelope],
+    after_seq: Option<u64>,
+    limit: usize,
+) -> Vec<Envelope> {
+    event_log
+        .iter()
+        .filter(|event| after_seq.is_none_or(|seq| event.seq > seq))
+        .filter(|event| matches!(event.kind, FrameKind::ChatEvent | FrameKind::AgentError))
+        .take(limit)
+        .cloned()
+        .collect()
 }
 
 async fn update_queued_messages_snapshot(
@@ -2302,7 +2165,7 @@ mod tests {
 
     use super::{
         AgentCommand, AgentHandle, append_event, attach_subscriber, generate_mock_name,
-        name_generation_fallback, sanitize_generated_agent_name,
+        name_generation_fallback, output_events_since, sanitize_generated_agent_name,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::stream::Stream;
@@ -2348,6 +2211,13 @@ mod tests {
                     AgentCommand::Snapshot { reply } => {
                         let _ = reply.send(start.clone());
                     }
+                    AgentCommand::ReadOutput {
+                        after_seq,
+                        limit,
+                        reply,
+                    } => {
+                        let _ = reply.send(output_events_since(&event_log, after_seq, limit));
+                    }
                     AgentCommand::Attach(stream) => {
                         attach_subscriber(&event_log, &mut subscribers, stream).await;
                     }
@@ -2358,9 +2228,7 @@ mod tests {
                         let _ = reply.send(());
                         break;
                     }
-                    AgentCommand::SendInput(_)
-                    | AgentCommand::Interrupt
-                    | AgentCommand::EnqueueAutoFollowUp { .. } => {}
+                    AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
                 }
             }
         });

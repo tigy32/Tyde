@@ -76,98 +76,104 @@ async fn wait_for_typing_true(client: &mut client::Connection, stream: &StreamPa
     }
 }
 
-async fn expect_turn_on_stream_contains(
+fn assert_no_nonempty_parent_queue(env: &Envelope, parent_stream: &StreamPath) {
+    if env.kind != FrameKind::QueuedMessages || env.stream != *parent_stream {
+        return;
+    }
+    let payload: QueuedMessagesPayload = env.parse_payload().expect("parse QueuedMessages");
+    assert!(
+        payload.messages.is_empty(),
+        "child completion must not enqueue messages on parent queue: {:?}",
+        payload.messages
+    );
+}
+
+async fn expect_completed_turn_without_parent_queue(
     client: &mut client::Connection,
     stream: &StreamPath,
     expected_text: &str,
+    parent_stream: &StreamPath,
 ) {
-    loop {
-        let env = raw_next(client, "TypingStatusChanged(true)").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if matches!(event, ChatEvent::TypingStatusChanged(true)) {
-            break;
-        }
-    }
+    let mut saw_expected_text = false;
+    let mut saw_stream_end = false;
 
     loop {
-        let env = raw_next(client, "StreamStart").await;
+        let env = raw_next(client, "child completed turn").await;
+        assert_no_nonempty_parent_queue(&env, parent_stream);
         if env.kind != FrameKind::ChatEvent || env.stream != *stream {
             continue;
         }
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if matches!(event, ChatEvent::StreamStart(..)) {
-            break;
-        }
-    }
-
-    loop {
-        let env = raw_next(client, "StreamDelta").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if let ChatEvent::StreamDelta(delta) = event {
-            assert!(
-                delta.text.contains(expected_text),
-                "expected delta on {stream} to contain {expected_text:?}, got {:?}",
-                delta.text
-            );
-            break;
-        }
-    }
-
-    loop {
-        let env = raw_next(client, "StreamEnd").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if matches!(event, ChatEvent::StreamEnd(..)) {
-            break;
-        }
-    }
-
-    loop {
-        let env = raw_next(client, "TypingStatusChanged(false)").await;
-        if env.kind != FrameKind::ChatEvent || env.stream != *stream {
-            continue;
-        }
-        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if matches!(event, ChatEvent::TypingStatusChanged(false)) {
-            return;
+        match event {
+            ChatEvent::StreamDelta(delta) => {
+                saw_expected_text |= delta.text.contains(expected_text);
+            }
+            ChatEvent::StreamEnd(data) => {
+                saw_expected_text |= data.message.content.contains(expected_text);
+                saw_stream_end = true;
+            }
+            ChatEvent::TypingStatusChanged(false) if saw_stream_end => {
+                assert!(
+                    saw_expected_text,
+                    "expected child turn on {stream} to contain {expected_text:?}"
+                );
+                return;
+            }
+            _ => {}
         }
     }
 }
 
-async fn expect_queued_messages_with_count(
+async fn expect_cancelled_turn_without_parent_queue(
     client: &mut client::Connection,
-    count: usize,
-    context: &str,
-) -> QueuedMessagesPayload {
+    stream: &StreamPath,
+    expected_text: &str,
+    parent_stream: &StreamPath,
+) {
+    let mut saw_cancel = false;
+
     loop {
-        let env = raw_next(client, context).await;
-        if env.kind != FrameKind::QueuedMessages {
+        let env = raw_next(client, "child cancelled turn").await;
+        assert_no_nonempty_parent_queue(&env, parent_stream);
+        if env.kind != FrameKind::ChatEvent || env.stream != *stream {
             continue;
         }
-        let payload: QueuedMessagesPayload = env.parse_payload().expect("parse QueuedMessages");
-        if payload.messages.len() == count {
-            return payload;
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::OperationCancelled(data) => {
+                assert!(
+                    data.message.contains(expected_text),
+                    "expected child cancellation to contain {expected_text:?}, got {:?}",
+                    data.message
+                );
+                saw_cancel = true;
+            }
+            ChatEvent::TypingStatusChanged(false) if saw_cancel => return,
+            _ => {}
         }
     }
 }
 
-fn child_notice_text(
-    child_name: &str,
-    child_id: &AgentId,
-    outcome: &str,
-    message_text: &str,
-) -> String {
-    format!(
-        "[TYDE CHILD AGENT UPDATE]\nThis is an automatic system-generated child completion notice, not a user instruction.\nChild name: {child_name}\nChild id: {child_id}\nChild state: idle\nChild outcome: {outcome}\n\nChild message:\n{message_text}\n[END TYDE CHILD AGENT UPDATE]"
-    )
+async fn assert_no_parent_reentry(
+    client: &mut client::Connection,
+    parent_stream: &StreamPath,
+    duration: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), client.next_event()).await {
+            Ok(Ok(Some(env))) => {
+                assert_no_nonempty_parent_queue(&env, parent_stream);
+                assert!(
+                    !(env.kind == FrameKind::ChatEvent && env.stream == *parent_stream),
+                    "child completion must not re-enter the parent turn, got {env:?}"
+                );
+            }
+            Ok(Ok(None)) => panic!("connection closed unexpectedly"),
+            Ok(Err(err)) => panic!("next_event failed: {err:?}"),
+            Err(_) => {}
+        }
+    }
 }
 
 fn mock_turn_text(prompt: &str) -> String {
@@ -175,7 +181,7 @@ fn mock_turn_text(prompt: &str) -> String {
 }
 
 #[tokio::test]
-async fn child_completion_is_enqueued_on_parent_queue() {
+async fn child_completion_does_not_enqueue_on_parent_queue() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
@@ -196,22 +202,17 @@ async fn child_completion_is_enqueued_on_parent_queue() {
     )
     .await;
 
-    let snapshot =
-        expect_queued_messages_with_count(&mut fixture.client, 1, "queued child completion notice")
-            .await;
-    assert_eq!(
-        snapshot.messages[0].message,
-        child_notice_text(
-            "child-complete",
-            &child_new.agent_id,
-            "completed",
-            &mock_turn_text("child completed"),
-        )
-    );
+    expect_completed_turn_without_parent_queue(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        &mock_turn_text("child completed"),
+        &parent_new.instance_stream,
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn child_cancellation_is_enqueued_on_parent_queue() {
+async fn child_cancellation_does_not_enqueue_on_parent_queue() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
@@ -232,76 +233,13 @@ async fn child_cancellation_is_enqueued_on_parent_queue() {
     )
     .await;
 
-    let snapshot = expect_queued_messages_with_count(
+    expect_cancelled_turn_without_parent_queue(
         &mut fixture.client,
-        1,
-        "queued child cancellation notice",
+        &child_new.instance_stream,
+        "mock backend cancelled: __mock_cancel__ child cancelled",
+        &parent_new.instance_stream,
     )
     .await;
-    assert_eq!(
-        snapshot.messages[0].message,
-        child_notice_text(
-            "child-cancelled",
-            &child_new.agent_id,
-            "cancelled",
-            "mock backend cancelled: __mock_cancel__ child cancelled",
-        )
-    );
-}
-
-#[tokio::test]
-async fn two_child_completions_are_enqueued_in_arrival_order() {
-    fixture::init_tracing();
-    let mut fixture = Fixture::new().await;
-
-    let (parent_new, _) = spawn_agent(
-        &mut fixture.client,
-        "parent-two-children",
-        "__mock_slow__ parent busy",
-        None,
-    )
-    .await;
-    wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
-
-    let (child_a_new, _) = spawn_agent(
-        &mut fixture.client,
-        "child-a",
-        "first child",
-        Some(parent_new.agent_id.clone()),
-    )
-    .await;
-    let (child_b_new, _) = spawn_agent(
-        &mut fixture.client,
-        "child-b",
-        "second child",
-        Some(parent_new.agent_id.clone()),
-    )
-    .await;
-
-    let snapshot = expect_queued_messages_with_count(
-        &mut fixture.client,
-        2,
-        "two queued child completion notices",
-    )
-    .await;
-    assert_eq!(
-        snapshot.messages[0].message,
-        child_notice_text(
-            "child-a",
-            &child_a_new.agent_id,
-            "completed",
-            &mock_turn_text("first child"),
-        )
-    );
-    assert_eq!(
-        snapshot.messages[1].message,
-        child_notice_text(
-            "child-b",
-            &child_b_new.agent_id,
-            "completed",
-            &mock_turn_text("second child"),
-        )
-    );
 }
 
 #[tokio::test]
@@ -309,8 +247,6 @@ async fn backend_native_child_does_not_enqueue_completion_notice() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
-    // Parent stays busy long enough for any child-completion notice to be
-    // enqueued if the server were (buggily) going to emit one.
     let (parent_new, _) = spawn_agent(
         &mut fixture.client,
         "parent-native",
@@ -320,18 +256,10 @@ async fn backend_native_child_does_not_enqueue_completion_notice() {
     .await;
     wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
 
-    // Wait long enough for the backend-native child to have completed. The
-    // parent's slow turn (MOCK_SLOW_SLEEP_MS) gives headroom for this.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), fixture.client.next_event()).await {
-            Ok(Ok(Some(env))) => {
-                assert_ne!(
-                    env.kind,
-                    FrameKind::QueuedMessages,
-                    "backend-native child completion must not enqueue a notice on the parent queue"
-                );
-            }
+            Ok(Ok(Some(env))) => assert_no_nonempty_parent_queue(&env, &parent_new.instance_stream),
             Ok(Ok(None)) => panic!("connection closed unexpectedly"),
             Ok(Err(err)) => panic!("next_event failed: {err:?}"),
             Err(_) => {}
@@ -340,37 +268,39 @@ async fn backend_native_child_does_not_enqueue_completion_notice() {
 }
 
 #[tokio::test]
-async fn idle_parent_immediately_reenters_turn_for_child_completion_notice() {
+async fn idle_parent_does_not_reenter_turn_for_child_completion() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
 
     let (parent_new, _) =
         spawn_agent(&mut fixture.client, "idle-parent", "parent idle", None).await;
-    expect_turn_on_stream_contains(
+    expect_completed_turn_without_parent_queue(
         &mut fixture.client,
         &parent_new.instance_stream,
         "mock backend response to: parent idle",
+        &parent_new.instance_stream,
     )
     .await;
 
     let (child_new, _) = spawn_agent(
         &mut fixture.client,
         "idle-parent-child",
-        "child auto resume",
+        "child stays separate",
         Some(parent_new.agent_id.clone()),
     )
     .await;
 
-    let expected_notice = child_notice_text(
-        "idle-parent-child",
-        &child_new.agent_id,
-        "completed",
-        &mock_turn_text("child auto resume"),
-    );
-    expect_turn_on_stream_contains(
+    expect_completed_turn_without_parent_queue(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        &mock_turn_text("child stays separate"),
+        &parent_new.instance_stream,
+    )
+    .await;
+    assert_no_parent_reentry(
         &mut fixture.client,
         &parent_new.instance_stream,
-        &expected_notice,
+        Duration::from_millis(500),
     )
     .await;
 }

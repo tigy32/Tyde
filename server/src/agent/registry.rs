@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    AgentId, AgentOrigin, AgentStartPayload, BackendKind, ChatEvent, CustomAgentId, ProjectId,
-    SendMessagePayload, SessionId, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    AgentControlStatus, AgentId, AgentOrigin, AgentStartPayload, BackendKind, ChatEvent,
+    CustomAgentId, ProjectId, SendMessagePayload, SessionId, SessionSettingsSchema,
+    SessionSettingsValues, SpawnCostHint,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -13,7 +14,6 @@ use crate::agent::customization::ResolvedSpawnConfig;
 use crate::agent::{AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor};
 use crate::backend::StartupMcpServer;
 use crate::backend::StartupMcpTransport;
-use crate::host::HostChildCompletionNoticeTx;
 use crate::host::agent_control_mcp_url_for_agent;
 use crate::store::session::SessionStore;
 use crate::sub_agent::HostSubAgentSpawnTx;
@@ -30,7 +30,6 @@ pub(crate) struct AgentStatus {
     pub terminated: bool,
     pub is_thinking: bool,
     pub turn_completed: bool,
-    pub last_message: Option<String>,
     pub last_error: Option<String>,
     pub activity_counter: u64,
 }
@@ -40,13 +39,13 @@ impl AgentStatus {
         !self.terminated && (!self.started || self.is_thinking || !self.turn_completed)
     }
 
-    pub fn status_label(&self) -> &'static str {
+    pub fn status(&self) -> AgentControlStatus {
         if self.terminated && self.last_error.is_some() {
-            "error"
+            AgentControlStatus::Failed
         } else if self.is_active() {
-            "thinking"
+            AgentControlStatus::Thinking
         } else {
-            "idle"
+            AgentControlStatus::Idle
         }
     }
 }
@@ -175,7 +174,6 @@ impl AgentRegistry {
         mut request: ResolvedSpawnRequest,
         session_store: Arc<Mutex<SessionStore>>,
         host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
-        child_completion_tx: HostChildCompletionNoticeTx,
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         for server in &mut request.startup_mcp_servers {
@@ -206,7 +204,6 @@ impl AgentRegistry {
             request,
             session_store,
             host_sub_agent_spawn_tx,
-            child_completion_tx,
             status_handle.clone(),
         );
 

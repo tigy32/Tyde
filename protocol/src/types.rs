@@ -180,6 +180,15 @@ pub enum AgentOrigin {
     BackendNative,
 }
 
+/// Tool-visible status for agent-control MCP responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlStatus {
+    Thinking,
+    Idle,
+    Failed,
+}
+
 /// Backend-agnostic hint for picking a cheaper or more capable spawned agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
