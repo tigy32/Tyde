@@ -1,4 +1,7 @@
+use std::cell::RefCell;
+
 use leptos::prelude::*;
+use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
@@ -10,6 +13,9 @@ use protocol::{
     ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectPath, ProjectReadDiffPayload,
     ProjectRootPath, ProjectStageHunkPayload, StreamPath,
 };
+
+const SBS_MIN_FRACTION: f64 = 0.05;
+const SBS_MAX_FRACTION: f64 = 0.95;
 
 #[component]
 pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope) -> impl IntoView {
@@ -221,10 +227,6 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
                     None
                 }
             }}
-            <div class="diff-file-header">
-                <span class="diff-file-path">{diff.root.to_string()}</span>
-                <span class="diff-scope-badge">{scope_label}</span>
-            </div>
             {diff.files.into_iter().enumerate().map(|(fi, file)| {
                 let hunk_offsets = file_hunk_offsets[fi].clone();
                 let root = diff.root.clone();
@@ -247,42 +249,334 @@ fn DiffFileView(
     let view_mode_sig = state.diff_view_mode;
     let relative_path = file.relative_path.clone();
 
+    let initial_split = match classify_diff_file(&file) {
+        DiffFileKind::PureAdd => 0.0,
+        DiffFileKind::PureDelete => 1.0,
+        DiffFileKind::Mixed => 0.5,
+    };
+    let split = RwSignal::new(initial_split);
+
+    on_cleanup(clear_sbs_drag_listeners);
+
+    let file_for_view = file.clone();
+    let offsets_for_view = hunk_offsets.clone();
+    let root_for_view = root.clone();
+    let path_for_view = relative_path.clone();
+
     view! {
         <div class="diff-file">
             <div class="diff-file-header">
                 <span class="diff-file-path">{file.relative_path}</span>
                 <span class="diff-scope-badge">{scope_label}</span>
             </div>
-            <div class="diff-hunks">
-                {file.hunks.into_iter().enumerate().map(|(hi, hunk)| {
-                    let offset = hunk_offsets[hi];
-                    let hunk_for_unified = hunk.clone();
-                    let hunk_for_side = hunk;
-                    let root_u = root.clone();
-                    let root_s = root.clone();
-                    let path_u = relative_path.clone();
-                    let path_s = relative_path.clone();
-                    view! {
-                        {move || match view_mode_sig.get() {
-                            DiffViewMode::Unified => view! {
-                                <UnifiedHunk hunk=hunk_for_unified.clone() context_mode=context_mode line_offset=offset scope=scope root=root_u.clone() relative_path=path_u.clone() />
-                            }.into_any(),
-                            DiffViewMode::SideBySide => view! {
-                                <SideBySideHunk hunk=hunk_for_side.clone() context_mode=context_mode line_offset=offset scope=scope root=root_s.clone() relative_path=path_s.clone() />
-                            }.into_any(),
-                        }}
-                    }
-                }).collect::<Vec<_>>()}
-            </div>
+            {move || match view_mode_sig.get() {
+                DiffViewMode::Unified => render_unified_hunks(
+                    file_for_view.clone(),
+                    offsets_for_view.clone(),
+                    context_mode,
+                    scope,
+                    root_for_view.clone(),
+                    path_for_view.clone(),
+                ),
+                DiffViewMode::SideBySide => render_sbs_panes(
+                    file_for_view.clone(),
+                    offsets_for_view.clone(),
+                    context_mode,
+                    scope,
+                    root_for_view.clone(),
+                    path_for_view.clone(),
+                    split,
+                ),
+            }}
         </div>
     }
 }
 
+fn render_unified_hunks(
+    file: ProjectGitDiffFile,
+    hunk_offsets: Vec<usize>,
+    context_mode: DiffContextMode,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
+) -> AnyView {
+    view! {
+        <div class="diff-hunks">
+            {file.hunks.into_iter().enumerate().map(|(hi, hunk)| {
+                let offset = hunk_offsets[hi];
+                view! {
+                    <UnifiedHunk hunk=hunk context_mode=context_mode line_offset=offset scope=scope root=root.clone() relative_path=relative_path.clone() />
+                }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
+    .into_any()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SbsSide {
+    Left,
+    Right,
+}
+
+fn render_sbs_panes(
+    file: ProjectGitDiffFile,
+    hunk_offsets: Vec<usize>,
+    context_mode: DiffContextMode,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
+    split: RwSignal<f64>,
+) -> AnyView {
+    let pair_ref = NodeRef::<leptos::html::Div>::new();
+
+    let file_left = file.clone();
+    let file_right = file.clone();
+    let offsets_left = hunk_offsets.clone();
+    let offsets_right = hunk_offsets.clone();
+    let root_left = root.clone();
+    let root_right = root.clone();
+    let path_left = relative_path.clone();
+    let path_right = relative_path.clone();
+
+    let left_style = move || {
+        let pct = (split.get() * 100.0).clamp(0.0, 100.0);
+        format!("flex: 0 0 {pct:.4}%")
+    };
+
+    let on_divider_mousedown = move |ev: web_sys::MouseEvent| {
+        ev.prevent_default();
+        start_divider_drag(pair_ref, split);
+    };
+
+    view! {
+        <div class="diff-pair" node_ref=pair_ref>
+            <div class="diff-pane diff-pane-left" style=left_style>
+                {render_sbs_pane_content(
+                    SbsSide::Left,
+                    file_left,
+                    offsets_left,
+                    context_mode,
+                    scope,
+                    root_left,
+                    path_left,
+                )}
+            </div>
+            <div
+                class="diff-divider"
+                title="Drag to resize"
+                on:mousedown=on_divider_mousedown
+            ></div>
+            <div class="diff-pane diff-pane-right">
+                {render_sbs_pane_content(
+                    SbsSide::Right,
+                    file_right,
+                    offsets_right,
+                    context_mode,
+                    scope,
+                    root_right,
+                    path_right,
+                )}
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+fn render_sbs_pane_content(
+    side: SbsSide,
+    file: ProjectGitDiffFile,
+    hunk_offsets: Vec<usize>,
+    context_mode: DiffContextMode,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
+) -> AnyView {
+    let find = use_context::<FindState>();
+    let show_stage_btn = scope == ProjectDiffScope::Unstaged && side == SbsSide::Right;
+    let show_header = context_mode == DiffContextMode::Hunks;
+
+    let mut hunk_views: Vec<AnyView> = Vec::with_capacity(file.hunks.len());
+    for (hi, hunk) in file.hunks.into_iter().enumerate() {
+        let line_offset = hunk_offsets[hi];
+        let header = hunk_header_label(&hunk);
+        let hunk_id = hunk.hunk_id.clone();
+        let lines = hunk.lines.clone();
+        let indices = sbs_search_indices(&lines, line_offset);
+        let rows = pair_lines_side_by_side(lines);
+
+        let cell_views: Vec<AnyView> = rows
+            .into_iter()
+            .zip(indices)
+            .map(|(row, (left_idx, right_idx))| {
+                let (cell, idx) = match side {
+                    SbsSide::Left => (row.left, left_idx),
+                    SbsSide::Right => (row.right, right_idx),
+                };
+                render_cell_search(cell, idx, find.clone())
+            })
+            .collect();
+
+        let header_view = if show_header {
+            let stage_btn = if show_stage_btn {
+                let r = root.clone();
+                let p = relative_path.clone();
+                let h = hunk_id.clone();
+                Some(view! {
+                    <button
+                        class="diff-hunk-stage-btn"
+                        title="Stage hunk"
+                        on:click=move |_| stage_hunk(r.clone(), p.clone(), h.clone())
+                    >
+                        "+"
+                    </button>
+                })
+            } else {
+                None
+            };
+            Some(view! {
+                <div class="diff-hunk-header">
+                    {header}
+                    {stage_btn}
+                </div>
+            })
+        } else {
+            None
+        };
+
+        hunk_views.push(
+            view! {
+                <div class="diff-hunk diff-hunk-side-by-side">
+                    {header_view}
+                    {cell_views}
+                </div>
+            }
+            .into_any(),
+        );
+    }
+
+    hunk_views.into_any()
+}
+
+thread_local! {
+    static SBS_DRAG_LISTENERS: RefCell<Option<SbsDragListeners>> = const { RefCell::new(None) };
+}
+
+struct SbsDragListeners {
+    window: web_sys::Window,
+    mousemove: Closure<dyn Fn(web_sys::MouseEvent)>,
+    mouseup: Closure<dyn Fn(web_sys::MouseEvent)>,
+}
+
+impl SbsDragListeners {
+    fn remove(self) {
+        let _ = self.window.remove_event_listener_with_callback(
+            "mousemove",
+            self.mousemove.as_ref().unchecked_ref(),
+        );
+        let _ = self
+            .window
+            .remove_event_listener_with_callback("mouseup", self.mouseup.as_ref().unchecked_ref());
+    }
+}
+
+fn clear_sbs_drag_listeners() {
+    SBS_DRAG_LISTENERS.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+}
+
+fn start_divider_drag(pair_ref: NodeRef<leptos::html::Div>, split: RwSignal<f64>) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    clear_sbs_drag_listeners();
+
+    if let Some(body) = window.document().and_then(|d| d.body()) {
+        let _ = body.style().set_property("cursor", "col-resize");
+        let _ = body.style().set_property("user-select", "none");
+    }
+
+    let mousemove = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |ev: web_sys::MouseEvent| {
+        let Some(el) = pair_ref.get_untracked() else {
+            return;
+        };
+        let rect = el.get_bounding_client_rect();
+        let width = rect.width();
+        if width <= 0.0 {
+            return;
+        }
+        let x = ev.client_x() as f64 - rect.left();
+        let f = (x / width).clamp(SBS_MIN_FRACTION, SBS_MAX_FRACTION);
+        split.set(f);
+    });
+
+    let mouseup = Closure::<dyn Fn(web_sys::MouseEvent)>::new(move |_: web_sys::MouseEvent| {
+        clear_sbs_drag_listeners();
+        if let Some(body) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.body())
+        {
+            let _ = body.style().remove_property("cursor");
+            let _ = body.style().remove_property("user-select");
+        }
+    });
+
+    let _ =
+        window.add_event_listener_with_callback("mousemove", mousemove.as_ref().unchecked_ref());
+    let _ = window.add_event_listener_with_callback("mouseup", mouseup.as_ref().unchecked_ref());
+
+    SBS_DRAG_LISTENERS.with(|slot| {
+        slot.borrow_mut().replace(SbsDragListeners {
+            window,
+            mousemove,
+            mouseup,
+        });
+    });
+}
+
+fn fmt_line_range(start: u32, count: u32) -> String {
+    if count == 0 {
+        "—".to_string()
+    } else if count == 1 {
+        start.to_string()
+    } else {
+        format!("{}-{}", start, start + count - 1)
+    }
+}
+
 fn hunk_header_label(hunk: &ProjectGitDiffHunk) -> String {
-    format!(
-        "@@ -{},{} +{},{} @@",
-        hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-    )
+    let old = fmt_line_range(hunk.old_start, hunk.old_count);
+    let new = fmt_line_range(hunk.new_start, hunk.new_count);
+    format!("Lines {old} → {new}")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffFileKind {
+    PureAdd,
+    PureDelete,
+    Mixed,
+}
+
+fn classify_diff_file(file: &ProjectGitDiffFile) -> DiffFileKind {
+    let mut has_added = false;
+    let mut has_removed = false;
+    for hunk in &file.hunks {
+        for line in &hunk.lines {
+            match line.kind {
+                ProjectGitDiffLineKind::Added => has_added = true,
+                ProjectGitDiffLineKind::Removed => has_removed = true,
+                ProjectGitDiffLineKind::Context => {}
+            }
+        }
+    }
+    match (has_added, has_removed) {
+        (true, false) => DiffFileKind::PureAdd,
+        (false, true) => DiffFileKind::PureDelete,
+        _ => DiffFileKind::Mixed,
+    }
 }
 
 fn line_class(kind: ProjectGitDiffLineKind) -> &'static str {
@@ -525,70 +819,6 @@ fn sbs_search_indices(
         }
     }
     out
-}
-
-#[component]
-fn SideBySideHunk(
-    hunk: ProjectGitDiffHunk,
-    context_mode: DiffContextMode,
-    line_offset: usize,
-    scope: ProjectDiffScope,
-    root: ProjectRootPath,
-    relative_path: String,
-) -> impl IntoView {
-    let find = use_context::<FindState>();
-    let header = hunk_header_label(&hunk);
-    let show_header = context_mode == DiffContextMode::Hunks;
-    let show_stage = scope == ProjectDiffScope::Unstaged;
-    let hunk_id = hunk.hunk_id.clone();
-
-    let indices = sbs_search_indices(&hunk.lines, line_offset);
-    let rows = pair_lines_side_by_side(hunk.lines);
-
-    view! {
-        <div class="diff-hunk diff-hunk-side-by-side">
-            {show_header.then(|| {
-                let stage_root = root.clone();
-                let stage_path = relative_path.clone();
-                let stage_hunk_id = hunk_id.clone();
-                view! {
-                    <div class="diff-hunk-header">
-                        {header}
-                        {show_stage.then(move || {
-                            let r = stage_root.clone();
-                            let p = stage_path.clone();
-                            let h = stage_hunk_id.clone();
-                            view! {
-                                <button
-                                    class="diff-hunk-stage-btn"
-                                    title="Stage hunk"
-                                    on:click=move |_| {
-                                        stage_hunk(r.clone(), p.clone(), h.clone());
-                                    }
-                                >
-                                    "+"
-                                </button>
-                            }
-                        })}
-                    </div>
-                }
-            })}
-            {rows.into_iter().zip(indices).map(|(row, (left_idx, right_idx))| {
-                let find_l = find.clone();
-                let find_r = find.clone();
-                view! {
-                    <div class="diff-row-sbs">
-                        <div class="diff-col-sbs diff-col-left">
-                            {render_cell_search(row.left, left_idx, find_l)}
-                        </div>
-                        <div class="diff-col-sbs diff-col-right">
-                            {render_cell_search(row.right, right_idx, find_r)}
-                        </div>
-                    </div>
-                }
-            }).collect::<Vec<_>>()}
-        </div>
-    }
 }
 
 fn render_cell_search(

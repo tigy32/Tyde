@@ -4105,13 +4105,29 @@ kbd {
 }
 
 .diff-content {
+    display: flex;
+    flex-direction: column;
     flex: 1;
     overflow-y: auto;
     padding: 0;
 }
 
 .diff-file {
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
     border-bottom: 1px solid var(--border-primary);
+}
+
+.diff-file:last-child {
+    flex: 1 0 auto;
+    border-bottom: none;
+}
+
+.diff-file:last-child .diff-pair,
+.diff-file:last-child .diff-hunks {
+    flex: 1;
+    min-height: 0;
 }
 
 .diff-file-header {
@@ -4123,7 +4139,7 @@ kbd {
     border-bottom: 1px solid var(--border-primary);
     position: sticky;
     top: 0;
-    z-index: 1;
+    z-index: 2;
 }
 
 .diff-file-path {
@@ -4151,8 +4167,9 @@ kbd {
 }
 
 .diff-hunks {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: minmax(max-content, 1fr);
+    overflow-x: auto;
 }
 
 .diff-hunk {
@@ -4219,9 +4236,9 @@ kbd {
 
 .diff-text {
     flex: 1;
-    min-width: 0;
-    white-space: pre-wrap;
-    word-break: break-all;
+    min-width: auto;
+    white-space: pre;
+    word-break: normal;
     padding-right: var(--space-2);
 }
 
@@ -4248,30 +4265,72 @@ kbd {
     letter-spacing: 0.5px;
 }
 
-.diff-row-sbs {
+.diff-pair {
+    display: flex;
+    align-items: stretch;
+    width: 100%;
+}
+
+.diff-pane {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    border-bottom: 1px solid var(--border-primary);
-}
-
-.diff-row-sbs:last-child {
-    border-bottom: none;
-}
-
-.diff-col-sbs {
+    grid-template-columns: minmax(max-content, 1fr);
+    overflow-x: auto;
+    overflow-y: visible;
     min-width: 0;
-    overflow: hidden;
-    border-right: 1px solid var(--border-primary);
 }
 
-.diff-col-sbs:last-child {
-    border-right: none;
+.diff-pane-right {
+    flex: 1 1 0%;
+}
+
+.diff-divider {
+    flex: 0 0 4px;
+    cursor: col-resize;
+    background: var(--border-primary);
+    user-select: none;
+}
+
+.diff-divider:hover {
+    background: var(--accent-primary);
+}
+
+.diff-pane .diff-gutter,
+.diff-pane .diff-prefix {
+    position: sticky;
+    z-index: 1;
+    background: var(--surface-base);
+}
+
+.diff-pane .diff-gutter {
+    left: 0;
+}
+
+.diff-pane .diff-prefix {
+    left: 48px;
+}
+
+.diff-hunks .diff-gutter-old,
+.diff-hunks .diff-gutter-new,
+.diff-hunks .diff-prefix {
+    position: sticky;
+    z-index: 1;
+    background: var(--surface-base);
+}
+
+.diff-hunks .diff-gutter-old {
+    left: 0;
+}
+
+.diff-hunks .diff-gutter-new {
+    left: 48px;
+}
+
+.diff-hunks .diff-prefix {
+    left: 96px;
 }
 
 .diff-line-empty {
     min-height: 20px;
-    background: var(--surface-0);
-    opacity: 0.5;
 }
 
 /* ===== Find Bar ===== */
