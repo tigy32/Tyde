@@ -244,6 +244,8 @@ impl KiroSession {
                 replaying_history: false,
                 replay_assistant_message_id: None,
                 replay_assistant_text: String::new(),
+                replay_assistant_message_emitted_since_user: false,
+                replay_error: None,
             }),
         });
 
@@ -298,6 +300,8 @@ struct KiroState {
     replaying_history: bool,
     replay_assistant_message_id: Option<String>,
     replay_assistant_text: String,
+    replay_assistant_message_emitted_since_user: bool,
+    replay_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -635,6 +639,8 @@ impl KiroInner {
             state.replaying_history = true;
             state.replay_assistant_message_id = None;
             state.replay_assistant_text.clear();
+            state.replay_assistant_message_emitted_since_user = false;
+            state.replay_error = None;
             (
                 state.workspace_root.clone(),
                 state.startup_mcp_servers.clone(),
@@ -671,13 +677,52 @@ impl KiroInner {
                 state.replaying_history = false;
                 state.replay_assistant_message_id = None;
                 state.replay_assistant_text.clear();
+                state.replay_assistant_message_emitted_since_user = false;
+                state.replay_error = None;
                 self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
                 return Err(err);
             }
         };
 
+        if let Err(err) = self.bridge.sync_inbound().await {
+            let mut state = self.state.lock().await;
+            state.replaying_history = false;
+            state.replay_assistant_message_id = None;
+            state.replay_assistant_text.clear();
+            state.replay_assistant_message_emitted_since_user = false;
+            state.replay_error = None;
+            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+            return Err(format!("Failed to finish Kiro session replay: {err}"));
+        }
+
         {
             let mut state = self.state.lock().await;
+            if let Some(error) = state.replay_error.take() {
+                state.replaying_history = false;
+                state.replay_assistant_message_id = None;
+                state.replay_assistant_text.clear();
+                state.replay_assistant_message_emitted_since_user = false;
+                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                return Err(error);
+            }
+            if !state.active_tool_contexts.is_empty() {
+                let pending = state
+                    .active_tool_contexts
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                state.replaying_history = false;
+                state.replay_assistant_message_id = None;
+                state.replay_assistant_text.clear();
+                state.replay_assistant_message_emitted_since_user = false;
+                state.active_tool_contexts.clear();
+                state.tool_call_aliases.clear();
+                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                return Err(format!(
+                    "Kiro session replay ended with unresolved tool calls: {pending}"
+                ));
+            }
             state.session_id = session_id;
             if let Some(model) = extract_current_model(&response) {
                 state.model = Some(model);
@@ -798,6 +843,10 @@ impl KiroInner {
                 self.handle_tool_call_update(params).await;
             }
             "turnend" => {
+                if self.state.lock().await.replaying_history {
+                    self.flush_replay_assistant_message().await;
+                    return;
+                }
                 self.finalize_active_stream_if_any(Some(params.clone()), true)
                     .await;
             }
@@ -895,6 +944,10 @@ impl KiroInner {
                 "images": []
             }
         }));
+        self.state
+            .lock()
+            .await
+            .replay_assistant_message_emitted_since_user = false;
     }
 
     async fn handle_reasoning_chunk(&self, params: &Value) {
@@ -1071,7 +1124,178 @@ impl KiroInner {
         }));
     }
 
+    async fn set_replay_error(&self, message: String) {
+        let mut state = self.state.lock().await;
+        if state.replay_error.is_none() {
+            state.replay_error = Some(message);
+        }
+    }
+
+    async fn replay_error_is_set(&self) -> bool {
+        self.state.lock().await.replay_error.is_some()
+    }
+
+    async fn ensure_replay_assistant_message_for_tool(&self) {
+        self.flush_replay_assistant_message().await;
+        let should_emit = {
+            let state = self.state.lock().await;
+            state.replaying_history
+                && state.replay_error.is_none()
+                && !state.replay_assistant_message_emitted_since_user
+        };
+        if should_emit {
+            self.emit_replay_assistant_message_text(String::new(), true)
+                .await;
+        }
+    }
+
+    async fn handle_replay_tool_call(&self, params: &Value) {
+        if self.replay_error_is_set().await {
+            return;
+        }
+
+        let Some(request) = parse_tool_call_request(params) else {
+            self.set_replay_error(format!(
+                "Kiro session replay contained tool_call without toolCallId: {params}"
+            ))
+            .await;
+            return;
+        };
+
+        let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
+        let message_id = extract_kiro_message_id(params);
+        let workspace_root = self.state.lock().await.workspace_root.clone();
+        let tool_type = map_tool_request_type(params, &request.args, &workspace_root).await;
+        let canonical_id = normalize_tool_call_id_fragment(&raw_tool_call_id);
+
+        {
+            let mut state = self.state.lock().await;
+            if state.active_tool_contexts.contains_key(&canonical_id) {
+                state.replay_error = Some(format!(
+                    "Kiro session replay contained duplicate tool_call id {canonical_id}"
+                ));
+                return;
+            }
+
+            state.active_tool_contexts.insert(
+                canonical_id.clone(),
+                KiroToolContext {
+                    tool_name: request.tool_name.clone(),
+                    tool_type: tool_type.clone(),
+                    request_emitted: true,
+                    pending_completion: None,
+                },
+            );
+            state
+                .tool_call_aliases
+                .insert(tool_alias_raw_key(&raw_tool_call_id), canonical_id.clone());
+            if let Some(message_id) = message_id.as_deref() {
+                state.tool_call_aliases.insert(
+                    tool_alias_message_key(message_id, &raw_tool_call_id),
+                    canonical_id.clone(),
+                );
+            }
+        }
+
+        self.ensure_replay_assistant_message_for_tool().await;
+        if self.replay_error_is_set().await {
+            return;
+        }
+
+        self.emit_event(json!({
+            "kind": "ToolRequest",
+            "data": {
+                "tool_call_id": canonical_id,
+                "tool_name": request.tool_name,
+                "tool_type": tool_type,
+            }
+        }));
+    }
+
+    async fn handle_replay_tool_call_update(&self, params: &Value) {
+        if self.replay_error_is_set().await {
+            return;
+        }
+
+        let raw_tool_call_id =
+            extract_kiro_tool_call_id(params).map(|raw| normalize_tool_call_id_fragment(&raw));
+        let message_id = extract_kiro_message_id(params);
+
+        let (resolved_tool_call_id, fallback_name) = {
+            let state = self.state.lock().await;
+            let resolved_id = resolve_tool_call_id_alias(
+                &state,
+                raw_tool_call_id.as_deref(),
+                message_id.as_deref(),
+            );
+            let fallback_name = resolved_id
+                .as_ref()
+                .and_then(|id| state.active_tool_contexts.get(id))
+                .map(|ctx| ctx.tool_name.clone());
+            (resolved_id, fallback_name)
+        };
+
+        let Some(resolved_tool_call_id) = resolved_tool_call_id else {
+            self.set_replay_error(format!(
+                "Kiro session replay contained tool_call_update for unknown toolCallId: {params}"
+            ))
+            .await;
+            return;
+        };
+        let Some(mut completion) = parse_tool_call_completion(params, fallback_name) else {
+            return;
+        };
+        completion.tool_call_id = resolved_tool_call_id;
+
+        let completion_to_emit = {
+            let mut state = self.state.lock().await;
+            let Some(context) = state.active_tool_contexts.get(&completion.tool_call_id) else {
+                state.replay_error = Some(format!(
+                    "Kiro session replay lost context for tool_call_update id {}",
+                    completion.tool_call_id
+                ));
+                return;
+            };
+
+            completion.tool_name = context.tool_name.clone();
+            let tool_result = map_tool_completion_result(&completion, Some(context));
+            let output = (
+                completion.tool_call_id.clone(),
+                completion.tool_name.clone(),
+                tool_result,
+                completion.success,
+                completion.error.clone(),
+            );
+
+            state.active_tool_contexts.remove(&completion.tool_call_id);
+            remove_tool_call_aliases(
+                &mut state.tool_call_aliases,
+                &completion.tool_call_id,
+                raw_tool_call_id.as_deref(),
+                message_id.as_deref(),
+            );
+            output
+        };
+
+        let (tool_call_id, tool_name, tool_result, success, error) = completion_to_emit;
+        self.emit_event(json!({
+            "kind": "ToolExecutionCompleted",
+            "data": {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_result": tool_result,
+                "success": success,
+                "error": error,
+            }
+        }));
+    }
+
     async fn handle_tool_call(&self, params: &Value) {
+        if self.state.lock().await.replaying_history {
+            self.handle_replay_tool_call(params).await;
+            return;
+        }
+
         let Some(request) = parse_tool_call_request(params) else {
             self.emit_event(json!({
                 "kind": "SubprocessStderr",
@@ -1210,6 +1434,11 @@ impl KiroInner {
     }
 
     async fn handle_tool_call_update(&self, params: &Value) {
+        if self.state.lock().await.replaying_history {
+            self.handle_replay_tool_call_update(params).await;
+            return;
+        }
+
         let raw_tool_call_id =
             extract_kiro_tool_call_id(params).map(|raw| normalize_tool_call_id_fragment(&raw));
         let message_id = extract_kiro_message_id(params);
@@ -1432,6 +1661,12 @@ impl KiroInner {
             .unwrap_or("Kiro error")
             .to_string();
 
+        if self.state.lock().await.replaying_history {
+            self.set_replay_error(format!("Kiro session replay failed: {message}"))
+                .await;
+            return;
+        }
+
         self.clear_active_stream().await;
         self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
         self.emit_event(json!({ "kind": "Error", "data": message }));
@@ -1442,7 +1677,11 @@ impl KiroInner {
             return;
         };
         let text = text.trim().to_string();
-        if text.is_empty() {
+        self.emit_replay_assistant_message_text(text, false).await;
+    }
+
+    async fn emit_replay_assistant_message_text(&self, text: String, allow_empty: bool) {
+        if text.is_empty() && !allow_empty {
             return;
         }
 
@@ -1466,6 +1705,10 @@ impl KiroInner {
                 "images": [],
             }
         }));
+        self.state
+            .lock()
+            .await
+            .replay_assistant_message_emitted_since_user = true;
     }
 
     async fn flush_replay_assistant_message(&self) {
@@ -3178,8 +3421,10 @@ impl Backend for KiroBackend {
         let events_tx_task = events_tx.clone();
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let known_session_id_task = Arc::clone(&known_session_id);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
         tokio::spawn(async move {
+            let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
             let roots = if workspace_roots.is_empty() {
                 vec!["/tmp".to_string()]
             } else {
@@ -3199,6 +3444,9 @@ impl Backend for KiroBackend {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::error!("Failed to spawn Kiro resume session: {err}");
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(format!("Failed to spawn Kiro resume session: {err}")));
+                    }
                     return;
                 }
             };
@@ -3211,6 +3459,9 @@ impl Backend for KiroBackend {
                 .await
             {
                 tracing::error!("Failed to resume Kiro session: {err}");
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!("Failed to resume Kiro session: {err}")));
+                }
                 session.shutdown().await;
                 return;
             }
@@ -3232,8 +3483,16 @@ impl Backend for KiroBackend {
                     .await
             {
                 tracing::error!("Failed to configure resumed Kiro session: {err}");
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!(
+                        "Failed to configure resumed Kiro session: {err}"
+                    )));
+                }
                 session.shutdown().await;
                 return;
+            }
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Ok(()));
             }
 
             let events_tx_forward = events_tx_task.clone();
@@ -3312,6 +3571,12 @@ impl Backend for KiroBackend {
             session.shutdown().await;
             let _ = forward_task.await;
         });
+
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err("Kiro resume initialization task ended early".to_string()),
+        }
 
         Ok((
             Self {
@@ -3642,6 +3907,171 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             std::fs::set_permissions(&path, perms).expect("chmod fake kiro acp program");
         }
         path
+    }
+
+    fn write_fake_kiro_restore_program() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tyde-kiro-restore-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake kiro restore tempdir");
+        let path = dir.join("fake-kiro-restore-acp");
+        let script = r#"#!/bin/sh
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kiro-bootstrap-session","models":{"currentModelId":"auto"}}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"restore this"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","kind":"read","title":"read","toolCallId":"tooluse_restore_read","rawInput":{"ops":[{"path":"README.md"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"read","title":"read","toolCallId":"tooluse_restore_read","status":"completed","rawOutput":{"items":[{"Text":"hello"}]}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","rawInput":{"command":"grep missing README.md","working_dir":"."}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"tool_call_update","kind":"execute","title":"grep","toolCallId":"tooluse_restore_grep","status":"cancelled","rawOutput":{"items":[]},"error":{"message":"grep was cancelled"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kiro-restored-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"restored done"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-session","models":{"currentModelId":"auto"}}}'
+"#;
+        std::fs::write(&path, script).expect("write fake kiro restore program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .expect("stat fake kiro restore program")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod fake kiro restore program");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn resume_session_replays_tool_history_as_valid_transcript_events() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "tyde-kiro-restore-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create fake restore workspace");
+        let program = write_fake_kiro_restore_program();
+
+        let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
+            &[workspace_root.to_string_lossy().to_string()],
+            None,
+            None,
+            &[],
+            None,
+            Some(program.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("spawn fake restore kiro session");
+
+        let handle = session.command_handle();
+        handle
+            .execute(SessionCommand::ResumeSession {
+                session_id: "kiro-restored-session".to_string(),
+            })
+            .await
+            .expect("resume fake kiro session");
+
+        let mut events = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(25), raw_events.recv()).await {
+                Ok(Some(value)) => {
+                    if let Some(event) = map_kiro_value_to_chat_event(&value) {
+                        events.push(event);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::StreamStart(_) | ChatEvent::StreamEnd(_))),
+            "restored transcript should not synthesize live stream boundaries: {events:?}"
+        );
+
+        let tool_requests = events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
+            .count();
+        let failed_completions = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ChatEvent::ToolExecutionCompleted(completion) if !completion.success
+                )
+            })
+            .count();
+        assert_eq!(
+            tool_requests, 2,
+            "expected replayed tool requests: {events:?}"
+        );
+        assert_eq!(
+            failed_completions, 1,
+            "expected cancelled replayed tool completion: {events:?}"
+        );
+
+        let host_stream = protocol::StreamPath("/host/test".to_string());
+        let agent_stream = protocol::StreamPath("/agent/test-agent/test-instance".to_string());
+        let agent_id = protocol::AgentId("test-agent".to_string());
+        let mut validator = protocol::ProtocolValidator::new();
+        let new_agent = protocol::Envelope::from_payload(
+            host_stream,
+            protocol::FrameKind::NewAgent,
+            0,
+            &protocol::NewAgentPayload {
+                agent_id: agent_id.clone(),
+                name: "test".to_string(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Kiro,
+                workspace_roots: vec![workspace_root.to_string_lossy().to_string()],
+                custom_agent_id: None,
+                project_id: None,
+                parent_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: agent_stream.clone(),
+            },
+        )
+        .expect("serialize NewAgent");
+        validator
+            .validate_envelope(&new_agent)
+            .expect("validate NewAgent");
+
+        let agent_start = protocol::Envelope::from_payload(
+            agent_stream.clone(),
+            protocol::FrameKind::AgentStart,
+            0,
+            &protocol::AgentStartPayload {
+                agent_id,
+                name: "test".to_string(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Kiro,
+                workspace_roots: vec![workspace_root.to_string_lossy().to_string()],
+                custom_agent_id: None,
+                project_id: None,
+                parent_agent_id: None,
+                created_at_ms: 0,
+            },
+        )
+        .expect("serialize AgentStart");
+        validator
+            .validate_envelope(&agent_start)
+            .expect("validate AgentStart");
+
+        for (index, event) in events.iter().enumerate() {
+            let env = protocol::Envelope::from_payload(
+                agent_stream.clone(),
+                protocol::FrameKind::ChatEvent,
+                index as u64 + 1,
+                event,
+            )
+            .expect("serialize ChatEvent");
+            validator
+                .validate_envelope(&env)
+                .unwrap_or_else(|error| panic!("restored event violated protocol: {error}"));
+        }
+
+        session.shutdown().await;
     }
 
     #[tokio::test]
