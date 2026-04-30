@@ -4334,39 +4334,25 @@ kbd {
     background: var(--accent-primary);
 }
 
+/* Gutters and prefixes used to be `position: sticky; left: 0/48/96px` so
+   they stayed visible during horizontal scroll on long lines. Sticky has
+   a per-row paint cost the browser pays on every scroll event regardless
+   of axis, and with virtualization rendering ~80 rows that's ~240 sticky
+   recalcs per scroll frame — visibly jarring. Most diffs don't have
+   lines wide enough to actually scroll horizontally, so the cost was
+   paid for a rare benefit.
+   Tradeoff: on wide-line diffs (e.g. minified files) the gutter now
+   scrolls off-left with the rest of the row. User has to scroll back
+   left to see line numbers. Acceptable; `:hover` to read a number
+   isn't great but neither is the paint flash. If a user complains
+   we'll do the proper architectural fix (separate gutter column
+   outside the horizontal-scroll area). */
 .diff-pane .diff-gutter,
-.diff-pane .diff-prefix {
-    position: sticky;
-    z-index: 1;
-    background: var(--surface-base);
-}
-
-.diff-pane .diff-gutter {
-    left: 0;
-}
-
-.diff-pane .diff-prefix {
-    left: 48px;
-}
-
+.diff-pane .diff-prefix,
 .diff-hunks .diff-gutter-old,
 .diff-hunks .diff-gutter-new,
 .diff-hunks .diff-prefix {
-    position: sticky;
-    z-index: 1;
     background: var(--surface-base);
-}
-
-.diff-hunks .diff-gutter-old {
-    left: 0;
-}
-
-.diff-hunks .diff-gutter-new {
-    left: 48px;
-}
-
-.diff-hunks .diff-prefix {
-    left: 96px;
 }
 
 .diff-line-empty {
