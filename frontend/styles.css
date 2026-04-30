@@ -783,6 +783,46 @@ details summary:focus:not(:focus-visible) {
     background: var(--accent-hover);
 }
 
+.browser-host-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.browser-host-select {
+    appearance: none;
+    -webkit-appearance: none;
+    padding: 5px 28px 5px 10px;
+    background: var(--surface-2);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 12px 12px;
+    color: var(--text-primary);
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    font-size: 0.9rem;
+    font-family: inherit;
+    cursor: pointer;
+    min-width: 180px;
+}
+
+.browser-host-select:hover:not(:disabled) {
+    background-color: var(--surface-3);
+}
+
+.browser-host-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.browser-host-select option {
+    background: var(--surface-1);
+    color: var(--text-primary);
+}
+
 .browser-path {
     padding: var(--space-2) var(--space-3);
     color: var(--text-secondary);

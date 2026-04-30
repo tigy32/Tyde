@@ -476,8 +476,8 @@ pub enum BrowsePurpose {
 
 #[derive(Clone, Debug)]
 pub struct BrowseDialogState {
-    pub host_id: String,
-    pub browse_stream: StreamPath,
+    pub host_id: ArcRwSignal<String>,
+    pub browse_stream: ArcRwSignal<StreamPath>,
     pub purpose: BrowsePurpose,
     pub include_hidden: ArcRwSignal<bool>,
     /// Set once `HostBrowseOpened` arrives.

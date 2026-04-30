@@ -2,24 +2,51 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    FrameKind, HostAbsPath, HostBrowseClosePayload, HostBrowseListPayload, HostBrowseStartPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectFileKind, StreamPath,
+    FrameKind, HostAbsPath, HostBrowseClosePayload, HostBrowseErrorCode, HostBrowseErrorPayload,
+    HostBrowseListPayload, HostBrowseStartPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectFileKind, StreamPath,
 };
 
 use crate::send::send_frame;
-use crate::state::{AppState, BrowseDialogState, BrowsePurpose};
+use crate::state::{AppState, BrowseDialogState, BrowsePurpose, ConnectionStatus};
 
 fn new_browse_stream() -> StreamPath {
     let id = (js_sys::Math::random() * 1_000_000_000_000.0) as u64;
     StreamPath(format!("/browse/{id}"))
 }
 
+/// Pick the host the modal should open against. Prefers the Settings-selected
+/// host when it is connected; otherwise falls back to the first configured
+/// host with an active stream. Returns `None` when no host is currently
+/// usable — callers must surface that to the user.
+fn pick_initial_host(state: &AppState) -> Option<(String, StreamPath)> {
+    if let Some((host_id, stream)) = state.selected_host_stream_untracked()
+        && matches!(
+            state.connection_status_for_host(&host_id),
+            ConnectionStatus::Connected
+        )
+    {
+        return Some((host_id, stream));
+    }
+    let statuses = state.connection_statuses.get_untracked();
+    let streams = state.host_streams.get_untracked();
+    state
+        .configured_hosts
+        .get_untracked()
+        .into_iter()
+        .find_map(|host| {
+            let connected = matches!(statuses.get(&host.id), Some(ConnectionStatus::Connected));
+            let stream = streams.get(&host.id).cloned()?;
+            connected.then_some((host.id, stream))
+        })
+}
+
 pub fn open_project_browser(state: &AppState) {
-    let Some((host_id, _host_stream)) = state.selected_host_stream_untracked() else {
-        log::error!("cannot open browser without a selected connected host");
+    let Some((host_id, host_stream)) = pick_initial_host(state) else {
+        log::error!("cannot open browser: no connected host available");
         return;
     };
-    open_browser_for(state, host_id, BrowsePurpose::OpenProject);
+    open_browser_for(state, host_id, host_stream, BrowsePurpose::OpenProject);
 }
 
 pub fn open_add_root_browser(state: &AppState) {
@@ -27,20 +54,33 @@ pub fn open_add_root_browser(state: &AppState) {
         log::error!("cannot add a root without an active project");
         return;
     };
+    let Some(host_stream) = state.host_stream_untracked(&active_project.host_id) else {
+        log::error!(
+            "cannot add a root: host {} has no active stream",
+            active_project.host_id
+        );
+        return;
+    };
     open_browser_for(
         state,
         active_project.host_id,
+        host_stream,
         BrowsePurpose::AddRoot {
             project_id: active_project.project_id,
         },
     );
 }
 
-fn open_browser_for(state: &AppState, host_id: String, purpose: BrowsePurpose) {
+fn open_browser_for(
+    state: &AppState,
+    host_id: String,
+    host_stream: StreamPath,
+    purpose: BrowsePurpose,
+) {
     let browse_stream = new_browse_stream();
     let dialog = BrowseDialogState {
-        host_id: host_id.clone(),
-        browse_stream: browse_stream.clone(),
+        host_id: ArcRwSignal::new(host_id.clone()),
+        browse_stream: ArcRwSignal::new(browse_stream.clone()),
         purpose,
         include_hidden: ArcRwSignal::new(false),
         platform: ArcRwSignal::new(None),
@@ -54,19 +94,16 @@ fn open_browser_for(state: &AppState, host_id: String, purpose: BrowsePurpose) {
     };
     state.browse_dialog.set(Some(dialog));
 
-    let Some(host_stream_path) = state.host_stream_untracked(&host_id) else {
-        log::error!("host {host_id} has no active host stream");
-        state.browse_dialog.set(None);
-        return;
-    };
-
+    let state_for_task = state.clone();
+    let host_id_for_err = host_id.clone();
+    let browse_stream_for_err = browse_stream.clone();
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
-            host_stream_path,
+            host_stream,
             FrameKind::HostBrowseStart,
             &HostBrowseStartPayload {
-                browse_stream,
+                browse_stream: browse_stream.clone(),
                 initial: None,
                 include_hidden: false,
             },
@@ -74,16 +111,29 @@ fn open_browser_for(state: &AppState, host_id: String, purpose: BrowsePurpose) {
         .await
         {
             log::error!("failed to send HostBrowseStart: {error}");
+            surface_transport_error(
+                &state_for_task,
+                &host_id_for_err,
+                &browse_stream_for_err,
+                format!("failed to start browser: {error}"),
+            );
         }
     });
 }
 
-fn send_list(host_id: &str, browse_stream: StreamPath, path: HostAbsPath, include_hidden: bool) {
-    let host_id = host_id.to_owned();
+fn send_list(
+    state: AppState,
+    host_id: String,
+    browse_stream: StreamPath,
+    path: HostAbsPath,
+    include_hidden: bool,
+) {
+    let host_id_for_err = host_id.clone();
+    let browse_stream_for_err = browse_stream.clone();
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
-            browse_stream,
+            browse_stream.clone(),
             FrameKind::HostBrowseList,
             &HostBrowseListPayload {
                 path,
@@ -93,8 +143,41 @@ fn send_list(host_id: &str, browse_stream: StreamPath, path: HostAbsPath, includ
         .await
         {
             log::error!("failed to send HostBrowseList: {error}");
+            surface_transport_error(
+                &state,
+                &host_id_for_err,
+                &browse_stream_for_err,
+                format!("failed to list directory: {error}"),
+            );
         }
     });
+}
+
+/// Show a transport-level (not server-protocol) error in the dialog, but only
+/// if the dialog is still pointing at the same (host, stream) — otherwise the
+/// user has already moved on and we'd be tainting a fresh stream's state.
+fn surface_transport_error(
+    state: &AppState,
+    host_id: &str,
+    browse_stream: &StreamPath,
+    message: String,
+) {
+    let Some(dialog) = state.browse_dialog.with_untracked(|d| {
+        d.as_ref()
+            .filter(|d| {
+                d.host_id.get_untracked() == host_id
+                    && d.browse_stream.get_untracked() == *browse_stream
+            })
+            .cloned()
+    }) else {
+        return;
+    };
+    dialog.error.set(Some(HostBrowseErrorPayload {
+        path: HostAbsPath(String::new()),
+        code: HostBrowseErrorCode::Internal,
+        message,
+    }));
+    dialog.loading.set(false);
 }
 
 fn close_dialog(state: &AppState) {
@@ -103,8 +186,8 @@ fn close_dialog(state: &AppState) {
     };
     state.browse_dialog.set(None);
 
-    let host_id = dialog.host_id.clone();
-    let browse_stream = dialog.browse_stream.clone();
+    let host_id = dialog.host_id.get_untracked();
+    let browse_stream = dialog.browse_stream.get_untracked();
     spawn_local(async move {
         if let Err(error) = send_frame(
             &host_id,
@@ -115,6 +198,96 @@ fn close_dialog(state: &AppState) {
         .await
         {
             log::error!("failed to send HostBrowseClose: {error}");
+        }
+    });
+}
+
+/// Switch the still-open dialog to a different host without remounting the
+/// modal. Validates the new host first so a failed switch leaves the old
+/// stream alive and the dialog usable.
+fn switch_host(state: &AppState, dialog: &BrowseDialogState, new_host_id: String) {
+    let old_host_id = dialog.host_id.get_untracked();
+    if old_host_id == new_host_id {
+        return;
+    }
+
+    let Some(new_host_stream) = state.host_stream_untracked(&new_host_id) else {
+        dialog.error.set(Some(HostBrowseErrorPayload {
+            path: HostAbsPath(String::new()),
+            code: HostBrowseErrorCode::Internal,
+            message: format!("host {new_host_id} has no active stream"),
+        }));
+        // Force the host_id signal to fire so the dropdown's prop:value
+        // re-binds back to the old host even though the value didn't change.
+        dialog.host_id.update(|_| {});
+        return;
+    };
+
+    let old_browse_stream = dialog.browse_stream.get_untracked();
+    let new_browse_stream = new_browse_stream();
+    let include_hidden = dialog.include_hidden.get_untracked();
+
+    // Atomically swap the dialog onto the new (host, stream) BEFORE issuing
+    // any frames. Late events from the old stream then fail the dispatcher's
+    // (host_id, browse_stream) match check.
+    let dialog_for_batch = dialog.clone();
+    let new_host_id_for_batch = new_host_id.clone();
+    let new_browse_stream_for_batch = new_browse_stream.clone();
+    leptos::prelude::batch(move || {
+        dialog_for_batch.host_id.set(new_host_id_for_batch);
+        dialog_for_batch
+            .browse_stream
+            .set(new_browse_stream_for_batch);
+        dialog_for_batch.platform.set(None);
+        dialog_for_batch.separator.set('/');
+        dialog_for_batch.home.set(None);
+        dialog_for_batch.current_path.set(None);
+        dialog_for_batch.parent.set(None);
+        dialog_for_batch.entries.set(Vec::new());
+        dialog_for_batch.error.set(None);
+        dialog_for_batch.loading.set(true);
+    });
+
+    // Sequence Start-on-new before Close-on-old inside one task. If Close
+    // arrived at the server before its matching Start, the server would
+    // no-op the close, then later register a stream nobody will close — a
+    // leak.
+    let state_for_task = state.clone();
+    let new_host_id_for_task = new_host_id;
+    let new_browse_stream_for_task = new_browse_stream;
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &new_host_id_for_task,
+            new_host_stream,
+            FrameKind::HostBrowseStart,
+            &HostBrowseStartPayload {
+                browse_stream: new_browse_stream_for_task.clone(),
+                initial: None,
+                include_hidden,
+            },
+        )
+        .await
+        {
+            log::error!("failed to send HostBrowseStart on switch: {error}");
+            surface_transport_error(
+                &state_for_task,
+                &new_host_id_for_task,
+                &new_browse_stream_for_task,
+                format!("failed to start browser on {new_host_id_for_task}: {error}"),
+            );
+            // Fall through and still close the old stream — the dialog has
+            // already moved off it.
+        }
+
+        if let Err(error) = send_frame(
+            &old_host_id,
+            old_browse_stream,
+            FrameKind::HostBrowseClose,
+            &HostBrowseClosePayload::default(),
+        )
+        .await
+        {
+            log::error!("failed to send HostBrowseClose on old stream: {error}");
         }
     });
 }
@@ -139,6 +312,8 @@ pub fn HostBrowser() -> impl IntoView {
 fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let state = expect_context::<AppState>();
 
+    let host_id_signal = dialog.host_id.clone();
+    let browse_stream_signal = dialog.browse_stream.clone();
     let current_path = dialog.current_path.clone();
     let parent = dialog.parent.clone();
     let entries = dialog.entries.clone();
@@ -146,19 +321,18 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let loading = dialog.loading.clone();
     let include_hidden = dialog.include_hidden.clone();
 
-    let host_id = dialog.host_id.clone();
-    let browse_stream = dialog.browse_stream.clone();
-
     let navigate_to = {
-        let host_id = host_id.clone();
-        let browse_stream = browse_stream.clone();
+        let state = state.clone();
+        let host_id_signal = host_id_signal.clone();
+        let browse_stream_signal = browse_stream_signal.clone();
         let include_hidden = include_hidden.clone();
         let loading = loading.clone();
         move |path: HostAbsPath| {
             loading.set(true);
             send_list(
-                &host_id,
-                browse_stream.clone(),
+                state.clone(),
+                host_id_signal.get_untracked(),
+                browse_stream_signal.get_untracked(),
                 path,
                 include_hidden.get_untracked(),
             );
@@ -177,13 +351,14 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
         }
     };
 
-    // Keep the address bar synced with current_path
+    // Sync the address bar with current_path. When switching hosts resets
+    // current_path to None, also clear the bar so the previous host's path
+    // doesn't linger while the new host loads.
     {
         let current_path = current_path.clone();
-        Effect::new(move |_| {
-            if let Some(path) = current_path.get() {
-                address_input.set(path.0);
-            }
+        Effect::new(move |_| match current_path.get() {
+            Some(path) => address_input.set(path.0),
+            None => address_input.set(String::new()),
         });
     }
 
@@ -239,7 +414,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let state_for_confirm = state.clone();
     let current_path_for_confirm = current_path.clone();
     let dialog_purpose = dialog.purpose.clone();
-    let dialog_host_id_for_confirm = dialog.host_id.clone();
+    let host_id_for_confirm = host_id_signal.clone();
     let on_confirm = move |_| {
         let Some(path) = current_path_for_confirm.get_untracked() else {
             return;
@@ -252,7 +427,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     .find(|segment| !segment.is_empty())
                     .unwrap_or(&path.0)
                     .to_owned();
-                let host_id = dialog_host_id_for_confirm.clone();
+                let host_id = host_id_for_confirm.get_untracked();
                 let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
                     log::error!("cannot create project without a connected dialog host");
                     return;
@@ -275,7 +450,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 close_dialog(&state_for_confirm);
             }
             BrowsePurpose::AddRoot { project_id } => {
-                let host_id = dialog_host_id_for_confirm.clone();
+                let host_id = host_id_for_confirm.get_untracked();
                 let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
                     log::error!("cannot add root without a connected dialog host");
                     return;
@@ -304,6 +479,65 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let on_modal_keydown = move |ev: web_sys::KeyboardEvent| {
         if ev.key() == "Escape" {
             close_dialog(&state_for_esc);
+        }
+    };
+
+    // Host dropdown is meaningless for AddRoot — the project lives on a
+    // single host. Disable the control entirely in that mode.
+    let allow_host_switch = matches!(dialog.purpose, BrowsePurpose::OpenProject);
+
+    let dropdown_view = {
+        let state = state.clone();
+        let host_id_signal = host_id_signal.clone();
+        let dialog = dialog.clone();
+        move || {
+            let current_host = host_id_signal.get();
+            let configured = state.configured_hosts.get();
+            let statuses = state.connection_statuses.get();
+            let streams = state.host_streams.get();
+            let options = configured
+                .into_iter()
+                .map(|host| {
+                    let connected =
+                        matches!(statuses.get(&host.id), Some(ConnectionStatus::Connected))
+                            && streams.contains_key(&host.id);
+                    let selected = host.id == current_host;
+                    let label = if connected {
+                        host.label.clone()
+                    } else {
+                        format!("{} (disconnected)", host.label)
+                    };
+                    // Disable disconnected hosts unless this is the one
+                    // currently shown — we still need to be able to render
+                    // its option as selected.
+                    let disabled = !connected && !selected;
+                    view! {
+                        <option value=host.id.clone() disabled=disabled selected=selected>
+                            {label}
+                        </option>
+                    }
+                })
+                .collect_view();
+            let on_change = {
+                let state = state.clone();
+                let dialog = dialog.clone();
+                move |ev: web_sys::Event| {
+                    let new_host_id = event_target_value(&ev);
+                    switch_host(&state, &dialog, new_host_id);
+                }
+            };
+            let host_id_for_value = host_id_signal.clone();
+            view! {
+                <select
+                    class="browser-host-select"
+                    prop:value=move || host_id_for_value.get()
+                    on:change=on_change
+                    disabled=!allow_host_switch
+                    title="Choose host"
+                >
+                    {options}
+                </select>
+            }
         }
     };
 
@@ -433,6 +667,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                     />
                     <button class="browser-btn" on:click=on_toggle_hidden>{hidden_label}</button>
                 </div>
+                <div class="browser-host-row">{dropdown_view}</div>
                 <div class="browser-path">{path_display}</div>
                 {error_view}
                 {loading_view}

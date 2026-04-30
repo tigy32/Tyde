@@ -1038,7 +1038,9 @@ fn active_browse_dialog(
     state.browse_dialog.with_untracked(|dialog| {
         dialog
             .as_ref()
-            .filter(|d| d.host_id == host_id && &d.browse_stream == stream)
+            .filter(|d| {
+                d.host_id.get_untracked() == host_id && d.browse_stream.get_untracked() == *stream
+            })
             .cloned()
     })
 }
