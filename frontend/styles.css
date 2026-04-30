@@ -4235,12 +4235,6 @@ kbd {
     font-size: 0.923rem;
     line-height: 20px;
     min-height: 20px;
-    /* Paint isolation: tells the browser this row's layout, paint, and
-       style are independent of its siblings. With many sticky-positioned
-       gutter children, this lets the browser skip recomputing sticky
-       offsets across all rows on every scroll frame, eliminating the
-       paint flash users see during fast scroll. */
-    contain: layout paint style;
 }
 
 .diff-line-context {
@@ -4514,10 +4508,6 @@ kbd {
     display: flex;
     line-height: 20px;
     min-height: 20px;
-    /* Same paint-isolation trick as `.diff-line` — independent rows so
-       the browser doesn't recompute layout/paint across all visible rows
-       during scroll. */
-    contain: layout paint style;
 }
 
 .file-line-num {
