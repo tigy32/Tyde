@@ -19,6 +19,7 @@ pub struct ProxyRouterHandle {
 }
 
 struct ConnectedHost {
+    app: AppHandle,
     connection_id: u64,
     tx: mpsc::Sender<ConnectionCommand>,
 }
@@ -39,6 +40,16 @@ enum RouterCommand {
         host_id: String,
         line: String,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    ConnectionLine {
+        host_id: String,
+        connection_id: u64,
+        line: String,
+    },
+    ConnectionError {
+        host_id: String,
+        connection_id: u64,
+        message: String,
     },
     ConnectionClosed {
         host_id: String,
@@ -140,7 +151,14 @@ async fn router_actor(
                 let connection_id = next_connection_id;
                 next_connection_id += 1;
 
-                let setup = match setup_connection_transport(&app, &host_id, transport, host).await
+                let setup = match setup_connection_transport(
+                    &host_id,
+                    connection_id,
+                    router_tx.clone(),
+                    transport,
+                    host,
+                )
+                .await
                 {
                     Ok(setup) => setup,
                     Err(err) => {
@@ -151,7 +169,6 @@ async fn router_actor(
                 let (connection_tx, connection_rx) = mpsc::channel(64);
                 tokio::spawn(connection_actor(
                     ConnectionActorContext {
-                        app,
                         host_id: host_id.clone(),
                         connection_id,
                         rx: connection_rx,
@@ -164,6 +181,7 @@ async fn router_actor(
                 hosts.insert(
                     host_id.clone(),
                     ConnectedHost {
+                        app,
                         connection_id,
                         tx: connection_tx,
                     },
@@ -199,6 +217,51 @@ async fn router_actor(
                     .send(ConnectionCommand::SendLine { line, reply })
                     .await;
             }
+            RouterCommand::ConnectionLine {
+                host_id,
+                connection_id,
+                line,
+            } => {
+                let Some(connected) = current_connection(&hosts, &host_id, connection_id) else {
+                    tracing::debug!(
+                        host_id,
+                        connection_id,
+                        line_len = line.len(),
+                        "discarding line from stale host connection"
+                    );
+                    continue;
+                };
+                if let Err(error) = connected.app.emit(
+                    HOST_LINE_EVENT,
+                    HostLineEvent {
+                        host_id: host_id.clone(),
+                        line,
+                    },
+                ) {
+                    let _ = emit_error(
+                        &connected.app,
+                        &host_id,
+                        format!("failed to emit host line: {error}"),
+                    );
+                }
+            }
+            RouterCommand::ConnectionError {
+                host_id,
+                connection_id,
+                message,
+            } => {
+                let Some(connected) = current_connection(&hosts, &host_id, connection_id) else {
+                    tracing::debug!(
+                        host_id,
+                        connection_id,
+                        message,
+                        "discarding error from stale host connection"
+                    );
+                    continue;
+                };
+                tracing::warn!(host_id, connection_id, "{message}");
+                let _ = emit_error(&connected.app, &host_id, message);
+            }
             RouterCommand::ConnectionClosed {
                 host_id,
                 connection_id,
@@ -208,12 +271,27 @@ async fn router_actor(
                     .map(|connected| connected.connection_id == connection_id)
                     .unwrap_or(false);
                 tracing::info!(host_id, connection_id, should_remove, "connection closed");
-                if should_remove {
-                    hosts.remove(&host_id);
+                if should_remove && let Some(connected) = hosts.remove(&host_id) {
+                    let _ = connected.app.emit(
+                        HOST_DISCONNECTED_EVENT,
+                        HostDisconnectedEvent {
+                            host_id: host_id.clone(),
+                        },
+                    );
                 }
             }
         }
     }
+}
+
+fn current_connection<'a>(
+    hosts: &'a HashMap<String, ConnectedHost>,
+    host_id: &str,
+    connection_id: u64,
+) -> Option<&'a ConnectedHost> {
+    hosts
+        .get(host_id)
+        .filter(|connected| connected.connection_id == connection_id)
 }
 
 struct ConnectionSetup {
@@ -223,7 +301,6 @@ struct ConnectionSetup {
 }
 
 struct ConnectionActorContext {
-    app: AppHandle,
     host_id: String,
     connection_id: u64,
     rx: mpsc::Receiver<ConnectionCommand>,
@@ -242,7 +319,6 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     let ConnectionActorContext {
-        app,
         host_id,
         connection_id,
         mut rx,
@@ -260,21 +336,30 @@ where
                         let line = trim_line_ending(incoming);
                         tracing::info!(
                             host_id,
+                            connection_id,
                             line_len = line.len(),
                             "proxy router received line from host"
                         );
-                        if let Err(error) = app.emit(
-                            HOST_LINE_EVENT,
-                            HostLineEvent {
+                        if router_tx
+                            .send(RouterCommand::ConnectionLine {
                                 host_id: host_id.clone(),
+                                connection_id,
                                 line,
-                            },
-                        ) {
-                            let _ = emit_error(&app, &host_id, format!("failed to emit host line: {error}"));
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
                         }
                     }
                     Err(error) => {
-                        let _ = emit_error(&app, &host_id, format!("failed to read from host connection: {error}"));
+                        let _ = router_tx
+                            .send(RouterCommand::ConnectionError {
+                                host_id: host_id.clone(),
+                                connection_id,
+                                message: format!("failed to read from host connection: {error}"),
+                            })
+                            .await;
                         break;
                     }
                 }
@@ -295,16 +380,22 @@ where
         ConnectionCleanup::None => {}
         ConnectionCleanup::Child(child) => {
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            match child.wait().await {
+                Ok(status) => {
+                    tracing::info!(host_id, connection_id, %status, "ssh transport exited");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        host_id,
+                        connection_id,
+                        %error,
+                        "failed to wait for ssh transport exit"
+                    );
+                }
+            }
         }
     }
 
-    let _ = app.emit(
-        HOST_DISCONNECTED_EVENT,
-        HostDisconnectedEvent {
-            host_id: host_id.clone(),
-        },
-    );
     let _ = router_tx
         .send(RouterCommand::ConnectionClosed {
             host_id,
@@ -353,8 +444,9 @@ fn trim_line_ending(mut line: String) -> String {
 }
 
 async fn setup_connection_transport(
-    app: &AppHandle,
     host_id: &str,
+    connection_id: u64,
+    router_tx: mpsc::Sender<RouterCommand>,
     transport: HostTransportConfig,
     host: server::HostHandle,
 ) -> Result<ConnectionSetup, String> {
@@ -417,7 +509,7 @@ async fn setup_connection_transport(
                 .ok_or_else(|| format!("ssh transport for host {host_id} has no stdin"))?;
 
             if let Some(stderr) = child.stderr.take() {
-                let app = app.clone();
+                let router_tx = router_tx.clone();
                 let host_id = host_id.to_string();
                 tokio::spawn(async move {
                     let mut stderr = BufReader::new(stderr);
@@ -430,15 +522,26 @@ async fn setup_connection_transport(
                                 if line.is_empty() {
                                     continue;
                                 }
-                                tracing::warn!(host_id, "{line}");
-                                let _ = emit_error(&app, &host_id, format!("ssh: {line}"));
+                                if router_tx
+                                    .send(RouterCommand::ConnectionError {
+                                        host_id: host_id.clone(),
+                                        connection_id,
+                                        message: format!("ssh: {line}"),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(error) => {
-                                let _ = emit_error(
-                                    &app,
-                                    &host_id,
-                                    format!("failed to read ssh stderr: {error}"),
-                                );
+                                let _ = router_tx
+                                    .send(RouterCommand::ConnectionError {
+                                        host_id: host_id.clone(),
+                                        connection_id,
+                                        message: format!("failed to read ssh stderr: {error}"),
+                                    })
+                                    .await;
                                 break;
                             }
                         }
