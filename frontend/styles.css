@@ -4317,6 +4317,18 @@ kbd {
     overflow-x: auto;
     overflow-y: visible;
     min-width: 0;
+    /* Hide the per-pane horizontal scrollbar. With two panes side by
+       side, two visible scrollbars stacked under each other is jarring
+       and most diffs don't even need horizontal scroll. The pane is
+       still horizontally scrollable via shift+wheel / trackpad gestures
+       when content overflows; the JS scroll-sync below keeps left and
+       right panes locked together so the user always sees corresponding
+       columns of code. */
+    scrollbar-width: none; /* Firefox */
+}
+
+.diff-pane::-webkit-scrollbar {
+    display: none; /* Chrome/Safari/Edge */
 }
 
 .diff-pane-right {

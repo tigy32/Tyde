@@ -692,6 +692,8 @@ fn render_sbs_panes(
     split: RwSignal<f64>,
 ) -> AnyView {
     let pair_ref = NodeRef::<leptos::html::Div>::new();
+    let left_pane_ref = NodeRef::<leptos::html::Div>::new();
+    let right_pane_ref = NodeRef::<leptos::html::Div>::new();
 
     // Compute per-hunk dual syntax tokens **once** for the file, then share
     // between left and right panes. Without this both panes would re-tokenize
@@ -727,9 +729,44 @@ fn render_sbs_panes(
         start_divider_drag(pair_ref, split);
     };
 
+    // Same horizontal scroll-sync handlers as in `render_sbs_virtualized`.
+    // Both code paths use the same `.diff-pane` selector so the CSS
+    // `scrollbar-width: none` applies to both; the JS sync below makes
+    // the panes scroll together horizontally so corresponding columns
+    // stay aligned for visual diff comparison.
+    let on_left_scroll = move |_: web_sys::Event| {
+        let Some(left) = left_pane_ref.get_untracked() else {
+            return;
+        };
+        let Some(right) = right_pane_ref.get_untracked() else {
+            return;
+        };
+        let lsl = left.scroll_left();
+        if right.scroll_left() != lsl {
+            right.set_scroll_left(lsl);
+        }
+    };
+    let on_right_scroll = move |_: web_sys::Event| {
+        let Some(left) = left_pane_ref.get_untracked() else {
+            return;
+        };
+        let Some(right) = right_pane_ref.get_untracked() else {
+            return;
+        };
+        let rsl = right.scroll_left();
+        if left.scroll_left() != rsl {
+            left.set_scroll_left(rsl);
+        }
+    };
+
     view! {
         <div class="diff-pair" node_ref=pair_ref>
-            <div class="diff-pane diff-pane-left" style=left_style>
+            <div
+                class="diff-pane diff-pane-left"
+                style=left_style
+                node_ref=left_pane_ref
+                on:scroll=on_left_scroll
+            >
                 {render_sbs_pane_content(
                     SbsSide::Left,
                     file_left,
@@ -746,7 +783,11 @@ fn render_sbs_panes(
                 title="Drag to resize"
                 on:mousedown=on_divider_mousedown
             ></div>
-            <div class="diff-pane diff-pane-right">
+            <div
+                class="diff-pane diff-pane-right"
+                node_ref=right_pane_ref
+                on:scroll=on_right_scroll
+            >
                 {render_sbs_pane_content(
                     SbsSide::Right,
                     file_right,
@@ -923,6 +964,43 @@ fn render_sbs_virtualized(
 
     let scroll = expect_context::<DiffScroll>();
     let pair_ref = NodeRef::<leptos::html::Div>::new();
+    let left_pane_ref = NodeRef::<leptos::html::Div>::new();
+    let right_pane_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Horizontal scroll-sync handlers wired directly via `on:scroll`
+    // below. When either pane scrolls, copy scrollLeft to the other
+    // pane. The "set only if different" check breaks the feedback loop
+    // — once both panes match, the other pane's scroll-event handler
+    // sees equal values and exits.
+    //
+    // Goal: make SBS panes feel like a single horizontally-scrollable
+    // surface (combined with the hidden CSS scrollbars on `.diff-pane`)
+    // so corresponding columns of code stay visually aligned even on
+    // wide-line diffs.
+    let on_left_scroll = move |_: web_sys::Event| {
+        let Some(left) = left_pane_ref.get_untracked() else {
+            return;
+        };
+        let Some(right) = right_pane_ref.get_untracked() else {
+            return;
+        };
+        let lsl = left.scroll_left();
+        if right.scroll_left() != lsl {
+            right.set_scroll_left(lsl);
+        }
+    };
+    let on_right_scroll = move |_: web_sys::Event| {
+        let Some(left) = left_pane_ref.get_untracked() else {
+            return;
+        };
+        let Some(right) = right_pane_ref.get_untracked() else {
+            return;
+        };
+        let rsl = right.scroll_left();
+        if left.scroll_left() != rsl {
+            left.set_scroll_left(rsl);
+        }
+    };
 
     let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
         let lh = scroll.line_height.get().max(1.0);
@@ -975,7 +1053,12 @@ fn render_sbs_virtualized(
 
     view! {
         <div class="diff-pair" node_ref=pair_ref>
-            <div class="diff-pane diff-pane-left" style=left_style>
+            <div
+                class="diff-pane diff-pane-left"
+                style=left_style
+                node_ref=left_pane_ref
+                on:scroll=on_left_scroll
+            >
                 {pane_left}
             </div>
             <div
@@ -983,7 +1066,11 @@ fn render_sbs_virtualized(
                 title="Drag to resize"
                 on:mousedown=on_divider_mousedown
             ></div>
-            <div class="diff-pane diff-pane-right">
+            <div
+                class="diff-pane diff-pane-right"
+                node_ref=right_pane_ref
+                on:scroll=on_right_scroll
+            >
                 {pane_right}
             </div>
         </div>
