@@ -50,20 +50,6 @@ pub fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
     None
 }
 
-/// Highlight an entire file's text from line 1 with the given syntax. Splits
-/// `text` on `\n`, runs syntect with persistent parser state across lines, and
-/// returns one `LineTokens` per input line. Returns `None` when the file is
-/// over the size cap (caller should fall back to plain text).
-///
-/// The returned vec has the same length as `text.split('\n').count()` — i.e.
-/// it preserves trailing-empty behavior of `split` (a trailing `\n` produces
-/// an extra empty line). Callers rendering line-by-line should use the same
-/// split to align indices.
-pub fn highlight_text(text: &str, syntax: &SyntaxReference) -> Option<Vec<LineTokens>> {
-    let lines: Vec<&str> = text.split('\n').collect();
-    highlight_lines(&lines, syntax)
-}
-
 /// Highlight a sequence of plain text lines (without trailing newlines).
 /// Returns one `LineTokens` per input line, or `None` if the input is too
 /// large.
@@ -95,6 +81,54 @@ fn highlight_lines(lines: &[&str], syntax: &SyntaxReference) -> Option<Vec<LineT
         out.push(tokens);
     }
     Some(out)
+}
+
+/// Stateful per-line highlighter that maintains syntect parser state across
+/// calls. Use when you need to chunk highlighting work (e.g. yielding to the
+/// browser between chunks of a large file) — successive `highlight_one` calls
+/// give the same result as feeding the lines into `highlight_lines` in one go.
+pub struct LineHighlighter {
+    inner: HighlightLines<'static>,
+}
+
+impl LineHighlighter {
+    pub fn new(syntax: &'static SyntaxReference) -> Self {
+        Self {
+            inner: HighlightLines::new(syntax, &THEME),
+        }
+    }
+
+    pub fn highlight_one(&mut self, line: &str) -> LineTokens {
+        let with_nl = format!("{line}\n");
+        let ranges = match self.inner.highlight_line(&with_nl, &SYNTAX_SET) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut tokens: LineTokens = Vec::with_capacity(ranges.len());
+        for (style, text) in ranges {
+            let trimmed = text.strip_suffix('\n').unwrap_or(text);
+            if trimmed.is_empty() {
+                continue;
+            }
+            tokens.push(Token {
+                fg: style.foreground,
+                text: trimmed.to_string(),
+            });
+        }
+        tokens
+    }
+}
+
+/// Force-load the bundled syntax set and theme so the next call doesn't have
+/// to deserialize ~341 KB of grammars on the wasm main thread. Cheap to call
+/// repeatedly; only the first call does real work.
+///
+/// Intended to be invoked once after the app's first paint (via a
+/// `setTimeout(0)`-style yield in `app::App`) so the cost lands during idle
+/// time rather than on the first file open or first markdown render.
+pub fn warm_up() {
+    Lazy::force(&SYNTAX_SET);
+    Lazy::force(&THEME);
 }
 
 /// For a single hunk, compute per-diff-line `LineTokens` for unified

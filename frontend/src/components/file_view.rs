@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState};
 use crate::state::{AppState, TabContent};
-use crate::syntax_highlight::{LineTokens, color_to_css, highlight_text, syntax_for_path};
+use crate::syntax_highlight::{LineHighlighter, LineTokens, color_to_css, syntax_for_path};
 
 use protocol::ProjectPath;
 
@@ -33,6 +34,18 @@ const INITIAL_LINE_HEIGHT_ESTIMATE: f64 = 18.0;
 /// first-paint render to ~80-100 lines for any file size.
 const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
 
+/// How many lines to highlight per yield slice when async-highlighting a
+/// large file. Small enough that the browser stays responsive (each slice
+/// is ~1ms in release, ~30ms in debug for a typical Rust file); large
+/// enough that the per-yield overhead doesn't dominate. Tune if you see
+/// stuttering scroll during initial load.
+const HIGHLIGHT_CHUNK_LINES: usize = 200;
+
+/// Above this line count we never highlight — the wasm main thread can't
+/// realistically tokenize that much without freezing the UI even with
+/// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
+const HIGHLIGHT_LINE_CAP: usize = 5000;
+
 #[component]
 pub fn FileView(path: ProjectPath) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -59,20 +72,6 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                             f.contents.unwrap_or_else(|| "(file not found)".to_owned())
                         };
 
-                        // Highlight the whole file once with persistent
-                        // syntect state so multi-line constructs (block
-                        // comments, raw strings) color correctly across the
-                        // virtualized window. Falls back to None for unknown
-                        // languages or files over the line cap; rendering
-                        // then degrades to plain text per line.
-                        let highlighted: Arc<Vec<Option<LineTokens>>> = Arc::new(
-                            match syntax_for_path(&f.path.relative_path) {
-                                Some(syn) => highlight_text(&content, syn)
-                                    .map(|v| v.into_iter().map(Some).collect())
-                                    .unwrap_or_default(),
-                                None => Vec::new(),
-                            },
-                        );
                         let on_close = move |_| {
                             let state = expect_context::<AppState>();
                             let tab_id = state.center_zone.with_untracked(|cz| {
@@ -90,6 +89,51 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                         let total = lines.len();
                         let find_state = FindState::new((*lines).clone());
                         provide_context(find_state.clone());
+
+                        // Async syntax highlighting. We don't tokenize on
+                        // mount — that would block first paint for ~1s on a
+                        // moderate file in debug builds. Instead we kick off
+                        // a spawn_local task that fills tokens into a signal
+                        // in `HIGHLIGHT_CHUNK_LINES`-sized chunks, yielding
+                        // to the browser between chunks. Each row reads its
+                        // own index from the signal, so visible lines render
+                        // plain text immediately and "fill in" with color
+                        // over the next ~hundred ms as chunks land.
+                        //
+                        // Persistent syntect parser state across chunks is
+                        // critical: it's how multi-line constructs (block
+                        // comments, raw strings) still color correctly even
+                        // though we're processing the file in pieces.
+                        let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> =
+                            ArcRwSignal::new(vec![None; total]);
+                        if total > 0 && total <= HIGHLIGHT_LINE_CAP
+                            && let Some(syntax) = syntax_for_path(&f.path.relative_path)
+                        {
+                            let lines_for_task = lines.clone();
+                            let signal_for_task = highlighted.clone();
+                            spawn_local(async move {
+                                let mut hl = LineHighlighter::new(syntax);
+                                let mut i = 0usize;
+                                while i < lines_for_task.len() {
+                                    let end = (i + HIGHLIGHT_CHUNK_LINES)
+                                        .min(lines_for_task.len());
+                                    let chunk_tokens: Vec<LineTokens> =
+                                        lines_for_task[i..end]
+                                            .iter()
+                                            .map(|l| hl.highlight_one(l))
+                                            .collect();
+                                    signal_for_task.update(|v| {
+                                        for (offset, toks) in chunk_tokens.into_iter().enumerate() {
+                                            if let Some(slot) = v.get_mut(i + offset) {
+                                                *slot = Some(toks);
+                                            }
+                                        }
+                                    });
+                                    i = end;
+                                    yield_to_browser().await;
+                                }
+                            });
+                        }
 
                         let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
 
@@ -199,9 +243,7 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                 >
                                     {
                                         let text = lines_for_render[i].clone();
-                                        let tokens = highlighted_for_render
-                                            .get(i)
-                                            .and_then(|t| t.clone());
+                                        let highlighted_for_row = highlighted_for_render.clone();
                                         let find = find_for_render.clone();
                                         view! {
                                             <div
@@ -209,7 +251,17 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                                 attr:data-find-idx=i
                                             >
                                                 <span class="file-line-num">{i + 1}</span>
-                                                {render_file_line_content(text, tokens)}
+                                                {move || {
+                                                    // Reactive read: when a
+                                                    // chunk lands and updates
+                                                    // the signal, this closure
+                                                    // re-runs and the row
+                                                    // swaps from plain text to
+                                                    // colored spans.
+                                                    let tokens = highlighted_for_row
+                                                        .with(|v| v.get(i).and_then(|t| t.clone()));
+                                                    render_file_line_content(text.clone(), tokens)
+                                                }}
                                             </div>
                                         }
                                     }
@@ -235,6 +287,18 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
             }}
         </div>
     }
+}
+
+/// Yield once to the browser event loop. Wasm has no real background
+/// threads; this is the closest we get to "let the page paint." Used between
+/// syntect highlight chunks so the UI stays responsive on large files.
+async fn yield_to_browser() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
 fn file_line_class(line_idx: usize, find: &FindState) -> &'static str {

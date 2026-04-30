@@ -28,6 +28,18 @@ fn generate_host_stream() -> StreamPath {
     StreamPath(format!("/host/{id}"))
 }
 
+/// Yield once to the browser event loop so any pending paint/layout work
+/// runs before we resume. Wasm has no real background threads; this is the
+/// closest we get to "after the next frame."
+async fn yield_to_browser() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 struct EventListenerHandle {
     window: web_sys::Window,
     event: &'static str,
@@ -414,6 +426,15 @@ pub fn App() -> impl IntoView {
     let listener_token = begin_app_listener_lifecycle();
     set_app_listeners_active(true);
     on_cleanup(clear_app_listeners);
+
+    // Pre-warm syntect AFTER first paint so the first file open / first
+    // markdown render doesn't pay the ~50-200ms grammar-deserialization cost
+    // synchronously. The setTimeout(0) yield lets the initial mount complete
+    // before we touch the lazy statics.
+    spawn_local(async {
+        yield_to_browser().await;
+        crate::syntax_highlight::warm_up();
+    });
 
     let state_for_startup = state.clone();
     Effect::new(move |_| {
