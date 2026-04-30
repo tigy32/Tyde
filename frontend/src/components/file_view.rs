@@ -211,9 +211,25 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                             }
                         });
 
-                        let on_scroll = move |_: web_sys::Event| {
-                            if let Some(el) = pre_ref.get() {
-                                scroll_top.set(el.scroll_top() as f64);
+                        // Throttle to one update per animation frame so the
+                        // visible_window memo only invalidates once per paint
+                        // even on a high-DPI trackpad firing scroll events
+                        // hundreds of times per second.
+                        let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let on_scroll = {
+                            let pending = scroll_pending.clone();
+                            move |_: web_sys::Event| {
+                                if pending.get() {
+                                    return;
+                                }
+                                pending.set(true);
+                                let pending = pending.clone();
+                                leptos::prelude::request_animation_frame(move || {
+                                    pending.set(false);
+                                    if let Some(el) = pre_ref.get() {
+                                        scroll_top.set(el.scroll_top() as f64);
+                                    }
+                                });
                             }
                         };
 

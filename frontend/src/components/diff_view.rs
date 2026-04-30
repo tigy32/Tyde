@@ -24,8 +24,11 @@ const SBS_MAX_FRACTION: f64 = 0.95;
 /// consistent across the two views.
 const INITIAL_LINE_HEIGHT_ESTIMATE: f64 = 18.0;
 const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
-/// Buffer rows rendered outside the visible viewport on each side.
-const OVERSCAN_LINES: f64 = 40.0;
+/// Buffer rows rendered outside the visible viewport on each side. Larger
+/// values reduce mount/unmount churn during fast scroll at the cost of a
+/// slightly bigger DOM. 80 keeps ~3 viewports in DOM at once on typical
+/// laptop displays — enough that wheel-scrolls don't outrun the buffer.
+const OVERSCAN_LINES: f64 = 80.0;
 /// Below this rendered-row total we render every row up front (no spacers,
 /// no scroll math). Keeps the small-diff path identical in DOM shape and
 /// preserves layout assertions for tiny test diffs.
@@ -294,9 +297,27 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
         }
     });
 
-    let on_scroll = move |_: web_sys::Event| {
-        if let Some(el) = scroll_ref.get() {
-            scroll_top.set(el.scroll_top() as f64);
+    // Throttle scroll updates to one per animation frame. Native scroll
+    // events fire faster than 60Hz (often hundreds/sec on a trackpad);
+    // batching means the visible_window memo only invalidates once per
+    // paint, so the `<For>` diffs once per frame and the main thread
+    // doesn't fight itself trying to keep up. Smooths out the
+    // "lines flash blank during fast scroll" pattern users report.
+    let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+    let on_scroll = {
+        let pending = scroll_pending.clone();
+        move |_: web_sys::Event| {
+            if pending.get() {
+                return;
+            }
+            pending.set(true);
+            let pending = pending.clone();
+            leptos::prelude::request_animation_frame(move || {
+                pending.set(false);
+                if let Some(el) = scroll_ref.get() {
+                    scroll_top.set(el.scroll_top() as f64);
+                }
+            });
         }
     };
 
