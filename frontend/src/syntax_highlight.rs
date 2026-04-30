@@ -12,14 +12,33 @@ use protocol::{ProjectGitDiffHunk, ProjectGitDiffLineKind};
 /// freeze the UI.
 const MAX_LINES_TO_HIGHLIGHT: usize = 5000;
 
-/// Default theme name when no preference is stored.
-pub const DEFAULT_THEME_NAME: &str = "base16-ocean.dark";
+/// Default theme name when no preference is stored. Catppuccin Mocha is the
+/// most popular dark theme in 2025 surveys; ships in `two-face`.
+pub const DEFAULT_THEME_NAME: &str = "Catppuccin Mocha";
 
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 
-/// All bundled themes, loaded once. We pick one of these by name based on
-/// the user's selection. Key set is exposed via `available_themes()`.
-static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
+/// All bundled themes. Built from `two-face`'s extra theme set (32 themes
+/// including Catppuccin's 4 flavors, Dracula, GitHub, Monokai variants,
+/// Nord, Gruvbox, OneHalf, Solarized, Sublime Snazzy, TwoDark, Zenburn),
+/// plus the syntect defaults so InspiredGitHub / base16-ocean.* are still
+/// available. Loaded once at startup.
+static THEME_SET: Lazy<ThemeSet> = Lazy::new(|| {
+    let mut set = ThemeSet::load_defaults();
+    let extra = two_face::theme::extra();
+    for name in two_face::theme::EmbeddedLazyThemeSet::theme_names() {
+        let theme = extra.get(*name);
+        set.themes.insert(name.as_name().to_owned(), theme.clone());
+    }
+    // Hide ANSI/Base16-256 — they target terminal palettes, not real
+    // syntax-highlighting colors.
+    set.themes.remove("ansi");
+    set.themes.remove("base16");
+    set.themes.remove("base16-256");
+    // Drop "1337" (`Leet`); it's a meme theme and the contrast is bad.
+    set.themes.remove("1337");
+    set
+});
 
 /// Currently-selected theme name (matches a key in `THEME_SET.themes`).
 /// Empty string falls back to `DEFAULT_THEME_NAME`. Writes are infrequent
