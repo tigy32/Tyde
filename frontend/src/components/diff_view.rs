@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
@@ -17,6 +18,29 @@ use protocol::{
 
 const SBS_MIN_FRACTION: f64 = 0.05;
 const SBS_MAX_FRACTION: f64 = 0.95;
+
+/// Initial estimates used by virtualization until the first measurement
+/// effect refines them. Match `file_view`'s constants so behavior is
+/// consistent across the two views.
+const INITIAL_LINE_HEIGHT_ESTIMATE: f64 = 18.0;
+const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
+/// Buffer rows rendered outside the visible viewport on each side.
+const OVERSCAN_LINES: f64 = 40.0;
+/// Below this rendered-row total we render every row up front (no spacers,
+/// no scroll math). Keeps the small-diff path identical in DOM shape and
+/// preserves layout assertions for tiny test diffs.
+const VIRTUALIZE_THRESHOLD: usize = 200;
+
+/// Geometry signals shared between `DiffContent` and any descendant that
+/// needs to virtualize its rows against the global scroll position. The
+/// scroll signal is updated by `DiffContent`'s `on:scroll`; size signals
+/// are refined by a measurement effect on first paint.
+#[derive(Clone, Copy)]
+struct DiffScroll {
+    scroll_top: RwSignal<f64>,
+    viewport_height: RwSignal<f64>,
+    line_height: RwSignal<f64>,
+}
 
 #[component]
 pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope) -> impl IntoView {
@@ -219,8 +243,65 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
     let find_state = FindState::new(searchable_lines);
     provide_context(find_state);
 
+    // Compute each file's rendered-row offset (its row index in the global
+    // virtual scrolling space). A "rendered row" is anything taking up a
+    // line of vertical real estate: file header, hunk header (only in
+    // Hunks mode), or one diff line. SBS pair rows count as one rendered
+    // row even though they show two cells.
+    //
+    // KNOWN LIMITATION (from codex review): the row-height model treats
+    // file/hunk headers as if they have the same height as a diff line.
+    // They don't, so spacer math accumulates a small drift across many
+    // files. Overscan hides most of it; a future fix is to count distinct
+    // height classes or pin all rows to a uniform line-height.
+    let mut file_rendered_offsets: Vec<usize> = Vec::with_capacity(diff.files.len());
+    let mut acc: usize = 0;
+    for file in &diff.files {
+        file_rendered_offsets.push(acc);
+        acc += rendered_rows_for_file(file, diff.context_mode);
+    }
+
+    // Scroll geometry. Pre-seed line/viewport height estimates so the
+    // visible window is bounded from the very first paint, before the
+    // measurement effect runs. Mirrors `file_view` exactly.
+    let scroll_top = RwSignal::new(0.0_f64);
+    let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
+    let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+    let scroll_ctx = DiffScroll {
+        scroll_top,
+        viewport_height,
+        line_height,
+    };
+    provide_context(scroll_ctx);
+
+    let scroll_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+
+    // Measure the geometry once after first paint. Re-runs are cheap; we
+    // only update the signal if the measured value differs meaningfully.
+    Effect::new(move |_| {
+        let Some(el) = scroll_ref.get() else { return };
+        let vh = el.client_height() as f64;
+        if vh > 0.0 && (viewport_height.get_untracked() - vh).abs() > 0.5 {
+            viewport_height.set(vh);
+        }
+        if let Ok(Some(line_el)) = el.query_selector(".diff-line")
+            && let Some(html_el) = line_el.dyn_ref::<web_sys::HtmlElement>()
+        {
+            let lh = html_el.offset_height() as f64;
+            if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
+                line_height.set(lh);
+            }
+        }
+    });
+
+    let on_scroll = move |_: web_sys::Event| {
+        if let Some(el) = scroll_ref.get() {
+            scroll_top.set(el.scroll_top() as f64);
+        }
+    };
+
     view! {
-        <div class="diff-content">
+        <div class="diff-content" node_ref=scroll_ref on:scroll=on_scroll>
             {move || {
                 if state.find_bar_open.get() {
                     Some(view! { <FindBar /> })
@@ -231,10 +312,29 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
             {diff.files.into_iter().enumerate().map(|(fi, file)| {
                 let hunk_offsets = file_hunk_offsets[fi].clone();
                 let root = diff.root.clone();
-                view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets /> }
+                let rendered_offset = file_rendered_offsets[fi];
+                view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset /> }
             }).collect::<Vec<_>>()}
         </div>
     }
+}
+
+/// Count how many vertical rows a single file's rendering takes: the file
+/// header + (per hunk: optional hunk header + every line). Used to lay out
+/// each file at a known position in the global virtual scroll space.
+fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMode) -> usize {
+    let mut total = 1; // file header
+    for hunk in &file.hunks {
+        if context_mode == DiffContextMode::Hunks {
+            total += 1;
+        }
+        // SBS pairing collapses some lines but worst-case (no pairing
+        // overlap) is 1 paired-row per source line, so use the line count
+        // as the upper bound. Slight over-estimate is fine — it just means
+        // a few extra pixels of bottom padding in SBS mode.
+        total += hunk.lines.len();
+    }
+    total
 }
 
 #[component]
@@ -245,6 +345,7 @@ fn DiffFileView(
     root: ProjectRootPath,
     context_mode: DiffContextMode,
     hunk_offsets: Vec<usize>,
+    rendered_offset: usize,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let view_mode_sig = state.diff_view_mode;
@@ -271,13 +372,14 @@ fn DiffFileView(
                 <span class="diff-scope-badge">{scope_label}</span>
             </div>
             {move || match view_mode_sig.get() {
-                DiffViewMode::Unified => render_unified_hunks(
+                DiffViewMode::Unified => render_unified_virtualized(
                     file_for_view.clone(),
                     offsets_for_view.clone(),
                     context_mode,
                     scope,
                     root_for_view.clone(),
                     path_for_view.clone(),
+                    rendered_offset,
                 ),
                 DiffViewMode::SideBySide => render_sbs_panes(
                     file_for_view.clone(),
@@ -312,6 +414,225 @@ fn render_unified_hunks(
         </div>
     }
     .into_any()
+}
+
+/// One vertical row inside a virtualized unified-diff file. The file
+/// header sits at index 0 in `rendered_offset` space (one above this list,
+/// rendered by `DiffFileView` itself), so the row indices here begin at 1
+/// for the first hunk header (or first line in FullFile mode). Each
+/// variant carries the indices it needs to render on demand.
+#[derive(Clone)]
+enum UnifiedFileItem {
+    HunkHeader { hi: usize },
+    Line { hi: usize, li: usize },
+}
+
+/// Build the per-file `Vec<UnifiedFileItem>` once. Item index i corresponds
+/// to rendered row `rendered_offset + 1 + i` in the global virtual scroll
+/// space (the `+1` is for the file header rendered separately above).
+fn build_unified_file_items(
+    file: &ProjectGitDiffFile,
+    context_mode: DiffContextMode,
+) -> Vec<UnifiedFileItem> {
+    let mut items = Vec::new();
+    for (hi, hunk) in file.hunks.iter().enumerate() {
+        if context_mode == DiffContextMode::Hunks {
+            items.push(UnifiedFileItem::HunkHeader { hi });
+        }
+        for li in 0..hunk.lines.len() {
+            items.push(UnifiedFileItem::Line { hi, li });
+        }
+    }
+    items
+}
+
+/// Per-file unified virtualized renderer. Reads the global `DiffScroll`
+/// context, computes its own visible window clipped to its row range, and
+/// emits top/bottom spacers + a `<For>` over visible items so off-screen
+/// rows incur zero DOM/paint cost. Falls through to the non-virtualized
+/// path for tiny files (preserves DOM shape for layout assertions).
+fn render_unified_virtualized(
+    file: ProjectGitDiffFile,
+    hunk_offsets: Vec<usize>,
+    context_mode: DiffContextMode,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
+    rendered_offset: usize,
+) -> AnyView {
+    let items = Arc::new(build_unified_file_items(&file, context_mode));
+    let total_items = items.len();
+
+    if total_items < VIRTUALIZE_THRESHOLD {
+        // Small file: render every row up front. Avoids spacer math and
+        // keeps the DOM identical to the pre-virtualization path.
+        return render_unified_hunks(file, hunk_offsets, context_mode, scope, root, relative_path);
+    }
+
+    let scroll = expect_context::<DiffScroll>();
+    let file_arc = Arc::new(file);
+    let hunk_offsets = Arc::new(hunk_offsets);
+
+    // Pre-compute syntax tokens per hunk once for the file so visible-row
+    // rendering is just an index lookup. Done eagerly here; for very large
+    // files we could chunk this with `spawn_local` like file_view does.
+    let syntax = syntax_for_path(&relative_path);
+    let mut hunk_tokens: Vec<Vec<Option<LineTokens>>> = Vec::with_capacity(file_arc.hunks.len());
+    for hunk in &file_arc.hunks {
+        let tokens = match syntax {
+            Some(syn) => compute_hunk_tokens(hunk, syn),
+            None => vec![None; hunk.lines.len()],
+        };
+        hunk_tokens.push(tokens);
+    }
+    let hunk_tokens = Arc::new(hunk_tokens);
+
+    let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
+        let lh = scroll.line_height.get().max(1.0);
+        let st = scroll.scroll_top.get();
+        let vh = scroll.viewport_height.get();
+        // File header sits at row `rendered_offset`; items occupy
+        // `rendered_offset + 1 ..= rendered_offset + total_items`. Map
+        // global scroll into local item indices.
+        let file_first_item_row = rendered_offset + 1;
+        let global_visible_first = ((st - OVERSCAN_LINES * lh) / lh).floor().max(0.0) as i64;
+        let global_visible_last = ((st + vh + OVERSCAN_LINES * lh) / lh).ceil() as i64;
+        let local_start = (global_visible_first - file_first_item_row as i64).max(0) as usize;
+        let local_end = (global_visible_last - file_first_item_row as i64).max(0) as usize;
+        let local_start = local_start.min(total_items);
+        let local_end = local_end.min(total_items);
+        (local_start, local_end)
+    });
+
+    let items_for_each = items.clone();
+    let lh_for_top = scroll.line_height;
+    let lh_for_bottom = scroll.line_height;
+    let window_for_top = visible_window;
+    let window_for_bottom = visible_window;
+
+    view! {
+        <div class="diff-hunks">
+            {move || {
+                let (start, _) = window_for_top.get();
+                let h = start as f64 * lh_for_top.get();
+                (h > 0.0).then(|| view! {
+                    <div class="diff-virt-spacer" style=format!("height: {h}px;")></div>
+                })
+            }}
+            <For
+                each=move || {
+                    let (s, e) = visible_window.get();
+                    (s..e).collect::<Vec<usize>>()
+                }
+                key=|i| *i
+                let:i
+            >
+                {
+                    let item = items_for_each[i].clone();
+                    let file = file_arc.clone();
+                    let hunk_offsets = hunk_offsets.clone();
+                    let hunk_tokens = hunk_tokens.clone();
+                    let root = root.clone();
+                    let path = relative_path.clone();
+                    render_unified_item(
+                        &item,
+                        file.as_ref(),
+                        hunk_offsets.as_ref(),
+                        hunk_tokens.as_ref(),
+                        context_mode,
+                        scope,
+                        &root,
+                        &path,
+                    )
+                }
+            </For>
+            {move || {
+                let (_, end) = window_for_bottom.get();
+                let h = total_items.saturating_sub(end) as f64 * lh_for_bottom.get();
+                (h > 0.0).then(|| view! {
+                    <div class="diff-virt-spacer" style=format!("height: {h}px;")></div>
+                })
+            }}
+        </div>
+    }
+    .into_any()
+}
+
+/// Render a single item from the per-file unified items list.
+#[allow(clippy::too_many_arguments)]
+fn render_unified_item(
+    item: &UnifiedFileItem,
+    file: &ProjectGitDiffFile,
+    hunk_offsets: &[usize],
+    hunk_tokens: &[Vec<Option<LineTokens>>],
+    context_mode: DiffContextMode,
+    scope: ProjectDiffScope,
+    root: &ProjectRootPath,
+    relative_path: &str,
+) -> AnyView {
+    match *item {
+        UnifiedFileItem::HunkHeader { hi } => {
+            let hunk = &file.hunks[hi];
+            let header = hunk_header_label(hunk);
+            let show_stage =
+                scope == ProjectDiffScope::Unstaged && context_mode == DiffContextMode::Hunks;
+            let stage_btn = if show_stage {
+                let r = root.clone();
+                let p = relative_path.to_owned();
+                let h = hunk.hunk_id.clone();
+                Some(view! {
+                    <button
+                        class="diff-hunk-stage-btn"
+                        title="Stage hunk"
+                        on:click=move |_| stage_hunk(r.clone(), p.clone(), h.clone())
+                    >
+                        "+"
+                    </button>
+                })
+            } else {
+                None
+            };
+            view! {
+                <div class="diff-hunk-header">
+                    {header}
+                    {stage_btn}
+                </div>
+            }
+            .into_any()
+        }
+        UnifiedFileItem::Line { hi, li } => {
+            let hunk = &file.hunks[hi];
+            let line = &hunk.lines[li];
+            let search_idx = hunk_offsets[hi] + li;
+            let base_class = line_class(line.kind);
+            let prefix = line_prefix(line.kind);
+            let old_str = line
+                .old_line_number
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let new_str = line
+                .new_line_number
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let text = line.text.clone();
+            let tokens = hunk_tokens[hi][li].clone();
+            let find = use_context::<FindState>();
+            let find_for_class = find.clone();
+            let find_for_text = find;
+            view! {
+                <div
+                    class=move || diff_line_class(base_class, search_idx, &find_for_class)
+                    attr:data-find-idx=search_idx
+                >
+                    <span class="diff-gutter diff-gutter-old">{old_str}</span>
+                    <span class="diff-gutter diff-gutter-new">{new_str}</span>
+                    <span class="diff-prefix">{prefix}</span>
+                    {move || render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text)}
+                </div>
+            }
+            .into_any()
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

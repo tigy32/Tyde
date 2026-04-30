@@ -372,6 +372,12 @@ fn scroll_to_find_line(line_index: usize) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
+    // TODO(virt-find): when the active match is virtualized off-screen
+    // (file_view large files, diff_view always), `query_selector` returns
+    // None and Next/Prev silently no-ops. Fix needs a per-view scroll
+    // resolver registered into FindState that maps a search idx to a
+    // scroll target without requiring the row to be in the DOM. Tracked
+    // separately from the virtualization commit.
     let selector = format!("[data-find-idx=\"{line_index}\"]");
     if let Ok(Some(el)) = document.query_selector(&selector) {
         // scrollIntoView({ behavior: "smooth", block: "center" })
