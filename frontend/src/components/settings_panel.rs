@@ -3252,3 +3252,121 @@ fn SkillsTab() -> impl IntoView {
         </div>
     }
 }
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::AppState;
+    use leptos::mount::mount_to;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::{HtmlElement, HtmlOptionElement, HtmlSelectElement};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 1024px; height: 768px;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Find the syntax-theme `<select>` by looking for one whose options
+    /// contain known bundled theme names. Resilient to ordering changes
+    /// among the page's other dropdowns (font family, model, etc.).
+    fn find_syntax_theme_select(container: &HtmlElement) -> Option<HtmlSelectElement> {
+        let nodes = container.query_selector_all("select").ok()?;
+        for i in 0..nodes.length() {
+            let node = nodes.item(i)?;
+            let select: HtmlSelectElement = node.dyn_into().ok()?;
+            for j in 0..select.length() {
+                let Some(option_node) = select.item(j) else {
+                    continue;
+                };
+                let Ok(option) = option_node.dyn_into::<HtmlOptionElement>() else {
+                    continue;
+                };
+                if option.value() == "Catppuccin Mocha" {
+                    return Some(select);
+                }
+            }
+        }
+        None
+    }
+
+    /// The Settings → Appearance pane must expose a syntax-theme picker
+    /// with the popular bundled themes available. If this regresses we
+    /// either lost the picker UI entirely or the bundled theme set was
+    /// silently shrunk — either way the user can no longer change colors
+    /// via the documented path.
+    ///
+    /// Asserts on the user-perceivable surface: a dropdown exists,
+    /// contains theme names users recognize, and has enough breadth to
+    /// be useful. Doesn't assert on internal class names of the wrapper.
+    #[wasm_bindgen_test]
+    async fn theme_dropdown_lists_popular_themes() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // SettingsPanel is gated on settings_open; opening it is the
+            // documented user gesture (Cmd+, / Ctrl+,).
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        let select =
+            find_syntax_theme_select(&container).expect("syntax theme dropdown should be present");
+
+        let options: Vec<String> = (0..select.length())
+            .filter_map(|i| {
+                select
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<HtmlOptionElement>().ok())
+                    .map(|o| o.value())
+            })
+            .collect();
+
+        // Popular themes that must remain bundled. Loss of any of these
+        // is a regression worth surfacing — they're what users see and
+        // recognize.
+        for expected in [
+            "Catppuccin Mocha",
+            "Dracula",
+            "Nord",
+            "GitHub",
+            "Monokai Extended",
+        ] {
+            assert!(
+                options.iter().any(|o| o == expected),
+                "expected `{expected}` in syntax theme dropdown; got {options:?}"
+            );
+        }
+
+        // Sanity: the dropdown should be substantively populated, not a
+        // single fallback theme. Threshold is generous so adding/removing
+        // one theme doesn't falsify the assertion.
+        assert!(
+            options.len() >= 20,
+            "expected >=20 themes in dropdown, got {}: {options:?}",
+            options.len()
+        );
+    }
+}

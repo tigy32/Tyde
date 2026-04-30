@@ -1912,6 +1912,7 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::state::DiffViewState;
     use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
     use leptos::mount::mount_to;
     use protocol::ProjectGitDiffHunk;
@@ -1921,13 +1922,29 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    /// Production stylesheet — needed so the scroll container has a real
+    /// computed height, otherwise virtualization's viewport math collapses
+    /// to zero and every row would render.
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document.get_element_by_id("test-prod-styles-app").is_none() {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-app");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+    }
+
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
         container
             .set_attribute(
                 "style",
-                "position: absolute; top: 0; left: 0; width: 800px; height: 600px;",
+                "position: absolute; top: 0; left: 0; width: 800px; height: 600px; \
+                 display: flex; flex-direction: column;",
             )
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
@@ -1942,6 +1959,39 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Build a synthetic diff with one file containing a single hunk of
+    /// `n` Added lines. Used by the virtualization regression test.
+    fn synth_added_diff(n: usize, root: ProjectRootPath) -> DiffViewState {
+        let lines: Vec<ProjectGitDiffLine> = (0..n)
+            .map(|i| ProjectGitDiffLine {
+                kind: ProjectGitDiffLineKind::Added,
+                text: format!("line {i}"),
+                old_line_number: None,
+                new_line_number: Some((i + 1) as u32),
+            })
+            .collect();
+        let hunk = ProjectGitDiffHunk {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: n as u32,
+            hunk_id: "h1".to_owned(),
+            lines,
+        };
+        let file = ProjectGitDiffFile {
+            relative_path: "big.rs".to_owned(),
+            hunks: vec![hunk],
+        };
+        DiffViewState {
+            root,
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![file],
+        }
     }
 
     /// A line of Rust source rendered by the diff view's per-line render path
@@ -1998,5 +2048,69 @@ mod wasm_tests {
         // original line — rendering must not corrupt or duplicate source.
         let rendered_text = container.text_content().unwrap_or_default();
         assert_eq!(rendered_text, "fn main() {}");
+    }
+
+    /// A diff with 1000 Added lines must NOT put all 1000 rows in the DOM.
+    /// Virtualization (commits c55a2c4 / 93e0343) clips rendering to the
+    /// visible window plus an overscan buffer; spacers above and below
+    /// preserve the scroll geometry so the scrollbar is the right size.
+    ///
+    /// If this regresses, the diff viewer's gutter paint flash on scroll
+    /// returns and the FullFile mode becomes unusable on big files.
+    /// Asserts on user-visible behaviour: row counts and scroll height,
+    /// not on internal class names beyond the ones needed to find rows.
+    #[wasm_bindgen_test]
+    async fn large_diff_only_renders_visible_window() {
+        ensure_styles_loaded();
+        let root = ProjectRootPath("test-root".to_owned());
+        let scope = ProjectDiffScope::Unstaged;
+        let total_lines = 1000usize;
+        let diff = synth_added_diff(total_lines, root.clone());
+
+        let container = make_container();
+        let mount_root = root.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.diff_contents.update(|d| {
+                d.insert((mount_root.clone(), scope), diff.clone());
+            });
+            provide_context(state);
+            view! { <DiffView root=mount_root.clone() scope=scope /> }
+        });
+        // First tick mounts; a second lets the measurement Effect refine
+        // viewport_height/line_height from real DOM measurements.
+        next_tick().await;
+        next_tick().await;
+
+        let rendered = container.query_selector_all(".diff-line").unwrap().length() as usize;
+        assert!(
+            rendered > 0,
+            "expected some diff lines rendered, got {rendered}"
+        );
+        assert!(
+            rendered < total_lines / 2,
+            "virtualization not engaging: rendered {rendered} of {total_lines} lines \
+             (expected fewer than {})",
+            total_lines / 2
+        );
+
+        // Scroll height should reflect the full file (visible rows + spacers
+        // standing in for off-screen rows). If virtualization regressed to
+        // rendering everything, scroll_height would still match — but we'd
+        // also see all 1000 rows in DOM. The row-count guard above catches
+        // that case; this guard catches the inverse regression where
+        // someone "fixes" the row count by silently dropping spacers.
+        let scroll_el = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff-content scroll container present")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let scroll_height = scroll_el.scroll_height();
+        assert!(
+            scroll_height > 5000,
+            "expected scroll_height > 5000px for 1000-line file, got {scroll_height}; \
+             spacers may have been dropped"
+        );
     }
 }
