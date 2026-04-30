@@ -322,16 +322,23 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
 /// Count how many vertical rows a single file's rendering takes: the file
 /// header + (per hunk: optional hunk header + every line). Used to lay out
 /// each file at a known position in the global virtual scroll space.
+///
+/// The line count is the unified-mode row count. SBS mode collapses paired
+/// Removed/Added lines into a single paired row, so the SBS row count is
+/// `<=` the unified count. This function returns the unified count, which
+/// is correct for unified mode and an upper bound for SBS. For single-file
+/// diffs (the typical case in Tyde) `rendered_offset` is always 0 so the
+/// over-estimate is moot. For multi-file SBS diffs the offsets shift
+/// downward by up to ~half the diff size; the visible window may briefly
+/// fall on the wrong file boundary until scrolling stabilizes. Acceptable
+/// for now; fix is to make this mode-aware (run `pair_lines_side_by_side`
+/// per hunk to count) and recompute when view_mode toggles.
 fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMode) -> usize {
     let mut total = 1; // file header
     for hunk in &file.hunks {
         if context_mode == DiffContextMode::Hunks {
             total += 1;
         }
-        // SBS pairing collapses some lines but worst-case (no pairing
-        // overlap) is 1 paired-row per source line, so use the line count
-        // as the upper bound. Slight over-estimate is fine — it just means
-        // a few extra pixels of bottom padding in SBS mode.
         total += hunk.lines.len();
     }
     total
@@ -381,7 +388,7 @@ fn DiffFileView(
                     path_for_view.clone(),
                     rendered_offset,
                 ),
-                DiffViewMode::SideBySide => render_sbs_panes(
+                DiffViewMode::SideBySide => render_sbs_virtualized(
                     file_for_view.clone(),
                     offsets_for_view.clone(),
                     context_mode,
@@ -389,6 +396,7 @@ fn DiffFileView(
                     root_for_view.clone(),
                     path_for_view.clone(),
                     split,
+                    rendered_offset,
                 ),
             }}
         </div>
@@ -801,6 +809,283 @@ fn render_sbs_pane_content(
     }
 
     hunk_views.into_any()
+}
+
+/// Per-hunk pre-pairing for SBS virtualization: the paired rows
+/// (`pair_lines_side_by_side_with_tokens` output) plus the per-row
+/// (left_idx, right_idx) search indices used by find highlighting.
+type HunkPairs = (Vec<SideBySideRow>, Vec<(Option<usize>, Option<usize>)>);
+
+/// One vertical row inside a virtualized SBS file (after the file header,
+/// which is rendered separately above the `.diff-pair`). PairedRow indices
+/// are into the corresponding hunk's pre-pairing.
+#[derive(Clone)]
+enum SbsItem {
+    HunkHeader { hi: usize },
+    PairedRow { hi: usize, ri: usize },
+}
+
+fn build_sbs_file_items(
+    _file: &ProjectGitDiffFile,
+    hunk_pairs: &[HunkPairs],
+    context_mode: DiffContextMode,
+) -> Vec<SbsItem> {
+    let mut items = Vec::new();
+    for (hi, (rows, _)) in hunk_pairs.iter().enumerate() {
+        if context_mode == DiffContextMode::Hunks {
+            items.push(SbsItem::HunkHeader { hi });
+        }
+        for ri in 0..rows.len() {
+            items.push(SbsItem::PairedRow { hi, ri });
+        }
+    }
+    items
+}
+
+/// Per-file SBS virtualized renderer. Pre-pairs every hunk, builds an
+/// item list, and emits a `.diff-pair` whose left and right panes both
+/// render top spacer + a `<For>` over the same visible-window slice +
+/// bottom spacer. Both panes share the visible_window memo so they stay
+/// row-aligned even as scroll progresses. Falls through to the eager
+/// `render_sbs_panes` path for tiny diffs.
+#[allow(clippy::too_many_arguments)]
+fn render_sbs_virtualized(
+    file: ProjectGitDiffFile,
+    hunk_offsets: Vec<usize>,
+    context_mode: DiffContextMode,
+    scope: ProjectDiffScope,
+    root: ProjectRootPath,
+    relative_path: String,
+    split: RwSignal<f64>,
+    rendered_offset: usize,
+) -> AnyView {
+    // Compute paired rows + search indices + dual tokens once per hunk.
+    let syntax = syntax_for_path(&relative_path);
+    let mut hunk_pairs: Vec<HunkPairs> = Vec::with_capacity(file.hunks.len());
+    for (hi, hunk) in file.hunks.iter().enumerate() {
+        let line_offset = hunk_offsets[hi];
+        let lines = hunk.lines.clone();
+        let indices = sbs_search_indices(&lines, line_offset);
+        let (old_tokens, new_tokens) = match syntax {
+            Some(syn) => crate::syntax_highlight::compute_hunk_tokens_dual(hunk, syn),
+            None => (vec![None; hunk.lines.len()], vec![None; hunk.lines.len()]),
+        };
+        let pairs = pair_lines_side_by_side_with_tokens(lines, old_tokens, new_tokens);
+        hunk_pairs.push((pairs, indices));
+    }
+    let hunk_pairs = Arc::new(hunk_pairs);
+
+    let items = Arc::new(build_sbs_file_items(&file, &hunk_pairs, context_mode));
+    let total_items = items.len();
+
+    if total_items < VIRTUALIZE_THRESHOLD {
+        // Small file: keep DOM shape identical to pre-virtualization path.
+        return render_sbs_panes(
+            file,
+            hunk_offsets,
+            context_mode,
+            scope,
+            root,
+            relative_path,
+            split,
+        );
+    }
+
+    let scroll = expect_context::<DiffScroll>();
+    let pair_ref = NodeRef::<leptos::html::Div>::new();
+
+    let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
+        let lh = scroll.line_height.get().max(1.0);
+        let st = scroll.scroll_top.get();
+        let vh = scroll.viewport_height.get();
+        let file_first_item_row = rendered_offset + 1;
+        let global_visible_first = ((st - OVERSCAN_LINES * lh) / lh).floor().max(0.0) as i64;
+        let global_visible_last = ((st + vh + OVERSCAN_LINES * lh) / lh).ceil() as i64;
+        let local_start = (global_visible_first - file_first_item_row as i64).max(0) as usize;
+        let local_end = (global_visible_last - file_first_item_row as i64).max(0) as usize;
+        let local_start = local_start.min(total_items);
+        let local_end = local_end.min(total_items);
+        (local_start, local_end)
+    });
+
+    let left_style = move || {
+        let pct = (split.get() * 100.0).clamp(0.0, 100.0);
+        format!("flex: 0 0 {pct:.4}%")
+    };
+
+    let on_divider_mousedown = move |ev: web_sys::MouseEvent| {
+        ev.prevent_default();
+        start_divider_drag(pair_ref, split);
+    };
+
+    let pane_left = render_sbs_pane_virtualized(
+        SbsSide::Left,
+        file.clone(),
+        hunk_pairs.clone(),
+        items.clone(),
+        visible_window,
+        scroll,
+        scope,
+        context_mode,
+        root.clone(),
+        relative_path.clone(),
+    );
+    let pane_right = render_sbs_pane_virtualized(
+        SbsSide::Right,
+        file,
+        hunk_pairs,
+        items,
+        visible_window,
+        scroll,
+        scope,
+        context_mode,
+        root,
+        relative_path,
+    );
+
+    view! {
+        <div class="diff-pair" node_ref=pair_ref>
+            <div class="diff-pane diff-pane-left" style=left_style>
+                {pane_left}
+            </div>
+            <div
+                class="diff-divider"
+                title="Drag to resize"
+                on:mousedown=on_divider_mousedown
+            ></div>
+            <div class="diff-pane diff-pane-right">
+                {pane_right}
+            </div>
+        </div>
+    }
+    .into_any()
+}
+
+/// Render one virtualized SBS pane. Spacers + `<For>` over the visible
+/// item slice; per-item rendering picks the cell for `side` and reuses
+/// the same gutter / search-aware logic as the eager pane.
+#[allow(clippy::too_many_arguments)]
+fn render_sbs_pane_virtualized(
+    side: SbsSide,
+    file: ProjectGitDiffFile,
+    hunk_pairs: Arc<Vec<HunkPairs>>,
+    items: Arc<Vec<SbsItem>>,
+    visible_window: Memo<(usize, usize)>,
+    scroll: DiffScroll,
+    scope: ProjectDiffScope,
+    context_mode: DiffContextMode,
+    root: ProjectRootPath,
+    relative_path: String,
+) -> AnyView {
+    let total_items = items.len();
+    let lh_for_top = scroll.line_height;
+    let lh_for_bottom = scroll.line_height;
+    let window_top = visible_window;
+    let window_bottom = visible_window;
+
+    view! {
+        <>
+            {move || {
+                let (start, _) = window_top.get();
+                let h = start as f64 * lh_for_top.get();
+                (h > 0.0).then(|| view! {
+                    <div class="diff-virt-spacer" style=format!("height: {h}px;")></div>
+                })
+            }}
+            <For
+                each=move || {
+                    let (s, e) = visible_window.get();
+                    (s..e).collect::<Vec<usize>>()
+                }
+                key=|i| *i
+                let:i
+            >
+                {
+                    let item = items[i].clone();
+                    let file = file.clone();
+                    let hunk_pairs = hunk_pairs.clone();
+                    let root = root.clone();
+                    let path = relative_path.clone();
+                    render_sbs_item(
+                        side,
+                        &item,
+                        &file,
+                        hunk_pairs.as_ref(),
+                        scope,
+                        context_mode,
+                        &root,
+                        &path,
+                    )
+                }
+            </For>
+            {move || {
+                let (_, end) = window_bottom.get();
+                let h = total_items.saturating_sub(end) as f64 * lh_for_bottom.get();
+                (h > 0.0).then(|| view! {
+                    <div class="diff-virt-spacer" style=format!("height: {h}px;")></div>
+                })
+            }}
+        </>
+    }
+    .into_any()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_sbs_item(
+    side: SbsSide,
+    item: &SbsItem,
+    file: &ProjectGitDiffFile,
+    hunk_pairs: &[HunkPairs],
+    scope: ProjectDiffScope,
+    context_mode: DiffContextMode,
+    root: &ProjectRootPath,
+    relative_path: &str,
+) -> AnyView {
+    match *item {
+        SbsItem::HunkHeader { hi } => {
+            // Header is identical-ish on both sides; show the stage
+            // button only on the right pane (matching the eager path).
+            let hunk = &file.hunks[hi];
+            let header = hunk_header_label(hunk);
+            let show_stage_btn = scope == ProjectDiffScope::Unstaged
+                && side == SbsSide::Right
+                && context_mode == DiffContextMode::Hunks;
+            let stage_btn = if show_stage_btn {
+                let r = root.clone();
+                let p = relative_path.to_owned();
+                let h = hunk.hunk_id.clone();
+                Some(view! {
+                    <button
+                        class="diff-hunk-stage-btn"
+                        title="Stage hunk"
+                        on:click=move |_| stage_hunk(r.clone(), p.clone(), h.clone())
+                    >
+                        "+"
+                    </button>
+                })
+            } else {
+                None
+            };
+            view! {
+                <div class="diff-hunk-header">
+                    {header}
+                    {stage_btn}
+                </div>
+            }
+            .into_any()
+        }
+        SbsItem::PairedRow { hi, ri } => {
+            let (rows, indices) = &hunk_pairs[hi];
+            let row = rows[ri].clone();
+            let (left_idx, right_idx) = indices[ri];
+            let (cell, idx) = match side {
+                SbsSide::Left => (row.left, left_idx),
+                SbsSide::Right => (row.right, right_idx),
+            };
+            let find = use_context::<FindState>();
+            render_cell_search(cell, idx, find)
+        }
+    }
 }
 
 thread_local! {
