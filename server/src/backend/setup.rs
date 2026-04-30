@@ -13,16 +13,16 @@ use crate::backend::codex::discover_models;
 use crate::browse_stream::host_platform;
 use crate::process_env;
 
-pub(crate) const TYCODE_VERSION: &str = "0.7.3";
+pub(crate) const TYCODE_VERSION: &str = "0.7.6";
 const TYCODE_RELEASE_BASE_URL: &str = "https://github.com/tigy32/Tycode/releases/download";
 const TYCODE_SUBPROCESS_SHA256_AARCH64_APPLE_DARWIN: &str =
-    "7fa6927b0bc6f6a7aa9b9577b0b69bcb19fa3c074dbebfc2f4d8143cfa080aef";
+    "f4af9d3beeca6b3173f4cf0ef90ff977f6c214f1c1881e223ea0f288b9b9aed4";
 const TYCODE_SUBPROCESS_SHA256_X86_64_APPLE_DARWIN: &str =
-    "c1ce63b47604c18af8dc3b87fad1865612802e4e92402bf0a375ce6205e46baf";
+    "e3c6de567a841c63b3b7be1e4974f806ea8dd12cc464af985e18dce27c0c4b1b";
 const TYCODE_SUBPROCESS_SHA256_AARCH64_UNKNOWN_LINUX_MUSL: &str =
-    "4d776bdaa8388103135021805c0be8954a2aca88f2b357bc75647a32a1c5d9c3";
+    "c4834c98c6dbdb296d6945effd43263253eda4f5fd054ef9e4294c37428cb919";
 const TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL: &str =
-    "809e47d50f09dd0885b577e091bf2efc44850ed88a2dfdc457b1e3423759c94f";
+    "290d32767a5b8740eb821e26c3533ffa0b85deb736c7656d20b63714434eeacb";
 const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const GEMINI_CLI_CANDIDATES: &[&str] = &["gemini"];
