@@ -602,6 +602,9 @@ pub struct AppState {
     pub font_size: RwSignal<u32>,
     pub theme: RwSignal<String>,
     pub font_family: RwSignal<String>,
+    /// Active syntect theme name (e.g. "base16-ocean.dark"). Drives both the
+    /// file viewer and diff viewer's syntax coloring. Persists across sessions.
+    pub syntax_theme: RwSignal<String>,
     pub diff_view_mode: RwSignal<DiffViewMode>,
     pub diff_context_mode: RwSignal<DiffContextMode>,
     pub tool_output_mode: RwSignal<ToolOutputMode>,
@@ -673,6 +676,7 @@ impl AppState {
             font_size: RwSignal::new(13),
             theme: RwSignal::new("dark".to_owned()),
             font_family: RwSignal::new("system".to_owned()),
+            syntax_theme: RwSignal::new(crate::syntax_highlight::DEFAULT_THEME_NAME.to_owned()),
             diff_view_mode: RwSignal::new(DiffViewMode::Unified),
             diff_context_mode: RwSignal::new(DiffContextMode::Hunks),
             tool_output_mode: RwSignal::new(ToolOutputMode::Compact),

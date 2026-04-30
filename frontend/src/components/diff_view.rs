@@ -372,32 +372,41 @@ fn DiffFileView(
     let root_for_view = root.clone();
     let path_for_view = relative_path.clone();
 
+    let syntax_theme = state.syntax_theme;
+
     view! {
         <div class="diff-file">
             <div class="diff-file-header">
                 <span class="diff-file-path">{file.relative_path}</span>
                 <span class="diff-scope-badge">{scope_label}</span>
             </div>
-            {move || match view_mode_sig.get() {
-                DiffViewMode::Unified => render_unified_virtualized(
-                    file_for_view.clone(),
-                    offsets_for_view.clone(),
-                    context_mode,
-                    scope,
-                    root_for_view.clone(),
-                    path_for_view.clone(),
-                    rendered_offset,
-                ),
-                DiffViewMode::SideBySide => render_sbs_virtualized(
-                    file_for_view.clone(),
-                    offsets_for_view.clone(),
-                    context_mode,
-                    scope,
-                    root_for_view.clone(),
-                    path_for_view.clone(),
-                    split,
-                    rendered_offset,
-                ),
+            {move || {
+                // Subscribe to syntax_theme so changing the active theme
+                // re-renders the diff with re-tokenized colors. Tokens are
+                // computed eagerly inside render_*_virtualized; reading
+                // the signal here causes that work to re-run on change.
+                let _ = syntax_theme.get();
+                match view_mode_sig.get() {
+                    DiffViewMode::Unified => render_unified_virtualized(
+                        file_for_view.clone(),
+                        offsets_for_view.clone(),
+                        context_mode,
+                        scope,
+                        root_for_view.clone(),
+                        path_for_view.clone(),
+                        rendered_offset,
+                    ),
+                    DiffViewMode::SideBySide => render_sbs_virtualized(
+                        file_for_view.clone(),
+                        offsets_for_view.clone(),
+                        context_mode,
+                        scope,
+                        root_for_view.clone(),
+                        path_for_view.clone(),
+                        split,
+                        rendered_offset,
+                    ),
+                }
             }}
         </div>
     }

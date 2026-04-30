@@ -1,3 +1,5 @@
+use std::sync::RwLock;
+
 use once_cell::sync::Lazy;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, Theme, ThemeSet};
@@ -10,14 +12,64 @@ use protocol::{ProjectGitDiffHunk, ProjectGitDiffLineKind};
 /// freeze the UI.
 const MAX_LINES_TO_HIGHLIGHT: usize = 5000;
 
+/// Default theme name when no preference is stored.
+pub const DEFAULT_THEME_NAME: &str = "base16-ocean.dark";
+
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 
-static THEME: Lazy<Theme> = Lazy::new(|| {
-    let mut ts = ThemeSet::load_defaults();
-    ts.themes
-        .remove("base16-ocean.dark")
-        .expect("syntect default theme base16-ocean.dark missing")
-});
+/// All bundled themes, loaded once. We pick one of these by name based on
+/// the user's selection. Key set is exposed via `available_themes()`.
+static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
+
+/// Currently-selected theme name (matches a key in `THEME_SET.themes`).
+/// Empty string falls back to `DEFAULT_THEME_NAME`. Writes are infrequent
+/// (only when the user picks a theme from settings); reads are on every
+/// highlight call.
+static SELECTED_THEME_NAME: RwLock<String> = RwLock::new(String::new());
+
+/// List the bundled theme names available for selection, sorted.
+pub fn available_themes() -> Vec<String> {
+    let mut names: Vec<String> = THEME_SET.themes.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Update the active theme. Future `LineHighlighter::new` calls pick up the
+/// new theme; already-running highlight tasks continue with their previously
+/// bound theme until they finish. Returns false (and is a no-op) if `name`
+/// isn't a bundled theme.
+pub fn set_selected_theme(name: &str) -> bool {
+    if !THEME_SET.themes.contains_key(name) {
+        return false;
+    }
+    if let Ok(mut slot) = SELECTED_THEME_NAME.write() {
+        *slot = name.to_owned();
+    }
+    true
+}
+
+fn current_theme() -> &'static Theme {
+    // THEME_SET is held in a `'static Lazy<ThemeSet>`, so any `&Theme`
+    // returned by indexing into its `themes` map has effective `'static`
+    // lifetime — Rust just can't infer it through `Lazy`'s deref. The
+    // closure-returning-reference pattern below makes the lifetime
+    // implicit at the call site without unsafe.
+    let theme_set: &'static ThemeSet = &THEME_SET;
+    let name_owned = SELECTED_THEME_NAME
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let lookup = if name_owned.is_empty() {
+        DEFAULT_THEME_NAME
+    } else {
+        name_owned.as_str()
+    };
+    theme_set
+        .themes
+        .get(lookup)
+        .or_else(|| theme_set.themes.get(DEFAULT_THEME_NAME))
+        .expect("default theme present in ThemeSet")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token {
@@ -58,8 +110,7 @@ fn highlight_lines(lines: &[&str], syntax: &SyntaxReference) -> Option<Vec<LineT
         return None;
     }
     let ss: &'static SyntaxSet = &SYNTAX_SET;
-    let theme: &'static Theme = &THEME;
-    let mut h = HighlightLines::new(syntax, theme);
+    let mut h = HighlightLines::new(syntax, current_theme());
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         let with_nl = format!("{line}\n");
@@ -94,7 +145,7 @@ pub struct LineHighlighter {
 impl LineHighlighter {
     pub fn new(syntax: &'static SyntaxReference) -> Self {
         Self {
-            inner: HighlightLines::new(syntax, &THEME),
+            inner: HighlightLines::new(syntax, current_theme()),
         }
     }
 
@@ -128,7 +179,7 @@ impl LineHighlighter {
 /// time rather than on the first file open or first markdown render.
 pub fn warm_up() {
     Lazy::force(&SYNTAX_SET);
-    Lazy::force(&THEME);
+    Lazy::force(&THEME_SET);
 }
 
 /// For a single hunk, compute per-diff-line `LineTokens` for unified

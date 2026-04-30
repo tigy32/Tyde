@@ -106,15 +106,54 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                         // though we're processing the file in pieces.
                         let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> =
                             ArcRwSignal::new(vec![None; total]);
-                        if total > 0 && total <= HIGHLIGHT_LINE_CAP
-                            && let Some(syntax) = syntax_for_path(&f.path.relative_path)
-                        {
-                            let lines_for_task = lines.clone();
-                            let signal_for_task = highlighted.clone();
+
+                        // Generation counter for live re-highlighting on
+                        // theme change. Bumping this invalidates any
+                        // in-flight chunked task, which checks the
+                        // generation each chunk and exits if stale.
+                        let highlight_gen: ArcRwSignal<u32> = ArcRwSignal::new(0);
+
+                        let path_for_effect = f.path.relative_path.clone();
+                        let syntax_theme = state.syntax_theme;
+                        let lines_for_effect = lines.clone();
+                        let highlighted_for_effect = highlighted.clone();
+                        let gen_for_effect = highlight_gen.clone();
+                        Effect::new(move |_| {
+                            // Subscribe to the theme signal. Whenever it
+                            // changes we discard prior tokens and kick off
+                            // a fresh chunked highlight pass with the new
+                            // theme.
+                            let _ = syntax_theme.get();
+
+                            let my_gen = gen_for_effect.get_untracked() + 1;
+                            gen_for_effect.set(my_gen);
+
+                            // Reset highlighted vec to plain text while we
+                            // re-tokenize. Visible rows momentarily render
+                            // plain, then fill in with the new theme.
+                            highlighted_for_effect.update(|v| {
+                                for slot in v.iter_mut() {
+                                    *slot = None;
+                                }
+                            });
+
+                            if total == 0 || total > HIGHLIGHT_LINE_CAP {
+                                return;
+                            }
+                            let Some(syntax) = syntax_for_path(&path_for_effect) else {
+                                return;
+                            };
+
+                            let lines_for_task = lines_for_effect.clone();
+                            let signal_for_task = highlighted_for_effect.clone();
+                            let gen_for_task = gen_for_effect.clone();
                             spawn_local(async move {
                                 let mut hl = LineHighlighter::new(syntax);
                                 let mut i = 0usize;
                                 while i < lines_for_task.len() {
+                                    if gen_for_task.get_untracked() != my_gen {
+                                        return; // newer task superseded us
+                                    }
                                     let end = (i + HIGHLIGHT_CHUNK_LINES)
                                         .min(lines_for_task.len());
                                     let chunk_tokens: Vec<LineTokens> =
@@ -122,8 +161,13 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                             .iter()
                                             .map(|l| hl.highlight_one(l))
                                             .collect();
+                                    if gen_for_task.get_untracked() != my_gen {
+                                        return;
+                                    }
                                     signal_for_task.update(|v| {
-                                        for (offset, toks) in chunk_tokens.into_iter().enumerate() {
+                                        for (offset, toks) in
+                                            chunk_tokens.into_iter().enumerate()
+                                        {
                                             if let Some(slot) = v.get_mut(i + offset) {
                                                 *slot = Some(toks);
                                             }
@@ -133,7 +177,7 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                     yield_to_browser().await;
                                 }
                             });
-                        }
+                        });
 
                         let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
 

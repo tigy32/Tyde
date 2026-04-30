@@ -26,6 +26,7 @@ const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control"];
 const STORAGE_THEME: &str = "tyde-theme";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
 const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
+const STORAGE_SYNTAX_THEME: &str = "tyde-syntax-theme";
 const STORAGE_TABS_ENABLED: &str = "tyde-tabs-enabled";
 const STORAGE_DIFF_VIEW_MODE: &str = "tyde-diff-view-mode";
 const STORAGE_DIFF_CONTEXT_MODE: &str = "tyde-diff-context-mode";
@@ -72,6 +73,12 @@ fn diff_context_mode_from_str(s: &str) -> Option<DiffContextMode> {
 pub fn persist_diff_view_mode(mode: DiffViewMode) {
     if let Some(storage) = local_storage() {
         let _ = storage.set_item(STORAGE_DIFF_VIEW_MODE, diff_view_mode_to_str(mode));
+    }
+}
+
+pub fn persist_syntax_theme(name: &str) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_SYNTAX_THEME, name);
     }
 }
 
@@ -249,6 +256,12 @@ pub fn restore_appearance(state: &AppState) {
     if let Ok(Some(family)) = storage.get_item(STORAGE_FONT_FAMILY) {
         apply_font_family(&family);
         state.font_family.set(family);
+    }
+
+    if let Ok(Some(theme_name)) = storage.get_item(STORAGE_SYNTAX_THEME)
+        && crate::syntax_highlight::set_selected_theme(&theme_name)
+    {
+        state.syntax_theme.set(theme_name);
     }
 
     if let Ok(Some(tabs_str)) = storage.get_item(STORAGE_TABS_ENABLED) {
@@ -1074,6 +1087,18 @@ fn AppearanceTab() -> impl IntoView {
         apply_font_family(&key);
     };
 
+    let on_syntax_theme = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let el: web_sys::HtmlSelectElement = target.unchecked_into();
+        let name = el.value();
+        if crate::syntax_highlight::set_selected_theme(&name) {
+            state.syntax_theme.set(name.clone());
+            persist_syntax_theme(&name);
+        }
+    };
+
+    let syntax_themes: Vec<String> = crate::syntax_highlight::available_themes();
+
     view! {
         <h2 class="settings-panel-title">"Appearance"</h2>
 
@@ -1112,6 +1137,21 @@ fn AppearanceTab() -> impl IntoView {
             >
                 {FONT_FAMILIES.iter().map(|(key, label, _)| {
                     view! { <option value=*key>{*label}</option> }
+                }).collect::<Vec<_>>()}
+            </select>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Syntax Theme"</label>
+            <p class="settings-description">"Color scheme for syntax highlighting in the file viewer, diff viewer, and chat code blocks. Reopen a file to see the change."</p>
+            <select
+                class="settings-select"
+                prop:value=move || state.syntax_theme.get()
+                on:change=on_syntax_theme
+            >
+                {syntax_themes.into_iter().map(|name| {
+                    let label = name.clone();
+                    view! { <option value=name>{label}</option> }
                 }).collect::<Vec<_>>()}
             </select>
         </div>
