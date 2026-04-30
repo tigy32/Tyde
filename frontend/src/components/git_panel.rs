@@ -1,6 +1,5 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::window;
 
 use crate::send::send_frame;
 use crate::state::{AppState, DiffViewState, root_display_name};
@@ -497,12 +496,7 @@ fn unstage_file(root: ProjectRootPath, path: String) {
 }
 
 fn discard_file(root: ProjectRootPath, path: String) {
-    let Some(win) = window() else { return };
     let message = format!("Discard changes to \"{}\"? This cannot be undone.", path);
-    match win.confirm_with_message(&message) {
-        Ok(true) => {}
-        _ => return,
-    }
 
     let state = expect_context::<AppState>();
     let Some(active_project) = state.active_project_ref_untracked() else {
@@ -511,6 +505,9 @@ fn discard_file(root: ProjectRootPath, path: String) {
     let project_id = active_project.project_id.clone();
     let stream = StreamPath(format!("/project/{}", project_id.0));
     spawn_local(async move {
+        if !crate::bridge::confirm_dialog("Discard changes", &message).await {
+            return;
+        }
         let payload = ProjectDiscardFilePayload {
             path: ProjectPath {
                 root,

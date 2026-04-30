@@ -291,6 +291,7 @@ pub fn run() {
     tracing::info!("starting tyde shell");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             tracing::info!("setup: spawning host and router");
             let host_store_path =

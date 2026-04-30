@@ -413,7 +413,6 @@ fn agent_card(
     let close_state = state.clone();
     let on_close = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
-        let window = web_sys::window().expect("window");
         let is_active = close_state
             .active_agent
             .with_untracked(|a| a.as_ref().is_some_and(|a| a.agent_id == close_agent_id));
@@ -429,13 +428,12 @@ fn agent_card(
         } else {
             format!("Close agent \"{}\"?", close_name)
         };
-        match window.confirm_with_message(&message) {
-            Ok(true) => {}
-            _ => return,
-        }
         let host_id = close_host_id.clone();
         let stream = close_stream.clone();
         spawn_local(async move {
+            if !crate::bridge::confirm_dialog("Close agent", &message).await {
+                return;
+            }
             if let Err(e) = close_agent(&host_id, stream).await {
                 log::error!("failed to send CloseAgent: {e}");
             }

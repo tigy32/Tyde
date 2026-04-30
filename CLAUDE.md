@@ -1,5 +1,24 @@
 # Tyde2 — Claude guidance
 
+## Confirmation / alert dialogs
+
+Do **not** call `window.confirm`, `window.alert`, or `window.prompt` (or the
+`web_sys::Window::confirm_with_message` / `alert_with_message` wrappers) from
+the frontend. They are silently no-op'd inside Tauri's WKWebView, so the
+prompt never appears and any branch that reads the return value is broken.
+
+Use the async helper instead:
+
+```rust
+if !crate::bridge::confirm_dialog("Title", &message).await {
+    return;
+}
+```
+
+It's wired through `tauri-plugin-dialog` and shows a real native dialog on
+desktop and mobile. Call sites need to be `async` (or run inside
+`spawn_local`) since the helper is async.
+
 ## Frontend UI tests
 
 Component-level rendering tests live inline in their component file under

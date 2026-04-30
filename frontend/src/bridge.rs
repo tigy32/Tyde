@@ -131,6 +131,40 @@ pub async fn submit_feedback(feedback: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Show a native OK/Cancel confirmation dialog via tauri-plugin-dialog.
+///
+/// Use this instead of `web_sys::Window::confirm_with_message` — the WKWebView
+/// `window.confirm()` API is silently no-op'd inside Tauri, so this is the
+/// only way to get a working confirmation prompt in the desktop/mobile shell.
+pub async fn confirm_dialog(title: &str, message: &str) -> bool {
+    #[derive(Serialize)]
+    struct Args<'a> {
+        title: &'a str,
+        message: &'a str,
+        kind: &'a str,
+        buttons: &'a str,
+    }
+    let args = match serde_wasm_bindgen::to_value(&Args {
+        title,
+        message,
+        kind: "warning",
+        buttons: "OkCancel",
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("confirm_dialog: failed to serialize args: {e}");
+            return false;
+        }
+    };
+    match tauri_invoke("plugin:dialog|message", args).await {
+        Ok(v) => v.as_string().as_deref() == Some("Ok"),
+        Err(e) => {
+            log::error!("confirm_dialog: plugin:dialog|message failed: {e:?}");
+            false
+        }
+    }
+}
+
 pub async fn mark_ui_debug_ready() -> Result<(), String> {
     tauri_invoke("mark_ui_debug_ready", JsValue::NULL)
         .await

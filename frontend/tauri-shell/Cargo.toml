@@ -25,6 +25,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 serde.workspace = true
 tokio.workspace = true
 tauri = { version = "2.10.3", features = [] }
+tauri-plugin-dialog = "2"
 tracing.workspace = true
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
