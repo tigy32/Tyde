@@ -6,9 +6,9 @@ use crate::state::{AppState, TabContent, sort_project_infos};
 
 use protocol::{
     BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, SessionSettingsValues, SetSessionSettingsPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath,
 };
 
 pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
@@ -190,12 +190,7 @@ pub fn rename_project(state: &AppState, host_id: String, project_id: ProjectId, 
     });
 }
 
-pub fn delete_project_root(
-    state: &AppState,
-    host_id: String,
-    project_id: ProjectId,
-    root: String,
-) {
+pub fn delete_project_root(state: &AppState, host_id: String, project_id: ProjectId, root: String) {
     let Some(host_stream) = state.host_stream_untracked(&host_id) else {
         log::error!("delete_project_root: host stream missing for {host_id}");
         return;
@@ -205,8 +200,13 @@ pub fn delete_project_root(
         root,
     };
     spawn_local(async move {
-        if let Err(error) =
-            send_frame(&host_id, host_stream, FrameKind::ProjectDeleteRoot, &payload).await
+        if let Err(error) = send_frame(
+            &host_id,
+            host_stream,
+            FrameKind::ProjectDeleteRoot,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send ProjectDeleteRoot: {error}");
         }

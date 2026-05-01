@@ -68,7 +68,7 @@ pub(crate) async fn list_dir(
 ) -> Result<HostBrowseEntriesPayload, HostBrowseErrorPayload> {
     let fs_path = PathBuf::from(&path.0);
 
-    let meta = match fs::symlink_metadata(&fs_path).await {
+    let meta = match fs::metadata(&fs_path).await {
         Ok(meta) => meta,
         Err(err) => return Err(map_target_error(path, err)),
     };
@@ -242,4 +242,39 @@ fn system_time_to_ms(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    use std::fs as std_fs;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_dir_follows_directory_symlink() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let target = temp_dir.path().join("actual-home");
+        std_fs::create_dir(&target).expect("create target directory");
+        std_fs::write(target.join("project.txt"), "hello").expect("write target file");
+
+        let link = temp_dir.path().join("home-link");
+        unix_fs::symlink(&target, &link).expect("create directory symlink");
+
+        let path = HostAbsPath(link.to_string_lossy().to_string());
+        let entries = list_dir(&path, false)
+            .await
+            .expect("directory symlink should list target directory");
+
+        assert_eq!(entries.path, path);
+        assert!(
+            entries
+                .entries
+                .iter()
+                .any(|entry| entry.name == "project.txt")
+        );
+    }
 }

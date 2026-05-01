@@ -9,11 +9,11 @@ use crate::{
     HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
     McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectReorderPayload, RunBackendSetupPayload, SessionListPayload,
-    SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TerminalCreatePayload, ToolExecutionCompletedData, ToolRequest,
+    ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload, RunBackendSetupPayload,
+    SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
+    SteeringUpsertPayload, StreamPath, TerminalCreatePayload, ToolExecutionCompletedData,
+    ToolRequest,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;

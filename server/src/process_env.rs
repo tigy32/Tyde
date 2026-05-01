@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Option<OsString>> = OnceLock::new();
+#[cfg(unix)]
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) fn resolved_child_process_path() -> Option<&'static OsStr> {
     RESOLVED_CHILD_PROCESS_PATH
@@ -156,7 +158,7 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
     };
 
     let started = Instant::now();
-    let timeout = Duration::from_millis(750);
+    let timeout = LOGIN_SHELL_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -244,7 +246,7 @@ fn resolve_login_shell_command_path_with_shell(shell: &str, binary: &str) -> Opt
     };
 
     let started = Instant::now();
-    let timeout = Duration::from_millis(750);
+    let timeout = LOGIN_SHELL_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {

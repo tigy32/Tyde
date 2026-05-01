@@ -9,14 +9,13 @@ use protocol::{
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
     McpServerUpsertPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
-    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
-    TerminalSendPayload,
+    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, RunBackendSetupPayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
+    TerminalResizePayload, TerminalSendPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;

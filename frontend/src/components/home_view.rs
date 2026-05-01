@@ -2,9 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::actions::{
-    begin_new_chat, begin_new_chat_with, delete_project_root, rename_project,
-};
+use crate::actions::{begin_new_chat, begin_new_chat_with, delete_project_root, rename_project};
 use crate::state::{AgentInfo, AppState, ConnectionStatus};
 
 use protocol::{BackendKind, CustomAgent};
@@ -206,7 +204,12 @@ fn ProjectCard(
             if trimmed.is_empty() || trimmed == project_name {
                 return;
             }
-            rename_project(&state, host_id.clone(), project_id.clone(), trimmed.to_owned());
+            rename_project(
+                &state,
+                host_id.clone(),
+                project_id.clone(),
+                trimmed.to_owned(),
+            );
         }
     };
 
@@ -222,18 +225,16 @@ fn ProjectCard(
     let on_blur = move |_| commit_for_blur();
 
     let commit_for_keydown = commit_rename.clone();
-    let on_keydown = move |ev: web_sys::KeyboardEvent| {
-        match ev.key().as_str() {
-            "Enter" => {
-                ev.prevent_default();
-                commit_for_keydown();
-            }
-            "Escape" => {
-                ev.prevent_default();
-                editing.set(false);
-            }
-            _ => {}
+    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+        "Enter" => {
+            ev.prevent_default();
+            commit_for_keydown();
         }
+        "Escape" => {
+            ev.prevent_default();
+            editing.set(false);
+        }
+        _ => {}
     };
 
     let project_name_view = project_name.clone();
@@ -244,7 +245,7 @@ fn ProjectCard(
                     class="project-card-name-input"
                     type="text"
                     prop:value=move || draft_name.get()
-                    on:input=on_input.clone()
+                    on:input=on_input
                     on:blur=on_blur.clone()
                     on:keydown=on_keydown.clone()
                     autofocus="true"
