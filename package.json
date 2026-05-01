@@ -1,7 +1,7 @@
 {
   "name": "tyde",
   "private": true,
-  "version": "0.8.3",
+  "version": "0.8.4",
   "scripts": {
     "tauri": "cargo tauri"
   },
