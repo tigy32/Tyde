@@ -248,11 +248,17 @@ fn TabButton(
     let input_ref = NodeRef::<leptos::html::Input>::new();
     let edit_value: RwSignal<String> = RwSignal::new(String::new());
 
-    // Initialize edit_value and focus the input when editing starts
+    // Seed edit_value when editing starts (false→true transition only) and
+    // focus the input once it's mounted. The two effects are deliberately
+    // separate: the seeding effect must NOT subscribe to input_ref, because
+    // that signal gets re-set on every element mount and would otherwise
+    // clobber the user's typed value back to the original label.
     {
         let state_init = expect_context::<AppState>();
+        let mut last_editing = false;
         Effect::new(move |_| {
-            if editing_tab_id.get() == Some(tab_id) {
+            let editing_now = editing_tab_id.get() == Some(tab_id);
+            if editing_now && !last_editing {
                 let label = state_init.center_zone.with_untracked(|cz| {
                     cz.tabs
                         .iter()
@@ -261,13 +267,18 @@ fn TabButton(
                         .unwrap_or_default()
                 });
                 edit_value.set(label);
-                if let Some(el) = input_ref.get() {
-                    let _ = el.focus();
-                    el.select();
-                }
             }
+            last_editing = editing_now;
         });
     }
+    Effect::new(move |_| {
+        if editing_tab_id.get() == Some(tab_id)
+            && let Some(el) = input_ref.get()
+        {
+            let _ = el.focus();
+            el.select();
+        }
+    });
 
     view! {
         <button
