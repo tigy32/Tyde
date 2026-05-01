@@ -12,7 +12,8 @@ use protocol::{
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
     HostBrowseStartPayload, HostSettingsPayload, McpServerDeletePayload, McpServerNotifyPayload,
     McpServerUpsertPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectDiscardFilePayload,
+    ProjectGitCommitPayload,
     ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
@@ -1012,6 +1013,44 @@ impl HostHandle {
                 project_id = %project_id,
                 error = %error,
                 "failed to refresh project actor after adding project root"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn delete_project_root(
+        &self,
+        payload: ProjectDeleteRootPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_delete_root";
+        let mut state = self.state.lock().await;
+        let project = state
+            .project_store
+            .lock()
+            .await
+            .delete_root(&payload.id, &payload.root)
+            .map_err(|error| project_store_error(OPERATION, error))?;
+        let project_id = project.id.clone();
+        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to start project actor after deleting project root"
+                );
+                None
+            }
+        };
+        drop(state);
+        if let Some(handle) = handle
+            && let Err(error) = handle.refresh().await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to refresh project actor after deleting project root"
             );
         }
         Ok(())
@@ -2308,7 +2347,7 @@ async fn project_exists(
 }
 
 fn project_store_error(operation: &'static str, error: String) -> AppError {
-    if error.contains("missing project") {
+    if error.contains("missing project") || error.contains("does not contain root") {
         AppError::not_found(operation, error)
     } else if error.contains("already contains root") || error.contains("duplicate id") {
         AppError::conflict(operation, error)

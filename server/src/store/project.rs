@@ -124,6 +124,21 @@ impl ProjectStore {
         Ok(updated)
     }
 
+    pub fn delete_root(&self, id: &ProjectId, root: &str) -> Result<Project, String> {
+        let mut records = Self::read_from_disk(&self.path)?;
+        let Some(project) = records.get_mut(&id.0) else {
+            return Err(format!("cannot delete root from missing project {}", id));
+        };
+        let original_len = project.roots.len();
+        project.roots.retain(|existing| existing != root);
+        if project.roots.len() == original_len {
+            return Err(format!("project {} does not contain root {}", id, root));
+        }
+        let updated = project.clone();
+        self.save(&records)?;
+        Ok(updated)
+    }
+
     pub fn delete(&self, id: &ProjectId) -> Result<Project, String> {
         let mut records = Self::read_from_disk(&self.path)?;
         let Some(project) = records.remove(&id.0) else {

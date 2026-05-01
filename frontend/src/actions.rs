@@ -5,9 +5,10 @@ use crate::send::send_frame;
 use crate::state::{AppState, TabContent, sort_project_infos};
 
 use protocol::{
-    BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload, ProjectId, ProjectPath,
-    ProjectReadFilePayload, ProjectReorderPayload, SessionSettingsValues,
-    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, SessionSettingsValues, SetSessionSettingsPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 
 pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
@@ -162,6 +163,52 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
         .await
         {
             log::error!("failed to send ProjectReadFile: {error}");
+        }
+    });
+}
+
+pub fn rename_project(state: &AppState, host_id: String, project_id: ProjectId, name: String) {
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        log::error!("rename_project: name must not be empty");
+        return;
+    }
+    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+        log::error!("rename_project: host stream missing for {host_id}");
+        return;
+    };
+    let payload = ProjectRenamePayload {
+        id: project_id,
+        name,
+    };
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&host_id, host_stream, FrameKind::ProjectRename, &payload).await
+        {
+            log::error!("failed to send ProjectRename: {error}");
+        }
+    });
+}
+
+pub fn delete_project_root(
+    state: &AppState,
+    host_id: String,
+    project_id: ProjectId,
+    root: String,
+) {
+    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+        log::error!("delete_project_root: host stream missing for {host_id}");
+        return;
+    };
+    let payload = ProjectDeleteRootPayload {
+        id: project_id,
+        root,
+    };
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&host_id, host_stream, FrameKind::ProjectDeleteRoot, &payload).await
+        {
+            log::error!("failed to send ProjectDeleteRoot: {error}");
         }
     });
 }

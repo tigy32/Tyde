@@ -1,6 +1,10 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 
-use crate::actions::{begin_new_chat, begin_new_chat_with};
+use crate::actions::{
+    begin_new_chat, begin_new_chat_with, delete_project_root, rename_project,
+};
 use crate::state::{AgentInfo, AppState, ConnectionStatus};
 
 use protocol::{BackendKind, CustomAgent};
@@ -116,7 +120,7 @@ pub fn HomeView() -> impl IntoView {
                                         view! {
                                             <div class="project-grid">
                                                 {projects.into_iter().map(|project| {
-                                                    view! { <ProjectCard project=project.project agents=agents.clone() host_id=project.host_id /> }
+                                                    view! { <ProjectCard project=project.project agents=agents.clone() host_id=project.host_id.clone() /> }
                                                 }).collect_view()}
                                             </div>
                                         }.into_any()
@@ -171,22 +175,153 @@ fn ProjectCard(
     agents: Vec<AgentInfo>,
     host_id: String,
 ) -> impl IntoView {
+    let state = expect_context::<AppState>();
     let project_id = project.id.clone();
     let agent_count = agents
         .iter()
         .filter(|agent| agent.host_id == host_id && agent.project_id.as_ref() == Some(&project_id))
         .count();
 
-    let roots_display = if project.roots.is_empty() {
-        "No workspace roots".to_string()
+    let editing = RwSignal::new(false);
+    let draft_name = RwSignal::new(project.name.clone());
+
+    let project_name = project.name.clone();
+    let begin_edit = {
+        let project_name = project_name.clone();
+        move |_| {
+            draft_name.set(project_name.clone());
+            editing.set(true);
+        }
+    };
+
+    let commit_rename = {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let project_id = project_id.clone();
+        let project_name = project_name.clone();
+        move || {
+            let new_name = draft_name.get_untracked();
+            let trimmed = new_name.trim();
+            editing.set(false);
+            if trimmed.is_empty() || trimmed == project_name {
+                return;
+            }
+            rename_project(&state, host_id.clone(), project_id.clone(), trimmed.to_owned());
+        }
+    };
+
+    let on_input = move |ev: web_sys::Event| {
+        if let Some(target) = ev.target()
+            && let Some(input) = target.dyn_ref::<web_sys::HtmlInputElement>()
+        {
+            draft_name.set(input.value());
+        }
+    };
+
+    let commit_for_blur = commit_rename.clone();
+    let on_blur = move |_| commit_for_blur();
+
+    let commit_for_keydown = commit_rename.clone();
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        match ev.key().as_str() {
+            "Enter" => {
+                ev.prevent_default();
+                commit_for_keydown();
+            }
+            "Escape" => {
+                ev.prevent_default();
+                editing.set(false);
+            }
+            _ => {}
+        }
+    };
+
+    let project_name_view = project_name.clone();
+    let name_view = move || {
+        if editing.get() {
+            view! {
+                <input
+                    class="project-card-name-input"
+                    type="text"
+                    prop:value=move || draft_name.get()
+                    on:input=on_input.clone()
+                    on:blur=on_blur.clone()
+                    on:keydown=on_keydown.clone()
+                    autofocus="true"
+                />
+            }
+            .into_any()
+        } else {
+            view! {
+                <button
+                    class="project-card-name"
+                    title="Click to rename"
+                    on:click=begin_edit.clone()
+                >
+                    {project_name_view.clone()}
+                </button>
+            }
+            .into_any()
+        }
+    };
+
+    let roots = project.roots.clone();
+    let roots_view = if roots.is_empty() {
+        view! { <div class="project-card-roots-empty">"No workspace roots"</div> }.into_any()
     } else {
-        project.roots.join(", ")
+        let host_id = host_id.clone();
+        let project_id = project_id.clone();
+        let project_name = project.name.clone();
+        roots
+            .into_iter()
+            .map(|root| {
+                let state = state.clone();
+                let host_id = host_id.clone();
+                let project_id = project_id.clone();
+                let project_name = project_name.clone();
+                let root_for_label = root.clone();
+                let root_for_title = root.clone();
+                let on_remove = move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    let state = state.clone();
+                    let host_id = host_id.clone();
+                    let project_id = project_id.clone();
+                    let project_name = project_name.clone();
+                    let root = root.clone();
+                    spawn_local(async move {
+                        let message = format!(
+                            "Remove root \"{}\" from project \"{}\"?",
+                            root, project_name
+                        );
+                        if !crate::bridge::confirm_dialog("Remove root", &message).await {
+                            return;
+                        }
+                        delete_project_root(&state, host_id, project_id, root);
+                    });
+                };
+                view! {
+                    <div class="project-card-root-row">
+                        <span class="project-card-root-path" title=root_for_title>
+                            {root_for_label}
+                        </span>
+                        <button
+                            class="project-card-root-remove"
+                            title="Remove root"
+                            on:click=on_remove
+                        >
+                            "×"
+                        </button>
+                    </div>
+                }
+            })
+            .collect_view()
+            .into_any()
     };
 
     view! {
         <div class="project-card">
-            <div class="project-card-name">{project.name}</div>
-            <div class="project-card-roots">{roots_display}</div>
+            {name_view}
+            <div class="project-card-roots">{roots_view}</div>
             <div class="project-card-agents">
                 {match agent_count {
                     0 => "No active agents".to_string(),

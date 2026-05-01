@@ -1246,10 +1246,46 @@ kbd {
 }
 
 .project-card-name {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    padding: var(--space-1);
+    margin: calc(-1 * var(--space-1));
+    margin-bottom: var(--space-1);
+    border-radius: 4px;
     font-size: 1.077rem;
     font-weight: 600;
     color: var(--text-primary);
+    cursor: text;
+    font-family: inherit;
+}
+
+.project-card-name:hover {
+    border-color: var(--border-secondary);
+    background: var(--surface-2);
+}
+
+.project-card-name-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: var(--space-1);
+    margin: calc(-1 * var(--space-1));
     margin-bottom: var(--space-1);
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--text-primary);
+    font-size: 1.077rem;
+    font-weight: 600;
+    font-family: inherit;
+    outline: none;
+}
+
+.project-card-name-input:focus {
+    border-color: var(--accent-primary, #4a90e2);
 }
 
 .project-card-roots {
@@ -1257,9 +1293,48 @@ kbd {
     color: var(--text-tertiary);
     font-family: var(--font-mono);
     margin-bottom: var(--space-2);
+}
+
+.project-card-roots-empty {
+    font-style: italic;
+}
+
+.project-card-root-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 1px 0;
+}
+
+.project-card-root-path {
+    flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    min-width: 0;
+}
+
+.project-card-root-remove {
+    background: transparent;
+    border: none;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    padding: 0 var(--space-1);
+    border-radius: 3px;
+    line-height: 1;
+    font-size: 1rem;
+    opacity: 0;
+    transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+
+.project-card-root-row:hover .project-card-root-remove,
+.project-card-root-remove:focus-visible {
+    opacity: 1;
+}
+
+.project-card-root-remove:hover {
+    background: var(--surface-3, var(--surface-2));
+    color: var(--text-primary);
 }
 
 .project-card-agents {

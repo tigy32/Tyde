@@ -20,7 +20,7 @@ pub use types::{
     McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
     McpTransportConfig, MessageSender, ModelInfo, NewAgentPayload, NewTerminalPayload,
     OperationCancelledData, PROTOCOL_VERSION, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDiffScope, ProjectDiscardFilePayload, ProjectFileContentsPayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectDiffScope, ProjectDiscardFilePayload, ProjectFileContentsPayload,
     ProjectFileEntry, ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind,
     ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectGitDiffFile, ProjectGitDiffHunk,
     ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,

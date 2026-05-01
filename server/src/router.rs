@@ -8,7 +8,8 @@ use protocol::{
     EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
     McpServerUpsertPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
+    ProjectListDirPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
     RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
@@ -76,6 +77,13 @@ pub(crate) async fn route_client_envelope(
                 ensure_non_empty("project_add_root", "id", payload.id.0.as_str())?;
                 ensure_non_empty("project_add_root", "root", payload.root.as_str())?;
                 host.add_project_root(payload).await?;
+            }
+            FrameKind::ProjectDeleteRoot => {
+                let payload: ProjectDeleteRootPayload =
+                    parse_payload(&envelope, "project_delete_root")?;
+                ensure_non_empty("project_delete_root", "id", payload.id.0.as_str())?;
+                ensure_non_empty("project_delete_root", "root", payload.root.as_str())?;
+                host.delete_project_root(payload).await?;
             }
             FrameKind::ProjectDelete => {
                 let payload: ProjectDeletePayload = parse_payload(&envelope, "project_delete")?;

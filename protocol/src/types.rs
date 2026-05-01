@@ -232,6 +232,7 @@ pub enum FrameKind {
     ProjectRename,
     ProjectReorder,
     ProjectAddRoot,
+    ProjectDeleteRoot,
     ProjectDelete,
     CustomAgentUpsert,
     CustomAgentDelete,
@@ -314,6 +315,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectRename => f.write_str("project_rename"),
             Self::ProjectReorder => f.write_str("project_reorder"),
             Self::ProjectAddRoot => f.write_str("project_add_root"),
+            Self::ProjectDeleteRoot => f.write_str("project_delete_root"),
             Self::ProjectDelete => f.write_str("project_delete"),
             Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
             Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
@@ -967,6 +969,12 @@ pub struct ProjectReorderPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectAddRootPayload {
+    pub id: ProjectId,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDeleteRootPayload {
     pub id: ProjectId,
     pub root: String,
 }

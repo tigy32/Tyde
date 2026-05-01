@@ -8,7 +8,8 @@ use crate::{
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBrowseClosePayload,
     HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
     McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectNotifyPayload,
     ProjectRenamePayload, ProjectReorderPayload, RunBackendSetupPayload, SessionListPayload,
     SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
@@ -183,6 +184,9 @@ impl ProtocolValidator {
             }
             FrameKind::ProjectAddRoot => {
                 parse_host_payload::<ProjectAddRootPayload>(self, envelope, "ProjectAddRoot")
+            }
+            FrameKind::ProjectDeleteRoot => {
+                parse_host_payload::<ProjectDeleteRootPayload>(self, envelope, "ProjectDeleteRoot")
             }
             FrameKind::ProjectDelete => {
                 parse_host_payload::<ProjectDeletePayload>(self, envelope, "ProjectDelete")
