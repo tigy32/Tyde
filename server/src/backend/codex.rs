@@ -4617,6 +4617,35 @@ fn backend_error_message(content: String) -> ChatEvent {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexAgentMessageCompletionDisposition {
+    EmitOnOpenStream,
+    EmitWithSyntheticStart,
+    SkipDuplicateEmpty,
+    SkipDuplicateCompleted,
+}
+
+fn codex_agent_message_completion_disposition(
+    has_open_stream: bool,
+    saw_agent_message_completed: bool,
+    stream_closed_by_turn_completion: bool,
+    text: &str,
+) -> CodexAgentMessageCompletionDisposition {
+    if has_open_stream {
+        return CodexAgentMessageCompletionDisposition::EmitOnOpenStream;
+    }
+
+    if saw_agent_message_completed {
+        return CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted;
+    }
+
+    if stream_closed_by_turn_completion && text.trim().is_empty() {
+        return CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty;
+    }
+
+    CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart
+}
+
 fn spawn_codex_subagent_event_bridge(
     mut raw_rx: mpsc::UnboundedReceiver<Value>,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
@@ -4949,6 +4978,7 @@ impl Backend for CodexBackend {
             let mut file_change_call_ids: HashMap<String, Vec<String>> = HashMap::new();
             let mut saw_agent_message_delta = false;
             let mut saw_agent_message_completed = false;
+            let mut stream_closed_by_turn_completion = false;
             let mut reasoning_notification_count = 0usize;
             let mut started_item_types: Vec<String> = Vec::new();
             let mut completed_item_types: Vec<String> = Vec::new();
@@ -5054,6 +5084,7 @@ impl Backend for CodexBackend {
                                 accumulated_text.clear();
                                 saw_agent_message_delta = false;
                                 saw_agent_message_completed = false;
+                                stream_closed_by_turn_completion = false;
                                 reasoning_notification_count = 0;
                                 started_item_types.clear();
                                 completed_item_types.clear();
@@ -5090,6 +5121,7 @@ impl Backend for CodexBackend {
                                     let start_message_id =
                                         msg_id.clone().unwrap_or_else(|| "assistant".to_string());
                                     current_message_id = Some(start_message_id.clone());
+                                    stream_closed_by_turn_completion = false;
                                     accumulated_text.clear();
                                     if !typing_status_active {
                                         let _ = events_tx
@@ -5130,12 +5162,51 @@ impl Backend for CodexBackend {
                                 }
                                 match item_type {
                                     "agentMessage" => {
-                                        saw_agent_message_completed = true;
                                         let text = item
                                             .get("text")
                                             .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
+                                        let disposition =
+                                            codex_agent_message_completion_disposition(
+                                                current_message_id.is_some(),
+                                                saw_agent_message_completed,
+                                                stream_closed_by_turn_completion,
+                                                &text,
+                                            );
+                                        match disposition {
+                                            CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty => {
+                                                tracing::warn!(
+                                                    turn_id = ?active_turn_id,
+                                                    item_id = %item_id,
+                                                    "Codex emitted an empty agentMessage completion after the turn was already closed; skipping duplicate StreamEnd"
+                                                );
+                                                saw_agent_message_completed = true;
+                                                stream_closed_by_turn_completion = false;
+                                                continue;
+                                            }
+                                            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted => {
+                                                tracing::warn!(
+                                                    turn_id = ?active_turn_id,
+                                                    item_id = %item_id,
+                                                    text_len = text.len(),
+                                                    "Codex emitted a duplicate agentMessage completion; skipping duplicate StreamEnd"
+                                                );
+                                                continue;
+                                            }
+                                            CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
+                                                let start_message_id = item_id.clone();
+                                                let _ = events_tx
+                                                    .send(ChatEvent::StreamStart(StreamStartData {
+                                                        message_id: Some(start_message_id),
+                                                        agent: CODEX_AGENT_NAME.to_owned(),
+                                                        model: Some(model_name.clone()),
+                                                    }))
+                                                    .await;
+                                            }
+                                            CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
+                                        }
+                                        saw_agent_message_completed = true;
                                         let final_text = if text.is_empty() {
                                             std::mem::take(&mut accumulated_text)
                                         } else {
@@ -5161,6 +5232,7 @@ impl Backend for CodexBackend {
                                             .send(ChatEvent::StreamEnd(StreamEndData { message }))
                                             .await;
                                         current_message_id = None;
+                                        stream_closed_by_turn_completion = false;
                                     }
                                     "commandExecution" => {
                                         let exit_code =
@@ -5411,6 +5483,7 @@ impl Backend for CodexBackend {
                                         let _ = events_tx
                                             .send(ChatEvent::StreamEnd(StreamEndData { message }))
                                             .await;
+                                        stream_closed_by_turn_completion = true;
                                     }
                                     current_message_id = None;
                                 }
@@ -5749,6 +5822,38 @@ mod tests {
 
     fn live_test_log(msg: &str) {
         eprintln!("[live-codex-test] {msg}");
+    }
+
+    #[test]
+    fn codex_agent_message_completion_skips_empty_duplicate_after_turn_close() {
+        let disposition = codex_agent_message_completion_disposition(false, false, true, "");
+
+        assert_eq!(
+            disposition,
+            CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty
+        );
+    }
+
+    #[test]
+    fn codex_agent_message_completion_starts_stream_for_late_content() {
+        let disposition =
+            codex_agent_message_completion_disposition(false, false, true, "final answer");
+
+        assert_eq!(
+            disposition,
+            CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart
+        );
+    }
+
+    #[test]
+    fn codex_agent_message_completion_skips_second_completed_item() {
+        let disposition =
+            codex_agent_message_completion_disposition(false, true, false, "duplicate");
+
+        assert_eq!(
+            disposition,
+            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted
+        );
     }
 
     #[test]

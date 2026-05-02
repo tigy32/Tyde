@@ -46,11 +46,7 @@ struct DiffScroll {
 }
 
 #[component]
-pub fn DiffView(
-    root: ProjectRootPath,
-    scope: ProjectDiffScope,
-    path: String,
-) -> impl IntoView {
+pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope, path: String) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let key = (root.clone(), scope, path.clone());

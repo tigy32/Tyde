@@ -1512,28 +1512,34 @@ mod tests {
             let root = ProjectRootPath("/root/proj".to_string());
             let scope = ProjectDiffScope::Unstaged;
 
-            let id_a = state.center_zone.try_update(|cz| {
-                cz.open(
-                    TabContent::Diff {
-                        root: root.clone(),
-                        scope,
-                        path: "src/a.rs".to_string(),
-                    },
-                    "Diff: proj/a.rs".to_string(),
-                    true,
-                )
-            }).unwrap();
-            let id_b = state.center_zone.try_update(|cz| {
-                cz.open(
-                    TabContent::Diff {
-                        root: root.clone(),
-                        scope,
-                        path: "src/b.rs".to_string(),
-                    },
-                    "Diff: proj/b.rs".to_string(),
-                    true,
-                )
-            }).unwrap();
+            let id_a = state
+                .center_zone
+                .try_update(|cz| {
+                    cz.open(
+                        TabContent::Diff {
+                            root: root.clone(),
+                            scope,
+                            path: "src/a.rs".to_string(),
+                        },
+                        "Diff: proj/a.rs".to_string(),
+                        true,
+                    )
+                })
+                .unwrap();
+            let id_b = state
+                .center_zone
+                .try_update(|cz| {
+                    cz.open(
+                        TabContent::Diff {
+                            root: root.clone(),
+                            scope,
+                            path: "src/b.rs".to_string(),
+                        },
+                        "Diff: proj/b.rs".to_string(),
+                        true,
+                    )
+                })
+                .unwrap();
 
             assert_ne!(id_a, id_b, "different paths must produce different tab ids");
             state.center_zone.with_untracked(|cz| {
@@ -1547,17 +1553,20 @@ mod tests {
             });
 
             // Re-opening the same path should reuse the existing tab.
-            let id_a2 = state.center_zone.try_update(|cz| {
-                cz.open(
-                    TabContent::Diff {
-                        root: root.clone(),
-                        scope,
-                        path: "src/a.rs".to_string(),
-                    },
-                    "Diff: proj/a.rs".to_string(),
-                    true,
-                )
-            }).unwrap();
+            let id_a2 = state
+                .center_zone
+                .try_update(|cz| {
+                    cz.open(
+                        TabContent::Diff {
+                            root: root.clone(),
+                            scope,
+                            path: "src/a.rs".to_string(),
+                        },
+                        "Diff: proj/a.rs".to_string(),
+                        true,
+                    )
+                })
+                .unwrap();
             assert_eq!(id_a, id_a2);
         });
     }
