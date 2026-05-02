@@ -619,6 +619,23 @@ details summary:focus:not(:focus-visible) {
     display: none;
 }
 
+.rail-label-input {
+    background: var(--surface-2);
+    border: 1px solid var(--border-secondary);
+    border-radius: 3px;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+    padding: 1px 4px;
+    outline: none;
+    min-width: 0;
+}
+
+.rail-label-input:focus {
+    border-color: var(--accent-primary, #4a90e2);
+}
+
 .rail-divider {
     align-self: center;
     width: 24px;

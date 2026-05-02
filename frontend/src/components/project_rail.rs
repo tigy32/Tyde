@@ -1,7 +1,8 @@
 use leptos::prelude::*;
+use leptos::tachys::dom::event_target_value;
 use wasm_bindgen::JsCast;
 
-use crate::actions::{delete_project, reorder_projects};
+use crate::actions::{delete_project, rename_project, reorder_projects};
 use crate::components::host_browser::open_project_browser;
 use crate::state::{ActiveProjectRef, AppState, TabContent};
 
@@ -32,6 +33,7 @@ pub fn ProjectRail() -> impl IntoView {
     let state_for_hosts = state.clone();
     let dragged_project = RwSignal::new(None::<DraggedProject>);
     let drop_target = RwSignal::new(None::<ProjectDropTarget>);
+    let editing_project = RwSignal::new(None::<(String, protocol::ProjectId)>);
 
     let state_for_home = state.clone();
     let go_home = move |_| {
@@ -109,11 +111,13 @@ pub fn ProjectRail() -> impl IntoView {
                         let host_id_for_projects = host_id.clone();
                         let dragged_project_for_projects = dragged_project;
                         let drop_target_for_projects = drop_target;
+                        let editing_project_for_projects = editing_project;
                         let projects_view = move || {
                             let state = state_for_projects.clone();
                             let host_id_filter = host_id_for_projects.clone();
                             let dragged_project = dragged_project_for_projects;
                             let drop_target = drop_target_for_projects;
+                            let editing_project = editing_project_for_projects;
                             state.projects.get()
                                 .into_iter()
                                 .filter(move |project| project.host_id == host_id_filter)
@@ -166,10 +170,13 @@ pub fn ProjectRail() -> impl IntoView {
                                     let project_id_for_drag = project_id.clone();
                                     let project_id_for_drop = project_id.clone();
                                     let project_id_for_dragover = project_id.clone();
+                                    let state_for_click = state.clone();
+                                    let host_id_for_click = host_id.clone();
+                                    let project_id_for_click = project_id.clone();
                                     let on_click = move |_| {
-                                        state.switch_active_project(Some(ActiveProjectRef {
-                                            host_id: host_id.clone(),
-                                            project_id: project_id.clone(),
+                                        state_for_click.switch_active_project(Some(ActiveProjectRef {
+                                            host_id: host_id_for_click.clone(),
+                                            project_id: project_id_for_click.clone(),
                                         }));
                                     };
                                     let on_remove = move |_| {
@@ -245,6 +252,125 @@ pub fn ProjectRail() -> impl IntoView {
                                     let abbrev = abbreviate(&project.name);
                                     let project_name = project.name.clone();
                                     let project_name_for_title = project_name.clone();
+
+                                    let editing_key = (host_id.clone(), project_id.clone());
+                                    let editing_key_for_check = editing_key.clone();
+                                    let editing_key_for_dbl = editing_key.clone();
+                                    let is_editing = move || {
+                                        editing_project.get().as_ref() == Some(&editing_key_for_check)
+                                    };
+                                    let on_dblclick = move |ev: web_sys::MouseEvent| {
+                                        ev.stop_propagation();
+                                        editing_project.set(Some(editing_key_for_dbl.clone()));
+                                    };
+
+                                    let input_ref = NodeRef::<leptos::html::Input>::new();
+                                    let edit_value: RwSignal<String> = RwSignal::new(String::new());
+                                    {
+                                        let editing_key_for_seed = editing_key.clone();
+                                        let initial_name = project_name.clone();
+                                        let mut last_editing = false;
+                                        Effect::new(move |_| {
+                                            let editing_now = editing_project.get().as_ref()
+                                                == Some(&editing_key_for_seed);
+                                            if editing_now && !last_editing {
+                                                edit_value.set(initial_name.clone());
+                                            }
+                                            last_editing = editing_now;
+                                        });
+                                    }
+                                    {
+                                        let editing_key_for_focus = editing_key.clone();
+                                        Effect::new(move |_| {
+                                            let editing_now = editing_project.get().as_ref()
+                                                == Some(&editing_key_for_focus);
+                                            if editing_now
+                                                && let Some(el) = input_ref.get()
+                                            {
+                                                let _ = el.focus();
+                                                el.select();
+                                            }
+                                        });
+                                    }
+
+                                    let state_for_kd = state.clone();
+                                    let host_id_for_kd = host_id.clone();
+                                    let project_id_for_kd = project_id.clone();
+                                    let original_for_kd = project_name.clone();
+                                    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+                                        ev.stop_propagation();
+                                        match ev.key().as_str() {
+                                            "Enter" => {
+                                                let new_name =
+                                                    edit_value.get_untracked().trim().to_string();
+                                                editing_project.set(None);
+                                                if !new_name.is_empty()
+                                                    && new_name != original_for_kd
+                                                {
+                                                    rename_project(
+                                                        &state_for_kd,
+                                                        host_id_for_kd.clone(),
+                                                        project_id_for_kd.clone(),
+                                                        new_name,
+                                                    );
+                                                }
+                                            }
+                                            "Escape" => editing_project.set(None),
+                                            _ => {}
+                                        }
+                                    };
+                                    let state_for_bl = state.clone();
+                                    let host_id_for_bl = host_id.clone();
+                                    let project_id_for_bl = project_id.clone();
+                                    let original_for_bl = project_name.clone();
+                                    let editing_key_for_bl = editing_key.clone();
+                                    let on_blur = move |_: web_sys::FocusEvent| {
+                                        if editing_project.with_untracked(|e| {
+                                            e.as_ref() != Some(&editing_key_for_bl)
+                                        }) {
+                                            return;
+                                        }
+                                        let new_name =
+                                            edit_value.get_untracked().trim().to_string();
+                                        editing_project.set(None);
+                                        if !new_name.is_empty() && new_name != original_for_bl {
+                                            rename_project(
+                                                &state_for_bl,
+                                                host_id_for_bl.clone(),
+                                                project_id_for_bl.clone(),
+                                                new_name,
+                                            );
+                                        }
+                                    };
+
+                                    let label_view = {
+                                        let project_name = project_name.clone();
+                                        move || {
+                                            if is_editing() {
+                                                view! {
+                                                    <input
+                                                        type="text"
+                                                        class="rail-label rail-label-input"
+                                                        node_ref=input_ref
+                                                        spellcheck="false"
+                                                        autocapitalize="none"
+                                                        autocomplete="off"
+                                                        prop:value=move || edit_value.get()
+                                                        on:input=move |ev| edit_value.set(event_target_value(&ev))
+                                                        on:keydown=on_keydown.clone()
+                                                        on:blur=on_blur.clone()
+                                                        on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                                                        on:dblclick=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                                                    />
+                                                }.into_any()
+                                            } else {
+                                                view! {
+                                                    <span class="rail-label">{project_name.clone()}</span>
+                                                }.into_any()
+                                            }
+                                        }
+                                    };
+
                                     view! {
                                         <div
                                             class=row_class
@@ -254,9 +380,14 @@ pub fn ProjectRail() -> impl IntoView {
                                             on:drop=on_drop
                                             on:dragend=on_drag_end
                                         >
-                                            <button class=item_class title=project_name_for_title on:click=on_click>
+                                            <button
+                                                class=item_class
+                                                title=project_name_for_title
+                                                on:click=on_click
+                                                on:dblclick=on_dblclick
+                                            >
                                                 <span class="rail-tag">{abbrev}</span>
-                                                <span class="rail-label">{project_name.clone()}</span>
+                                                {label_view}
                                             </button>
                                             <button class="rail-project-remove" title="Remove project" on:click=on_remove>
                                                 "×"
