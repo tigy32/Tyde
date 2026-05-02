@@ -459,15 +459,15 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                 .iter()
                                 .find(|t| t.id == tab_id)
                                 .and_then(|t| match &t.content {
-                                    TabContent::Diff { root, scope } => {
-                                        Some((root.clone(), *scope))
+                                    TabContent::Diff { root, scope, path } => {
+                                        Some((root.clone(), *scope, path.clone()))
                                     }
                                     _ => None,
                                 })
                         });
                         match resolved {
-                            Some((root, scope)) => {
-                                view! { <DiffView root=root scope=scope /> }.into_any()
+                            Some((root, scope, path)) => {
+                                view! { <DiffView root=root scope=scope path=path /> }.into_any()
                             }
                             None => view! { <div></div> }.into_any(),
                         }

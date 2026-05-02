@@ -622,7 +622,15 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         }
         FrameKind::ProjectGitDiff => match envelope.parse_payload::<ProjectGitDiffPayload>() {
             Ok(payload) => {
-                let key = (payload.root.clone(), payload.scope);
+                // Tabs (and their corresponding diff_contents entries) are keyed
+                // by path. A response without a path can't be matched to a
+                // specific tab, so drop it. In practice every frontend request
+                // sets `path: Some(...)`.
+                let Some(payload_path) = payload.path.clone() else {
+                    log::debug!("ignoring ProjectGitDiff payload with no path");
+                    return;
+                };
+                let key = (payload.root.clone(), payload.scope, payload_path);
                 let current = state
                     .diff_contents
                     .with_untracked(|diffs| diffs.get(&key).cloned());

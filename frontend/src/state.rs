@@ -88,6 +88,7 @@ pub enum TabContent {
     Diff {
         root: ProjectRootPath,
         scope: ProjectDiffScope,
+        path: String,
     },
 }
 
@@ -500,7 +501,7 @@ pub struct ProjectViewMemory {
     pub center_zone: Option<CenterZoneState>,
     pub active_terminal: Option<ActiveTerminalRef>,
     pub open_files: HashMap<ProjectPath, OpenFile>,
-    pub diff_contents: HashMap<(ProjectRootPath, ProjectDiffScope), DiffViewState>,
+    pub diff_contents: HashMap<(ProjectRootPath, ProjectDiffScope, String), DiffViewState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -573,7 +574,8 @@ pub struct AppState {
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
     pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
-    pub diff_contents: RwSignal<HashMap<(ProjectRootPath, ProjectDiffScope), DiffViewState>>,
+    pub diff_contents:
+        RwSignal<HashMap<(ProjectRootPath, ProjectDiffScope, String), DiffViewState>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
     pub transient_events: RwSignal<HashMap<AgentId, Vec<TransientEvent>>>,
@@ -1091,8 +1093,8 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope } => {
-                    let key = (root.clone(), *scope);
+                TabContent::Diff { root, scope, path } => {
+                    let key = (root.clone(), *scope, path.clone());
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1131,8 +1133,8 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope } => {
-                    let key = (root.clone(), *scope);
+                TabContent::Diff { root, scope, path } => {
+                    let key = (root.clone(), *scope, path.clone());
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1168,8 +1170,8 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope } => {
-                    let key = (root.clone(), *scope);
+                TabContent::Diff { root, scope, path } => {
+                    let key = (root.clone(), *scope, path.clone());
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1196,8 +1198,8 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope } => {
-                    let key = (root.clone(), *scope);
+                TabContent::Diff { root, scope, path } => {
+                    let key = (root.clone(), *scope, path.clone());
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1404,11 +1406,15 @@ mod tests {
         }
     }
 
-    fn test_diff_state(root: ProjectRootPath, scope: ProjectDiffScope) -> DiffViewState {
+    fn test_diff_state(
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<String>,
+    ) -> DiffViewState {
         DiffViewState {
             root: root.clone(),
             scope,
-            path: None,
+            path,
             context_mode: DiffContextMode::Hunks,
             pending: false,
             files: vec![],
@@ -1444,11 +1450,13 @@ mod tests {
                 .with_untracked(|cz| cz.active_tab_id.unwrap());
             let diff_root = ProjectRootPath("/root/proj".to_string());
             let diff_scope = ProjectDiffScope::Unstaged;
+            let diff_path = "src/lib.rs".to_string();
             state.center_zone.update(|cz| {
                 cz.open(
                     TabContent::Diff {
                         root: diff_root.clone(),
                         scope: diff_scope,
+                        path: diff_path.clone(),
                     },
                     "Diff".to_string(),
                     true,
@@ -1467,8 +1475,8 @@ mod tests {
             });
             state.diff_contents.update(|m| {
                 m.insert(
-                    (diff_root.clone(), diff_scope),
-                    test_diff_state(diff_root.clone(), diff_scope),
+                    (diff_root.clone(), diff_scope, diff_path.clone()),
+                    test_diff_state(diff_root.clone(), diff_scope, Some(diff_path.clone())),
                 );
             });
 
@@ -1482,13 +1490,75 @@ mod tests {
             assert!(
                 !state
                     .diff_contents
-                    .with_untracked(|m| m.contains_key(&(diff_root, diff_scope)))
+                    .with_untracked(|m| m.contains_key(&(diff_root, diff_scope, diff_path)))
             );
             state.center_zone.with_untracked(|cz| {
                 assert_eq!(cz.tabs.len(), 2);
                 assert!(cz.tabs.iter().any(|t| t.id == target_id));
                 assert!(cz.tabs.iter().any(|t| !t.closeable));
             });
+        });
+    }
+
+    /// Opening diffs for two different files in the same (root, scope) must
+    /// create two distinct tabs — they are different views and should not
+    /// silently overwrite each other (regression: tabs were keyed only on
+    /// (root, scope), which collapsed every diff into a single stale tab).
+    #[test]
+    fn diffs_for_different_paths_open_separate_tabs() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let root = ProjectRootPath("/root/proj".to_string());
+            let scope = ProjectDiffScope::Unstaged;
+
+            let id_a = state.center_zone.try_update(|cz| {
+                cz.open(
+                    TabContent::Diff {
+                        root: root.clone(),
+                        scope,
+                        path: "src/a.rs".to_string(),
+                    },
+                    "Diff: proj/a.rs".to_string(),
+                    true,
+                )
+            }).unwrap();
+            let id_b = state.center_zone.try_update(|cz| {
+                cz.open(
+                    TabContent::Diff {
+                        root: root.clone(),
+                        scope,
+                        path: "src/b.rs".to_string(),
+                    },
+                    "Diff: proj/b.rs".to_string(),
+                    true,
+                )
+            }).unwrap();
+
+            assert_ne!(id_a, id_b, "different paths must produce different tab ids");
+            state.center_zone.with_untracked(|cz| {
+                let labels: Vec<&str> = cz
+                    .tabs
+                    .iter()
+                    .filter(|t| matches!(&t.content, TabContent::Diff { .. }))
+                    .map(|t| t.label.as_str())
+                    .collect();
+                assert_eq!(labels, vec!["Diff: proj/a.rs", "Diff: proj/b.rs"]);
+            });
+
+            // Re-opening the same path should reuse the existing tab.
+            let id_a2 = state.center_zone.try_update(|cz| {
+                cz.open(
+                    TabContent::Diff {
+                        root: root.clone(),
+                        scope,
+                        path: "src/a.rs".to_string(),
+                    },
+                    "Diff: proj/a.rs".to_string(),
+                    true,
+                )
+            }).unwrap();
+            assert_eq!(id_a, id_a2);
         });
     }
 

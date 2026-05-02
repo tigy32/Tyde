@@ -388,6 +388,7 @@ fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
         crate::state::TabContent::Diff {
             root: root.clone(),
             scope,
+            path: path.clone(),
         },
         label,
         true,
@@ -406,7 +407,7 @@ fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
     // dispatch reducer rejects responses that don't match it. Without this,
     // a context-mode flip before the first response arrives would leave the
     // view empty with nothing to re-dispatch against.
-    let key = (root.clone(), scope);
+    let key = (root.clone(), scope, path.clone());
     state.diff_contents.update(|diffs| {
         let previous = diffs.get(&key);
         let next = DiffViewState::for_request(

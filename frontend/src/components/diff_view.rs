@@ -46,10 +46,14 @@ struct DiffScroll {
 }
 
 #[component]
-pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope) -> impl IntoView {
+pub fn DiffView(
+    root: ProjectRootPath,
+    scope: ProjectDiffScope,
+    path: String,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let key = (root.clone(), scope);
+    let key = (root.clone(), scope, path.clone());
     let diff_key = key.clone();
     let diff = move || {
         state
@@ -2156,13 +2160,17 @@ mod wasm_tests {
 
         let container = make_container();
         let mount_root = root.clone();
+        let mount_path = "big.rs".to_owned();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.diff_contents.update(|d| {
-                d.insert((mount_root.clone(), scope), diff.clone());
+                d.insert(
+                    (mount_root.clone(), scope, mount_path.clone()),
+                    diff.clone(),
+                );
             });
             provide_context(state);
-            view! { <DiffView root=mount_root.clone() scope=scope /> }
+            view! { <DiffView root=mount_root.clone() scope=scope path=mount_path.clone() /> }
         });
         // First tick mounts; a second lets the measurement Effect refine
         // viewport_height/line_height from real DOM measurements.
