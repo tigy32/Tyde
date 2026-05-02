@@ -4336,6 +4336,13 @@ kbd {
 .diff-hunks {
     display: grid;
     grid-template-columns: minmax(max-content, 1fr);
+    /* Without this Chrome stretches the implicit auto-sized rows to fill
+       the grid's height (since `.diff-hunks` is `flex: 1` of `.diff-file`
+       in the only-file case). Each hunk row then balloons taller than its
+       content, leaving empty space *inside* each `.diff-hunk` that reads
+       as a gap between hunks. `start` packs rows at the top so empty
+       space (if any) lands below the last hunk where it belongs. */
+    align-content: start;
     overflow-x: auto;
 }
 
@@ -4441,6 +4448,12 @@ kbd {
 .diff-pane {
     display: grid;
     grid-template-columns: minmax(max-content, 1fr);
+    /* Same fix as `.diff-hunks`: without `align-content: start` Chrome
+       stretches the auto-sized grid rows to fill the pane's flex height,
+       making each `.diff-hunk` track far taller than its content. The
+       extra space inside each hunk renders as a gap before the next
+       hunk header. Pack rows at the top instead. */
+    align-content: start;
     overflow-x: auto;
     overflow-y: visible;
     min-width: 0;

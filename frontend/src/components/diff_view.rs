@@ -2208,4 +2208,111 @@ mod wasm_tests {
              spacers may have been dropped"
         );
     }
+
+    /// In SBS mode, consecutive `.diff-hunk` siblings inside a `.diff-pane`
+    /// (a `display: grid` container) must pack tightly with no extra space
+    /// between them. Regression: without `align-content: start` Chrome
+    /// stretches auto-sized grid rows to fill the pane's flex height,
+    /// inflating each `.diff-hunk` track and leaving a visible empty
+    /// region inside each hunk that reads as a gap before the next hunk
+    /// header.
+    #[wasm_bindgen_test]
+    async fn sbs_hunks_pack_with_no_inter_hunk_gap() {
+        ensure_styles_loaded();
+        let root = ProjectRootPath("test-root".to_owned());
+        let scope = ProjectDiffScope::Unstaged;
+        let path = "multi.rs".to_owned();
+
+        let mk_hunk = |old_start: u32, new_start: u32, hunk_id: &str| ProjectGitDiffHunk {
+            old_start,
+            old_count: 2,
+            new_start,
+            new_count: 2,
+            hunk_id: hunk_id.to_owned(),
+            lines: vec![
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Context,
+                    text: format!("ctx line {old_start}"),
+                    old_line_number: Some(old_start),
+                    new_line_number: Some(new_start),
+                },
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Context,
+                    text: format!("ctx line {}", old_start + 1),
+                    old_line_number: Some(old_start + 1),
+                    new_line_number: Some(new_start + 1),
+                },
+            ],
+        };
+        let file = ProjectGitDiffFile {
+            relative_path: path.clone(),
+            hunks: vec![mk_hunk(431, 431, "h1"), mk_hunk(459, 458, "h2")],
+        };
+        let diff = DiffViewState {
+            root: root.clone(),
+            scope,
+            path: Some(path.clone()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![file],
+        };
+
+        let container = make_container();
+        let mount_root = root.clone();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.diff_view_mode.set(DiffViewMode::SideBySide);
+            state.diff_contents.update(|d| {
+                d.insert(
+                    (mount_root.clone(), scope, mount_path.clone()),
+                    diff.clone(),
+                );
+            });
+            provide_context(state);
+            view! { <DiffView root=mount_root.clone() scope=scope path=mount_path.clone() /> }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        let left_pane = container
+            .query_selector(".diff-pane-left")
+            .unwrap()
+            .expect("left SBS pane present")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let hunks = left_pane.query_selector_all(".diff-hunk").unwrap();
+        assert_eq!(hunks.length(), 2, "expected two hunks in left pane");
+
+        let h0 = hunks
+            .item(0)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .get_bounding_client_rect();
+        let h1 = hunks
+            .item(1)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .get_bounding_client_rect();
+        let gap = h1.top() - h0.bottom();
+        assert!(
+            gap.abs() < 1.0,
+            "expected hunks to pack tightly, got {gap}px between them \
+             (hunk0 bottom={}, hunk1 top={})",
+            h0.bottom(),
+            h1.top(),
+        );
+
+        // Each hunk should hug its content (header ~22px + 2 ctx lines × 20px
+        // = ~62px). Without `align-content: start` Chrome inflates each hunk
+        // to roughly half the pane height, which would be > 200px each.
+        assert!(
+            h0.height() < 120.0,
+            "first hunk inflated to {}px (content should be ~62px); \
+             grid rows are stretching when they shouldn't",
+            h0.height(),
+        );
+    }
 }
