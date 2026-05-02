@@ -3,13 +3,13 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::actions::open_file;
+use crate::actions::{delete_project_root, open_file};
 use crate::components::host_browser::open_add_root_browser;
 use crate::send::send_frame;
 use crate::state::{AppState, display_path_name, root_display_name};
 
 use protocol::{
-    FrameKind, ProjectFileEntry, ProjectFileKind, ProjectListDirPayload, ProjectPath,
+    FrameKind, ProjectFileEntry, ProjectFileKind, ProjectId, ProjectListDirPayload, ProjectPath,
     ProjectRootPath, StreamPath,
 };
 
@@ -199,10 +199,18 @@ pub fn FileExplorer() -> impl IntoView {
                         Some(root_trees) => {
                             let filter_val = filter.get().to_lowercase();
                             let hidden = show_hidden.get();
+                            let active = state.active_project.get();
                             root_trees
                                 .into_iter()
                                 .flat_map(|(root, nodes)| {
-                                    render_root_section(root, nodes, &filter_val, hidden, expanded_dirs)
+                                    render_root_section(
+                                        root,
+                                        nodes,
+                                        &filter_val,
+                                        hidden,
+                                        expanded_dirs,
+                                        active.as_ref().map(|a| (a.host_id.clone(), a.project_id.clone())),
+                                    )
                                 })
                                 .collect::<Vec<_>>()
                         }
@@ -249,14 +257,38 @@ fn render_root_section(
     filter: &str,
     show_hidden: bool,
     expanded_dirs: RwSignal<HashSet<String>>,
+    project_ref: Option<(String, ProjectId)>,
 ) -> Vec<AnyView> {
     let mut views = Vec::new();
     let root_label = root_display_name(&root);
     let root_title = root.0.clone();
+    let remove_button = project_ref.map(|(host_id, project_id)| {
+        let root_path = root.0.clone();
+        let on_remove = move |ev: web_sys::MouseEvent| {
+            ev.stop_propagation();
+            let host_id = host_id.clone();
+            let project_id = project_id.clone();
+            let root_path = root_path.clone();
+            spawn_local(async move {
+                let message = format!("Remove root \"{root_path}\" from this project?");
+                if !crate::bridge::confirm_dialog("Remove root", &message).await {
+                    return;
+                }
+                let state = expect_context::<AppState>();
+                delete_project_root(&state, host_id, project_id, root_path);
+            });
+        };
+        view! {
+            <button class="fe-root-remove" title="Remove root" on:click=on_remove>
+                "×"
+            </button>
+        }
+    });
     views.push(
         view! {
             <div class="fe-root-header" title=root_title>
                 <span class="fe-root-name">{root_label}</span>
+                {remove_button}
             </div>
         }
         .into_any(),
