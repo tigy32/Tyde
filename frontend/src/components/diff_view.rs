@@ -227,6 +227,13 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
         ProjectDiffScope::Staged => "staged",
         ProjectDiffScope::Unstaged => "unstaged",
     };
+    let perf_key = format!(
+        "diff:{}:{}",
+        diff.root.0,
+        diff.path.clone().unwrap_or_default()
+    );
+    crate::perf::log_phase("diff_open", "content_mount", &perf_key, "");
+    let mount_t0 = crate::perf::now_ms();
 
     // Flatten all diff lines into a searchable list and compute per-hunk
     // starting offsets so each rendered line knows its flat search index.
@@ -263,6 +270,19 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
         file_rendered_offsets.push(acc);
         acc += rendered_rows_for_file(file, diff.context_mode);
     }
+    let prep_dt = crate::perf::now_ms() - mount_t0;
+    let total_lines: usize = diff
+        .files
+        .iter()
+        .flat_map(|f| f.hunks.iter())
+        .map(|h| h.lines.len())
+        .sum();
+    crate::perf::log_phase(
+        "diff_open",
+        "prep_done",
+        &perf_key,
+        &format!(" lines={total_lines} took={prep_dt:.1}ms"),
+    );
 
     // Scroll geometry. Pre-seed line/viewport height estimates so the
     // visible window is bounded from the very first paint, before the
@@ -281,6 +301,8 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
 
     // Measure the geometry once after first paint. Re-runs are cheap; we
     // only update the signal if the measured value differs meaningfully.
+    let perf_key_for_measure = perf_key.clone();
+    let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
     Effect::new(move |_| {
         let Some(el) = scroll_ref.get() else { return };
         let vh = el.client_height() as f64;
@@ -293,6 +315,15 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
             let lh = html_el.offset_height() as f64;
             if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
                 line_height.set(lh);
+            }
+            if !measure_logged.get() {
+                measure_logged.set(true);
+                crate::perf::log_phase(
+                    "diff_open",
+                    "first_paint_measured",
+                    &perf_key_for_measure,
+                    &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
+                );
             }
         }
     });
@@ -514,6 +545,7 @@ fn render_unified_virtualized(
     // Pre-compute syntax tokens per hunk once for the file so visible-row
     // rendering is just an index lookup. Done eagerly here; for very large
     // files we could chunk this with `spawn_local` like file_view does.
+    let unified_t0 = crate::perf::now_ms();
     let syntax = syntax_for_path(&relative_path);
     let mut hunk_tokens: Vec<Vec<Option<LineTokens>>> = Vec::with_capacity(file_arc.hunks.len());
     for hunk in &file_arc.hunks {
@@ -524,6 +556,19 @@ fn render_unified_virtualized(
         hunk_tokens.push(tokens);
     }
     let hunk_tokens = Arc::new(hunk_tokens);
+    let unified_dt = crate::perf::now_ms() - unified_t0;
+    let perf_key_u = format!("diff:{}:{relative_path}", root.0);
+    let total_lines: usize = file_arc.hunks.iter().map(|h| h.lines.len()).sum();
+    crate::perf::log_phase(
+        "diff_open",
+        "unified_tokens",
+        &perf_key_u,
+        &format!(
+            " hunks={} lines={total_lines} syntax={} took={unified_dt:.1}ms",
+            file_arc.hunks.len(),
+            syntax.is_some(),
+        ),
+    );
 
     let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
         let lh = scroll.line_height.get().max(1.0);
@@ -698,6 +743,7 @@ fn render_sbs_panes(
     // Compute per-hunk dual syntax tokens **once** for the file, then share
     // between left and right panes. Without this both panes would re-tokenize
     // independently, doubling syntect work and amplifying first-render stall.
+    let eager_t0 = crate::perf::now_ms();
     let syntax = syntax_for_path(&relative_path);
     let hunk_tokens: Vec<DualHunkTokens> = file
         .hunks
@@ -707,6 +753,19 @@ fn render_sbs_panes(
             None => (vec![None; hunk.lines.len()], vec![None; hunk.lines.len()]),
         })
         .collect();
+    let eager_dt = crate::perf::now_ms() - eager_t0;
+    let perf_key_eager = format!("diff:{}:{relative_path}", root.0);
+    let total_lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+    crate::perf::log_phase(
+        "diff_open",
+        "sbs_tokens_eager",
+        &perf_key_eager,
+        &format!(
+            " hunks={} lines={total_lines} syntax={} took={eager_dt:.1}ms",
+            file.hunks.len(),
+            syntax.is_some(),
+        ),
+    );
 
     let file_left = file.clone();
     let file_right = file.clone();
@@ -931,8 +990,10 @@ fn render_sbs_virtualized(
     rendered_offset: usize,
 ) -> AnyView {
     // Compute paired rows + search indices + dual tokens once per hunk.
+    let sbs_t0 = crate::perf::now_ms();
     let syntax = syntax_for_path(&relative_path);
     let mut hunk_pairs: Vec<HunkPairs> = Vec::with_capacity(file.hunks.len());
+    let mut total_lines = 0usize;
     for (hi, hunk) in file.hunks.iter().enumerate() {
         let line_offset = hunk_offsets[hi];
         let lines = hunk.lines.clone();
@@ -941,10 +1002,23 @@ fn render_sbs_virtualized(
             Some(syn) => crate::syntax_highlight::compute_hunk_tokens_dual(hunk, syn),
             None => (vec![None; hunk.lines.len()], vec![None; hunk.lines.len()]),
         };
+        total_lines += hunk.lines.len();
         let pairs = pair_lines_side_by_side_with_tokens(lines, old_tokens, new_tokens);
         hunk_pairs.push((pairs, indices));
     }
     let hunk_pairs = Arc::new(hunk_pairs);
+    let sbs_dt = crate::perf::now_ms() - sbs_t0;
+    let perf_key = format!("diff:{}:{relative_path}", root.0);
+    crate::perf::log_phase(
+        "diff_open",
+        "sbs_tokens_paired",
+        &perf_key,
+        &format!(
+            " hunks={} lines={total_lines} syntax={} took={sbs_dt:.1}ms",
+            file.hunks.len(),
+            syntax.is_some(),
+        ),
+    );
 
     let items = Arc::new(build_sbs_file_items(&file, &hunk_pairs, context_mode));
     let total_items = items.len();

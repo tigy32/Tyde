@@ -379,6 +379,9 @@ fn change_kind_class(kind: Option<ProjectGitChangeKind>) -> &'static str {
 
 fn view_diff(root: ProjectRootPath, scope: ProjectDiffScope, path: String) {
     let state = expect_context::<AppState>();
+    let perf_key = format!("diff:{}:{path}", root.0);
+    crate::perf::mark_start(&perf_key);
+    crate::perf::log_phase("diff_open", "click", &perf_key, "");
     let label = format!(
         "Diff: {}/{}",
         root_display_name(&root),

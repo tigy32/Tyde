@@ -630,7 +630,20 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     log::debug!("ignoring ProjectGitDiff payload with no path");
                     return;
                 };
-                let key = (payload.root.clone(), payload.scope, payload_path);
+                let key = (payload.root.clone(), payload.scope, payload_path.clone());
+                let perf_key = format!("diff:{}:{payload_path}", payload.root.0);
+                let total_lines: usize =
+                    payload.files.iter().flat_map(|f| f.hunks.iter()).map(|h| h.lines.len()).sum();
+                crate::perf::log_phase(
+                    "diff_open",
+                    "response",
+                    &perf_key,
+                    &format!(
+                        " files={} lines={total_lines} mode={:?}",
+                        payload.files.len(),
+                        payload.context_mode,
+                    ),
+                );
                 let current = state
                     .diff_contents
                     .with_untracked(|diffs| diffs.get(&key).cloned());
@@ -678,6 +691,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             match envelope.parse_payload::<ProjectFileContentsPayload>() {
                 Ok(payload) => {
                     let path = payload.path.clone();
+                    let perf_key = format!("file:{}", path.relative_path);
+                    let bytes = payload.contents.as_ref().map(|s| s.len()).unwrap_or(0);
+                    crate::perf::log_phase(
+                        "file_open",
+                        "response",
+                        &perf_key,
+                        &format!(" bytes={bytes} binary={}", payload.is_binary),
+                    );
                     let base_label = path
                         .relative_path
                         .rsplit('/')

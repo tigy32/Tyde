@@ -90,8 +90,18 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                         // for a 50K-line file), which takes seconds in
                         // debug-build wasm. `FileLines::new` does two
                         // allocations total, regardless of line count.
+                        let perf_key = format!("file:{}", f.path.relative_path);
+                        crate::perf::log_phase("file_open", "mount", &perf_key, "");
+                        let lines_t0 = crate::perf::now_ms();
                         let (find_state, lines) = FindState::from_file(&content);
                         let total = lines.len();
+                        let lines_dt = crate::perf::now_ms() - lines_t0;
+                        crate::perf::log_phase(
+                            "file_open",
+                            "lines_built",
+                            &perf_key,
+                            &format!(" lines={total} took={lines_dt:.1}ms"),
+                        );
                         provide_context(find_state.clone());
 
                         // Async syntax highlighting. We don't tokenize on
@@ -151,9 +161,19 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                             let lines_for_task = lines_for_effect.clone();
                             let signal_for_task = highlighted_for_effect.clone();
                             let gen_for_task = gen_for_effect.clone();
+                            let perf_key_for_task = format!("file:{}", path_for_effect);
                             spawn_local(async move {
+                                let task_t0 = crate::perf::now_ms();
+                                crate::perf::log_phase(
+                                    "file_open",
+                                    "hl_started",
+                                    &perf_key_for_task,
+                                    &format!(" lines={}", lines_for_task.len()),
+                                );
                                 let mut hl = LineHighlighter::new(syntax);
                                 let mut i = 0usize;
+                                let mut chunks = 0u32;
+                                let mut first_chunk_logged = false;
                                 while i < lines_for_task.len() {
                                     if gen_for_task.get_untracked() != my_gen {
                                         return; // newer task superseded us
@@ -176,8 +196,26 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                         }
                                     });
                                     i = end;
+                                    chunks += 1;
+                                    if !first_chunk_logged {
+                                        let dt = crate::perf::now_ms() - task_t0;
+                                        crate::perf::log_phase(
+                                            "file_open",
+                                            "hl_first_chunk",
+                                            &perf_key_for_task,
+                                            &format!(" through={i} took={dt:.1}ms"),
+                                        );
+                                        first_chunk_logged = true;
+                                    }
                                     yield_to_browser().await;
                                 }
+                                let dt = crate::perf::now_ms() - task_t0;
+                                crate::perf::log_phase(
+                                    "file_open",
+                                    "hl_finished",
+                                    &perf_key_for_task,
+                                    &format!(" chunks={chunks} took={dt:.1}ms"),
+                                );
                             });
                         });
 
@@ -196,6 +234,8 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                         // Measure the geometry once after first paint. The
                         // Effect re-runs if the underlying signals fire
                         // (rare here — only the initial mount).
+                        let perf_key_for_measure = format!("file:{}", f.path.relative_path);
+                        let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
                         Effect::new(move |_| {
                             let Some(el) = pre_ref.get() else { return };
                             let vh = el.client_height() as f64;
@@ -209,6 +249,15 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                 let lh = html_el.offset_height() as f64;
                                 if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
                                     line_height.set(lh);
+                                }
+                                if !measure_logged.get() {
+                                    measure_logged.set(true);
+                                    crate::perf::log_phase(
+                                        "file_open",
+                                        "first_paint_measured",
+                                        &perf_key_for_measure,
+                                        &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
+                                    );
                                 }
                             }
                         });

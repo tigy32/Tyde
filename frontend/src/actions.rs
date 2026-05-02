@@ -150,6 +150,10 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
         return;
     };
 
+    let perf_key = format!("file:{}", path.relative_path);
+    crate::perf::mark_start(&perf_key);
+    crate::perf::log_phase("file_open", "click", &perf_key, "");
+
     let payload = ProjectReadFilePayload { path };
     let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
 

@@ -6,6 +6,7 @@ mod devtools;
 mod dispatch;
 mod line_source;
 mod markdown;
+mod perf;
 mod send;
 mod state;
 mod syntax_highlight;
