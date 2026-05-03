@@ -164,12 +164,14 @@ fn selected_backend_kind(state: &AppState) -> Option<BackendKind> {
 
 fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
     if let Some(active_agent) = state.active_agent.get() {
-        let agents = state.agents.get();
-        if let Some(agent) = agents
-            .iter()
-            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
-        {
-            return Some(agent.backend_kind);
+        let backend = state.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+                .map(|a| a.backend_kind)
+        });
+        if let Some(backend) = backend {
+            return Some(backend);
         }
     }
 
@@ -184,27 +186,34 @@ fn selected_backend_kind_tracked(state: &AppState) -> Option<BackendKind> {
 }
 
 fn active_agent_is_initializing_tracked(state: &AppState) -> bool {
-    let active_agent = match state.active_agent.get() {
-        Some(active_agent) => active_agent,
-        None => return false,
+    let Some(active_agent) = state.active_agent.get() else {
+        return false;
     };
-    state.agents.get().iter().any(|agent| {
-        agent.host_id == active_agent.host_id
-            && agent.agent_id == active_agent.agent_id
-            && !agent.started
-            && agent.fatal_error.is_none()
+    // `with` reads through the signal without cloning the inner
+    // `Vec<AgentInfo>`. The previous `state.agents.get()` cloned the
+    // whole list every time this helper ran — and ui_mode Memo
+    // re-runs on every chat_input keystroke, so a dozen agents +
+    // a fast typer = a Vec clone per character.
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == active_agent.host_id
+                && agent.agent_id == active_agent.agent_id
+                && !agent.started
+                && agent.fatal_error.is_none()
+        })
     })
 }
 
 fn active_agent_is_backend_native(state: &AppState) -> bool {
-    let active_agent = match state.active_agent.get() {
-        Some(a) => a,
-        None => return false,
+    let Some(active_agent) = state.active_agent.get() else {
+        return false;
     };
-    state.agents.get().iter().any(|agent| {
-        agent.host_id == active_agent.host_id
-            && agent.agent_id == active_agent.agent_id
-            && matches!(agent.origin, AgentOrigin::BackendNative)
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == active_agent.host_id
+                && agent.agent_id == active_agent.agent_id
+                && matches!(agent.origin, AgentOrigin::BackendNative)
+        })
     })
 }
 
@@ -485,8 +494,12 @@ pub fn ChatInput() -> impl IntoView {
             ui_state.chat_context_connection_status(),
             ConnectionStatus::Connected
         );
-        let has_text = !ui_state.chat_input.get().trim().is_empty();
-        let has_images = !ui_images.get().is_empty();
+        // `with` reads through the signal to compute `has_text` without
+        // cloning the input string per keystroke — `chat_input.get()`
+        // would clone the entire String into a temporary just to check
+        // `trim().is_empty()` and drop it.
+        let has_text = ui_state.chat_input.with(|s| !s.trim().is_empty());
+        let has_images = ui_images.with(|images| !images.is_empty());
         let has_input = has_text || has_images;
         let is_thinking = active_agent_is_initializing_tracked(&ui_state)
             || ui_state
@@ -495,10 +508,7 @@ pub fn ChatInput() -> impl IntoView {
                 .map(|agent_ref| {
                     ui_state
                         .agent_turn_active
-                        .get()
-                        .get(&agent_ref.agent_id)
-                        .copied()
-                        .unwrap_or(false)
+                        .with(|map| map.get(&agent_ref.agent_id).copied().unwrap_or(false))
                 })
                 .unwrap_or(false);
 
@@ -549,12 +559,10 @@ pub fn ChatInput() -> impl IntoView {
             .active_agent
             .get()
             .map(|agent_ref| {
+                // `with` reads through the HashMap signal without cloning it.
                 thinking_state
                     .agent_turn_active
-                    .get()
-                    .get(&agent_ref.agent_id)
-                    .copied()
-                    .unwrap_or(false)
+                    .with(|map| map.get(&agent_ref.agent_id).copied().unwrap_or(false))
             })
             .unwrap_or(false)
     };
@@ -565,8 +573,8 @@ pub fn ChatInput() -> impl IntoView {
         matches!(
             submit_on_enter_state.chat_context_connection_status(),
             ConnectionStatus::Connected
-        ) && (!submit_on_enter_state.chat_input.get().trim().is_empty()
-            || !submit_on_enter_images.get().is_empty())
+        ) && (submit_on_enter_state.chat_input.with(|s| !s.trim().is_empty())
+            || submit_on_enter_images.with(|images| !images.is_empty()))
     };
 
     let on_keydown_state = state.clone();
@@ -718,15 +726,23 @@ pub fn ChatInput() -> impl IntoView {
     // ran a property write per keystroke.
     let reset_state = state.clone();
     Effect::new(move |_| {
-        let val = reset_state.chat_input.get();
         let Some(el) = textarea_ref.get() else {
             return;
         };
         let textarea: web_sys::HtmlTextAreaElement = (*el).clone().unchecked_into();
-        if textarea.value() != val {
+        // `with` reads the signal in place to skip cloning the input
+        // string per keystroke; the previous `chat_input.get()`
+        // allocated a fresh `String` just to compare against the DOM
+        // value and (in the no-op case) drop it.
+        let needs_set = reset_state
+            .chat_input
+            .with(|val| textarea.value() != *val);
+        if needs_set {
+            let val = reset_state.chat_input.get_untracked();
             textarea.set_value(&val);
         }
-        if val.is_empty() {
+        let is_empty = reset_state.chat_input.with(|val| val.is_empty());
+        if is_empty {
             let html_el: web_sys::HtmlElement = el.into();
             let _ = html_el.style().set_property("height", "auto");
         }

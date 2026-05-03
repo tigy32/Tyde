@@ -53,16 +53,19 @@ pub fn ChatView(
             .with(|m| m.get(&id).cloned().unwrap_or_default())
     };
 
+    // `.with` reads through the HashMap signals without cloning the
+    // entire map — the previous `.get()` allocated a fresh
+    // HashMap<AgentId, StreamingState> on every read, and these
+    // closures fire from the auto-scroll Effect on every stream-start
+    // / stream-end, plus per-render in the streaming-card branch.
     let streaming = move || {
         let agent_id = agent_ref.get()?.agent_id;
-        let map = state.streaming_text.get();
-        map.get(&agent_id).cloned()
+        state.streaming_text.with(|m| m.get(&agent_id).cloned())
     };
 
     let task_list = move || {
         let agent_id = agent_ref.get()?.agent_id;
-        let map = state.task_lists.get();
-        map.get(&agent_id).cloned()
+        state.task_lists.with(|m| m.get(&agent_id).cloned())
     };
 
     // Walk back from the latest message to find the most recent assistant
@@ -96,8 +99,7 @@ pub fn ChatView(
 
     let transient_events = move || {
         let agent_id = agent_ref.get()?.agent_id;
-        let map = state.transient_events.get();
-        map.get(&agent_id).cloned()
+        state.transient_events.with(|m| m.get(&agent_id).cloned())
     };
 
     // Centralised lookup of the AgentInfo for this view's agent_ref.
