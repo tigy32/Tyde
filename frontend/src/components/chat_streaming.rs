@@ -98,18 +98,26 @@ pub fn ChatStreamingView(streaming: StreamingState) -> impl IntoView {
                 {
                     let throttled = throttled_text.clone();
                     move || {
-                        let current = throttled.get();
-                        if current.is_empty() {
-                            view! { <p class="chat-card-thinking">"Thinking\u{2026}"</p> }.into_any()
-                        } else {
-                            let html = render_markdown(&current);
-                            view! {
-                                <>
-                                    <div inner_html=html></div>
-                                    <span class="streaming-cursor"></span>
-                                </>
-                            }.into_any()
-                        }
+                        // Read through `with` so render_markdown sees the
+                        // string in place rather than getting a fresh clone.
+                        // Markdown re-rendering at 30Hz over a long
+                        // response shouldn't also pay a per-tick String
+                        // clone of the accumulated text.
+                        throttled.with(|current| {
+                            if current.is_empty() {
+                                view! { <p class="chat-card-thinking">"Thinking\u{2026}"</p> }
+                                    .into_any()
+                            } else {
+                                let html = render_markdown(current);
+                                view! {
+                                    <>
+                                        <div inner_html=html></div>
+                                        <span class="streaming-cursor"></span>
+                                    </>
+                                }
+                                .into_any()
+                            }
+                        })
                     }
                 }
             </div>
