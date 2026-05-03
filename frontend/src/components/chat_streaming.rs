@@ -52,7 +52,9 @@ pub fn ChatStreamingView(streaming: StreamingState) -> impl IntoView {
     let text_for_effect = text.clone();
     let timer_cb_for_effect = timer_cb.clone();
     Effect::new(move |_| {
-        let _ = text_for_effect.get(); // subscribe to deltas
+        // Subscribe without cloning the accumulated text on every
+        // delta — `.with` tracks the dependency for free.
+        text_for_effect.with(|_| ());
         if render_pending.get() {
             return;
         }

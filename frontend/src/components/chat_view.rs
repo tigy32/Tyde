@@ -206,8 +206,12 @@ pub fn ChatView(
         let _len = messages_len.get();
         let stream = streaming();
         if let Some(ss) = stream.as_ref() {
-            let _ = ss.text.get();
-            let _ = ss.reasoning.get();
+            // Subscribe without cloning the strings. `.get()` on
+            // `ArcRwSignal<String>` cloned the entire accumulated text
+            // into a temporary just to be discarded — `.with` reads
+            // through and tracks the dependency without the alloc.
+            ss.text.with(|_| ());
+            ss.reasoning.with(|_| ());
         }
         if user_scrolled_up.get_untracked() {
             return;
