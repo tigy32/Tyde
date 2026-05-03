@@ -372,7 +372,7 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
             let pending = pending.clone();
             leptos::prelude::request_animation_frame(move || {
                 pending.set(false);
-                if let Some(el) = pre_ref.get() {
+                if let Some(el) = pre_ref.get_untracked() {
                     scroll_top.set(el.scroll_top() as f64);
                 }
             });

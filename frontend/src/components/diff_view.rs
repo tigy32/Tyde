@@ -345,7 +345,7 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
             let pending = pending.clone();
             leptos::prelude::request_animation_frame(move || {
                 pending.set(false);
-                if let Some(el) = scroll_ref.get() {
+                if let Some(el) = scroll_ref.get_untracked() {
                     scroll_top.set(el.scroll_top() as f64);
                 }
             });

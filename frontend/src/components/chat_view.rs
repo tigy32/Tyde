@@ -223,14 +223,19 @@ pub fn ChatView(
         let pending = scroll_pending.clone();
         request_animation_frame(move || {
             pending.set(false);
-            if let Some(el) = scroll_ref.get() {
+            // rAF callback runs outside the reactive tracking context;
+            // `.get_untracked()` reads the NodeRef without registering
+            // a (useless) subscription that Leptos would warn about.
+            if let Some(el) = scroll_ref.get_untracked() {
                 el.set_scroll_top(el.scroll_height());
             }
         });
     });
 
     let scroll_to_bottom = move |_| {
-        if let Some(el) = scroll_ref.get() {
+        // Event handler — not a reactive context, so use untracked
+        // read on the NodeRef.
+        if let Some(el) = scroll_ref.get_untracked() {
             el.set_scroll_top(el.scroll_height());
             user_scrolled_up.set(false);
             show_scroll_btn.set(false);
