@@ -170,34 +170,46 @@ pub fn AgentsPanel() -> impl IntoView {
             .collect::<Vec<_>>()
     });
 
-    // Build parent-children grouping
+    // Build parent-children grouping in O(N). The previous version
+    // did O(N×M) parent-lookup per parent and a second O(N) pass to
+    // detect orphans, which the agents panel re-runs on every chat
+    // streaming delta because `filtered_agents` subscribes to
+    // `streaming_text` and `agent_turn_active`. With dozens of agents
+    // and a fast model this would dominate per-delta main-thread time.
     let grouped = Memo::new(move |_| {
+        use std::collections::{HashMap, HashSet};
         let agents = filtered_agents.get();
-        // Parents: no parent_agent_id
-        let parents: Vec<&AgentInfo> = agents
-            .iter()
-            .filter(|a| a.parent_agent_id.is_none())
-            .collect();
-        let mut result: Vec<(AgentInfo, Vec<AgentInfo>)> = Vec::new();
-        for parent in parents {
-            let children: Vec<AgentInfo> = agents
-                .iter()
-                .filter(|a| a.parent_agent_id.as_ref() == Some(&parent.agent_id))
-                .cloned()
-                .collect();
-            result.push((parent.clone(), children));
-        }
-        // Orphans: agents whose parent is filtered out
-        let parent_ids: Vec<_> = result.iter().map(|(p, _)| p.agent_id.clone()).collect();
-        for agent in &agents {
-            if agent.parent_agent_id.is_some()
-                && !parent_ids.contains(&agent.parent_agent_id.as_ref().unwrap().clone())
-                && !result
-                    .iter()
-                    .any(|(_, children)| children.iter().any(|c| c.agent_id == agent.agent_id))
-            {
-                result.push((agent.clone(), Vec::new()));
+
+        // Index every visible agent's id once; lets us tell orphans
+        // (parent filtered out) from real children in a single pass.
+        let visible_ids: HashSet<AgentId> =
+            agents.iter().map(|a| a.agent_id.clone()).collect();
+
+        // Bucket children by parent_agent_id. One alloc per parent
+        // group; orphans land in a synthetic "orphan" bucket whose
+        // entries we later promote to top-level rows.
+        let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> =
+            HashMap::new();
+        let mut top_level: Vec<AgentInfo> = Vec::new();
+        let mut orphans: Vec<AgentInfo> = Vec::new();
+        for agent in agents {
+            match &agent.parent_agent_id {
+                Some(pid) if visible_ids.contains(pid) => {
+                    children_by_parent.entry(pid.clone()).or_default().push(agent);
+                }
+                Some(_) => orphans.push(agent),
+                None => top_level.push(agent),
             }
+        }
+
+        let mut result: Vec<(AgentInfo, Vec<AgentInfo>)> =
+            Vec::with_capacity(top_level.len() + orphans.len());
+        for parent in top_level {
+            let children = children_by_parent.remove(&parent.agent_id).unwrap_or_default();
+            result.push((parent, children));
+        }
+        for orphan in orphans {
+            result.push((orphan, Vec::new()));
         }
         result
     });

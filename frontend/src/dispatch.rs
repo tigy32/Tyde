@@ -815,20 +815,41 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::TerminalOutput => match envelope.parse_payload::<TerminalOutputPayload>() {
             Ok(payload) => {
-                let mut write_tid: Option<String> = None;
-                state.terminals.update(|terminals| {
-                    if let Some(terminal) = terminals.iter_mut().find(|terminal| {
-                        terminal.host_id == host_id && terminal.stream == envelope.stream
-                    }) {
-                        if terminal.widget_mounted {
-                            write_tid = Some(terminal.terminal_id.0.clone());
-                        } else {
+                // Fast path: terminal widget is already mounted, so we
+                // just write the bytes straight to xterm — no reactive
+                // state needs to change. The original code called
+                // `state.terminals.update(...)` regardless, which fires
+                // on every output chunk (often hundreds per second from
+                // a noisy build) and notifies every subscriber of the
+                // terminals list, e.g. the dock-zone tab counter and
+                // any panel that lists terminals. Each notify ran a
+                // full re-render of those subtrees while xterm itself
+                // did the only meaningful work.
+                let mounted_tid = state.terminals.with_untracked(|terminals| {
+                    terminals
+                        .iter()
+                        .find(|terminal| {
+                            terminal.host_id == host_id
+                                && terminal.stream == envelope.stream
+                                && terminal.widget_mounted
+                        })
+                        .map(|terminal| terminal.terminal_id.0.clone())
+                });
+                if let Some(tid) = mounted_tid {
+                    crate::term_bridge::write(&tid, &payload.data);
+                } else {
+                    // Slow path: widget hasn't mounted yet (or the
+                    // terminal isn't tracked). Buffer pending output so
+                    // the widget can flush it at mount time. This
+                    // *does* mutate state and so must go through
+                    // `update`.
+                    state.terminals.update(|terminals| {
+                        if let Some(terminal) = terminals.iter_mut().find(|terminal| {
+                            terminal.host_id == host_id && terminal.stream == envelope.stream
+                        }) {
                             terminal.pending_output.push(payload.data.clone());
                         }
-                    }
-                });
-                if let Some(tid) = write_tid {
-                    crate::term_bridge::write(&tid, &payload.data);
+                    });
                 }
             }
             Err(error) => report_dispatch_error(
