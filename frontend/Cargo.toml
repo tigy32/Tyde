@@ -28,6 +28,7 @@ web-sys = { version = "0.3", features = [
     "HtmlBodyElement",
     "HtmlElement",
     "HtmlHeadElement",
+    "HtmlScriptElement",
     "HtmlStyleElement",
     "HtmlTextAreaElement",
     "Navigator",
@@ -37,6 +38,11 @@ web-sys = { version = "0.3", features = [
     "ProgressEvent",
     "Storage",
     "Window",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
     "console",
 ] }
 log = "0.4"

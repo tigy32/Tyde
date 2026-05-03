@@ -32,12 +32,11 @@ const INITIAL_LINE_HEIGHT_ESTIMATE: f64 = 18.0;
 /// first-paint render to ~80-100 lines for any file size.
 const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
 
-/// How many lines to highlight per yield slice when async-highlighting a
-/// large file. Small enough that the browser stays responsive (each slice
-/// is ~1ms in release, ~30ms in debug for a typical Rust file); large
-/// enough that the per-yield overhead doesn't dominate. Tune if you see
-/// stuttering scroll during initial load.
-const HIGHLIGHT_CHUNK_LINES: usize = 200;
+/// In-process fallback chunk size when the highlight Web Worker can't be
+/// instantiated — typically only in `wasm-bindgen-test` runs (no Trunk
+/// bundle in the page) but also covers worker init failures in
+/// production.
+const FALLBACK_CHUNK_LINES: usize = 200;
 
 /// Above this line count we never highlight — the wasm main thread can't
 /// realistically tokenize that much without freezing the UI even with
@@ -160,18 +159,17 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     let highlighted_for_effect = highlighted.clone();
     let gen_for_effect = highlight_gen.clone();
     Effect::new(move |_| {
-        // Subscribe to the theme signal. Whenever it
-        // changes we discard prior tokens and kick off
-        // a fresh chunked highlight pass with the new
-        // theme.
-        let _ = syntax_theme.get();
+        // Subscribe to the theme signal so a theme change drops the
+        // current tokens and dispatches a fresh request with the new
+        // theme name.
+        let theme_name = syntax_theme.get();
 
         let my_gen = gen_for_effect.get_untracked() + 1;
         gen_for_effect.set(my_gen);
 
-        // Reset highlighted vec to plain text while we
-        // re-tokenize. Visible rows momentarily render
-        // plain, then fill in with the new theme.
+        // Reset highlighted vec to plain text while we re-tokenize.
+        // Visible rows momentarily render plain, then fill in with the
+        // new theme as chunks stream in from the worker.
         highlighted_for_effect.update(|v| {
             for slot in v.iter_mut() {
                 *slot = None;
@@ -185,62 +183,98 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
             return;
         };
 
-        let lines_for_task = lines_for_effect.clone();
+        // Prefer the worker. If `shared()` returns `None` we're in an
+        // environment without the Trunk-emitted bootstrap script
+        // (wasm-bindgen-test, e.g.) — fall back to the previous
+        // main-thread chunked path so behaviour is preserved for
+        // tests and any worker init failure.
+        let Some(client) = crate::highlight_worker::shared() else {
+            run_fallback_highlight(
+                syntax,
+                lines_for_effect.clone(),
+                highlighted_for_effect.clone(),
+                gen_for_effect.clone(),
+                my_gen,
+                format!("file:{}", path_for_effect),
+            );
+            return;
+        };
+
+        // Snapshot the lines as `Vec<String>` for the worker. We pay
+        // one alloc per line on the main thread, then the worker
+        // structured-clones them across the postMessage boundary.
+        // Cheap enough (~few ms) for files within the 5K-line cap.
+        let lines_owned: Vec<String> = (0..lines_for_effect.len())
+            .map(|i| lines_for_effect.line(i).to_owned())
+            .collect();
+
         let signal_for_task = highlighted_for_effect.clone();
         let gen_for_task = gen_for_effect.clone();
         let perf_key_for_task = format!("file:{}", path_for_effect);
-        spawn_local(async move {
-            let task_t0 = crate::perf::now_ms();
-            crate::perf::log_phase(
-                "file_open",
-                "hl_started",
-                &perf_key_for_task,
-                &format!(" lines={}", lines_for_task.len()),
-            );
-            let mut hl = LineHighlighter::new(syntax);
-            let mut i = 0usize;
-            let mut chunks = 0u32;
-            let mut first_chunk_logged = false;
-            while i < lines_for_task.len() {
-                if gen_for_task.get_untracked() != my_gen {
-                    return; // newer task superseded us
-                }
-                let end = (i + HIGHLIGHT_CHUNK_LINES).min(lines_for_task.len());
-                let chunk_tokens: Vec<LineTokens> = (i..end)
-                    .map(|j| hl.highlight_one(lines_for_task.line(j)))
-                    .collect();
+        let perf_key_for_done = perf_key_for_task.clone();
+        let task_t0 = crate::perf::now_ms();
+        let first_chunk_logged = std::rc::Rc::new(std::cell::Cell::new(false));
+        let first_chunk_logged_for_done = first_chunk_logged.clone();
+        crate::perf::log_phase(
+            "file_open",
+            "hl_started",
+            &perf_key_for_task,
+            &format!(" lines={total}"),
+        );
+
+        let on_chunk = {
+            let gen_for_task = gen_for_task.clone();
+            Box::new(move |start: usize, tokens: Vec<LineTokens>| {
+                // The client also drops superseded callbacks before
+                // dispatching new tasks, but defend in depth — a stale
+                // chunk that races a generation bump shouldn't write
+                // tokens for a torn-down highlight pass.
                 if gen_for_task.get_untracked() != my_gen {
                     return;
                 }
-                signal_for_task.update(|v| {
-                    for (offset, toks) in chunk_tokens.into_iter().enumerate() {
-                        if let Some(slot) = v.get_mut(i + offset) {
-                            *slot = Some(toks);
-                        }
-                    }
-                });
-                i = end;
-                chunks += 1;
-                if !first_chunk_logged {
+                if !first_chunk_logged.get() {
+                    first_chunk_logged.set(true);
                     let dt = crate::perf::now_ms() - task_t0;
                     crate::perf::log_phase(
                         "file_open",
                         "hl_first_chunk",
                         &perf_key_for_task,
-                        &format!(" through={i} took={dt:.1}ms"),
+                        &format!(" through={} took={dt:.1}ms", start + tokens.len()),
                     );
-                    first_chunk_logged = true;
                 }
-                yield_to_browser().await;
-            }
+                signal_for_task.update(|v| {
+                    for (offset, toks) in tokens.into_iter().enumerate() {
+                        if let Some(slot) = v.get_mut(start + offset) {
+                            *slot = Some(toks);
+                        }
+                    }
+                });
+            })
+        };
+        let on_done = Box::new(move || {
+            // `first_chunk_logged` clone is only present so we don't
+            // double-log a "finished" before "first_chunk" fired in
+            // the empty-tokens edge case.
+            let _ = &first_chunk_logged_for_done;
             let dt = crate::perf::now_ms() - task_t0;
             crate::perf::log_phase(
                 "file_open",
                 "hl_finished",
-                &perf_key_for_task,
-                &format!(" chunks={chunks} took={dt:.1}ms"),
+                &perf_key_for_done,
+                &format!(" took={dt:.1}ms"),
             );
         });
+
+        let _task_id = client.highlight_file(
+            path_for_effect.clone(),
+            theme_name,
+            lines_owned,
+            on_chunk,
+            on_done,
+        );
+        // `shared()` clones the same `Rc` each time, so dropping the
+        // local clone here is a no-op for the singleton's lifetime.
+        drop(client);
     });
 
     let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
@@ -412,9 +446,8 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     }
 }
 
-/// Yield once to the browser event loop. Wasm has no real background
-/// threads; this is the closest we get to "let the page paint." Used between
-/// syntect highlight chunks so the UI stays responsive on large files.
+/// Yield to the browser between fallback-highlight chunks so the UI
+/// doesn't freeze on large files when the worker isn't available.
 async fn yield_to_browser() {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         if let Some(window) = web_sys::window() {
@@ -422,6 +455,71 @@ async fn yield_to_browser() {
         }
     });
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Main-thread fallback used when the highlight worker can't be
+/// instantiated. Mirrors the pre-worker behavior: spawn_local + chunked
+/// LineHighlighter with a per-chunk yield. Same generation-counter
+/// cancellation as the worker path.
+fn run_fallback_highlight(
+    syntax: &'static syntect::parsing::SyntaxReference,
+    lines: crate::line_source::FileLines,
+    highlighted: ArcRwSignal<Vec<Option<LineTokens>>>,
+    generation: ArcRwSignal<u32>,
+    my_gen: u32,
+    perf_key: String,
+) {
+    spawn_local(async move {
+        let task_t0 = crate::perf::now_ms();
+        crate::perf::log_phase(
+            "file_open",
+            "hl_started",
+            &perf_key,
+            &format!(" lines={} via=fallback", lines.len()),
+        );
+        let mut hl = LineHighlighter::new(syntax);
+        let mut i = 0usize;
+        let mut chunks = 0u32;
+        let mut first_chunk_logged = false;
+        while i < lines.len() {
+            if generation.get_untracked() != my_gen {
+                return;
+            }
+            let end = (i + FALLBACK_CHUNK_LINES).min(lines.len());
+            let chunk_tokens: Vec<LineTokens> =
+                (i..end).map(|j| hl.highlight_one(lines.line(j))).collect();
+            if generation.get_untracked() != my_gen {
+                return;
+            }
+            highlighted.update(|v| {
+                for (offset, toks) in chunk_tokens.into_iter().enumerate() {
+                    if let Some(slot) = v.get_mut(i + offset) {
+                        *slot = Some(toks);
+                    }
+                }
+            });
+            i = end;
+            chunks += 1;
+            if !first_chunk_logged {
+                let dt = crate::perf::now_ms() - task_t0;
+                crate::perf::log_phase(
+                    "file_open",
+                    "hl_first_chunk",
+                    &perf_key,
+                    &format!(" through={i} took={dt:.1}ms via=fallback"),
+                );
+                first_chunk_logged = true;
+            }
+            yield_to_browser().await;
+        }
+        let dt = crate::perf::now_ms() - task_t0;
+        crate::perf::log_phase(
+            "file_open",
+            "hl_finished",
+            &perf_key,
+            &format!(" chunks={chunks} took={dt:.1}ms via=fallback"),
+        );
+    });
 }
 
 fn file_line_class(line_idx: usize, find: &FindState) -> &'static str {

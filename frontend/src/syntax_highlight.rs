@@ -1,6 +1,7 @@
 use std::sync::RwLock;
 
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -90,10 +91,48 @@ fn current_theme() -> &'static Theme {
         .expect("default theme present in ThemeSet")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One styled run inside a single line. `fg` carries syntect's RGBA
+/// foreground; we (de)serialize it as a flat `{r,g,b,a}` so the type
+/// can cross a Web Worker `postMessage` boundary without depending on
+/// syntect's optional serde feature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token {
+    #[serde(with = "color_serde")]
     pub fg: Color,
     pub text: String,
+}
+
+mod color_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use syntect::highlighting::Color;
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    }
+
+    pub fn serialize<S: Serializer>(c: &Color, s: S) -> Result<S::Ok, S::Error> {
+        Wire {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Color, D::Error> {
+        let w = Wire::deserialize(d)?;
+        Ok(Color {
+            r: w.r,
+            g: w.g,
+            b: w.b,
+            a: w.a,
+        })
+    }
 }
 
 pub type LineTokens = Vec<Token>;
