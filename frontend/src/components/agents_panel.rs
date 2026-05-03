@@ -148,26 +148,35 @@ pub fn AgentsPanel() -> impl IntoView {
 
     let filter_state = state.clone();
     let filtered_agents = Memo::new(move |_| {
-        let agents = filter_state.agents.get();
-        let streaming_map = filter_state.streaming_text.get();
-        let turn_active_map = filter_state.agent_turn_active.get();
         let active_project = filter_state.active_project.get();
         let query = search.get().to_lowercase();
         let filters = current_filters.get();
 
-        agents
-            .into_iter()
-            .filter(|a| {
-                agent_passes_filters(
-                    a,
-                    &filters,
-                    active_project.as_ref(),
-                    &streaming_map,
-                    &turn_active_map,
-                    &query,
-                )
+        // Read the noisy maps in place via `with` rather than cloning
+        // them up-front. The Memo re-runs on every keystroke in the
+        // panel-search input, and cloning the streaming/turn-active
+        // HashMaps + the full agents Vec on each keystroke was the
+        // dominant per-keystroke cost in the audit.
+        filter_state.streaming_text.with(|streaming_map| {
+            filter_state.agent_turn_active.with(|turn_active_map| {
+                filter_state.agents.with(|agents| {
+                    agents
+                        .iter()
+                        .filter(|a| {
+                            agent_passes_filters(
+                                a,
+                                &filters,
+                                active_project.as_ref(),
+                                streaming_map,
+                                turn_active_map,
+                                &query,
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
             })
-            .collect::<Vec<_>>()
+        })
     });
 
     // Build parent-children grouping in O(N). The previous version

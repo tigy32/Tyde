@@ -771,11 +771,12 @@ pub fn ChatInput() -> impl IntoView {
         let Some(active) = queue_state.active_agent.get() else {
             return Vec::new();
         };
-        let queue = queue_state.agent_message_queue.get();
-        queue
-            .get(&active.agent_id)
-            .map(|entries| entries.iter().map(|e| e.id.clone()).collect())
-            .unwrap_or_default()
+        queue_state.agent_message_queue.with(|queue| {
+            queue
+                .get(&active.agent_id)
+                .map(|entries| entries.iter().map(|e| e.id.clone()).collect())
+                .unwrap_or_default()
+        })
     });
 
     view! {
