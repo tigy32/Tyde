@@ -28,35 +28,41 @@ pub fn ChatStreamingView(streaming: StreamingState) -> impl IntoView {
     // Throttled mirror of `text`. Updated via `setTimeout` rather than
     // following each delta synchronously, so the rendered markdown
     // re-parses at most ~30Hz no matter how fast the model streams.
+    //
+    // The timer callback is allocated *once* and reused across firings.
+    // The previous version called `Closure::new(...).forget()` per
+    // throttle tick — leaking ~150 closures per long response (~40KB
+    // each in debug). The persistent Closure lives in an Rc captured
+    // by both the scheduling Effect and stays alive via the
+    // ChatStreamingView's reactive scope.
     let throttled_text: ArcRwSignal<String> = ArcRwSignal::new(text.get_untracked());
     let render_pending = Rc::new(Cell::new(false));
-    let throttled_for_effect = throttled_text.clone();
+    let timer_cb = {
+        let pending = render_pending.clone();
+        let dest = throttled_text.clone();
+        let src = text.clone();
+        Rc::new(wasm_bindgen::closure::Closure::<dyn FnMut()>::new(
+            move || {
+                pending.set(false);
+                dest.set(src.get_untracked());
+            },
+        ))
+    };
+
     let text_for_effect = text.clone();
+    let timer_cb_for_effect = timer_cb.clone();
     Effect::new(move |_| {
         let _ = text_for_effect.get(); // subscribe to deltas
         if render_pending.get() {
             return;
         }
         render_pending.set(true);
-        let pending = render_pending.clone();
-        let dest = throttled_for_effect.clone();
-        let src = text_for_effect.clone();
-        let cb = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-            pending.set(false);
-            dest.set(src.get_untracked());
-        });
         if let Some(window) = web_sys::window() {
             let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(),
+                timer_cb_for_effect.as_ref().as_ref().unchecked_ref(),
                 STREAMING_RENDER_INTERVAL_MS,
             );
         }
-        // Closure must outlive the timer; `forget` leaks one closure per
-        // throttle window. With ~30Hz cadence and an in-flight stream
-        // typically ≤ a few seconds long, the resulting allocations are
-        // a few hundred kb and freed when the page reloads. A long-term
-        // fix would pool a single Closure per ChatStreamingView.
-        cb.forget();
     });
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();

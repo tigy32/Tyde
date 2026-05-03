@@ -148,18 +148,40 @@ pub fn ChatView(
     // for the lifetime of the underlying scroll element; when the component
     // unmounts, the DOM element is removed and the listener is collected with
     // it. One leaked Closure per chat-tab mount is bounded and acceptable.
+    //
+    // The scroll handler reads `scrollHeight`/`scrollTop`/`clientHeight`,
+    // each of which forces a synchronous layout. Trackpad/wheel scrolls
+    // can fire 100+ events per second, so we throttle to one read per
+    // animation frame. We also only `set` on the signals when the
+    // boolean actually changes — a stationary signal write still
+    // notifies subscribers in Leptos's RwSignal.
     let scroll_ref_for_handler = scroll_ref;
     Effect::new(move |_| {
         if let Some(el) = scroll_ref_for_handler.get() {
             let el_clone = el.clone();
+            let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+            let last_is_near_bottom = std::rc::Rc::new(std::cell::Cell::new(true));
             let handler = Closure::<dyn Fn()>::new(move || {
-                let scroll_height = el_clone.scroll_height();
-                let scroll_top = el_clone.scroll_top();
-                let client_height = el_clone.client_height();
-                let distance_from_bottom = scroll_height - scroll_top - client_height;
-                let is_near_bottom = distance_from_bottom < 80;
-                user_scrolled_up.set(!is_near_bottom);
-                show_scroll_btn.set(!is_near_bottom);
+                if listener_pending.get() {
+                    return;
+                }
+                listener_pending.set(true);
+                let pending = listener_pending.clone();
+                let last = last_is_near_bottom.clone();
+                let el_for_raf = el_clone.clone();
+                leptos::prelude::request_animation_frame(move || {
+                    pending.set(false);
+                    let scroll_height = el_for_raf.scroll_height();
+                    let scroll_top = el_for_raf.scroll_top();
+                    let client_height = el_for_raf.client_height();
+                    let distance_from_bottom = scroll_height - scroll_top - client_height;
+                    let is_near_bottom = distance_from_bottom < 80;
+                    if is_near_bottom != last.get() {
+                        last.set(is_near_bottom);
+                        user_scrolled_up.set(!is_near_bottom);
+                        show_scroll_btn.set(!is_near_bottom);
+                    }
+                });
             });
             let _ = el.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
             handler.forget();
