@@ -169,6 +169,15 @@ pub fn ChatView(
     // *length* of messages — not the full Vec — so unrelated chat row
     // updates (e.g. tool_request mutations to existing rows) don't trigger a
     // scroll.
+    //
+    // Coalesce multiple deltas-per-frame into a single rAF. The previous
+    // implementation scheduled one rAF per `text`/`reasoning` delta — at
+    // 50+ deltas/sec while the model streams, all of them fired in the
+    // *same* frame and each ran its own scrollHeight read (a forced
+    // layout) plus a scrollTop write. The pending-flag gate caps it to
+    // at most one scroll per frame, which still keeps the bottom
+    // pinned.
+    let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     Effect::new(move |_| {
         let _len = messages_len.get();
         let stream = streaming();
@@ -179,11 +188,17 @@ pub fn ChatView(
         if user_scrolled_up.get_untracked() {
             return;
         }
-        if let Some(el) = scroll_ref.get() {
-            request_animation_frame(move || {
-                el.set_scroll_top(el.scroll_height());
-            });
+        if scroll_pending.get() {
+            return;
         }
+        scroll_pending.set(true);
+        let pending = scroll_pending.clone();
+        request_animation_frame(move || {
+            pending.set(false);
+            if let Some(el) = scroll_ref.get() {
+                el.set_scroll_top(el.scroll_height());
+            }
+        });
     });
 
     let scroll_to_bottom = move |_| {
