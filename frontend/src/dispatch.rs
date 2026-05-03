@@ -1379,11 +1379,16 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                 data.message_id,
                 data.text.len()
             );
-            let streaming = state
+            // Pull out only the text-signal handle, not the entire
+            // StreamingState — cloning the latter copies the
+            // `agent_name`/`model` Strings on every delta. With ~50
+            // deltas/sec from a fast model that's a steady drip of
+            // small allocations the GC has to manage.
+            let text_signal = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_id).cloned());
-            if let Some(streaming) = streaming {
-                streaming.text.update(|text| text.push_str(&data.text));
+                .with_untracked(|map| map.get(&agent_id).map(|s| s.text.clone()));
+            if let Some(text_signal) = text_signal {
+                text_signal.update(|text| text.push_str(&data.text));
             }
         }
         ChatEvent::StreamReasoningDelta(data) => {
@@ -1394,13 +1399,11 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                 data.message_id,
                 data.text.len()
             );
-            let streaming = state
+            let reasoning_signal = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_id).cloned());
-            if let Some(streaming) = streaming {
-                streaming
-                    .reasoning
-                    .update(|reasoning| reasoning.push_str(&data.text));
+                .with_untracked(|map| map.get(&agent_id).map(|s| s.reasoning.clone()));
+            if let Some(reasoning_signal) = reasoning_signal {
+                reasoning_signal.update(|reasoning| reasoning.push_str(&data.text));
             }
         }
         ChatEvent::StreamEnd(data) => {
