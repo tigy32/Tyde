@@ -38,6 +38,21 @@ const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
 /// production.
 const FALLBACK_CHUNK_LINES: usize = 200;
 
+/// Number of lines to tokenize *synchronously on the main thread* before
+/// first paint, so the visible viewport renders already-coloured rather
+/// than flashing from plain text to highlighted ~200ms later (VSCode
+/// does the same — viewport-first, defer the rest). Sized to roughly
+/// match a typical viewport (~35 lines at 700px / 20px line-height) so
+/// the visible area is fully coloured on first paint without paying
+/// for off-screen lines twice. Cost: lines × per-line tokenize cost
+/// (~0.3ms release, ~3ms debug).
+///
+/// The worker still tokenizes the full file from line 0 so multi-line
+/// constructs (block comments, raw strings) stay correct — these
+/// initial tokens get overwritten by the worker's first chunk, which
+/// is a no-op visually since the result is identical.
+const INSTANT_PREFIX_LINES: usize = 40;
+
 /// Above this line count we never highlight — the wasm main thread can't
 /// realistically tokenize that much without freezing the UI even with
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
@@ -145,7 +160,31 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     // critical: it's how multi-line constructs (block
     // comments, raw strings) still color correctly even
     // though we're processing the file in pieces.
-    let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> = ArcRwSignal::new(vec![None; total]);
+    let mut initial_tokens: Vec<Option<LineTokens>> = vec![None; total];
+
+    // Synchronously tokenize the first viewport's worth of lines on the
+    // main thread so first paint shows already-coloured text. Without
+    // this the worker takes ~150ms+ to deliver its first chunk in debug
+    // builds and the user sees an uncoloured-to-coloured flash.
+    if total > 0 && total <= HIGHLIGHT_LINE_CAP
+        && let Some(syntax) = syntax_for_path(&f.path.relative_path)
+    {
+        let prefix_t0 = crate::perf::now_ms();
+        let prefix_end = total.min(INSTANT_PREFIX_LINES);
+        let mut hl = LineHighlighter::new(syntax);
+        for i in 0..prefix_end {
+            initial_tokens[i] = Some(hl.highlight_one(lines.line(i)));
+        }
+        let dt = crate::perf::now_ms() - prefix_t0;
+        crate::perf::log_phase(
+            "file_open",
+            "instant_prefix",
+            &perf_key,
+            &format!(" lines={prefix_end} took={dt:.1}ms"),
+        );
+    }
+
+    let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> = ArcRwSignal::new(initial_tokens);
 
     // Generation counter for live re-highlighting on
     // theme change. Bumping this invalidates any

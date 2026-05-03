@@ -237,6 +237,15 @@ impl LineHighlighter {
 /// time rather than on the first file open or first markdown render.
 pub fn warm_up() {
     Lazy::force(&SYNTAX_SET);
+    // Force lazy syntect/onig regex compilation. Without this the first
+    // real highlight call pays the regex-compile cost (~300ms in debug
+    // for a Rust file) on top of its tokenize work, which the user
+    // perceives as a slow first file-open. A throwaway one-liner is
+    // enough to populate onig's compiled-regex cache.
+    if let Some(rust) = SYNTAX_SET.find_syntax_by_extension("rs") {
+        let mut hl = LineHighlighter::new(rust);
+        let _ = hl.highlight_one("fn main() {}");
+    }
     Lazy::force(&THEME_SET);
 }
 
