@@ -632,8 +632,12 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 };
                 let key = (payload.root.clone(), payload.scope, payload_path.clone());
                 let perf_key = format!("diff:{}:{payload_path}", payload.root.0);
-                let total_lines: usize =
-                    payload.files.iter().flat_map(|f| f.hunks.iter()).map(|h| h.lines.len()).sum();
+                let total_lines: usize = payload
+                    .files
+                    .iter()
+                    .flat_map(|f| f.hunks.iter())
+                    .map(|h| h.lines.len())
+                    .sum();
                 crate::perf::log_phase(
                     "diff_open",
                     "response",

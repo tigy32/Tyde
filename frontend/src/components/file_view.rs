@@ -44,275 +44,295 @@ const HIGHLIGHT_CHUNK_LINES: usize = 200;
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
 const HIGHLIGHT_LINE_CAP: usize = 5000;
 
+/// Outer `FileView` is intentionally thin: it tracks only whether the file
+/// has been loaded into `open_files` (cheap `bool` Memo) and mounts the
+/// heavy inner `FileViewLoaded` exactly once via `Show`. Without this
+/// split, the previous `move ||` body re-ran on every `open_files`
+/// change — opening a different file in another tab re-built `FileLines`,
+/// re-created the highlight `Effect`, and re-spawned the syntect task in
+/// every already-open tab. With many tabs that compounds quickly and is
+/// the main "feels sluggish" symptom.
 #[component]
 pub fn FileView(path: ProjectPath) -> impl IntoView {
     let state = expect_context::<AppState>();
-
     let file_path = path.clone();
-    let file_info = move || {
+    let is_loaded = Memo::new(move |_| {
         state
             .open_files
-            .with(|files| files.get(&file_path).cloned())
-    };
+            .with(|files| files.contains_key(&file_path))
+    });
 
-    let close_path = path.clone();
-
+    let path_for_loaded = path.clone();
     view! {
         <div class="file-view">
-            {move || {
-                let close_path = close_path.clone();
-                match file_info() {
-                    Some(f) => {
-                        let path_display = format!("{}/{}", f.path.root.0, f.path.relative_path);
-                        let content = if f.is_binary {
-                            "(binary file)".to_owned()
-                        } else {
-                            f.contents.unwrap_or_else(|| "(file not found)".to_owned())
-                        };
+            <Show
+                when=move || is_loaded.get()
+                fallback=move || view! { <div class="panel-empty">"No file open"</div> }
+            >
+                <FileViewLoaded path=path_for_loaded.clone() />
+            </Show>
+        </div>
+    }
+}
 
-                        let on_close = move |_| {
-                            let state = expect_context::<AppState>();
-                            let tab_id = state.center_zone.with_untracked(|cz| {
-                                cz.find_tab(&TabContent::File {
-                                    path: close_path.clone(),
-                                })
-                            });
-                            if let Some(id) = tab_id {
-                                state.close_tab(id);
-                            }
-                        };
+/// Per-tab file body. All heavy setup (line table, find state,
+/// virtualization signals, async syntect task) runs **once** at mount —
+/// never repeats when other files open or close. Reads contents
+/// untracked from `open_files`; the file is guaranteed present because
+/// the parent `Show` only mounts this when `open_files` already contains
+/// the path.
+#[component]
+fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
+    let state = expect_context::<AppState>();
 
-                        // Hold the entire file content as a single
-                        // `Arc<str>` plus a per-line byte-offset table.
-                        // This is critical for huge files: the previous
-                        // `content.lines().map(|l| l.to_owned()).collect()`
-                        // allocated one `String` per line (50 000 allocs
-                        // for a 50K-line file), which takes seconds in
-                        // debug-build wasm. `FileLines::new` does two
-                        // allocations total, regardless of line count.
-                        let perf_key = format!("file:{}", f.path.relative_path);
-                        crate::perf::log_phase("file_open", "mount", &perf_key, "");
-                        let lines_t0 = crate::perf::now_ms();
-                        let (find_state, lines) = FindState::from_file(&content);
-                        let total = lines.len();
-                        let lines_dt = crate::perf::now_ms() - lines_t0;
-                        crate::perf::log_phase(
-                            "file_open",
-                            "lines_built",
-                            &perf_key,
-                            &format!(" lines={total} took={lines_dt:.1}ms"),
-                        );
-                        provide_context(find_state.clone());
+    let f = state
+        .open_files
+        .with_untracked(|files| files.get(&path).cloned())
+        .expect("FileViewLoaded mounted with no open_files entry");
 
-                        // Async syntax highlighting. We don't tokenize on
-                        // mount — that would block first paint for ~1s on a
-                        // moderate file in debug builds. Instead we kick off
-                        // a spawn_local task that fills tokens into a signal
-                        // in `HIGHLIGHT_CHUNK_LINES`-sized chunks, yielding
-                        // to the browser between chunks. Each row reads its
-                        // own index from the signal, so visible lines render
-                        // plain text immediately and "fill in" with color
-                        // over the next ~hundred ms as chunks land.
-                        //
-                        // Persistent syntect parser state across chunks is
-                        // critical: it's how multi-line constructs (block
-                        // comments, raw strings) still color correctly even
-                        // though we're processing the file in pieces.
-                        let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> =
-                            ArcRwSignal::new(vec![None; total]);
+    let close_path = path.clone();
+    let path_display = format!("{}/{}", f.path.root.0, f.path.relative_path);
+    let content = if f.is_binary {
+        "(binary file)".to_owned()
+    } else {
+        f.contents.unwrap_or_else(|| "(file not found)".to_owned())
+    };
 
-                        // Generation counter for live re-highlighting on
-                        // theme change. Bumping this invalidates any
-                        // in-flight chunked task, which checks the
-                        // generation each chunk and exits if stale.
-                        let highlight_gen: ArcRwSignal<u32> = ArcRwSignal::new(0);
+    let on_close = move |_| {
+        let state = expect_context::<AppState>();
+        let tab_id = state.center_zone.with_untracked(|cz| {
+            cz.find_tab(&TabContent::File {
+                path: close_path.clone(),
+            })
+        });
+        if let Some(id) = tab_id {
+            state.close_tab(id);
+        }
+    };
 
-                        let path_for_effect = f.path.relative_path.clone();
-                        let syntax_theme = state.syntax_theme;
-                        let lines_for_effect = lines.clone();
-                        let highlighted_for_effect = highlighted.clone();
-                        let gen_for_effect = highlight_gen.clone();
-                        Effect::new(move |_| {
-                            // Subscribe to the theme signal. Whenever it
-                            // changes we discard prior tokens and kick off
-                            // a fresh chunked highlight pass with the new
-                            // theme.
-                            let _ = syntax_theme.get();
+    // Hold the entire file content as a single
+    // `Arc<str>` plus a per-line byte-offset table.
+    // This is critical for huge files: the previous
+    // `content.lines().map(|l| l.to_owned()).collect()`
+    // allocated one `String` per line (50 000 allocs
+    // for a 50K-line file), which takes seconds in
+    // debug-build wasm. `FileLines::new` does two
+    // allocations total, regardless of line count.
+    let perf_key = format!("file:{}", f.path.relative_path);
+    crate::perf::log_phase("file_open", "mount", &perf_key, "");
+    let lines_t0 = crate::perf::now_ms();
+    let (find_state, lines) = FindState::from_file(&content);
+    let total = lines.len();
+    let lines_dt = crate::perf::now_ms() - lines_t0;
+    crate::perf::log_phase(
+        "file_open",
+        "lines_built",
+        &perf_key,
+        &format!(" lines={total} took={lines_dt:.1}ms"),
+    );
+    provide_context(find_state.clone());
 
-                            let my_gen = gen_for_effect.get_untracked() + 1;
-                            gen_for_effect.set(my_gen);
+    // Async syntax highlighting. We don't tokenize on
+    // mount — that would block first paint for ~1s on a
+    // moderate file in debug builds. Instead we kick off
+    // a spawn_local task that fills tokens into a signal
+    // in `HIGHLIGHT_CHUNK_LINES`-sized chunks, yielding
+    // to the browser between chunks. Each row reads its
+    // own index from the signal, so visible lines render
+    // plain text immediately and "fill in" with color
+    // over the next ~hundred ms as chunks land.
+    //
+    // Persistent syntect parser state across chunks is
+    // critical: it's how multi-line constructs (block
+    // comments, raw strings) still color correctly even
+    // though we're processing the file in pieces.
+    let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> = ArcRwSignal::new(vec![None; total]);
 
-                            // Reset highlighted vec to plain text while we
-                            // re-tokenize. Visible rows momentarily render
-                            // plain, then fill in with the new theme.
-                            highlighted_for_effect.update(|v| {
-                                for slot in v.iter_mut() {
-                                    *slot = None;
-                                }
-                            });
+    // Generation counter for live re-highlighting on
+    // theme change. Bumping this invalidates any
+    // in-flight chunked task, which checks the
+    // generation each chunk and exits if stale.
+    let highlight_gen: ArcRwSignal<u32> = ArcRwSignal::new(0);
 
-                            if total == 0 || total > HIGHLIGHT_LINE_CAP {
-                                return;
-                            }
-                            let Some(syntax) = syntax_for_path(&path_for_effect) else {
-                                return;
-                            };
+    let path_for_effect = f.path.relative_path.clone();
+    let syntax_theme = state.syntax_theme;
+    let lines_for_effect = lines.clone();
+    let highlighted_for_effect = highlighted.clone();
+    let gen_for_effect = highlight_gen.clone();
+    Effect::new(move |_| {
+        // Subscribe to the theme signal. Whenever it
+        // changes we discard prior tokens and kick off
+        // a fresh chunked highlight pass with the new
+        // theme.
+        let _ = syntax_theme.get();
 
-                            let lines_for_task = lines_for_effect.clone();
-                            let signal_for_task = highlighted_for_effect.clone();
-                            let gen_for_task = gen_for_effect.clone();
-                            let perf_key_for_task = format!("file:{}", path_for_effect);
-                            spawn_local(async move {
-                                let task_t0 = crate::perf::now_ms();
-                                crate::perf::log_phase(
-                                    "file_open",
-                                    "hl_started",
-                                    &perf_key_for_task,
-                                    &format!(" lines={}", lines_for_task.len()),
-                                );
-                                let mut hl = LineHighlighter::new(syntax);
-                                let mut i = 0usize;
-                                let mut chunks = 0u32;
-                                let mut first_chunk_logged = false;
-                                while i < lines_for_task.len() {
-                                    if gen_for_task.get_untracked() != my_gen {
-                                        return; // newer task superseded us
-                                    }
-                                    let end = (i + HIGHLIGHT_CHUNK_LINES)
-                                        .min(lines_for_task.len());
-                                    let chunk_tokens: Vec<LineTokens> = (i..end)
-                                        .map(|j| hl.highlight_one(lines_for_task.line(j)))
-                                        .collect();
-                                    if gen_for_task.get_untracked() != my_gen {
-                                        return;
-                                    }
-                                    signal_for_task.update(|v| {
-                                        for (offset, toks) in
-                                            chunk_tokens.into_iter().enumerate()
-                                        {
-                                            if let Some(slot) = v.get_mut(i + offset) {
-                                                *slot = Some(toks);
-                                            }
-                                        }
-                                    });
-                                    i = end;
-                                    chunks += 1;
-                                    if !first_chunk_logged {
-                                        let dt = crate::perf::now_ms() - task_t0;
-                                        crate::perf::log_phase(
-                                            "file_open",
-                                            "hl_first_chunk",
-                                            &perf_key_for_task,
-                                            &format!(" through={i} took={dt:.1}ms"),
-                                        );
-                                        first_chunk_logged = true;
-                                    }
-                                    yield_to_browser().await;
-                                }
-                                let dt = crate::perf::now_ms() - task_t0;
-                                crate::perf::log_phase(
-                                    "file_open",
-                                    "hl_finished",
-                                    &perf_key_for_task,
-                                    &format!(" chunks={chunks} took={dt:.1}ms"),
-                                );
-                            });
-                        });
+        let my_gen = gen_for_effect.get_untracked() + 1;
+        gen_for_effect.set(my_gen);
 
-                        let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
+        // Reset highlighted vec to plain text while we
+        // re-tokenize. Visible rows momentarily render
+        // plain, then fill in with the new theme.
+        highlighted_for_effect.update(|v| {
+            for slot in v.iter_mut() {
+                *slot = None;
+            }
+        });
 
-                        // Virtualization geometry. Pre-seed the line and
-                        // viewport heights with reasonable estimates so the
-                        // very first render of a large file already uses a
-                        // bounded window. The measurement Effect below
-                        // refines both values once layout is real.
-                        let scroll_top = RwSignal::new(0.0_f64);
-                        let viewport_height =
-                            RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
-                        let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+        if total == 0 || total > HIGHLIGHT_LINE_CAP {
+            return;
+        }
+        let Some(syntax) = syntax_for_path(&path_for_effect) else {
+            return;
+        };
 
-                        // Measure the geometry once after first paint. The
-                        // Effect re-runs if the underlying signals fire
-                        // (rare here — only the initial mount).
-                        let perf_key_for_measure = format!("file:{}", f.path.relative_path);
-                        let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
-                        Effect::new(move |_| {
-                            let Some(el) = pre_ref.get() else { return };
-                            let vh = el.client_height() as f64;
-                            if vh > 0.0 {
-                                viewport_height.set(vh);
-                            }
-                            if let Ok(Some(line_el)) = el.query_selector(".file-line")
-                                && let Some(html_el) =
-                                    line_el.dyn_ref::<web_sys::HtmlElement>()
-                            {
-                                let lh = html_el.offset_height() as f64;
-                                if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
-                                    line_height.set(lh);
-                                }
-                                if !measure_logged.get() {
-                                    measure_logged.set(true);
-                                    crate::perf::log_phase(
-                                        "file_open",
-                                        "first_paint_measured",
-                                        &perf_key_for_measure,
-                                        &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
-                                    );
-                                }
-                            }
-                        });
+        let lines_for_task = lines_for_effect.clone();
+        let signal_for_task = highlighted_for_effect.clone();
+        let gen_for_task = gen_for_effect.clone();
+        let perf_key_for_task = format!("file:{}", path_for_effect);
+        spawn_local(async move {
+            let task_t0 = crate::perf::now_ms();
+            crate::perf::log_phase(
+                "file_open",
+                "hl_started",
+                &perf_key_for_task,
+                &format!(" lines={}", lines_for_task.len()),
+            );
+            let mut hl = LineHighlighter::new(syntax);
+            let mut i = 0usize;
+            let mut chunks = 0u32;
+            let mut first_chunk_logged = false;
+            while i < lines_for_task.len() {
+                if gen_for_task.get_untracked() != my_gen {
+                    return; // newer task superseded us
+                }
+                let end = (i + HIGHLIGHT_CHUNK_LINES).min(lines_for_task.len());
+                let chunk_tokens: Vec<LineTokens> = (i..end)
+                    .map(|j| hl.highlight_one(lines_for_task.line(j)))
+                    .collect();
+                if gen_for_task.get_untracked() != my_gen {
+                    return;
+                }
+                signal_for_task.update(|v| {
+                    for (offset, toks) in chunk_tokens.into_iter().enumerate() {
+                        if let Some(slot) = v.get_mut(i + offset) {
+                            *slot = Some(toks);
+                        }
+                    }
+                });
+                i = end;
+                chunks += 1;
+                if !first_chunk_logged {
+                    let dt = crate::perf::now_ms() - task_t0;
+                    crate::perf::log_phase(
+                        "file_open",
+                        "hl_first_chunk",
+                        &perf_key_for_task,
+                        &format!(" through={i} took={dt:.1}ms"),
+                    );
+                    first_chunk_logged = true;
+                }
+                yield_to_browser().await;
+            }
+            let dt = crate::perf::now_ms() - task_t0;
+            crate::perf::log_phase(
+                "file_open",
+                "hl_finished",
+                &perf_key_for_task,
+                &format!(" chunks={chunks} took={dt:.1}ms"),
+            );
+        });
+    });
 
-                        // Throttle to one update per animation frame so the
-                        // visible_window memo only invalidates once per paint
-                        // even on a high-DPI trackpad firing scroll events
-                        // hundreds of times per second.
-                        let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-                        let on_scroll = {
-                            let pending = scroll_pending.clone();
-                            move |_: web_sys::Event| {
-                                if pending.get() {
-                                    return;
-                                }
-                                pending.set(true);
-                                let pending = pending.clone();
-                                leptos::prelude::request_animation_frame(move || {
-                                    pending.set(false);
-                                    if let Some(el) = pre_ref.get() {
-                                        scroll_top.set(el.scroll_top() as f64);
-                                    }
-                                });
-                            }
-                        };
+    let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
 
-                        // Visible window in line-index space. Small files
-                        // render everything (start=0, end=total) so spacers
-                        // stay at 0px and the pre-virtualization DOM shape
-                        // is preserved. Larger files use the seeded
-                        // (then measured) line_height to bound the window
-                        // from the very first render.
-                        let visible_window: Memo<(usize, usize)> =
-                            Memo::new(move |_| {
-                                if total < VIRTUALIZE_THRESHOLD {
-                                    return (0, total);
-                                }
-                                let lh = line_height.get();
-                                let st = scroll_top.get();
-                                let vh = viewport_height.get();
-                                let start_f =
-                                    ((st - OVERSCAN_LINES * lh) / lh).floor().max(0.0);
-                                let end_f = ((st + vh + OVERSCAN_LINES * lh) / lh)
-                                    .ceil()
-                                    .min(total as f64);
-                                (start_f as usize, end_f as usize)
-                            });
+    // Virtualization geometry. Pre-seed the line and
+    // viewport heights with reasonable estimates so the
+    // very first render of a large file already uses a
+    // bounded window. The measurement Effect below
+    // refines both values once layout is real.
+    let scroll_top = RwSignal::new(0.0_f64);
+    let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
+    let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
 
-                        let find_bar_open = state.find_bar_open;
+    // Measure the geometry once after first paint. The
+    // Effect re-runs if the underlying signals fire
+    // (rare here — only the initial mount).
+    let perf_key_for_measure = format!("file:{}", f.path.relative_path);
+    let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
+    Effect::new(move |_| {
+        let Some(el) = pre_ref.get() else { return };
+        let vh = el.client_height() as f64;
+        if vh > 0.0 {
+            viewport_height.set(vh);
+        }
+        if let Ok(Some(line_el)) = el.query_selector(".file-line")
+            && let Some(html_el) = line_el.dyn_ref::<web_sys::HtmlElement>()
+        {
+            let lh = html_el.offset_height() as f64;
+            if lh > 0.0 && (line_height.get_untracked() - lh).abs() > 0.5 {
+                line_height.set(lh);
+            }
+            if !measure_logged.get() {
+                measure_logged.set(true);
+                crate::perf::log_phase(
+                    "file_open",
+                    "first_paint_measured",
+                    &perf_key_for_measure,
+                    &format!(" viewport_h={vh:.0} line_h={lh:.1}"),
+                );
+            }
+        }
+    });
 
-                        let lines_for_render = lines.clone();
-                        let highlighted_for_render = highlighted.clone();
-                        let find_for_render = find_state.clone();
+    // Throttle to one update per animation frame so the
+    // visible_window memo only invalidates once per paint
+    // even on a high-DPI trackpad firing scroll events
+    // hundreds of times per second.
+    let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+    let on_scroll = {
+        let pending = scroll_pending.clone();
+        move |_: web_sys::Event| {
+            if pending.get() {
+                return;
+            }
+            pending.set(true);
+            let pending = pending.clone();
+            leptos::prelude::request_animation_frame(move || {
+                pending.set(false);
+                if let Some(el) = pre_ref.get() {
+                    scroll_top.set(el.scroll_top() as f64);
+                }
+            });
+        }
+    };
 
-                        view! {
+    // Visible window in line-index space. Small files
+    // render everything (start=0, end=total) so spacers
+    // stay at 0px and the pre-virtualization DOM shape
+    // is preserved. Larger files use the seeded
+    // (then measured) line_height to bound the window
+    // from the very first render.
+    let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
+        if total < VIRTUALIZE_THRESHOLD {
+            return (0, total);
+        }
+        let lh = line_height.get();
+        let st = scroll_top.get();
+        let vh = viewport_height.get();
+        let start_f = ((st - OVERSCAN_LINES * lh) / lh).floor().max(0.0);
+        let end_f = ((st + vh + OVERSCAN_LINES * lh) / lh)
+            .ceil()
+            .min(total as f64);
+        (start_f as usize, end_f as usize)
+    });
+
+    let find_bar_open = state.find_bar_open;
+
+    let lines_for_render = lines.clone();
+    let highlighted_for_render = highlighted.clone();
+    let find_for_render = find_state.clone();
+
+    view! {
                             <div class="file-view-header">
                                 <span class="file-view-path">{path_display}</span>
                                 <button class="file-view-close" on:click=on_close title="Close">"×"</button>
@@ -389,14 +409,6 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                                     })
                                 }}
                             </pre>
-                        }.into_any()
-                    }
-                    None => view! {
-                        <div class="panel-empty">"No file open"</div>
-                    }.into_any(),
-                }
-            }}
-        </div>
     }
 }
 
