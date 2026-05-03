@@ -704,12 +704,29 @@ pub fn ChatInput() -> impl IntoView {
     };
 
     let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+
+    // Synchronise the textarea's `value` property *only* when the
+    // signal diverges from what the DOM already has — the common case
+    // is the user typing, where `on_input` already mutated the
+    // textarea before the signal updated, so we'd otherwise re-set
+    // the property to the same string per keystroke. The comparison
+    // turns those into no-ops while still letting external resets
+    // (send, attach, prefill) push their value into the DOM.
+    //
+    // This replaces the previous `prop:value=move || …` reactive
+    // binding on the textarea, which subscribed unconditionally and
+    // ran a property write per keystroke.
     let reset_state = state.clone();
     Effect::new(move |_| {
         let val = reset_state.chat_input.get();
-        if val.is_empty()
-            && let Some(el) = textarea_ref.get()
-        {
+        let Some(el) = textarea_ref.get() else {
+            return;
+        };
+        let textarea: web_sys::HtmlTextAreaElement = (*el).clone().unchecked_into();
+        if textarea.value() != val {
+            textarea.set_value(&val);
+        }
+        if val.is_empty() {
             let html_el: web_sys::HtmlElement = el.into();
             let _ = html_el.style().set_property("height", "auto");
         }
@@ -833,7 +850,6 @@ pub fn ChatInput() -> impl IntoView {
                 <textarea
                     class="chat-textarea"
                     placeholder="Type a message or drop images..."
-                    prop:value=move || state.chat_input.get()
                     prop:disabled=move || is_readonly.get()
                     on:input=on_input
                     on:keydown=on_keydown
