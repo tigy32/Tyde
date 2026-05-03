@@ -15,10 +15,14 @@ use crate::state::ChatRowHandle;
 pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
     let entry = row.entry;
 
+    // Each Memo reads through `with` to avoid cloning the entire
+    // ChatMessageEntry (which carries a potentially-long
+    // `message.content: String`) just to extract a field. Memos
+    // already dedup via `PartialEq` on the projected tuple, so this
+    // is purely savings on the per-evaluation alloc cost.
     let entry_for_meta = entry.clone();
     let card_meta: Memo<(String, String, bool, bool)> = Memo::new(move |_| {
-        let e = entry_for_meta.get();
-        match &e.message.sender {
+        entry_for_meta.with(|e| match &e.message.sender {
             MessageSender::User => (
                 "chat-card chat-card-user".to_owned(),
                 "You".to_owned(),
@@ -49,14 +53,15 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
                 false,
                 false,
             ),
-        }
+        })
     });
 
     let entry_for_content = entry.clone();
     let content_data: Memo<(bool, String)> = Memo::new(move |_| {
-        let e = entry_for_content.get();
-        let is_user = matches!(e.message.sender, MessageSender::User);
-        (is_user, e.message.content)
+        entry_for_content.with(|e| {
+            let is_user = matches!(e.message.sender, MessageSender::User);
+            (is_user, e.message.content.clone())
+        })
     });
 
     let content_html: Memo<String> = Memo::new(move |_| {
@@ -76,11 +81,13 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
     });
 
     let entry_for_timestamp = entry.clone();
-    let timestamp_memo: Memo<u64> = Memo::new(move |_| entry_for_timestamp.get().message.timestamp);
+    let timestamp_memo: Memo<u64> =
+        Memo::new(move |_| entry_for_timestamp.with(|e| e.message.timestamp));
 
     let entry_for_model = entry.clone();
-    let model_memo: Memo<Option<String>> =
-        Memo::new(move |_| entry_for_model.get().message.model_info.map(|mi| mi.model));
+    let model_memo: Memo<Option<String>> = Memo::new(move |_| {
+        entry_for_model.with(|e| e.message.model_info.as_ref().map(|mi| mi.model.clone()))
+    });
 
     let copy_state = RwSignal::new("copy");
 
