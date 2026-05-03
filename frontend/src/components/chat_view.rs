@@ -7,7 +7,7 @@ use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
-use crate::state::{ActiveAgentRef, AppState, ChatRowHandle, ToolOutputMode, TransientEvent};
+use crate::state::{ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ToolOutputMode, TransientEvent};
 
 use protocol::BackendKind;
 
@@ -100,40 +100,40 @@ pub fn ChatView(
         map.get(&agent_id).cloned()
     };
 
+    // Centralised lookup of the AgentInfo for this view's agent_ref.
+    // The previous code did `state.agents.get()` (clones the full Vec)
+    // three times across `agent_name`, `agent_backend`, and
+    // `agent_initializing`, so any agent-list change fired three full
+    // clones. Sharing a single `Memo<Option<AgentInfo>>` collapses
+    // that to one clone per change, with closures becoming cheap
+    // field reads.
+    let current_agent: Memo<Option<AgentInfo>> = Memo::new(move |_| {
+        let active = agent_ref.get()?;
+        state.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|a| a.host_id == active.host_id && a.agent_id == active.agent_id)
+                .cloned()
+        })
+    });
+
     let agent_name = move || -> String {
-        let Some(active_agent) = agent_ref.get() else {
+        if agent_ref.get().is_none() {
             return String::new();
-        };
-        let agents = state.agents.get();
-        match agents
-            .iter()
-            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
-        {
-            Some(a) => a.name.clone(),
-            None => "[unknown agent]".to_owned(),
         }
+        current_agent
+            .get()
+            .map(|a| a.name)
+            .unwrap_or_else(|| "[unknown agent]".to_owned())
     };
 
-    let agent_backend = move || -> Option<BackendKind> {
-        let active_agent = agent_ref.get()?;
-        let agents = state.agents.get();
-        agents
-            .iter()
-            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
-            .map(|a| a.backend_kind)
-    };
+    let agent_backend = move || -> Option<BackendKind> { current_agent.get().map(|a| a.backend_kind) };
 
     let agent_initializing = move || -> bool {
-        let active_agent = match agent_ref.get() {
-            Some(active_agent) => active_agent,
-            None => return false,
-        };
-        state.agents.get().iter().any(|agent| {
-            agent.host_id == active_agent.host_id
-                && agent.agent_id == active_agent.agent_id
-                && !agent.started
-                && agent.fatal_error.is_none()
-        })
+        current_agent
+            .get()
+            .map(|a| !a.started && a.fatal_error.is_none())
+            .unwrap_or(false)
     };
 
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
