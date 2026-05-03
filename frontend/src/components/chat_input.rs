@@ -598,16 +598,33 @@ pub fn ChatInput() -> impl IntoView {
     };
 
     let on_input_state = state.clone();
+    // Throttle textarea autosize to one update per animation frame.
+    // The previous code ran height="auto" → read scrollHeight →
+    // write height inline on every keypress, which forces a synchronous
+    // layout each character. Coalescing into rAF caps this to 60Hz
+    // and aligns the layout pass with the browser's paint cycle.
+    let autosize_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     let on_input = move |ev: leptos::ev::Event| {
         let target = event_target_value(&ev);
         on_input_state.chat_input.set(target);
-        if let Some(el) = ev.target() {
-            let el: web_sys::HtmlTextAreaElement = el.unchecked_into();
-            let style = web_sys::HtmlElement::from(el.clone()).style();
-            let _ = style.set_property("height", "auto");
-            let scroll_h = el.scroll_height();
-            let _ = style.set_property("height", &format!("{scroll_h}px"));
+        if autosize_pending.get() {
+            return;
         }
+        let Some(node) = ev.target() else {
+            return;
+        };
+        let Ok(textarea) = node.dyn_into::<web_sys::HtmlTextAreaElement>() else {
+            return;
+        };
+        autosize_pending.set(true);
+        let pending = autosize_pending.clone();
+        leptos::prelude::request_animation_frame(move || {
+            pending.set(false);
+            let style = web_sys::HtmlElement::from(textarea.clone()).style();
+            let _ = style.set_property("height", "auto");
+            let scroll_h = textarea.scroll_height();
+            let _ = style.set_property("height", &format!("{scroll_h}px"));
+        });
     };
 
     let on_dragenter_error = attachment_error;

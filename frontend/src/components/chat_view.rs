@@ -20,6 +20,12 @@ pub fn ChatView(
     /// agent_ref upgrades from `None` to the spawned agent (see
     /// `dispatch.rs` agent-creation handling).
     agent_ref: Signal<Option<ActiveAgentRef>>,
+    /// True only when this tab is the active one in the center-zone.
+    /// Used to gate the `ChatInput` so hidden chat tabs don't mount
+    /// duplicate inputs that all subscribe to the global
+    /// `state.chat_input` — every keystroke would wake each hidden
+    /// instance, doubling-or-worse the per-keystroke main-thread cost.
+    is_active: Signal<bool>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -318,7 +324,12 @@ pub fn ChatView(
                     </Show>
                 </div>
             </Show>
-            <ChatInput />
+            <Show
+                when=move || is_active.get()
+                fallback=|| ()
+            >
+                <ChatInput />
+            </Show>
         </div>
     }
 }
@@ -472,7 +483,8 @@ mod wasm_tests {
             *setup_handle.borrow_mut() = Some(state.clone());
             provide_context(state);
             let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
-            view! { <ChatView agent_ref=agent_ref_signal /> }
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView agent_ref=agent_ref_signal is_active=is_active_signal /> }
         });
 
         next_tick().await;

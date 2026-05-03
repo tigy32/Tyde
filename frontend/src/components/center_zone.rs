@@ -432,7 +432,25 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                     }
                                 })
                             });
-                        view! { <ChatView agent_ref=agent_ref_signal /> }.into_any()
+                        // `is_active` Signal lets `ChatView` gate the
+                        // `ChatInput` on active-tab. Without this every
+                        // hidden chat tab kept its `ChatInput` mounted,
+                        // and they all subscribe to one global
+                        // `state.chat_input` — every keystroke woke each
+                        // hidden input plus its textarea-autosize layout
+                        // pass, scaling typing latency with tab count.
+                        let active_state = state.clone();
+                        let is_active_signal: Signal<bool> = Signal::derive(move || {
+                            active_state
+                                .center_zone
+                                .with(|cz| cz.active_tab_id == Some(tab_id))
+                        });
+                        view! {
+                            <ChatView
+                                agent_ref=agent_ref_signal
+                                is_active=is_active_signal
+                            />
+                        }.into_any()
                     }
                     TabKind::File => {
                         // Snapshot the path at the moment the variant

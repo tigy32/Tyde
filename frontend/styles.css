@@ -1652,6 +1652,15 @@ kbd {
     word-wrap: break-word;
     overflow-wrap: break-word;
     animation: card-enter 0.15s ease-out;
+    /* Cheap pseudo-virtualization: tells the browser to skip layout/paint
+       for off-screen cards entirely. `contain-intrinsic-size` reserves
+       a placeholder height so the scrollbar stays accurate while the
+       content is "skipped". Until proper transcript virtualization lands
+       this is the highest-leverage win for long conversations — long
+       transcripts otherwise force layout/paint of every card whenever
+       any signal upstream invalidates. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 200px;
 }
 
 .chat-card + .chat-card {
