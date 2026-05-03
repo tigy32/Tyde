@@ -261,11 +261,19 @@ pub fn SessionSettingsBar() -> impl IntoView {
         let state = state.clone();
         move || -> Option<(String, BackendKind)> {
             if let Some(agent_ref) = state.active_agent.get() {
-                let agent =
-                    state.agents.get().into_iter().find(|a| {
-                        a.host_id == agent_ref.host_id && a.agent_id == agent_ref.agent_id
-                    })?;
-                Some((agent_ref.host_id, agent.backend_kind))
+                // `with` reads the agents Vec in place — the previous
+                // `state.agents.get().into_iter().find` cloned the
+                // whole Vec just to find one agent's backend_kind.
+                let backend_kind = state.agents.with(|agents| {
+                    agents
+                        .iter()
+                        .find(|a| {
+                            a.host_id == agent_ref.host_id
+                                && a.agent_id == agent_ref.agent_id
+                        })
+                        .map(|a| a.backend_kind)
+                })?;
+                Some((agent_ref.host_id, backend_kind))
             } else {
                 let host_id = state.chat_context_host_id()?;
                 let settings = state.host_settings(&host_id)?;
