@@ -28,10 +28,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::syntax_highlight::LineTokens;
 
-/// Maximum lines per chunk batched back to main. Sets cancellation
-/// latency: when a new highlight request supersedes an in-flight one,
-/// the worker keeps tokenizing until the next chunk boundary.
-const CHUNK_SIZE: usize = 200;
+/// Lines per chunk batched back to main. Smaller chunks mean each
+/// arrives sooner and the visible viewport gets coloured earlier — the
+/// "first chunk" perceived latency is roughly chunk_size × per-line
+/// tokenize cost (~0.3ms in release, ~3ms in debug). 50 lines lands the
+/// first chunk in ~15ms release / ~150ms debug, well under the
+/// "uncoloured flash" threshold for a typical viewport.
+///
+/// Also sets cancellation latency: a superseding request waits for the
+/// current chunk to finish before the worker checks the active task id.
+const CHUNK_SIZE: usize = 50;
 
 /// Wire format for `main → worker`. Tagged enum keeps future variants
 /// (e.g. unified-diff hunk highlighting) easy to add.

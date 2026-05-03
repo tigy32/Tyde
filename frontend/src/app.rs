@@ -431,9 +431,16 @@ pub fn App() -> impl IntoView {
     // markdown render doesn't pay the ~50-200ms grammar-deserialization cost
     // synchronously. The setTimeout(0) yield lets the initial mount complete
     // before we touch the lazy statics.
+    //
+    // Same idea for the highlight Web Worker: spawn it eagerly here so the
+    // ~700ms wasm-init in the worker context happens during idle time,
+    // not when the user opens their first file. Without this the first
+    // file pays the cold-start latency and shows uncoloured text for a
+    // visibly-jarring second.
     spawn_local(async {
         yield_to_browser().await;
         crate::syntax_highlight::warm_up();
+        let _ = crate::highlight_worker::shared();
     });
 
     let state_for_startup = state.clone();
