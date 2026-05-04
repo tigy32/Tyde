@@ -282,7 +282,16 @@ fn TabButton(
 
     view! {
         <button
-            class=move || if is_active() { "tab active" } else { "tab" }
+            class=move || {
+                let mut class = if is_active() { "tab active" } else { "tab" }.to_string();
+                if is_home_tab() {
+                    class.push_str(" tab-home");
+                }
+                class
+            }
+            title=move || tab_data().map(|t| t.label).unwrap_or_default()
+            aria-label=move || tab_data().map(|t| t.label).unwrap_or_default()
+            attr:data-tab-id=tab_id.0.to_string()
             on:click=on_click
             on:contextmenu=on_contextmenu
         >
@@ -329,6 +338,15 @@ fn TabButton(
                             on:blur=on_blur
                             on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                         />
+                    }.into_any()
+                } else if is_home_tab() {
+                    view! {
+                        <span class="tab-home-icon" aria-hidden="true">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                                <polyline points="9 22 9 12 15 12 15 22"/>
+                            </svg>
+                        </span>
                     }.into_any()
                 } else {
                     view! {
@@ -503,6 +521,7 @@ pub fn CenterZone() -> impl IntoView {
 
     let context_menu: RwSignal<Option<(TabId, f64, f64)>> = RwSignal::new(None);
     let editing_tab_id: RwSignal<Option<TabId>> = RwSignal::new(None);
+    let tab_scroll_ref = NodeRef::<leptos::html::Div>::new();
 
     // New chat split button
     let menu_open = RwSignal::new(false);
@@ -542,6 +561,52 @@ pub fn CenterZone() -> impl IntoView {
             .center_zone
             .with(|cz| cz.tabs.iter().map(|t| t.id).collect::<Vec<_>>())
     };
+    let scroll_tab_ids = move || {
+        state.center_zone.with(|cz| {
+            cz.tabs
+                .iter()
+                .filter(|t| !matches!(t.content, TabContent::Home))
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        })
+    };
+    let home_tab_id = move || {
+        state.center_zone.with(|cz| {
+            cz.tabs
+                .iter()
+                .find(|t| matches!(t.content, TabContent::Home))
+                .map(|t| t.id)
+        })
+    };
+
+    Effect::new(move |_| {
+        let Some(active_tab_id) = state.center_zone.with(|cz| cz.active_tab_id) else {
+            return;
+        };
+        let Some(scroller) = tab_scroll_ref.get() else {
+            return;
+        };
+
+        leptos::prelude::request_animation_frame(move || {
+            let selector = format!("[data-tab-id=\"{}\"]", active_tab_id.0);
+            let Ok(Some(tab_el)) = scroller.query_selector(&selector) else {
+                return;
+            };
+
+            let scroller_rect = scroller.get_bounding_client_rect();
+            let tab_rect = tab_el.get_bounding_client_rect();
+            let left_delta = tab_rect.left() - scroller_rect.left();
+            let right_delta = tab_rect.right() - scroller_rect.right();
+            let padding = 8.0;
+            let current_scroll = scroller.scroll_left();
+
+            if left_delta < padding {
+                scroller.set_scroll_left(current_scroll + (left_delta - padding).round() as i32);
+            } else if right_delta > -padding {
+                scroller.set_scroll_left(current_scroll + (right_delta + padding).round() as i32);
+            }
+        });
+    });
 
     // Tabs whose content components should currently exist in the DOM:
     // the active tab plus up to `TAB_LRU_CAPACITY - 1` recently-active
@@ -573,76 +638,82 @@ pub fn CenterZone() -> impl IntoView {
 
     let tab_bar_class = move || {
         if state.tabs_enabled.get() {
-            "tab-bar"
+            "tab-bar center-tab-bar"
         } else {
-            "tab-bar tab-bar-hidden"
+            "tab-bar center-tab-bar tab-bar-hidden"
         }
     };
 
     view! {
         <div class="center-zone">
             <div class=tab_bar_class>
-                {move || tab_ids().into_iter().map(|id| {
-                    view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
-                }).collect_view()}
+                <div class="tab-strip-scroll" node_ref=tab_scroll_ref>
+                    {move || scroll_tab_ids().into_iter().map(|id| {
+                        view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
+                    }).collect_view()}
+                </div>
 
-                <div class="tab-bar-spacer"></div>
+                <div class="pinned-tab-actions">
+                    {move || home_tab_id().map(|id| {
+                        view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
+                    })}
 
-                <div class="new-chat-split">
-                    <button
-                        class="new-chat-btn"
-                        title="New Chat"
-                        disabled=move || !is_connected.get()
-                        on:click=on_new_chat
-                    >
-                        "New Chat"
-                    </button>
-                    <button
-                        class="new-chat-menu-trigger"
-                        title="Choose backend for new chat"
-                        disabled=move || !is_connected.get()
-                        on:click=on_toggle_menu
-                        aria-haspopup="menu"
-                        aria-expanded=move || if menu_open.get() { "true" } else { "false" }
-                    >
-                        <svg width="10" height="6" viewBox="0 0 10 6" fill="none">
-                            <path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </button>
+                    <div class="new-chat-split">
+                        <button
+                            class="new-chat-btn"
+                            title="New Chat"
+                            disabled=move || !is_connected.get()
+                            on:click=on_new_chat
+                        >
+                            "New Chat"
+                        </button>
+                        <button
+                            class="new-chat-menu-trigger"
+                            title="Choose backend for new chat"
+                            disabled=move || !is_connected.get()
+                            on:click=on_toggle_menu
+                            aria-haspopup="menu"
+                            aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                        >
+                            <svg width="10" height="6" viewBox="0 0 10 6" fill="none">
+                                <path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
 
-                    <Show when=move || menu_open.get()>
-                        <div class="new-chat-backdrop" on:click=close_menu></div>
-                        <div class="new-chat-menu" role="menu">
-                            {move || {
-                                let backends = enabled_backends.get();
-                                if backends.is_empty() {
-                                    vec![view! {
-                                        <div class="new-chat-menu-empty">
-                                            "No backends enabled"
-                                        </div>
-                                    }.into_any()]
-                                } else {
-                                    backends.into_iter().map(|kind| {
-                                        let label = backend_label(kind);
-                                        let menu_state = expect_context::<AppState>();
-                                        let on_click = move |_| {
-                                            menu_open.set(false);
-                                            begin_new_chat(&menu_state, Some(kind));
-                                        };
-                                        view! {
-                                            <button
-                                                class="new-chat-menu-item"
-                                                role="menuitem"
-                                                on:click=on_click
-                                            >
-                                                {format!("New {label} Chat")}
-                                            </button>
-                                        }.into_any()
-                                    }).collect::<Vec<_>>()
-                                }
-                            }}
-                        </div>
-                    </Show>
+                        <Show when=move || menu_open.get()>
+                            <div class="new-chat-backdrop" on:click=close_menu></div>
+                            <div class="new-chat-menu" role="menu">
+                                {move || {
+                                    let backends = enabled_backends.get();
+                                    if backends.is_empty() {
+                                        vec![view! {
+                                            <div class="new-chat-menu-empty">
+                                                "No backends enabled"
+                                            </div>
+                                        }.into_any()]
+                                    } else {
+                                        backends.into_iter().map(|kind| {
+                                            let label = backend_label(kind);
+                                            let menu_state = expect_context::<AppState>();
+                                            let on_click = move |_| {
+                                                menu_open.set(false);
+                                                begin_new_chat(&menu_state, Some(kind));
+                                            };
+                                            view! {
+                                                <button
+                                                    class="new-chat-menu-item"
+                                                    role="menuitem"
+                                                    on:click=on_click
+                                                >
+                                                    {format!("New {label} Chat")}
+                                                </button>
+                                            }.into_any()
+                                        }).collect::<Vec<_>>()
+                                    }
+                                }}
+                            </div>
+                        </Show>
+                    </div>
                 </div>
             </div>
             <div class="center-content">

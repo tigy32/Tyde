@@ -1039,8 +1039,40 @@ details summary:focus:not(:focus-visible) {
     gap: 1px;
 }
 
+.center-tab-bar {
+    gap: 0;
+    overflow: hidden;
+}
+
 .tab-bar-hidden {
     display: none;
+}
+
+.tab-strip-scroll {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.tab-strip-scroll::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+}
+
+.pinned-tab-actions {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+    padding-left: var(--space-1);
 }
 
 .tab {
@@ -1051,6 +1083,22 @@ details summary:focus:not(:focus-visible) {
     color: var(--text-secondary);
     border-bottom: 2px solid transparent;
     transition: color 0.15s, border-color 0.15s;
+}
+
+.center-tab-bar .tab {
+    flex: 0 0 auto;
+}
+
+.tab-home {
+    justify-content: center;
+    width: 34px;
+    padding: 0;
+}
+
+.tab-home-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .tab:hover {
@@ -1088,10 +1136,6 @@ details summary:focus:not(:focus-visible) {
 .tab-close:hover {
     opacity: 1;
     background: var(--surface-3);
-}
-
-.tab-bar-spacer {
-    flex: 1;
 }
 
 /* ===== Center Content ===== */
