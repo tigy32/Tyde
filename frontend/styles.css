@@ -1652,18 +1652,41 @@ kbd {
     word-wrap: break-word;
     overflow-wrap: break-word;
     animation: card-enter 0.15s ease-out;
-    /* Cheap pseudo-virtualization: tells the browser to skip layout/paint
-       for off-screen cards entirely. `contain-intrinsic-size` reserves
-       a placeholder height so the scrollbar stays accurate while the
-       content is "skipped". Until proper transcript virtualization lands
-       this is the highest-leverage win for long conversations — long
-       transcripts otherwise force layout/paint of every card whenever
-       any signal upstream invalidates. */
-    content-visibility: auto;
-    contain-intrinsic-size: auto 200px;
 }
 
 .chat-card + .chat-card {
+    margin-top: 6px;
+}
+
+/* Virtualized chat history. Rows outside the viewport (plus a small
+   overscan) are unmounted; their absence is reserved by `.virt-spacer`
+   divs whose height is computed in Rust from estimated/measured row
+   heights. `display: block` on `.virt-row` is intentional — flex
+   layouts on the parent don't apply to spacers, which would otherwise
+   collapse to zero. */
+.virt-row {
+    display: block;
+}
+
+.virt-row + .virt-row {
+    margin-top: 6px;
+}
+
+.virt-spacer {
+    flex: 0 0 auto;
+    width: 100%;
+}
+
+/* Restore the inter-card gap at the windowed-list / trailing-card
+   boundary. The `.chat-card + .chat-card` rule above only matches when
+   the previous sibling is also a `.chat-card`, so the historic gap
+   between the last history row (now a `.virt-row`) and the first
+   trailing card (transient retry/cancel notice, or the live streaming
+   card) was lost when virtualization landed. The explicit selectors
+   here put it back without re-introducing margin onto the spacers
+   themselves — that would corrupt the precise scroll geometry the
+   spacers reserve. */
+.virt-spacer-bottom + .chat-card {
     margin-top: 6px;
 }
 

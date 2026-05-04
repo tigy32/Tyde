@@ -1245,6 +1245,10 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
             }
         }
     });
+    // The center_zone update above can remove tab ids that are still in
+    // `tab_lru`. Prune so we don't keep mounting references to vanished
+    // tabs.
+    state.prune_tab_lru();
 }
 
 fn close_agent_tabs(

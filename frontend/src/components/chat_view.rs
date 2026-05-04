@@ -1,5 +1,7 @@
 use leptos::prelude::*;
+use std::collections::HashMap;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 
 use crate::components::chat_input::ChatInput;
@@ -7,9 +9,32 @@ use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
-use crate::state::{ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ToolOutputMode, TransientEvent};
+use crate::state::{
+    ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ChatRowId, ToolOutputMode, TransientEvent,
+};
 
 use protocol::BackendKind;
+
+/// Default per-row height assumed for rows we haven't measured yet.
+/// Affects initial scrollbar size and pre-measurement window math; once
+/// a row is measured by the per-row `ResizeObserver` the real height
+/// supersedes this. Picked to roughly match a typical text-only chat
+/// card so first-paint geometry is in the right ballpark for short
+/// transcripts.
+const ESTIMATED_ROW_HEIGHT: f64 = 200.0;
+/// Number of rows to render outside the visible viewport in each
+/// direction. A small buffer means scroll-into-view shows a measured row
+/// rather than a default-sized placeholder, hiding the first-frame
+/// height correction from the user.
+const VIRT_OVERSCAN: usize = 5;
+/// CSS gap inserted between adjacent rows by `.virt-row + .virt-row {
+/// margin-top: 6px; }` in styles.css. `ResizeObserver` reports the
+/// row's own border-box height — it doesn't include outside margins —
+/// so the spacer/scroll math has to add this back per non-first row,
+/// otherwise the scrollbar drifts (under-reports total content height
+/// by `ROW_GAP_PX` per unmounted gap on long transcripts). Must stay
+/// in lockstep with the CSS rule.
+const ROW_GAP_PX: f64 = 6.0;
 
 #[component]
 pub fn ChatView(
@@ -142,68 +167,283 @@ pub fn ChatView(
     let user_scrolled_up = RwSignal::new(false);
     let show_scroll_btn = RwSignal::new(false);
 
-    // Per-instance scroll listener. Multiple `ChatView`s may exist
-    // simultaneously (one per chat tab, mounted-and-hidden), so we cannot use
-    // a thread-local single-slot handle. We forget the Closure so it survives
-    // for the lifetime of the underlying scroll element; when the component
-    // unmounts, the DOM element is removed and the listener is collected with
-    // it. One leaked Closure per chat-tab mount is bounded and acceptable.
+    // Virtualization plumbing — see `VirtualWindow` and the windowed `<For>`
+    // below. The chat row list is windowed: only rows whose offsets fall
+    // within (scroll_top - overscan, scroll_top + viewport + overscan) are
+    // mounted; rows outside the window are summarised by spacer divs.
     //
-    // The scroll handler reads `scrollHeight`/`scrollTop`/`clientHeight`,
-    // each of which forces a synchronous layout. Trackpad/wheel scrolls
-    // can fire 100+ events per second, so we throttle to one read per
-    // animation frame. We also only `set` on the signals when the
-    // boolean actually changes — a stationary signal write still
-    // notifies subscribers in Leptos's RwSignal.
+    // - `scroll_top_sig` and `viewport_height_sig` track the viewport so
+    //   the window-computing Memo can react to scroll and resize.
+    // - `row_heights` maps `ChatRowId` to the row's measured DOM height.
+    //   Rows without an entry use `ESTIMATED_ROW_HEIGHT`. Stored as a
+    //   non-reactive `StoredValue` because it can churn at high frequency
+    //   during streaming and its updates are signalled coarsely via
+    //   `heights_version`.
+    // - `heights_version` is bumped any time `row_heights` mutates by a
+    //   meaningful amount; the windowing Memo subscribes to it.
+    let scroll_top_sig = RwSignal::new(0.0_f64);
+    let viewport_height_sig = RwSignal::new(800.0_f64);
+    let row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage> =
+        StoredValue::new_local(HashMap::new());
+    let heights_version = RwSignal::new(0u32);
+
+    // Per-instance scroll + user-input listeners. Multiple `ChatView`s
+    // can be mounted simultaneously (LRU hot set), so we can't use
+    // thread-local handles. Closures are parked in a `StoredValue`
+    // and removed on `on_cleanup` — tab LRU eviction can mount/unmount
+    // this ChatView many times for the same chat, and without explicit
+    // cleanup each cycle would leak its handlers.
+    struct ScrollListenerHolder {
+        element: web_sys::HtmlElement,
+        scroll_handler: Closure<dyn Fn()>,
+        input_handler: Closure<dyn Fn()>,
+    }
+    let scroll_listener_slot: StoredValue<Option<ScrollListenerHolder>, LocalStorage> =
+        StoredValue::new_local(None);
+    // Two listeners, with separate responsibilities:
+    //
+    //   1. The `scroll` listener (always fires, including on
+    //      programmatic `set_scroll_top` calls). It only updates
+    //      `scroll_top_sig` — the windowing Memo needs current scroll
+    //      position. It does NOT touch `user_scrolled_up`. Otherwise,
+    //      content growing below the user (e.g. during a session
+    //      restore where messages stream in over seconds) would trip
+    //      the near-bottom check, set `user_scrolled_up = true`, and
+    //      permanently disable sticky-bottom. That was the visible
+    //      "stuck at top after restore" bug.
+    //
+    //   2. The user-input listeners (`wheel`, `touchstart`, `keydown`)
+    //      fire only on real user actions. Those re-evaluate distance-
+    //      from-bottom and update `user_scrolled_up` / `show_scroll_btn`
+    //      accordingly. Programmatic scrolls and content-growth scrolls
+    //      stay sticky.
     let scroll_ref_for_handler = scroll_ref;
     Effect::new(move |_| {
-        if let Some(el) = scroll_ref_for_handler.get() {
-            let el_clone = el.clone();
-            let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-            let last_is_near_bottom = std::rc::Rc::new(std::cell::Cell::new(true));
-            let handler = Closure::<dyn Fn()>::new(move || {
-                if listener_pending.get() {
-                    return;
-                }
-                listener_pending.set(true);
-                let pending = listener_pending.clone();
-                let last = last_is_near_bottom.clone();
-                let el_for_raf = el_clone.clone();
-                leptos::prelude::request_animation_frame(move || {
-                    pending.set(false);
-                    let scroll_height = el_for_raf.scroll_height();
-                    let scroll_top = el_for_raf.scroll_top();
-                    let client_height = el_for_raf.client_height();
-                    let distance_from_bottom = scroll_height - scroll_top - client_height;
-                    let is_near_bottom = distance_from_bottom < 80;
-                    if is_near_bottom != last.get() {
-                        last.set(is_near_bottom);
-                        user_scrolled_up.set(!is_near_bottom);
-                        show_scroll_btn.set(!is_near_bottom);
-                    }
-                });
-            });
-            let _ = el.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
-            handler.forget();
+        let Some(el) = scroll_ref_for_handler.get() else {
+            return;
+        };
+        if scroll_listener_slot.with_value(|s| s.is_some()) {
+            return;
         }
+        let el_clone = el.clone();
+        let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let scroll_handler = Closure::<dyn Fn()>::new(move || {
+            if listener_pending.get() {
+                return;
+            }
+            listener_pending.set(true);
+            let pending = listener_pending.clone();
+            let el_for_cb = el_clone.clone();
+            // `setTimeout(0)` instead of `requestAnimationFrame` — rAF
+            // is paused for hidden Tauri webviews (macOS WKWebView
+            // throttles when the window is occluded). setTimeout
+            // fires regardless of visibility.
+            leptos::prelude::set_timeout(
+                move || {
+                    pending.set(false);
+                    let scroll_top = el_for_cb.scroll_top();
+                    scroll_top_sig.set(scroll_top as f64);
+                },
+                std::time::Duration::from_millis(0),
+            );
+        });
+        let _ = el.add_event_listener_with_callback(
+            "scroll",
+            scroll_handler.as_ref().unchecked_ref(),
+        );
+
+        // User-input observation. Each user-input event re-evaluates
+        // distance-from-bottom and updates `user_scrolled_up`. The
+        // events themselves don't carry post-scroll geometry — we
+        // schedule a `setTimeout(0)` to read after the browser has
+        // applied the input's scroll effect.
+        let el_for_input = el.clone();
+        let input_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let input_handler = Closure::<dyn Fn()>::new(move || {
+            if input_pending.get() {
+                return;
+            }
+            input_pending.set(true);
+            let pending = input_pending.clone();
+            let el_for_cb = el_for_input.clone();
+            leptos::prelude::set_timeout(
+                move || {
+                    pending.set(false);
+                    let scroll_height = el_for_cb.scroll_height();
+                    let scroll_top = el_for_cb.scroll_top();
+                    let client_height = el_for_cb.client_height();
+                    let distance_from_bottom =
+                        scroll_height - scroll_top - client_height;
+                    let is_near_bottom = distance_from_bottom < 80;
+                    user_scrolled_up.set(!is_near_bottom);
+                    show_scroll_btn.set(!is_near_bottom);
+                },
+                std::time::Duration::from_millis(0),
+            );
+        });
+        for event in &["wheel", "touchstart", "keydown"] {
+            let _ = el.add_event_listener_with_callback(
+                event,
+                input_handler.as_ref().unchecked_ref(),
+            );
+        }
+
+        let element: web_sys::HtmlElement = el.unchecked_into();
+        scroll_listener_slot.update_value(|s| *s = Some(ScrollListenerHolder {
+            element,
+            scroll_handler,
+            input_handler,
+        }));
+    });
+    on_cleanup(move || {
+        scroll_listener_slot.update_value(|s| {
+            if let Some(holder) = s.take() {
+                let _ = holder.element.remove_event_listener_with_callback(
+                    "scroll",
+                    holder.scroll_handler.as_ref().unchecked_ref(),
+                );
+                for event in &["wheel", "touchstart", "keydown"] {
+                    let _ = holder.element.remove_event_listener_with_callback(
+                        event,
+                        holder.input_handler.as_ref().unchecked_ref(),
+                    );
+                }
+                // Closures drop here.
+            }
+        });
+    });
+
+    // Track viewport height via `ResizeObserver` on the scroll container.
+    // The window-bounds Memo needs the live height, not just whatever
+    // happened to be true at first paint. The observer also fires when
+    // the user resizes the window or toggles dock visibility, both of
+    // which affect what's actually visible.
+    type ViewportObserverSlot =
+        Option<(web_sys::ResizeObserver, Closure<dyn FnMut(JsValue, JsValue)>)>;
+    let viewport_observer_slot: StoredValue<ViewportObserverSlot, LocalStorage> =
+        StoredValue::new_local(None);
+    let scroll_ref_for_viewport = scroll_ref;
+    Effect::new(move |_| {
+        let Some(el) = scroll_ref_for_viewport.get() else {
+            return;
+        };
+        if viewport_observer_slot.with_value(|s| s.is_some()) {
+            return;
+        }
+        // Seed the signal eagerly so the first paint gets a real value
+        // rather than the default 800px estimate.
+        viewport_height_sig.set(el.client_height() as f64);
+        let el_clone = el.clone();
+        let cb = Closure::<dyn FnMut(JsValue, JsValue)>::new(
+            move |_entries: JsValue, _: JsValue| {
+                viewport_height_sig.set(el_clone.client_height() as f64);
+            },
+        );
+        if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+            let element: web_sys::Element = el.unchecked_into();
+            observer.observe(&element);
+            viewport_observer_slot.update_value(|s| *s = Some((observer, cb)));
+        }
+    });
+    on_cleanup(move || {
+        viewport_observer_slot.update_value(|s| {
+            if let Some((observer, _cb)) = s.take() {
+                observer.disconnect();
+            }
+        });
+    });
+
+    // Compute the row index window plus top/bottom spacer heights.
+    // Reactive on `chat_rows` (via `row_handles`), scroll position,
+    // viewport height, and `heights_version` (per-row measurements).
+    // Returns indices into the *current* rows Vec.
+    //
+    // Algorithm: walk forward summing per-row heights until we cross
+    // `scroll_top` (first visible) and again until we cross
+    // `scroll_top + viewport` (one past last visible). Apply
+    // `VIRT_OVERSCAN` rows of buffer in each direction so a row at the
+    // edge isn't visibly missing while it's being measured.
+    let visible_window: Memo<VirtualWindow> = Memo::new(move |_| {
+        let _ = heights_version.get();
+        let st = scroll_top_sig.get();
+        let vp = viewport_height_sig.get();
+        let rows = row_handles();
+        let n = rows.len();
+        if n == 0 {
+            return VirtualWindow::EMPTY;
+        }
+        row_heights.with_value(|map| {
+            // `slot_height` includes the top margin that separates this
+            // row from the previous one, so the running sum matches
+            // what the browser actually lays out. The very first row
+            // gets no leading gap.
+            let slot_height = |idx: usize| -> f64 {
+                let raw = map
+                    .get(&rows[idx].id)
+                    .copied()
+                    .unwrap_or(ESTIMATED_ROW_HEIGHT);
+                if idx == 0 { raw } else { raw + ROW_GAP_PX }
+            };
+
+            let mut acc = 0.0_f64;
+            let mut first = 0usize;
+            while first < n {
+                let h = slot_height(first);
+                if acc + h > st {
+                    break;
+                }
+                acc += h;
+                first += 1;
+            }
+            let viewport_end = st + vp;
+            let mut last_excl = first;
+            while last_excl < n {
+                if acc >= viewport_end {
+                    break;
+                }
+                acc += slot_height(last_excl);
+                last_excl += 1;
+            }
+            let start = first.saturating_sub(VIRT_OVERSCAN);
+            let end = (last_excl + VIRT_OVERSCAN).min(n);
+            let top_pad: f64 = (0..start).map(slot_height).sum();
+            let bottom_pad: f64 = (end..n).map(slot_height).sum();
+            VirtualWindow {
+                start,
+                end,
+                top_pad,
+                bottom_pad,
+            }
+        })
     });
 
     // Auto-scroll effect: whenever the message count or streaming text grows,
-    // scroll to bottom (only if the user hasn't scrolled up). Scoped to the
+    // scroll to bottom (only if the user has scrolled up). Scoped to the
     // *length* of messages — not the full Vec — so unrelated chat row
     // updates (e.g. tool_request mutations to existing rows) don't trigger a
     // scroll.
     //
-    // Coalesce multiple deltas-per-frame into a single rAF. The previous
-    // implementation scheduled one rAF per `text`/`reasoning` delta — at
-    // 50+ deltas/sec while the model streams, all of them fired in the
-    // *same* frame and each ran its own scrollHeight read (a forced
-    // layout) plus a scrollTop write. The pending-flag gate caps it to
-    // at most one scroll per frame, which still keeps the bottom
-    // pinned.
+    // Coalesce multiple deltas-per-frame into a single setTimeout. The
+    // previous implementation scheduled one rAF per `text`/`reasoning`
+    // delta — at 50+ deltas/sec while the model streams, all of them
+    // fired in the *same* frame and each ran its own scrollHeight read
+    // (a forced layout) plus a scrollTop write. The pending-flag gate
+    // caps it to at most one scroll per coalesced burst, which still
+    // keeps the bottom pinned.
+    //
+    // Subscribes to `heights_version` so a measurement that grew the last
+    // (visible/streaming) row's height re-pins the bottom. Without that
+    // subscription, sticky-bottom would visibly drift up by the height
+    // delta on every measurement during streaming.
+    //
+    // `user_scrolled_up` is set true only by the user-input listeners
+    // below (wheel/touchstart/keydown). The plain `scroll` event never
+    // touches it, so content growing below the user can't masquerade
+    // as user intent and disable sticky-bottom.
     let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     Effect::new(move |_| {
         let _len = messages_len.get();
+        let _hv = heights_version.get();
         let stream = streaming();
         if let Some(ss) = stream.as_ref() {
             // Subscribe without cloning the strings. `.get()` on
@@ -221,15 +461,33 @@ pub fn ChatView(
         }
         scroll_pending.set(true);
         let pending = scroll_pending.clone();
-        request_animation_frame(move || {
-            pending.set(false);
-            // rAF callback runs outside the reactive tracking context;
-            // `.get_untracked()` reads the NodeRef without registering
-            // a (useless) subscription that Leptos would warn about.
-            if let Some(el) = scroll_ref.get_untracked() {
-                el.set_scroll_top(el.scroll_height());
-            }
-        });
+        // `setTimeout(0)` instead of `requestAnimationFrame`. rAF is
+        // paused for hidden Tauri windows on macOS — a user
+        // backgrounding the app during session restore would leave the
+        // chat stuck wherever it was. setTimeout fires regardless of
+        // window visibility. We still coalesce within a reactive batch
+        // via `scroll_pending`.
+        leptos::prelude::set_timeout(
+            move || {
+                pending.set(false);
+                if let Some(el) = scroll_ref.get_untracked() {
+                    el.set_scroll_top(el.scroll_height());
+                    // Mirror the post-clamp scrollTop into
+                    // `scroll_top_sig` immediately. Without this, the
+                    // windowing Memo only sees the new scroll position
+                    // once the `scroll` event round-trips through the
+                    // listener — leaving a window of one or more frames
+                    // where `scroll_top` is at the bottom but
+                    // `visible_window` still has the old `start = 0`.
+                    // The user would see the scrollbar at the end but
+                    // the rendered rows from index 0, with the
+                    // bottom-pad spacer covering the entire visible
+                    // region.
+                    scroll_top_sig.set(el.scroll_top() as f64);
+                }
+            },
+            std::time::Duration::from_millis(0),
+        );
     });
 
     let scroll_to_bottom = move |_| {
@@ -237,6 +495,11 @@ pub fn ChatView(
         // read on the NodeRef.
         if let Some(el) = scroll_ref.get_untracked() {
             el.set_scroll_top(el.scroll_height());
+            // Same staleness fix as the auto-scroll rAF — keep
+            // `scroll_top_sig` synchronously consistent with the new
+            // scroll position so the windowing Memo recomputes
+            // immediately rather than waiting on the scroll event.
+            scroll_top_sig.set(el.scroll_top() as f64);
             user_scrolled_up.set(false);
             show_scroll_btn.set(false);
         }
@@ -308,13 +571,46 @@ pub fn ChatView(
                             }
                         }}
 
+                        // Windowed history: top spacer + visible rows +
+                        // bottom spacer. The spacers reserve scroll
+                        // geometry for the unrendered rows so the
+                        // scrollbar tracks total estimated height even
+                        // though we only mount what's near the viewport.
+                        // `MeasuredRow` reports each rendered row's
+                        // post-layout height back into `row_heights`,
+                        // which keeps the spacers honest as the user
+                        // scrolls into previously-unmeasured regions.
+                        <div
+                            class="virt-spacer virt-spacer-top"
+                            style=move || {
+                                visible_window
+                                    .with(|w| format!("height: {}px;", w.top_pad))
+                            }
+                        ></div>
                         <For
-                            each=move || row_handles()
+                            each=move || {
+                                let win = visible_window.get();
+                                let rows = row_handles();
+                                let end = win.end.min(rows.len());
+                                let start = win.start.min(end);
+                                rows[start..end].to_vec()
+                            }
                             key=|row| row.id
                             let:row
                         >
-                            <ChatMessageView row=row />
+                            <MeasuredRow
+                                row=row
+                                row_heights=row_heights
+                                heights_version=heights_version
+                            />
                         </For>
+                        <div
+                            class="virt-spacer virt-spacer-bottom"
+                            style=move || {
+                                visible_window
+                                    .with(|w| format!("height: {}px;", w.bottom_pad))
+                            }
+                        ></div>
 
                         // Transient events (retry, cancel) rendered as cards
                         {move || {
@@ -382,6 +678,119 @@ pub fn ChatView(
     }
 }
 
+/// Window descriptor produced by the chat-list virtualizer. `start..end`
+/// is the half-open range of row indices currently mounted; `top_pad`
+/// and `bottom_pad` are the spacer-div heights that reserve scroll
+/// geometry for the unmounted rows above and below. `PartialEq` so the
+/// `Memo` short-circuits when the window doesn't actually change —
+/// avoids triggering downstream re-renders on every signal tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VirtualWindow {
+    start: usize,
+    end: usize,
+    top_pad: f64,
+    bottom_pad: f64,
+}
+
+impl VirtualWindow {
+    const EMPTY: Self = Self {
+        start: 0,
+        end: 0,
+        top_pad: 0.0,
+        bottom_pad: 0.0,
+    };
+}
+
+/// Wraps a `ChatMessageView` with a `ResizeObserver` that records the
+/// row's measured DOM height into `row_heights` and bumps
+/// `heights_version` when the height changes meaningfully (>=0.5px).
+/// The bump triggers `visible_window` to recompute, which keeps the
+/// top/bottom spacers honest as the user scrolls into rows that were
+/// previously estimated.
+///
+/// We hold the observer alive in an `Rc<RefCell<Option<...>>>` and
+/// disconnect it on `on_cleanup` so the GC doesn't collect the closure
+/// while the row is still mounted. Per-row observer cost is bounded
+/// because at most `viewport / min_row_height + 2 * VIRT_OVERSCAN` rows
+/// are mounted at any time.
+#[component]
+fn MeasuredRow(
+    row: ChatRowHandle,
+    row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage>,
+    heights_version: RwSignal<u32>,
+) -> impl IntoView {
+    let row_id = row.id;
+    let node_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+
+    // Observer + closure are !Send/!Sync (web_sys handles wrap raw JS
+    // pointers), so we can't capture them in a `Send + Sync` cleanup
+    // closure directly. `StoredValue::new_local` parks them in
+    // thread-local storage and hands back a `Copy` ID handle that *is*
+    // `Send + Sync`. Both the Effect and `on_cleanup` get their own
+    // handle that points at the same slot.
+    type ObserverPair =
+        Option<(web_sys::ResizeObserver, Closure<dyn FnMut(JsValue, JsValue)>)>;
+    let slot: StoredValue<ObserverPair, LocalStorage> = StoredValue::new_local(None);
+
+    Effect::new(move |_| {
+        let Some(el) = node_ref.get() else {
+            return;
+        };
+        // Observer already wired? Don't double-wrap.
+        let already = slot.with_value(|s| s.is_some());
+        if already {
+            return;
+        }
+        let element: web_sys::Element = el.clone().unchecked_into();
+        let elem_for_cb = element.clone();
+        let cb = Closure::<dyn FnMut(JsValue, JsValue)>::new(
+            move |_entries: JsValue, _: JsValue| {
+                let h = elem_for_cb.get_bounding_client_rect().height();
+                // Inactive tabs in the LRU hot set stay mounted under
+                // `display: none`, where every element measures as 0px.
+                // If we recorded those zeros, switching back to the
+                // hidden tab would compute spacers against rows the
+                // window math thinks have no height — collapsing the
+                // visible window onto rows that are actually below the
+                // viewport. Ignore zero/negative measurements; the next
+                // observer fire after the tab is shown again will
+                // record the real height.
+                if !(h > 0.0) {
+                    return;
+                }
+                let changed = row_heights.with_value(|map| {
+                    let prev = map.get(&row_id).copied();
+                    prev.map_or(true, |p| (p - h).abs() >= 0.5)
+                });
+                if changed {
+                    row_heights.update_value(|map| {
+                        map.insert(row_id, h);
+                    });
+                    heights_version.update(|v| *v = v.wrapping_add(1));
+                }
+            },
+        );
+        if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+            observer.observe(&element);
+            slot.update_value(|s| *s = Some((observer, cb)));
+        }
+    });
+
+    on_cleanup(move || {
+        slot.update_value(|s| {
+            if let Some((observer, _cb)) = s.take() {
+                observer.disconnect();
+            }
+        });
+    });
+
+    view! {
+        <div class="virt-row" node_ref=node_ref>
+            <ChatMessageView row=row />
+        </div>
+    }
+}
+
 /// Cycle button for the global tool-output verbosity setting. Lives on the
 /// chat header next to the backend badge. Reads and writes
 /// `state.tool_output_mode` directly (frontend-local, persisted to
@@ -443,6 +852,22 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    /// Inject the production CSS into the test document so flex/scroll
+    /// layout matches what the user sees. Without this, `.chat-messages`
+    /// has no defined height and viewport-based windowing math runs
+    /// against zero, defeating the test.
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document.get_element_by_id("test-prod-styles-chat").is_none() {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-chat");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+    }
+
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
@@ -458,11 +883,12 @@ mod wasm_tests {
     }
 
     fn message_rows(container: &HtmlElement) -> Vec<Element> {
-        // Each `<ChatMessageView>` renders a top-level `<div class="chat-card ...">`
-        // — match by the stable `chat-card` class to find the rendered rows
-        // independently of the per-sender modifier classes.
+        // Each rendered chat row is wrapped in a `.virt-row` by the
+        // windowed list. The wrapping div is keyed by row id, so its
+        // DOM identity is what survives an append — that's what the
+        // identity assertions below need to look at.
         let nodes = container
-            .query_selector_all(".chat-messages > .chat-card")
+            .query_selector_all(".chat-messages > .virt-row")
             .unwrap();
         (0..nodes.length())
             .filter_map(|i| nodes.item(i)?.dyn_into::<Element>().ok())
@@ -584,6 +1010,81 @@ mod wasm_tests {
                 .contains("fourth"),
             true,
             "newly appended row should display the appended content"
+        );
+    }
+
+    /// With a long transcript the windowed `<For>` should mount only a
+    /// small fraction of the rows. Asserts on what the user *can't*
+    /// perceive: rows whose offsets are far below the viewport never
+    /// hit the DOM, so the bottom spacer reserves their estimated
+    /// height instead. This is the load-bearing assertion for the
+    /// "1600-message chats are slow" fix — if it regresses, every
+    /// future signal touch on the chat will scale linearly with
+    /// transcript length again.
+    #[wasm_bindgen_test]
+    async fn windowed_list_does_not_mount_all_rows_for_long_transcript() {
+        ensure_styles_loaded();
+
+        let agent_id = AgentId("agent-virt".to_owned());
+        let host_id = "host-virt".to_owned();
+        // 200 rows is well above the viewport / overscan budget at any
+        // row height — this confirms windowing engaged, not just that
+        // the test container happened to be too small.
+        let total_rows = 200usize;
+
+        let container = make_container();
+        let agent_id_for_mount = agent_id.clone();
+        let host_id_for_mount = host_id.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_for_mount.clone(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let rows: Vec<ChatRowHandle> = (0..total_rows)
+                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("msg {i}"))))
+                .collect();
+            state.chat_rows.update(|m| {
+                m.insert(agent_id_for_mount.clone(), rows);
+            });
+            provide_context(state);
+            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView agent_ref=agent_ref_signal is_active=is_active_signal /> }
+        });
+
+        next_tick().await;
+        // Second tick lets the viewport ResizeObserver and per-row
+        // ResizeObservers fire so the visible-window Memo recomputes
+        // against measured heights rather than the 200px estimate.
+        next_tick().await;
+
+        let mounted = message_rows(&container);
+        assert!(
+            !mounted.is_empty(),
+            "expected the windowed list to mount at least one row"
+        );
+        assert!(
+            mounted.len() < total_rows,
+            "windowing did not engage: mounted {} of {} rows",
+            mounted.len(),
+            total_rows,
+        );
+
+        // The bottom spacer should reserve nonzero height representing
+        // the unmounted suffix of the transcript. If the spacer is
+        // missing or zero-height, scrollbar geometry no longer
+        // matches reality and the user can't scroll into the
+        // unmounted rows.
+        let spacer = container
+            .query_selector(".virt-spacer-bottom")
+            .unwrap()
+            .expect("bottom spacer must be present in the DOM");
+        let spacer_html: HtmlElement = spacer.dyn_into().unwrap();
+        let height = spacer_html.get_bounding_client_rect().height();
+        assert!(
+            height > 0.0,
+            "bottom spacer must reserve geometry for unmounted rows; got {height}px"
         );
     }
 }

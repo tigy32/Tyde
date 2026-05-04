@@ -61,6 +61,14 @@ pub struct AgentInfo {
 
 // ── Tab system ──────────────────────────────────────────────────────────
 
+/// Maximum number of tab content components mounted at once. The active tab
+/// is always mounted; the rest of the slots hold the most-recently-active
+/// tabs before it (display:none, but state preserved for instant switch
+/// back). Tabs beyond this hot set are fully unmounted — switching back
+/// remounts them from cached AppState (chat_rows, open_files, diff_contents)
+/// so no data is lost, only ephemeral UI state like scroll position.
+pub const TAB_LRU_CAPACITY: usize = 2;
+
 thread_local! {
     static NEXT_TAB_ID: Cell<u64> = const { Cell::new(0) };
 }
@@ -567,6 +575,14 @@ pub struct AppState {
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     pub center_zone: RwSignal<CenterZoneState>,
+    /// Tabs whose content components are currently mounted, MRU-first. The
+    /// active tab is always at the front; the next slot (if any) is the most
+    /// recently active tab before it. Tabs absent from this list have their
+    /// content unmounted entirely — no DOM, no reactive subscriptions. This
+    /// keeps "many tabs open" cheap: we pay for at most `TAB_LRU_CAPACITY`
+    /// component trees regardless of how many tabs the user has opened.
+    /// Driven by an Effect in `App` watching `center_zone.active_tab_id`.
+    pub tab_lru: RwSignal<Vec<TabId>>,
     pub tabs_enabled: RwSignal<bool>,
     pub left_dock: RwSignal<DockVisibility>,
     pub right_dock: RwSignal<DockVisibility>,
@@ -619,7 +635,17 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let center_zone: RwSignal<CenterZoneState> = RwSignal::new(CenterZoneState::default());
+        let initial_center_zone = CenterZoneState::default();
+        // Pre-seed the LRU with the initial active tab so the first
+        // CenterZone render mounts it immediately. Without this seed the
+        // first frame paints with no mounted tab content, then the
+        // tab-LRU Effect in `App` fires and adds the active tab — visible
+        // as a one-frame flash of empty center zone on app boot.
+        let initial_lru: Vec<TabId> = initial_center_zone
+            .active_tab_id
+            .into_iter()
+            .collect();
+        let center_zone: RwSignal<CenterZoneState> = RwSignal::new(initial_center_zone);
         let active_agent: Memo<Option<ActiveAgentRef>> = Memo::new(move |_| {
             center_zone.with(|cz| {
                 cz.active_tab().and_then(|tab| match &tab.content {
@@ -647,6 +673,7 @@ impl AppState {
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
             center_zone,
+            tab_lru: RwSignal::new(initial_lru),
             tabs_enabled: RwSignal::new(true),
             left_dock: RwSignal::new(DockVisibility::Visible),
             right_dock: RwSignal::new(DockVisibility::Visible),
@@ -906,10 +933,16 @@ impl AppState {
         self.active_project.set(next.clone());
 
         // active_agent is a Memo derived from center_zone — restoring center_zone
-        // implicitly restores it.
+        // implicitly restores it. Tab LRU is reset and re-seeded with the
+        // incoming project's active tab so the first render after switch
+        // mounts content (avoids a one-frame empty flash before the Effect
+        // in `App` fires).
         match (next.is_some(), restored) {
             (true, Some(memory)) => {
-                self.center_zone.set(memory.center_zone.unwrap_or_default());
+                let cz = memory.center_zone.unwrap_or_default();
+                self.tab_lru
+                    .set(cz.active_tab_id.into_iter().collect());
+                self.center_zone.set(cz);
                 self.active_terminal.set(memory.active_terminal);
                 self.open_files.set(memory.open_files);
                 self.diff_contents.set(memory.diff_contents);
@@ -921,13 +954,18 @@ impl AppState {
                     "New Chat".to_string(),
                     true,
                 );
+                self.tab_lru
+                    .set(cz.active_tab_id.into_iter().collect());
                 self.center_zone.set(cz);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
                 self.diff_contents.set(HashMap::new());
             }
             (false, _) => {
-                self.center_zone.set(CenterZoneState::default());
+                let cz = CenterZoneState::default();
+                self.tab_lru
+                    .set(cz.active_tab_id.into_iter().collect());
+                self.center_zone.set(cz);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
                 self.diff_contents.set(HashMap::new());
@@ -1078,6 +1116,42 @@ impl AppState {
         });
     }
 
+    /// Insert `id` at the MRU front of `tab_lru`, dedup, truncate to
+    /// `TAB_LRU_CAPACITY`. Called whenever a tab becomes active (via the
+    /// Effect installed in `App` watching `active_tab_id`). Tabs that fall
+    /// off the end of the list have their components unmounted by the
+    /// next `<For>` re-render in `CenterZone`.
+    pub fn bump_tab_lru(&self, id: TabId) {
+        self.tab_lru.update(|lru| {
+            lru.retain(|existing| *existing != id);
+            lru.insert(0, id);
+            if lru.len() > TAB_LRU_CAPACITY {
+                lru.truncate(TAB_LRU_CAPACITY);
+            }
+        });
+    }
+
+    /// Remove `id` from `tab_lru` outright. Called when a tab is closed —
+    /// keeps the LRU from referencing dead tab ids.
+    pub fn forget_tab_lru(&self, id: TabId) {
+        self.tab_lru.update(|lru| {
+            lru.retain(|existing| *existing != id);
+        });
+    }
+
+    /// Drop any LRU entries for tab ids no longer present in `center_zone`.
+    /// Called after bulk-close operations (`close_others`,
+    /// `close_tabs_to_right`, `close_all`) so we don't keep mounting
+    /// references to vanished tabs.
+    pub fn prune_tab_lru(&self) {
+        let live: Vec<TabId> = self
+            .center_zone
+            .with_untracked(|cz| cz.tabs.iter().map(|t| t.id).collect());
+        self.tab_lru.update(|lru| {
+            lru.retain(|id| live.contains(id));
+        });
+    }
+
     pub fn close_tab(&self, id: TabId) {
         let content = self.center_zone.with_untracked(|cz| {
             cz.tabs
@@ -1102,6 +1176,7 @@ impl AppState {
                 _ => {}
             }
         }
+        self.forget_tab_lru(id);
         self.center_zone.update(|cz| cz.close(id));
     }
 
@@ -1143,6 +1218,7 @@ impl AppState {
             }
         }
         self.center_zone.update(|cz| cz.close_others(id));
+        self.prune_tab_lru();
     }
 
     pub fn close_tabs_to_right(&self, id: TabId) {
@@ -1180,6 +1256,7 @@ impl AppState {
             }
         }
         self.center_zone.update(|cz| cz.close_to_right(id));
+        self.prune_tab_lru();
     }
 
     pub fn close_all_tabs(&self) {
@@ -1208,6 +1285,7 @@ impl AppState {
             }
         }
         self.center_zone.update(|cz| cz.close_all());
+        self.prune_tab_lru();
     }
 
     pub fn rename_tab_label(&self, id: TabId, new_label: String) {
@@ -1278,6 +1356,54 @@ mod tests {
         assert_eq!(cz.tabs.len(), 1);
         assert!(matches!(cz.tabs[0].content, TabContent::Home));
         assert_eq!(cz.active_tab_id, Some(home_id));
+    }
+
+    #[test]
+    fn bump_tab_lru_pushes_to_front_dedup_truncate() {
+        let state = AppState::new();
+        let a = next_tab_id();
+        let b = next_tab_id();
+        let c = next_tab_id();
+
+        // Wipe the seed (initial home tab) so the test is deterministic.
+        state.tab_lru.set(Vec::new());
+
+        state.bump_tab_lru(a);
+        state.bump_tab_lru(b);
+        // Capacity is 2 — bumping `c` evicts `a`.
+        state.bump_tab_lru(c);
+        assert_eq!(state.tab_lru.get_untracked(), vec![c, b]);
+
+        // Re-bumping the back-of-LRU tab brings it forward without
+        // changing list length.
+        state.bump_tab_lru(b);
+        assert_eq!(state.tab_lru.get_untracked(), vec![b, c]);
+    }
+
+    #[test]
+    fn forget_tab_lru_drops_only_target() {
+        let state = AppState::new();
+        state.tab_lru.set(Vec::new());
+        let a = next_tab_id();
+        let b = next_tab_id();
+        state.bump_tab_lru(a);
+        state.bump_tab_lru(b);
+        state.forget_tab_lru(a);
+        assert_eq!(state.tab_lru.get_untracked(), vec![b]);
+    }
+
+    #[test]
+    fn prune_tab_lru_drops_ids_not_in_center_zone() {
+        let state = AppState::new();
+        let live_id = state
+            .center_zone
+            .with_untracked(|cz| cz.active_tab_id)
+            .expect("default home tab is active");
+        let stale = next_tab_id();
+        // Manually insert a stale id alongside the live one.
+        state.tab_lru.set(vec![live_id, stale]);
+        state.prune_tab_lru();
+        assert_eq!(state.tab_lru.get_untracked(), vec![live_id]);
     }
 
     #[test]

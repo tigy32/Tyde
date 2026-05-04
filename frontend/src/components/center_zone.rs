@@ -543,6 +543,34 @@ pub fn CenterZone() -> impl IntoView {
             .with(|cz| cz.tabs.iter().map(|t| t.id).collect::<Vec<_>>())
     };
 
+    // Tabs whose content components should currently exist in the DOM:
+    // the active tab plus up to `TAB_LRU_CAPACITY - 1` recently-active
+    // tabs. Other tabs still appear in the strip but their content is
+    // unmounted — switching to one remounts it from cached AppState
+    // (`chat_rows`, `open_files`, `diff_contents`) so no data is lost,
+    // only ephemeral UI state like scroll offset.
+    //
+    // We include the current `active_tab_id` unconditionally even when
+    // it's not yet in `tab_lru`. The LRU-bumping Effect in `App` runs
+    // *after* the synchronous `center_zone.update` that switched the
+    // active tab — without this safety net there's a one-frame window
+    // where the new active tab isn't in the LRU and so doesn't render,
+    // visible to the user as a flash of empty center zone on every tab
+    // switch.
+    let mounted_tab_ids = move || {
+        let lru = state.tab_lru.get();
+        // Filter to keep `cz.tabs` order — a stable order avoids surprising
+        // `<For>` keyed-diff thrash when the LRU MRU-front churns.
+        state.center_zone.with(|cz| {
+            let active = cz.active_tab_id;
+            cz.tabs
+                .iter()
+                .filter(|t| Some(t.id) == active || lru.contains(&t.id))
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        })
+    };
+
     let tab_bar_class = move || {
         if state.tabs_enabled.get() {
             "tab-bar"
@@ -619,7 +647,7 @@ pub fn CenterZone() -> impl IntoView {
             </div>
             <div class="center-content">
                 <For
-                    each=move || tab_ids()
+                    each=move || mounted_tab_ids()
                     key=|id| *id
                     let:tab_id
                 >

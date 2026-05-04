@@ -16,7 +16,7 @@ use crate::components::workbench::Workbench;
 use crate::devtools;
 use crate::dispatch::dispatch_envelope;
 use crate::send::send_frame;
-use crate::state::{AppState, ConnectionStatus};
+use crate::state::{AppState, ConnectionStatus, TabId};
 
 use protocol::{
     Envelope, FrameKind, HelloPayload, PROTOCOL_VERSION, ProjectPath, ProjectRootPath, StreamPath,
@@ -472,6 +472,31 @@ pub fn App() -> impl IntoView {
                 }
             }
         });
+    });
+
+    // Tab LRU tracker. Whenever the active tab changes, push it to the front
+    // of `tab_lru`. Any tab that falls outside `TAB_LRU_CAPACITY` will
+    // unmount on the next `<For>` re-render in `CenterZone`. This is the
+    // mechanism that keeps "many tabs open" cheap: only the active tab plus
+    // a small hot set has live components, regardless of how many tabs the
+    // user has on the strip.
+    //
+    // Implemented as a `Memo` so the Effect only re-fires when the active
+    // tab id actually changes — not on every unrelated `center_zone`
+    // mutation (rename, replace_active payload upgrade, etc.). Without
+    // this gate, every tab-strip rename would re-touch `tab_lru` and
+    // cascade-rerender every TabMount that subscribes to it.
+    let state_for_lru_memo = state.clone();
+    let active_tab_memo: Memo<Option<TabId>> = Memo::new(move |_| {
+        state_for_lru_memo
+            .center_zone
+            .with(|cz| cz.active_tab_id)
+    });
+    let state_for_lru = state.clone();
+    Effect::new(move |_| {
+        if let Some(active) = active_tab_memo.get() {
+            state_for_lru.bump_tab_lru(active);
+        }
     });
 
     let state_for_keys = state.clone();
