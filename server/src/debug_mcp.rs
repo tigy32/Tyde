@@ -258,7 +258,7 @@ pub fn start_server(bind_addr: Option<SocketAddr>) -> Result<DebugMcpHandle, Str
                         move || Ok(TydeDebugMcpServer::new(Arc::clone(&state))),
                         Default::default(),
                         StreamableHttpServerConfig {
-                            stateful_mode: true,
+                            stateful_mode: false,
                             sse_keep_alive: None,
                             ..Default::default()
                         },
