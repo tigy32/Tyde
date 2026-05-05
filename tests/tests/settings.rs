@@ -51,11 +51,11 @@ fn write_fake_tycode_binary(home: &Path) -> PathBuf {
     let path = home
         .join(".tyde")
         .join("tycode")
-        .join("0.7.6")
+        .join("0.7.7")
         .join("tycode-subprocess");
     std::fs::create_dir_all(path.parent().expect("fake Tycode parent"))
         .expect("create fake Tycode install dir");
-    std::fs::write(&path, "#!/bin/sh\nprintf 'tycode-subprocess 0.7.6\\n'\n")
+    std::fs::write(&path, "#!/bin/sh\nprintf 'tycode-subprocess 0.7.7\\n'\n")
         .expect("write fake Tycode binary");
     #[cfg(unix)]
     {
@@ -249,7 +249,7 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     assert_eq!(tycode.status, BackendSetupStatus::Installed);
     assert_eq!(
         tycode.installed_version.as_deref(),
-        Some("tycode-subprocess 0.7.6")
+        Some("tycode-subprocess 0.7.7")
     );
     assert!(tycode.sign_in_command.is_none());
 
