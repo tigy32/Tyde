@@ -23,7 +23,13 @@ pub async fn run_connection(
     let (output_tx, mut output_rx) = mpsc::channel::<Envelope>(AGENT_OUTPUT_BUFFER);
     let host_output_stream = Stream::new(host_stream.clone(), output_tx);
 
-    host.register_host_stream(host_output_stream.clone()).await;
+    let deferred_attachments = host.register_host_stream(host_output_stream.clone()).await;
+
+    tokio::spawn(async move {
+        for (agent_handle, stream) in deferred_attachments {
+            agent_handle.attach(stream).await;
+        }
+    });
 
     let result = async {
         loop {

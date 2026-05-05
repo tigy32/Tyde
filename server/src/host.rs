@@ -178,7 +178,10 @@ impl SubAgentEmitter for HostSubAgentEmitter {
 }
 
 impl HostHandle {
-    pub(crate) async fn register_host_stream(&self, host_stream: Stream) {
+    pub(crate) async fn register_host_stream(
+        &self,
+        host_stream: Stream,
+    ) -> Vec<(AgentHandle, Stream)> {
         let backend_setup = setup::collect_backend_setup().await;
         let mut state = self.state.lock().await;
         let host_path = host_stream.path().clone();
@@ -216,21 +219,21 @@ impl HostHandle {
             .is_err()
         {
             state.host_streams.remove(&host_path);
-            return;
+            return Vec::new();
         }
         if emit_session_schemas_for_subscriber(&schemas, subscriber)
             .await
             .is_err()
         {
             state.host_streams.remove(&host_path);
-            return;
+            return Vec::new();
         }
         if emit_backend_setup_for_subscriber(&backend_setup, subscriber)
             .await
             .is_err()
         {
             state.host_streams.remove(&host_path);
-            return;
+            return Vec::new();
         }
 
         let projects = state
@@ -258,7 +261,7 @@ impl HostHandle {
             .is_err()
             {
                 state.host_streams.remove(&host_path);
-                return;
+                return Vec::new();
             }
         }
         for project_id in project_ids {
@@ -297,7 +300,7 @@ impl HostHandle {
             .is_err()
             {
                 state.host_streams.remove(&host_path);
-                return;
+                return Vec::new();
             }
         }
 
@@ -334,7 +337,7 @@ impl HostHandle {
                 .is_err()
             {
                 state.host_streams.remove(&host_path);
-                return;
+                return Vec::new();
             }
         }
 
@@ -359,7 +362,7 @@ impl HostHandle {
             .is_err()
             {
                 state.host_streams.remove(&host_path);
-                return;
+                return Vec::new();
             }
         }
 
@@ -386,11 +389,12 @@ impl HostHandle {
             .is_err()
             {
                 state.host_streams.remove(&host_path);
-                return;
+                return Vec::new();
             }
         }
 
         let agent_ids = state.registry.agent_ids();
+        let mut deferred_attachments = Vec::new();
         for agent_id in agent_ids {
             let agent_handle = state.registry.agent_handle(&agent_id).unwrap_or_else(|| {
                 panic!(
@@ -410,19 +414,39 @@ impl HostHandle {
                     host_path
                 );
             };
-            if emit_new_agent_for_stream(&start, &agent_handle, &subscriber.stream)
+            let instance_stream = new_instance_stream(&start.agent_id);
+            let new_agent = NewAgentPayload {
+                agent_id: start.agent_id.clone(),
+                name: start.name.clone(),
+                origin: start.origin,
+                backend_kind: start.backend_kind,
+                workspace_roots: start.workspace_roots.clone(),
+                custom_agent_id: start.custom_agent_id.clone(),
+                project_id: start.project_id.clone(),
+                parent_agent_id: start.parent_agent_id.clone(),
+                created_at_ms: start.created_at_ms,
+                instance_stream: instance_stream.clone(),
+            };
+            let payload = serde_json::to_value(&new_agent)
+                .expect("failed to serialize NewAgent payload for host stream fanout");
+            if subscriber
+                .stream
+                .send_value(FrameKind::NewAgent, payload)
                 .await
                 .is_err()
             {
                 state.host_streams.remove(&host_path);
-                return;
+                return Vec::new();
             }
+            let agent_stream = subscriber.stream.with_path(instance_stream);
+            deferred_attachments.push((agent_handle, agent_stream));
         }
 
         drop(state);
         if refresh_kiro_schema {
             self.schedule_session_schema_refresh();
         }
+        deferred_attachments
     }
 
     pub(crate) async fn unregister_host_stream(&self, path: &StreamPath) {
