@@ -4611,6 +4611,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -5371,6 +5372,7 @@ dependencies = [
  "core-foundation-sys",
  "devtools-protocol",
  "host-config",
+ "libc",
  "protocol",
  "reqwest 0.12.28",
  "serde",
@@ -5380,6 +5382,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
