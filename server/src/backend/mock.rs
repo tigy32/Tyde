@@ -15,8 +15,6 @@ use super::empty_session_settings_schema;
 use super::{Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpTransport};
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
-const INPUT_BUFFER: usize = 64;
-const EVENT_BUFFER: usize = 256;
 const MOCK_MODEL: &str = "mock";
 const FORCE_SPAWN_FAILURE_SENTINEL: &str = "__mock_fail_spawn__";
 const SPAWN_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
@@ -56,7 +54,7 @@ fn session_store() -> &'static Mutex<HashMap<String, MockSessionRecord>> {
 }
 
 pub struct MockBackend {
-    command_tx: mpsc::Sender<MockCommand>,
+    command_tx: mpsc::UnboundedSender<MockCommand>,
     session_id: SessionId,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
 }
@@ -122,8 +120,8 @@ impl Backend for MockBackend {
             );
         }
 
-        let (command_tx, mut command_rx) = mpsc::channel::<MockCommand>(INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<MockCommand>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
@@ -133,7 +131,7 @@ impl Backend for MockBackend {
                 // Send TypingStatusChanged(true) so the actor sets in_turn=true,
                 // then sleep to give tests time to queue messages, then return so
                 // that events_tx is dropped and the actor detects termination.
-                let _ = events_tx.send(ChatEvent::TypingStatusChanged(true)).await;
+                let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
                 sleep(Duration::from_millis(MOCK_DIE_SLEEP_MS)).await;
                 return;
             }
@@ -222,8 +220,8 @@ impl Backend for MockBackend {
             record.updated_at_ms = now_ms();
         }
 
-        let (command_tx, mut command_rx) = mpsc::channel::<MockCommand>(INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<MockCommand>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
@@ -297,12 +295,11 @@ impl Backend for MockBackend {
     async fn send(&self, input: AgentInput) -> bool {
         self.command_tx
             .send(MockCommand::Input(input))
-            .await
             .is_ok()
     }
 
     async fn interrupt(&self) -> bool {
-        self.command_tx.send(MockCommand::Interrupt).await.is_ok()
+        self.command_tx.send(MockCommand::Interrupt).is_ok()
     }
 
     async fn shutdown(self) {
@@ -322,7 +319,7 @@ fn record_prompt(session_id: &SessionId, prompt: &str) {
 }
 
 async fn emit_turn(
-    events_tx: &mpsc::Sender<ChatEvent>,
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_id: &SessionId,
     user_message: &str,
 ) -> bool {
@@ -334,7 +331,6 @@ async fn emit_turn(
 
     if events_tx
         .send(ChatEvent::TypingStatusChanged(true))
-        .await
         .is_err()
     {
         return false;
@@ -345,14 +341,12 @@ async fn emit_turn(
             .send(ChatEvent::OperationCancelled(OperationCancelledData {
                 message: format!("mock backend cancelled: {user_message}"),
             }))
-            .await
             .is_err()
         {
             return false;
         }
         return events_tx
             .send(ChatEvent::TypingStatusChanged(false))
-            .await
             .is_ok();
     }
 
@@ -369,7 +363,6 @@ async fn emit_turn(
                 context_breakdown: None,
                 images: None,
             }))
-            .await
             .is_err()
         {
             return false;
@@ -393,7 +386,6 @@ async fn emit_turn(
                     images: None,
                 },
             }))
-            .await
             .is_err()
         {
             return false;
@@ -401,7 +393,6 @@ async fn emit_turn(
 
         return events_tx
             .send(ChatEvent::TypingStatusChanged(false))
-            .await
             .is_ok();
     }
 
@@ -411,7 +402,6 @@ async fn emit_turn(
             agent: "mock".to_owned(),
             model: Some(MOCK_MODEL.to_owned()),
         }))
-        .await
         .is_err()
     {
         return false;
@@ -422,7 +412,6 @@ async fn emit_turn(
             message_id: message_id.clone(),
             text: response_text.clone(),
         }))
-        .await
         .is_err()
     {
         return false;
@@ -453,7 +442,6 @@ async fn emit_turn(
 
     if events_tx
         .send(ChatEvent::StreamEnd(StreamEndData { message }))
-        .await
         .is_err()
     {
         return false;
@@ -467,7 +455,6 @@ async fn emit_turn(
 
     events_tx
         .send(ChatEvent::TypingStatusChanged(false))
-        .await
         .is_ok()
 }
 

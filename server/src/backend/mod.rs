@@ -123,11 +123,11 @@ pub struct BackendSpawnConfig {
 /// The agent actor reads from this while independently sending AgentInput
 /// through the Backend handle — true duplex.
 pub struct EventStream {
-    rx: mpsc::Receiver<ChatEvent>,
+    rx: mpsc::UnboundedReceiver<ChatEvent>,
 }
 
 impl EventStream {
-    pub fn new(rx: mpsc::Receiver<ChatEvent>) -> Self {
+    pub fn new(rx: mpsc::UnboundedReceiver<ChatEvent>) -> Self {
         Self { rx }
     }
 

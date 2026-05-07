@@ -4537,12 +4537,10 @@ use super::{
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
-const BACKEND_INPUT_BUFFER: usize = 64;
-const BACKEND_EVENT_BUFFER: usize = 256;
 
 pub struct CodexBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-    interrupt_tx: mpsc::Sender<()>,
+    input_tx: mpsc::UnboundedSender<AgentInput>,
+    interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
 }
@@ -4746,9 +4744,9 @@ impl Backend for CodexBackend {
             workspace_roots
         };
         let cwd = pick_workspace_root(&roots)?;
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (subagent_emitter_tx, _subagent_emitter_rx) =
@@ -4994,7 +4992,6 @@ impl Backend for CodexBackend {
                     initial_message.clone(),
                     initial_images.clone(),
                 ))
-                .await
                 .is_err()
             {
                 if let Some(tx) = ready_tx.take() {
@@ -5090,8 +5087,7 @@ impl Backend for CodexBackend {
                                 completed_item_types.clear();
                                 if !typing_status_active {
                                     let _ = events_tx
-                                        .send(ChatEvent::TypingStatusChanged(true))
-                                        .await;
+                                        .send(ChatEvent::TypingStatusChanged(true));
                                     typing_status_active = true;
                                 }
                                 let _ = events_tx
@@ -5099,8 +5095,7 @@ impl Backend for CodexBackend {
                                         message_id: Some(turn_id),
                                         agent: CODEX_AGENT_NAME.to_owned(),
                                         model: Some(model_name.clone()),
-                                    }))
-                                    .await;
+                                    }));
                             }
                             "item/agentMessage/delta" => {
                                 let delta = params
@@ -5125,8 +5120,7 @@ impl Backend for CodexBackend {
                                     accumulated_text.clear();
                                     if !typing_status_active {
                                         let _ = events_tx
-                                            .send(ChatEvent::TypingStatusChanged(true))
-                                            .await;
+                                            .send(ChatEvent::TypingStatusChanged(true));
                                         typing_status_active = true;
                                     }
                                     let _ = events_tx
@@ -5134,16 +5128,14 @@ impl Backend for CodexBackend {
                                             message_id: Some(start_message_id),
                                             agent: CODEX_AGENT_NAME.to_owned(),
                                             model: Some(model_name.clone()),
-                                        }))
-                                        .await;
+                                        }));
                                 }
                                 accumulated_text.push_str(&delta);
                                 let _ = events_tx
                                     .send(ChatEvent::StreamDelta(StreamTextDeltaData {
                                         message_id: msg_id,
                                         text: delta,
-                                    }))
-                                    .await;
+                                    }));
                             }
                             "item/completed" => {
                                 let item_type = params
@@ -5201,8 +5193,7 @@ impl Backend for CodexBackend {
                                                         message_id: Some(start_message_id),
                                                         agent: CODEX_AGENT_NAME.to_owned(),
                                                         model: Some(model_name.clone()),
-                                                    }))
-                                                    .await;
+                                                    }));
                                             }
                                             CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
                                         }
@@ -5229,8 +5220,7 @@ impl Backend for CodexBackend {
                                             images: None,
                                         };
                                         let _ = events_tx
-                                            .send(ChatEvent::StreamEnd(StreamEndData { message }))
-                                            .await;
+                                            .send(ChatEvent::StreamEnd(StreamEndData { message }));
                                         current_message_id = None;
                                         stream_closed_by_turn_completion = false;
                                     }
@@ -5263,8 +5253,7 @@ impl Backend for CodexBackend {
                                                         ))
                                                     },
                                                 },
-                                            ))
-                                            .await;
+                                            ));
                                     }
                                     "fileChange" => {
                                         let file_changes = parse_codex_file_changes(&item);
@@ -5301,8 +5290,7 @@ impl Backend for CodexBackend {
                                                                 )
                                                             },
                                                         },
-                                                    ))
-                                                    .await;
+                                                    ));
                                             }
                                         }
                                     }
@@ -5332,8 +5320,7 @@ impl Backend for CodexBackend {
                                                         Some(format!("{tool_name} failed"))
                                                     },
                                                 },
-                                            ))
-                                            .await;
+                                            ));
                                     }
                                     _ => {}
                                 }
@@ -5372,8 +5359,7 @@ impl Backend for CodexBackend {
                                                     command,
                                                     working_directory: cwd,
                                                 },
-                                            }))
-                                            .await;
+                                            }));
                                     }
                                     "fileChange" => {
                                         let file_changes = parse_codex_file_changes(&item);
@@ -5402,8 +5388,7 @@ impl Backend for CodexBackend {
                                                         before: change.before,
                                                         after: change.after,
                                                     },
-                                                }))
-                                                .await;
+                                                }));
                                         }
                                     }
                                     "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
@@ -5418,8 +5403,7 @@ impl Backend for CodexBackend {
                                                 tool_call_id: item_id,
                                                 tool_name,
                                                 tool_type: ToolRequestType::Other { args: item },
-                                            }))
-                                            .await;
+                                            }));
                                     }
                                     _ => {}
                                 }
@@ -5481,8 +5465,7 @@ impl Backend for CodexBackend {
                                             images: None,
                                         };
                                         let _ = events_tx
-                                            .send(ChatEvent::StreamEnd(StreamEndData { message }))
-                                            .await;
+                                            .send(ChatEvent::StreamEnd(StreamEndData { message }));
                                         stream_closed_by_turn_completion = true;
                                     }
                                     current_message_id = None;
@@ -5493,16 +5476,14 @@ impl Backend for CodexBackend {
                                             protocol::OperationCancelledData {
                                                 message: "Operation cancelled".to_string(),
                                             },
-                                        ))
-                                        .await;
+                                        ));
                                 }
                                 if let Some(message) = turn_error_message {
-                                    let _ = events_tx.send(backend_error_message(message)).await;
+                                    let _ = events_tx.send(backend_error_message(message));
                                 }
                                 if typing_status_active {
                                     let _ = events_tx
-                                        .send(ChatEvent::TypingStatusChanged(false))
-                                        .await;
+                                        .send(ChatEvent::TypingStatusChanged(false));
                                     typing_status_active = false;
                                 }
                             }
@@ -5519,7 +5500,6 @@ impl Backend for CodexBackend {
                                 let images = protocol_images_to_attachments(payload.images);
                                 if events_tx
                                     .send(backend_user_message(visible_message, visible_images))
-                                    .await
                                     .is_err()
                                 {
                                     break;
@@ -5633,9 +5613,9 @@ impl Backend for CodexBackend {
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let (subagent_emitter_tx, _subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
@@ -5711,7 +5691,7 @@ impl Backend for CodexBackend {
                             break;
                         };
                         if let Some(event) = raw_chat_event(&raw)
-                            && events_tx.send(event).await.is_err() {
+                            && events_tx.send(event).is_err() {
                                 break;
                             }
                     }
@@ -5791,11 +5771,11 @@ impl Backend for CodexBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).await.is_ok()
+        self.input_tx.send(input).is_ok()
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).await.is_ok()
+        self.interrupt_tx.send(()).is_ok()
     }
 
     async fn shutdown(self) {

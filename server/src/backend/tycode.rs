@@ -21,17 +21,15 @@ use super::{
 };
 use crate::process_env;
 
-const BACKEND_INPUT_BUFFER: usize = 64;
-const BACKEND_EVENT_BUFFER: usize = 256;
 
 fn subprocess_bin() -> Result<String, String> {
     resolve_tycode_binary_path().ok_or_else(|| "tycode-subprocess not found".to_string())
 }
 
 pub struct TycodeBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-    interrupt_tx: mpsc::Sender<()>,
-    shutdown_tx: mpsc::Sender<()>,
+    input_tx: mpsc::UnboundedSender<AgentInput>,
+    interrupt_tx: mpsc::UnboundedSender<()>,
+    shutdown_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
@@ -111,10 +109,10 @@ impl Backend for TycodeBackend {
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let workspace_roots = if workspace_roots.is_empty() {
             vec!["/tmp".to_string()]
         } else {
@@ -200,7 +198,7 @@ impl Backend for TycodeBackend {
 
             // Spawn a task to forward follow-up messages to stdin
             let (stdin_tx, mut stdin_rx) =
-                mpsc::channel::<TycodeStdinCommand>(BACKEND_INPUT_BUFFER);
+                mpsc::unbounded_channel::<TycodeStdinCommand>();
             tokio::spawn(async move {
                 let mut stdin = stdin;
                 while let Some(command) = stdin_rx.recv().await {
@@ -220,7 +218,6 @@ impl Backend for TycodeBackend {
                 .send(TycodeStdinCommand::Json(
                     serde_json::json!({ "UserInput": initial_message }),
                 ))
-                .await
                 .is_err()
             {
                 let _ = ready_tx.send(Err("Tycode stdin writer closed during spawn".to_string()));
@@ -238,7 +235,6 @@ impl Backend for TycodeBackend {
                                 .send(TycodeStdinCommand::Json(
                                     serde_json::json!({ "UserInput": message }),
                                 ))
-                                .await
                                 .is_err()
                             {
                                 break;
@@ -261,7 +257,6 @@ impl Backend for TycodeBackend {
                 while interrupt_rx.recv().await.is_some() {
                     if stdin_tx_interrupt
                         .send(TycodeStdinCommand::Cancel)
-                        .await
                         .is_err()
                     {
                         break;
@@ -323,7 +318,7 @@ impl Backend for TycodeBackend {
 
                 for event in events {
                     update_tycode_stream_state(&event, &mut stream_open, &mut accumulated_text);
-                    if events_tx.send(event).await.is_err() {
+                    if events_tx.send(event).is_err() {
                         break;
                     }
                     if events_tx.is_closed() {
@@ -350,8 +345,7 @@ impl Backend for TycodeBackend {
                             context_breakdown: None,
                             images: None,
                         },
-                    }))
-                    .await;
+                    }));
             }
 
             if let Some(ready_tx) = ready_tx.take() {
@@ -381,10 +375,10 @@ impl Backend for TycodeBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let workspace_roots = if workspace_roots.is_empty() {
             vec!["/tmp".to_string()]
         } else {
@@ -458,7 +452,7 @@ impl Backend for TycodeBackend {
             let _last_stderr_line = spawn_tycode_stderr_logger(stderr);
 
             let (stdin_tx, mut stdin_rx) =
-                mpsc::channel::<TycodeStdinCommand>(BACKEND_INPUT_BUFFER);
+                mpsc::unbounded_channel::<TycodeStdinCommand>();
             tokio::spawn(async move {
                 let mut stdin = stdin;
                 while let Some(command) = stdin_rx.recv().await {
@@ -478,7 +472,6 @@ impl Backend for TycodeBackend {
                 .send(TycodeStdinCommand::Json(serde_json::json!({
                     "ResumeSession": { "session_id": session_id.0 }
                 })))
-                .await
                 .is_err()
             {
                 return;
@@ -494,7 +487,6 @@ impl Backend for TycodeBackend {
                                 .send(TycodeStdinCommand::Json(
                                     serde_json::json!({ "UserInput": message }),
                                 ))
-                                .await
                                 .is_err()
                             {
                                 break;
@@ -517,7 +509,6 @@ impl Backend for TycodeBackend {
                 while interrupt_rx.recv().await.is_some() {
                     if stdin_tx_interrupt
                         .send(TycodeStdinCommand::Cancel)
-                        .await
                         .is_err()
                     {
                         break;
@@ -563,7 +554,7 @@ impl Backend for TycodeBackend {
 
                 for event in events {
                     update_tycode_stream_state(&event, &mut stream_open, &mut accumulated_text);
-                    if events_tx.send(event).await.is_err() {
+                    if events_tx.send(event).is_err() {
                         break;
                     }
                 }
@@ -585,8 +576,7 @@ impl Backend for TycodeBackend {
                             context_breakdown: None,
                             images: None,
                         },
-                    }))
-                    .await;
+                    }));
             }
         });
 
@@ -614,15 +604,15 @@ impl Backend for TycodeBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).await.is_ok()
+        self.input_tx.send(input).is_ok()
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).await.is_ok()
+        self.interrupt_tx.send(()).is_ok()
     }
 
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(()).await;
+        let _ = self.shutdown_tx.send(());
     }
 }
 

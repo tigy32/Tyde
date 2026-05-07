@@ -1590,14 +1590,13 @@ use super::{
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
-const EVENT_BUFFER: usize = 256;
 const GEMINI_SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
 
 type GeminiReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<SessionId, String>>>>>;
 
 pub struct GeminiBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-    interrupt_tx: mpsc::Sender<()>,
+    input_tx: mpsc::UnboundedSender<AgentInput>,
+    interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
@@ -1647,12 +1646,12 @@ fn backend_error_message(content: String) -> ChatEvent {
 
 async fn forward_gemini_backend_event(
     raw: Value,
-    events_tx: &mpsc::Sender<ChatEvent>,
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_id_sink: &Arc<std::sync::Mutex<Option<SessionId>>>,
     ready_tx: Option<&GeminiReadyTx>,
 ) -> bool {
     if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
-        return events_tx.send(event).await.is_ok();
+        return events_tx.send(event).is_ok();
     }
 
     match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
@@ -1692,7 +1691,6 @@ async fn forward_gemini_backend_event(
             }
             if events_tx
                 .send(backend_error_message(message.clone()))
-                .await
                 .is_err()
             {
                 return false;
@@ -1727,9 +1725,9 @@ impl Backend for GeminiBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(EVENT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(EVENT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
@@ -1881,14 +1879,12 @@ impl Backend for GeminiBackend {
                                     message: "Gemini turn cancelled.".to_string(),
                                 },
                             ))
-                            .await
                             .is_err()
                         {
                             break;
                         }
                         if events_tx
                             .send(ChatEvent::TypingStatusChanged(false))
-                            .await
                             .is_err()
                         {
                             break;
@@ -1927,9 +1923,9 @@ impl Backend for GeminiBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(EVENT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(EVENT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let roots = if workspace_roots.is_empty() {
             vec!["/tmp".to_string()]
         } else {
@@ -2054,14 +2050,12 @@ impl Backend for GeminiBackend {
                                     message: "Gemini turn cancelled.".to_string(),
                                 },
                             ))
-                            .await
                             .is_err()
                         {
                             break;
                         }
                         if events_tx
                             .send(ChatEvent::TypingStatusChanged(false))
-                            .await
                             .is_err()
                         {
                             break;
@@ -2088,7 +2082,7 @@ impl Backend for GeminiBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).await.is_ok()
+        self.input_tx.send(input).is_ok()
     }
 
     fn session_id(&self) -> SessionId {
@@ -2100,7 +2094,7 @@ impl Backend for GeminiBackend {
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).await.is_ok()
+        self.interrupt_tx.send(()).is_ok()
     }
 
     async fn shutdown(self) {

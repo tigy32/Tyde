@@ -56,7 +56,7 @@ pub(crate) struct ProjectStreamSubscription {
 
 #[derive(Clone)]
 pub(crate) struct ProjectStreamHandle {
-    tx: mpsc::Sender<ProjectStreamCommand>,
+    tx: mpsc::UnboundedSender<ProjectStreamCommand>,
 }
 
 enum ProjectStreamCommand {
@@ -113,7 +113,6 @@ impl ProjectStreamHandle {
                 stream,
                 reply,
             })
-            .await
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         response
             .await
@@ -123,15 +122,13 @@ impl ProjectStreamHandle {
     pub(crate) async fn remove_subscriber(&self, host_path: StreamPath) {
         let _ = self
             .tx
-            .send(ProjectStreamCommand::RemoveSubscriber { host_path })
-            .await;
+            .send(ProjectStreamCommand::RemoveSubscriber { host_path });
     }
 
     pub(crate) async fn refresh(&self) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ProjectStreamCommand::Refresh { reply })
-            .await
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         response
             .await
@@ -152,7 +149,6 @@ impl ProjectStreamHandle {
                 context_mode,
                 reply,
             })
-            .await
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         response
             .await
@@ -169,7 +165,7 @@ pub(crate) async fn spawn_project_subscription(
     let watcher = create_project_watcher(&project, watch_tx.clone())?;
     let watched_roots = project.roots.clone();
     let snapshot = initialize_snapshot(&project)?;
-    let (command_tx, command_rx) = mpsc::channel(16);
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = ProjectStreamHandle { tx: command_tx };
 
     let task = tokio::spawn(async move {
@@ -242,7 +238,7 @@ async fn run_project_subscription(
     mut watched_roots: Vec<String>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
-    mut command_rx: mpsc::Receiver<ProjectStreamCommand>,
+    mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
 ) {
     let mut subscribers = HashMap::<StreamPath, Stream>::new();
     let mut pending_update = PendingProjectUpdate::default();
@@ -537,7 +533,6 @@ async fn emit_snapshot_to_stream(
     };
     stream
         .send_value(FrameKind::ProjectGitStatus, git_status)
-        .await
         .map_err(|_| "project stream closed".to_owned())
 }
 
@@ -559,7 +554,7 @@ async fn fan_out_value(
 ) {
     let mut dead = Vec::new();
     for (host_path, stream) in subscribers.iter() {
-        if stream.send_value(kind, payload.clone()).await.is_err() {
+        if stream.send_value(kind, payload.clone()).is_err() {
             dead.push(host_path.clone());
         }
     }
@@ -631,7 +626,6 @@ async fn send_payload<T: serde::Serialize>(
         .map_err(|error| format!("failed to serialize {kind} payload: {error}"))?;
     stream
         .send_value(kind, payload)
-        .await
         .map_err(|_| "project stream closed".to_owned())
 }
 
@@ -671,7 +665,7 @@ async fn emit_project_command_error(
     };
     match serde_json::to_value(payload) {
         Ok(payload) => {
-            let _ = stream.send_value(FrameKind::CommandError, payload).await;
+            let _ = stream.send_value(FrameKind::CommandError, payload);
         }
         Err(error) => {
             tracing::warn!(

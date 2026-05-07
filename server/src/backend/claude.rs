@@ -5096,18 +5096,16 @@ use super::{
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
-const BACKEND_EVENT_BUFFER: usize = 256;
-const BACKEND_INPUT_BUFFER: usize = 64;
 
 type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 /// Minimal Backend-trait handle for the Claude CLI.
 ///
-/// Holds an `mpsc::Sender<AgentInput>` that the spawned task reads from;
+/// Holds an `mpsc::UnboundedSender<AgentInput>` that the spawned task reads from;
 /// the task writes stdin of the child process accordingly.
 pub struct ClaudeBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-    interrupt_tx: mpsc::Sender<()>,
+    input_tx: mpsc::UnboundedSender<AgentInput>,
+    interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
 }
@@ -5133,9 +5131,9 @@ impl ClaudeBackend {
         initial_input: protocol::SendMessagePayload,
         initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (subagent_emitter_tx, mut subagent_emitter_rx) = watch::channel(initial_emitter);
@@ -5459,12 +5457,12 @@ fn spawn_claude_subagent_event_bridge(
 
 async fn forward_claude_backend_event(
     raw: Value,
-    events_tx: &mpsc::Sender<ChatEvent>,
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_id_sink: &Arc<std::sync::Mutex<Option<SessionId>>>,
     ready_tx: Option<&ClaudeReadyTx>,
 ) -> bool {
     if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
-        return events_tx.send(event).await.is_ok();
+        return events_tx.send(event).is_ok();
     }
 
     match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
@@ -5498,7 +5496,6 @@ async fn forward_claude_backend_event(
             }
             if events_tx
                 .send(backend_error_message(message.clone()))
-                .await
                 .is_err()
             {
                 return false;
@@ -5584,9 +5581,9 @@ impl Backend for ClaudeBackend {
         config: BackendSpawnConfig,
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
@@ -5759,11 +5756,11 @@ impl Backend for ClaudeBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).await.is_ok()
+        self.input_tx.send(input).is_ok()
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).await.is_ok()
+        self.interrupt_tx.send(()).is_ok()
     }
 
     async fn shutdown(self) {
@@ -8676,7 +8673,7 @@ mod tests {
     async fn forward_claude_backend_event_fails_ready_on_pre_session_error() {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
         let ready_tx: ClaudeReadyTx = Arc::new(Mutex::new(Some(ready_tx)));
-        let (events_tx, mut events_rx) = mpsc::channel::<ChatEvent>(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
 
         let forwarded = forward_claude_backend_event(

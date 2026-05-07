@@ -432,7 +432,6 @@ impl HostHandle {
             if subscriber
                 .stream
                 .send_value(FrameKind::NewAgent, payload)
-                .await
                 .is_err()
             {
                 state.host_streams.remove(&host_path);
@@ -707,16 +706,21 @@ impl HostHandle {
                         record.custom_agent_id
                     );
                 }
-                let project_id = payload.project_id.or(record.project_id.clone());
-                if let Some(project_id) = &project_id {
-                    project_store
-                        .lock()
-                        .await
-                        .get(project_id)
-                        .unwrap_or_else(|| {
-                            panic!("cannot resume agent in missing project {}", project_id)
-                        });
-                }
+                let requested_project_id = payload.project_id.or(record.project_id.clone());
+                let (project_id, missing_project_warning) = match requested_project_id {
+                    Some(project_id) => {
+                        if project_store.lock().await.get(&project_id).is_some() {
+                            (Some(project_id), None)
+                        } else {
+                            let warning = format!(
+                                "project {} was deleted; resuming without a project",
+                                project_id
+                            );
+                            (None, Some(warning))
+                        }
+                    }
+                    None => (None, None),
+                };
                 let startup_mcp_servers = startup_mcp_servers_for_settings(
                     &host_settings,
                     &record.workspace_roots,
@@ -857,6 +861,12 @@ impl HostHandle {
                     });
                     sanitize_session_settings_values(schema, &stored_settings)
                 });
+                let combined_startup_warning = match (startup_warning, missing_project_warning) {
+                    (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
                 ResolvedSpawnRequest {
                     name: resolved_name,
                     origin,
@@ -876,7 +886,7 @@ impl HostHandle {
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: Some(session_id),
-                    startup_warning,
+                    startup_warning: combined_startup_warning,
                     startup_failure,
                     initial_alias,
                     use_mock_backend,
@@ -1082,23 +1092,6 @@ impl HostHandle {
     pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) -> AppResult<()> {
         const OPERATION: &str = "project_delete";
         let mut state = self.state.lock().await;
-        let referenced_session = state
-            .session_store
-            .lock()
-            .await
-            .list()
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-            .into_iter()
-            .find(|record| record.project_id.as_ref() == Some(&payload.id));
-        if let Some(session) = referenced_session {
-            return Err(AppError::conflict(
-                OPERATION,
-                format!(
-                    "cannot delete project {} while referenced by session {}",
-                    payload.id, session.id
-                ),
-            ));
-        }
         let referenced_steering = state
             .steering_store
             .lock()
@@ -1328,9 +1321,7 @@ impl HostHandle {
                 error,
             )
         })?;
-        let _ = host_output_stream
-            .send_value(FrameKind::SessionList, payload)
-            .await;
+        let _ = host_output_stream.send_value(FrameKind::SessionList, payload);
         Ok(())
     }
 
@@ -1563,7 +1554,6 @@ impl HostHandle {
             })?;
         if host_output_stream
             .send_value(FrameKind::NewTerminal, host_payload)
-            .await
             .is_err()
         {
             return Ok(None);
@@ -2106,8 +2096,7 @@ impl HostHandle {
             )
         })?;
         let _ = project_output_stream
-            .send_value(FrameKind::ProjectFileContents, payload)
-            .await;
+            .send_value(FrameKind::ProjectFileContents, payload);
         Ok(())
     }
 
@@ -2141,8 +2130,7 @@ impl HostHandle {
             )
         })?;
         let _ = project_output_stream
-            .send_value(FrameKind::ProjectFileList, payload)
-            .await;
+            .send_value(FrameKind::ProjectFileList, payload);
         Ok(())
     }
 
@@ -2189,8 +2177,7 @@ impl HostHandle {
             )
         })?;
         let _ = project_output_stream
-            .send_value(FrameKind::ProjectGitDiff, payload)
-            .await;
+            .send_value(FrameKind::ProjectGitDiff, payload);
         Ok(())
     }
 
@@ -2325,8 +2312,7 @@ impl HostHandle {
             )
         })?;
         let _ = project_output_stream
-            .send_value(FrameKind::ProjectGitCommitResult, result_payload)
-            .await;
+            .send_value(FrameKind::ProjectGitCommitResult, result_payload);
         self.refresh_after_project_mutation(
             connection_host_stream,
             project_output_stream.clone(),
@@ -2788,7 +2774,7 @@ async fn emit_new_agent_for_stream(
 
     let payload = serde_json::to_value(&new_agent)
         .expect("failed to serialize NewAgent payload for host stream fanout");
-    stream.send_value(FrameKind::NewAgent, payload).await?;
+    stream.send_value(FrameKind::NewAgent, payload)?;
 
     let agent_stream = stream.with_path(instance_stream);
     let attached = agent_handle.attach(agent_stream).await;
@@ -2821,7 +2807,6 @@ async fn fan_out_session_lists(state: &mut HostState) {
         if subscriber
             .stream
             .send_value(FrameKind::SessionList, payload.clone())
-            .await
             .is_err()
         {
             dead_paths.push(path);
@@ -3060,7 +3045,6 @@ async fn emit_project_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::ProjectNotify, payload)
-        .await
 }
 
 async fn emit_custom_agent_notify_for_subscriber(
@@ -3072,7 +3056,6 @@ async fn emit_custom_agent_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::CustomAgentNotify, payload)
-        .await
 }
 
 async fn emit_steering_notify_for_subscriber(
@@ -3084,7 +3067,6 @@ async fn emit_steering_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::SteeringNotify, payload)
-        .await
 }
 
 async fn emit_skill_notify_for_subscriber(
@@ -3096,7 +3078,6 @@ async fn emit_skill_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::SkillNotify, payload)
-        .await
 }
 
 async fn emit_mcp_server_notify_for_subscriber(
@@ -3108,7 +3089,6 @@ async fn emit_mcp_server_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::McpServerNotify, payload)
-        .await
 }
 
 async fn emit_host_settings_for_subscriber(
@@ -3122,7 +3102,6 @@ async fn emit_host_settings_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::HostSettings, payload)
-        .await
 }
 
 async fn emit_backend_setup_for_subscriber(
@@ -3134,7 +3113,6 @@ async fn emit_backend_setup_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::BackendSetup, payload)
-        .await
 }
 
 async fn emit_agent_closed_for_stream(
@@ -3143,7 +3121,7 @@ async fn emit_agent_closed_for_stream(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize AgentClosed payload for host stream fanout");
-    stream.send_value(FrameKind::AgentClosed, payload).await
+    stream.send_value(FrameKind::AgentClosed, payload)
 }
 
 async fn emit_session_schemas_for_subscriber(
@@ -3157,7 +3135,6 @@ async fn emit_session_schemas_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::SessionSchemas, payload)
-        .await
 }
 
 fn session_schema_for_backend(

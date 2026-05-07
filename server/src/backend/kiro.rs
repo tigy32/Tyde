@@ -3183,13 +3183,11 @@ use super::{
     session_settings_to_json,
 };
 
-const BACKEND_EVENT_BUFFER: usize = 256;
-const BACKEND_INPUT_BUFFER: usize = 64;
 const BACKEND_AGENT_NAME: &str = "kiro";
 
 pub struct KiroBackend {
-    input_tx: mpsc::Sender<AgentInput>,
-    interrupt_tx: mpsc::Sender<()>,
+    input_tx: mpsc::UnboundedSender<AgentInput>,
+    interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
 }
 
@@ -3235,9 +3233,9 @@ impl Backend for KiroBackend {
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
         let initial_images = protocol_images_to_attachments(initial_input.images);
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let events_tx_task = events_tx.clone();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
@@ -3305,7 +3303,7 @@ impl Backend for KiroBackend {
             let forward_task = tokio::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if let Some(event) = map_kiro_value_to_chat_event(&raw)
-                        && events_tx_forward.send(event).await.is_err()
+                        && events_tx_forward.send(event).is_err()
                     {
                         return;
                     }
@@ -3415,9 +3413,9 @@ impl Backend for KiroBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let (input_tx, mut input_rx) = mpsc::channel::<AgentInput>(BACKEND_INPUT_BUFFER);
-        let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(BACKEND_INPUT_BUFFER);
-        let (events_tx, events_rx) = mpsc::channel::<ChatEvent>(BACKEND_EVENT_BUFFER);
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let events_tx_task = events_tx.clone();
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let known_session_id_task = Arc::clone(&known_session_id);
@@ -3499,7 +3497,7 @@ impl Backend for KiroBackend {
             let forward_task = tokio::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if let Some(event) = map_kiro_value_to_chat_event(&raw)
-                        && events_tx_forward.send(event).await.is_err()
+                        && events_tx_forward.send(event).is_err()
                     {
                         return;
                     }
@@ -3624,7 +3622,7 @@ impl Backend for KiroBackend {
     async fn send(&self, input: AgentInput) -> bool {
         match input {
             input @ AgentInput::SendMessage(_) | input @ AgentInput::UpdateSessionSettings(_) => {
-                self.input_tx.send(input).await.is_ok()
+                self.input_tx.send(input).is_ok()
             }
             AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
@@ -3637,7 +3635,7 @@ impl Backend for KiroBackend {
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).await.is_ok()
+        self.interrupt_tx.send(()).is_ok()
     }
 
     async fn shutdown(self) {

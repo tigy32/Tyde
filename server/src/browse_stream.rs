@@ -48,18 +48,18 @@ pub(crate) fn opened_payload(initial: &HostAbsPath) -> HostBrowseOpenedPayload {
 pub(crate) async fn emit_opened(stream: &Stream, payload: &HostBrowseOpenedPayload) {
     let value =
         serde_json::to_value(payload).expect("failed to serialize HostBrowseOpened payload");
-    let _ = stream.send_value(FrameKind::HostBrowseOpened, value).await;
+    let _ = stream.send_value(FrameKind::HostBrowseOpened, value);
 }
 
 pub(crate) async fn emit_entries(stream: &Stream, payload: &HostBrowseEntriesPayload) {
     let value =
         serde_json::to_value(payload).expect("failed to serialize HostBrowseEntries payload");
-    let _ = stream.send_value(FrameKind::HostBrowseEntries, value).await;
+    let _ = stream.send_value(FrameKind::HostBrowseEntries, value);
 }
 
 pub(crate) async fn emit_error(stream: &Stream, payload: &HostBrowseErrorPayload) {
     let value = serde_json::to_value(payload).expect("failed to serialize HostBrowseError payload");
-    let _ = stream.send_value(FrameKind::HostBrowseError, value).await;
+    let _ = stream.send_value(FrameKind::HostBrowseError, value);
 }
 
 pub(crate) async fn list_dir(

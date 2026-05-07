@@ -4,14 +4,14 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub(crate) struct Stream {
     path: StreamPath,
-    tx: mpsc::Sender<Envelope>,
+    tx: mpsc::UnboundedSender<Envelope>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StreamClosed;
 
 impl Stream {
-    pub fn new(path: StreamPath, tx: mpsc::Sender<Envelope>) -> Self {
+    pub fn new(path: StreamPath, tx: mpsc::UnboundedSender<Envelope>) -> Self {
         Self { path, tx }
     }
 
@@ -26,7 +26,7 @@ impl Stream {
         &self.path
     }
 
-    pub async fn send_value(
+    pub fn send_value(
         &self,
         kind: FrameKind,
         payload: serde_json::Value,
@@ -37,6 +37,6 @@ impl Stream {
             seq: 0,
             payload,
         };
-        self.tx.send(envelope).await.map_err(|_| StreamClosed)
+        self.tx.send(envelope).map_err(|_| StreamClosed)
     }
 }

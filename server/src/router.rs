@@ -736,7 +736,7 @@ async fn send_agent_not_running_error(stream: Stream, agent_id: AgentId) {
     };
     match serde_json::to_value(&payload) {
         Ok(payload) => {
-            let _ = stream.send_value(FrameKind::AgentError, payload).await;
+            let _ = stream.send_value(FrameKind::AgentError, payload);
         }
         Err(error) => {
             tracing::error!(

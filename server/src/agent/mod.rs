@@ -34,7 +34,6 @@ pub(crate) mod registry;
 
 use self::registry::{InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSpawnRequest};
 
-const COMMAND_BUFFER: usize = 64;
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -91,7 +90,7 @@ enum AgentNamePersistence {
 
 #[derive(Clone)]
 pub(crate) struct AgentHandle {
-    tx: mpsc::Sender<AgentCommand>,
+    tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
 }
 
@@ -100,7 +99,7 @@ impl AgentHandle {
         if !self.accepting_input.load(Ordering::SeqCst) {
             return false;
         }
-        self.tx.send(AgentCommand::SendInput(input)).await.is_ok()
+        self.tx.send(AgentCommand::SendInput(input)).is_ok()
     }
 
     pub async fn set_name(&self, name: String) -> Option<bool> {
@@ -112,7 +111,6 @@ impl AgentHandle {
                 persistence: AgentNamePersistence::User,
                 reply: reply_tx,
             })
-            .await
             .is_err()
         {
             return None;
@@ -129,7 +127,6 @@ impl AgentHandle {
                 persistence: AgentNamePersistence::GeneratedIfNoUserAlias,
                 reply: reply_tx,
             })
-            .await
             .is_err()
         {
             return None;
@@ -142,7 +139,6 @@ impl AgentHandle {
         if self
             .tx
             .send(AgentCommand::Snapshot { reply: reply_tx })
-            .await
             .is_err()
         {
             return None;
@@ -159,7 +155,6 @@ impl AgentHandle {
                 limit,
                 reply: reply_tx,
             })
-            .await
             .is_err()
         {
             return None;
@@ -171,7 +166,7 @@ impl AgentHandle {
         if !self.accepting_input.load(Ordering::SeqCst) {
             return false;
         }
-        self.tx.send(AgentCommand::Interrupt).await.is_ok()
+        self.tx.send(AgentCommand::Interrupt).is_ok()
     }
 
     pub async fn close(&self) -> bool {
@@ -180,7 +175,6 @@ impl AgentHandle {
         if self
             .tx
             .send(AgentCommand::Close { reply: reply_tx })
-            .await
             .is_err()
         {
             return false;
@@ -189,7 +183,7 @@ impl AgentHandle {
     }
 
     pub async fn attach(&self, stream: Stream) -> bool {
-        self.tx.send(AgentCommand::Attach(stream)).await.is_ok()
+        self.tx.send(AgentCommand::Attach(stream)).is_ok()
     }
 }
 
@@ -508,7 +502,7 @@ pub(crate) fn spawn_agent_actor(
     host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     status_handle: registry::AgentStatusHandle,
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
-    let (tx, mut rx) = mpsc::channel::<AgentCommand>(COMMAND_BUFFER);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
     let (startup_tx, startup_rx) = oneshot::channel();
@@ -1226,8 +1220,7 @@ pub(crate) fn spawn_agent_actor(
                                     let _ = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
-                                        .send(AgentInput::UpdateSessionSettings(update))
-                                        .await;
+                                        .send(AgentInput::UpdateSessionSettings(update));
                                     if let Err(err) = session_store
                                         .lock()
                                         .await
@@ -1346,7 +1339,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                         }
                         AgentCommand::Attach(stream) => {
-                            attach_subscriber(&event_log, &mut subscribers, stream).await;
+                            attach_subscriber(&event_log, &mut subscribers, stream);
                         }
                     }
                 }
@@ -1371,7 +1364,7 @@ pub(crate) fn spawn_relay_agent_actor(
     session_id: SessionId,
     status_handle: registry::AgentStatusHandle,
 ) -> AgentHandle {
-    let (tx, mut rx) = mpsc::channel::<AgentCommand>(COMMAND_BUFFER);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(true));
     let accepting_input_task = Arc::clone(&accepting_input);
 
@@ -1559,7 +1552,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             }
                         }
                         AgentCommand::Attach(stream) => {
-                            attach_subscriber(&event_log, &mut subscribers, stream).await;
+                            attach_subscriber(&event_log, &mut subscribers, stream);
                         }
                     }
                 }
@@ -1656,7 +1649,7 @@ async fn park_terminal_agent(
     current_start: &mut AgentStartPayload,
     event_log: &mut [Envelope],
     subscribers: &mut Vec<Stream>,
-    rx: &mut mpsc::Receiver<AgentCommand>,
+    rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
 ) {
     loop {
         let Some(command) = rx.recv().await else {
@@ -1694,7 +1687,7 @@ async fn park_terminal_agent(
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
             AgentCommand::Attach(stream) => {
-                attach_subscriber(event_log, subscribers, stream).await;
+                attach_subscriber(event_log, subscribers, stream);
             }
             AgentCommand::Close { reply } => {
                 let _ = reply.send(());
@@ -1890,7 +1883,7 @@ async fn append_event<T: serde::Serialize>(
     )
     .expect("failed to serialize protocol payload in agent actor");
     event_log.push(event.clone());
-    broadcast_event(subscribers, &event).await;
+    broadcast_event(subscribers, &event);
 }
 
 fn output_events_since(
@@ -1949,15 +1942,14 @@ async fn broadcast_live_event<T: serde::Serialize>(
         seq: 0,
         payload,
     };
-    broadcast_event(subscribers, &event).await;
+    broadcast_event(subscribers, &event);
 }
 
-async fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
+fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
     let mut idx = 0;
     while idx < subscribers.len() {
         if subscribers[idx]
             .send_value(event.kind, event.payload.clone())
-            .await
             .is_err()
         {
             subscribers.swap_remove(idx);
@@ -1967,11 +1959,10 @@ async fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
     }
 }
 
-async fn attach_subscriber(event_log: &[Envelope], subscribers: &mut Vec<Stream>, stream: Stream) {
+fn attach_subscriber(event_log: &[Envelope], subscribers: &mut Vec<Stream>, stream: Stream) {
     for event in event_log {
         if stream
             .send_value(event.kind, event.payload.clone())
-            .await
             .is_err()
         {
             return;
@@ -2175,7 +2166,7 @@ mod tests {
         error: String,
         status_handle: AgentStatusHandle,
     ) -> AgentHandle {
-        let (tx, mut rx) = mpsc::channel::<AgentCommand>(8);
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
         let accepting_input = Arc::new(AtomicBool::new(false));
         let accepting_input_task = Arc::clone(&accepting_input);
 
@@ -2219,7 +2210,7 @@ mod tests {
                         let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                     }
                     AgentCommand::Attach(stream) => {
-                        attach_subscriber(&event_log, &mut subscribers, stream).await;
+                        attach_subscriber(&event_log, &mut subscribers, stream);
                     }
                     AgentCommand::SetName { reply, .. } => {
                         let _ = reply.send(false);
@@ -2300,7 +2291,7 @@ mod tests {
         assert_eq!(snapshot.agent_id.0, "agent-failed");
         assert_eq!(snapshot.name, "Chat");
 
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let stream = Stream::new(StreamPath("/agent/agent-failed".to_string()), tx);
         assert!(handle.attach(stream).await);
 
