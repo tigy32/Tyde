@@ -266,6 +266,7 @@ fn render_root_section(
         let root_path = root.0.clone();
         let on_remove = move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
+            let state = expect_context::<AppState>();
             let host_id = host_id.clone();
             let project_id = project_id.clone();
             let root_path = root_path.clone();
@@ -274,7 +275,6 @@ fn render_root_section(
                 if !crate::bridge::confirm_dialog("Remove root", &message).await {
                     return;
                 }
-                let state = expect_context::<AppState>();
                 delete_project_root(&state, host_id, project_id, root_path);
             });
         };
