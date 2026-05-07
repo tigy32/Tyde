@@ -268,8 +268,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
                     agents
                         .iter()
                         .find(|a| {
-                            a.host_id == agent_ref.host_id
-                                && a.agent_id == agent_ref.agent_id
+                            a.host_id == agent_ref.host_id && a.agent_id == agent_ref.agent_id
                         })
                         .map(|a| a.backend_kind)
                 })?;

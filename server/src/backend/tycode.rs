@@ -139,7 +139,6 @@ impl Backend for TycodeBackend {
                 workspace_roots.push(root.path.to_string_lossy().to_string());
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
-            let known_session_ids = known_tycode_session_ids();
             let subprocess_bin = match subprocess_bin() {
                 Ok(path) => path,
                 Err(err) => {
@@ -319,19 +318,6 @@ impl Backend for TycodeBackend {
 
                 let events = map_tycode_value_to_chat_events(&value);
                 if events.is_empty() {
-                    if session_id_task
-                        .lock()
-                        .expect("tycode session_id mutex poisoned")
-                        .is_none()
-                        && let Some(discovered) = discover_new_tycode_session(&known_session_ids)
-                    {
-                        *session_id_task
-                            .lock()
-                            .expect("tycode session_id mutex poisoned") = Some(discovered);
-                        if let Some(ready_tx) = ready_tx.take() {
-                            let _ = ready_tx.send(Ok(()));
-                        }
-                    }
                     continue;
                 }
 
@@ -342,20 +328,6 @@ impl Backend for TycodeBackend {
                     }
                     if events_tx.is_closed() {
                         break;
-                    }
-                }
-
-                if session_id_task
-                    .lock()
-                    .expect("tycode session_id mutex poisoned")
-                    .is_none()
-                    && let Some(discovered) = discover_new_tycode_session(&known_session_ids)
-                {
-                    *session_id_task
-                        .lock()
-                        .expect("tycode session_id mutex poisoned") = Some(discovered);
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Ok(()));
                     }
                 }
             }
@@ -693,24 +665,6 @@ async fn write_cancel(stdin: &mut tokio::process::ChildStdin) -> bool {
 fn tycode_sessions_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory".to_string())?;
     Ok(PathBuf::from(home).join(".tycode").join("sessions"))
-}
-
-fn known_tycode_session_ids() -> Vec<String> {
-    list_tycode_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|session| session.id.0)
-        .collect()
-}
-
-fn discover_new_tycode_session(known_session_ids: &[String]) -> Option<SessionId> {
-    let known: std::collections::HashSet<_> = known_session_ids.iter().collect();
-    let mut sessions = list_tycode_sessions().ok()?;
-    sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
-    sessions
-        .into_iter()
-        .find(|session| !known.contains(&session.id.0))
-        .map(|session| session.id)
 }
 
 fn build_tycode_mcp_servers_json(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {

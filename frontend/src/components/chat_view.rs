@@ -154,7 +154,8 @@ pub fn ChatView(
             .unwrap_or_else(|| "[unknown agent]".to_owned())
     };
 
-    let agent_backend = move || -> Option<BackendKind> { current_agent.get().map(|a| a.backend_kind) };
+    let agent_backend =
+        move || -> Option<BackendKind> { current_agent.get().map(|a| a.backend_kind) };
 
     let agent_initializing = move || -> bool {
         current_agent
@@ -247,10 +248,8 @@ pub fn ChatView(
                 std::time::Duration::from_millis(0),
             );
         });
-        let _ = el.add_event_listener_with_callback(
-            "scroll",
-            scroll_handler.as_ref().unchecked_ref(),
-        );
+        let _ =
+            el.add_event_listener_with_callback("scroll", scroll_handler.as_ref().unchecked_ref());
 
         // User-input observation. Each user-input event re-evaluates
         // distance-from-bottom and updates `user_scrolled_up`. The
@@ -272,8 +271,7 @@ pub fn ChatView(
                     let scroll_height = el_for_cb.scroll_height();
                     let scroll_top = el_for_cb.scroll_top();
                     let client_height = el_for_cb.client_height();
-                    let distance_from_bottom =
-                        scroll_height - scroll_top - client_height;
+                    let distance_from_bottom = scroll_height - scroll_top - client_height;
                     let is_near_bottom = distance_from_bottom < 80;
                     user_scrolled_up.set(!is_near_bottom);
                     show_scroll_btn.set(!is_near_bottom);
@@ -282,18 +280,18 @@ pub fn ChatView(
             );
         });
         for event in &["wheel", "touchstart", "keydown"] {
-            let _ = el.add_event_listener_with_callback(
-                event,
-                input_handler.as_ref().unchecked_ref(),
-            );
+            let _ =
+                el.add_event_listener_with_callback(event, input_handler.as_ref().unchecked_ref());
         }
 
         let element: web_sys::HtmlElement = el.unchecked_into();
-        scroll_listener_slot.update_value(|s| *s = Some(ScrollListenerHolder {
-            element,
-            scroll_handler,
-            input_handler,
-        }));
+        scroll_listener_slot.update_value(|s| {
+            *s = Some(ScrollListenerHolder {
+                element,
+                scroll_handler,
+                input_handler,
+            })
+        });
     });
     on_cleanup(move || {
         scroll_listener_slot.update_value(|s| {
@@ -318,8 +316,10 @@ pub fn ChatView(
     // happened to be true at first paint. The observer also fires when
     // the user resizes the window or toggles dock visibility, both of
     // which affect what's actually visible.
-    type ViewportObserverSlot =
-        Option<(web_sys::ResizeObserver, Closure<dyn FnMut(JsValue, JsValue)>)>;
+    type ViewportObserverSlot = Option<(
+        web_sys::ResizeObserver,
+        Closure<dyn FnMut(JsValue, JsValue)>,
+    )>;
     let viewport_observer_slot: StoredValue<ViewportObserverSlot, LocalStorage> =
         StoredValue::new_local(None);
     let scroll_ref_for_viewport = scroll_ref;
@@ -334,11 +334,10 @@ pub fn ChatView(
         // rather than the default 800px estimate.
         viewport_height_sig.set(el.client_height() as f64);
         let el_clone = el.clone();
-        let cb = Closure::<dyn FnMut(JsValue, JsValue)>::new(
-            move |_entries: JsValue, _: JsValue| {
+        let cb =
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
                 viewport_height_sig.set(el_clone.client_height() as f64);
-            },
-        );
+            });
         if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
             let element: web_sys::Element = el.unchecked_into();
             observer.observe(&element);
@@ -728,8 +727,10 @@ fn MeasuredRow(
     // thread-local storage and hands back a `Copy` ID handle that *is*
     // `Send + Sync`. Both the Effect and `on_cleanup` get their own
     // handle that points at the same slot.
-    type ObserverPair =
-        Option<(web_sys::ResizeObserver, Closure<dyn FnMut(JsValue, JsValue)>)>;
+    type ObserverPair = Option<(
+        web_sys::ResizeObserver,
+        Closure<dyn FnMut(JsValue, JsValue)>,
+    )>;
     let slot: StoredValue<ObserverPair, LocalStorage> = StoredValue::new_local(None);
 
     Effect::new(move |_| {
@@ -743,8 +744,8 @@ fn MeasuredRow(
         }
         let element: web_sys::Element = el.clone().unchecked_into();
         let elem_for_cb = element.clone();
-        let cb = Closure::<dyn FnMut(JsValue, JsValue)>::new(
-            move |_entries: JsValue, _: JsValue| {
+        let cb =
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
                 let h = elem_for_cb.get_bounding_client_rect().height();
                 // Inactive tabs in the LRU hot set stay mounted under
                 // `display: none`, where every element measures as 0px.
@@ -768,8 +769,7 @@ fn MeasuredRow(
                     });
                     heights_version.update(|v| *v = v.wrapping_add(1));
                 }
-            },
-        );
+            });
         if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
             observer.observe(&element);
             slot.update_value(|s| *s = Some((observer, cb)));
@@ -860,7 +860,10 @@ mod wasm_tests {
     /// against zero, defeating the test.
     fn ensure_styles_loaded() {
         let document = web_sys::window().unwrap().document().unwrap();
-        if document.get_element_by_id("test-prod-styles-chat").is_none() {
+        if document
+            .get_element_by_id("test-prod-styles-chat")
+            .is_none()
+        {
             let style = document.create_element("style").unwrap();
             style.set_id("test-prod-styles-chat");
             style.set_text_content(Some(PROD_STYLES));

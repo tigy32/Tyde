@@ -641,10 +641,7 @@ impl AppState {
         // first frame paints with no mounted tab content, then the
         // tab-LRU Effect in `App` fires and adds the active tab — visible
         // as a one-frame flash of empty center zone on app boot.
-        let initial_lru: Vec<TabId> = initial_center_zone
-            .active_tab_id
-            .into_iter()
-            .collect();
+        let initial_lru: Vec<TabId> = initial_center_zone.active_tab_id.into_iter().collect();
         let center_zone: RwSignal<CenterZoneState> = RwSignal::new(initial_center_zone);
         let active_agent: Memo<Option<ActiveAgentRef>> = Memo::new(move |_| {
             center_zone.with(|cz| {
@@ -940,8 +937,7 @@ impl AppState {
         match (next.is_some(), restored) {
             (true, Some(memory)) => {
                 let cz = memory.center_zone.unwrap_or_default();
-                self.tab_lru
-                    .set(cz.active_tab_id.into_iter().collect());
+                self.tab_lru.set(cz.active_tab_id.into_iter().collect());
                 self.center_zone.set(cz);
                 self.active_terminal.set(memory.active_terminal);
                 self.open_files.set(memory.open_files);
@@ -954,8 +950,7 @@ impl AppState {
                     "New Chat".to_string(),
                     true,
                 );
-                self.tab_lru
-                    .set(cz.active_tab_id.into_iter().collect());
+                self.tab_lru.set(cz.active_tab_id.into_iter().collect());
                 self.center_zone.set(cz);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());
@@ -963,8 +958,7 @@ impl AppState {
             }
             (false, _) => {
                 let cz = CenterZoneState::default();
-                self.tab_lru
-                    .set(cz.active_tab_id.into_iter().collect());
+                self.tab_lru.set(cz.active_tab_id.into_iter().collect());
                 self.center_zone.set(cz);
                 self.active_terminal.set(None);
                 self.open_files.set(HashMap::new());

@@ -166,7 +166,8 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     // main thread so first paint shows already-coloured text. Without
     // this the worker takes ~150ms+ to deliver its first chunk in debug
     // builds and the user sees an uncoloured-to-coloured flash.
-    if total > 0 && total <= HIGHLIGHT_LINE_CAP
+    if total > 0
+        && total <= HIGHLIGHT_LINE_CAP
         && let Some(syntax) = syntax_for_path(&f.path.relative_path)
     {
         let prefix_t0 = crate::perf::now_ms();

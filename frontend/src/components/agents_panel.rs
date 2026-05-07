@@ -191,20 +191,21 @@ pub fn AgentsPanel() -> impl IntoView {
 
         // Index every visible agent's id once; lets us tell orphans
         // (parent filtered out) from real children in a single pass.
-        let visible_ids: HashSet<AgentId> =
-            agents.iter().map(|a| a.agent_id.clone()).collect();
+        let visible_ids: HashSet<AgentId> = agents.iter().map(|a| a.agent_id.clone()).collect();
 
         // Bucket children by parent_agent_id. One alloc per parent
         // group; orphans land in a synthetic "orphan" bucket whose
         // entries we later promote to top-level rows.
-        let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> =
-            HashMap::new();
+        let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> = HashMap::new();
         let mut top_level: Vec<AgentInfo> = Vec::new();
         let mut orphans: Vec<AgentInfo> = Vec::new();
         for agent in agents {
             match &agent.parent_agent_id {
                 Some(pid) if visible_ids.contains(pid) => {
-                    children_by_parent.entry(pid.clone()).or_default().push(agent);
+                    children_by_parent
+                        .entry(pid.clone())
+                        .or_default()
+                        .push(agent);
                 }
                 Some(_) => orphans.push(agent),
                 None => top_level.push(agent),
@@ -214,7 +215,9 @@ pub fn AgentsPanel() -> impl IntoView {
         let mut result: Vec<(AgentInfo, Vec<AgentInfo>)> =
             Vec::with_capacity(top_level.len() + orphans.len());
         for parent in top_level {
-            let children = children_by_parent.remove(&parent.agent_id).unwrap_or_default();
+            let children = children_by_parent
+                .remove(&parent.agent_id)
+                .unwrap_or_default();
             result.push((parent, children));
         }
         for orphan in orphans {

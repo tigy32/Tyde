@@ -487,11 +487,8 @@ pub fn App() -> impl IntoView {
     // this gate, every tab-strip rename would re-touch `tab_lru` and
     // cascade-rerender every TabMount that subscribes to it.
     let state_for_lru_memo = state.clone();
-    let active_tab_memo: Memo<Option<TabId>> = Memo::new(move |_| {
-        state_for_lru_memo
-            .center_zone
-            .with(|cz| cz.active_tab_id)
-    });
+    let active_tab_memo: Memo<Option<TabId>> =
+        Memo::new(move |_| state_for_lru_memo.center_zone.with(|cz| cz.active_tab_id));
     let state_for_lru = state.clone();
     Effect::new(move |_| {
         if let Some(active) = active_tab_memo.get() {

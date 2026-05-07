@@ -573,7 +573,9 @@ pub fn ChatInput() -> impl IntoView {
         matches!(
             submit_on_enter_state.chat_context_connection_status(),
             ConnectionStatus::Connected
-        ) && (submit_on_enter_state.chat_input.with(|s| !s.trim().is_empty())
+        ) && (submit_on_enter_state
+            .chat_input
+            .with(|s| !s.trim().is_empty())
             || submit_on_enter_images.with(|images| !images.is_empty()))
     };
 
@@ -734,9 +736,7 @@ pub fn ChatInput() -> impl IntoView {
         // string per keystroke; the previous `chat_input.get()`
         // allocated a fresh `String` just to compare against the DOM
         // value and (in the no-op case) drop it.
-        let needs_set = reset_state
-            .chat_input
-            .with(|val| textarea.value() != *val);
+        let needs_set = reset_state.chat_input.with(|val| textarea.value() != *val);
         if needs_set {
             let val = reset_state.chat_input.get_untracked();
             textarea.set_value(&val);

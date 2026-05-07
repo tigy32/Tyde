@@ -1423,9 +1423,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             // and `model` strings we don't need here).
             let tool_requests = state
                 .streaming_text
-                .with_untracked(|map| {
-                    map.get(&agent_id).map(|s| s.tool_requests.get_untracked())
-                })
+                .with_untracked(|map| map.get(&agent_id).map(|s| s.tool_requests.get_untracked()))
                 .unwrap_or_default();
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
