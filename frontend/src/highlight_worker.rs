@@ -24,8 +24,10 @@
 //! cancellation latency. We use 200 lines, matching the previous
 //! main-thread chunk size.
 
+#[cfg(target_arch = "wasm32")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_arch = "wasm32")]
 use crate::syntax_highlight::LineTokens;
 
 /// Lines per chunk batched back to main. Smaller chunks mean each
@@ -37,10 +39,12 @@ use crate::syntax_highlight::LineTokens;
 ///
 /// Also sets cancellation latency: a superseding request waits for the
 /// current chunk to finish before the worker checks the active task id.
+#[cfg(target_arch = "wasm32")]
 const CHUNK_SIZE: usize = 50;
 
 /// Wire format for `main → worker`. Tagged enum keeps future variants
 /// (e.g. unified-diff hunk highlighting) easy to add.
+#[cfg(target_arch = "wasm32")]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
@@ -56,6 +60,7 @@ pub enum Request {
 
 /// Wire format for `worker → main`. Streamed; one `Chunk` per slice
 /// followed by exactly one `Done`.
+#[cfg(target_arch = "wasm32")]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {

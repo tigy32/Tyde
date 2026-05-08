@@ -21,7 +21,6 @@ use super::{
 };
 use crate::process_env;
 
-
 fn subprocess_bin() -> Result<String, String> {
     resolve_tycode_binary_path().ok_or_else(|| "tycode-subprocess not found".to_string())
 }
@@ -197,8 +196,7 @@ impl Backend for TycodeBackend {
             let last_stderr_line = spawn_tycode_stderr_logger(stderr);
 
             // Spawn a task to forward follow-up messages to stdin
-            let (stdin_tx, mut stdin_rx) =
-                mpsc::unbounded_channel::<TycodeStdinCommand>();
+            let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<TycodeStdinCommand>();
             tokio::spawn(async move {
                 let mut stdin = stdin;
                 while let Some(command) = stdin_rx.recv().await {
@@ -255,10 +253,7 @@ impl Backend for TycodeBackend {
             let stdin_tx_interrupt = stdin_tx.clone();
             tokio::spawn(async move {
                 while interrupt_rx.recv().await.is_some() {
-                    if stdin_tx_interrupt
-                        .send(TycodeStdinCommand::Cancel)
-                        .is_err()
-                    {
+                    if stdin_tx_interrupt.send(TycodeStdinCommand::Cancel).is_err() {
                         break;
                     }
                 }
@@ -330,22 +325,21 @@ impl Backend for TycodeBackend {
             // Some tycode builds terminate without emitting StreamEnd. Synthesize
             // one so downstream callers don't hang waiting for end-of-turn.
             if stream_open {
-                let _ = events_tx
-                    .send(ChatEvent::StreamEnd(StreamEndData {
-                        message: ChatMessage {
-                            timestamp: unix_now_ms(),
-                            sender: MessageSender::Assistant {
-                                agent: "tycode".to_string(),
-                            },
-                            content: accumulated_text,
-                            reasoning: None,
-                            tool_calls: Vec::new(),
-                            model_info: None,
-                            token_usage: None,
-                            context_breakdown: None,
-                            images: None,
+                let _ = events_tx.send(ChatEvent::StreamEnd(StreamEndData {
+                    message: ChatMessage {
+                        timestamp: unix_now_ms(),
+                        sender: MessageSender::Assistant {
+                            agent: "tycode".to_string(),
                         },
-                    }));
+                        content: accumulated_text,
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                }));
             }
 
             if let Some(ready_tx) = ready_tx.take() {
@@ -451,8 +445,7 @@ impl Backend for TycodeBackend {
             };
             let _last_stderr_line = spawn_tycode_stderr_logger(stderr);
 
-            let (stdin_tx, mut stdin_rx) =
-                mpsc::unbounded_channel::<TycodeStdinCommand>();
+            let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<TycodeStdinCommand>();
             tokio::spawn(async move {
                 let mut stdin = stdin;
                 while let Some(command) = stdin_rx.recv().await {
@@ -507,10 +500,7 @@ impl Backend for TycodeBackend {
             let stdin_tx_interrupt = stdin_tx.clone();
             tokio::spawn(async move {
                 while interrupt_rx.recv().await.is_some() {
-                    if stdin_tx_interrupt
-                        .send(TycodeStdinCommand::Cancel)
-                        .is_err()
-                    {
+                    if stdin_tx_interrupt.send(TycodeStdinCommand::Cancel).is_err() {
                         break;
                     }
                 }
@@ -561,22 +551,21 @@ impl Backend for TycodeBackend {
             }
 
             if stream_open {
-                let _ = events_tx
-                    .send(ChatEvent::StreamEnd(StreamEndData {
-                        message: ChatMessage {
-                            timestamp: unix_now_ms(),
-                            sender: MessageSender::Assistant {
-                                agent: "tycode".to_string(),
-                            },
-                            content: accumulated_text,
-                            reasoning: None,
-                            tool_calls: Vec::new(),
-                            model_info: None,
-                            token_usage: None,
-                            context_breakdown: None,
-                            images: None,
+                let _ = events_tx.send(ChatEvent::StreamEnd(StreamEndData {
+                    message: ChatMessage {
+                        timestamp: unix_now_ms(),
+                        sender: MessageSender::Assistant {
+                            agent: "tycode".to_string(),
                         },
-                    }));
+                        content: accumulated_text,
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                }));
             }
         });
 

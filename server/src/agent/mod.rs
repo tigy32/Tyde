@@ -1220,7 +1220,8 @@ pub(crate) fn spawn_agent_actor(
                                     let _ = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
-                                        .send(AgentInput::UpdateSessionSettings(update));
+                                        .send(AgentInput::UpdateSessionSettings(update))
+                                        .await;
                                     if let Err(err) = session_store
                                         .lock()
                                         .await

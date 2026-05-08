@@ -9,10 +9,7 @@ use crate::host::HostHandle;
 use crate::router::route_client_envelope;
 use crate::stream::Stream;
 
-pub async fn run_connection(
-    connection: Connection,
-    host: HostHandle,
-) -> Result<(), FrameError> {
+pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<(), FrameError> {
     let host_stream = connection
         .outgoing_seq
         .keys()

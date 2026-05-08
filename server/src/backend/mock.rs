@@ -293,9 +293,7 @@ impl Backend for MockBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.command_tx
-            .send(MockCommand::Input(input))
-            .is_ok()
+        self.command_tx.send(MockCommand::Input(input)).is_ok()
     }
 
     async fn interrupt(&self) -> bool {

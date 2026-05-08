@@ -761,12 +761,12 @@ fn MeasuredRow(
                 // viewport. Ignore zero/negative measurements; the next
                 // observer fire after the tab is shown again will
                 // record the real height.
-                if !(h > 0.0) {
+                if !matches!(h.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
                     return;
                 }
                 let changed = row_heights.with_value(|map| {
                     let prev = map.get(&row_id).copied();
-                    prev.map_or(true, |p| (p - h).abs() >= 0.5)
+                    prev.is_none_or(|p| (p - h).abs() >= 0.5)
                 });
                 if changed {
                     row_heights.update_value(|map| {

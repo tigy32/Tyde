@@ -2095,8 +2095,7 @@ impl HostHandle {
                 error,
             )
         })?;
-        let _ = project_output_stream
-            .send_value(FrameKind::ProjectFileContents, payload);
+        let _ = project_output_stream.send_value(FrameKind::ProjectFileContents, payload);
         Ok(())
     }
 
@@ -2129,8 +2128,7 @@ impl HostHandle {
                 error,
             )
         })?;
-        let _ = project_output_stream
-            .send_value(FrameKind::ProjectFileList, payload);
+        let _ = project_output_stream.send_value(FrameKind::ProjectFileList, payload);
         Ok(())
     }
 
@@ -2176,8 +2174,7 @@ impl HostHandle {
                 error,
             )
         })?;
-        let _ = project_output_stream
-            .send_value(FrameKind::ProjectGitDiff, payload);
+        let _ = project_output_stream.send_value(FrameKind::ProjectGitDiff, payload);
         Ok(())
     }
 
@@ -2311,8 +2308,7 @@ impl HostHandle {
                 error,
             )
         })?;
-        let _ = project_output_stream
-            .send_value(FrameKind::ProjectGitCommitResult, result_payload);
+        let _ = project_output_stream.send_value(FrameKind::ProjectGitCommitResult, result_payload);
         self.refresh_after_project_mutation(
             connection_host_stream,
             project_output_stream.clone(),

@@ -63,8 +63,7 @@ impl TerminalHandle {
     pub(crate) async fn emit_start(&self) -> Result<(), StreamClosed> {
         let payload =
             serde_json::to_value(&self.start).expect("failed to serialize terminal start payload");
-        self.stream
-            .send_value(FrameKind::TerminalStart, payload)
+        self.stream.send_value(FrameKind::TerminalStart, payload)
     }
 
     pub(crate) async fn send(&self, payload: TerminalSendPayload) {

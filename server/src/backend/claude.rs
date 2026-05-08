@@ -5096,7 +5096,6 @@ use super::{
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
-
 type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 /// Minimal Backend-trait handle for the Claude CLI.

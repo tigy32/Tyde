@@ -10,7 +10,7 @@ use crate::state::StreamingState;
 /// Stream-delta cadence at which we re-parse markdown for the in-flight
 /// assistant response. The raw `streaming.text` signal updates on every
 /// delta (often 50+ per second from a fast LLM). Re-running pulldown-cmark
-/// + syntect on the full accumulated text per delta dominates main-thread
+/// and syntect on the full accumulated text per delta dominates main-thread
 /// time during a response — long replies with code blocks will pin the
 /// thread for hundreds of ms at a time. Throttling the rendered text to
 /// roughly two frames smooths the stream visually while keeping the cost

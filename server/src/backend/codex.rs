@@ -4537,7 +4537,6 @@ use super::{
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
-
 pub struct CodexBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<()>,

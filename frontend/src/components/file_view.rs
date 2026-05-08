@@ -173,8 +173,8 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
         let prefix_t0 = crate::perf::now_ms();
         let prefix_end = total.min(INSTANT_PREFIX_LINES);
         let mut hl = LineHighlighter::new(syntax);
-        for i in 0..prefix_end {
-            initial_tokens[i] = Some(hl.highlight_one(lines.line(i)));
+        for (i, slot) in initial_tokens.iter_mut().enumerate().take(prefix_end) {
+            *slot = Some(hl.highlight_one(lines.line(i)));
         }
         let dt = crate::perf::now_ms() - prefix_t0;
         crate::perf::log_phase(

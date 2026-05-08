@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Option<OsString>> = OnceLock::new();
 #[cfg(unix)]
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const PROBE_SENTINEL_BEGIN: &str = "TYDE_SHELL_PROBE_BEGIN_7f3c9a2e=";
+#[cfg(unix)]
+const PROBE_SENTINEL_END: &str = "=TYDE_SHELL_PROBE_END_7f3c9a2e";
 
 pub(crate) fn resolved_child_process_path() -> Option<&'static OsStr> {
     RESOLVED_CHILD_PROCESS_PATH
@@ -142,9 +146,14 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
         return;
     };
 
+    let script = format!(
+        "printf '{begin}%s{end}\\n' \"$PATH\"",
+        begin = PROBE_SENTINEL_BEGIN,
+        end = PROBE_SENTINEL_END,
+    );
     let mut child = match Command::new(&shell)
-        .arg("-lc")
-        .arg("printf %s \"$PATH\"")
+        .arg("-ilc")
+        .arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -169,11 +178,18 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
                     Some(stdout) => stdout,
                     None => return,
                 };
-                let trimmed = String::from_utf8_lossy(&stdout).trim().to_string();
-                if trimmed.is_empty() {
+                let text = String::from_utf8_lossy(&stdout);
+                let Some(value) = extract_probe_value(&text) else {
+                    tracing::debug!(
+                        "login-shell PATH probe output missing sentinels via {}",
+                        shell
+                    );
+                    return;
+                };
+                if value.is_empty() {
                     return;
                 }
-                extend_from_path_value(segments, Some(OsString::from(trimmed)));
+                extend_from_path_value(segments, Some(OsString::from(value)));
                 return;
             }
             Ok(None) => {
@@ -212,6 +228,14 @@ fn default_login_shell() -> Option<String> {
 }
 
 #[cfg(unix)]
+fn extract_probe_value(output: &str) -> Option<&str> {
+    let start = output.rfind(PROBE_SENTINEL_BEGIN)? + PROBE_SENTINEL_BEGIN.len();
+    let rest = output.get(start..)?;
+    let end = rest.find(PROBE_SENTINEL_END)?;
+    Some(rest[..end].trim())
+}
+
+#[cfg(unix)]
 fn read_child_stdout(mut child: std::process::Child, context: &str) -> Option<Vec<u8>> {
     let mut stdout = Vec::new();
     if let Some(mut pipe) = child.stdout.take()
@@ -225,9 +249,14 @@ fn read_child_stdout(mut child: std::process::Child, context: &str) -> Option<Ve
 
 #[cfg(unix)]
 fn resolve_login_shell_command_path_with_shell(shell: &str, binary: &str) -> Option<PathBuf> {
+    let script = format!(
+        "printf '{begin}%s{end}\\n' \"$(command -v -- \"$TYDE_LOOKUP_BINARY\")\"",
+        begin = PROBE_SENTINEL_BEGIN,
+        end = PROBE_SENTINEL_END,
+    );
     let mut child = match Command::new(shell)
-        .arg("-lc")
-        .arg("command -v -- \"$TYDE_LOOKUP_BINARY\"")
+        .arg("-ilc")
+        .arg(&script)
         .env("TYDE_LOOKUP_BINARY", binary)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -256,10 +285,10 @@ fn resolve_login_shell_command_path_with_shell(shell: &str, binary: &str) -> Opt
                 let stdout =
                     String::from_utf8_lossy(&read_child_stdout(child, "login-shell resolution")?)
                         .into_owned();
-                let resolved = stdout
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())?;
+                let resolved = extract_probe_value(&stdout)?;
+                if resolved.is_empty() {
+                    return None;
+                }
                 let resolved_path = PathBuf::from(resolved);
                 if !resolved_path.is_absolute() || !resolved_path.is_file() {
                     return None;
@@ -373,7 +402,10 @@ mod tests {
         let shell = dir.join("fake-shell");
         write_executable(
             &shell,
-            &format!("#!/bin/sh\nprintf '%s\\n' \"{}\"\n", binary.display()),
+            &format!(
+                "#!/bin/sh\nPATH='{path}' exec /bin/sh -c \"$2\"\n",
+                path = dir.display(),
+            ),
         );
 
         let resolved = resolve_login_shell_command_path_with_shell(
@@ -390,7 +422,14 @@ mod tests {
     fn resolve_login_shell_command_path_rejects_non_absolute_output() {
         let dir = temp_test_dir();
         let shell = dir.join("fake-shell");
-        write_executable(&shell, "#!/bin/sh\nprintf 'tycode-subprocess\\n'\n");
+        write_executable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nprintf '{begin}tycode-subprocess{end}\\n'\n",
+                begin = PROBE_SENTINEL_BEGIN,
+                end = PROBE_SENTINEL_END,
+            ),
+        );
 
         let resolved = resolve_login_shell_command_path_with_shell(
             shell.to_str().expect("shell path utf-8"),
@@ -399,5 +438,50 @@ mod tests {
 
         assert_eq!(resolved, None);
         fs::remove_dir_all(dir).expect("remove temp test dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_login_shell_command_path_ignores_rcfile_noise() {
+        let dir = temp_test_dir();
+        let binary = dir.join("tycode-subprocess");
+        write_executable(&binary, "#!/bin/sh\nexit 0\n");
+
+        let shell = dir.join("fake-shell");
+        write_executable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nprintf 'welcome banner from rcfile\\n'\nPATH='{path}' exec /bin/sh -c \"$2\"\n",
+                path = dir.display(),
+            ),
+        );
+
+        let resolved = resolve_login_shell_command_path_with_shell(
+            shell.to_str().expect("shell path utf-8"),
+            "tycode-subprocess",
+        );
+
+        assert_eq!(resolved, Some(binary));
+        fs::remove_dir_all(dir).expect("remove temp test dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_probe_value_finds_payload_amidst_noise() {
+        let input = format!(
+            "welcome\nsome plugin output\n{begin}/opt/homebrew/bin/claude{end}\ntrailing\n",
+            begin = PROBE_SENTINEL_BEGIN,
+            end = PROBE_SENTINEL_END,
+        );
+        assert_eq!(
+            extract_probe_value(&input),
+            Some("/opt/homebrew/bin/claude")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_probe_value_returns_none_without_sentinels() {
+        assert_eq!(extract_probe_value("just some random output\n"), None);
     }
 }
