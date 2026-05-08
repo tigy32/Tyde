@@ -1169,6 +1169,23 @@ impl HostHandle {
                 ),
             ));
         }
+        let referenced_session = state
+            .session_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .into_iter()
+            .find(|session| session.project_id.as_ref() == Some(&payload.id));
+        if let Some(session) = referenced_session {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot delete project {} while referenced by session {}",
+                    payload.id, session.id
+                ),
+            ));
+        }
         let project = state
             .project_store
             .lock()
