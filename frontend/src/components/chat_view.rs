@@ -458,6 +458,15 @@ pub fn ChatView(
         if scroll_pending.get() {
             return;
         }
+        // Resolve the NodeRef synchronously — the Effect body runs
+        // inside this component's reactive owner, so the signal is
+        // guaranteed alive here. Capturing the raw `HtmlDivElement`
+        // into the deferred closure means the timer never touches the
+        // reactive graph after the owner is disposed (tab LRU eviction
+        // mid-flight used to panic here).
+        let Some(el) = scroll_ref.get_untracked() else {
+            return;
+        };
         scroll_pending.set(true);
         let pending = scroll_pending.clone();
         // `setTimeout(0)` instead of `requestAnimationFrame`. rAF is
@@ -469,21 +478,17 @@ pub fn ChatView(
         leptos::prelude::set_timeout(
             move || {
                 pending.set(false);
-                if let Some(el) = scroll_ref.get_untracked() {
-                    el.set_scroll_top(el.scroll_height());
-                    // Mirror the post-clamp scrollTop into
-                    // `scroll_top_sig` immediately. Without this, the
-                    // windowing Memo only sees the new scroll position
-                    // once the `scroll` event round-trips through the
-                    // listener — leaving a window of one or more frames
-                    // where `scroll_top` is at the bottom but
-                    // `visible_window` still has the old `start = 0`.
-                    // The user would see the scrollbar at the end but
-                    // the rendered rows from index 0, with the
-                    // bottom-pad spacer covering the entire visible
-                    // region.
-                    scroll_top_sig.set(el.scroll_top() as f64);
-                }
+                el.set_scroll_top(el.scroll_height());
+                // Mirror the post-clamp scrollTop into `scroll_top_sig`
+                // immediately. Without this, the windowing Memo only
+                // sees the new scroll position once the `scroll` event
+                // round-trips through the listener — leaving a window
+                // of one or more frames where `scroll_top` is at the
+                // bottom but `visible_window` still has the old
+                // `start = 0`. The user would see the scrollbar at the
+                // end but the rendered rows from index 0, with the
+                // bottom-pad spacer covering the entire visible region.
+                scroll_top_sig.set(el.scroll_top() as f64);
             },
             std::time::Duration::from_millis(0),
         );
