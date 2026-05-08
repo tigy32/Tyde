@@ -2914,9 +2914,18 @@ fn try_claim_review_action(
 }
 
 /// Public entry — used by the agent header's "Review changes" button.
-/// Sends `ReviewCreate` on `/project/<id>` and tags the (host, project)
-/// pair as create-pending so the button disables until the server's
-/// `ReviewListChanged` echoes back.
+///
+/// At most one Draft review per project at a time. If one already
+/// exists for the active agent's project we just focus its tab (and
+/// open it if it isn't open yet) instead of asking the server for a
+/// new one — otherwise the user ends up with a long stack of empty
+/// drafts that have to be cancelled one at a time. The server enforces
+/// the same invariant with a `Conflict` `CommandError` for any caller
+/// that bypasses this check (MCP, an older client).
+///
+/// Otherwise sends `ReviewCreate` on `/project/<id>` and tags the
+/// (host, project) pair as create-pending so the button disables until
+/// the server's `ReviewListChanged` echoes back.
 pub fn create_review_for_active_agent(state: &AppState) {
     let Some(active_agent) = state.active_agent.get_untracked() else {
         return;
@@ -2934,6 +2943,28 @@ pub fn create_review_for_active_agent(state: &AppState) {
         log::warn!("create_review_for_active_agent: agent has no project — skipping");
         return;
     };
+
+    let existing_draft = state.review_summaries.with_untracked(|map| {
+        map.get(&project_id).and_then(|summaries| {
+            summaries
+                .iter()
+                .filter(|s| matches!(s.status, ReviewStatus::Draft))
+                .max_by_key(|s| s.updated_at_ms)
+                .map(|s| s.id.clone())
+        })
+    });
+    if let Some(review_id) = existing_draft {
+        let label = review_tab_label(&review_id);
+        state.open_tab(
+            TabContent::Review {
+                host_id: host_id.clone(),
+                review_id,
+            },
+            label,
+            true,
+        );
+        return;
+    }
 
     let mut claimed = false;
     state.review_create_pending.update(|map| {

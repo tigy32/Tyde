@@ -2455,6 +2455,31 @@ impl HostHandle {
             )
         };
 
+        // One Draft per project. Prior implementation let callers pile
+        // up an unbounded stack of empty drafts that the user then had
+        // to cancel one at a time. The frontend already routes the
+        // "Review changes" click to the existing Draft when one
+        // exists; this check enforces the same invariant for any
+        // caller that bypasses the UI (MCP, an older client).
+        let existing = review_registry
+            .summaries(project_id.clone())
+            .await
+            .map_err(|error| {
+                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+            })?;
+        if let Some(draft) = existing
+            .into_iter()
+            .find(|summary| matches!(summary.status, protocol::ReviewStatus::Draft))
+        {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "project {} already has a draft review {}; submit or cancel it first",
+                    project_id, draft.id
+                ),
+            ));
+        }
+
         let project = load_project(&project_store, &project_id, OPERATION).await?;
         let origin_start = origin_agent.snapshot().await.ok_or_else(|| {
             AppError::not_found(

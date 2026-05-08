@@ -7,15 +7,15 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentId, AgentStartPayload, BackendKind, ChatEvent, DiffContextMode, Envelope, FrameKind,
-    MessageOrigin, MessageSender, NewAgentPayload, Project, ProjectCreatePayload, ProjectDiffScope,
-    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
-    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
-    ReviewAiReviewerStatus, ReviewAnchor, ReviewCommentId, ReviewCommentSource,
-    ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewEventPayload,
-    ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubscribePayload,
-    ReviewSuggestedComment, ReviewSuggestionState, SessionId, SessionListPayload, SpawnAgentParams,
-    SpawnAgentPayload,
+    AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode, CommandErrorPayload,
+    DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
+    ProjectCreatePayload, ProjectDiffScope, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review, ReviewActionPayload,
+    ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor, ReviewCommentId,
+    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
+    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
+    ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, SessionId,
+    SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -917,6 +917,77 @@ async fn cancel_rules_for_draft_and_submitted_reviews() {
     )
     .await;
     assert!(!error.fatal);
+}
+
+/// At-most-one Draft per project. The frontend routes the
+/// "Review changes" click to the existing Draft, but a misbehaving
+/// caller (MCP, an older client) could still ask the server for a
+/// second one — the server has to fail closed with a
+/// `Conflict` `CommandError` so the user doesn't accumulate a stack
+/// of empty drafts. Submitting or cancelling the existing Draft has
+/// to make a new create succeed again.
+#[tokio::test]
+async fn second_review_create_is_rejected_while_a_draft_exists() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+
+    let first = create_review(&mut client, &project, &agent).await;
+
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                origin_agent_id: agent.agent_id.clone(),
+                selection: ReviewDiffSelection::AllUncommitted,
+            },
+        )
+        .await
+        .expect("send second review create");
+    let envelope = loop {
+        let env = next_env(&mut client, "second review_create rejection").await;
+        if env.kind == FrameKind::CommandError {
+            break env;
+        }
+    };
+    let error: CommandErrorPayload = envelope.parse_payload().expect("command error payload");
+    assert_eq!(error.operation, "review_create");
+    assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(!error.fatal);
+    assert!(
+        error.message.contains("already has a draft review"),
+        "unexpected review_create error: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains(&first.id.0),
+        "expected error to name the existing draft id, got: {}",
+        error.message
+    );
+
+    client
+        .review_action(&first.id, ReviewActionPayload::Cancel)
+        .await
+        .expect("cancel first draft");
+    match expect_review_event(&mut client, "first draft cancel").await {
+        ReviewEventPayload::StatusChanged {
+            status: ReviewStatus::Cancelled { .. },
+        } => {}
+        other => panic!("expected cancelled status, got {other:?}"),
+    }
+
+    let second = create_review(&mut client, &project, &agent).await;
+    assert_ne!(
+        second.id, first.id,
+        "second create after cancel should yield a fresh review id"
+    );
+    assert!(matches!(second.status, ReviewStatus::Draft));
 }
 
 #[tokio::test]
