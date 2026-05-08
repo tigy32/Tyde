@@ -3,11 +3,15 @@ use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::Envelope;
+use crate::types::SeqMismatch;
 
 #[derive(Debug)]
 pub enum FrameError {
     Io(io::Error),
     Json(serde_json::Error),
+    /// Peer sent a frame that violates the wire protocol (e.g. per-stream
+    /// sequence numbers out of order). Callers should close the connection.
+    Protocol(String),
 }
 
 impl From<io::Error> for FrameError {
@@ -19,6 +23,32 @@ impl From<io::Error> for FrameError {
 impl From<serde_json::Error> for FrameError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<SeqMismatch> for FrameError {
+    fn from(value: SeqMismatch) -> Self {
+        Self::Protocol(value.to_string())
+    }
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "io error: {err}"),
+            Self::Json(err) => write!(f, "json error: {err}"),
+            Self::Protocol(msg) => write!(f, "protocol violation: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Json(err) => Some(err),
+            Self::Protocol(_) => None,
+        }
     }
 }
 

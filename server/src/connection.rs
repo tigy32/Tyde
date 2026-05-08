@@ -177,7 +177,18 @@ async fn app_loop(
                     "server received envelope"
                 );
 
-                incoming_seq.validate(&envelope.stream, envelope.seq, envelope.kind);
+                if let Err(error) =
+                    incoming_seq.validate(&envelope.stream, envelope.seq, envelope.kind)
+                {
+                    tracing::warn!(
+                        stream = %envelope.stream,
+                        seq = envelope.seq,
+                        kind = %envelope.kind,
+                        %error,
+                        "closing connection after protocol violation",
+                    );
+                    return Err(error.into());
+                }
 
                 let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;

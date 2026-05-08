@@ -62,7 +62,17 @@ where
     };
 
     let mut incoming_seq = SeqValidator::new();
-    incoming_seq.validate(&first.stream, first.seq, first.kind);
+    if let Err(error) = incoming_seq.validate(&first.stream, first.seq, first.kind) {
+        let message = format!("handshake frame failed protocol validation: {error}");
+        let reject = RejectPayload {
+            code: RejectCode::InvalidHandshake,
+            message: message.clone(),
+            server_protocol_version: config.protocol_version,
+            server_tyde_version: config.tyde_version,
+        };
+        send_reject(&mut write_half, first.stream.clone(), reject).await?;
+        return Err(HandshakeError::InvalidHandshake(message));
+    }
 
     if first.kind != FrameKind::Hello {
         let reject = RejectPayload {

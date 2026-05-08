@@ -27,6 +27,15 @@ fn next_seq(host_id: &str, stream: &StreamPath) -> u64 {
     })
 }
 
+/// Forget outbound sequence counters for a host. Called on disconnect so that
+/// a subsequent reconnect starts each stream at seq=0 again, which is what
+/// the server's freshly-constructed `SeqValidator` expects.
+pub fn clear_host_seqs(host_id: &str) {
+    SEQ_MAP.with(|map| {
+        map.borrow_mut().retain(|(h, _), _| h != host_id);
+    });
+}
+
 pub async fn send_frame<T: Serialize>(
     host_id: &str,
     stream: StreamPath,

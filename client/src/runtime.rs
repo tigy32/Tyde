@@ -540,7 +540,12 @@ async fn read_pump(
     shared: std::sync::Weak<Shared>,
 ) {
     while let Ok(Some(envelope)) = read_envelope(&mut reader).await {
-        incoming_seq.validate(&envelope.stream, envelope.seq, envelope.kind);
+        if incoming_seq
+            .validate(&envelope.stream, envelope.seq, envelope.kind)
+            .is_err()
+        {
+            break;
+        }
 
         let Some(shared) = shared.upgrade() else {
             break;

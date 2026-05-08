@@ -507,7 +507,7 @@ impl Connection {
         };
 
         self.incoming_seq
-            .validate(&envelope.stream, envelope.seq, envelope.kind);
+            .validate(&envelope.stream, envelope.seq, envelope.kind)?;
 
         if envelope.stream.0.starts_with("/host/") {
             match envelope.kind {
@@ -1019,7 +1019,9 @@ where
     };
 
     let mut incoming_seq = SeqValidator::new();
-    incoming_seq.validate(&response.stream, response.seq, response.kind);
+    incoming_seq
+        .validate(&response.stream, response.seq, response.kind)
+        .map_err(|err| HandshakeError::Frame(err.into()))?;
 
     if response.stream != stream_path {
         return Err(HandshakeError::StreamMismatch {

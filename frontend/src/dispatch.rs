@@ -52,6 +52,16 @@ impl FrontendSeqValidator {
         self.expected.insert(key, expected + 1);
         Ok(())
     }
+
+    fn forget_host(&mut self, host_id: &str) {
+        self.expected.retain(|(h, _), _| h != host_id);
+    }
+}
+
+/// Drop per-host inbound sequence state. Matches the outbound counterpart in
+/// `send::clear_host_seqs` so a reconnect sees seq=0 again on both sides.
+pub fn clear_host_seqs(host_id: &str) {
+    INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
 }
 
 thread_local! {

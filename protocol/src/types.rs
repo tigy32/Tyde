@@ -1622,6 +1622,26 @@ pub struct TaskList {
     pub tasks: Vec<Task>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqMismatch {
+    pub stream: StreamPath,
+    pub kind: FrameKind,
+    pub expected: u64,
+    pub got: u64,
+}
+
+impl std::fmt::Display for SeqMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sequence mismatch for stream {} kind {}: expected {}, got {}",
+            self.stream, self.kind, self.expected, self.got
+        )
+    }
+}
+
+impl std::error::Error for SeqMismatch {}
+
 #[derive(Debug, Default)]
 pub struct SeqValidator {
     expected: HashMap<StreamPath, u64>,
@@ -1632,12 +1652,22 @@ impl SeqValidator {
         Self::default()
     }
 
-    pub fn validate(&mut self, stream: &StreamPath, seq: u64, kind: FrameKind) {
+    pub fn validate(
+        &mut self,
+        stream: &StreamPath,
+        seq: u64,
+        kind: FrameKind,
+    ) -> Result<(), SeqMismatch> {
         let expected = self.expected.get(stream).copied().unwrap_or(0);
-        assert_eq!(
-            seq, expected,
-            "sequence mismatch for stream {stream} kind {kind}: expected {expected}, got {seq}"
-        );
+        if seq != expected {
+            return Err(SeqMismatch {
+                stream: stream.clone(),
+                kind,
+                expected,
+                got: seq,
+            });
+        }
         self.expected.insert(stream.clone(), expected + 1);
+        Ok(())
     }
 }
