@@ -11,10 +11,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
+use protocol::BackendAccessMode;
+
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
 use crate::process_env;
+use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
@@ -26,7 +29,8 @@ const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX: u64 = 400_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
-const CODEX_FORCED_THREAD_SANDBOX: &str = "danger-full-access";
+const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
+const CODEX_READ_ONLY_SANDBOX: &str = "read-only";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 static DISCOVERED_MODELS: OnceLock<Vec<protocol::SelectOption>> = OnceLock::new();
@@ -52,6 +56,7 @@ impl CodexSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -59,6 +64,7 @@ impl CodexSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            access_mode,
         )
         .await
     }
@@ -68,6 +74,7 @@ impl CodexSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -75,6 +82,7 @@ impl CodexSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            access_mode,
         )
         .await
     }
@@ -84,6 +92,7 @@ impl CodexSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -91,6 +100,7 @@ impl CodexSession {
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            access_mode,
         )
         .await
     }
@@ -101,6 +111,7 @@ impl CodexSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let steering_tempfile = match steering_content {
             Some(content) if !content.trim().is_empty() => {
@@ -112,6 +123,7 @@ impl CodexSession {
             ssh_host.as_deref(),
             startup_mcp_servers,
             steering_tempfile.as_deref(),
+            access_mode,
         )
         .await?;
 
@@ -148,7 +160,7 @@ impl CodexSession {
                 "thread/start",
                 json!({
                     "cwd": cwd,
-                    "sandbox": CODEX_FORCED_THREAD_SANDBOX,
+                    "sandbox": codex_sandbox_mode(access_mode),
                     "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
                     "ephemeral": ephemeral,
                     "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
@@ -179,6 +191,7 @@ impl CodexSession {
                 model,
                 reasoning_effort: Some("xhigh".to_string()),
                 approval_policy: None,
+                access_mode,
                 turn_network_access: codex_has_http_mcp_servers(startup_mcp_servers),
                 active_turn_id: None,
                 active_stream: None,
@@ -271,7 +284,8 @@ impl CodexSession {
 }
 
 pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, String> {
-    let (rpc, _inbound_rx) = CodexRpc::spawn(ssh_host, &[], None).await?;
+    let (rpc, _inbound_rx) =
+        CodexRpc::spawn(ssh_host, &[], None, BackendAccessMode::Unrestricted).await?;
 
     rpc.request(
         "initialize",
@@ -300,13 +314,14 @@ pub async fn discover_models() {
 
     // `model/list` is a JSON-RPC method, not a CLI subcommand. Spawn a short-lived
     // app-server session to call it, the same way query_account_rate_limits does.
-    let (rpc, _inbound_rx) = match CodexRpc::spawn(None, &[], None).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            tracing::warn!("Codex model discovery: failed to spawn app-server: {err}");
-            return;
-        }
-    };
+    let (rpc, _inbound_rx) =
+        match CodexRpc::spawn(None, &[], None, BackendAccessMode::Unrestricted).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!("Codex model discovery: failed to spawn app-server: {err}");
+                return;
+            }
+        };
 
     let init_result = rpc
         .request(
@@ -495,6 +510,7 @@ struct CodexState {
     model: Option<String>,
     reasoning_effort: Option<String>,
     approval_policy: Option<String>,
+    access_mode: BackendAccessMode,
     turn_network_access: bool,
     active_turn_id: Option<String>,
     active_stream: Option<ActiveStreamState>,
@@ -553,6 +569,7 @@ impl CodexInner {
                     model_override,
                     effort_override,
                     approval_policy_override,
+                    access_mode,
                     turn_network_access,
                 ) = {
                     let mut state = self.state.lock().await;
@@ -562,6 +579,7 @@ impl CodexInner {
                         state.model.clone(),
                         state.reasoning_effort.clone(),
                         state.approval_policy.clone(),
+                        state.access_mode,
                         state.turn_network_access,
                     )
                 };
@@ -597,9 +615,7 @@ impl CodexInner {
                 let approval_policy = approval_policy_override
                     .unwrap_or_else(|| CODEX_FORCED_APPROVAL_POLICY.to_string());
                 params["approvalPolicy"] = Value::String(approval_policy);
-                // Force full-access sandbox on each turn so resumed/continued threads cannot fall back to a more restrictive default.
-                params["sandboxPolicy"] =
-                    codex_danger_full_access_sandbox_policy(turn_network_access);
+                params["sandboxPolicy"] = codex_sandbox_policy(access_mode, turn_network_access);
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
                     self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
@@ -1880,6 +1896,15 @@ impl CodexInner {
                         }
                     }
                 }));
+            }
+            "mcpServer/elicitation/request" => {
+                let result = codex_mcp_elicitation_result(params);
+                if let Err(err) = self.rpc.respond(id, result).await {
+                    self.emit_event(json!({
+                        "kind": "SubprocessStderr",
+                        "data": format!("Failed to resolve Codex MCP elicitation request: {err}")
+                    }));
+                }
             }
             "item/tool/call" => {
                 let call_id = params
@@ -4092,6 +4117,69 @@ fn value_str_len(value: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn codex_mcp_elicitation_result(params: &Value) -> Value {
+    let server_name = params
+        .get("serverName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let approval_kind = params
+        .get("_meta")
+        .and_then(|meta| meta.get("codex_approval_kind"))
+        .and_then(Value::as_str);
+    if approval_kind == Some("mcp_tool_call")
+        && matches!(
+            server_name,
+            "tyde-debug" | "tyde-agent-control" | REVIEW_FEEDBACK_MCP_SERVER_NAME
+        )
+    {
+        return json!({
+            "action": "accept",
+            "content": {}
+        });
+    }
+
+    json!({
+        "action": "cancel"
+    })
+}
+
+fn codex_server_request_result(method: &str, params: &Value) -> Value {
+    match method {
+        "mcpServer/elicitation/request" => codex_mcp_elicitation_result(params),
+        _ => json!({"ignored": true, "reason": "unsupported_server_request"}),
+    }
+}
+
+async fn respond_codex_spawn_server_request(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    id: Value,
+    method: &str,
+    params: &Value,
+) {
+    let result = codex_server_request_result(method, params);
+    if let Err(err) = codex_rpc_respond_stdin(stdin, id, result).await {
+        tracing::warn!("Failed to resolve Codex server request {method}: {err}");
+    }
+}
+
+async fn codex_rpc_respond_stdin(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    id: Value,
+    result: Value,
+) -> Result<(), String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    });
+    let mut writer = stdin.lock().await;
+    let line = format!("{payload}\n");
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|err| format!("Failed to write to Codex stdin: {err}"))
+}
+
 fn parse_approval_decision(message: &str) -> &'static str {
     let normalized = message.trim().to_ascii_lowercase();
     if normalized.starts_with("cancel") {
@@ -4133,8 +4221,47 @@ fn codex_has_http_mcp_servers(startup_mcp_servers: &[StartupMcpServer]) -> bool 
     })
 }
 
+fn codex_sandbox_mode(access_mode: BackendAccessMode) -> &'static str {
+    match access_mode {
+        BackendAccessMode::Unrestricted => CODEX_UNRESTRICTED_SANDBOX,
+        BackendAccessMode::ReadOnly => CODEX_READ_ONLY_SANDBOX,
+    }
+}
+
 fn codex_danger_full_access_sandbox_policy(_network_access: bool) -> Value {
     json!({ "type": "dangerFullAccess" })
+}
+
+fn codex_read_only_sandbox_policy(network_access: bool) -> Value {
+    json!({
+        "type": "readOnly",
+        "networkAccess": network_access,
+    })
+}
+
+fn codex_sandbox_policy(access_mode: BackendAccessMode, network_access: bool) -> Value {
+    match access_mode {
+        BackendAccessMode::Unrestricted => codex_danger_full_access_sandbox_policy(network_access),
+        BackendAccessMode::ReadOnly => codex_read_only_sandbox_policy(network_access),
+    }
+}
+
+fn codex_app_server_args(
+    access_mode: BackendAccessMode,
+    config_overrides: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "--sandbox".to_string(),
+        codex_sandbox_mode(access_mode).to_string(),
+        "app-server".to_string(),
+        "--listen".to_string(),
+        "stdio://".to_string(),
+    ];
+    for override_key_value in config_overrides {
+        args.push("-c".to_string());
+        args.push(override_key_value.clone());
+    }
+    args
 }
 
 fn normalize_reasoning_effort(raw: &str) -> Option<String> {
@@ -4321,6 +4448,7 @@ impl CodexRpc {
         ssh_host: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_tempfile: Option<&std::path::Path>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
         if let Some(path) = steering_tempfile {
@@ -4330,21 +4458,12 @@ impl CodexRpc {
             ));
         }
         let mut child = if let Some(host) = ssh_host {
-            let mut remote_args = vec![
-                "app-server".to_string(),
-                "--listen".to_string(),
-                "stdio://".to_string(),
-            ];
-            for override_key_value in &config_overrides {
-                remote_args.push("-c".to_string());
-                remote_args.push(override_key_value.clone());
-            }
+            let remote_args = codex_app_server_args(access_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
             let mut cmd = Command::new("codex");
-            cmd.arg("app-server").arg("--listen").arg("stdio://");
-            for override_key_value in &config_overrides {
-                cmd.arg("-c").arg(override_key_value);
+            for arg in codex_app_server_args(access_mode, &config_overrides) {
+                cmd.arg(arg);
             }
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
@@ -4756,6 +4875,7 @@ impl Backend for CodexBackend {
             let mut ready_tx = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
+            let access_mode = config.resolved_spawn_config.access_mode;
             let resolved_settings = resolve_session_settings(&config);
             let model_override = match resolved_settings.0.get("model") {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
@@ -4780,9 +4900,8 @@ impl Backend for CodexBackend {
             let turn_network_access = codex_has_http_mcp_servers(&config.startup_mcp_servers);
             // --- spawn codex CLI ------------------------------------------------
             let mut command = Command::new("codex");
-            command.arg("app-server").arg("--listen").arg("stdio://");
-            for override_key_value in &startup_mcp_config_overrides {
-                command.arg("-c").arg(override_key_value);
+            for arg in codex_app_server_args(access_mode, &startup_mcp_config_overrides) {
+                command.arg(arg);
             }
             if let Some(path) = process_env::resolved_child_process_path() {
                 command.env("PATH", path);
@@ -4811,7 +4930,7 @@ impl Backend for CodexBackend {
             let next_id = Arc::new(AtomicU64::new(1));
 
             // --- stdout reader task ---------------------------------------------
-            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<(String, Value)>();
+            let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<CodexInbound>();
             {
                 let pending = Arc::clone(&pending);
                 let notif_tx = notif_tx.clone();
@@ -4850,10 +4969,21 @@ impl Backend for CodexBackend {
                             }
                         }
 
-                        // Notification (has method, no id or has id as server-request)
+                        // Notification (has method, no id) or server request (has method and id).
                         if let Some(method) = parsed.get("method").and_then(Value::as_str) {
                             let params = parsed.get("params").cloned().unwrap_or(Value::Null);
-                            let _ = notif_tx.send((method.to_string(), params));
+                            if let Some(id) = parsed.get("id").cloned() {
+                                let _ = notif_tx.send(CodexInbound::ServerRequest {
+                                    id,
+                                    method: method.to_string(),
+                                    params,
+                                });
+                            } else {
+                                let _ = notif_tx.send(CodexInbound::Notification {
+                                    method: method.to_string(),
+                                    params,
+                                });
+                            }
                         }
                     }
                 });
@@ -4931,7 +5061,7 @@ impl Backend for CodexBackend {
                 "thread/start",
                 json!({
                     "cwd": cwd,
-                    "sandbox": CODEX_FORCED_THREAD_SANDBOX,
+                    "sandbox": codex_sandbox_mode(access_mode),
                     "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
                 }),
             )
@@ -4985,6 +5115,7 @@ impl Backend for CodexBackend {
             let thread_id_for_input = thread_id.clone();
             let model_for_input = model_override.clone();
             let effort_for_input = effort_override.clone();
+            let access_mode_for_input = access_mode;
 
             if events_tx
                 .send(backend_user_message(
@@ -5039,7 +5170,7 @@ impl Backend for CodexBackend {
             initial_turn_params["approvalPolicy"] =
                 Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
             initial_turn_params["sandboxPolicy"] =
-                codex_danger_full_access_sandbox_policy(turn_network_access);
+                codex_sandbox_policy(access_mode, turn_network_access);
             if let Err(err) = rpc_request(
                 &stdin_for_input,
                 &pending_for_input,
@@ -5062,7 +5193,28 @@ impl Backend for CodexBackend {
             loop {
                 tokio::select! {
                     notif = notif_rx.recv() => {
-                        let Some((method, params)) = notif else { break };
+                        let Some(inbound) = notif else { break };
+                        let (method, params) = match inbound {
+                            CodexInbound::Notification { method, params } => (method, params),
+                            CodexInbound::ServerRequest { id, method, params } => {
+                                respond_codex_spawn_server_request(
+                                    &stdin_for_input,
+                                    id,
+                                    &method,
+                                    &params,
+                                )
+                                .await;
+                                continue;
+                            }
+                            CodexInbound::Stderr(line) => {
+                                tracing::warn!("Codex stderr: {line}");
+                                continue;
+                            }
+                            CodexInbound::Closed { exit_code } => {
+                                tracing::warn!(?exit_code, "Codex app-server closed");
+                                break;
+                            }
+                        };
                         if is_reasoning_notification_method(method.as_str()) {
                             reasoning_notification_count = reasoning_notification_count.saturating_add(1);
                         }
@@ -5539,7 +5691,10 @@ impl Backend for CodexBackend {
                                 turn_params["approvalPolicy"] =
                                     Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
                                 turn_params["sandboxPolicy"] =
-                                    codex_danger_full_access_sandbox_policy(turn_network_access);
+                                    codex_sandbox_policy(
+                                        access_mode_for_input,
+                                        turn_network_access,
+                                    );
                                 let _ = rpc_request(
                                     &stdin_for_input,
                                     &pending_for_input,
@@ -5635,6 +5790,7 @@ impl Backend for CodexBackend {
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
+                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -6010,6 +6166,7 @@ mod tests {
             model: Some("codex".to_string()),
             reasoning_effort: Some("xhigh".to_string()),
             approval_policy: None,
+            access_mode: BackendAccessMode::Unrestricted,
             turn_network_access: false,
             active_turn_id: Some("turn-test".to_string()),
             active_stream: Some(ActiveStreamState {
@@ -6278,8 +6435,14 @@ mod tests {
 
             let workspace_roots = vec![workspace.to_string_lossy().to_string()];
             live_test_log("spawning CodexSession");
-            let (session, mut event_rx) = CodexSession::spawn(&workspace_roots, None, &[], None)
-                .await
+            let (session, mut event_rx) = CodexSession::spawn(
+                &workspace_roots,
+                None,
+                &[],
+                None,
+                BackendAccessMode::Unrestricted,
+            )
+            .await
                 .expect("spawn codex session");
             live_test_log("CodexSession spawned");
             let emitter = Arc::new(RecordingSubAgentEmitter::new());
@@ -6546,10 +6709,15 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 },
             }];
 
-            let (session, _event_rx) =
-                CodexSession::spawn(&workspace_roots, None, &startup_mcp_servers, None)
-                    .await
-                    .expect("spawn codex session");
+            let (session, _event_rx) = CodexSession::spawn(
+                &workspace_roots,
+                None,
+                &startup_mcp_servers,
+                None,
+                BackendAccessMode::Unrestricted,
+            )
+            .await
+            .expect("spawn codex session");
 
             let server = live_test_wait_for_mcp_tool(
                 &session,
@@ -6671,10 +6839,15 @@ If you skip spawn_agent or wait_agent, this test fails."#;
                 },
             }];
 
-            let (session, _event_rx) =
-                CodexSession::spawn(&workspace_roots, None, &startup_mcp_servers, None)
-                    .await
-                    .expect("spawn codex session");
+            let (session, _event_rx) = CodexSession::spawn(
+                &workspace_roots,
+                None,
+                &startup_mcp_servers,
+                None,
+                BackendAccessMode::Unrestricted,
+            )
+            .await
+            .expect("spawn codex session");
 
             let server = live_test_wait_for_mcp_tool(
                 &session,
@@ -6793,8 +6966,14 @@ If you skip spawn_agent or wait_agent, this test fails."#;
             }];
 
             let (session, mut event_rx) =
-                CodexSession::spawn(&workspace_roots, None, &startup_mcp_servers, None)
-                    .await
+                CodexSession::spawn(
+                    &workspace_roots,
+                    None,
+                    &startup_mcp_servers,
+                    None,
+                    BackendAccessMode::Unrestricted,
+                )
+                .await
                     .expect("spawn codex session");
 
             let _ = live_test_wait_for_mcp_tool(
@@ -7584,6 +7763,57 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
+    fn codex_mcp_elicitation_approves_tyde_review_tools() {
+        let result = codex_mcp_elicitation_result(&json!({
+            "serverName": REVIEW_FEEDBACK_MCP_SERVER_NAME,
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call"
+            }
+        }));
+
+        assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
+        assert!(result.get("content").and_then(Value::as_object).is_some());
+    }
+
+    #[test]
+    fn codex_mcp_elicitation_cancels_unknown_tools() {
+        let result = codex_mcp_elicitation_result(&json!({
+            "serverName": "external-mcp",
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call"
+            }
+        }));
+
+        assert_eq!(result.get("action").and_then(Value::as_str), Some("cancel"));
+    }
+
+    #[test]
+    fn codex_server_request_result_uses_elicitation_policy() {
+        let result = codex_server_request_result(
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": REVIEW_FEEDBACK_MCP_SERVER_NAME,
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call"
+                }
+            }),
+        );
+
+        assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
+    }
+
+    #[test]
+    fn codex_server_request_result_resolves_unknown_requests() {
+        let result = codex_server_request_result("unknown/request", &json!({}));
+
+        assert_eq!(result.get("ignored").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result.get("reason").and_then(Value::as_str),
+            Some("unsupported_server_request")
+        );
+    }
+
+    #[test]
     fn codex_danger_full_access_sandbox_policy_is_danger_full_access() {
         let policy = codex_danger_full_access_sandbox_policy(false);
         assert_eq!(
@@ -7601,6 +7831,22 @@ Do not describe the tool, and do not skip the tool call."#;
             Some("dangerFullAccess")
         );
         assert_eq!(policy.get("networkAccess"), None);
+    }
+
+    #[test]
+    fn codex_read_only_access_mode_sets_cli_and_turn_sandbox() {
+        let args = codex_app_server_args(BackendAccessMode::ReadOnly, &[]);
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
+            ["--sandbox", "read-only", "app-server"]
+        );
+
+        let policy = codex_sandbox_policy(BackendAccessMode::ReadOnly, true);
+        assert_eq!(policy.get("type").and_then(Value::as_str), Some("readOnly"));
+        assert_eq!(
+            policy.get("networkAccess").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

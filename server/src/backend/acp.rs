@@ -8,6 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use protocol::BackendAccessMode;
+
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
 use crate::process_env;
 const ACP_DEFAULT_FILE_LINE_LIMIT: usize = 2_000;
@@ -88,12 +90,14 @@ pub struct AcpBridge {
     inbound_tx: mpsc::UnboundedSender<AcpInbound>,
     terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminal>>>>,
     next_terminal_id: AtomicU64,
+    access_mode: BackendAccessMode,
 }
 
 impl AcpBridge {
     pub async fn spawn(
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
         let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, ssh_host).await?;
         Ok((
@@ -102,6 +106,7 @@ impl AcpBridge {
                 inbound_tx,
                 terminals: Mutex::new(HashMap::new()),
                 next_terminal_id: AtomicU64::new(1),
+                access_mode,
             },
             inbound_rx,
         ))
@@ -170,6 +175,11 @@ impl AcpBridge {
         method: &str,
         params: &Value,
     ) -> Result<Option<Value>, String> {
+        if self.access_mode == BackendAccessMode::ReadOnly
+            && let Some(message) = acp_read_only_rejection(method)
+        {
+            return Err(message);
+        }
         match method {
             "fs/read_text_file" => self.handle_fs_read_text_file(params).await.map(Some),
             "fs/write_text_file" => self.handle_fs_write_text_file(params).await.map(Some),
@@ -444,6 +454,13 @@ impl AcpBridge {
     }
 
     async fn handle_request_permission(&self, params: &Value) -> Result<Value, String> {
+        if self.access_mode == BackendAccessMode::ReadOnly {
+            return Ok(json!({
+                "outcome": {
+                    "outcome": "cancelled"
+                }
+            }));
+        }
         let options = params
             .get("options")
             .and_then(Value::as_array)
@@ -961,6 +978,32 @@ fn terminal_id_from_params(params: &Value) -> Result<String, String> {
         .ok_or("terminal method requires non-empty 'terminalId'".to_string())
 }
 
+fn acp_read_only_rejection(method: &str) -> Option<String> {
+    match method {
+        "fs/write_text_file"
+        | "fs/writeTextFile"
+        | "fs/write_file"
+        | "fs/writeFile"
+        | "acp.fs.write_text_file"
+        | "acp.fs.writeTextFile"
+        | "acp.fs.write_file"
+        | "acp.fs.writeFile"
+        | "terminal/create"
+        | "terminal/execute_command"
+        | "terminal/executeCommand"
+        | "terminal/kill"
+        | "terminal/release"
+        | "acp.terminal.create"
+        | "acp.terminal.execute_command"
+        | "acp.terminal.executeCommand"
+        | "acp.terminal.kill"
+        | "acp.terminal.release" => Some(format!(
+            "BackendAccessMode::ReadOnly rejects mutating ACP request '{method}'"
+        )),
+        _ => None,
+    }
+}
+
 fn select_permission_option(options: &[Value]) -> Option<String> {
     let find_by_kind = |kind: &str| {
         options.iter().find_map(|option| {
@@ -1244,5 +1287,19 @@ impl AcpRpc {
         if let Some(child) = self.child.lock().await.as_mut() {
             let _ = child.start_kill();
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_read_only_rejects_write_and_terminal_requests() {
+        assert!(acp_read_only_rejection("fs/write_text_file").is_some());
+        assert!(acp_read_only_rejection("acp.fs.write_file").is_some());
+        assert!(acp_read_only_rejection("terminal/create").is_some());
+        assert!(acp_read_only_rejection("terminal/execute_command").is_some());
+        assert!(acp_read_only_rejection("fs/read_text_file").is_none());
+        assert!(acp_read_only_rejection("session/request_permission").is_none());
     }
 }

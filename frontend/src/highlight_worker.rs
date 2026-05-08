@@ -30,17 +30,21 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_arch = "wasm32")]
 use crate::syntax_highlight::LineTokens;
 
-/// Lines per chunk batched back to main. Smaller chunks mean each
-/// arrives sooner and the visible viewport gets coloured earlier — the
-/// "first chunk" perceived latency is roughly chunk_size × per-line
-/// tokenize cost (~0.3ms in release, ~3ms in debug). 50 lines lands the
-/// first chunk in ~15ms release / ~150ms debug, well under the
-/// "uncoloured flash" threshold for a typical viewport.
-///
-/// Also sets cancellation latency: a superseding request waits for the
-/// current chunk to finish before the worker checks the active task id.
+/// Lines per chunk batched back to main, after the warm-up first chunk.
+/// Smaller chunks mean each arrives sooner AND cancellation latency is
+/// shorter (the worker only checks the active task id between chunks).
+/// 50 lines × ~3ms/line debug ≈ 150ms cancellation latency, which is
+/// well below the human "click felt unresponsive" threshold.
 #[cfg(target_arch = "wasm32")]
 const CHUNK_SIZE: usize = 50;
+
+/// First chunk size — intentionally tiny so the very first viewport
+/// shows colored text quickly even on a cold worker (where the first
+/// `highlight_one` pays the onig regex-compile cost — ~hundreds of ms
+/// in debug). After this chunk lands the regex caches are warm and the
+/// rest of the file streams in at the larger `CHUNK_SIZE`.
+#[cfg(target_arch = "wasm32")]
+const FIRST_CHUNK_SIZE: usize = 10;
 
 /// Wire format for `main → worker`. Tagged enum keeps future variants
 /// (e.g. unified-diff hunk highlighting) easy to add.
@@ -49,13 +53,23 @@ const CHUNK_SIZE: usize = 50;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Request {
     /// Tokenize a whole file. The worker processes it in `CHUNK_SIZE`
-    /// slices and emits one `Chunk` per slice.
+    /// slices and emits one `Chunk` per slice. If `supersede_prior` is
+    /// true, the worker drops any in-flight tasks before starting this
+    /// one — used by callers that have a single active file open at a
+    /// time. Concurrent callers (e.g. side-by-side mode tokenizing
+    /// Old + New) pass false so neither side cancels the other.
     HighlightFile {
         task_id: u64,
         syntax_name: String,
         theme_name: String,
         lines: Vec<String>,
+        supersede_prior: bool,
     },
+    /// Drop every in-flight task. Sent by the client immediately
+    /// before a batch of `HighlightFile { supersede_prior: false }`
+    /// requests so the prior file's tokenization stops without
+    /// requiring per-task cancellation.
+    CancelAll,
 }
 
 /// Wire format for `worker → main`. Streamed; one `Chunk` per slice
@@ -77,7 +91,8 @@ pub enum Response {
 #[cfg(target_arch = "wasm32")]
 mod worker_impl {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::rc::Rc;
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
@@ -85,6 +100,14 @@ mod worker_impl {
     /// Entry point invoked by `syntax_worker.js` after wasm-init. Hooks a
     /// `message` listener on the worker global scope; never returns.
     pub fn worker_main() {
+        // Warm up syntect inside the worker so the first real
+        // `highlight_file` request doesn't pay the onig regex-compile
+        // cost (~hundreds of ms in debug). Runs synchronously here
+        // because the worker has nothing else to do until a request
+        // arrives — by which time SYNTAX_SET / THEME_SET are loaded
+        // and the Rust regexes are cached.
+        crate::syntax_highlight::warm_up();
+
         let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
 
         // The worker global is a `JsValue` we keep so the message
@@ -92,13 +115,17 @@ mod worker_impl {
         // can move it.
         let scope_for_handler = scope.clone();
 
-        // Latest task id seen. The handler drops a task as soon as a
-        // newer task id arrives. Cell is fine — workers are
-        // single-threaded.
-        let active_task: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Set of task ids that should keep running. New tasks insert
+        // into the set; superseding requests clear the set first;
+        // explicit `CancelAll` empties it. The async tokenize loop
+        // checks the set at each chunk boundary and exits if its id
+        // is no longer present. Multiple concurrent tasks are
+        // supported (e.g. SBS mode tokenizes Old + New in parallel).
+        let alive: Rc<RefCell<HashSet<u64>>> = Rc::new(RefCell::new(HashSet::new()));
 
         let handler = Closure::<dyn FnMut(web_sys::MessageEvent)>::new({
-            let active_task = active_task.clone();
+            let alive = alive.clone();
+            let scope_for_spawn = scope_for_handler.clone();
             move |evt: web_sys::MessageEvent| {
                 let value = evt.data();
                 let req: Request = match serde_wasm_bindgen::from_value(value) {
@@ -108,7 +135,16 @@ mod worker_impl {
                         return;
                     }
                 };
-                handle_request(req, &scope_for_handler, &active_task);
+                // Spawn the actual work so the message handler returns
+                // immediately. The async body yields between chunks via
+                // `setTimeout(0)` so newer message arrivals are picked
+                // up. Tasks that get superseded see their id removed
+                // from `alive` and exit at the next yield point.
+                let scope = scope_for_spawn.clone();
+                let alive = alive.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    handle_request(req, &scope, &alive).await;
+                });
             }
         });
 
@@ -121,19 +157,26 @@ mod worker_impl {
         handler.forget();
     }
 
-    fn handle_request(
+    async fn handle_request(
         req: Request,
         scope: &web_sys::DedicatedWorkerGlobalScope,
-        active_task: &Rc<Cell<u64>>,
+        alive: &Rc<RefCell<HashSet<u64>>>,
     ) {
         match req {
+            Request::CancelAll => {
+                alive.borrow_mut().clear();
+            }
             Request::HighlightFile {
                 task_id,
                 syntax_name,
                 theme_name,
                 lines,
+                supersede_prior,
             } => {
-                active_task.set(task_id);
+                if supersede_prior {
+                    alive.borrow_mut().clear();
+                }
+                alive.borrow_mut().insert(task_id);
 
                 // Apply theme inside the worker so the per-line
                 // highlight call uses the right palette.
@@ -146,18 +189,20 @@ mod worker_impl {
                 else {
                     // Unknown syntax: just emit Done so the client
                     // detaches its callback.
+                    alive.borrow_mut().remove(&task_id);
                     post(scope, &Response::Done { task_id });
                     return;
                 };
 
                 let mut hl = crate::syntax_highlight::LineHighlighter::new(syntax);
                 let mut start = 0usize;
+                let mut chunk_size = FIRST_CHUNK_SIZE;
                 while start < lines.len() {
-                    if active_task.get() != task_id {
-                        // Newer task arrived between chunks; abandon.
+                    if !alive.borrow().contains(&task_id) {
+                        // This task was cancelled or superseded.
                         return;
                     }
-                    let end = (start + CHUNK_SIZE).min(lines.len());
+                    let end = (start + chunk_size).min(lines.len());
                     let mut chunk: Vec<LineTokens> = Vec::with_capacity(end - start);
                     for line in &lines[start..end] {
                         chunk.push(hl.highlight_one(line));
@@ -171,10 +216,29 @@ mod worker_impl {
                         },
                     );
                     start = end;
+                    chunk_size = CHUNK_SIZE;
+                    // Yield to the JS event loop so newer messages
+                    // (more `HighlightFile` requests, or a
+                    // `CancelAll`) can be picked up.
+                    next_macrotask().await;
                 }
-                post(scope, &Response::Done { task_id });
+                let still_alive = alive.borrow_mut().remove(&task_id);
+                if still_alive {
+                    post(scope, &Response::Done { task_id });
+                }
             }
         }
+    }
+
+    /// Yield to the worker's JS event loop. Lets queued `message`
+    /// events fire so a new `HighlightFile` request can preempt the
+    /// in-flight one mid-file.
+    async fn next_macrotask() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+            let _ = scope.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
     fn post(scope: &web_sys::DedicatedWorkerGlobalScope, resp: &Response) {
@@ -377,12 +441,47 @@ pub mod client {
             })
         }
 
+        /// Drop all in-flight task callbacks AND tell the worker to
+        /// stop processing them. Used by callers that want to cancel
+        /// a prior file's worker tasks before spawning new ones —
+        /// typically called immediately before one or more
+        /// `highlight_file_concurrent` calls.
+        pub fn cancel_all(self: &Rc<Self>) {
+            self.active.borrow_mut().clear();
+            // Also tell the worker. Without this, the worker's task
+            // set keeps running (its tokenize loops produce chunks
+            // that just get dropped on the client side, but they
+            // burn worker CPU until they finish).
+            if let Ok(v) = serde_wasm_bindgen::to_value(&Request::CancelAll)
+                && let Err(e) = self.worker.post_message(&v)
+            {
+                log::error!("[hl-client] cancel_all post_message failed: {e:?}");
+            }
+        }
+
+        /// Ship a file's lines off to the worker for highlighting WITHOUT
+        /// cancelling other in-flight tasks. Used by callers that need
+        /// multiple concurrent tasks — e.g. side-by-side mode tokenizes
+        /// Old and New streams in parallel; cancelling one when the
+        /// other arrives would leave half the file uncolored.
+        pub fn highlight_file_concurrent(
+            self: &Rc<Self>,
+            syntax_name: String,
+            theme_name: String,
+            lines: Vec<String>,
+            on_chunk: ChunkCb,
+            on_done: DoneCb,
+        ) -> u64 {
+            self.spawn_inner(syntax_name, theme_name, lines, false, on_chunk, on_done)
+        }
+
         /// Ship a file's lines off to the worker for highlighting.
         /// `on_chunk` fires for each chunk of tokens (with the starting
         /// line index of that chunk). `on_done` fires once when
         /// processing finishes. Returns the task id; callers can
         /// implicitly cancel the previous task by spawning another (the
-        /// previous one's callbacks are dropped).
+        /// previous one's callbacks are dropped on both client and
+        /// worker sides).
         pub fn highlight_file(
             self: &Rc<Self>,
             syntax_name: String,
@@ -391,14 +490,24 @@ pub mod client {
             on_chunk: ChunkCb,
             on_done: DoneCb,
         ) -> u64 {
+            // Drop client-side callbacks for any prior tasks; the
+            // `supersede_prior: true` flag tells the worker to do the
+            // same on its end at the moment the new task is picked up.
+            self.active.borrow_mut().clear();
+            self.spawn_inner(syntax_name, theme_name, lines, true, on_chunk, on_done)
+        }
+
+        fn spawn_inner(
+            self: &Rc<Self>,
+            syntax_name: String,
+            theme_name: String,
+            lines: Vec<String>,
+            supersede_prior: bool,
+            on_chunk: ChunkCb,
+            on_done: DoneCb,
+        ) -> u64 {
             let task_id = self.next_task_id.get();
             self.next_task_id.set(task_id + 1);
-
-            // Drop callbacks for any prior in-flight tasks before
-            // recording the new one. This is the cancellation hook on
-            // the client side; the worker also checks the active task
-            // id at chunk boundaries.
-            self.active.borrow_mut().clear();
             self.active.borrow_mut().insert(
                 task_id,
                 Pending {
@@ -412,6 +521,7 @@ pub mod client {
                 syntax_name,
                 theme_name,
                 lines,
+                supersede_prior,
             };
             match serde_wasm_bindgen::to_value(&req) {
                 Ok(v) => {
@@ -455,6 +565,21 @@ impl HighlightClient {
         _on_done: Box<dyn FnOnce()>,
     ) -> u64 {
         unreachable!("HighlightClient::highlight_file is wasm32-only")
+    }
+
+    pub fn highlight_file_concurrent(
+        self: &std::rc::Rc<Self>,
+        _path: String,
+        _theme_name: String,
+        _lines: Vec<String>,
+        _on_chunk: Box<dyn FnMut(usize, Vec<crate::syntax_highlight::LineTokens>)>,
+        _on_done: Box<dyn FnOnce()>,
+    ) -> u64 {
+        unreachable!("HighlightClient::highlight_file_concurrent is wasm32-only")
+    }
+
+    pub fn cancel_all(self: &std::rc::Rc<Self>) {
+        unreachable!("HighlightClient::cancel_all is wasm32-only")
     }
 }
 

@@ -11,9 +11,9 @@ pub mod tycode;
 use std::collections::HashMap;
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, CustomAgentId, ImageData, SendMessagePayload, SessionId,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SpawnCostHint,
+    AgentInput, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId, ImageData,
+    SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -318,6 +318,12 @@ pub(crate) fn session_settings_to_json(values: &SessionSettingsValues) -> Value 
 
 pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -> Option<String> {
     let mut sections = Vec::new();
+    if config.access_mode == BackendAccessMode::ReadOnly {
+        sections.push(
+            "Backend access mode is read-only: do not edit or write files, run shell commands, or otherwise change state. Use only read-only file inspection and configured MCP tools."
+                .to_string(),
+        );
+    }
     if let Some(instructions) = config
         .instructions
         .as_ref()

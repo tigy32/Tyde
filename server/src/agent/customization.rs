@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use protocol::{
-    BackendKind, CustomAgentId, McpServerConfig, McpServerId, McpTransportConfig, ProjectId,
-    SkillId, ToolPolicy,
+    BackendAccessMode, BackendKind, CustomAgentId, McpServerConfig, McpServerId,
+    McpTransportConfig, ProjectId, SkillId, ToolPolicy,
 };
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
@@ -24,6 +24,7 @@ pub struct ResolvedSpawnConfig {
     pub skills: Vec<ResolvedSkill>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub tool_policy: ToolPolicy,
+    pub access_mode: BackendAccessMode,
 }
 
 impl Default for ResolvedSpawnConfig {
@@ -34,6 +35,7 @@ impl Default for ResolvedSpawnConfig {
             skills: Vec::new(),
             mcp_servers: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
+            access_mode: BackendAccessMode::Unrestricted,
         }
     }
 }
@@ -123,6 +125,7 @@ pub(crate) fn resolve_spawn_config(
         skills,
         mcp_servers,
         tool_policy,
+        access_mode: BackendAccessMode::Unrestricted,
     })
 }
 

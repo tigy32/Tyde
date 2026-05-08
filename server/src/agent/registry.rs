@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    AgentControlStatus, AgentId, AgentOrigin, AgentStartPayload, BackendKind, ChatEvent,
-    CustomAgentId, ProjectId, SendMessagePayload, SessionId, SessionSettingsSchema,
+    AgentControlStatus, AgentId, AgentOrigin, AgentStartPayload, BackendAccessMode, BackendKind,
+    ChatEvent, CustomAgentId, ProjectId, SendMessagePayload, SessionId, SessionSettingsSchema,
     SessionSettingsValues, SpawnCostHint,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -14,7 +14,9 @@ use crate::agent::customization::ResolvedSpawnConfig;
 use crate::agent::{AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor};
 use crate::backend::StartupMcpServer;
 use crate::backend::StartupMcpTransport;
-use crate::host::agent_control_mcp_url_for_agent;
+use crate::host::mcp_url_for_agent;
+use crate::review::ReviewRegistryHandle;
+use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::store::session::SessionStore;
 use crate::sub_agent::HostSubAgentSpawnTx;
 
@@ -157,6 +159,7 @@ pub(crate) struct SpawnedRelayAgent {
 struct AgentEntry {
     handle: AgentHandle,
     status_handle: AgentStatusHandle,
+    access_mode: BackendAccessMode,
 }
 
 impl AgentRegistry {
@@ -174,16 +177,18 @@ impl AgentRegistry {
         mut request: ResolvedSpawnRequest,
         session_store: Arc<Mutex<SessionStore>>,
         host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+        review_registry: ReviewRegistryHandle,
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         for server in &mut request.startup_mcp_servers {
-            if server.name != "tyde-agent-control" {
+            if server.name != "tyde-agent-control" && server.name != REVIEW_FEEDBACK_MCP_SERVER_NAME
+            {
                 continue;
             }
             let StartupMcpTransport::Http { url, .. } = &mut server.transport else {
-                panic!("tyde-agent-control MCP server must use HTTP transport");
+                panic!("Tyde injected MCP servers must use HTTP transport");
             };
-            *url = agent_control_mcp_url_for_agent(url, &agent_id);
+            *url = mcp_url_for_agent(url, &agent_id);
         }
         let start = AgentStartPayload {
             agent_id: agent_id.clone(),
@@ -197,6 +202,7 @@ impl AgentRegistry {
             created_at_ms: now_ms(),
         };
 
+        let access_mode = request.resolved_spawn_config.access_mode;
         let status_handle = self.next_status_handle();
         let (handle, startup_rx) = spawn_agent_actor(
             agent_id.clone(),
@@ -204,6 +210,7 @@ impl AgentRegistry {
             request,
             session_store,
             host_sub_agent_spawn_tx,
+            review_registry,
             status_handle.clone(),
         );
 
@@ -212,6 +219,7 @@ impl AgentRegistry {
             AgentEntry {
                 handle: handle.clone(),
                 status_handle,
+                access_mode,
             },
         );
         assert!(
@@ -261,6 +269,7 @@ impl AgentRegistry {
             AgentEntry {
                 handle: handle.clone(),
                 status_handle,
+                access_mode: BackendAccessMode::Unrestricted,
             },
         );
         assert!(
@@ -284,6 +293,10 @@ impl AgentRegistry {
         self.agents
             .get(agent_id)
             .map(|entry| entry.status_handle.clone())
+    }
+
+    pub fn agent_access_mode(&self, agent_id: &AgentId) -> Option<BackendAccessMode> {
+        self.agents.get(agent_id).map(|entry| entry.access_mode)
     }
 
     pub fn agent_ids(&self) -> Vec<AgentId> {

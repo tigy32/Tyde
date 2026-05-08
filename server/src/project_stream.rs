@@ -8,10 +8,10 @@ use std::time::Duration;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use protocol::{
     CommandErrorCode, CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
-    ProjectDiffScope, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
-    ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
-    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    ProjectDiffScope, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry,
+    ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile,
+    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, StreamPath,
 };
 use serde_json::Value;
@@ -75,6 +75,10 @@ enum ProjectStreamCommand {
         host_path: StreamPath,
         key: ProjectDiffRequestKey,
         context_mode: DiffContextMode,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    EmitProjectEvent {
+        payload: ProjectEventPayload,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -149,6 +153,19 @@ impl ProjectStreamHandle {
                 context_mode,
                 reply,
             })
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) async fn emit_project_event(
+        &self,
+        payload: ProjectEventPayload,
+    ) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::EmitProjectEvent { payload, reply })
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         response
             .await
@@ -296,6 +313,10 @@ async fn run_project_subscription(
                     ProjectStreamCommand::RememberDiffContext { host_path, key, context_mode, reply } => {
                         snapshot.diff_context_modes.insert((host_path, key), context_mode);
                         let _ = reply.send(Ok(()));
+                    }
+                    ProjectStreamCommand::EmitProjectEvent { payload, reply } => {
+                        let result = broadcast_project_event(&mut subscribers, &payload).await;
+                        let _ = reply.send(result);
                     }
                 }
             }
@@ -563,6 +584,27 @@ async fn fan_out_value(
     }
 }
 
+async fn broadcast_project_event(
+    subscribers: &mut HashMap<StreamPath, Stream>,
+    payload: &ProjectEventPayload,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(payload)
+        .map_err(|error| format!("failed to serialize ProjectEvent payload: {error}"))?;
+    let mut dead = Vec::new();
+    for (host_path, stream) in subscribers.iter() {
+        if stream
+            .send_value(FrameKind::ProjectEvent, payload.clone())
+            .is_err()
+        {
+            dead.push(host_path.clone());
+        }
+    }
+    for host_path in dead {
+        subscribers.remove(&host_path);
+    }
+    Ok(())
+}
+
 async fn refresh_remembered_diffs(
     project: &Project,
     snapshot: &ProjectSnapshotState,
@@ -614,6 +656,7 @@ fn diff_scope_sort_key(scope: ProjectDiffScope) -> u8 {
     match scope {
         ProjectDiffScope::Staged => 0,
         ProjectDiffScope::Unstaged => 1,
+        ProjectDiffScope::Uncommitted => 2,
     }
 }
 
@@ -906,8 +949,10 @@ where
     }
 
     let mut args = vec!["diff", git_diff_context_arg(payload.context_mode)];
-    if matches!(payload.scope, ProjectDiffScope::Staged) {
-        args.push("--cached");
+    match payload.scope {
+        ProjectDiffScope::Staged => args.push("--cached"),
+        ProjectDiffScope::Unstaged => {}
+        ProjectDiffScope::Uncommitted => args.push("HEAD"),
     }
     if let Some(path) = &payload.path {
         args.push("--");
@@ -916,7 +961,10 @@ where
 
     let raw = run_git(&payload.root.0, &args, GitAccessMode::ReadOnly)?;
     let mut files = parse_git_diff(&raw)?;
-    if matches!(payload.scope, ProjectDiffScope::Unstaged) {
+    if matches!(
+        payload.scope,
+        ProjectDiffScope::Unstaged | ProjectDiffScope::Uncommitted
+    ) {
         let untracked_paths = list_untracked_paths_with_runner(
             &payload.root.0,
             payload.path.as_deref(),

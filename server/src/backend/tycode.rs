@@ -10,8 +10,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SessionId, StreamEndData,
-    StreamTextDeltaData,
+    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender, SessionId,
+    StreamEndData, StreamTextDeltaData,
 };
 
 use super::{
@@ -97,6 +97,30 @@ fn materialize_tycode_customization(
     Ok(Some(root))
 }
 
+fn tycode_read_only_agent_json(config: &BackendSpawnConfig) -> Option<String> {
+    if config.resolved_spawn_config.access_mode != BackendAccessMode::ReadOnly {
+        return None;
+    }
+    let system_prompt = render_combined_spawn_instructions(&config.resolved_spawn_config)
+        .unwrap_or_else(|| {
+            "Backend access mode is read-only: inspect files and call configured MCP tools only."
+                .to_string()
+        });
+    Some(
+        serde_json::json!({
+            "name": "tyde-read-only",
+            "description": "Tyde read-only agent",
+            "systemPrompt": system_prompt,
+            "tools": [
+                "set_tracked_files",
+                "search_types",
+                "get_type_docs"
+            ]
+        })
+        .to_string(),
+    )
+}
+
 impl Backend for TycodeBackend {
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         empty_session_settings_schema(BackendKind::Tycode)
@@ -146,6 +170,9 @@ impl Backend for TycodeBackend {
             };
             let mut command = Command::new(&subprocess_bin);
             command.arg("--workspace-roots").arg(&roots_json);
+            if let Some(agent_json) = tycode_read_only_agent_json(&config) {
+                command.arg("--agent").arg(agent_json);
+            }
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
             }
@@ -403,6 +430,9 @@ impl Backend for TycodeBackend {
             };
             let mut command = Command::new(&subprocess_bin);
             command.arg("--workspace-roots").arg(&roots_json);
+            if let Some(agent_json) = tycode_read_only_agent_json(&config) {
+                command.arg("--agent").arg(agent_json);
+            }
             if let Some(mcp_servers_json) = mcp_servers_json.as_deref() {
                 command.arg("--mcp-servers").arg(mcp_servers_json);
             }
@@ -952,6 +982,31 @@ mod tests {
             value["context7"]["env"]["FOO"],
             Value::String("bar".to_string())
         );
+    }
+
+    #[test]
+    fn tycode_read_only_access_mode_uses_read_only_agent_tools() {
+        let agent_json = tycode_read_only_agent_json(&BackendSpawnConfig {
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                access_mode: BackendAccessMode::ReadOnly,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("read-only agent json");
+        let value: Value = serde_json::from_str(&agent_json).expect("valid agent json");
+        let tools = value
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert!(tools.contains(&"set_tracked_files"));
+        assert!(!tools.contains(&"write_file"));
+        assert!(!tools.contains(&"modify_file"));
+        assert!(!tools.contains(&"run_build_test"));
     }
 
     #[test]

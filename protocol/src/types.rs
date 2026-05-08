@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,6 +98,36 @@ impl fmt::Display for QueuedMessageId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ReviewId(pub String);
+
+impl fmt::Display for ReviewId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReviewCommentId(pub String);
+
+impl fmt::Display for ReviewCommentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReviewSuggestionId(pub String);
+
+impl fmt::Display for ReviewSuggestionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProjectId(pub String);
@@ -165,6 +196,20 @@ impl BackendKind {
             Self::Tycode | Self::Gemini => false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendAccessMode {
+    #[default]
+    Unrestricted,
+    /// Backend MUST refuse to execute any tool that mutates the
+    /// filesystem, runs shell commands, or otherwise changes state
+    /// outside the agent's own message stream. Read-only filesystem
+    /// access (read files, list directories, glob, grep) and
+    /// configured MCP tool calls are still allowed. The exact
+    /// implementation depends on the backend's available knobs.
+    ReadOnly,
 }
 
 /// Provenance of a live agent — who created it.
@@ -291,6 +336,11 @@ pub enum FrameKind {
     CommandError,
     SessionSchemas,
     SessionSettings,
+    ReviewCreate,
+    ReviewAction,
+    ReviewEvent,
+    ReviewSubscribe,
+    ProjectEvent,
 }
 
 impl fmt::Display for FrameKind {
@@ -371,6 +421,11 @@ impl fmt::Display for FrameKind {
             Self::SetSessionSettings => f.write_str("set_session_settings"),
             Self::SessionSchemas => f.write_str("session_schemas"),
             Self::SessionSettings => f.write_str("session_settings"),
+            Self::ReviewCreate => f.write_str("review_create"),
+            Self::ReviewAction => f.write_str("review_action"),
+            Self::ReviewEvent => f.write_str("review_event"),
+            Self::ReviewSubscribe => f.write_str("review_subscribe"),
+            Self::ProjectEvent => f.write_str("project_event"),
         }
     }
 }
@@ -547,6 +602,8 @@ pub enum SpawnAgentParams {
         images: Option<Vec<ImageData>>,
         backend_kind: BackendKind,
         cost_hint: Option<SpawnCostHint>,
+        #[serde(default)]
+        access_mode: BackendAccessMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_settings: Option<SessionSettingsValues>,
     },
@@ -561,6 +618,15 @@ pub struct SendMessagePayload {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
+    #[serde(default)]
+    pub origin: Option<MessageOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageOrigin {
+    User,
+    Review { review_id: ReviewId },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -568,6 +634,8 @@ pub struct QueuedMessageEntry {
     pub id: QueuedMessageId,
     pub message: String,
     pub images: Vec<ImageData>,
+    #[serde(default)]
+    pub origin: Option<MessageOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -991,7 +1059,15 @@ pub enum ProjectNotifyPayload {
     Delete { project: Project },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectEventPayload {
+    ReviewListChanged { reviews: Vec<ReviewSummary> },
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ProjectRootPath(pub String);
 
@@ -1017,6 +1093,8 @@ pub struct ProjectReadFilePayload {
 pub enum ProjectDiffScope {
     Unstaged,
     Staged,
+    /// `git diff HEAD` — staged + unstaged combined. Used by Review.
+    Uncommitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1150,7 +1228,7 @@ pub struct ProjectFileContentsPayload {
     pub is_binary: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffPayload {
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
@@ -1159,13 +1237,13 @@ pub struct ProjectGitDiffPayload {
     pub files: Vec<ProjectGitDiffFile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffFile {
     pub relative_path: String,
     pub hunks: Vec<ProjectGitDiffHunk>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffHunk {
     pub hunk_id: String,
     pub old_start: u32,
@@ -1175,7 +1253,7 @@ pub struct ProjectGitDiffHunk {
     pub lines: Vec<ProjectGitDiffLine>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffLine {
     pub kind: ProjectGitDiffLineKind,
     pub text: String,
@@ -1189,6 +1267,251 @@ pub enum ProjectGitDiffLineKind {
     Context,
     Added,
     Removed,
+}
+
+// ── Review ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ReviewStatus {
+    /// User editing — comments and AI suggestions can change.
+    Draft,
+    /// Frozen, accepted comments locked. Bundle queued for delivery; the
+    /// originating agent may not be live yet.
+    Submitted { submitted_at_ms: u64 },
+    /// Bundle delivered to a live agent actor for the originating session.
+    Consumed {
+        submitted_at_ms: u64,
+        consumed_at_ms: u64,
+        target_agent_id: AgentId,
+    },
+    /// Explicit user discard. Terminal.
+    Cancelled { cancelled_at_ms: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewDiffSelection {
+    /// v1 default. All uncommitted changes across all roots in the project.
+    AllUncommitted,
+    /// v2. One root, optionally narrowed to a path.
+    Root {
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewLocation {
+    pub root: ProjectRootPath,
+    pub relative_path: String,
+    pub anchor: ReviewAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewAnchor {
+    File,
+    Hunk {
+        hunk_id: String,
+        old_start: u32,
+        old_count: u32,
+        new_start: u32,
+        new_count: u32,
+    },
+    LineRange {
+        side: ReviewDiffSide,
+        start_line: u32,
+        end_line: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDiffSide {
+    Old,
+    New,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub id: ReviewCommentId,
+    pub location: ReviewLocation,
+    pub body: String,
+    pub source: ReviewCommentSource,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewCommentSource {
+    User,
+    AiSuggestion {
+        suggestion_id: ReviewSuggestionId,
+        edited: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSuggestedComment {
+    pub id: ReviewSuggestionId,
+    pub location: ReviewLocation,
+    pub body: String,
+    pub rationale: Option<String>,
+    pub severity: ReviewSeverity,
+    pub state: ReviewSuggestionState,
+    pub reviewer_agent_id: AgentId,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSeverity {
+    Info,
+    Warn,
+    Bug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ReviewSuggestionState {
+    Pending,
+    Accepted { comment_id: ReviewCommentId },
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub id: ReviewId,
+    pub project_id: ProjectId,
+    pub origin_agent_id: AgentId,
+    pub origin_session_id: SessionId,
+    pub selection: ReviewDiffSelection,
+    pub status: ReviewStatus,
+    pub diffs: Vec<ProjectGitDiffPayload>,
+    pub comments: Vec<ReviewComment>,
+    pub suggestions: Vec<ReviewSuggestedComment>,
+    pub ai_reviewer: ReviewAiReviewerState,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAiReviewerState {
+    pub status: ReviewAiReviewerStatus,
+    pub agent_id: Option<AgentId>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAiReviewerStatus {
+    Idle,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCreatePayload {
+    pub origin_agent_id: AgentId,
+    pub selection: ReviewDiffSelection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSubscribePayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewActionPayload {
+    AddComment {
+        location: ReviewLocation,
+        body: String,
+    },
+    UpdateComment {
+        comment_id: ReviewCommentId,
+        body: String,
+    },
+    DeleteComment {
+        comment_id: ReviewCommentId,
+    },
+    AcceptSuggestion {
+        suggestion_id: ReviewSuggestionId,
+        edit: Option<String>,
+    },
+    RejectSuggestion {
+        suggestion_id: ReviewSuggestionId,
+    },
+    StartAiReview {
+        backend_kind: BackendKind,
+        cost_hint: Option<SpawnCostHint>,
+        instructions: Option<String>,
+    },
+    Submit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewEventPayload {
+    Snapshot { review: Review },
+    CommentUpsert { comment: ReviewComment },
+    CommentDelete { comment_id: ReviewCommentId },
+    SuggestionUpsert { suggestion: ReviewSuggestedComment },
+    AiReviewerChanged { state: ReviewAiReviewerState },
+    StatusChanged { status: ReviewStatus },
+    Error { error: ReviewErrorPayload },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewErrorPayload {
+    pub code: ReviewErrorCode,
+    pub message: String,
+    pub fatal: bool,
+    pub context: ReviewErrorContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewErrorCode {
+    InvalidStatus,
+    InvalidLocation,
+    UnknownComment,
+    UnknownSuggestion,
+    OriginAgentNotRunning,
+    AmbiguousOriginSession,
+    ReviewerAlreadyRunning,
+    ReviewerBackendUnsupported,
+    GitFailed,
+    IoFailed,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewErrorContext {
+    AddComment,
+    UpdateComment { comment_id: ReviewCommentId },
+    DeleteComment { comment_id: ReviewCommentId },
+    AcceptSuggestion { suggestion_id: ReviewSuggestionId },
+    RejectSuggestion { suggestion_id: ReviewSuggestionId },
+    StartAiReview,
+    Submit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSummary {
+    pub id: ReviewId,
+    pub status: ReviewStatus,
+    pub origin_session_id: SessionId,
+    pub origin_agent_id: AgentId,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub user_comment_count: u32,
+    pub pending_suggestion_count: u32,
 }
 
 /// Absolute host-native path. Server-owned semantics: interpretation is up to

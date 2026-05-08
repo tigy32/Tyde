@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use protocol::{McpServerConfig, McpServerId, McpTransportConfig};
 use serde::{Deserialize, Serialize};
 
-pub const RESERVED_MCP_SERVER_NAMES: [&str; 2] = ["tyde-debug", "tyde-agent-control"];
+pub const RESERVED_MCP_SERVER_NAMES: [&str; 3] =
+    ["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {

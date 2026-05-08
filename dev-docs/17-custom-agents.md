@@ -142,8 +142,8 @@ pub enum McpTransportConfig {
 ```
 
 `name` is the backend-visible MCP server name. The host rejects blank names,
-duplicate names, and reserved names (`tyde-debug`, `tyde-agent-control`) at
-write time.
+duplicate names, and reserved names (`tyde-debug`, `tyde-agent-control`,
+`tyde-review-feedback`) at write time.
 
 ### 2.6 Spawn metadata
 
@@ -349,7 +349,8 @@ At spawn:
 
 1. Start with the built-in startup MCP set from the existing
    `startup_mcp_servers_for_settings()` logic in `host.rs`. That keeps
-   `tyde-debug` and `tyde-agent-control` server-owned.
+   `tyde-debug`, `tyde-agent-control`, and `tyde-review-feedback`
+   server-owned.
 2. If `custom_agent_id` is set, resolve that exact `CustomAgentId`. Missing ID
    is a spawn error. Then union the custom agent's referenced MCP servers into a
    name-keyed map. Reserved names remain reserved; any collision with a reserved

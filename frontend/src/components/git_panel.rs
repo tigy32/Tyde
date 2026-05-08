@@ -42,6 +42,7 @@ pub fn GitPanel() -> impl IntoView {
                     }}
                 </span>
             </div>
+            <ReviewIndicator />
             <div class="gp-content">
                 {move || {
                     match git_roots.get() {
@@ -65,6 +66,54 @@ pub fn GitPanel() -> impl IntoView {
                 }}
             </div>
         </div>
+    }
+}
+
+/// Display-only indicator surfacing an open (Draft/Submitted) review
+/// against the active project's working tree. Click navigates to the
+/// review tab. Creation lives in the agent header — this surface has no
+/// agent context.
+#[component]
+fn ReviewIndicator() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let lookup_state = state.clone();
+    let open =
+        move || crate::components::review_view::open_review_for_active_project(&lookup_state);
+
+    view! {
+        {move || {
+            let (host_id, review_id) = open()?;
+            let short: String = review_id.0.chars().take(8).collect();
+            let click_host = host_id.clone();
+            let click_review = review_id.clone();
+            Some(view! {
+                <button
+                    class="gp-review-indicator"
+                    title="Open the existing draft review for this project's working tree"
+                    on:click=move |_| {
+                        let state = expect_context::<AppState>();
+                        state.open_tab(
+                            crate::state::TabContent::Review {
+                                host_id: click_host.clone(),
+                                review_id: click_review.clone(),
+                            },
+                            crate::components::review_view::review_tab_label(&click_review),
+                            true,
+                        );
+                    }
+                >
+                    <svg class="gp-review-indicator-icon" viewBox="0 0 16 16" fill="none"
+                         stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+                         stroke-linejoin="round" aria-hidden="true">
+                        <path d="M3 2.5h7l3 3V13a.5.5 0 0 1-.5.5h-9.5A.5.5 0 0 1 2.5 13V3a.5.5 0 0 1 .5-.5z" />
+                        <path d="M10 2.5V6h3" />
+                        <path d="M5.5 9.25l1.5 1.5L11 7.5" />
+                    </svg>
+                    <span class="gp-review-indicator-label">"Open draft review"</span>
+                    <span class="gp-review-indicator-id">{short}</span>
+                </button>
+            })
+        }}
     }
 }
 
@@ -264,6 +313,9 @@ fn GitFileSection(
                         let change_kind = match scope {
                             ProjectDiffScope::Staged => file.staged,
                             ProjectDiffScope::Unstaged => file.unstaged,
+                            // Git panel only opens diffs in Staged/Unstaged scopes;
+                            // Uncommitted is reserved for review snapshots.
+                            ProjectDiffScope::Uncommitted => file.unstaged.or(file.staged),
                         };
                         let is_untracked = file.untracked;
                         let icon = if is_untracked {

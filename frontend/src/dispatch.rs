@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use wasm_bindgen_futures::spawn_local;
@@ -9,19 +9,22 @@ use protocol::{
     AgentStartPayload, BackendSetupPayload, ChatEvent, CommandErrorPayload,
     CustomAgentNotifyPayload, Envelope, FrameKind, HostBrowseEntriesPayload,
     HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerNotifyPayload, NewAgentPayload, NewTerminalPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectPayload, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
+    McpServerNotifyPayload, NewAgentPayload, NewTerminalPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitCommitResultPayload,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
+    ProtocolValidator, QueuedMessagesPayload, RejectPayload, ReviewCommentSource,
+    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
+    StreamPath, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    TerminalStartPayload,
 };
 
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
-    OpenFile, ProjectInfo, SessionInfo, StreamingState, TabContent, TerminalInfo, ToolRequestEntry,
-    TransientEvent, reduce_diff_response, root_display_name, sort_project_infos,
+    OpenFile, ProjectInfo, ReviewActionTarget, SessionInfo, StreamingState, TabContent,
+    TerminalInfo, ToolRequestEntry, TransientEvent, reduce_diff_response, root_display_name,
+    sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -174,6 +177,15 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state.command_errors_by_host.update(|errors| {
                     errors.insert(host_id.to_string(), message);
                 });
+                // Release any review-side pending gate the rejected
+                // command was holding. Without this, a server-side
+                // failure (unknown project, git error, malformed
+                // payload) would leave the "Review changes" or
+                // Submit/Cancel buttons disabled forever — the only
+                // other clear path is `ReviewListChanged` /
+                // `ReviewEvent::Snapshot`, neither of which fires for
+                // a rejected request.
+                clear_review_pending_on_error(state, host_id, &payload);
             }
             Err(error) => {
                 report_dispatch_error(
@@ -539,6 +551,71 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse session_list payload: {error}"),
             ),
         },
+        FrameKind::ProjectEvent => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "project_notify on malformed project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<ProjectEventPayload>() {
+                Ok(ProjectEventPayload::ReviewListChanged { reviews }) => {
+                    let prev_ids: HashSet<ReviewId> =
+                        state.review_summaries.with_untracked(|map| {
+                            map.get(&project_id)
+                                .map(|s| s.iter().map(|s| s.id.clone()).collect())
+                                .unwrap_or_default()
+                        });
+                    let new_ids: Vec<ReviewId> = reviews
+                        .iter()
+                        .filter(|s| !prev_ids.contains(&s.id))
+                        .map(|s| s.id.clone())
+                        .collect();
+                    state.review_summaries.update(|map| {
+                        map.insert(project_id.clone(), reviews);
+                    });
+                    let pending_key = (host_id.to_string(), project_id);
+                    let has_pending = state
+                        .review_create_pending
+                        .with_untracked(|m| m.get(&pending_key).copied().unwrap_or(0))
+                        > 0;
+                    if has_pending && !new_ids.is_empty() {
+                        // Pair the most recent new review with one pending
+                        // create token. The user clicks "Review changes",
+                        // server creates the review, ReviewListChanged
+                        // arrives — open/focus a tab for that review.
+                        let new_review_id = new_ids.last().cloned().expect("non-empty");
+                        let host_for_tab = pending_key.0.clone();
+                        let label =
+                            crate::components::review_view::review_tab_label(&new_review_id);
+                        state.open_tab(
+                            TabContent::Review {
+                                host_id: host_for_tab,
+                                review_id: new_review_id,
+                            },
+                            label,
+                            true,
+                        );
+                        state.review_create_pending.update(|map| {
+                            if let Some(count) = map.get_mut(&pending_key) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    map.remove(&pending_key);
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_event payload: {error}"),
+                ),
+            }
+        }
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
                 state.projects.update(|projects| {
@@ -1040,8 +1117,279 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse skill_notify payload: {error}"),
             ),
         },
+        FrameKind::ReviewEvent => {
+            let Some(review_id) = resolve_review_id(&envelope.stream) else {
+                log::warn!("review_event on non-review stream {}", envelope.stream);
+                return;
+            };
+            let parse_t0 = crate::perf::now_ms();
+            let payload_bytes = envelope.payload.to_string().len();
+            match envelope.parse_payload::<ReviewEventPayload>() {
+                Ok(payload) => {
+                    let parse_dt = crate::perf::now_ms() - parse_t0;
+                    let variant = match &payload {
+                        ReviewEventPayload::Snapshot { .. } => "Snapshot",
+                        ReviewEventPayload::CommentUpsert { .. } => "CommentUpsert",
+                        ReviewEventPayload::CommentDelete { .. } => "CommentDelete",
+                        ReviewEventPayload::SuggestionUpsert { .. } => "SuggestionUpsert",
+                        ReviewEventPayload::AiReviewerChanged { .. } => "AiReviewerChanged",
+                        ReviewEventPayload::StatusChanged { .. } => "StatusChanged",
+                        ReviewEventPayload::Error { .. } => "Error",
+                    };
+                    let key = format!("review:{}", review_id.0);
+                    crate::perf::log_phase(
+                        "review_dispatch",
+                        "parsed",
+                        &key,
+                        &format!(" variant={variant} bytes={payload_bytes} took={parse_dt:.1}ms"),
+                    );
+                    let apply_t0 = crate::perf::now_ms();
+                    apply_review_event(state, &review_id, payload);
+                    let apply_dt = crate::perf::now_ms() - apply_t0;
+                    crate::perf::log_phase(
+                        "review_dispatch",
+                        "applied",
+                        &key,
+                        &format!(" variant={variant} took={apply_dt:.1}ms"),
+                    );
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse review_event payload: {error}"),
+                ),
+            }
+        }
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
+        }
+    }
+}
+
+fn resolve_review_id(stream: &StreamPath) -> Option<ReviewId> {
+    let suffix = stream.0.strip_prefix("/review/")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    Some(ReviewId(suffix.to_string()))
+}
+
+fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEventPayload) {
+    match payload {
+        ReviewEventPayload::Snapshot { review } => {
+            state.reviews.update(|map| {
+                map.insert(review_id.clone(), review);
+            });
+            // A snapshot from a fresh subscription means any in-flight
+            // submit/cancel/etc. echoes have already been folded in.
+            state.review_action_pending.update(|map| {
+                map.remove(review_id);
+            });
+            state.review_action_target_pending.update(|set| {
+                set.retain(|(rid, _)| rid != review_id);
+            });
+        }
+        ReviewEventPayload::CommentUpsert { comment } => {
+            let was_new = state.reviews.with_untracked(|map| {
+                map.get(review_id)
+                    .map(|r| !r.comments.iter().any(|c| c.id == comment.id))
+                    .unwrap_or(false)
+            });
+            state.reviews.update(|map| {
+                let Some(review) = map.get_mut(review_id) else {
+                    log::warn!(
+                        "review CommentUpsert for unknown review {review_id} — \
+                         dropped (Snapshot will resync on resubscribe)"
+                    );
+                    return;
+                };
+                if let Some(existing) = review.comments.iter_mut().find(|c| c.id == comment.id) {
+                    *existing = comment.clone();
+                } else {
+                    review.comments.push(comment.clone());
+                }
+            });
+            state.review_action_target_pending.update(|set| {
+                // New User comment — clear the AddComment gate (composer
+                // closes from its own effect on seeing the new comment).
+                if was_new && matches!(comment.source, ReviewCommentSource::User) {
+                    set.remove(&(review_id.clone(), ReviewActionTarget::AddComment));
+                }
+                // Existing comment updated — clear UpdateComment gate.
+                if !was_new {
+                    set.remove(&(
+                        review_id.clone(),
+                        ReviewActionTarget::UpdateComment(comment.id.clone()),
+                    ));
+                }
+                // Newly-created AI-suggestion-derived comment ⇒ matching
+                // AcceptSuggestion gate clears.
+                if let ReviewCommentSource::AiSuggestion { suggestion_id, .. } = &comment.source {
+                    set.remove(&(
+                        review_id.clone(),
+                        ReviewActionTarget::AcceptSuggestion(suggestion_id.clone()),
+                    ));
+                }
+            });
+        }
+        ReviewEventPayload::CommentDelete { comment_id } => {
+            state.reviews.update(|map| {
+                let Some(review) = map.get_mut(review_id) else {
+                    return;
+                };
+                review.comments.retain(|c| c.id != comment_id);
+            });
+            state.review_action_target_pending.update(|set| {
+                set.remove(&(
+                    review_id.clone(),
+                    ReviewActionTarget::DeleteComment(comment_id),
+                ));
+            });
+        }
+        ReviewEventPayload::SuggestionUpsert { suggestion } => {
+            state.reviews.update(|map| {
+                let Some(review) = map.get_mut(review_id) else {
+                    return;
+                };
+                if let Some(existing) = review
+                    .suggestions
+                    .iter_mut()
+                    .find(|s| s.id == suggestion.id)
+                {
+                    *existing = suggestion.clone();
+                } else {
+                    review.suggestions.push(suggestion.clone());
+                }
+            });
+            state
+                .review_action_target_pending
+                .update(|set| match &suggestion.state {
+                    ReviewSuggestionState::Accepted { .. } => {
+                        set.remove(&(
+                            review_id.clone(),
+                            ReviewActionTarget::AcceptSuggestion(suggestion.id.clone()),
+                        ));
+                    }
+                    ReviewSuggestionState::Rejected => {
+                        set.remove(&(
+                            review_id.clone(),
+                            ReviewActionTarget::RejectSuggestion(suggestion.id.clone()),
+                        ));
+                    }
+                    ReviewSuggestionState::Pending => {}
+                });
+        }
+        ReviewEventPayload::AiReviewerChanged { state: ai_state } => {
+            state.reviews.update(|map| {
+                if let Some(review) = map.get_mut(review_id) {
+                    review.ai_reviewer = ai_state;
+                }
+            });
+            state.review_action_pending.update(|map| {
+                if let Some(gate) = map.get_mut(review_id) {
+                    gate.start_ai = false;
+                    if gate.is_idle() {
+                        map.remove(review_id);
+                    }
+                }
+            });
+        }
+        ReviewEventPayload::StatusChanged { status } => {
+            state.reviews.update(|map| {
+                if let Some(review) = map.get_mut(review_id) {
+                    review.status = status;
+                }
+            });
+            state.review_action_pending.update(|map| {
+                if let Some(gate) = map.get_mut(review_id) {
+                    gate.submit = false;
+                    gate.cancel = false;
+                    if gate.is_idle() {
+                        map.remove(review_id);
+                    }
+                }
+            });
+        }
+        ReviewEventPayload::Error { error } => {
+            log::error!(
+                "review {review_id} server error code={:?} fatal={} context={:?}: {}",
+                error.code,
+                error.fatal,
+                error.context,
+                error.message
+            );
+            // Clear only the gate matching the error context.
+            match error.context {
+                ReviewErrorContext::AddComment => {
+                    state.review_action_target_pending.update(|set| {
+                        set.remove(&(review_id.clone(), ReviewActionTarget::AddComment));
+                    });
+                }
+                ReviewErrorContext::UpdateComment { comment_id } => {
+                    state.review_action_target_pending.update(|set| {
+                        set.remove(&(
+                            review_id.clone(),
+                            ReviewActionTarget::UpdateComment(comment_id),
+                        ));
+                    });
+                }
+                ReviewErrorContext::DeleteComment { comment_id } => {
+                    state.review_action_target_pending.update(|set| {
+                        set.remove(&(
+                            review_id.clone(),
+                            ReviewActionTarget::DeleteComment(comment_id),
+                        ));
+                    });
+                }
+                ReviewErrorContext::AcceptSuggestion { suggestion_id } => {
+                    state.review_action_target_pending.update(|set| {
+                        set.remove(&(
+                            review_id.clone(),
+                            ReviewActionTarget::AcceptSuggestion(suggestion_id),
+                        ));
+                    });
+                }
+                ReviewErrorContext::RejectSuggestion { suggestion_id } => {
+                    state.review_action_target_pending.update(|set| {
+                        set.remove(&(
+                            review_id.clone(),
+                            ReviewActionTarget::RejectSuggestion(suggestion_id),
+                        ));
+                    });
+                }
+                ReviewErrorContext::StartAiReview => {
+                    state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(review_id) {
+                            gate.start_ai = false;
+                            if gate.is_idle() {
+                                map.remove(review_id);
+                            }
+                        }
+                    });
+                }
+                ReviewErrorContext::Submit => {
+                    state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(review_id) {
+                            gate.submit = false;
+                            if gate.is_idle() {
+                                map.remove(review_id);
+                            }
+                        }
+                    });
+                }
+                ReviewErrorContext::Cancel => {
+                    state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(review_id) {
+                            gate.cancel = false;
+                            if gate.is_idle() {
+                                map.remove(review_id);
+                            }
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -1161,6 +1509,53 @@ fn resolve_project_id(stream: &StreamPath) -> Option<ProjectId> {
         return None;
     }
     Some(ProjectId(suffix.to_string()))
+}
+
+/// Drop the optimistic-gate state any pending review-shaped command
+/// was holding, scoped exactly to the command that failed.
+///
+/// `request_kind` distinguishes a `ReviewCreate` (the "Review changes"
+/// button gate, keyed by host+project) from a `ReviewAction` (the
+/// Submit/Cancel/AddComment/etc. gates, keyed by review id and target).
+/// Anything else is ignored — those frames don't have a per-request UI
+/// gate to release.
+fn clear_review_pending_on_error(state: &AppState, host_id: &str, payload: &CommandErrorPayload) {
+    match payload.request_kind {
+        FrameKind::ReviewCreate => {
+            let Some(project_id) = resolve_project_id(&payload.stream) else {
+                log::warn!(
+                    "command_error: ReviewCreate on non-project stream {}",
+                    payload.stream
+                );
+                return;
+            };
+            state.review_create_pending.update(|map| {
+                let key = (host_id.to_string(), project_id);
+                if let Some(count) = map.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&key);
+                    }
+                }
+            });
+        }
+        FrameKind::ReviewAction => {
+            let Some(review_id) = resolve_review_id(&payload.stream) else {
+                log::warn!(
+                    "command_error: ReviewAction on non-review stream {}",
+                    payload.stream
+                );
+                return;
+            };
+            state.review_action_pending.update(|map| {
+                map.remove(&review_id);
+            });
+            state.review_action_target_pending.update(|set| {
+                set.retain(|(rid, _)| rid != &review_id);
+            });
+        }
+        _ => {}
+    }
 }
 
 fn resolve_agent_id(state: &AppState, host_id: &str, stream: &StreamPath) -> Option<AgentId> {

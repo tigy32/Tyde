@@ -587,6 +587,7 @@ async fn replay_order_replays_customization_before_agents() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -723,6 +724,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -802,6 +804,7 @@ async fn tool_policy_rejection_for_non_claude_backends() {
                     images: None,
                     backend_kind,
                     cost_hint: None,
+                    access_mode: Default::default(),
                     session_settings: None,
                 },
             })
@@ -855,6 +858,7 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -973,6 +977,7 @@ async fn reserved_mcp_name_collision_returns_spawn_error() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1051,6 +1056,7 @@ async fn steering_ordering_combines_host_and_project_by_title() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })

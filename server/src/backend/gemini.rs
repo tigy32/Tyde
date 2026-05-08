@@ -12,6 +12,8 @@ use tokio::io::BufReader;
 use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use protocol::BackendAccessMode;
+
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
@@ -23,6 +25,7 @@ use crate::subprocess::ImageAttachment;
 
 const GEMINI_AGENT_NAME: &str = "gemini";
 const GEMINI_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
+const GEMINI_READ_ONLY_APPROVAL_MODE: &str = "plan";
 static GEMINI_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -47,12 +50,14 @@ impl GeminiSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            access_mode,
         )
         .await
     }
@@ -62,12 +67,14 @@ impl GeminiSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            access_mode,
         )
         .await
     }
@@ -77,12 +84,14 @@ impl GeminiSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
             ssh_host,
             startup_mcp_servers,
             steering_content,
+            access_mode,
         )
         .await
     }
@@ -92,6 +101,7 @@ impl GeminiSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
             let parsed = parse_remote_workspace_roots(workspace_roots)?
@@ -120,6 +130,7 @@ impl GeminiSession {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
                 startup_mcp_servers: startup_mcp_servers.to_vec(),
+                access_mode,
                 active_turn: None,
             }),
         });
@@ -151,6 +162,7 @@ struct GeminiState {
     permission_mode: Option<String>,
     steering_content: Option<String>,
     startup_mcp_servers: Vec<StartupMcpServer>,
+    access_mode: BackendAccessMode,
     active_turn: Option<ActiveTurn>,
 }
 
@@ -212,6 +224,22 @@ enum TurnOutcome {
         summary: GeminiStdoutSummary,
         error: String,
     },
+}
+
+fn gemini_cli_args(access_mode: BackendAccessMode, prompt: String) -> Vec<String> {
+    let mut args = Vec::new();
+    match access_mode {
+        BackendAccessMode::Unrestricted => args.push("-y".to_string()),
+        BackendAccessMode::ReadOnly => {
+            args.push("--approval-mode".to_string());
+            args.push(GEMINI_READ_ONLY_APPROVAL_MODE.to_string());
+        }
+    }
+    args.push("-p".to_string());
+    args.push(prompt);
+    args.push("--output-format".to_string());
+    args.push("stream-json".to_string());
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +359,7 @@ impl GeminiInner {
             permission_mode,
             steering_content,
             startup_mcp_servers,
+            access_mode,
             cancel_rx,
         ) = {
             let mut state = self.state.lock().await;
@@ -355,6 +384,7 @@ impl GeminiInner {
                 state.permission_mode.clone(),
                 state.steering_content.clone(),
                 state.startup_mcp_servers.clone(),
+                state.access_mode,
                 cancel_rx,
             )
         };
@@ -375,6 +405,7 @@ impl GeminiInner {
                     permission_mode.as_deref(),
                     steering_content.as_deref(),
                     &startup_mcp_servers,
+                    access_mode,
                     cancel_rx,
                 )
                 .await;
@@ -427,6 +458,7 @@ impl GeminiInner {
         _permission_mode: Option<&str>,
         steering_content: Option<&str>,
         startup_mcp_servers: &[StartupMcpServer],
+        access_mode: BackendAccessMode,
         cancel_rx: oneshot::Receiver<()>,
     ) -> TurnOutcome {
         let effective_prompt = match steering_content.filter(|s| !s.trim().is_empty()) {
@@ -434,13 +466,7 @@ impl GeminiInner {
             None => prompt.to_string(),
         };
 
-        let mut cli_args: Vec<String> = vec![
-            "-y".to_string(),
-            "-p".to_string(),
-            effective_prompt,
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-        ];
+        let mut cli_args = gemini_cli_args(access_mode, effective_prompt);
 
         if let Some(model_name) = model.as_deref().filter(|m| !m.trim().is_empty()) {
             cli_args.push("--model".to_string());
@@ -455,17 +481,38 @@ impl GeminiInner {
         // Inject startup MCP servers by writing that file, restoring original after.
         let mcp_settings_json = build_gemini_settings_json(startup_mcp_servers);
         let mut mcp_cleanup: Option<GeminiMcpCleanup> = None;
+        let mut read_only_cwd: Option<tempfile::TempDir> = None;
 
-        if let Some(ref json) = mcp_settings_json
-            && ssh_host.is_none()
-        {
-            match inject_gemini_mcp_settings(workspace_root, json) {
-                Ok(cleanup) => mcp_cleanup = Some(cleanup),
-                Err(err) => {
-                    return TurnOutcome::Failed {
-                        summary: GeminiStdoutSummary::default(),
-                        error: format!("Failed to write Gemini MCP settings: {err}"),
-                    };
+        if let Some(ref json) = mcp_settings_json {
+            if access_mode == BackendAccessMode::ReadOnly && ssh_host.is_some() {
+                return TurnOutcome::Failed {
+                    summary: GeminiStdoutSummary::default(),
+                    error:
+                        "Gemini backend cannot honor ReadOnly for remote MCP settings without writing remote configuration"
+                            .to_string(),
+                };
+            }
+            if access_mode == BackendAccessMode::ReadOnly {
+                match materialize_gemini_read_only_cwd(json) {
+                    Ok(tempdir) => read_only_cwd = Some(tempdir),
+                    Err(err) => {
+                        return TurnOutcome::Failed {
+                            summary: GeminiStdoutSummary::default(),
+                            error: format!("Failed to create Gemini read-only MCP settings: {err}"),
+                        };
+                    }
+                }
+                cli_args.push("--include-directories".to_string());
+                cli_args.push(workspace_root.to_string());
+            } else if ssh_host.is_none() {
+                match inject_gemini_mcp_settings(workspace_root, json) {
+                    Ok(cleanup) => mcp_cleanup = Some(cleanup),
+                    Err(err) => {
+                        return TurnOutcome::Failed {
+                            summary: GeminiStdoutSummary::default(),
+                            error: format!("Failed to write Gemini MCP settings: {err}"),
+                        };
+                    }
                 }
             }
         }
@@ -527,7 +574,11 @@ impl GeminiInner {
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
             }
-            cmd.current_dir(workspace_root)
+            let current_dir = read_only_cwd
+                .as_ref()
+                .map(|dir| dir.path())
+                .unwrap_or_else(|| Path::new(workspace_root));
+            cmd.current_dir(current_dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -1464,6 +1515,26 @@ fn build_stdio_mcp_config(
     Some(Value::Object(cfg))
 }
 
+fn materialize_gemini_read_only_cwd(settings_json: &str) -> Result<tempfile::TempDir, String> {
+    let tempdir = tempfile::tempdir()
+        .map_err(|err| format!("Failed to create temporary Gemini cwd: {err}"))?;
+    let settings_dir = tempdir.path().join(".gemini");
+    fs::create_dir_all(&settings_dir).map_err(|err| {
+        format!(
+            "Failed to create temporary Gemini settings dir {}: {err}",
+            settings_dir.display()
+        )
+    })?;
+    let settings_path = settings_dir.join("settings.json");
+    fs::write(&settings_path, settings_json).map_err(|err| {
+        format!(
+            "Failed to write temporary Gemini settings {}: {err}",
+            settings_path.display()
+        )
+    })?;
+    Ok(tempdir)
+}
+
 fn evaluate_exit_status(
     status: ExitStatus,
     stdout_summary: GeminiStdoutSummary,
@@ -1745,6 +1816,7 @@ impl Backend for GeminiBackend {
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
+                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -1942,6 +2014,7 @@ impl Backend for GeminiBackend {
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
+                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -2111,14 +2184,26 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("tyde-gemini-test-{}", unix_now_ms()));
         std::fs::create_dir_all(&workspace).expect("create temp workspace");
         let roots = vec![workspace.display().to_string()];
-        let (session, _events) = GeminiSession::spawn(&roots, None, &[], None)
-            .await
-            .expect("spawn Gemini session");
+        let (session, _events) =
+            GeminiSession::spawn(&roots, None, &[], None, BackendAccessMode::Unrestricted)
+                .await
+                .expect("spawn Gemini session");
 
         let state = session.inner.state.lock().await;
         assert_eq!(
             state.permission_mode.as_deref(),
             Some(GEMINI_DEFAULT_PERMISSION_MODE)
         );
+    }
+
+    #[test]
+    fn gemini_read_only_access_mode_uses_plan_approval_mode() {
+        let args = gemini_cli_args(BackendAccessMode::ReadOnly, "prompt".to_string());
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--approval-mode" && pair[1] == "plan")
+        );
+        assert!(!args.iter().any(|arg| arg == "-y"));
     }
 }

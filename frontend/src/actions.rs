@@ -126,6 +126,7 @@ pub fn spawn_new_chat(
                 images: initial_images,
                 backend_kind,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings,
             },
         };

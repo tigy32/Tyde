@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use client::ClientConfig;
 use protocol::{
     AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    BackendKind, ChatEvent, Envelope, FrameKind, HostSettings, HostSettingsPayload,
-    NewAgentPayload, ProjectId, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
-    SpawnCostHint, StreamPath,
+    BackendAccessMode, BackendKind, ChatEvent, Envelope, FrameKind, HostSettings,
+    HostSettingsPayload, NewAgentPayload, ProjectId, SendMessagePayload, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -408,6 +408,7 @@ pub struct SpawnRequest {
     pub project_id: Option<ProjectId>,
     pub name: Option<String>,
     pub cost_hint: Option<SpawnCostHint>,
+    pub access_mode: BackendAccessMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -572,6 +573,7 @@ async fn run_runtime(
                                 images: None,
                                 backend_kind: request.backend_kind,
                                 cost_hint: request.cost_hint,
+                                access_mode: request.access_mode,
                                 session_settings: None,
                             },
                         };
@@ -603,6 +605,7 @@ async fn run_runtime(
                             SendMessagePayload {
                                 message,
                                 images: None,
+                                origin: None,
                             },
                         ).await {
                             Ok(()) => {
@@ -932,6 +935,22 @@ impl From<BackendKindInput> for BackendKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+enum BackendAccessModeInput {
+    Unrestricted,
+    ReadOnly,
+}
+
+impl From<BackendAccessModeInput> for BackendAccessMode {
+    fn from(value: BackendAccessModeInput) -> Self {
+        match value {
+            BackendAccessModeInput::Unrestricted => Self::Unrestricted,
+            BackendAccessModeInput::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum CostHintInput {
     Low,
     Med,
@@ -958,6 +977,7 @@ struct SpawnAgentToolInput {
     project_id: Option<String>,
     name: Option<String>,
     cost_hint: Option<CostHintInput>,
+    access_mode: Option<BackendAccessModeInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -969,6 +989,7 @@ struct SpawnRequestInput {
     project_id: Option<String>,
     name: Option<String>,
     cost_hint: Option<CostHintInput>,
+    access_mode: Option<BackendAccessModeInput>,
 }
 
 impl From<SpawnAgentToolInput> for SpawnRequestInput {
@@ -981,6 +1002,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
             project_id: value.project_id,
             name: value.name,
             cost_hint: value.cost_hint,
+            access_mode: value.access_mode,
         }
     }
 }
@@ -1029,6 +1051,7 @@ fn build_spawn_request(
         project_id,
         name,
         cost_hint,
+        access_mode,
     } = input;
 
     if workspace_roots.is_empty() {
@@ -1065,6 +1088,7 @@ fn build_spawn_request(
         project_id,
         name,
         cost_hint: cost_hint.map(SpawnCostHint::from),
+        access_mode: access_mode.map(BackendAccessMode::from).unwrap_or_default(),
     })
 }
 
@@ -1645,6 +1669,7 @@ mod tests {
             project_id: None,
             name: Some("test-agent".to_string()),
             cost_hint: None,
+            access_mode: BackendAccessMode::Unrestricted,
         };
 
         let spawned = control
@@ -1679,6 +1704,7 @@ mod tests {
             project_id: None,
             name: Some("send-message-agent".to_string()),
             cost_hint: None,
+            access_mode: BackendAccessMode::Unrestricted,
         };
 
         let spawned = control

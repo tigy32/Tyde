@@ -8,6 +8,7 @@ protocol = { path = "../protocol" }
 server = { path = "../server" }
 tyde-dev-driver = { path = "../dev-driver" }
 paste = "1"
+rmcp = { version = "0.15.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true

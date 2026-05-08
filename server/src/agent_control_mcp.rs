@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
-    AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendKind, Envelope, ProjectId,
-    SendMessagePayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
+    AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendAccessMode, BackendKind, Envelope,
+    ProjectId, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -75,6 +75,22 @@ impl From<BackendKindInput> for BackendKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+enum BackendAccessModeInput {
+    Unrestricted,
+    ReadOnly,
+}
+
+impl From<BackendAccessModeInput> for BackendAccessMode {
+    fn from(value: BackendAccessModeInput) -> Self {
+        match value {
+            BackendAccessModeInput::Unrestricted => Self::Unrestricted,
+            BackendAccessModeInput::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 enum CostHintInput {
     Low,
     Med,
@@ -101,6 +117,7 @@ struct SpawnAgentToolInput {
     project_id: Option<String>,
     name: Option<String>,
     cost_hint: Option<CostHintInput>,
+    access_mode: Option<BackendAccessModeInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -258,7 +275,12 @@ impl TydeAgentControlMcpServer {
     async fn tyde_send_agent_message(
         &self,
         Parameters(input): Parameters<SendAgentMessageToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let request_agent_id = match request_agent_id_from_parts(&parts) {
+            Ok(agent_id) => agent_id,
+            Err(err) => return Ok(err_text(err)),
+        };
         let agent_id = match parse_agent_id(&input.agent_id) {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
@@ -266,7 +288,7 @@ impl TydeAgentControlMcpServer {
         if input.message.trim().is_empty() {
             return Ok(err_text("message must not be empty"));
         }
-        match do_send_message(&self.host, &agent_id, input.message).await {
+        match do_send_message(&self.host, &agent_id, input.message, request_agent_id).await {
             Ok(()) => ok_json(json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }
@@ -365,6 +387,9 @@ async fn do_spawn_agent(
     input: SpawnRequestInput,
     request_agent_id: Option<AgentId>,
 ) -> Result<SpawnAgentResult, String> {
+    reject_mutating_tool_for_read_only_caller(host, request_agent_id.as_ref(), "tyde_spawn_agent")
+        .await?;
+
     if input.workspace_roots.is_empty() {
         return Err("workspace_roots must contain at least one root".to_string());
     }
@@ -408,6 +433,10 @@ async fn do_spawn_agent(
             images: None,
             backend_kind,
             cost_hint: input.cost_hint.map(SpawnCostHint::from),
+            access_mode: input
+                .access_mode
+                .map(BackendAccessMode::from)
+                .unwrap_or_default(),
             session_settings: None,
         },
     };
@@ -437,7 +466,15 @@ async fn do_send_message(
     host: &HostHandle,
     agent_id: &AgentId,
     message: String,
+    request_agent_id: Option<AgentId>,
 ) -> Result<(), String> {
+    reject_mutating_tool_for_read_only_caller(
+        host,
+        request_agent_id.as_ref(),
+        "tyde_send_agent_message",
+    )
+    .await?;
+
     let handle = host
         .agent_handle(agent_id)
         .await
@@ -457,10 +494,27 @@ async fn do_send_message(
         .send_input(AgentInput::SendMessage(SendMessagePayload {
             message,
             images: None,
+            origin: None,
         }))
         .await;
     if !sent {
         return Err("agent backend is closed".to_string());
+    }
+    Ok(())
+}
+
+async fn reject_mutating_tool_for_read_only_caller(
+    host: &HostHandle,
+    request_agent_id: Option<&AgentId>,
+    tool_name: &'static str,
+) -> Result<(), String> {
+    let Some(agent_id) = request_agent_id else {
+        return Ok(());
+    };
+    if host.agent_access_mode(agent_id).await == Some(BackendAccessMode::ReadOnly) {
+        return Err(format!(
+            "BackendAccessMode::ReadOnly rejects mutating MCP tool '{tool_name}'"
+        ));
     }
     Ok(())
 }
@@ -598,6 +652,7 @@ struct SpawnRequestInput {
     project_id: Option<String>,
     name: Option<String>,
     cost_hint: Option<CostHintInput>,
+    access_mode: Option<BackendAccessModeInput>,
 }
 
 impl From<SpawnAgentToolInput> for SpawnRequestInput {
@@ -610,6 +665,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
             project_id: v.project_id,
             name: v.name,
             cost_hint: v.cost_hint,
+            access_mode: v.access_mode,
         }
     }
 }

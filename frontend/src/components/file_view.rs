@@ -38,21 +38,6 @@ const INITIAL_VIEWPORT_HEIGHT_ESTIMATE: f64 = 600.0;
 /// production.
 const FALLBACK_CHUNK_LINES: usize = 200;
 
-/// Number of lines to tokenize *synchronously on the main thread* before
-/// first paint, so the visible viewport renders already-coloured rather
-/// than flashing from plain text to highlighted ~200ms later (VSCode
-/// does the same — viewport-first, defer the rest). Sized to roughly
-/// match a typical viewport (~35 lines at 700px / 20px line-height) so
-/// the visible area is fully coloured on first paint without paying
-/// for off-screen lines twice. Cost: lines × per-line tokenize cost
-/// (~0.3ms release, ~3ms debug).
-///
-/// The worker still tokenizes the full file from line 0 so multi-line
-/// constructs (block comments, raw strings) stay correct — these
-/// initial tokens get overwritten by the worker's first chunk, which
-/// is a no-op visually since the result is identical.
-const INSTANT_PREFIX_LINES: usize = 40;
-
 /// Above this line count we never highlight — the wasm main thread can't
 /// realistically tokenize that much without freezing the UI even with
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
@@ -146,45 +131,22 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     );
     provide_context(find_state.clone());
 
-    // Async syntax highlighting. We don't tokenize on
-    // mount — that would block first paint for ~1s on a
-    // moderate file in debug builds. Instead we kick off
-    // a spawn_local task that fills tokens into a signal
-    // in `HIGHLIGHT_CHUNK_LINES`-sized chunks, yielding
-    // to the browser between chunks. Each row reads its
-    // own index from the signal, so visible lines render
-    // plain text immediately and "fill in" with color
+    // Async syntax highlighting. We do *zero* sync syntect work on
+    // mount — even tokenizing 40 lines of Rust costs ~700ms in
+    // debug-build wasm on a cold syntect (first time the language is
+    // touched in the session pays onig regex compile costs the
+    // pre-emptive `warm_up()` only partially amortizes). Plain-text
+    // first paint at <50ms beats colored first paint at >700ms.
+    //
+    // Tokens stream in via the spawn_local task / worker below: each
+    // row reads its own index from `highlighted` reactively, so visible
+    // lines render plain text immediately and "fill in" with color
     // over the next ~hundred ms as chunks land.
     //
-    // Persistent syntect parser state across chunks is
-    // critical: it's how multi-line constructs (block
-    // comments, raw strings) still color correctly even
-    // though we're processing the file in pieces.
-    let mut initial_tokens: Vec<Option<LineTokens>> = vec![None; total];
-
-    // Synchronously tokenize the first viewport's worth of lines on the
-    // main thread so first paint shows already-coloured text. Without
-    // this the worker takes ~150ms+ to deliver its first chunk in debug
-    // builds and the user sees an uncoloured-to-coloured flash.
-    if total > 0
-        && total <= HIGHLIGHT_LINE_CAP
-        && let Some(syntax) = syntax_for_path(&f.path.relative_path)
-    {
-        let prefix_t0 = crate::perf::now_ms();
-        let prefix_end = total.min(INSTANT_PREFIX_LINES);
-        let mut hl = LineHighlighter::new(syntax);
-        for (i, slot) in initial_tokens.iter_mut().enumerate().take(prefix_end) {
-            *slot = Some(hl.highlight_one(lines.line(i)));
-        }
-        let dt = crate::perf::now_ms() - prefix_t0;
-        crate::perf::log_phase(
-            "file_open",
-            "instant_prefix",
-            &perf_key,
-            &format!(" lines={prefix_end} took={dt:.1}ms"),
-        );
-    }
-
+    // Persistent syntect parser state across chunks is critical: it's
+    // how multi-line constructs (block comments, raw strings) still
+    // color correctly even though we're processing the file in pieces.
+    let initial_tokens: Vec<Option<LineTokens>> = vec![None; total];
     let highlighted: ArcRwSignal<Vec<Option<LineTokens>>> = ArcRwSignal::new(initial_tokens);
 
     // Generation counter for live re-highlighting on
@@ -358,25 +320,15 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
         }
     });
 
-    // Throttle to one update per animation frame so the
-    // visible_window memo only invalidates once per paint
-    // even on a high-DPI trackpad firing scroll events
-    // hundreds of times per second.
-    let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-    let on_scroll = {
-        let pending = scroll_pending.clone();
-        move |_: web_sys::Event| {
-            if pending.get() {
-                return;
-            }
-            pending.set(true);
-            let pending = pending.clone();
-            leptos::prelude::request_animation_frame(move || {
-                pending.set(false);
-                if let Some(el) = pre_ref.get_untracked() {
-                    scroll_top.set(el.scroll_top() as f64);
-                }
-            });
+    // Write the native scrollTop straight into the signal. Leptos
+    // batches reactive updates within the same task, so a burst of
+    // native scroll events still only re-renders the visible window
+    // once per microtask. (We previously throttled with rAF, but the
+    // rAF callback fires unreliably in Tauri's WKWebView and that
+    // pinned the visible window to its initial range.)
+    let on_scroll = move |_: web_sys::Event| {
+        if let Some(el) = pre_ref.get_untracked() {
+            scroll_top.set(el.scroll_top() as f64);
         }
     };
 
@@ -453,7 +405,7 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
                                         view! {
                                             <div
                                                 class=move || file_line_class(i, &find)
-                                                attr:data-find-idx=i
+                                                data-find-idx=i
                                             >
                                                 <span class="file-line-num">{i + 1}</span>
                                                 {move || {
@@ -497,6 +449,14 @@ async fn yield_to_browser() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
+/// First-chunk size for the fallback path. Intentionally smaller than
+/// `FALLBACK_CHUNK_LINES` so colored text appears in the visible
+/// viewport quickly even on cold syntect (where each line costs
+/// ~10-20ms in debug builds — a 200-line first chunk would block the
+/// main thread for several seconds). After the first chunk lands the
+/// regex/parser caches are warm and full-size chunks are cheap.
+const FALLBACK_FIRST_CHUNK_LINES: usize = 40;
+
 /// Main-thread fallback used when the highlight worker can't be
 /// instantiated. Mirrors the pre-worker behavior: spawn_local + chunked
 /// LineHighlighter with a per-chunk yield. Same generation-counter
@@ -510,6 +470,15 @@ fn run_fallback_highlight(
     perf_key: String,
 ) {
     spawn_local(async move {
+        // Yield once before any syntect work so the parent component
+        // can paint its plain-text DOM. Without this the spawn_local
+        // body runs in the same microtask burst as the mount, and the
+        // first chunk's regex-compile cost (~hundreds of ms on cold
+        // syntect) shows up as click latency.
+        yield_to_browser().await;
+        if generation.get_untracked() != my_gen {
+            return;
+        }
         let task_t0 = crate::perf::now_ms();
         crate::perf::log_phase(
             "file_open",
@@ -521,11 +490,12 @@ fn run_fallback_highlight(
         let mut i = 0usize;
         let mut chunks = 0u32;
         let mut first_chunk_logged = false;
+        let mut chunk_size = FALLBACK_FIRST_CHUNK_LINES;
         while i < lines.len() {
             if generation.get_untracked() != my_gen {
                 return;
             }
-            let end = (i + FALLBACK_CHUNK_LINES).min(lines.len());
+            let end = (i + chunk_size).min(lines.len());
             let chunk_tokens: Vec<LineTokens> =
                 (i..end).map(|j| hl.highlight_one(lines.line(j))).collect();
             if generation.get_untracked() != my_gen {
@@ -550,6 +520,7 @@ fn run_fallback_highlight(
                 );
                 first_chunk_logged = true;
             }
+            chunk_size = FALLBACK_CHUNK_LINES;
             yield_to_browser().await;
         }
         let dt = crate::perf::now_ms() - task_t0;
@@ -812,11 +783,23 @@ mod wasm_tests {
             provide_context(state);
             view! { <FileView path=mount_path.clone() /> }
         });
-        next_tick().await;
-
-        let nodes = container
+        // The fallback highlighter yields once before doing any syntect
+        // work (so the parent component can paint plain text first), so
+        // we need at least two ticks for the first chunk to land. Loop
+        // a few extra times in case the chunk crosses additional
+        // macrotask boundaries on slower CI runners.
+        let mut nodes = container
             .query_selector_all(".file-line code span[style]")
             .unwrap();
+        for _ in 0..20 {
+            if nodes.length() > 0 {
+                break;
+            }
+            next_tick().await;
+            nodes = container
+                .query_selector_all(".file-line code span[style]")
+                .unwrap();
+        }
         assert!(
             nodes.length() > 0,
             "expected at least one styled span in the rendered file line"

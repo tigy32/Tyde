@@ -264,6 +264,7 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
         let payload = SendMessagePayload {
             message: text,
             images: payload_images,
+            origin: None,
         };
         if let Err(e) =
             send_frame(&host_id, instance_stream, FrameKind::SendMessage, &payload).await
@@ -337,6 +338,7 @@ fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>
         let payload = SendMessagePayload {
             message: text,
             images: payload_images,
+            origin: None,
         };
         if let Err(e) =
             send_frame(&host_id, instance_stream, FrameKind::SendMessage, &payload).await

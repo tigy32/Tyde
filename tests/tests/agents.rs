@@ -444,6 +444,7 @@ async fn spawn_parent_with_native_child(
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -504,6 +505,7 @@ async fn agent_lifecycle() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -569,6 +571,7 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -630,6 +633,7 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -710,6 +714,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
             project_id: None,
             name: Some("agent-control".to_owned()),
             cost_hint: None,
+            access_mode: Default::default(),
         })
         .await
         .expect("agent control spawn should succeed");
@@ -791,6 +796,7 @@ async fn agent_control_spawn_without_name_returns_generated_name() {
             project_id: None,
             name: None,
             cost_hint: None,
+            access_mode: Default::default(),
         })
         .await
         .expect("agent control spawn without name should succeed");
@@ -820,6 +826,7 @@ async fn agent_control_http_infers_parent_agent_id_from_request_url() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -929,6 +936,7 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1030,6 +1038,7 @@ async fn agent_origin_is_user_for_normal_spawns() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1216,6 +1225,7 @@ async fn cancelling_parent_cascades_to_user_children_and_closes_relay_children()
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1322,6 +1332,7 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
                 images: None,
                 backend_kind: BackendKind::Tycode,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1387,6 +1398,7 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1444,6 +1456,7 @@ async fn renaming_agent_updates_live_streams_and_replay() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1515,6 +1528,7 @@ async fn multiple_agents() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1534,6 +1548,7 @@ async fn multiple_agents() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1665,6 +1680,7 @@ async fn late_joining_client_gets_replay() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -1987,6 +2003,7 @@ async fn project_replay_happens_before_agent_replay() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -2097,6 +2114,7 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -2199,6 +2217,7 @@ async fn spawn_with_missing_project_id_closes_the_connection() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })

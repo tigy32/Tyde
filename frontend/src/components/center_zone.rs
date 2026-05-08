@@ -9,6 +9,7 @@ use crate::components::chat_view::ChatView;
 use crate::components::diff_view::DiffView;
 use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
+use crate::components::review_view::ReviewView;
 use crate::components::settings_panel::SettingsPanel;
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus, TabContent, TabId};
@@ -384,6 +385,7 @@ enum TabKind {
     Chat,
     File,
     Diff,
+    Review,
     Missing,
 }
 
@@ -415,6 +417,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                 Some(TabContent::Chat { .. }) => TabKind::Chat,
                 Some(TabContent::File { .. }) => TabKind::File,
                 Some(TabContent::Diff { .. }) => TabKind::Diff,
+                Some(TabContent::Review { .. }) => TabKind::Review,
                 None => TabKind::Missing,
             }
         })
@@ -508,6 +511,26 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                             None => view! { <div></div> }.into_any(),
                         }
                     }
+                    TabKind::Review => {
+                        let resolved = state.center_zone.with_untracked(|cz| {
+                            cz.tabs
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                                .and_then(|t| match &t.content {
+                                    TabContent::Review { host_id, review_id } => {
+                                        Some((host_id.clone(), review_id.clone()))
+                                    }
+                                    _ => None,
+                                })
+                        });
+                        match resolved {
+                            Some((host_id, review_id)) => {
+                                view! { <ReviewView host_id=host_id review_id=review_id /> }
+                                    .into_any()
+                            }
+                            None => view! { <div></div> }.into_any(),
+                        }
+                    }
                     TabKind::Missing => view! { <div></div> }.into_any(),
                 }
             }}
@@ -525,6 +548,7 @@ pub fn CenterZone() -> impl IntoView {
 
     // New chat split button
     let menu_open = RwSignal::new(false);
+    let menu_position = RwSignal::new(None::<(f64, f64)>);
 
     let is_connected_state = state.clone();
     let is_connected = Memo::new(move |_| {
@@ -549,11 +573,37 @@ pub fn CenterZone() -> impl IntoView {
 
     let on_toggle_menu = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
-        menu_open.update(|open| *open = !*open);
+        if menu_open.get_untracked() {
+            menu_open.set(false);
+            menu_position.set(None);
+            return;
+        }
+
+        let Some(trigger) = ev
+            .current_target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        else {
+            log::error!("new chat menu trigger click did not have an element target");
+            return;
+        };
+        let Some(window) = web_sys::window() else {
+            log::error!("new chat menu cannot open without a browser window");
+            return;
+        };
+        let Some(window_width) = window.inner_width().ok().and_then(|width| width.as_f64()) else {
+            log::error!("new chat menu cannot resolve window width");
+            return;
+        };
+        let rect = trigger.get_bounding_client_rect();
+        let top = rect.bottom() + 2.0;
+        let right = (window_width - rect.right()).max(0.0);
+        menu_position.set(Some((top, right)));
+        menu_open.set(true);
     };
 
     let close_menu = move |_: web_sys::MouseEvent| {
         menu_open.set(false);
+        menu_position.set(None);
     };
 
     let tab_ids = move || {
@@ -647,6 +697,12 @@ pub fn CenterZone() -> impl IntoView {
     view! {
         <div class="center-zone">
             <div class=tab_bar_class>
+                <div class="pinned-tab-leading">
+                    {move || home_tab_id().map(|id| {
+                        view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
+                    })}
+                </div>
+
                 <div class="tab-strip-scroll" node_ref=tab_scroll_ref>
                     {move || scroll_tab_ids().into_iter().map(|id| {
                         view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
@@ -654,10 +710,7 @@ pub fn CenterZone() -> impl IntoView {
                 </div>
 
                 <div class="pinned-tab-actions">
-                    {move || home_tab_id().map(|id| {
-                        view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
-                    })}
-
+                    <span class="tab-bar-divider" aria-hidden="true"></span>
                     <div class="new-chat-split">
                         <button
                             class="new-chat-btn"
@@ -680,9 +733,20 @@ pub fn CenterZone() -> impl IntoView {
                             </svg>
                         </button>
 
-                        <Show when=move || menu_open.get()>
+                        <Show when=move || menu_open.get() && menu_position.get().is_some()>
                             <div class="new-chat-backdrop" on:click=close_menu></div>
-                            <div class="new-chat-menu" role="menu">
+                            <div
+                                class="new-chat-menu"
+                                role="menu"
+                                style=move || {
+                                    menu_position
+                                        .get()
+                                        .map(|(top, right)| {
+                                            format!("top: {top}px; right: {right}px;")
+                                        })
+                                        .unwrap_or_default()
+                                }
+                            >
                                 {move || {
                                     let backends = enabled_backends.get();
                                     if backends.is_empty() {
@@ -697,6 +761,7 @@ pub fn CenterZone() -> impl IntoView {
                                             let menu_state = expect_context::<AppState>();
                                             let on_click = move |_| {
                                                 menu_open.set(false);
+                                                menu_position.set(None);
                                                 begin_new_chat(&menu_state, Some(kind));
                                             };
                                             view! {

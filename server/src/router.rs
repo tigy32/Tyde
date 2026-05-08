@@ -11,7 +11,8 @@ use protocol::{
     ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
     ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, RunBackendSetupPayload, SendMessagePayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
+    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
@@ -392,6 +393,21 @@ pub(crate) async fn route_client_envelope(
                 )
                 .await?;
             }
+            FrameKind::ReviewCreate => {
+                let payload: ReviewCreatePayload = parse_payload(&envelope, "review_create")?;
+                ensure_non_empty(
+                    "review_create",
+                    "origin_agent_id",
+                    payload.origin_agent_id.0.as_str(),
+                )?;
+                host.create_review(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
             FrameKind::ProjectStageFile => {
                 let payload: ProjectStageFilePayload =
                     parse_payload(&envelope, "project_stage_file")?;
@@ -506,6 +522,40 @@ pub(crate) async fn route_client_envelope(
                     "route_client_envelope",
                     format!(
                         "unexpected client frame kind {} on browse stream {}",
+                        other, envelope.stream
+                    ),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if envelope.stream.0.starts_with("/review/") {
+        let stream_path = envelope.stream.clone();
+        let review_id = parse_review_id(&stream_path)?;
+        let review_output_stream = host_output_stream.with_path(stream_path.clone());
+
+        match envelope.kind {
+            FrameKind::ReviewAction => {
+                let payload: ReviewActionPayload = parse_payload(&envelope, "review_action")?;
+                host.review_action(
+                    connection_host_stream,
+                    review_output_stream,
+                    review_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::ReviewSubscribe => {
+                let _: ReviewSubscribePayload = parse_payload(&envelope, "review_subscribe")?;
+                host.review_subscribe(connection_host_stream, review_output_stream, review_id)
+                    .await?;
+            }
+            other => {
+                return Err(AppError::protocol(
+                    "route_client_envelope",
+                    format!(
+                        "unexpected client frame kind {} on review stream {}",
                         other, envelope.stream
                     ),
                 ));
@@ -725,6 +775,42 @@ fn parse_terminal_id(stream: &StreamPath) -> AppResult<TerminalId> {
     })?;
 
     Ok(TerminalId(segments[2].to_owned()))
+}
+
+fn parse_review_id(stream: &StreamPath) -> AppResult<ReviewId> {
+    let segments: Vec<&str> = stream.0.split('/').collect();
+    if segments.len() != 3 {
+        return Err(AppError::protocol(
+            "parse_review_stream",
+            format!(
+                "review stream must have format /review/<review_id>, got {}",
+                stream
+            ),
+        ));
+    }
+    if segments.first() != Some(&"") {
+        return Err(AppError::protocol(
+            "parse_review_stream",
+            format!("review stream must be absolute path, got {}", stream),
+        ));
+    }
+    if segments[1] != "review" {
+        return Err(AppError::protocol(
+            "parse_review_stream",
+            format!("expected /review/<review_id> stream, got {}", stream),
+        ));
+    }
+    Uuid::parse_str(segments[2]).map_err(|error| {
+        AppError::protocol(
+            "parse_review_stream",
+            format!(
+                "review stream contains invalid review_id UUID {} in {}",
+                segments[2], stream
+            ),
+        )
+        .with_source(anyhow!(error))
+    })?;
+    Ok(ReviewId(segments[2].to_owned()))
 }
 
 async fn send_agent_not_running_error(stream: Stream, agent_id: AgentId) {

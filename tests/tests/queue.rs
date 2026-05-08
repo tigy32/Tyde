@@ -74,6 +74,7 @@ async fn spawn_and_start(client: &mut client::Connection, name: &str, prompt: &s
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })

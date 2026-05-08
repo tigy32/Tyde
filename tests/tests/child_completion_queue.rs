@@ -35,6 +35,7 @@ async fn spawn_agent(
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })

@@ -1,5 +1,10 @@
-use leptos::prelude::*;
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
@@ -167,6 +172,11 @@ pub fn ChatView(
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
     let user_scrolled_up = RwSignal::new(false);
     let show_scroll_btn = RwSignal::new(false);
+    let view_mounted = Arc::new(AtomicBool::new(true));
+    let view_mounted_for_cleanup = view_mounted.clone();
+    on_cleanup(move || {
+        view_mounted_for_cleanup.store(false, Ordering::Relaxed);
+    });
 
     // Virtualization plumbing — see `VirtualWindow` and the windowed `<For>`
     // below. The chat row list is windowed: only rows whose offsets fall
@@ -201,6 +211,7 @@ pub fn ChatView(
     }
     let scroll_listener_slot: StoredValue<Option<ScrollListenerHolder>, LocalStorage> =
         StoredValue::new_local(None);
+    let view_mounted_for_listeners = view_mounted.clone();
     // Two listeners, with separate responsibilities:
     //
     //   1. The `scroll` listener (always fires, including on
@@ -228,6 +239,7 @@ pub fn ChatView(
         }
         let el_clone = el.clone();
         let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let listener_mounted = view_mounted_for_listeners.clone();
         let scroll_handler = Closure::<dyn Fn()>::new(move || {
             if listener_pending.get() {
                 return;
@@ -235,12 +247,16 @@ pub fn ChatView(
             listener_pending.set(true);
             let pending = listener_pending.clone();
             let el_for_cb = el_clone.clone();
+            let mounted = listener_mounted.clone();
             // `setTimeout(0)` instead of `requestAnimationFrame` — rAF
             // is paused for hidden Tauri webviews (macOS WKWebView
             // throttles when the window is occluded). setTimeout
             // fires regardless of visibility.
             leptos::prelude::set_timeout(
                 move || {
+                    if !mounted.load(Ordering::Relaxed) {
+                        return;
+                    }
                     pending.set(false);
                     let scroll_top = el_for_cb.scroll_top();
                     scroll_top_sig.set(scroll_top as f64);
@@ -258,6 +274,7 @@ pub fn ChatView(
         // applied the input's scroll effect.
         let el_for_input = el.clone();
         let input_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let input_mounted = view_mounted_for_listeners.clone();
         let input_handler = Closure::<dyn Fn()>::new(move || {
             if input_pending.get() {
                 return;
@@ -265,8 +282,12 @@ pub fn ChatView(
             input_pending.set(true);
             let pending = input_pending.clone();
             let el_for_cb = el_for_input.clone();
+            let mounted = input_mounted.clone();
             leptos::prelude::set_timeout(
                 move || {
+                    if !mounted.load(Ordering::Relaxed) {
+                        return;
+                    }
                     pending.set(false);
                     let scroll_height = el_for_cb.scroll_height();
                     let scroll_top = el_for_cb.scroll_top();
@@ -323,6 +344,7 @@ pub fn ChatView(
     let viewport_observer_slot: StoredValue<ViewportObserverSlot, LocalStorage> =
         StoredValue::new_local(None);
     let scroll_ref_for_viewport = scroll_ref;
+    let view_mounted_for_viewport = view_mounted.clone();
     Effect::new(move |_| {
         let Some(el) = scroll_ref_for_viewport.get() else {
             return;
@@ -334,9 +356,27 @@ pub fn ChatView(
         // rather than the default 800px estimate.
         viewport_height_sig.set(el.client_height() as f64);
         let el_clone = el.clone();
+        let viewport_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let viewport_mounted = view_mounted_for_viewport.clone();
         let cb =
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
-                viewport_height_sig.set(el_clone.client_height() as f64);
+                if viewport_pending.get() {
+                    return;
+                }
+                viewport_pending.set(true);
+                let pending = viewport_pending.clone();
+                let el_for_cb = el_clone.clone();
+                let mounted = viewport_mounted.clone();
+                leptos::prelude::set_timeout(
+                    move || {
+                        if !mounted.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        pending.set(false);
+                        viewport_height_sig.set(el_for_cb.client_height() as f64);
+                    },
+                    std::time::Duration::from_millis(0),
+                );
             });
         if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
             let element: web_sys::Element = el.unchecked_into();
@@ -440,6 +480,7 @@ pub fn ChatView(
     // touches it, so content growing below the user can't masquerade
     // as user intent and disable sticky-bottom.
     let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+    let view_mounted_for_auto_scroll = view_mounted.clone();
     Effect::new(move |_| {
         let _len = messages_len.get();
         let _hv = heights_version.get();
@@ -469,6 +510,7 @@ pub fn ChatView(
         };
         scroll_pending.set(true);
         let pending = scroll_pending.clone();
+        let mounted = view_mounted_for_auto_scroll.clone();
         // `setTimeout(0)` instead of `requestAnimationFrame`. rAF is
         // paused for hidden Tauri windows on macOS — a user
         // backgrounding the app during session restore would leave the
@@ -477,6 +519,9 @@ pub fn ChatView(
         // via `scroll_pending`.
         leptos::prelude::set_timeout(
             move || {
+                if !mounted.load(Ordering::Relaxed) {
+                    return;
+                }
                 pending.set(false);
                 el.set_scroll_top(el.scroll_height());
                 // Mirror the post-clamp scrollTop into `scroll_top_sig`
@@ -546,6 +591,7 @@ pub fn ChatView(
                         view! { <span class=badge_class>{label}</span> }
                     })}
                     <ToolOutputModeToggle />
+                    <ReviewChangesButton />
                 </div>
                 {move || {
                     view! {
@@ -725,6 +771,7 @@ fn MeasuredRow(
 ) -> impl IntoView {
     let row_id = row.id;
     let node_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let row_mounted = Arc::new(AtomicBool::new(true));
 
     // Observer + closure are !Send/!Sync (web_sys handles wrap raw JS
     // pointers), so we can't capture them in a `Send + Sync` cleanup
@@ -737,6 +784,7 @@ fn MeasuredRow(
         Closure<dyn FnMut(JsValue, JsValue)>,
     )>;
     let slot: StoredValue<ObserverPair, LocalStorage> = StoredValue::new_local(None);
+    let row_mounted_for_observer = row_mounted.clone();
 
     Effect::new(move |_| {
         let Some(el) = node_ref.get() else {
@@ -749,31 +797,49 @@ fn MeasuredRow(
         }
         let element: web_sys::Element = el.clone().unchecked_into();
         let elem_for_cb = element.clone();
+        let resize_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let row_mounted_for_cb = row_mounted_for_observer.clone();
         let cb =
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
-                let h = elem_for_cb.get_bounding_client_rect().height();
-                // Inactive tabs in the LRU hot set stay mounted under
-                // `display: none`, where every element measures as 0px.
-                // If we recorded those zeros, switching back to the
-                // hidden tab would compute spacers against rows the
-                // window math thinks have no height — collapsing the
-                // visible window onto rows that are actually below the
-                // viewport. Ignore zero/negative measurements; the next
-                // observer fire after the tab is shown again will
-                // record the real height.
-                if !matches!(h.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+                if resize_pending.get() {
                     return;
                 }
-                let changed = row_heights.with_value(|map| {
-                    let prev = map.get(&row_id).copied();
-                    prev.is_none_or(|p| (p - h).abs() >= 0.5)
-                });
-                if changed {
-                    row_heights.update_value(|map| {
-                        map.insert(row_id, h);
-                    });
-                    heights_version.update(|v| *v = v.wrapping_add(1));
-                }
+                resize_pending.set(true);
+                let pending = resize_pending.clone();
+                let elem_for_timeout = elem_for_cb.clone();
+                let mounted = row_mounted_for_cb.clone();
+                leptos::prelude::set_timeout(
+                    move || {
+                        if !mounted.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        pending.set(false);
+                        let h = elem_for_timeout.get_bounding_client_rect().height();
+                        // Inactive tabs in the LRU hot set stay mounted under
+                        // `display: none`, where every element measures as 0px.
+                        // If we recorded those zeros, switching back to the
+                        // hidden tab would compute spacers against rows the
+                        // window math thinks have no height — collapsing the
+                        // visible window onto rows that are actually below the
+                        // viewport. Ignore zero/negative measurements; the next
+                        // observer fire after the tab is shown again will
+                        // record the real height.
+                        if h <= 0.0 || h.is_nan() {
+                            return;
+                        }
+                        let changed = row_heights.with_value(|map| {
+                            let prev = map.get(&row_id).copied();
+                            prev.is_none_or(|p| (p - h).abs() >= 0.5)
+                        });
+                        if changed {
+                            row_heights.update_value(|map| {
+                                map.insert(row_id, h);
+                            });
+                            heights_version.update(|v| *v = v.wrapping_add(1));
+                        }
+                    },
+                    std::time::Duration::from_millis(0),
+                );
             });
         if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
             observer.observe(&element);
@@ -782,6 +848,7 @@ fn MeasuredRow(
     });
 
     on_cleanup(move || {
+        row_mounted.store(false, Ordering::Relaxed);
         slot.update_value(|s| {
             if let Some((observer, _cb)) = s.take() {
                 observer.disconnect();
@@ -832,6 +899,48 @@ fn ToolOutputModeToggle() -> impl IntoView {
             title=title
             on:click=on_click
         >{label}</button>
+    }
+}
+
+/// "Review changes" header button. Visible whenever the active agent
+/// owns a project that has uncommitted changes. Disabled while a
+/// `ReviewCreate` for that project is in flight (until the server
+/// `ProjectEventPayload::ReviewListChanged` echoes back).
+///
+/// Click → `FrameKind::ReviewCreate` with `selection: AllUncommitted`,
+/// then opens (or focuses) a tab for the most recently-created review on
+/// that project once the summary list lands.
+#[component]
+fn ReviewChangesButton() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let visibility_state = state.clone();
+    let visible = move || {
+        crate::components::review_view::active_agent_has_uncommitted_changes(&visibility_state)
+    };
+    let pending_state = state.clone();
+    let pending =
+        move || crate::components::review_view::active_agent_review_create_pending(&pending_state);
+    let click_state = state.clone();
+    let on_click = move |_| {
+        crate::components::review_view::create_review_for_active_agent(&click_state);
+    };
+    view! {
+        <Show when=visible.clone()>
+            <button
+                class="chat-review-btn"
+                disabled=pending.clone()
+                title="Freeze the project's uncommitted changes into a Review you can comment on"
+                on:click=on_click.clone()
+            >
+                <svg class="chat-review-btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                     stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 2.5h7l3 3V13a.5.5 0 0 1-.5.5h-9.5A.5.5 0 0 1 2.5 13V3a.5.5 0 0 1 .5-.5z" />
+                    <path d="M10 2.5V6h3" />
+                    <path d="M5.5 9.25l1.5 1.5L11 7.5" />
+                </svg>
+                <span class="chat-review-btn-label">"Review changes"</span>
+            </button>
+        </Show>
     }
 }
 

@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, BackendKind, ChatEvent, Envelope, FrameKind, MessageSender,
-    QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
+    AgentStartPayload, BackendKind, ChatEvent, Envelope, FrameKind, MessageOrigin, MessageSender,
+    QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
+    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -25,6 +25,7 @@ use crate::backend::{
     validate_session_settings_values,
 };
 use crate::host::HostSubAgentEmitter;
+use crate::review::ReviewRegistryHandle;
 use crate::store::session::SessionStore;
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
@@ -229,6 +230,7 @@ pub(crate) async fn generate_agent_name(
     let initial_input = SendMessagePayload {
         message: name_prompt,
         images: None,
+        origin: None,
     };
     let name_agent_id = AgentId(Uuid::new_v4().to_string());
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
@@ -500,6 +502,7 @@ pub(crate) fn spawn_agent_actor(
     request: ResolvedSpawnRequest,
     session_store: Arc<Mutex<SessionStore>>,
     host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    review_registry: ReviewRegistryHandle,
     status_handle: registry::AgentStatusHandle,
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
@@ -924,7 +927,9 @@ pub(crate) fn spawn_agent_actor(
                         if !backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
-                            .send(AgentInput::SendMessage(queued_message_to_send_payload(queued)))
+                            .send(AgentInput::SendMessage(queued_message_to_send_payload(
+                                queued.clone(),
+                            )))
                             .await
                         {
                             let payload = AgentErrorPayload {
@@ -957,6 +962,14 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             return;
                         }
+                        if let Some(MessageOrigin::Review { review_id }) = queued.origin {
+                            notify_review_bundle_consumed(
+                                &review_registry,
+                                review_id,
+                                &current_start.agent_id,
+                            )
+                            .await;
+                        }
                     }
                 }
                 maybe_command = rx.recv() => {
@@ -970,11 +983,16 @@ pub(crate) fn spawn_agent_actor(
                             }
                             match input {
                                 AgentInput::SendMessage(msg) => {
+                                    let review_origin = match msg.origin.clone() {
+                                        Some(MessageOrigin::Review { review_id }) => Some(review_id),
+                                        Some(MessageOrigin::User) | None => None,
+                                    };
                                     if in_turn {
                                         queue.push_back(QueuedMessageEntry {
                                             id: QueuedMessageId(Uuid::new_v4().to_string()),
                                             message: msg.message,
                                             images: msg.images.unwrap_or_default(),
+                                            origin: msg.origin,
                                         });
                                         update_queued_messages_snapshot(
                                             &canonical_stream,
@@ -1020,6 +1038,14 @@ pub(crate) fn spawn_agent_actor(
                                             )
                                             .await;
                                             return;
+                                        }
+                                        if let Some(review_id) = review_origin {
+                                            notify_review_bundle_consumed(
+                                                &review_registry,
+                                                review_id,
+                                                &current_start.agent_id,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -1141,7 +1167,7 @@ pub(crate) fn spawn_agent_actor(
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
                                         .send(AgentInput::SendMessage(
-                                            queued_message_to_send_payload(queued),
+                                            queued_message_to_send_payload(queued.clone()),
                                         ))
                                         .await
                                     {
@@ -1174,6 +1200,15 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         return;
+                                    }
+                                    if let Some(MessageOrigin::Review { review_id }) = queued.origin
+                                    {
+                                        notify_review_bundle_consumed(
+                                            &review_registry,
+                                            review_id,
+                                            &current_start.agent_id,
+                                        )
+                                        .await;
                                     }
                                 }
                                 AgentInput::UpdateSessionSettings(update) => {
@@ -1799,6 +1834,34 @@ fn queued_message_to_send_payload(entry: QueuedMessageEntry) -> SendMessagePaylo
     SendMessagePayload {
         message: entry.message,
         images: (!entry.images.is_empty()).then_some(entry.images),
+        origin: entry.origin,
+    }
+}
+
+async fn notify_review_bundle_consumed(
+    review_registry: &ReviewRegistryHandle,
+    review_id: protocol::ReviewId,
+    target_agent_id: &AgentId,
+) {
+    if let Err(error) = review_registry
+        .bundle_consumed(review_id.clone(), target_agent_id.clone(), now_ms())
+        .await
+    {
+        let message = format!(
+            "failed to mark review bundle consumed by agent {}: {}",
+            target_agent_id, error
+        );
+        if let Err(report_error) = review_registry
+            .internal_error(review_id.clone(), message, ReviewErrorContext::Submit)
+            .await
+        {
+            tracing::warn!(
+                review_id = %review_id,
+                target_agent_id = %target_agent_id,
+                error = %report_error,
+                "failed to surface review bundle consumption error"
+            );
+        }
     }
 }
 
@@ -2282,6 +2345,7 @@ mod tests {
                 .send_input(AgentInput::SendMessage(protocol::SendMessagePayload {
                     message: "hello".to_string(),
                     images: None,
+                    origin: None,
                 }))
                 .await
         );

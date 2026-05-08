@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use protocol::ToolPolicy;
+use protocol::{BackendAccessMode, ToolPolicy};
 
 use crate::backend::{AgentIdentity, SessionCommand, StartupMcpServer, StartupMcpTransport};
 use crate::process_env;
@@ -42,6 +42,7 @@ const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
 const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CLAUDE_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
+const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "plan";
 const CLAUDE_CONVERSATION_COMPACTED_NOTICE: &str = "Conversation compacted.";
 static CLAUDE_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -61,6 +62,16 @@ pub struct ClaudeSession {
     inner: Arc<ClaudeInner>,
 }
 
+struct ClaudeSpawnMode<'a> {
+    no_session_persistence: bool,
+    ssh_host: Option<String>,
+    startup_mcp_servers: &'a [StartupMcpServer],
+    steering_content: Option<&'a str>,
+    agent_identity: Option<&'a AgentIdentity>,
+    tool_policy: ToolPolicy,
+    access_mode: BackendAccessMode,
+}
+
 impl ClaudeSession {
     pub async fn spawn(
         workspace_roots: &[String],
@@ -69,15 +80,19 @@ impl ClaudeSession {
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
         tool_policy: ToolPolicy,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            false,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            agent_identity,
-            tool_policy,
+            ClaudeSpawnMode {
+                no_session_persistence: false,
+                ssh_host,
+                startup_mcp_servers,
+                steering_content,
+                agent_identity,
+                tool_policy,
+                access_mode,
+            },
         )
         .await
     }
@@ -89,29 +104,28 @@ impl ClaudeSession {
         steering_content: Option<&str>,
         agent_identity: Option<&AgentIdentity>,
         tool_policy: ToolPolicy,
+        access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
-            true,
-            ssh_host,
-            startup_mcp_servers,
-            steering_content,
-            agent_identity,
-            tool_policy,
+            ClaudeSpawnMode {
+                no_session_persistence: true,
+                ssh_host,
+                startup_mcp_servers,
+                steering_content,
+                agent_identity,
+                tool_policy,
+                access_mode,
+            },
         )
         .await
     }
 
     async fn spawn_with_mode(
         workspace_roots: &[String],
-        no_session_persistence: bool,
-        ssh_host: Option<String>,
-        startup_mcp_servers: &[StartupMcpServer],
-        steering_content: Option<&str>,
-        agent_identity: Option<&AgentIdentity>,
-        tool_policy: ToolPolicy,
+        mode: ClaudeSpawnMode<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let (workspace_root, resolved_ssh_host) = if let Some(host) = ssh_host {
+        let (workspace_root, resolved_ssh_host) = if let Some(host) = mode.ssh_host {
             let parsed = crate::remote::parse_remote_workspace_roots(workspace_roots)?
                 .ok_or("Expected remote workspace roots for SSH session")?;
             let remote_path = parsed
@@ -131,14 +145,16 @@ impl ClaudeSession {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
                 session_id: None,
-                ephemeral: no_session_persistence,
+                ephemeral: mode.no_session_persistence,
                 model: None,
                 effort: Some("high".to_string()),
-                permission_mode: Some(CLAUDE_DEFAULT_PERMISSION_MODE.to_string()),
-                startup_mcp_config_json: build_claude_mcp_config_json(startup_mcp_servers),
-                steering_content: steering_content.map(|s| s.to_string()),
-                agent_identity: agent_identity.cloned(),
-                tool_policy,
+                permission_mode: Some(
+                    claude_permission_mode_for_access_mode(mode.access_mode).to_string(),
+                ),
+                startup_mcp_config_json: build_claude_mcp_config_json(mode.startup_mcp_servers),
+                steering_content: mode.steering_content.map(|s| s.to_string()),
+                agent_identity: mode.agent_identity.cloned(),
+                tool_policy: mode.tool_policy,
                 last_cumulative_usage: None,
                 conversation_bytes_total: 0,
                 active_turn: None,
@@ -5098,6 +5114,13 @@ use super::{
 
 type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
+fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'static str {
+    match access_mode {
+        BackendAccessMode::Unrestricted => CLAUDE_DEFAULT_PERMISSION_MODE,
+        BackendAccessMode::ReadOnly => CLAUDE_READ_ONLY_PERMISSION_MODE,
+    }
+}
+
 /// Minimal Backend-trait handle for the Claude CLI.
 ///
 /// Holds an `mpsc::UnboundedSender<AgentInput>` that the spawned task reads from;
@@ -5153,6 +5176,7 @@ impl ClaudeBackend {
                 steering_content.as_deref(),
                 agent_identity.as_ref(),
                 config.resolved_spawn_config.tool_policy.clone(),
+                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -5178,7 +5202,9 @@ impl ClaudeBackend {
                 let settings = json!({
                     "model": model_override,
                     "effort": effort_override,
-                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
+                    "permission_mode": claude_permission_mode_for_access_mode(
+                        config.resolved_spawn_config.access_mode,
+                    ),
                 });
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
@@ -5606,6 +5632,7 @@ impl Backend for ClaudeBackend {
                 steering_content.as_deref(),
                 agent_identity.as_ref(),
                 config.resolved_spawn_config.tool_policy.clone(),
+                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -5634,7 +5661,9 @@ impl Backend for ClaudeBackend {
                 let settings = json!({
                     "model": model_override,
                     "effort": effort_override,
-                    "permission_mode": CLAUDE_DEFAULT_PERMISSION_MODE,
+                    "permission_mode": claude_permission_mode_for_access_mode(
+                        config.resolved_spawn_config.access_mode,
+                    ),
                 });
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
@@ -5881,6 +5910,18 @@ mod tests {
         assert_eq!(
             resolved.0.get("effort"),
             Some(&SessionSettingValue::String("medium".to_string()))
+        );
+    }
+
+    #[test]
+    fn claude_read_only_access_mode_uses_plan_permission_mode() {
+        assert_eq!(
+            claude_permission_mode_for_access_mode(BackendAccessMode::ReadOnly),
+            "plan"
+        );
+        assert_eq!(
+            claude_permission_mode_for_access_mode(BackendAccessMode::Unrestricted),
+            "bypassPermissions"
         );
     }
 

@@ -171,6 +171,7 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
                     protocol::SendMessagePayload {
                         message: "Reply exactly with ok".to_owned(),
                         images: None,
+                        origin: None,
                     },
                 ),
             )
@@ -208,6 +209,7 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
                     protocol::SendMessagePayload {
                         message: "Reply exactly with ok".to_owned(),
                         images: None,
+                        origin: None,
                     },
                 ),
             )
@@ -273,6 +275,7 @@ async fn spawn_mock_agent_and_collect_turn(
                 images: None,
                 backend_kind,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -449,6 +452,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
                 images: None,
                 backend_kind: BackendKind::Kiro,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: Some(session_settings),
             },
         })
@@ -525,6 +529,7 @@ async fn compact_turn_emits_system_message_and_stream_end_without_error() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -834,6 +839,7 @@ async fn spawn_agent_via_protocol_with_options(
                 images,
                 backend_kind,
                 cost_hint,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -2160,6 +2166,7 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
                     images: None,
                     backend_kind,
                     cost_hint: Some(SpawnCostHint::High),
+                    access_mode: Default::default(),
                     session_settings: None,
                 },
             })

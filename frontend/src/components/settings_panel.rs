@@ -21,7 +21,7 @@ use crate::send::{
     steering_delete, steering_upsert,
 };
 
-const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control"];
+const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 
 const STORAGE_THEME: &str = "tyde-theme";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
@@ -2556,7 +2556,7 @@ fn McpServersTab() -> impl IntoView {
             <h2 class="settings-panel-title">"MCP Servers"</h2>
         </div>
         <p class="settings-description settings-panel-intro">
-            "Configure MCP servers (HTTP or Stdio). Names \"tyde-debug\" and \"tyde-agent-control\" are reserved."
+            "Configure MCP servers (HTTP or Stdio). Names \"tyde-debug\", \"tyde-agent-control\", and \"tyde-review-feedback\" are reserved."
         </p>
 
         <div class="settings-field">

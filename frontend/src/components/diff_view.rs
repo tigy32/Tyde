@@ -8,13 +8,179 @@ use wasm_bindgen_futures::spawn_local;
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
 use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, DiffViewState};
-use crate::syntax_highlight::{LineTokens, color_to_css, compute_hunk_tokens, syntax_for_path};
+use crate::syntax_highlight::{
+    LineHighlighter, LineTokens, color_to_css, compute_hunk_tokens, syntax_for_path,
+};
 
 use protocol::{
     DiffContextMode, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectPath, ProjectReadDiffPayload,
-    ProjectRootPath, ProjectStageHunkPayload, StreamPath,
+    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectPath,
+    ProjectReadDiffPayload, ProjectRootPath, ProjectStageHunkPayload, ReviewDiffSide, StreamPath,
 };
+
+/// Map a path's extension to a syntect language token (`"rs"`, `"ts"`,
+/// etc.) the highlight worker can resolve. Empty string means "let the
+/// worker fall back to path-based detection".
+fn syntax_token_for_path(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit('.').next()?;
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "rs" => "rs",
+        "ts" | "tsx" => "ts",
+        "js" | "jsx" => "js",
+        "py" => "py",
+        "go" => "go",
+        "java" => "java",
+        "c" => "c",
+        "cpp" | "cc" | "cxx" | "h" | "hpp" => "cpp",
+        "css" => "css",
+        "html" => "html",
+        "json" => "json",
+        "md" => "md",
+        "sh" | "bash" => "sh",
+        "yml" | "yaml" => "yaml",
+        "toml" => "toml",
+        _ => return None,
+    })
+}
+
+/// Main-thread fallback used when the highlight worker can't be
+/// instantiated (wasm-bindgen-test, worker init failure). Tokenizes in
+/// 50-line chunks, yielding to the browser between each so input
+/// events / first paint don't get starved. Writes into per-line signals
+/// so re-renders are bounded to the lines that actually changed.
+async fn run_fallback_diff_highlight(
+    syntax: &'static syntect::parsing::SyntaxReference,
+    lines: Vec<String>,
+    signals: Vec<ArcRwSignal<Option<LineTokens>>>,
+    perf_key: String,
+    task_t0: f64,
+) {
+    next_macrotask().await;
+    let mut hl = LineHighlighter::new(syntax);
+    let mut first_chunk_logged = false;
+    const CHUNK: usize = 50;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let end = (i + CHUNK).min(lines.len());
+        for (j, line) in lines.iter().enumerate().take(end).skip(i) {
+            let toks = hl.highlight_one(line);
+            if let Some(sig) = signals.get(j) {
+                sig.set(Some(toks));
+            }
+        }
+        if !first_chunk_logged {
+            first_chunk_logged = true;
+            let dt = crate::perf::now_ms() - task_t0;
+            crate::perf::log_phase(
+                "diff_open",
+                "hl_first_chunk",
+                &perf_key,
+                &format!(" through={end} took={dt:.1}ms via=fallback"),
+            );
+        }
+        i = end;
+        next_macrotask().await;
+    }
+    let dt = crate::perf::now_ms() - task_t0;
+    crate::perf::log_phase(
+        "diff_open",
+        "hl_finished",
+        &perf_key,
+        &format!(" lines={} took={dt:.1}ms via=fallback", lines.len()),
+    );
+}
+
+/// Yield to the browser event loop. Used to chunk expensive synchronous
+/// work (syntax highlighting, in particular) so the main thread doesn't
+/// freeze on large diffs.
+async fn next_macrotask() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Reactive view of per-hunk syntax tokens for the unified renderer.
+/// One `ArcRwSignal` per line — when a chunk lands, only the affected
+/// line signals fire, so re-renders are bounded to the lines that
+/// actually changed instead of every visible row tracking a single
+/// shared signal. With the prior shared-signal design, a 200-line chunk
+/// landing while 100 rows were on screen triggered 100 row re-renders
+/// per chunk, which manifested as 200–400 ms main-thread blocks.
+#[derive(Clone)]
+struct HunkTokensView {
+    signals: Arc<Vec<Vec<ArcRwSignal<Option<LineTokens>>>>>,
+}
+
+impl HunkTokensView {
+    fn new(per_line: Vec<Vec<ArcRwSignal<Option<LineTokens>>>>) -> Self {
+        Self {
+            signals: Arc::new(per_line),
+        }
+    }
+
+    fn read(&self, hi: usize, li: usize) -> Option<LineTokens> {
+        self.signals
+            .get(hi)
+            .and_then(|h| h.get(li))
+            .map(|s| s.get())
+            .unwrap_or(None)
+    }
+}
+
+/// Invoked when the user presses the pointer down on a line-number gutter
+/// (the canonical one for that line: `.diff-gutter-new` for Added/Context,
+/// `.diff-gutter-old` for Removed). Used by review mode to start a
+/// click+drag line-range selection. The diff renderer always calls
+/// `prevent_default()` on the event before invoking the callback so OS
+/// text-selection doesn't kick in mid-drag.
+pub type GutterPointerDownFn =
+    std::sync::Arc<dyn Fn(ProjectRootPath, String, ReviewDiffSide, u32) + Send + Sync + 'static>;
+
+/// Returns an extra CSS class to attach to a rendered diff line, or `None`
+/// to leave the row unchanged. The callback is read inside the line's
+/// reactive `class` closure, so changes to the underlying signals (e.g. a
+/// drag-selection range) flow through to the DOM without a remount.
+pub type LineExtraClassFn = std::sync::Arc<
+    dyn Fn(ProjectRootPath, String, ReviewDiffSide, u32) -> Option<&'static str>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Renders an inline gutter button inside the file header (one per file).
+/// Always-rendered — review mode uses it for the small `+ comment on file`
+/// affordance next to the path label.
+pub type GutterActionFileHeaderFn =
+    std::sync::Arc<dyn Fn(ProjectRootPath, String) -> AnyView + Send + Sync + 'static>;
+
+/// Renders an inline decoration block under a single line. Returning
+/// `None` skips the slot for that line — this is what callers do when
+/// no thread (composer/comments/suggestions) is anchored here, so the
+/// row contributes zero extra DOM.
+pub type DecorationLineFn = std::sync::Arc<
+    dyn Fn(ProjectRootPath, String, ReviewDiffSide, u32) -> Option<AnyView> + Send + Sync + 'static,
+>;
+
+/// Renders an inline decoration block under the file header (one per file).
+pub type DecorationFileHeaderFn =
+    std::sync::Arc<dyn Fn(ProjectRootPath, String) -> Option<AnyView> + Send + Sync + 'static>;
+
+/// Bundle of optional review-mode hooks passed down through the diff
+/// renderer. The decoration callbacks are responsible for returning
+/// `None` when they have nothing to render — virtualization stays on
+/// regardless. Lines without a thread therefore contribute no extra DOM,
+/// so a 1500-line file with a handful of comments stays virtualized.
+#[derive(Clone, Default)]
+pub struct DiffDecorations {
+    pub gutter_pointer_down: Option<GutterPointerDownFn>,
+    pub line_extra_class: Option<LineExtraClassFn>,
+    pub gutter_action_for_file_header: Option<GutterActionFileHeaderFn>,
+    pub decoration_below_line: Option<DecorationLineFn>,
+    pub decoration_below_file_header: Option<DecorationFileHeaderFn>,
+}
 
 const SBS_MIN_FRACTION: f64 = 0.05;
 const SBS_MAX_FRACTION: f64 = 0.95;
@@ -46,27 +212,85 @@ struct DiffScroll {
 }
 
 #[component]
-pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope, path: String) -> impl IntoView {
+pub fn DiffView(
+    root: ProjectRootPath,
+    scope: ProjectDiffScope,
+    path: String,
+    /// When `Some`, drives the diff from a frozen payload Memo instead of
+    /// `state.diff_contents` and skips refetches on context-mode change.
+    /// The payload list is filtered by `(root, scope)` and the matching
+    /// payload's files filtered to `path` if non-empty.
+    #[prop(optional)]
+    frozen_payload: Option<Memo<Option<Vec<ProjectGitDiffPayload>>>>,
+    #[prop(optional)] on_gutter_pointer_down: Option<GutterPointerDownFn>,
+    #[prop(optional)] line_extra_class: Option<LineExtraClassFn>,
+    #[prop(optional)] gutter_action_for_file_header: Option<GutterActionFileHeaderFn>,
+    #[prop(optional)] decoration_below_line: Option<DecorationLineFn>,
+    #[prop(optional)] decoration_below_file_header: Option<DecorationFileHeaderFn>,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
+
+    // Review mode is implied by `frozen_payload`: the caller is rendering
+    // a review's frozen snapshot and wants the chrome that doesn't apply
+    // (LAYOUT toggle, CONTEXT toggle, scope badge) suppressed.
+    let review_mode = frozen_payload.is_some();
+
+    let decorations = DiffDecorations {
+        gutter_pointer_down: on_gutter_pointer_down,
+        line_extra_class,
+        gutter_action_for_file_header,
+        decoration_below_line,
+        decoration_below_file_header,
+    };
 
     let key = (root.clone(), scope, path.clone());
     let diff_key = key.clone();
-    let diff = move || {
+    let frozen_for_diff = frozen_payload;
+    let diff_root = root.clone();
+    let diff_path = path.clone();
+    let diff = move || -> Option<DiffViewState> {
+        if let Some(memo) = frozen_for_diff {
+            let payloads = memo.get()?;
+            let matched = payloads
+                .into_iter()
+                .find(|p| p.root == diff_root && p.scope == scope)?;
+            let files: Vec<ProjectGitDiffFile> = if diff_path.is_empty() {
+                matched.files
+            } else {
+                matched
+                    .files
+                    .into_iter()
+                    .filter(|f| f.relative_path == diff_path)
+                    .collect()
+            };
+            return Some(DiffViewState {
+                root: matched.root,
+                scope: matched.scope,
+                path: if diff_path.is_empty() {
+                    None
+                } else {
+                    Some(diff_path.clone())
+                },
+                context_mode: matched.context_mode,
+                pending: false,
+                files,
+            });
+        }
         state
             .diff_contents
             .with(|diffs| diffs.get(&diff_key).cloned())
     };
 
     // Reactive effect: when the context-mode signal differs from the stored
-    // entry's requested mode, dispatch a fresh ProjectReadDiff. The stored
-    // entry (created by `git_panel::view_diff` before the first response
-    // arrives) is the authority on "what was last requested", so this works
-    // even during an in-flight initial request: the pending entry is mutated
-    // to reflect the new mode, and the dispatch reducer will reject any
-    // response whose `context_mode` doesn't match.
+    // entry's requested mode, dispatch a fresh ProjectReadDiff. Disabled in
+    // frozen-payload mode because the snapshot does not refetch.
+    let frozen_for_effect = frozen_payload.is_some();
     let effect_state = state.clone();
     let effect_key = key.clone();
     Effect::new(move |_| {
+        if frozen_for_effect {
+            return;
+        }
         let signal_mode = effect_state.diff_context_mode.get();
         let Some(current) = effect_state
             .diff_contents
@@ -118,19 +342,22 @@ pub fn DiffView(root: ProjectRootPath, scope: ProjectDiffScope, path: String) ->
 
     view! {
         <div class="diff-view">
-            <DiffToolbar />
-            {move || match diff() {
-                Some(dv) if dv.pending && dv.files.is_empty() => view! {
-                    <div class="diff-empty">
-                        <p class="placeholder-text">"Loading diff…"</p>
-                    </div>
-                }.into_any(),
-                Some(dv) => view! { <DiffContent diff=dv /> }.into_any(),
-                None => view! {
-                    <div class="diff-empty">
-                        <p class="placeholder-text">"Select a file to view its diff"</p>
-                    </div>
-                }.into_any(),
+            {(!review_mode).then(|| view! { <DiffToolbar /> })}
+            {move || {
+                let decorations = decorations.clone();
+                match diff() {
+                    Some(dv) if dv.pending && dv.files.is_empty() => view! {
+                        <div class="diff-empty">
+                            <p class="placeholder-text">"Loading diff…"</p>
+                        </div>
+                    }.into_any(),
+                    Some(dv) => view! { <DiffContent diff=dv decorations=decorations review_mode=review_mode /> }.into_any(),
+                    None => view! {
+                        <div class="diff-empty">
+                            <p class="placeholder-text">"Select a file to view its diff"</p>
+                        </div>
+                    }.into_any(),
+                }
             }}
         </div>
     }
@@ -221,11 +448,16 @@ fn stage_hunk(root: ProjectRootPath, relative_path: String, hunk_id: String) {
 }
 
 #[component]
-fn DiffContent(diff: DiffViewState) -> impl IntoView {
+fn DiffContent(
+    diff: DiffViewState,
+    decorations: DiffDecorations,
+    #[prop(optional)] review_mode: bool,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
     let scope_label = match diff.scope {
         ProjectDiffScope::Staged => "staged",
         ProjectDiffScope::Unstaged => "unstaged",
+        ProjectDiffScope::Uncommitted => "uncommitted",
     };
     let perf_key = format!(
         "diff:{}:{}",
@@ -334,21 +566,18 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
     // paint, so the `<For>` diffs once per frame and the main thread
     // doesn't fight itself trying to keep up. Smooths out the
     // "lines flash blank during fast scroll" pattern users report.
-    let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
-    let on_scroll = {
-        let pending = scroll_pending.clone();
-        move |_: web_sys::Event| {
-            if pending.get() {
-                return;
-            }
-            pending.set(true);
-            let pending = pending.clone();
-            leptos::prelude::request_animation_frame(move || {
-                pending.set(false);
-                if let Some(el) = scroll_ref.get_untracked() {
-                    scroll_top.set(el.scroll_top() as f64);
-                }
-            });
+    // Scroll handler: write the native scrollTop straight into the
+    // signal. Leptos batches reactive updates within the same task, so
+    // a burst of native scroll events still only re-renders the visible
+    // window once per microtask. Earlier we throttled with
+    // `request_animation_frame`, but the rAF callback never fires
+    // reliably in this Tauri WKWebView — the visible window stayed at
+    // its initial range and AI-suggestion rows that lived hundreds of
+    // lines down were unreachable because no scroll ever propagated
+    // into the virtualization math.
+    let on_scroll = move |_: web_sys::Event| {
+        if let Some(el) = scroll_ref.get_untracked() {
+            scroll_top.set(el.scroll_top() as f64);
         }
     };
 
@@ -365,7 +594,8 @@ fn DiffContent(diff: DiffViewState) -> impl IntoView {
                 let hunk_offsets = file_hunk_offsets[fi].clone();
                 let root = diff.root.clone();
                 let rendered_offset = file_rendered_offsets[fi];
-                view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset /> }
+                let decorations = decorations.clone();
+                view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset decorations=decorations review_mode=review_mode /> }
             }).collect::<Vec<_>>()}
         </div>
     }
@@ -405,6 +635,8 @@ fn DiffFileView(
     context_mode: DiffContextMode,
     hunk_offsets: Vec<usize>,
     rendered_offset: usize,
+    #[prop(optional)] decorations: DiffDecorations,
+    #[prop(optional)] review_mode: bool,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let view_mode_sig = state.diff_view_mode;
@@ -426,12 +658,27 @@ fn DiffFileView(
 
     let syntax_theme = state.syntax_theme;
 
+    let decorations_for_view = decorations.clone();
+    let header_decoration_root = root.clone();
+    let header_decoration_path = relative_path.clone();
+    let header_decoration_cb = decorations.decoration_below_file_header.clone();
+
+    let header_action_root = root.clone();
+    let header_action_path = relative_path.clone();
+    let header_action_cb = decorations.gutter_action_for_file_header.clone();
+
     view! {
         <div class="diff-file">
             <div class="diff-file-header">
                 <span class="diff-file-path">{file.relative_path}</span>
-                <span class="diff-scope-badge">{scope_label}</span>
+                {(!review_mode).then(|| view! { <span class="diff-scope-badge">{scope_label}</span> })}
+                {header_action_cb.as_ref().map(|cb| {
+                    cb(header_action_root.clone(), header_action_path.clone())
+                })}
             </div>
+            {move || header_decoration_cb.as_ref().and_then(|cb| {
+                cb(header_decoration_root.clone(), header_decoration_path.clone())
+            })}
             {move || {
                 // Subscribe to syntax_theme so changing the active theme
                 // re-renders the diff with re-tokenized colors. Tokens are
@@ -439,15 +686,16 @@ fn DiffFileView(
                 // the signal here causes that work to re-run on change.
                 let _ = syntax_theme.get();
                 match view_mode_sig.get() {
-                    DiffViewMode::Unified => render_unified_virtualized(
-                        file_for_view.clone(),
-                        offsets_for_view.clone(),
+                    DiffViewMode::Unified => render_unified_virtualized(UnifiedVirtualizedArgs {
+                        file: file_for_view.clone(),
+                        hunk_offsets: offsets_for_view.clone(),
                         context_mode,
                         scope,
-                        root_for_view.clone(),
-                        path_for_view.clone(),
+                        root: root_for_view.clone(),
+                        relative_path: path_for_view.clone(),
                         rendered_offset,
-                    ),
+                        decorations: decorations_for_view.clone(),
+                    }),
                     DiffViewMode::SideBySide => render_sbs_virtualized(
                         file_for_view.clone(),
                         offsets_for_view.clone(),
@@ -457,6 +705,7 @@ fn DiffFileView(
                         path_for_view.clone(),
                         split,
                         rendered_offset,
+                        decorations_for_view.clone(),
                     ),
                 }
             }}
@@ -471,13 +720,15 @@ fn render_unified_hunks(
     scope: ProjectDiffScope,
     root: ProjectRootPath,
     relative_path: String,
+    decorations: DiffDecorations,
 ) -> AnyView {
     view! {
         <div class="diff-hunks">
             {file.hunks.into_iter().enumerate().map(|(hi, hunk)| {
                 let offset = hunk_offsets[hi];
+                let decorations = decorations.clone();
                 view! {
-                    <UnifiedHunk hunk=hunk context_mode=context_mode line_offset=offset scope=scope root=root.clone() relative_path=relative_path.clone() />
+                    <UnifiedHunk hunk=hunk context_mode=context_mode line_offset=offset scope=scope root=root.clone() relative_path=relative_path.clone() decorations=decorations />
                 }
             }).collect::<Vec<_>>()}
         </div>
@@ -520,7 +771,7 @@ fn build_unified_file_items(
 /// emits top/bottom spacers + a `<For>` over visible items so off-screen
 /// rows incur zero DOM/paint cost. Falls through to the non-virtualized
 /// path for tiny files (preserves DOM shape for layout assertions).
-fn render_unified_virtualized(
+struct UnifiedVirtualizedArgs {
     file: ProjectGitDiffFile,
     hunk_offsets: Vec<usize>,
     context_mode: DiffContextMode,
@@ -528,47 +779,186 @@ fn render_unified_virtualized(
     root: ProjectRootPath,
     relative_path: String,
     rendered_offset: usize,
-) -> AnyView {
+    decorations: DiffDecorations,
+}
+
+fn render_unified_virtualized(args: UnifiedVirtualizedArgs) -> AnyView {
+    let UnifiedVirtualizedArgs {
+        file,
+        hunk_offsets,
+        context_mode,
+        scope,
+        root,
+        relative_path,
+        rendered_offset,
+        decorations,
+    } = args;
+    let _ruv_t0 = crate::perf::now_ms();
+    let _ruv_key = format!("diff:{}:{relative_path}", root.0);
     let items = Arc::new(build_unified_file_items(&file, context_mode));
     let total_items = items.len();
+    crate::perf::log_phase(
+        "diff_open",
+        "ruv_build_items",
+        &_ruv_key,
+        &format!(
+            " items={total_items} took={:.1}ms",
+            crate::perf::now_ms() - _ruv_t0
+        ),
+    );
 
     if total_items < VIRTUALIZE_THRESHOLD {
-        // Small file: render every row up front. Avoids spacer math and
-        // keeps the DOM identical to the pre-virtualization path.
-        return render_unified_hunks(file, hunk_offsets, context_mode, scope, root, relative_path);
+        // Small file: render every row up front. Keeps DOM shape identical
+        // to the pre-virtualization path for layout-assertion tests.
+        return render_unified_hunks(
+            file,
+            hunk_offsets,
+            context_mode,
+            scope,
+            root,
+            relative_path,
+            decorations,
+        );
     }
 
     let scroll = expect_context::<DiffScroll>();
     let file_arc = Arc::new(file);
     let hunk_offsets = Arc::new(hunk_offsets);
 
-    // Pre-compute syntax tokens per hunk once for the file so visible-row
-    // rendering is just an index lookup. Done eagerly here; for very large
-    // files we could chunk this with `spawn_local` like file_view does.
-    let unified_t0 = crate::perf::now_ms();
+    // Tokenization runs in the highlight worker (separate JS thread) so
+    // the main thread isn't blocked. Each line gets its OWN reactive
+    // signal — when the worker streams a chunk back, only the lines
+    // covered by that chunk re-render, instead of every visible row
+    // being invalidated by a single shared signal.
+    //
+    // Without these two together, opening a 3000-line Rust diff caused
+    // 200–470 ms main-thread freezes recurring for ~3.5 s (every
+    // 50-line worker chunk re-rendered ~100 visible rows; plus the
+    // tokenization itself ran on the main thread).
     let syntax = syntax_for_path(&relative_path);
-    let mut hunk_tokens: Vec<Vec<Option<LineTokens>>> = Vec::with_capacity(file_arc.hunks.len());
-    for hunk in &file_arc.hunks {
-        let tokens = match syntax {
-            Some(syn) => compute_hunk_tokens(hunk, syn),
-            None => vec![None; hunk.lines.len()],
-        };
-        hunk_tokens.push(tokens);
-    }
-    let hunk_tokens = Arc::new(hunk_tokens);
-    let unified_dt = crate::perf::now_ms() - unified_t0;
     let perf_key_u = format!("diff:{}:{relative_path}", root.0);
     let total_lines: usize = file_arc.hunks.iter().map(|h| h.lines.len()).sum();
+    const HIGHLIGHT_LINE_CAP: usize = 50_000;
+
+    let _signals_t0 = crate::perf::now_ms();
+    let per_line_signals: Vec<Vec<ArcRwSignal<Option<LineTokens>>>> = file_arc
+        .hunks
+        .iter()
+        .map(|h| (0..h.lines.len()).map(|_| ArcRwSignal::new(None)).collect())
+        .collect();
     crate::perf::log_phase(
         "diff_open",
-        "unified_tokens",
+        "ruv_alloc_signals",
         &perf_key_u,
         &format!(
-            " hunks={} lines={total_lines} syntax={} took={unified_dt:.1}ms",
-            file_arc.hunks.len(),
-            syntax.is_some(),
+            " lines={total_lines} took={:.1}ms",
+            crate::perf::now_ms() - _signals_t0
         ),
     );
+
+    if let Some(syn) = syntax
+        && total_lines <= HIGHLIGHT_LINE_CAP
+    {
+        // Build the flat (hi, li) → flat_index mapping the worker's
+        // start-index responses get translated through.
+        let flat_to_pos: Vec<(usize, usize)> = file_arc
+            .hunks
+            .iter()
+            .enumerate()
+            .flat_map(|(hi, h)| (0..h.lines.len()).map(move |li| (hi, li)))
+            .collect();
+
+        // Snapshot lines for the worker. One String alloc per line — for
+        // a 3000-line diff that's ~3 ms of work, well below the
+        // perceptual threshold and amortized by getting the work off
+        // the main thread.
+        let lines_owned: Vec<String> = file_arc
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter().map(|l| l.text.clone()))
+            .collect();
+
+        // Per-line signal handles for the worker callback.
+        let signals_for_cb: Vec<ArcRwSignal<Option<LineTokens>>> = file_arc
+            .hunks
+            .iter()
+            .enumerate()
+            .flat_map(|(hi, h)| {
+                let row = &per_line_signals[hi];
+                (0..h.lines.len()).map(move |li| row[li].clone())
+            })
+            .collect();
+
+        let syntax_name = syntax_token_for_path(&relative_path)
+            .unwrap_or("")
+            .to_owned();
+        let theme_name = expect_context::<AppState>().syntax_theme.get_untracked();
+        let key_for_done = perf_key_u.clone();
+        let key_for_first = perf_key_u.clone();
+        let total_for_done = total_lines;
+        let task_t0 = crate::perf::now_ms();
+        let first_chunk_logged = std::rc::Rc::new(std::cell::Cell::new(false));
+        let first_logged_for_cb = first_chunk_logged.clone();
+
+        // Prefer the worker. Fall back to the main-thread chunked path
+        // if the worker can't be spawned (wasm-bindgen-test environment,
+        // or worker init failure). The fallback also yields between
+        // chunks and uses per-line signals so a fallback file open
+        // still doesn't lock up the main thread the way the prior
+        // shared-signal design did.
+        if let Some(client) = crate::highlight_worker::shared() {
+            let on_chunk = Box::new(move |start: usize, tokens: Vec<LineTokens>| {
+                if !first_logged_for_cb.get() {
+                    first_logged_for_cb.set(true);
+                    let dt = crate::perf::now_ms() - task_t0;
+                    crate::perf::log_phase(
+                        "diff_open",
+                        "hl_first_chunk",
+                        &key_for_first,
+                        &format!(" through={} took={dt:.1}ms", start + tokens.len()),
+                    );
+                }
+                for (offset, toks) in tokens.into_iter().enumerate() {
+                    let idx = start + offset;
+                    if let Some(sig) = signals_for_cb.get(idx) {
+                        sig.set(Some(toks));
+                    }
+                }
+            });
+            let on_done = Box::new(move || {
+                let dt = crate::perf::now_ms() - task_t0;
+                crate::perf::log_phase(
+                    "diff_open",
+                    "hl_finished",
+                    &key_for_done,
+                    &format!(" lines={total_for_done} took={dt:.1}ms via=worker"),
+                );
+            });
+            let _ = syn;
+            let _ = flat_to_pos;
+            let _task_id = client.highlight_file(
+                if syntax_name.is_empty() {
+                    relative_path.clone()
+                } else {
+                    syntax_name
+                },
+                theme_name,
+                lines_owned,
+                on_chunk,
+                on_done,
+            );
+        } else {
+            spawn_local(run_fallback_diff_highlight(
+                syn,
+                lines_owned,
+                signals_for_cb,
+                perf_key_u.clone(),
+                task_t0,
+            ));
+        }
+    }
+
+    let hunk_tokens = HunkTokensView::new(per_line_signals);
 
     let visible_window: Memo<(usize, usize)> = Memo::new(move |_| {
         let lh = scroll.line_height.get().max(1.0);
@@ -617,15 +1007,17 @@ fn render_unified_virtualized(
                     let hunk_tokens = hunk_tokens.clone();
                     let root = root.clone();
                     let path = relative_path.clone();
+                    let decorations = decorations.clone();
                     render_unified_item(
                         &item,
                         file.as_ref(),
                         hunk_offsets.as_ref(),
-                        hunk_tokens.as_ref(),
+                        &hunk_tokens,
                         context_mode,
                         scope,
                         &root,
                         &path,
+                        &decorations,
                     )
                 }
             </For>
@@ -647,11 +1039,12 @@ fn render_unified_item(
     item: &UnifiedFileItem,
     file: &ProjectGitDiffFile,
     hunk_offsets: &[usize],
-    hunk_tokens: &[Vec<Option<LineTokens>>],
+    hunk_tokens: &HunkTokensView,
     context_mode: DiffContextMode,
     scope: ProjectDiffScope,
     root: &ProjectRootPath,
     relative_path: &str,
+    decorations: &DiffDecorations,
 ) -> AnyView {
     match *item {
         UnifiedFileItem::HunkHeader { hi } => {
@@ -698,20 +1091,123 @@ fn render_unified_item(
                 .map(|n| n.to_string())
                 .unwrap_or_default();
             let text = line.text.clone();
-            let tokens = hunk_tokens[hi][li].clone();
+            let hunk_tokens_clone = hunk_tokens.clone();
             let find = use_context::<FindState>();
             let find_for_class = find.clone();
             let find_for_text = find;
+            let kind = line.kind;
+            let (anchor_side, anchor_line_no) = match kind {
+                ProjectGitDiffLineKind::Removed => (ReviewDiffSide::Old, line.old_line_number),
+                ProjectGitDiffLineKind::Added | ProjectGitDiffLineKind::Context => (
+                    ReviewDiffSide::New,
+                    line.new_line_number.or(line.old_line_number),
+                ),
+            };
+            let pointer_down_cb = decorations.gutter_pointer_down.clone();
+            let extra_class_cb = decorations.line_extra_class.clone();
+            let line_decoration_cb = decorations.decoration_below_line.clone();
+            let class_root = root.clone();
+            let class_path = relative_path.to_owned();
+            let decoration_root = root.clone();
+            let decoration_path = relative_path.to_owned();
+            let pdown_root = root.clone();
+            let pdown_path = relative_path.to_owned();
+            let line_class_closure = move || {
+                let mut s = diff_line_class(base_class, search_idx, &find_for_class);
+                if let (Some(cb), Some(n)) = (extra_class_cb.as_ref(), anchor_line_no)
+                    && let Some(extra) = cb(class_root.clone(), class_path.clone(), anchor_side, n)
+                {
+                    s.push(' ');
+                    s.push_str(extra);
+                }
+                s
+            };
+            let anchor_side_str = match anchor_side {
+                ReviewDiffSide::Old => "old",
+                ReviewDiffSide::New => "new",
+            };
+            let anchor_line_attr = anchor_line_no.map(|n| n.to_string()).unwrap_or_default();
+            // Per-side line numbers for drag-selection: lets the
+            // window-level pointermove listener look up "what line is the
+            // cursor over on the side the drag started on?" even when the
+            // cursor is over a row whose primary anchor side doesn't
+            // match (e.g. drag started on +new, cursor over a Removed
+            // line). Empty string means the row has no counterpart on
+            // that side.
+            let anchor_old_line_attr = line
+                .old_line_number
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let anchor_new_line_attr = line
+                .new_line_number
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let pointer_active = pointer_down_cb.is_some() && anchor_line_no.is_some();
+            let old_clickable = pointer_active && anchor_side == ReviewDiffSide::Old;
+            let new_clickable = pointer_active && anchor_side == ReviewDiffSide::New;
+            let old_class = if old_clickable {
+                "diff-gutter diff-gutter-old diff-gutter-clickable"
+            } else {
+                "diff-gutter diff-gutter-old"
+            };
+            let new_class = if new_clickable {
+                "diff-gutter diff-gutter-new diff-gutter-clickable"
+            } else {
+                "diff-gutter diff-gutter-new"
+            };
+            let cb_for_old = pointer_down_cb.clone();
+            let cb_for_new = pointer_down_cb.clone();
+            let pdown_root_old = pdown_root.clone();
+            let pdown_path_old = pdown_path.clone();
+            let pdown_root_new = pdown_root;
+            let pdown_path_new = pdown_path;
             view! {
-                <div
-                    class=move || diff_line_class(base_class, search_idx, &find_for_class)
-                    attr:data-find-idx=search_idx
-                >
-                    <span class="diff-gutter diff-gutter-old">{old_str}</span>
-                    <span class="diff-gutter diff-gutter-new">{new_str}</span>
-                    <span class="diff-prefix">{prefix}</span>
-                    {move || render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text)}
-                </div>
+                <>
+                    <div
+                        class=line_class_closure
+                        data-find-idx=search_idx
+                        data-anchor-side=anchor_side_str
+                        data-anchor-line=anchor_line_attr
+                        data-anchor-old-line=anchor_old_line_attr
+                        data-anchor-new-line=anchor_new_line_attr
+                    >
+                        <span
+                            class=old_class
+                            title=if old_clickable { "Click or drag to comment" } else { "" }
+                            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                if !old_clickable { return; }
+                                let Some(cb) = cb_for_old.as_ref() else { return };
+                                let Some(n) = anchor_line_no else { return };
+                                ev.prevent_default();
+                                cb(pdown_root_old.clone(), pdown_path_old.clone(), ReviewDiffSide::Old, n);
+                            }
+                        >{old_str}</span>
+                        <span
+                            class=new_class
+                            title=if new_clickable { "Click or drag to comment" } else { "" }
+                            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                if !new_clickable { return; }
+                                let Some(cb) = cb_for_new.as_ref() else { return };
+                                let Some(n) = anchor_line_no else { return };
+                                ev.prevent_default();
+                                cb(pdown_root_new.clone(), pdown_path_new.clone(), ReviewDiffSide::New, n);
+                            }
+                        >{new_str}</span>
+                        <span class="diff-prefix">{prefix}</span>
+                        {move || {
+                            // Reactive read so the row re-renders as
+                            // chunked syntax tokens land via the lazy
+                            // ArcRwSignal. For Eager paths this is a
+                            // plain Arc lookup with no signal track.
+                            let tokens = hunk_tokens_clone.read(hi, li);
+                            render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text)
+                        }}
+                    </div>
+                    {move || line_decoration_cb.as_ref().and_then(|cb| {
+                        let n = anchor_line_no?;
+                        cb(decoration_root.clone(), decoration_path.clone(), anchor_side, n)
+                    })}
+                </>
             }
             .into_any()
         }
@@ -725,8 +1221,15 @@ enum SbsSide {
 }
 
 /// Per-hunk dual highlight: `(old_per_line, new_per_line)`.
-type DualHunkTokens = (Vec<Option<LineTokens>>, Vec<Option<LineTokens>>);
+/// Per-hunk pair of per-line reactive token signals — one entry per
+/// hunk line on each side. `None` at an index means that line never
+/// appears on that side (e.g. an Added line on the Old side).
+type DualHunkTokenSignals = (
+    Vec<Option<ArcRwSignal<Option<LineTokens>>>>,
+    Vec<Option<ArcRwSignal<Option<LineTokens>>>>,
+);
 
+#[allow(clippy::too_many_arguments)]
 fn render_sbs_panes(
     file: ProjectGitDiffFile,
     hunk_offsets: Vec<usize>,
@@ -735,37 +1238,82 @@ fn render_sbs_panes(
     root: ProjectRootPath,
     relative_path: String,
     split: RwSignal<f64>,
+    decorations: DiffDecorations,
 ) -> AnyView {
     let pair_ref = NodeRef::<leptos::html::Div>::new();
     let left_pane_ref = NodeRef::<leptos::html::Div>::new();
     let right_pane_ref = NodeRef::<leptos::html::Div>::new();
 
-    // Compute per-hunk dual syntax tokens **once** for the file, then share
-    // between left and right panes. Without this both panes would re-tokenize
-    // independently, doubling syntect work and amplifying first-render stall.
-    let eager_t0 = crate::perf::now_ms();
+    // No synchronous tokenization on the main thread — same architecture
+    // as `render_sbs_virtualized`. Per-line signals are allocated up
+    // front; the worker streams tokens into them. The eager path used
+    // to call `compute_hunk_tokens_dual` here, blocking the main
+    // thread for ~3 s on a 2000-line file in SBS mode.
     let syntax = syntax_for_path(&relative_path);
-    let hunk_tokens: Vec<DualHunkTokens> = file
-        .hunks
-        .iter()
-        .map(|hunk| match syntax {
-            Some(syn) => crate::syntax_highlight::compute_hunk_tokens_dual(hunk, syn),
-            None => (vec![None; hunk.lines.len()], vec![None; hunk.lines.len()]),
-        })
-        .collect();
-    let eager_dt = crate::perf::now_ms() - eager_t0;
-    let perf_key_eager = format!("diff:{}:{relative_path}", root.0);
+    let perf_key = format!("diff:{}:{relative_path}", root.0);
     let total_lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+
+    let mut hunk_old_signals: Vec<Vec<Option<ArcRwSignal<Option<LineTokens>>>>> =
+        Vec::with_capacity(file.hunks.len());
+    let mut hunk_new_signals: Vec<Vec<Option<ArcRwSignal<Option<LineTokens>>>>> =
+        Vec::with_capacity(file.hunks.len());
+    let mut hunk_tokens: Vec<DualHunkTokenSignals> = Vec::with_capacity(file.hunks.len());
+    for hunk in file.hunks.iter() {
+        let mut old_sigs: Vec<Option<ArcRwSignal<Option<LineTokens>>>> =
+            Vec::with_capacity(hunk.lines.len());
+        let mut new_sigs: Vec<Option<ArcRwSignal<Option<LineTokens>>>> =
+            Vec::with_capacity(hunk.lines.len());
+        for line in &hunk.lines {
+            old_sigs.push(match line.kind {
+                ProjectGitDiffLineKind::Removed | ProjectGitDiffLineKind::Context => {
+                    Some(ArcRwSignal::new(None))
+                }
+                ProjectGitDiffLineKind::Added => None,
+            });
+            new_sigs.push(match line.kind {
+                ProjectGitDiffLineKind::Added | ProjectGitDiffLineKind::Context => {
+                    Some(ArcRwSignal::new(None))
+                }
+                ProjectGitDiffLineKind::Removed => None,
+            });
+        }
+        hunk_old_signals.push(old_sigs.clone());
+        hunk_new_signals.push(new_sigs.clone());
+        hunk_tokens.push((old_sigs, new_sigs));
+    }
     crate::perf::log_phase(
         "diff_open",
-        "sbs_tokens_eager",
-        &perf_key_eager,
-        &format!(
-            " hunks={} lines={total_lines} syntax={} took={eager_dt:.1}ms",
-            file.hunks.len(),
-            syntax.is_some(),
-        ),
+        "sbs_pairs_built",
+        &perf_key,
+        &format!(" hunks={} lines={total_lines}", file.hunks.len()),
     );
+
+    if syntax.is_some() {
+        // Cancel any prior file's worker tasks once, then spawn both
+        // sides for this file via the concurrent (no-cancel) variant
+        // so Old + New both run to completion. Without the explicit
+        // cancel_all, opening file A then file B would leave A's
+        // tokenization running indefinitely; without the concurrent
+        // variant on the per-side calls, the second side would
+        // cancel the first.
+        if let Some(client) = crate::highlight_worker::shared() {
+            client.cancel_all();
+        }
+        spawn_sbs_side_highlight(
+            relative_path.clone(),
+            &file.hunks,
+            ProjectGitDiffSide::Old,
+            &hunk_old_signals,
+            perf_key.clone(),
+        );
+        spawn_sbs_side_highlight(
+            relative_path.clone(),
+            &file.hunks,
+            ProjectGitDiffSide::New,
+            &hunk_new_signals,
+            perf_key.clone(),
+        );
+    }
 
     let file_left = file.clone();
     let file_right = file.clone();
@@ -835,6 +1383,7 @@ fn render_sbs_panes(
                     root_left,
                     path_left,
                     tokens_left,
+                    decorations.clone(),
                 )}
             </div>
             <div
@@ -856,6 +1405,7 @@ fn render_sbs_panes(
                     root_right,
                     path_right,
                     tokens_right,
+                    decorations,
                 )}
             </div>
         </div>
@@ -872,7 +1422,8 @@ fn render_sbs_pane_content(
     scope: ProjectDiffScope,
     root: ProjectRootPath,
     relative_path: String,
-    hunk_tokens: Vec<DualHunkTokens>,
+    hunk_tokens: Vec<DualHunkTokenSignals>,
+    decorations: DiffDecorations,
 ) -> AnyView {
     let find = use_context::<FindState>();
     let show_stage_btn = scope == ProjectDiffScope::Unstaged && side == SbsSide::Right;
@@ -885,18 +1436,23 @@ fn render_sbs_pane_content(
         let hunk_id = hunk.hunk_id.clone();
         let lines = hunk.lines.clone();
         let indices = sbs_search_indices(&lines, line_offset);
-        let (old_tokens, new_tokens) = hunk_tokens[hi].clone();
-        let rows = pair_lines_side_by_side_with_tokens(lines, old_tokens, new_tokens);
+        let (old_sigs, new_sigs) = hunk_tokens[hi].clone();
+        let rows = pair_lines_side_by_side_with_token_signals(lines, &old_sigs, &new_sigs);
 
         let cell_views: Vec<AnyView> = rows
             .into_iter()
             .zip(indices)
             .map(|(row, (left_idx, right_idx))| {
-                let (cell, idx) = match side {
-                    SbsSide::Left => (row.left, left_idx),
-                    SbsSide::Right => (row.right, right_idx),
-                };
-                render_cell_search(cell, idx, find.clone())
+                render_sbs_paired_row(
+                    row,
+                    side,
+                    left_idx,
+                    right_idx,
+                    find.clone(),
+                    &root,
+                    &relative_path,
+                    &decorations,
+                )
             })
             .collect();
 
@@ -988,43 +1544,110 @@ fn render_sbs_virtualized(
     relative_path: String,
     split: RwSignal<f64>,
     rendered_offset: usize,
+    decorations: DiffDecorations,
 ) -> AnyView {
-    // Compute paired rows + search indices + dual tokens once per hunk.
+    // Pair rows + search indices synchronously (cheap), but do ZERO syntect
+    // work on the main thread. Each line gets its own old-side and
+    // new-side `ArcRwSignal<Option<LineTokens>>`; the worker streams
+    // tokens in via per-line signal updates so only the rows that
+    // actually changed re-render. This mirrors the unified path's
+    // architecture — without it, opening a 2000-line file in SBS mode
+    // froze the main thread for ~3.4 s while compute_hunk_tokens_dual
+    // ran inline.
     let sbs_t0 = crate::perf::now_ms();
     let syntax = syntax_for_path(&relative_path);
+    let perf_key = format!("diff:{}:{relative_path}", root.0);
     let mut hunk_pairs: Vec<HunkPairs> = Vec::with_capacity(file.hunks.len());
     let mut total_lines = 0usize;
+    // For each hunk, allocate per-line signals AND build the pair list
+    // referencing those signals. The pairing function fills `tokens` on
+    // each cell with a clone of the signal handle for that line/side.
+    let mut hunk_old_signals: Vec<Vec<Option<ArcRwSignal<Option<LineTokens>>>>> =
+        Vec::with_capacity(file.hunks.len());
+    let mut hunk_new_signals: Vec<Vec<Option<ArcRwSignal<Option<LineTokens>>>>> =
+        Vec::with_capacity(file.hunks.len());
     for (hi, hunk) in file.hunks.iter().enumerate() {
         let line_offset = hunk_offsets[hi];
         let lines = hunk.lines.clone();
         let indices = sbs_search_indices(&lines, line_offset);
-        let (old_tokens, new_tokens) = match syntax {
-            Some(syn) => crate::syntax_highlight::compute_hunk_tokens_dual(hunk, syn),
-            None => (vec![None; hunk.lines.len()], vec![None; hunk.lines.len()]),
-        };
-        total_lines += hunk.lines.len();
-        let pairs = pair_lines_side_by_side_with_tokens(lines, old_tokens, new_tokens);
+        let n = hunk.lines.len();
+        // Build per-line signal slots. Old slot is Some only for
+        // Removed/Context (the lines that appear on the left); New slot
+        // is Some only for Added/Context. This matches what
+        // compute_hunk_tokens_dual returns and avoids allocating
+        // unreachable signals.
+        let mut old_sigs: Vec<Option<ArcRwSignal<Option<LineTokens>>>> = Vec::with_capacity(n);
+        let mut new_sigs: Vec<Option<ArcRwSignal<Option<LineTokens>>>> = Vec::with_capacity(n);
+        for line in &hunk.lines {
+            old_sigs.push(match line.kind {
+                ProjectGitDiffLineKind::Removed | ProjectGitDiffLineKind::Context => {
+                    Some(ArcRwSignal::new(None))
+                }
+                ProjectGitDiffLineKind::Added => None,
+            });
+            new_sigs.push(match line.kind {
+                ProjectGitDiffLineKind::Added | ProjectGitDiffLineKind::Context => {
+                    Some(ArcRwSignal::new(None))
+                }
+                ProjectGitDiffLineKind::Removed => None,
+            });
+        }
+        total_lines += n;
+        let pairs = pair_lines_side_by_side_with_token_signals(lines, &old_sigs, &new_sigs);
         hunk_pairs.push((pairs, indices));
+        hunk_old_signals.push(old_sigs);
+        hunk_new_signals.push(new_sigs);
     }
     let hunk_pairs = Arc::new(hunk_pairs);
     let sbs_dt = crate::perf::now_ms() - sbs_t0;
-    let perf_key = format!("diff:{}:{relative_path}", root.0);
     crate::perf::log_phase(
         "diff_open",
-        "sbs_tokens_paired",
+        "sbs_pairs_built",
         &perf_key,
         &format!(
-            " hunks={} lines={total_lines} syntax={} took={sbs_dt:.1}ms",
+            " hunks={} lines={total_lines} took={sbs_dt:.1}ms",
             file.hunks.len(),
-            syntax.is_some(),
         ),
     );
+
+    // Spawn ONE worker request per side per file (not per hunk). The
+    // worker's `active_task` is single-slot, so per-hunk requests would
+    // cancel earlier hunks before they emitted any chunks — leaving
+    // most of the file uncolored. One request per side ships every
+    // hunk's lines for that side as a single stream; the callback maps
+    // chunks back to (hunk_idx, line_idx) for the per-line signals.
+    if syntax.is_some() {
+        // Cancel any prior file's worker tasks once, then spawn both
+        // sides for this file via the concurrent (no-cancel) variant
+        // so Old + New both run to completion. Without the explicit
+        // cancel_all, opening file A then file B would leave A's
+        // tokenization running indefinitely; without the concurrent
+        // variant on the per-side calls, the second side would
+        // cancel the first.
+        if let Some(client) = crate::highlight_worker::shared() {
+            client.cancel_all();
+        }
+        spawn_sbs_side_highlight(
+            relative_path.clone(),
+            &file.hunks,
+            ProjectGitDiffSide::Old,
+            &hunk_old_signals,
+            perf_key.clone(),
+        );
+        spawn_sbs_side_highlight(
+            relative_path.clone(),
+            &file.hunks,
+            ProjectGitDiffSide::New,
+            &hunk_new_signals,
+            perf_key.clone(),
+        );
+    }
 
     let items = Arc::new(build_sbs_file_items(&file, &hunk_pairs, context_mode));
     let total_items = items.len();
 
     if total_items < VIRTUALIZE_THRESHOLD {
-        // Small file: keep DOM shape identical to pre-virtualization path.
+        // Small file: keep DOM shape identical to pre-virtualization.
         return render_sbs_panes(
             file,
             hunk_offsets,
@@ -1033,6 +1656,7 @@ fn render_sbs_virtualized(
             root,
             relative_path,
             split,
+            decorations,
         );
     }
 
@@ -1111,6 +1735,7 @@ fn render_sbs_virtualized(
         context_mode,
         root.clone(),
         relative_path.clone(),
+        decorations.clone(),
     );
     let pane_right = render_sbs_pane_virtualized(
         SbsSide::Right,
@@ -1123,6 +1748,7 @@ fn render_sbs_virtualized(
         context_mode,
         root,
         relative_path,
+        decorations,
     );
 
     view! {
@@ -1167,6 +1793,7 @@ fn render_sbs_pane_virtualized(
     context_mode: DiffContextMode,
     root: ProjectRootPath,
     relative_path: String,
+    decorations: DiffDecorations,
 ) -> AnyView {
     let total_items = items.len();
     let lh_for_top = scroll.line_height;
@@ -1197,6 +1824,7 @@ fn render_sbs_pane_virtualized(
                     let hunk_pairs = hunk_pairs.clone();
                     let root = root.clone();
                     let path = relative_path.clone();
+                    let decorations = decorations.clone();
                     render_sbs_item(
                         side,
                         &item,
@@ -1206,6 +1834,7 @@ fn render_sbs_pane_virtualized(
                         context_mode,
                         &root,
                         &path,
+                        &decorations,
                     )
                 }
             </For>
@@ -1231,6 +1860,7 @@ fn render_sbs_item(
     context_mode: DiffContextMode,
     root: &ProjectRootPath,
     relative_path: &str,
+    decorations: &DiffDecorations,
 ) -> AnyView {
     match *item {
         SbsItem::HunkHeader { hi } => {
@@ -1269,12 +1899,17 @@ fn render_sbs_item(
             let (rows, indices) = &hunk_pairs[hi];
             let row = rows[ri].clone();
             let (left_idx, right_idx) = indices[ri];
-            let (cell, idx) = match side {
-                SbsSide::Left => (row.left, left_idx),
-                SbsSide::Right => (row.right, right_idx),
-            };
             let find = use_context::<FindState>();
-            render_cell_search(cell, idx, find)
+            render_sbs_paired_row(
+                row,
+                side,
+                left_idx,
+                right_idx,
+                find,
+                root,
+                relative_path,
+                decorations,
+            )
         }
     }
 }
@@ -1424,6 +2059,7 @@ fn UnifiedHunk(
     scope: ProjectDiffScope,
     root: ProjectRootPath,
     relative_path: String,
+    #[prop(optional)] decorations: DiffDecorations,
 ) -> impl IntoView {
     let find = use_context::<FindState>();
     let header = hunk_header_label(&hunk);
@@ -1434,6 +2070,7 @@ fn UnifiedHunk(
         Some(syn) => compute_hunk_tokens(&hunk, syn),
         None => vec![None; hunk.lines.len()],
     };
+
     view! {
         <div class="diff-hunk">
             {show_header.then(|| {
@@ -1471,19 +2108,103 @@ fn UnifiedHunk(
                 let text = line.text;
                 let find_for_class = find.clone();
                 let find_for_text = find.clone();
+                let kind = line.kind;
+                let (anchor_side, anchor_line_no) = match kind {
+                    ProjectGitDiffLineKind::Removed => (ReviewDiffSide::Old, line.old_line_number),
+                    ProjectGitDiffLineKind::Added | ProjectGitDiffLineKind::Context => (
+                        ReviewDiffSide::New,
+                        line.new_line_number.or(line.old_line_number),
+                    ),
+                };
+                let pointer_down_cb = decorations.gutter_pointer_down.clone();
+                let extra_class_cb = decorations.line_extra_class.clone();
+                let line_decoration_cb = decorations.decoration_below_line.clone();
+                let class_root = root.clone();
+                let class_path = relative_path.clone();
+                let decoration_root = root.clone();
+                let decoration_path = relative_path.clone();
+                let pdown_root_old = root.clone();
+                let pdown_path_old = relative_path.clone();
+                let pdown_root_new = root.clone();
+                let pdown_path_new = relative_path.clone();
+                let line_class_closure = move || {
+                    let mut s = diff_line_class(base_class, search_idx, &find_for_class);
+                    if let (Some(cb), Some(n)) = (extra_class_cb.as_ref(), anchor_line_no)
+                        && let Some(extra) =
+                            cb(class_root.clone(), class_path.clone(), anchor_side, n)
+                    {
+                        s.push(' ');
+                        s.push_str(extra);
+                    }
+                    s
+                };
+                let anchor_side_str = match anchor_side {
+                    ReviewDiffSide::Old => "old",
+                    ReviewDiffSide::New => "new",
+                };
+                let anchor_line_attr = anchor_line_no.map(|n| n.to_string()).unwrap_or_default();
+                let anchor_old_line_attr = line
+                    .old_line_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                let anchor_new_line_attr = line
+                    .new_line_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                let pointer_active = pointer_down_cb.is_some() && anchor_line_no.is_some();
+                let old_clickable = pointer_active && anchor_side == ReviewDiffSide::Old;
+                let new_clickable = pointer_active && anchor_side == ReviewDiffSide::New;
+                let old_class = if old_clickable {
+                    "diff-gutter diff-gutter-old diff-gutter-clickable"
+                } else {
+                    "diff-gutter diff-gutter-old"
+                };
+                let new_class = if new_clickable {
+                    "diff-gutter diff-gutter-new diff-gutter-clickable"
+                } else {
+                    "diff-gutter diff-gutter-new"
+                };
+                let cb_for_old = pointer_down_cb.clone();
+                let cb_for_new = pointer_down_cb;
                 view! {
                     <div
-                        class=move || diff_line_class(base_class, search_idx, &find_for_class)
-                        attr:data-find-idx=search_idx
+                        class=line_class_closure
+                        data-find-idx=search_idx
+                        data-anchor-side=anchor_side_str
+                        data-anchor-line=anchor_line_attr
+                        data-anchor-old-line=anchor_old_line_attr
+                        data-anchor-new-line=anchor_new_line_attr
                     >
-                        <span class="diff-gutter diff-gutter-old">{old_str}</span>
-                        <span class="diff-gutter diff-gutter-new">{new_str}</span>
+                        <span
+                            class=old_class
+                            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                if !old_clickable { return; }
+                                let Some(cb) = cb_for_old.as_ref() else { return };
+                                let Some(n) = anchor_line_no else { return };
+                                ev.prevent_default();
+                                cb(pdown_root_old.clone(), pdown_path_old.clone(), ReviewDiffSide::Old, n);
+                            }
+                        >{old_str}</span>
+                        <span
+                            class=new_class
+                            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                if !new_clickable { return; }
+                                let Some(cb) = cb_for_new.as_ref() else { return };
+                                let Some(n) = anchor_line_no else { return };
+                                ev.prevent_default();
+                                cb(pdown_root_new.clone(), pdown_path_new.clone(), ReviewDiffSide::New, n);
+                            }
+                        >{new_str}</span>
                         <span class="diff-prefix">{prefix}</span>
                         {move || {
                             let result: AnyView = render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text);
                             result
                         }}
                     </div>
+                    {move || line_decoration_cb.as_ref().and_then(|cb| {
+                        let n = anchor_line_no?;
+                        cb(decoration_root.clone(), decoration_path.clone(), anchor_side, n)
+                    })}
                 }
             }).collect::<Vec<_>>()}
         </div>
@@ -1497,13 +2218,38 @@ pub struct SideBySideRow {
     pub right: Option<SideBySideCell>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SideBySideCell {
     pub kind: ProjectGitDiffLineKind,
     pub line_number: Option<u32>,
     pub text: String,
+    /// Static snapshot of the cell's syntax tokens. Populated by the
+    /// test-facing pairing helpers so existing tests keep working with
+    /// plain values. The runtime renderer prefers `tokens_signal` if
+    /// present so it can react to async tokenization landing.
     pub tokens: Option<LineTokens>,
+    /// Reactive token slot used by the live renderer. `None` means
+    /// "use `tokens` directly". `Some(signal)` means the row should
+    /// read from the signal each render so worker-streamed chunks
+    /// update only the affected rows instead of forcing a re-render
+    /// of the whole window via a shared signal.
+    pub tokens_signal: Option<ArcRwSignal<Option<LineTokens>>>,
 }
+
+impl PartialEq for SideBySideCell {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare on user-visible content. `tokens_signal` carries
+        // identity, not value, and `tokens` is a render-time cache —
+        // either may legitimately differ between two cells that the
+        // pairing layer treats as equivalent.
+        self.kind == other.kind
+            && self.line_number == other.line_number
+            && self.text == other.text
+            && self.tokens == other.tokens
+    }
+}
+
+impl Eq for SideBySideCell {}
 
 /// Convenience wrapper used by tests; pairs lines with no syntax tokens.
 pub fn pair_lines_side_by_side(lines: Vec<ProjectGitDiffLine>) -> Vec<SideBySideRow> {
@@ -1552,12 +2298,14 @@ pub fn pair_lines_side_by_side_with_tokens(
                         line_number: r.old_line_number,
                         text: r.text,
                         tokens: r_old,
+                        tokens_signal: None,
                     }),
                     right: Some(SideBySideCell {
                         kind: a.kind,
                         line_number: a.new_line_number,
                         text: a.text,
                         tokens: a_new,
+                        tokens_signal: None,
                     }),
                 });
             }
@@ -1568,6 +2316,7 @@ pub fn pair_lines_side_by_side_with_tokens(
                         line_number: r.old_line_number,
                         text: r.text,
                         tokens: r_old,
+                        tokens_signal: None,
                     }),
                     right: None,
                 });
@@ -1580,6 +2329,7 @@ pub fn pair_lines_side_by_side_with_tokens(
                         line_number: a.new_line_number,
                         text: a.text,
                         tokens: a_new,
+                        tokens_signal: None,
                     }),
                 });
             }
@@ -1601,12 +2351,14 @@ pub fn pair_lines_side_by_side_with_tokens(
                         line_number: line.old_line_number,
                         text: line.text.clone(),
                         tokens: old_tok,
+                        tokens_signal: None,
                     }),
                     right: Some(SideBySideCell {
                         kind: ProjectGitDiffLineKind::Context,
                         line_number: line.new_line_number,
                         text: line.text,
                         tokens: new_tok,
+                        tokens_signal: None,
                     }),
                 });
             }
@@ -1614,6 +2366,277 @@ pub fn pair_lines_side_by_side_with_tokens(
     }
     flush(&mut removed, &mut added, &mut rows);
     rows
+}
+
+/// Side selector used when shipping a hunk to the worker. Each side is
+/// a separate `HighlightFile` request because the parser state across
+/// removed/added boundaries diverges between the two streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectGitDiffSide {
+    Old,
+    New,
+}
+
+/// Like `pair_lines_side_by_side_with_tokens` but the per-cell `tokens`
+/// field stays None and `tokens_signal` carries the per-line reactive
+/// handle. The render layer reads the signal at row-render time so
+/// worker-streamed chunks update only the affected rows.
+fn pair_lines_side_by_side_with_token_signals(
+    lines: Vec<ProjectGitDiffLine>,
+    old_signals: &[Option<ArcRwSignal<Option<LineTokens>>>],
+    new_signals: &[Option<ArcRwSignal<Option<LineTokens>>>],
+) -> Vec<SideBySideRow> {
+    debug_assert_eq!(lines.len(), old_signals.len());
+    debug_assert_eq!(lines.len(), new_signals.len());
+
+    type Entry = (
+        ProjectGitDiffLine,
+        Option<ArcRwSignal<Option<LineTokens>>>,
+        Option<ArcRwSignal<Option<LineTokens>>>,
+    );
+
+    let mut rows: Vec<SideBySideRow> = Vec::new();
+    let mut removed: Vec<Entry> = Vec::new();
+    let mut added: Vec<Entry> = Vec::new();
+
+    let flush =
+        |removed: &mut Vec<Entry>, added: &mut Vec<Entry>, rows: &mut Vec<SideBySideRow>| {
+            let pair_count = removed.len().min(added.len());
+            let rem_iter = std::mem::take(removed);
+            let add_iter = std::mem::take(added);
+            let mut rem_it = rem_iter.into_iter();
+            let mut add_it = add_iter.into_iter();
+            for _ in 0..pair_count {
+                let (r, r_old, _r_new) = rem_it.next().expect("removed run underflow");
+                let (a, _a_old, a_new) = add_it.next().expect("added run underflow");
+                rows.push(SideBySideRow {
+                    left: Some(SideBySideCell {
+                        kind: r.kind,
+                        line_number: r.old_line_number,
+                        text: r.text,
+                        tokens: None,
+                        tokens_signal: r_old,
+                    }),
+                    right: Some(SideBySideCell {
+                        kind: a.kind,
+                        line_number: a.new_line_number,
+                        text: a.text,
+                        tokens: None,
+                        tokens_signal: a_new,
+                    }),
+                });
+            }
+            for (r, r_old, _) in rem_it {
+                rows.push(SideBySideRow {
+                    left: Some(SideBySideCell {
+                        kind: r.kind,
+                        line_number: r.old_line_number,
+                        text: r.text,
+                        tokens: None,
+                        tokens_signal: r_old,
+                    }),
+                    right: None,
+                });
+            }
+            for (a, _, a_new) in add_it {
+                rows.push(SideBySideRow {
+                    left: None,
+                    right: Some(SideBySideCell {
+                        kind: a.kind,
+                        line_number: a.new_line_number,
+                        text: a.text,
+                        tokens: None,
+                        tokens_signal: a_new,
+                    }),
+                });
+            }
+        };
+
+    for ((line, old_sig), new_sig) in lines
+        .into_iter()
+        .zip(old_signals.iter().cloned())
+        .zip(new_signals.iter().cloned())
+    {
+        match line.kind {
+            ProjectGitDiffLineKind::Removed => removed.push((line, old_sig, new_sig)),
+            ProjectGitDiffLineKind::Added => added.push((line, old_sig, new_sig)),
+            ProjectGitDiffLineKind::Context => {
+                flush(&mut removed, &mut added, &mut rows);
+                rows.push(SideBySideRow {
+                    left: Some(SideBySideCell {
+                        kind: ProjectGitDiffLineKind::Context,
+                        line_number: line.old_line_number,
+                        text: line.text.clone(),
+                        tokens: None,
+                        tokens_signal: old_sig,
+                    }),
+                    right: Some(SideBySideCell {
+                        kind: ProjectGitDiffLineKind::Context,
+                        line_number: line.new_line_number,
+                        text: line.text,
+                        tokens: None,
+                        tokens_signal: new_sig,
+                    }),
+                });
+            }
+        }
+    }
+    flush(&mut removed, &mut added, &mut rows);
+    rows
+}
+
+/// Ship one side of an ENTIRE FILE (all hunks at once) to the highlight
+/// worker. The worker only tracks one active task — calling it per-hunk
+/// would cancel earlier hunks before they emit chunks, leaving most of
+/// the file uncolored. So we concatenate every included line into one
+/// stream and ship a single request per side.
+///
+/// `hunk_signals[hi]` is the per-line signal slice for hunk `hi`; the
+/// worker returns chunks indexed by stream-position, which we map back
+/// to (hunk_idx, line_idx) via the parallel `stream_to_pos` table.
+fn spawn_sbs_side_highlight(
+    relative_path: String,
+    hunks: &[ProjectGitDiffHunk],
+    side: ProjectGitDiffSide,
+    hunk_signals: &[Vec<Option<ArcRwSignal<Option<LineTokens>>>>],
+    perf_key: String,
+) {
+    debug_assert_eq!(hunks.len(), hunk_signals.len());
+    let mut stream_lines: Vec<String> = Vec::new();
+    // Each entry: (hunk_idx, line_idx_within_hunk).
+    let mut stream_to_pos: Vec<(usize, usize)> = Vec::new();
+    for (hi, hunk) in hunks.iter().enumerate() {
+        for (li, line) in hunk.lines.iter().enumerate() {
+            let included = matches!(
+                (side, line.kind),
+                (ProjectGitDiffSide::Old, ProjectGitDiffLineKind::Removed)
+                    | (ProjectGitDiffSide::Old, ProjectGitDiffLineKind::Context)
+                    | (ProjectGitDiffSide::New, ProjectGitDiffLineKind::Added)
+                    | (ProjectGitDiffSide::New, ProjectGitDiffLineKind::Context)
+            );
+            if included {
+                stream_lines.push(line.text.clone());
+                stream_to_pos.push((hi, li));
+            }
+        }
+    }
+    if stream_lines.is_empty() {
+        return;
+    }
+
+    let key = perf_key;
+    let task_t0 = crate::perf::now_ms();
+    let side_tag = match side {
+        ProjectGitDiffSide::Old => "old",
+        ProjectGitDiffSide::New => "new",
+    };
+    let key_for_first = key.clone();
+    let key_for_done = key.clone();
+    let first_logged = std::rc::Rc::new(std::cell::Cell::new(false));
+    let first_for_cb = first_logged.clone();
+    let total_for_done = stream_lines.len();
+
+    // Clone the nested signal vec once so the callback owns it.
+    let signals_for_cb: Vec<Vec<Option<ArcRwSignal<Option<LineTokens>>>>> = hunk_signals.to_vec();
+    let stream_to_pos_for_cb = stream_to_pos;
+
+    if let Some(client) = crate::highlight_worker::shared() {
+        let on_chunk = Box::new(move |start: usize, tokens: Vec<LineTokens>| {
+            if !first_for_cb.get() {
+                first_for_cb.set(true);
+                let dt = crate::perf::now_ms() - task_t0;
+                crate::perf::log_phase(
+                    "diff_open",
+                    "sbs_hl_first_chunk",
+                    &key_for_first,
+                    &format!(
+                        " side={side_tag} through={} took={dt:.1}ms",
+                        start + tokens.len()
+                    ),
+                );
+            }
+            for (offset, toks) in tokens.into_iter().enumerate() {
+                let stream_idx = start + offset;
+                let Some(&(hi, li)) = stream_to_pos_for_cb.get(stream_idx) else {
+                    continue;
+                };
+                if let Some(Some(sig)) = signals_for_cb.get(hi).and_then(|h| h.get(li)) {
+                    sig.set(Some(toks));
+                }
+            }
+        });
+        let on_done = Box::new(move || {
+            let dt = crate::perf::now_ms() - task_t0;
+            crate::perf::log_phase(
+                "diff_open",
+                "sbs_hl_finished",
+                &key_for_done,
+                &format!(" side={side_tag} lines={total_for_done} took={dt:.1}ms via=worker"),
+            );
+        });
+        let syntax_name = syntax_token_for_path(&relative_path)
+            .unwrap_or("")
+            .to_owned();
+        let theme_name = expect_context::<AppState>().syntax_theme.get_untracked();
+        // Use the concurrent variant — the SBS path spawns Old + New
+        // sides as two tasks that must both run; calling the
+        // auto-cancelling `highlight_file` here would cancel the
+        // first when the second arrives. Outer caller cancels prior
+        // file's tasks via `cancel_all` before spawning either side.
+        let _task_id = client.highlight_file_concurrent(
+            if syntax_name.is_empty() {
+                relative_path
+            } else {
+                syntax_name
+            },
+            theme_name,
+            stream_lines,
+            on_chunk,
+            on_done,
+        );
+    } else {
+        // No-worker fallback: tokenize on the main thread but yielding
+        // between 50-line chunks so the UI doesn't lock up.
+        let Some(syn) = syntax_for_path(&relative_path) else {
+            return;
+        };
+        spawn_local(async move {
+            next_macrotask().await;
+            let mut hl = LineHighlighter::new(syn);
+            const CHUNK: usize = 50;
+            let mut i = 0usize;
+            while i < stream_lines.len() {
+                let end = (i + CHUNK).min(stream_lines.len());
+                for (j, line) in stream_lines.iter().enumerate().take(end).skip(i) {
+                    let toks = hl.highlight_one(line);
+                    if let Some(&(hi, li)) = stream_to_pos_for_cb.get(j)
+                        && let Some(Some(sig)) = signals_for_cb.get(hi).and_then(|h| h.get(li))
+                    {
+                        sig.set(Some(toks));
+                    }
+                }
+                if !first_for_cb.get() {
+                    first_for_cb.set(true);
+                    let dt = crate::perf::now_ms() - task_t0;
+                    crate::perf::log_phase(
+                        "diff_open",
+                        "sbs_hl_first_chunk",
+                        &key_for_first,
+                        &format!(" side={side_tag} through={end} took={dt:.1}ms via=fallback"),
+                    );
+                }
+                i = end;
+                next_macrotask().await;
+            }
+            let dt = crate::perf::now_ms() - task_t0;
+            crate::perf::log_phase(
+                "diff_open",
+                "sbs_hl_finished",
+                &key_for_done,
+                &format!(" side={side_tag} lines={total_for_done} took={dt:.1}ms via=fallback"),
+            );
+        });
+    }
 }
 
 /// Compute search indices for each cell in the paired side-by-side rows.
@@ -1676,47 +2699,164 @@ fn sbs_search_indices(
     out
 }
 
-fn render_cell_search(
-    cell: Option<SideBySideCell>,
-    search_idx: Option<usize>,
+/// Render one SBS row (a paired left+right line) for one pane.
+///
+/// Why this is a single helper instead of "render the cell, then attach
+/// decorations later":
+/// - Drag-to-select needs `data-anchor-side` and per-side line numbers
+///   on the same `.diff-line` the user's pointer can land on, so the
+///   window-level `pointermove` listener can identify which side+line
+///   the cursor is over even when it's on a Removed-only or Added-only
+///   row.
+/// - Inline review threads (composer / comment cards / suggestion
+///   cards) render *below* the line they're anchored to. The decoration
+///   slot has to sit next to the row that just rendered so virtualized
+///   mount/unmount keeps it co-located with its anchor row.
+///
+/// The `pane_side` argument disambiguates the visible cell from the
+/// invisible counterpart: for the left pane we read `row.left` for
+/// gutter/text and use `Old` as the anchor side; for the right pane
+/// we read `row.right` and use `New`. Per-side line attrs always come
+/// from the *full* paired row so a drag started on the right pane that
+/// passes over a Removed-only row (whose right cell is empty) still
+/// degrades cleanly — the listener sees no `data-anchor-new-line` and
+/// just leaves the selection range unchanged for that row.
+#[allow(clippy::too_many_arguments)]
+fn render_sbs_paired_row(
+    row: SideBySideRow,
+    pane_side: SbsSide,
+    left_idx: Option<usize>,
+    right_idx: Option<usize>,
     find: Option<FindState>,
+    root: &ProjectRootPath,
+    relative_path: &str,
+    decorations: &DiffDecorations,
 ) -> AnyView {
-    match cell {
-        Some(c) => {
-            let base_class = line_class(c.kind);
-            let prefix = line_prefix(c.kind);
-            let num = c.line_number.map(|n| n.to_string()).unwrap_or_default();
-            let text = c.text;
-            let tokens = c.tokens;
-            let find_for_class = find.clone();
-            let find_for_text = find;
-            let idx_str = search_idx.map(|i| i.to_string()).unwrap_or_default();
-            view! {
-                <div
-                    class=move || {
-                        if let (Some(idx), Some(find)) = (search_idx, &find_for_class) {
-                            diff_line_class(base_class, idx, &Some(find.clone()))
-                        } else {
-                            base_class.to_string()
-                        }
-                    }
-                    attr:data-find-idx=idx_str
-                >
-                    <span class="diff-gutter">{num}</span>
-                    <span class="diff-prefix">{prefix}</span>
-                    {move || {
-                        let result: AnyView = match search_idx {
-                            Some(idx) => render_diff_text(&text, tokens.as_ref(), idx, &find_for_text),
-                            None => render_diff_text_plain(&text, tokens.as_ref()),
-                        };
-                        result
-                    }}
-                </div>
-            }
-            .into_any()
+    let (cell, search_idx) = match pane_side {
+        SbsSide::Left => (row.left.clone(), left_idx),
+        SbsSide::Right => (row.right.clone(), right_idx),
+    };
+
+    let Some(c) = cell else {
+        return view! { <div class="diff-line diff-line-empty"></div> }.into_any();
+    };
+
+    let base_class = line_class(c.kind);
+    let prefix = line_prefix(c.kind);
+    let num = c.line_number.map(|n| n.to_string()).unwrap_or_default();
+    let text = c.text;
+    let static_tokens = c.tokens;
+    let token_signal = c.tokens_signal;
+    let find_for_class = find.clone();
+    let find_for_text = find;
+    let idx_str = search_idx.map(|i| i.to_string()).unwrap_or_default();
+
+    let anchor_side = match pane_side {
+        SbsSide::Left => ReviewDiffSide::Old,
+        SbsSide::Right => ReviewDiffSide::New,
+    };
+    let anchor_side_str = match anchor_side {
+        ReviewDiffSide::Old => "old",
+        ReviewDiffSide::New => "new",
+    };
+    let anchor_line_no: Option<u32> = c.line_number;
+    let anchor_line_attr = anchor_line_no.map(|n| n.to_string()).unwrap_or_default();
+    let paired_old_line = row
+        .left
+        .as_ref()
+        .and_then(|c| c.line_number)
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let paired_new_line = row
+        .right
+        .as_ref()
+        .and_then(|c| c.line_number)
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+
+    let pointer_down_cb = decorations.gutter_pointer_down.clone();
+    let extra_class_cb = decorations.line_extra_class.clone();
+    let line_decoration_cb = decorations.decoration_below_line.clone();
+    let pointer_active = pointer_down_cb.is_some() && anchor_line_no.is_some();
+
+    let class_root = root.clone();
+    let class_path = relative_path.to_owned();
+    let line_class_closure = move || {
+        let mut s = if let (Some(idx), Some(find)) = (search_idx, &find_for_class) {
+            diff_line_class(base_class, idx, &Some(find.clone()))
+        } else {
+            base_class.to_string()
+        };
+        if let (Some(cb), Some(n)) = (extra_class_cb.as_ref(), anchor_line_no)
+            && let Some(extra) = cb(class_root.clone(), class_path.clone(), anchor_side, n)
+        {
+            s.push(' ');
+            s.push_str(extra);
         }
-        None => view! { <div class="diff-line diff-line-empty"></div> }.into_any(),
+        s
+    };
+
+    let gutter_class = if pointer_active {
+        "diff-gutter diff-gutter-clickable"
+    } else {
+        "diff-gutter"
+    };
+    let pdown_root = root.clone();
+    let pdown_path = relative_path.to_owned();
+    let pdown_cb = pointer_down_cb;
+    let on_pointer_down = move |ev: web_sys::PointerEvent| {
+        if !pointer_active {
+            return;
+        }
+        let Some(cb) = pdown_cb.as_ref() else { return };
+        let Some(n) = anchor_line_no else { return };
+        ev.prevent_default();
+        cb(pdown_root.clone(), pdown_path.clone(), anchor_side, n);
+    };
+
+    let decoration_root = root.clone();
+    let decoration_path = relative_path.to_owned();
+
+    view! {
+        <>
+            <div
+                class=line_class_closure
+                data-find-idx=idx_str
+                data-anchor-side=anchor_side_str
+                data-anchor-line=anchor_line_attr
+                data-anchor-old-line=paired_old_line
+                data-anchor-new-line=paired_new_line
+            >
+                <span
+                    class=gutter_class
+                    title=if pointer_active { "Click or drag to comment" } else { "" }
+                    on:pointerdown=on_pointer_down
+                >{num}</span>
+                <span class="diff-prefix">{prefix}</span>
+                {move || {
+                    // Reactive read: if the cell carries a token signal
+                    // (live SBS path), pull the current value each render
+                    // so chunks landing from the worker fill in colour
+                    // without remounting the row. Otherwise fall back to
+                    // the static snapshot the test API attaches.
+                    let live_tokens = token_signal
+                        .as_ref()
+                        .map(|s| s.get())
+                        .unwrap_or_else(|| static_tokens.clone());
+                    let result: AnyView = match search_idx {
+                        Some(idx) => render_diff_text(&text, live_tokens.as_ref(), idx, &find_for_text),
+                        None => render_diff_text_plain(&text, live_tokens.as_ref()),
+                    };
+                    result
+                }}
+            </div>
+            {move || line_decoration_cb.as_ref().and_then(|cb| {
+                let n = anchor_line_no?;
+                cb(decoration_root.clone(), decoration_path.clone(), anchor_side, n)
+            })}
+        </>
     }
+    .into_any()
 }
 
 // ── Search-aware rendering helpers ──────────────────────────────────────
@@ -2277,6 +3417,99 @@ mod wasm_tests {
             "expected scroll_height > 5000px for 1000-line file, got {scroll_height}; \
              spacers may have been dropped"
         );
+    }
+
+    /// CRITICAL: Virtualization must stay engaged when the host passes
+    /// review-mode decoration callbacks. Regression we're guarding against:
+    /// a previous refactor disabled virt whenever any decoration was set,
+    /// blowing up the DOM for 1500-line files in review mode and making
+    /// them feel sluggish to open. The decoration callback is responsible
+    /// for returning `None` when there's nothing to show — that keeps lines
+    /// uniform-height and the row-count math correct.
+    #[wasm_bindgen_test]
+    async fn large_diff_with_decorations_still_virtualizes() {
+        ensure_styles_loaded();
+        let root = ProjectRootPath("test-root".to_owned());
+        let scope = ProjectDiffScope::Unstaged;
+        let total_lines = 1500usize;
+        let diff = synth_added_diff(total_lines, root.clone());
+
+        // A line-decoration callback that returns None for every row —
+        // mimics the review-mode case where most rows have no thread.
+        let line_decoration: super::DecorationLineFn = std::sync::Arc::new(|_, _, _, _| None);
+        // Pointer-down callback stand-in: the real review surface uses
+        // this to start a drag selection. For virtualization purposes
+        // any non-None callback exercises the same code path.
+        let pointer_down: super::GutterPointerDownFn = std::sync::Arc::new(|_, _, _, _| {});
+
+        let container = make_container();
+        let mount_root = root.clone();
+        let mount_path = "big.rs".to_owned();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.diff_contents.update(|d| {
+                d.insert(
+                    (mount_root.clone(), scope, mount_path.clone()),
+                    diff.clone(),
+                );
+            });
+            provide_context(state);
+            view! {
+                <DiffView
+                    root=mount_root.clone()
+                    scope=scope
+                    path=mount_path.clone()
+                    on_gutter_pointer_down=pointer_down.clone()
+                    decoration_below_line=line_decoration.clone()
+                />
+            }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        let rendered = container.query_selector_all(".diff-line").unwrap().length() as usize;
+        assert!(
+            rendered > 0 && rendered < 250,
+            "decorations must not disable virtualization: rendered {rendered} of \
+             {total_lines} lines (expected < 250)"
+        );
+
+        // None-returning decoration callbacks must not leave empty
+        // `.review-thread-region` boxes in the DOM (looks like a
+        // dropzone, confuses users).
+        let empty_threads = container
+            .query_selector_all(".review-thread-region:empty")
+            .unwrap()
+            .length();
+        assert_eq!(
+            empty_threads, 0,
+            "empty thread-region elements should not be emitted"
+        );
+
+        // Each rendered diff line must expose its anchor side+line as
+        // data attributes — the drag-selection hit-test depends on this.
+        let line: HtmlElement = container
+            .query_selector(".diff-line")
+            .unwrap()
+            .expect("at least one diff-line rendered")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            line.get_attribute("data-anchor-side").is_some(),
+            "diff-line must expose data-anchor-side for drag hit-testing"
+        );
+        assert!(
+            line.get_attribute("data-anchor-line").is_some(),
+            "diff-line must expose data-anchor-line for drag hit-testing"
+        );
+
+        // The canonical gutter must carry the clickable class so its
+        // cursor reads as :pointer for the click+drag affordance.
+        let canonical_gutter = line
+            .query_selector(".diff-gutter-clickable")
+            .unwrap()
+            .expect("canonical gutter should be clickable when callback set");
+        let _ = canonical_gutter;
     }
 
     /// In SBS mode, consecutive `.diff-hunk` siblings inside a `.diff-pane`

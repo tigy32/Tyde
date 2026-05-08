@@ -14,11 +14,12 @@ use protocol::{
     FrameKind, HelloPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
     McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
     NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectDeletePayload, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
     ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    RejectPayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
+    RejectPayload, ReviewActionPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
+    ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
     SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
     SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
@@ -254,6 +255,51 @@ impl Connection {
             .await
     }
 
+    pub async fn review_create(
+        &mut self,
+        project_id: &ProjectId,
+        payload: ReviewCreatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_project_payload(project_id, FrameKind::ReviewCreate, &payload)
+            .await
+    }
+
+    pub async fn review_action(
+        &mut self,
+        review_id: &ReviewId,
+        payload: ReviewActionPayload,
+    ) -> Result<(), FrameError> {
+        let stream = self.review_stream(review_id);
+        let seq = self
+            .outgoing_seq
+            .get(&stream)
+            .copied()
+            .expect("missing review stream sequence counter");
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::ReviewAction, seq, &payload)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream, seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn review_subscribe(
+        &mut self,
+        review_id: &ReviewId,
+        payload: ReviewSubscribePayload,
+    ) -> Result<(), FrameError> {
+        let stream = self.review_stream(review_id);
+        let seq = self
+            .outgoing_seq
+            .get(&stream)
+            .copied()
+            .expect("missing review stream sequence counter");
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::ReviewSubscribe, seq, &payload)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream, seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn project_stage_file(
         &mut self,
         project_id: &ProjectId,
@@ -326,6 +372,7 @@ impl Connection {
             SendMessagePayload {
                 message,
                 images: None,
+                origin: None,
             },
         )
         .await
@@ -350,6 +397,7 @@ impl Connection {
             SendMessagePayload {
                 message,
                 images: None,
+                origin: None,
             },
         )
         .await
@@ -705,9 +753,29 @@ impl Connection {
                     let _: ProjectGitDiffPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::ProjectEvent => {
+                    let _: ProjectEventPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 other => {
                     panic!(
                         "unexpected server frame kind {} on project stream {}",
+                        other, envelope.stream
+                    );
+                }
+            }
+        } else if envelope.stream.0.starts_with("/review/") {
+            match envelope.kind {
+                FrameKind::ReviewEvent => {
+                    let _: ReviewEventPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    self.outgoing_seq
+                        .entry(envelope.stream.clone())
+                        .or_insert(0);
+                }
+                other => {
+                    panic!(
+                        "unexpected server frame kind {} on review stream {}",
                         other, envelope.stream
                     );
                 }
@@ -838,6 +906,12 @@ impl Connection {
 
     fn terminal_stream(&self, terminal_id: &TerminalId) -> StreamPath {
         StreamPath(format!("/terminal/{}", terminal_id))
+    }
+
+    fn review_stream(&mut self, review_id: &ReviewId) -> StreamPath {
+        let stream = StreamPath(format!("/review/{}", review_id));
+        self.outgoing_seq.entry(stream.clone()).or_insert(0);
+        stream
     }
 }
 

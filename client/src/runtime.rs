@@ -7,7 +7,7 @@ use protocol::{
     CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameError, FrameKind,
     HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerNotifyPayload,
     NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectDeletePayload, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload,
@@ -144,6 +144,7 @@ pub enum ProjectEvent {
     GitStatus(ProjectGitStatusPayload),
     FileContents(ProjectFileContentsPayload),
     GitDiff(ProjectGitDiffPayload),
+    Notify(ProjectEventPayload),
 }
 
 pub enum TerminalEvent {
@@ -931,6 +932,13 @@ async fn handle_project_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 Err(_) => return,
             };
             ProjectEvent::GitDiff(payload)
+        }
+        FrameKind::ProjectEvent => {
+            let payload: ProjectEventPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::Notify(payload)
         }
         other => panic!(
             "unexpected server frame kind {} on project stream {}",

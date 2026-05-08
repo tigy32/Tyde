@@ -159,6 +159,7 @@ async fn list_sessions_and_resume_agent() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -258,6 +259,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -286,6 +288,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -400,6 +403,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -540,6 +544,7 @@ async fn delete_session_removes_it_from_list() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })

@@ -110,6 +110,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
+                access_mode: Default::default(),
                 session_settings: None,
             },
         })
@@ -181,6 +182,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         .send_message(SendMessagePayload {
             message: follow_up.to_owned(),
             images: None,
+            origin: None,
         })
         .await
         .expect("follow-up send should succeed");

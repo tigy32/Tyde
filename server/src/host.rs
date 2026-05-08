@@ -10,18 +10,20 @@ use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentId, AgentOrigin, AgentStartPayload, BackendSetupPayload, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
-    HostBrowseStartPayload, HostSettingsPayload, McpServerDeletePayload, McpServerNotifyPayload,
-    McpServerUpsertPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectDiscardFilePayload,
-    ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload,
-    ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, RunBackendSetupPayload, SessionId,
-    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, StreamPath, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
-    TerminalResizePayload, TerminalSendPayload,
+    HostBrowseStartPayload, HostSettingsPayload, McpServerConfig, McpServerDeletePayload,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
+    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
+    ReviewId, RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload,
+    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
+    TerminalSendPayload,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -49,9 +51,19 @@ use crate::project_stream::{
     commit, discard_file, read_diff, read_file, spawn_project_subscription, stage_file, stage_hunk,
     unstage_file,
 };
+use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
+use crate::review::reviewer::{
+    ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
+    reviewer_tool_policy,
+};
+use crate::review::{
+    ReviewRegistry, ReviewRegistryHandle, build_create_request, review_stream_path,
+};
+use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
 use crate::store::project::ProjectStore;
+use crate::store::review::ReviewStore;
 use crate::store::session::SessionStore;
 use crate::store::settings::HostSettingsStore;
 use crate::store::skills::SkillStore;
@@ -71,6 +83,7 @@ struct HostSubscriber {
 pub struct HostRuntimeConfig {
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
+    pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub kiro_probe_program: Option<String>,
 }
 
@@ -83,6 +96,7 @@ enum KiroSessionSchemaState {
 
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
+    pub review_registry: ReviewRegistryHandle,
     pub project_store: Arc<Mutex<ProjectStore>>,
     pub settings_store: Arc<Mutex<HostSettingsStore>>,
     pub session_store: Arc<Mutex<SessionStore>>,
@@ -95,6 +109,7 @@ pub(crate) struct HostState {
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
+    pub review_mcp: ReviewMcpHandle,
     kiro_session_schema: KiroSessionSchemaState,
     kiro_probe_program: Option<String>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
@@ -131,6 +146,7 @@ impl HostSubAgentEmitter {
 struct HostStorePaths {
     session: PathBuf,
     project: PathBuf,
+    review: PathBuf,
     settings: PathBuf,
     custom_agent: PathBuf,
     mcp_server: PathBuf,
@@ -273,6 +289,16 @@ impl HostHandle {
                     project_id = %project_id,
                     error = %error,
                     "failed to subscribe host to project stream during registration"
+                );
+            }
+            if let Err(error) =
+                emit_review_list_changed_for_project(&mut state, project_id.clone()).await
+            {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to emit review list during registration"
                 );
             }
         }
@@ -449,9 +475,10 @@ impl HostHandle {
     }
 
     pub(crate) async fn unregister_host_stream(&self, path: &StreamPath) {
-        let (project_handles, terminals) = {
+        let (project_handles, terminals, review_registry) = {
             let mut state = self.state.lock().await;
             state.host_streams.remove(path);
+            let review_registry = state.review_registry.clone();
             let project_handles = state
                 .project_streams
                 .values()
@@ -481,12 +508,14 @@ impl HostHandle {
                 };
                 terminals.push(terminal);
             }
-            (project_handles, terminals)
+            (project_handles, terminals, review_registry)
         };
 
         for handle in project_handles {
             handle.remove_subscriber(path.clone()).await;
         }
+
+        review_registry.unsubscribe_all(path.clone()).await;
 
         for terminal in terminals {
             terminal.close().await;
@@ -502,6 +531,16 @@ impl HostHandle {
         &self,
         payload: SpawnAgentPayload,
         origin: AgentOrigin,
+    ) -> AgentId {
+        self.spawn_agent_with_origin_and_config(payload, origin, None)
+            .await
+    }
+
+    async fn spawn_agent_with_origin_and_config(
+        &self,
+        payload: SpawnAgentPayload,
+        origin: AgentOrigin,
+        resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
     ) -> AgentId {
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
@@ -554,6 +593,7 @@ impl HostHandle {
                 images,
                 backend_kind,
                 cost_hint,
+                access_mode,
                 session_settings,
             } => {
                 if let Some(project_id) = &payload.project_id {
@@ -574,10 +614,12 @@ impl HostHandle {
                 let requested_custom_agent_id = payload.custom_agent_id.clone();
                 let (
                     effective_custom_agent_id,
-                    resolved_spawn_config,
+                    mut resolved_spawn_config,
                     startup_warning,
                     startup_failure,
-                ) = {
+                ) = if let Some(resolved) = resolved_spawn_config_override.clone() {
+                    (None, resolved, None, None)
+                } else {
                     let custom_agents = custom_agent_store.lock().await;
                     let mcp_servers = mcp_server_store.lock().await;
                     let steering = steering_store.lock().await;
@@ -601,6 +643,9 @@ impl HostHandle {
                         ),
                     }
                 };
+                if resolved_spawn_config_override.is_none() {
+                    resolved_spawn_config.access_mode = access_mode;
+                }
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let session_settings_schema = {
@@ -673,6 +718,7 @@ impl HostHandle {
                     initial_input: Some(protocol::SendMessagePayload {
                         message: prompt,
                         images,
+                        origin: None,
                     }),
                     cost_hint,
                     session_settings,
@@ -879,6 +925,7 @@ impl HostHandle {
                     initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
                         message: prompt,
                         images: None,
+                        origin: None,
                     }),
                     cost_hint: None,
                     session_settings: sanitized_settings,
@@ -905,10 +952,13 @@ impl HostHandle {
         let (start, agent_handle, startup_rx, host_streams) = {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
-            let spawned =
-                state
-                    .registry
-                    .spawn(request, Arc::clone(&session_store), sub_agent_spawn_tx);
+            let review_registry = state.review_registry.clone();
+            let spawned = state.registry.spawn(
+                request,
+                Arc::clone(&session_store),
+                sub_agent_spawn_tx,
+                review_registry,
+            );
             let host_streams = state
                 .host_streams
                 .iter()
@@ -982,6 +1032,16 @@ impl HostHandle {
                     project_id = %project_id,
                     error = %error,
                     "failed to subscribe host to project stream after project creation"
+                );
+            }
+            if let Err(error) =
+                emit_review_list_changed_for_project(&mut state, project_id.clone()).await
+            {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to emit initial review list after project creation"
                 );
             }
         }
@@ -1698,6 +1758,13 @@ impl HostHandle {
             .agent_status_handle(agent_id)
     }
 
+    pub(crate) async fn agent_access_mode(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<protocol::BackendAccessMode> {
+        self.state.lock().await.registry.agent_access_mode(agent_id)
+    }
+
     pub(crate) async fn agent_status_snapshot(
         &self,
         agent_id: &AgentId,
@@ -1747,6 +1814,22 @@ impl HostHandle {
         self.state.lock().await.agent_control_mcp.url.clone()
     }
 
+    pub async fn review_mcp_url(&self) -> String {
+        self.state.lock().await.review_mcp.url.clone()
+    }
+
+    pub(crate) async fn propose_review_comment(
+        &self,
+        review_id: ReviewId,
+        suggestion: protocol::ReviewSuggestedComment,
+    ) -> Result<Result<protocol::ReviewSuggestionId, protocol::ReviewErrorPayload>, String> {
+        let registry = {
+            let state = self.state.lock().await;
+            state.review_registry.clone()
+        };
+        registry.ai_suggestion(review_id, suggestion).await
+    }
+
     /// Spawn an agent and return its AgentId (for use by agent-control MCP).
     pub(crate) async fn spawn_agent_and_return_id(&self, payload: SpawnAgentPayload) -> AgentId {
         self.spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
@@ -1769,6 +1852,7 @@ impl HostHandle {
                             .insert(agent_id.clone(), session_id.clone());
                     }
                     host.fan_out_session_lists().await;
+                    host.deliver_submitted_reviews_for_session(session_id).await;
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -2318,6 +2402,358 @@ impl HostHandle {
         .await?;
         Ok(())
     }
+
+    pub(crate) async fn create_review(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: ReviewCreatePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "review_create";
+        let (project_store, review_registry, origin_agent, origin_session_id) = {
+            let state = self.state.lock().await;
+            let Some(origin_agent) = state.registry.agent_handle(&payload.origin_agent_id) else {
+                return Err(AppError::not_found(
+                    OPERATION,
+                    format!("origin agent {} is not running", payload.origin_agent_id),
+                ));
+            };
+            let Some(origin_session_id) =
+                state.agent_sessions.get(&payload.origin_agent_id).cloned()
+            else {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!(
+                        "origin agent {} is not bound to a session yet",
+                        payload.origin_agent_id
+                    ),
+                ));
+            };
+            (
+                Arc::clone(&state.project_store),
+                state.review_registry.clone(),
+                origin_agent,
+                origin_session_id,
+            )
+        };
+
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        let origin_start = origin_agent.snapshot().await.ok_or_else(|| {
+            AppError::not_found(
+                OPERATION,
+                format!("origin agent {} stopped", payload.origin_agent_id),
+            )
+        })?;
+        if origin_start.project_id.as_ref() != Some(&project_id) {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "origin agent {} is not bound to project {}",
+                    payload.origin_agent_id, project_id
+                ),
+            ));
+        }
+
+        let diffs = read_review_diffs(&project, &payload.selection).map_err(|error| {
+            AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+        })?;
+        let review_id = ReviewId(Uuid::new_v4().to_string());
+        let review_stream = project_output_stream.with_path(review_stream_path(&review_id));
+        let request = build_create_request(
+            review_id,
+            project_id,
+            origin_session_id,
+            payload,
+            diffs,
+            connection_host_stream.clone(),
+            review_stream,
+        );
+        review_registry.create(request).await.map_err(|error| {
+            AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn review_action(
+        &self,
+        connection_host_stream: &StreamPath,
+        review_output_stream: Stream,
+        review_id: ReviewId,
+        payload: ReviewActionPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "review_action";
+        let review_registry = {
+            let state = self.state.lock().await;
+            state.review_registry.clone()
+        };
+        review_registry
+            .action(
+                review_id,
+                payload,
+                connection_host_stream.clone(),
+                review_output_stream,
+            )
+            .await
+            .map_err(|error| {
+                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+            })?;
+        Ok(())
+    }
+
+    pub(crate) async fn review_subscribe(
+        &self,
+        connection_host_stream: &StreamPath,
+        review_output_stream: Stream,
+        review_id: ReviewId,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "review_subscribe";
+        let review_registry = {
+            let state = self.state.lock().await;
+            state.review_registry.clone()
+        };
+        review_registry
+            .subscribe(
+                review_id,
+                connection_host_stream.clone(),
+                review_output_stream,
+            )
+            .await
+            .map_err(|error| {
+                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+            })?;
+        Ok(())
+    }
+
+    async fn deliver_review_payload(
+        &self,
+        review_id: ReviewId,
+        target_session_id: SessionId,
+        payload: SendMessagePayload,
+    ) -> ReviewDeliveryOutcome {
+        let Some(protocol::MessageOrigin::Review {
+            review_id: origin_review_id,
+        }) = payload.origin.as_ref()
+        else {
+            return ReviewDeliveryOutcome::Failed(
+                "review delivery payload did not carry review origin".to_owned(),
+            );
+        };
+        if origin_review_id != &review_id {
+            return ReviewDeliveryOutcome::Failed(format!(
+                "review delivery payload origin {} did not match {}",
+                origin_review_id, review_id
+            ));
+        }
+
+        let (target_agent_id, target_agent) = {
+            let state = self.state.lock().await;
+            let matches = state
+                .agent_sessions
+                .iter()
+                .filter(|(_, session_id)| *session_id == &target_session_id)
+                .filter_map(|(agent_id, _)| {
+                    state
+                        .registry
+                        .agent_handle(agent_id)
+                        .map(|handle| (agent_id.clone(), handle))
+                })
+                .collect::<Vec<_>>();
+            match matches.len() {
+                0 => return ReviewDeliveryOutcome::Offline,
+                1 => matches.into_iter().next().expect("one match must exist"),
+                _ => return ReviewDeliveryOutcome::Ambiguous,
+            }
+        };
+
+        if target_agent
+            .send_input(protocol::AgentInput::SendMessage(payload))
+            .await
+        {
+            tracing::info!(
+                review_id = %review_id,
+                target_agent_id = %target_agent_id,
+                target_session_id = %target_session_id,
+                "delivered review feedback bundle to live agent"
+            );
+            ReviewDeliveryOutcome::Delivered
+        } else {
+            ReviewDeliveryOutcome::Offline
+        }
+    }
+
+    async fn deliver_submitted_reviews_for_session(&self, session_id: SessionId) {
+        let registry = {
+            let state = self.state.lock().await;
+            state.review_registry.clone()
+        };
+        let bundles = match registry
+            .submitted_bundles_for_session(session_id.clone())
+            .await
+        {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to query submitted reviews for resumed session"
+                );
+                return;
+            }
+        };
+        for (review_id, payload) in bundles {
+            match self
+                .deliver_review_payload(review_id.clone(), session_id.clone(), payload)
+                .await
+            {
+                ReviewDeliveryOutcome::Delivered | ReviewDeliveryOutcome::Offline => {}
+                ReviewDeliveryOutcome::Ambiguous => {
+                    tracing::warn!(
+                        review_id = %review_id,
+                        session_id = %session_id,
+                        "submitted review delivery is ambiguous after session resume"
+                    );
+                }
+                ReviewDeliveryOutcome::Failed(message) => {
+                    tracing::warn!(
+                        review_id = %review_id,
+                        session_id = %session_id,
+                        error = %message,
+                        "submitted review delivery failed after session resume"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn emit_review_list_changed(&self, project_id: ProjectId) {
+        let (registry, handle) = {
+            let mut state = self.state.lock().await;
+            let registry = state.review_registry.clone();
+            let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %error,
+                        "failed to ensure project actor for review list update"
+                    );
+                    return;
+                }
+            };
+            (registry, handle)
+        };
+        let summaries = match registry.summaries(project_id.clone()).await {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to build review summaries"
+                );
+                return;
+            }
+        };
+        if let Err(error) = handle
+            .emit_project_event(protocol::ProjectEventPayload::ReviewListChanged {
+                reviews: summaries,
+            })
+            .await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to emit review list update"
+            );
+        }
+    }
+
+    async fn spawn_ai_reviewer(
+        &self,
+        request: ReviewAiSpawnRequest,
+    ) -> (
+        oneshot::Sender<Result<AgentId, String>>,
+        Result<AgentId, String>,
+    ) {
+        let reply = request.reply;
+        let roots = request
+            .review
+            .diffs
+            .iter()
+            .map(|diff| diff.root.0.clone())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            review_id = %request.review_id,
+            backend_kind = ?request.backend_kind,
+            "spawning AI reviewer"
+        );
+        if roots.is_empty() {
+            return (reply, Err("review has no frozen diff roots".to_owned()));
+        }
+        let review_mcp_url = {
+            let state = self.state.lock().await;
+            state.review_mcp.url.clone()
+        };
+        if review_mcp_url.trim().is_empty() {
+            return (
+                reply,
+                Err("review feedback MCP server is unavailable for AI review".to_owned()),
+            );
+        }
+        let reviewer_system_prompt =
+            build_reviewer_system_prompt(&request.review, request.instructions);
+        let reviewer_spawn_config = ResolvedSpawnConfig {
+            instructions: Some(reviewer_system_prompt),
+            steering_body: String::new(),
+            skills: Vec::new(),
+            mcp_servers: vec![McpServerConfig {
+                id: McpServerId("tyde-review-feedback".to_owned()),
+                name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
+                transport: McpTransportConfig::Http {
+                    url: review_mcp_url,
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            }],
+            tool_policy: reviewer_tool_policy(),
+            access_mode: protocol::BackendAccessMode::ReadOnly,
+        };
+        let prompt = build_reviewer_user_prompt();
+        let payload = SpawnAgentPayload {
+            name: Some("AI Review".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(request.review.origin_agent_id.clone()),
+            project_id: Some(request.review.project_id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: roots,
+                prompt,
+                images: None,
+                backend_kind: request.backend_kind,
+                cost_hint: request.cost_hint,
+                access_mode: protocol::BackendAccessMode::ReadOnly,
+                session_settings: None,
+            },
+        };
+        let agent_id = self
+            .spawn_agent_with_origin_and_config(
+                payload,
+                protocol::AgentOrigin::AgentControl,
+                Some(reviewer_spawn_config),
+            )
+            .await;
+        if let Some(agent_handle) = self.agent_handle(&agent_id).await {
+            ReviewerToolBridge::spawn(agent_id.clone(), agent_handle, request.review_handle);
+            (reply, Ok(agent_id))
+        } else {
+            (
+                reply,
+                Err(format!(
+                    "spawned AI reviewer {} but could not attach tool bridge",
+                    agent_id
+                )),
+            )
+        }
+    }
 }
 
 async fn load_project(
@@ -2334,6 +2770,35 @@ async fn load_project(
         .into_iter()
         .find(|project| &project.id == project_id)
         .ok_or_else(|| AppError::not_found(operation, format!("project {} not found", project_id)))
+}
+
+fn read_review_diffs(
+    project: &Project,
+    selection: &ReviewDiffSelection,
+) -> Result<Vec<protocol::ProjectGitDiffPayload>, String> {
+    let payloads = match selection {
+        ReviewDiffSelection::AllUncommitted => project
+            .roots
+            .iter()
+            .map(|root| ProjectReadDiffPayload {
+                root: ProjectRootPath(root.clone()),
+                scope: protocol::ProjectDiffScope::Uncommitted,
+                path: None,
+                context_mode: protocol::DiffContextMode::FullFile,
+            })
+            .collect::<Vec<_>>(),
+        ReviewDiffSelection::Root { root, scope, path } => vec![ProjectReadDiffPayload {
+            root: root.clone(),
+            scope: *scope,
+            path: path.clone(),
+            context_mode: protocol::DiffContextMode::FullFile,
+        }],
+    };
+
+    payloads
+        .into_iter()
+        .map(|payload| read_diff(project, payload))
+        .collect()
 }
 
 async fn project_exists(
@@ -2425,6 +2890,8 @@ pub fn spawn_host() -> HostHandle {
         .unwrap_or_else(|err| panic!("failed to resolve default session store path: {err}"));
     let project_path = ProjectStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default project store path: {err}"));
+    let review_path = ReviewStore::default_path()
+        .unwrap_or_else(|err| panic!("failed to resolve default review store path: {err}"));
     let settings_path = HostSettingsStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default settings store path: {err}"));
     let custom_agent_path = CustomAgentStore::default_path()
@@ -2441,6 +2908,7 @@ pub fn spawn_host() -> HostHandle {
         HostStorePaths {
             session: session_path,
             project: project_path,
+            review: review_path,
             settings: settings_path,
             custom_agent: custom_agent_path,
             mcp_server: mcp_server_path,
@@ -2500,6 +2968,7 @@ pub fn spawn_host_with_store_paths_and_runtime_config(
         HostStorePaths {
             session: session_path,
             project: project_path,
+            review: parent.join("reviews.json"),
             settings: settings_path,
             custom_agent: parent.join("custom_agents.json"),
             mcp_server: parent.join("mcp_servers.json"),
@@ -2545,6 +3014,7 @@ pub fn spawn_host_with_mock_backend_and_runtime_config(
         HostStorePaths {
             session: session_path,
             project: project_path,
+            review: parent.join("reviews.json"),
             settings: settings_path,
             custom_agent: parent.join("custom_agents.json"),
             mcp_server: parent.join("mcp_servers.json"),
@@ -2563,7 +3033,8 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     let session_store = SessionStore::load(paths.session)?;
-    let project_store = ProjectStore::load(paths.project)?;
+    let project_store = Arc::new(Mutex::new(ProjectStore::load(paths.project)?));
+    let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
     let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
@@ -2571,6 +3042,17 @@ fn spawn_host_inner(
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
     let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
         mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
+    let (review_delivery_tx, review_delivery_rx) = mpsc::channel::<ReviewDeliveryRequest>(64);
+    let (review_ai_spawn_tx, review_ai_spawn_rx) = mpsc::channel::<ReviewAiSpawnRequest>(16);
+    let (review_project_update_tx, review_project_update_rx) =
+        mpsc::unbounded_channel::<ProjectId>();
+    let review_registry = ReviewRegistry::spawn(
+        review_store,
+        Arc::clone(&project_store),
+        review_delivery_tx,
+        review_ai_spawn_tx,
+        review_project_update_tx,
+    )?;
     let debug_mcp = match crate::debug_mcp::start_server(runtime_config.debug_mcp_bind_addr) {
         Ok(handle) => handle,
         Err(err) if runtime_config.debug_mcp_bind_addr.is_none() => {
@@ -2587,10 +3069,12 @@ fn spawn_host_inner(
     // server. The MCP server runs on its own thread and accesses the host
     // through the cloned handle.
     let agent_control_mcp_placeholder = AgentControlMcpHandle { url: String::new() };
+    let review_mcp_placeholder = ReviewMcpHandle { url: String::new() };
     let host = HostHandle {
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
-            project_store: Arc::new(Mutex::new(project_store)),
+            review_registry,
+            project_store,
             settings_store: Arc::new(Mutex::new(settings_store)),
             session_store: Arc::new(Mutex::new(session_store)),
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
@@ -2602,6 +3086,7 @@ fn spawn_host_inner(
             use_mock_backend,
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
+            review_mcp: review_mcp_placeholder,
             kiro_session_schema: KiroSessionSchemaState::Pending,
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             host_streams: HashMap::new(),
@@ -2634,7 +3119,28 @@ fn spawn_host_inner(
         .expect("newly created host state must be unlocked")
         .agent_control_mcp = agent_control_mcp;
 
+    let review_mcp =
+        match crate::review_mcp::start_server(runtime_config.review_mcp_bind_addr, host.clone()) {
+            Ok(handle) => handle,
+            Err(err) if runtime_config.review_mcp_bind_addr.is_none() => {
+                tracing::warn!(
+                    "review MCP server unavailable; continuing without it: {}",
+                    err
+                );
+                ReviewMcpHandle { url: String::new() }
+            }
+            Err(err) => return Err(err),
+        };
+
+    host.state
+        .try_lock()
+        .expect("newly created host state must be unlocked")
+        .review_mcp = review_mcp;
+
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
+    spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
+    spawn_host_review_ai_task(host.clone(), review_ai_spawn_rx);
+    spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
 
     Ok(host)
 }
@@ -2662,6 +3168,92 @@ fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
             runtime.block_on(worker);
         })
         .expect("failed to spawn host sub-agent worker thread");
+}
+
+fn spawn_host_review_delivery_task(
+    host: HostHandle,
+    mut rx: mpsc::Receiver<ReviewDeliveryRequest>,
+) {
+    let worker = async move {
+        while let Some(request) = rx.recv().await {
+            let outcome = host
+                .deliver_review_payload(
+                    request.review_id,
+                    request.origin_session_id,
+                    request.payload,
+                )
+                .await;
+            let _ = request.reply.send(outcome);
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-review-delivery".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build review delivery runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn review delivery worker thread");
+}
+
+fn spawn_host_review_ai_task(host: HostHandle, mut rx: mpsc::Receiver<ReviewAiSpawnRequest>) {
+    let worker = async move {
+        while let Some(request) = rx.recv().await {
+            let (reply, result) = host.spawn_ai_reviewer(request).await;
+            let _ = reply.send(result);
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-review-ai".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build review AI runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn review AI worker thread");
+}
+
+fn spawn_host_review_project_update_task(
+    host: HostHandle,
+    mut rx: mpsc::UnboundedReceiver<ProjectId>,
+) {
+    let worker = async move {
+        while let Some(project_id) = rx.recv().await {
+            host.emit_review_list_changed(project_id).await;
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-review-projects".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build review project update runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn review project update worker thread");
 }
 
 pub(crate) fn startup_mcp_servers_for_settings(
@@ -2722,7 +3314,7 @@ fn debug_mcp_url_for_repo_root(base_url: &str, repo_root: &str) -> String {
     )
 }
 
-pub(crate) fn agent_control_mcp_url_for_agent(base_url: &str, agent_id: &AgentId) -> String {
+pub(crate) fn mcp_url_for_agent(base_url: &str, agent_id: &AgentId) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
     format!(
         "{base_url}{separator}agent_id={}",
@@ -2958,6 +3550,20 @@ async fn subscribe_host_to_project(
     let handle = ensure_project_actor(state, project_id).await?;
     handle
         .add_subscriber(host_path.clone(), project_output_stream)
+        .await
+}
+
+async fn emit_review_list_changed_for_project(
+    state: &mut HostState,
+    project_id: ProjectId,
+) -> Result<(), String> {
+    let summaries = state.review_registry.summaries(project_id.clone()).await?;
+    if summaries.is_empty() {
+        return Ok(());
+    }
+    let handle = ensure_project_actor(state, project_id).await?;
+    handle
+        .emit_project_event(protocol::ProjectEventPayload::ReviewListChanged { reviews: summaries })
         .await
 }
 
@@ -3350,6 +3956,11 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::review::ReviewHandle;
+    use protocol::{
+        BackendKind, DiffContextMode, ProjectDiffScope, ProjectGitDiffPayload, Review,
+        ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus,
+    };
 
     #[test]
     fn spawn_host_with_mock_backend_does_not_require_existing_tokio_runtime() {
@@ -3364,6 +3975,67 @@ mod tests {
         if let Err(err) = result {
             panic!("host spawn should succeed without an existing Tokio runtime: {err}");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ai_reviewer_non_claude_reaches_read_only_spawn_preconditions() {
+        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp host dir");
+        let host = spawn_host_with_store_paths_and_runtime_config(
+            dir.join("sessions.json"),
+            dir.join("projects.json"),
+            dir.join("settings.json"),
+            HostRuntimeConfig::default(),
+        )
+        .expect("spawn host");
+        host.state.lock().await.review_mcp.url.clear();
+
+        let (review_tx, _review_rx) = mpsc::channel(1);
+        let (reply, _response) = oneshot::channel();
+        let review = Review {
+            id: ReviewId("review-test".to_string()),
+            project_id: ProjectId("project-test".to_string()),
+            origin_agent_id: AgentId("agent-test".to_string()),
+            origin_session_id: SessionId("session-test".to_string()),
+            selection: ReviewDiffSelection::AllUncommitted,
+            status: ReviewStatus::Draft,
+            diffs: vec![ProjectGitDiffPayload {
+                root: ProjectRootPath("/tmp/review-root".to_string()),
+                scope: ProjectDiffScope::Uncommitted,
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+                files: Vec::new(),
+            }],
+            comments: Vec::new(),
+            suggestions: Vec::new(),
+            ai_reviewer: ReviewAiReviewerState {
+                status: ReviewAiReviewerStatus::Idle,
+                agent_id: None,
+                error: None,
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let (_reply, result) = host
+            .spawn_ai_reviewer(crate::review::actor::ReviewAiSpawnRequest {
+                review_id: review.id.clone(),
+                review,
+                backend_kind: BackendKind::Codex,
+                cost_hint: None,
+                instructions: None,
+                review_handle: ReviewHandle { tx: review_tx },
+                reply,
+            })
+            .await;
+
+        let err = result.expect_err("missing MCP should fail before spawning");
+        assert!(
+            err.contains("review feedback MCP server is unavailable"),
+            "unexpected error: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

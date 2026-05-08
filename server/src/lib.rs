@@ -10,6 +10,8 @@ pub(crate) mod host;
 pub(crate) mod process_env;
 pub(crate) mod project_stream;
 pub mod remote;
+pub(crate) mod review;
+pub(crate) mod review_mcp;
 pub(crate) mod router;
 pub mod steering;
 pub mod store;

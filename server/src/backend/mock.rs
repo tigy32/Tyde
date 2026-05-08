@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo,
+    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo,
     OperationCancelledData, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData,
     TokenUsage, ToolPolicy,
 };
@@ -44,6 +44,7 @@ struct MockSessionRecord {
     steering_body: String,
     skills: Vec<String>,
     tool_policy: ToolPolicy,
+    access_mode: BackendAccessMode,
     created_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -95,6 +96,10 @@ impl Backend for MockBackend {
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
+        let slow_initial_turn = resolved_spawn_config
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains(MOCK_SLOW_TURN_SENTINEL));
 
         {
             let mut store = session_store()
@@ -114,6 +119,7 @@ impl Backend for MockBackend {
                         .map(|skill| format!("{}={}", skill.name, summarize_text(&skill.body)))
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
+                    access_mode: resolved_spawn_config.access_mode,
                     created_at_ms: now,
                     updated_at_ms: now,
                 },
@@ -137,7 +143,14 @@ impl Backend for MockBackend {
             }
             let mut active_subagents = Vec::new();
             record_prompt(&session_id_for_task, &initial_message);
-            if !emit_turn(&events_tx, &session_id_for_task, &initial_message).await {
+            if !emit_turn(
+                &events_tx,
+                &session_id_for_task,
+                &initial_message,
+                slow_initial_turn,
+            )
+            .await
+            {
                 return;
             }
             maybe_spawn_native_child(
@@ -151,7 +164,9 @@ impl Backend for MockBackend {
                 match command {
                     MockCommand::Input(AgentInput::SendMessage(payload)) => {
                         record_prompt(&session_id_for_task, &payload.message);
-                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message).await {
+                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
+                            .await
+                        {
                             return;
                         }
                         maybe_spawn_native_child(
@@ -217,6 +232,7 @@ impl Backend for MockBackend {
                 .map(|skill| format!("{}={}", skill.name, summarize_text(&skill.body)))
                 .collect();
             record.tool_policy = resolved_spawn_config.tool_policy;
+            record.access_mode = resolved_spawn_config.access_mode;
             record.updated_at_ms = now_ms();
         }
 
@@ -232,7 +248,9 @@ impl Backend for MockBackend {
                 match command {
                     MockCommand::Input(AgentInput::SendMessage(payload)) => {
                         record_prompt(&session_id_for_task, &payload.message);
-                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message).await {
+                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
+                            .await
+                        {
                             return;
                         }
                         maybe_spawn_native_child(
@@ -320,6 +338,7 @@ async fn emit_turn(
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_id: &SessionId,
     user_message: &str,
+    force_slow: bool,
 ) -> bool {
     let message_id = Some(Uuid::new_v4().to_string());
     let response_text = format!(
@@ -445,7 +464,7 @@ async fn emit_turn(
         return false;
     }
 
-    if user_message.contains(MOCK_SLOW_TURN_SENTINEL) {
+    if force_slow || user_message.contains(MOCK_SLOW_TURN_SENTINEL) {
         // Yield here so the Tokio scheduler can run client tasks and allow tests
         // to send queued messages before the turn officially ends.
         sleep(Duration::from_millis(MOCK_SLOW_SLEEP_MS)).await;
@@ -577,6 +596,9 @@ fn startup_mcp_response_prefix(session_id: &SessionId) -> String {
     if !matches!(record.tool_policy, ToolPolicy::Unrestricted) {
         parts.push(format!("[tool_policy: {:?}]", record.tool_policy));
     }
+    if record.access_mode != BackendAccessMode::Unrestricted {
+        parts.push(format!("[access_mode: {:?}]", record.access_mode));
+    }
     if parts.is_empty() {
         return String::new();
     }
@@ -592,4 +614,39 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time is before UNIX_EPOCH")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::customization::ResolvedSpawnConfig;
+
+    #[tokio::test]
+    async fn mock_backend_records_read_only_access_mode() {
+        let (backend, _events) = MockBackend::spawn(
+            vec!["/tmp".to_string()],
+            BackendSpawnConfig {
+                resolved_spawn_config: ResolvedSpawnConfig {
+                    access_mode: BackendAccessMode::ReadOnly,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            protocol::SendMessagePayload {
+                message: "hello".to_string(),
+                images: None,
+                origin: None,
+            },
+        )
+        .await
+        .expect("spawn mock backend");
+
+        let store = session_store()
+            .lock()
+            .expect("mock backend session store mutex poisoned");
+        let record = store
+            .get(&backend.session_id.0)
+            .expect("mock session record");
+        assert_eq!(record.access_mode, BackendAccessMode::ReadOnly);
+    }
 }

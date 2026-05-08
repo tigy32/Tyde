@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
@@ -8,9 +8,10 @@ use protocol::{
     DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform,
     HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope, ProjectGitDiffFile,
     ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath, QueuedMessageEntry, SessionSchemaEntry, SessionSettingsValues, SessionSummary,
-    Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, TerminalId,
-    ToolExecutionCompletedData, ToolRequest,
+    ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId,
+    ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
+    Steering, SteeringId, StreamPath, TaskList, TerminalId, ToolExecutionCompletedData,
+    ToolRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +98,10 @@ pub enum TabContent {
         root: ProjectRootPath,
         scope: ProjectDiffScope,
         path: String,
+    },
+    Review {
+        host_id: String,
+        review_id: ReviewId,
     },
 }
 
@@ -631,6 +636,72 @@ pub struct AppState {
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
     pub skills: RwSignal<HashMap<String, HashMap<SkillId, Skill>>>,
     pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
+    /// Per-review full state. Server is the source of truth: a `ReviewView`
+    /// subscribes to `/review/<id>` and dispatch applies `ReviewEvent`
+    /// deltas to the entry. The first event on subscribe is always
+    /// `ReviewEvent::Snapshot` which seeds (or replaces) the entry.
+    pub reviews: RwSignal<HashMap<ReviewId, Review>>,
+    /// Per-project review summary lists, populated from
+    /// `ProjectEventPayload::ReviewListChanged` on each project stream.
+    /// Used by the project rail / git panel indicator to show "open
+    /// review against this working tree" without subscribing to every
+    /// `/review/<id>` stream.
+    pub review_summaries: RwSignal<HashMap<ProjectId, Vec<ReviewSummary>>>,
+    /// True while a `ReviewCreate` for the given (host, project) is in
+    /// flight and the server hasn't yet echoed a `ReviewListChanged` that
+    /// includes a fresh review. Disables the "Review changes" button on
+    /// the agent header so the user can't fire a second creation while
+    /// the first is mid-flight. Cleared by the dispatch handler when a
+    /// summary list refresh arrives that wasn't already known. No
+    /// optimistic UI: we never synthesize a Review record on the
+    /// frontend.
+    pub review_create_pending: RwSignal<HashMap<(String, ProjectId), u32>>,
+    /// Per-review action gate: true while a `ReviewAction` is in flight
+    /// for that review id, used to disable buttons until the server
+    /// echoes back the corresponding event. Each entry is a small bitmap
+    /// of the actions awaiting echo so independent buttons (Submit,
+    /// Cancel, Run AI, …) gate independently.
+    pub review_action_pending: RwSignal<HashMap<ReviewId, ReviewActionGate>>,
+    /// Per-(review, target) gate for actions that operate on a specific
+    /// comment, suggestion, or composer instance. Held in a `HashSet` so
+    /// each in-flight action keys to its own row, allowing independent
+    /// rows to gate independently. Entries are cleared by dispatch when
+    /// the matching `ReviewEvent` echoes back, or on
+    /// `ReviewEvent::Error` whose context matches.
+    pub review_action_target_pending: RwSignal<HashSet<(ReviewId, ReviewActionTarget)>>,
+}
+
+/// Identifier for a per-row review action awaiting server echo. Used as
+/// part of a `(ReviewId, ReviewActionTarget)` key so independent rows
+/// (different comments, suggestions) gate independently of each other.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReviewActionTarget {
+    /// New comment via the inline composer for this review.
+    AddComment,
+    /// Update an existing comment.
+    UpdateComment(ReviewCommentId),
+    /// Delete an existing comment.
+    DeleteComment(ReviewCommentId),
+    /// Accept (or Edit & Accept) a pending AI suggestion.
+    AcceptSuggestion(ReviewSuggestionId),
+    /// Reject a pending AI suggestion.
+    RejectSuggestion(ReviewSuggestionId),
+}
+
+/// Bitmask of review actions awaiting server echo. `0` means "nothing in
+/// flight" — when the value drops back to `0` the entry can be removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReviewActionGate {
+    pub submit: bool,
+    pub cancel: bool,
+    pub start_ai: bool,
+    pub add_comment: bool,
+}
+
+impl ReviewActionGate {
+    pub fn is_idle(&self) -> bool {
+        !(self.submit || self.cancel || self.start_ai || self.add_comment)
+    }
 }
 
 impl AppState {
@@ -711,6 +782,11 @@ impl AppState {
             steering: RwSignal::new(HashMap::new()),
             skills: RwSignal::new(HashMap::new()),
             agents_panel_filters: RwSignal::new(HashMap::new()),
+            reviews: RwSignal::new(HashMap::new()),
+            review_summaries: RwSignal::new(HashMap::new()),
+            review_create_pending: RwSignal::new(HashMap::new()),
+            review_action_pending: RwSignal::new(HashMap::new()),
+            review_action_target_pending: RwSignal::new(HashSet::new()),
         }
     }
 
