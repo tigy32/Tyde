@@ -7,7 +7,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewMode, DiffViewState};
+use crate::state::{AppState, DiffViewMode, DiffViewState, TabId, TabScrollState};
 use crate::syntax_highlight::{
     LineHighlighter, LineTokens, color_to_css, compute_hunk_tokens, syntax_for_path,
 };
@@ -200,6 +200,15 @@ const OVERSCAN_LINES: f64 = 80.0;
 /// preserves layout assertions for tiny test diffs.
 const VIRTUALIZE_THRESHOLD: usize = 200;
 
+fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
+    TabScrollState {
+        scroll_top: el.scroll_top(),
+        scroll_height: el.scroll_height(),
+        client_height: el.client_height(),
+        user_scrolled_up: true,
+    }
+}
+
 /// Geometry signals shared between `DiffContent` and any descendant that
 /// needs to virtualize its rows against the global scroll position. The
 /// scroll signal is updated by `DiffContent`'s `on:scroll`; size signals
@@ -213,6 +222,7 @@ struct DiffScroll {
 
 #[component]
 pub fn DiffView(
+    #[prop(optional)] tab_id: Option<TabId>,
     root: ProjectRootPath,
     scope: ProjectDiffScope,
     path: String,
@@ -351,7 +361,14 @@ pub fn DiffView(
                             <p class="placeholder-text">"Loading diff…"</p>
                         </div>
                     }.into_any(),
-                    Some(dv) => view! { <DiffContent diff=dv decorations=decorations review_mode=review_mode /> }.into_any(),
+                    Some(dv) => view! {
+                        <DiffContent
+                            tab_id=tab_id
+                            diff=dv
+                            decorations=decorations
+                            review_mode=review_mode
+                        />
+                    }.into_any(),
                     None => view! {
                         <div class="diff-empty">
                             <p class="placeholder-text">"Select a file to view its diff"</p>
@@ -449,11 +466,13 @@ fn stage_hunk(root: ProjectRootPath, relative_path: String, hunk_id: String) {
 
 #[component]
 fn DiffContent(
+    tab_id: Option<TabId>,
     diff: DiffViewState,
     decorations: DiffDecorations,
     #[prop(optional)] review_mode: bool,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let initial_scroll_state = tab_id.and_then(|id| state.tab_scroll_state_untracked(id));
     let scope_label = match diff.scope {
         ProjectDiffScope::Staged => "staged",
         ProjectDiffScope::Unstaged => "unstaged",
@@ -519,7 +538,8 @@ fn DiffContent(
     // Scroll geometry. Pre-seed line/viewport height estimates so the
     // visible window is bounded from the very first paint, before the
     // measurement effect runs. Mirrors `file_view` exactly.
-    let scroll_top = RwSignal::new(0.0_f64);
+    let scroll_top =
+        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
     let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
     let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
     let scroll_ctx = DiffScroll {
@@ -530,6 +550,27 @@ fn DiffContent(
     provide_context(scroll_ctx);
 
     let scroll_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+
+    let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
+    let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
+    let scroll_ref_for_restore = scroll_ref;
+    let state_for_restore = state.clone();
+    Effect::new(move |_| {
+        if restored_initial_scroll_for_effect.get() {
+            return;
+        }
+        let (Some(tab_id), Some(saved)) = (tab_id, initial_scroll_state) else {
+            return;
+        };
+        let Some(el) = scroll_ref_for_restore.get() else {
+            return;
+        };
+        restored_initial_scroll_for_effect.set(true);
+        el.set_scroll_top(saved.scroll_top);
+        scroll_top.set(el.scroll_top() as f64);
+        let element: web_sys::Element = el.clone().unchecked_into();
+        state_for_restore.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+    });
 
     // Measure the geometry once after first paint. Re-runs are cheap; we
     // only update the signal if the measured value differs meaningfully.
@@ -575,9 +616,15 @@ fn DiffContent(
     // its initial range and AI-suggestion rows that lived hundreds of
     // lines down were unreachable because no scroll ever propagated
     // into the virtualization math.
+    let state_for_scroll = state.clone();
     let on_scroll = move |_: web_sys::Event| {
         if let Some(el) = scroll_ref.get_untracked() {
             scroll_top.set(el.scroll_top() as f64);
+            if let Some(tab_id) = tab_id {
+                let element: web_sys::Element = el.clone().unchecked_into();
+                state_for_scroll
+                    .save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+            }
         }
     };
 

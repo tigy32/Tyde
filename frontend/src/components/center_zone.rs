@@ -468,6 +468,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                         });
                         view! {
                             <ChatView
+                                tab_id=tab_id
                                 agent_ref=agent_ref_signal
                                 is_active=is_active_signal
                             />
@@ -488,7 +489,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                 })
                         });
                         match path {
-                            Some(path) => view! { <FileView path=path /> }.into_any(),
+                            Some(path) => view! { <FileView tab_id=tab_id path=path /> }.into_any(),
                             None => view! { <div></div> }.into_any(),
                         }
                     }
@@ -506,7 +507,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                         });
                         match resolved {
                             Some((root, scope, path)) => {
-                                view! { <DiffView root=root scope=scope path=path /> }.into_any()
+                                view! { <DiffView tab_id=tab_id root=root scope=scope path=path /> }.into_any()
                             }
                             None => view! { <div></div> }.into_any(),
                         }

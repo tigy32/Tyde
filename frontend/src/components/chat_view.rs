@@ -15,7 +15,8 @@ use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ChatRowId, ToolOutputMode, TransientEvent,
+    ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ChatRowId, TabId, TabScrollState,
+    ToolOutputMode, TransientEvent,
 };
 
 use protocol::BackendKind;
@@ -41,8 +42,36 @@ const VIRT_OVERSCAN: usize = 5;
 /// in lockstep with the CSS rule.
 const ROW_GAP_PX: f64 = 6.0;
 
+fn tab_scroll_state_from_element(el: &web_sys::Element, user_scrolled_up: bool) -> TabScrollState {
+    TabScrollState {
+        scroll_top: el.scroll_top(),
+        scroll_height: el.scroll_height(),
+        client_height: el.client_height(),
+        user_scrolled_up,
+    }
+}
+
+fn restore_scroll_top_without_animation(el: &web_sys::HtmlElement, scroll_top: i32) {
+    let style = el.style();
+    let previous = style.get_property_value("scroll-behavior").ok();
+    let _ = style.set_property("scroll-behavior", "auto");
+    el.set_scroll_top(scroll_top);
+    leptos::prelude::set_timeout(
+        move || match previous.as_deref() {
+            Some(value) if !value.is_empty() => {
+                let _ = style.set_property("scroll-behavior", value);
+            }
+            _ => {
+                let _ = style.remove_property("scroll-behavior");
+            }
+        },
+        std::time::Duration::from_millis(0),
+    );
+}
+
 #[component]
 pub fn ChatView(
+    tab_id: TabId,
     /// Per-instance binding to a chat — typically derived from a tab's
     /// `TabContent::Chat { agent_ref }` so each tab has its own view that
     /// stays mounted even when the tab is hidden via CSS. Passed as a Signal
@@ -58,6 +87,7 @@ pub fn ChatView(
     is_active: Signal<bool>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
 
     let has_agent = move || agent_ref.get().is_some();
 
@@ -170,8 +200,10 @@ pub fn ChatView(
     };
 
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
-    let user_scrolled_up = RwSignal::new(false);
-    let show_scroll_btn = RwSignal::new(false);
+    let user_scrolled_up =
+        RwSignal::new(initial_scroll_state.is_some_and(|scroll| scroll.user_scrolled_up));
+    let show_scroll_btn =
+        RwSignal::new(initial_scroll_state.is_some_and(|scroll| scroll.user_scrolled_up));
     let view_mounted = Arc::new(AtomicBool::new(true));
     let view_mounted_for_cleanup = view_mounted.clone();
     on_cleanup(move || {
@@ -192,11 +224,46 @@ pub fn ChatView(
     //   `heights_version`.
     // - `heights_version` is bumped any time `row_heights` mutates by a
     //   meaningful amount; the windowing Memo subscribes to it.
-    let scroll_top_sig = RwSignal::new(0.0_f64);
+    let scroll_top_sig =
+        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
     let viewport_height_sig = RwSignal::new(800.0_f64);
     let row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage> =
         StoredValue::new_local(HashMap::new());
     let heights_version = RwSignal::new(0u32);
+
+    let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
+    let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
+    let scroll_ref_for_restore = scroll_ref;
+    let state_for_restore = state.clone();
+    Effect::new(move |_| {
+        if restored_initial_scroll_for_effect.get() {
+            return;
+        }
+        let Some(saved) = initial_scroll_state else {
+            return;
+        };
+        let Some(el) = scroll_ref_for_restore.get() else {
+            return;
+        };
+        restored_initial_scroll_for_effect.set(true);
+        let target_scroll_top = if saved.user_scrolled_up {
+            saved.scroll_top
+        } else {
+            el.scroll_height()
+        };
+        let html_el: web_sys::HtmlElement = el.clone().unchecked_into();
+        restore_scroll_top_without_animation(&html_el, target_scroll_top);
+        scroll_top_sig.set(html_el.scroll_top() as f64);
+        state_for_restore.save_tab_scroll_state(
+            tab_id,
+            TabScrollState {
+                scroll_top: html_el.scroll_top(),
+                scroll_height: html_el.scroll_height(),
+                client_height: html_el.client_height(),
+                user_scrolled_up: saved.user_scrolled_up,
+            },
+        );
+    });
 
     // Per-instance scroll + user-input listeners. Multiple `ChatView`s
     // can be mounted simultaneously (LRU hot set), so we can't use
@@ -230,6 +297,7 @@ pub fn ChatView(
     //      accordingly. Programmatic scrolls and content-growth scrolls
     //      stay sticky.
     let scroll_ref_for_handler = scroll_ref;
+    let state_for_scroll_listener = state.clone();
     Effect::new(move |_| {
         let Some(el) = scroll_ref_for_handler.get() else {
             return;
@@ -238,6 +306,7 @@ pub fn ChatView(
             return;
         }
         let el_clone = el.clone();
+        let state_for_scroll_handler = state_for_scroll_listener.clone();
         let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
         let listener_mounted = view_mounted_for_listeners.clone();
         let scroll_handler = Closure::<dyn Fn()>::new(move || {
@@ -247,6 +316,7 @@ pub fn ChatView(
             listener_pending.set(true);
             let pending = listener_pending.clone();
             let el_for_cb = el_clone.clone();
+            let state_for_cb = state_for_scroll_handler.clone();
             let mounted = listener_mounted.clone();
             // `setTimeout(0)` instead of `requestAnimationFrame` — rAF
             // is paused for hidden Tauri webviews (macOS WKWebView
@@ -260,6 +330,11 @@ pub fn ChatView(
                     pending.set(false);
                     let scroll_top = el_for_cb.scroll_top();
                     scroll_top_sig.set(scroll_top as f64);
+                    let element: web_sys::Element = el_for_cb.clone().unchecked_into();
+                    state_for_cb.save_tab_scroll_state(
+                        tab_id,
+                        tab_scroll_state_from_element(&element, user_scrolled_up.get_untracked()),
+                    );
                 },
                 std::time::Duration::from_millis(0),
             );
@@ -273,6 +348,7 @@ pub fn ChatView(
         // schedule a `setTimeout(0)` to read after the browser has
         // applied the input's scroll effect.
         let el_for_input = el.clone();
+        let state_for_input_handler = state_for_scroll_listener.clone();
         let input_pending = std::rc::Rc::new(std::cell::Cell::new(false));
         let input_mounted = view_mounted_for_listeners.clone();
         let input_handler = Closure::<dyn Fn()>::new(move || {
@@ -282,6 +358,7 @@ pub fn ChatView(
             input_pending.set(true);
             let pending = input_pending.clone();
             let el_for_cb = el_for_input.clone();
+            let state_for_cb = state_for_input_handler.clone();
             let mounted = input_mounted.clone();
             leptos::prelude::set_timeout(
                 move || {
@@ -296,6 +373,11 @@ pub fn ChatView(
                     let is_near_bottom = distance_from_bottom < 80;
                     user_scrolled_up.set(!is_near_bottom);
                     show_scroll_btn.set(!is_near_bottom);
+                    let element: web_sys::Element = el_for_cb.clone().unchecked_into();
+                    state_for_cb.save_tab_scroll_state(
+                        tab_id,
+                        tab_scroll_state_from_element(&element, !is_near_bottom),
+                    );
                 },
                 std::time::Duration::from_millis(0),
             );
@@ -314,9 +396,15 @@ pub fn ChatView(
             })
         });
     });
+    let state_for_scroll_cleanup = state.clone();
     on_cleanup(move || {
         scroll_listener_slot.update_value(|s| {
             if let Some(holder) = s.take() {
+                let element: web_sys::Element = holder.element.clone().unchecked_into();
+                state_for_scroll_cleanup.save_tab_scroll_state(
+                    tab_id,
+                    tab_scroll_state_from_element(&element, user_scrolled_up.get_untracked()),
+                );
                 let _ = holder.element.remove_event_listener_with_callback(
                     "scroll",
                     holder.scroll_handler.as_ref().unchecked_ref(),
@@ -481,6 +569,7 @@ pub fn ChatView(
     // as user intent and disable sticky-bottom.
     let scroll_pending = std::rc::Rc::new(std::cell::Cell::new(false));
     let view_mounted_for_auto_scroll = view_mounted.clone();
+    let state_for_auto_scroll = state.clone();
     Effect::new(move |_| {
         let _len = messages_len.get();
         let _hv = heights_version.get();
@@ -511,6 +600,7 @@ pub fn ChatView(
         scroll_pending.set(true);
         let pending = scroll_pending.clone();
         let mounted = view_mounted_for_auto_scroll.clone();
+        let state_for_cb = state_for_auto_scroll.clone();
         // `setTimeout(0)` instead of `requestAnimationFrame`. rAF is
         // paused for hidden Tauri windows on macOS — a user
         // backgrounding the app during session restore would leave the
@@ -534,11 +624,15 @@ pub fn ChatView(
                 // end but the rendered rows from index 0, with the
                 // bottom-pad spacer covering the entire visible region.
                 scroll_top_sig.set(el.scroll_top() as f64);
+                let element: web_sys::Element = el.clone().unchecked_into();
+                state_for_cb
+                    .save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element, false));
             },
             std::time::Duration::from_millis(0),
         );
     });
 
+    let tab_scroll_state_for_scroll_to_bottom = state.tab_scroll_state;
     let scroll_to_bottom = move |_| {
         // Event handler — not a reactive context, so use untracked
         // read on the NodeRef.
@@ -551,6 +645,10 @@ pub fn ChatView(
             scroll_top_sig.set(el.scroll_top() as f64);
             user_scrolled_up.set(false);
             show_scroll_btn.set(false);
+            let element: web_sys::Element = el.clone().unchecked_into();
+            tab_scroll_state_for_scroll_to_bottom.update(|scroll| {
+                scroll.insert(tab_id, tab_scroll_state_from_element(&element, false));
+            });
         }
     };
 
@@ -1075,7 +1173,7 @@ mod wasm_tests {
             provide_context(state);
             let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
             let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView agent_ref=agent_ref_signal is_active=is_active_signal /> }
+            view! { <ChatView tab_id=TabId(10_001) agent_ref=agent_ref_signal is_active=is_active_signal /> }
         });
 
         next_tick().await;
@@ -1167,7 +1265,7 @@ mod wasm_tests {
             provide_context(state);
             let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
             let is_active_signal: Signal<bool> = Signal::derive(|| true);
-            view! { <ChatView agent_ref=agent_ref_signal is_active=is_active_signal /> }
+            view! { <ChatView tab_id=TabId(10_002) agent_ref=agent_ref_signal is_active=is_active_signal /> }
         });
 
         next_tick().await;
@@ -1202,6 +1300,67 @@ mod wasm_tests {
         assert!(
             height > 0.0,
             "bottom spacer must reserve geometry for unmounted rows; got {height}px"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn remount_restores_saved_scroll_position() {
+        ensure_styles_loaded();
+
+        let agent_id = AgentId("agent-scroll".to_owned());
+        let host_id = "host-scroll".to_owned();
+        let tab_id = TabId(10_003);
+        let saved_scroll_top = 1_800;
+
+        let container = make_container();
+        let agent_id_for_mount = agent_id.clone();
+        let host_id_for_mount = host_id.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_for_mount.clone(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let rows: Vec<ChatRowHandle> = (0..80)
+                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("scroll msg {i}"))))
+                .collect();
+            state.chat_rows.update(|m| {
+                m.insert(agent_id_for_mount.clone(), rows);
+            });
+            state.save_tab_scroll_state(
+                tab_id,
+                TabScrollState {
+                    scroll_top: saved_scroll_top,
+                    scroll_height: 16_000,
+                    client_height: 600,
+                    user_scrolled_up: true,
+                },
+            );
+            provide_context(state);
+            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=tab_id agent_ref=agent_ref_signal is_active=is_active_signal /> }
+        });
+
+        next_tick().await;
+        next_tick().await;
+
+        let scroller: HtmlElement = container
+            .query_selector(".chat-messages")
+            .unwrap()
+            .expect("chat scroller present")
+            .dyn_into()
+            .unwrap();
+        let restored = scroller.scroll_top();
+        assert!(
+            restored >= saved_scroll_top - 20,
+            "expected remount to restore scrollTop near {saved_scroll_top}, got {restored}"
+        );
+        let distance_from_bottom =
+            scroller.scroll_height() - scroller.scroll_top() - scroller.client_height();
+        assert!(
+            distance_from_bottom > 500,
+            "restored user-scrolled tab should not auto-scroll back to bottom"
         );
     }
 }

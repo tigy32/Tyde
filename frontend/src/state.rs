@@ -77,6 +77,14 @@ thread_local! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TabId(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabScrollState {
+    pub scroll_top: i32,
+    pub scroll_height: i32,
+    pub client_height: i32,
+    pub user_scrolled_up: bool,
+}
+
 pub fn next_tab_id() -> TabId {
     NEXT_TAB_ID.with(|cell| {
         let id = cell.get();
@@ -588,6 +596,7 @@ pub struct AppState {
     /// component trees regardless of how many tabs the user has opened.
     /// Driven by an Effect in `App` watching `center_zone.active_tab_id`.
     pub tab_lru: RwSignal<Vec<TabId>>,
+    pub tab_scroll_state: RwSignal<HashMap<TabId, TabScrollState>>,
     pub tabs_enabled: RwSignal<bool>,
     pub left_dock: RwSignal<DockVisibility>,
     pub right_dock: RwSignal<DockVisibility>,
@@ -742,6 +751,7 @@ impl AppState {
             task_lists: RwSignal::new(HashMap::new()),
             center_zone,
             tab_lru: RwSignal::new(initial_lru),
+            tab_scroll_state: RwSignal::new(HashMap::new()),
             tabs_enabled: RwSignal::new(true),
             left_dock: RwSignal::new(DockVisibility::Visible),
             right_dock: RwSignal::new(DockVisibility::Visible),
@@ -1184,13 +1194,17 @@ impl AppState {
 
     pub fn open_tab(&self, content: TabContent, label: String, closeable: bool) {
         let tabs_enabled = self.tabs_enabled.get_untracked();
+        let mut replaced_id = None;
         self.center_zone.update(|cz| {
             if tabs_enabled {
                 cz.open(content, label, closeable);
             } else {
-                cz.replace_active(content, label, closeable);
+                replaced_id = Some(cz.replace_active(content, label, closeable));
             }
         });
+        if let Some(id) = replaced_id {
+            self.forget_tab_scroll_state(id);
+        }
     }
 
     /// Insert `id` at the MRU front of `tab_lru`, dedup, truncate to
@@ -1213,6 +1227,23 @@ impl AppState {
     pub fn forget_tab_lru(&self, id: TabId) {
         self.tab_lru.update(|lru| {
             lru.retain(|existing| *existing != id);
+        });
+    }
+
+    pub fn tab_scroll_state_untracked(&self, id: TabId) -> Option<TabScrollState> {
+        self.tab_scroll_state
+            .with_untracked(|scroll| scroll.get(&id).copied())
+    }
+
+    pub fn save_tab_scroll_state(&self, id: TabId, scroll_state: TabScrollState) {
+        self.tab_scroll_state.update(|scroll| {
+            scroll.insert(id, scroll_state);
+        });
+    }
+
+    pub fn forget_tab_scroll_state(&self, id: TabId) {
+        self.tab_scroll_state.update(|scroll| {
+            scroll.remove(&id);
         });
     }
 
@@ -1254,6 +1285,7 @@ impl AppState {
             }
         }
         self.forget_tab_lru(id);
+        self.forget_tab_scroll_state(id);
         self.center_zone.update(|cz| cz.close(id));
     }
 
@@ -1274,10 +1306,10 @@ impl AppState {
             cz.tabs
                 .iter()
                 .filter(|t| t.id != id && t.closeable)
-                .map(|t| t.content.clone())
+                .map(|t| (t.id, t.content.clone()))
                 .collect()
         });
-        for content in &to_close {
+        for (tab_id, content) in &to_close {
             match content {
                 TabContent::File { path } => {
                     let path = path.clone();
@@ -1293,6 +1325,7 @@ impl AppState {
                 }
                 _ => {}
             }
+            self.forget_tab_scroll_state(*tab_id);
         }
         self.center_zone.update(|cz| cz.close_others(id));
         self.prune_tab_lru();
@@ -1312,10 +1345,10 @@ impl AppState {
             cz.tabs[idx + 1..]
                 .iter()
                 .filter(|t| t.closeable)
-                .map(|t| t.content.clone())
+                .map(|t| (t.id, t.content.clone()))
                 .collect()
         });
-        for content in &to_close {
+        for (tab_id, content) in &to_close {
             match content {
                 TabContent::File { path } => {
                     let path = path.clone();
@@ -1331,6 +1364,7 @@ impl AppState {
                 }
                 _ => {}
             }
+            self.forget_tab_scroll_state(*tab_id);
         }
         self.center_zone.update(|cz| cz.close_to_right(id));
         self.prune_tab_lru();
@@ -1341,10 +1375,10 @@ impl AppState {
             cz.tabs
                 .iter()
                 .filter(|t| t.closeable)
-                .map(|t| t.content.clone())
+                .map(|t| (t.id, t.content.clone()))
                 .collect()
         });
-        for content in &to_close {
+        for (tab_id, content) in &to_close {
             match content {
                 TabContent::File { path } => {
                     let path = path.clone();
@@ -1360,6 +1394,7 @@ impl AppState {
                 }
                 _ => {}
             }
+            self.forget_tab_scroll_state(*tab_id);
         }
         self.center_zone.update(|cz| cz.close_all());
         self.prune_tab_lru();

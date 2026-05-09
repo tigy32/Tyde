@@ -3,7 +3,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState};
-use crate::state::{AppState, TabContent};
+use crate::state::{AppState, TabContent, TabId, TabScrollState};
 use crate::syntax_highlight::{LineHighlighter, LineTokens, color_to_css, syntax_for_path};
 
 use protocol::ProjectPath;
@@ -43,6 +43,15 @@ const FALLBACK_CHUNK_LINES: usize = 200;
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
 const HIGHLIGHT_LINE_CAP: usize = 5000;
 
+fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
+    TabScrollState {
+        scroll_top: el.scroll_top(),
+        scroll_height: el.scroll_height(),
+        client_height: el.client_height(),
+        user_scrolled_up: true,
+    }
+}
+
 /// Outer `FileView` is intentionally thin: it tracks only whether the file
 /// has been loaded into `open_files` (cheap `bool` Memo) and mounts the
 /// heavy inner `FileViewLoaded` exactly once via `Show`. Without this
@@ -52,7 +61,7 @@ const HIGHLIGHT_LINE_CAP: usize = 5000;
 /// every already-open tab. With many tabs that compounds quickly and is
 /// the main "feels sluggish" symptom.
 #[component]
-pub fn FileView(path: ProjectPath) -> impl IntoView {
+pub fn FileView(tab_id: TabId, path: ProjectPath) -> impl IntoView {
     let state = expect_context::<AppState>();
     let file_path = path.clone();
     let is_loaded = Memo::new(move |_| {
@@ -68,7 +77,7 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
                 when=move || is_loaded.get()
                 fallback=move || view! { <div class="panel-empty">"No file open"</div> }
             >
-                <FileViewLoaded path=path_for_loaded.clone() />
+                <FileViewLoaded tab_id=tab_id path=path_for_loaded.clone() />
             </Show>
         </div>
     }
@@ -81,8 +90,9 @@ pub fn FileView(path: ProjectPath) -> impl IntoView {
 /// the parent `Show` only mounts this when `open_files` already contains
 /// the path.
 #[component]
-fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
+fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
 
     let f = state
         .open_files
@@ -286,9 +296,31 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     // very first render of a large file already uses a
     // bounded window. The measurement Effect below
     // refines both values once layout is real.
-    let scroll_top = RwSignal::new(0.0_f64);
+    let scroll_top =
+        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
     let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
     let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+
+    let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
+    let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
+    let pre_ref_for_restore = pre_ref;
+    let state_for_restore = state.clone();
+    Effect::new(move |_| {
+        if restored_initial_scroll_for_effect.get() {
+            return;
+        }
+        let Some(saved) = initial_scroll_state else {
+            return;
+        };
+        let Some(el) = pre_ref_for_restore.get() else {
+            return;
+        };
+        restored_initial_scroll_for_effect.set(true);
+        el.set_scroll_top(saved.scroll_top);
+        scroll_top.set(el.scroll_top() as f64);
+        let element: web_sys::Element = el.clone().unchecked_into();
+        state_for_restore.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+    });
 
     // Measure the geometry once after first paint. The
     // Effect re-runs if the underlying signals fire
@@ -326,9 +358,12 @@ fn FileViewLoaded(path: ProjectPath) -> impl IntoView {
     // once per microtask. (We previously throttled with rAF, but the
     // rAF callback fires unreliably in Tauri's WKWebView and that
     // pinned the visible window to its initial range.)
+    let state_for_scroll = state.clone();
     let on_scroll = move |_: web_sys::Event| {
         if let Some(el) = pre_ref.get_untracked() {
             scroll_top.set(el.scroll_top() as f64);
+            let element: web_sys::Element = el.clone().unchecked_into();
+            state_for_scroll.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
         }
     };
 
@@ -685,7 +720,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_001) path=mount_path.clone() /> }
         });
 
         next_tick().await;
@@ -781,7 +816,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_002) path=mount_path.clone() /> }
         });
         // The fallback highlighter yields once before doing any syntect
         // work (so the parent component can paint plain text first), so
@@ -860,7 +895,7 @@ mod wasm_tests {
                 );
             });
             provide_context(state);
-            view! { <FileView path=mount_path.clone() /> }
+            view! { <FileView tab_id=TabId(20_003) path=mount_path.clone() /> }
         });
 
         // Virtualization must engage on the very first paint — pre-seeded
