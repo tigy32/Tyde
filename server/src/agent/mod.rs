@@ -1449,6 +1449,24 @@ pub(crate) fn spawn_relay_agent_actor(
                             s.turn_completed = true;
                             s.activity_counter = s.activity_counter.saturating_add(1);
                         }).await;
+                        // The subagent's backend event stream is done, but the
+                        // agent handle is still in the registry. Keep serving
+                        // Snapshot/ReadOutput/Attach/SetName so host-stream
+                        // registration replay (host::register_host_stream) can
+                        // find us, until the host explicitly closes the agent.
+                        park_relay_terminal_agent(
+                            &session_store,
+                            &session_id,
+                            &mut pending_alias,
+                            &mut current_start,
+                            &mut event_log,
+                            &mut subscribers,
+                            &mut rx,
+                            &accepting_input_task,
+                            &status_handle,
+                            &canonical_stream,
+                        )
+                        .await;
                         return;
                     };
 
@@ -1730,6 +1748,76 @@ async fn park_terminal_agent(
                 break;
             }
             AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn park_relay_terminal_agent(
+    session_store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    pending_alias: &mut Option<InitialAgentAlias>,
+    current_start: &mut AgentStartPayload,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    accepting_input: &Arc<AtomicBool>,
+    status_handle: &registry::AgentStatusHandle,
+    canonical_stream: &str,
+) {
+    loop {
+        let Some(command) = rx.recv().await else {
+            break;
+        };
+        match command {
+            AgentCommand::SetName {
+                name,
+                persistence,
+                reply,
+            } => {
+                let applied = apply_agent_name_change(
+                    AgentNameChangeContext {
+                        session_store,
+                        session_id: Some(session_id),
+                        pending_alias,
+                        current_start,
+                        event_log,
+                        subscribers,
+                    },
+                    name,
+                    persistence,
+                )
+                .await;
+                let _ = reply.send(applied);
+            }
+            AgentCommand::Snapshot { reply } => {
+                let _ = reply.send(current_start.clone());
+            }
+            AgentCommand::ReadOutput {
+                after_seq,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(output_events_since(event_log, after_seq, limit));
+            }
+            AgentCommand::Attach(stream) => {
+                attach_subscriber(event_log, subscribers, stream);
+            }
+            AgentCommand::Close { reply } => {
+                finish_actor_close(accepting_input, status_handle, reply).await;
+                break;
+            }
+            AgentCommand::SendInput(_) | AgentCommand::Interrupt => {
+                let payload = relay_input_rejected_payload(&current_start.agent_id);
+                append_event(
+                    canonical_stream,
+                    event_log,
+                    subscribers,
+                    FrameKind::AgentError,
+                    &payload,
+                )
+                .await;
+            }
         }
     }
 }

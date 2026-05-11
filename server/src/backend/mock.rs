@@ -18,6 +18,13 @@ use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 const MOCK_MODEL: &str = "mock";
 const FORCE_SPAWN_FAILURE_SENTINEL: &str = "__mock_fail_spawn__";
 const SPAWN_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
+/// Like `__mock_spawn_native_child__` but drops the emitter handle immediately
+/// after the turn completes, which closes the child's backend event stream.
+/// Used to regression-test that the relay agent actor parks instead of exiting
+/// when the event stream ends — an exited relay actor with a live registry
+/// entry panics the next `snapshot()` call during host-stream replay.
+pub(crate) const SPAWN_NATIVE_CHILD_AND_DROP_SENTINEL: &str =
+    "__mock_spawn_native_child_and_drop__";
 const MOCK_CANCEL_TURN_SENTINEL: &str = "__mock_cancel__";
 const MOCK_COMPACT_SENTINEL: &str = "/compact";
 /// Causes `emit_turn` to sleep 2 s before emitting `TypingStatusChanged(false)`.
@@ -480,7 +487,8 @@ async fn maybe_spawn_native_child(
     subagent_emitter_rx: &mut watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
     active_subagents: &mut Vec<SubAgentHandle>,
 ) {
-    if !prompt.contains(SPAWN_NATIVE_CHILD_SENTINEL) {
+    let drop_handle = prompt.contains(SPAWN_NATIVE_CHILD_AND_DROP_SENTINEL);
+    if !drop_handle && !prompt.contains(SPAWN_NATIVE_CHILD_SENTINEL) {
         return;
     }
 
@@ -489,7 +497,9 @@ async fn maybe_spawn_native_child(
     sleep(Duration::from_millis(50)).await;
 
     let emitter = wait_for_subagent_emitter(subagent_emitter_rx).await;
-    let clean_prompt = prompt.replace(SPAWN_NATIVE_CHILD_SENTINEL, "");
+    let clean_prompt = prompt
+        .replace(SPAWN_NATIVE_CHILD_AND_DROP_SENTINEL, "")
+        .replace(SPAWN_NATIVE_CHILD_SENTINEL, "");
     let clean_prompt = clean_prompt.trim();
     let child_prompt = if clean_prompt.is_empty() {
         "native child task"
@@ -509,7 +519,13 @@ async fn maybe_spawn_native_child(
         .await;
 
     emit_native_child_turn(&handle.event_tx, child_prompt);
-    active_subagents.push(handle);
+    if drop_handle {
+        // Dropping the handle closes event_tx, so the relay actor sees
+        // events.recv() == None and must park instead of exiting.
+        drop(handle);
+    } else {
+        active_subagents.push(handle);
+    }
 }
 
 async fn wait_for_subagent_emitter(

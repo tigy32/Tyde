@@ -295,6 +295,7 @@ fn chat_event_contains(event: &Envelope, expected_text: &str) -> bool {
 }
 
 const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
+const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
 
 async fn expect_turn_on_stream(
     client: &mut client::Connection,
@@ -1203,6 +1204,94 @@ async fn backend_native_child_sessions_are_non_resumable() {
         "resume of non-resumable backend-native child session",
     )
     .await;
+}
+
+/// Regression: when a backend-native child's event stream closes (e.g. the
+/// backend finishes the sub-agent turn and drops its emitter handle), the
+/// relay agent actor used to just `return`, leaving a dead mpsc sender in
+/// the registry. The next host-stream replay called `snapshot()` on that
+/// handle and panicked. The fix parks the relay actor on event-stream close
+/// so Snapshot/ReadOutput/Attach keep working until the host explicitly
+/// closes the agent.
+#[tokio::test]
+async fn backend_native_child_with_closed_event_stream_still_replays_to_late_clients() {
+    let mut fixture = Fixture::new().await;
+
+    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_AND_DROP_SENTINEL}");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("parent-with-dropped-native-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/dropped-sub-agent-parent".to_owned()],
+                prompt: parent_prompt,
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent with native child failed");
+
+    let parent_new_env = expect_next_event(&mut fixture.client, "parent NewAgent").await;
+    assert_eq!(parent_new_env.kind, FrameKind::NewAgent);
+    let parent_new: NewAgentPayload = parent_new_env.parse_payload().expect("parse NewAgent");
+
+    let parent_start_env = expect_next_event(&mut fixture.client, "parent AgentStart").await;
+    assert_eq!(parent_start_env.kind, FrameKind::AgentStart);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "mock backend response to: parent prompt",
+    )
+    .await;
+
+    let child_new_env = expect_next_event(&mut fixture.client, "native child NewAgent").await;
+    assert_eq!(child_new_env.kind, FrameKind::NewAgent);
+    let child_new: NewAgentPayload = child_new_env
+        .parse_payload()
+        .expect("parse native child NewAgent");
+
+    let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
+    assert_eq!(child_start_env.kind, FrameKind::AgentStart);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock native child response to: parent prompt",
+    )
+    .await;
+
+    // After the child's turn ends, the mock dropped the emitter handle so
+    // the relay actor's backend event stream is closed. Give the actor a
+    // beat to process the None and transition into its parked state.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect a late client — this triggers register_host_stream, which
+    // snapshots every registered agent. Without the park, this panics the
+    // server and the client sees a closed connection.
+    let mut late_client = fixture.connect().await;
+    let replayed_child_new = expect_replayed_new_agent(
+        &mut late_client,
+        &child_new.agent_id,
+        "late client native child NewAgent",
+    )
+    .await;
+    assert_eq!(replayed_child_new.origin, AgentOrigin::BackendNative);
+
+    let replayed_child_start = expect_agent_start_on_stream(
+        &mut late_client,
+        &replayed_child_new.instance_stream,
+        "late client native child AgentStart",
+    )
+    .await;
+    assert_eq!(replayed_child_start.origin, AgentOrigin::BackendNative);
 }
 
 #[tokio::test]
