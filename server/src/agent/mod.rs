@@ -10,7 +10,7 @@ use protocol::{
     QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
     SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::backend::claude::ClaudeBackend;
@@ -57,6 +57,7 @@ struct AgentNameChangeContext<'a> {
     session_id: Option<&'a SessionId>,
     pending_alias: &'a mut Option<InitialAgentAlias>,
     current_start: &'a mut AgentStartPayload,
+    start_tx: &'a watch::Sender<AgentStartPayload>,
     event_log: &'a mut [Envelope],
     subscribers: &'a mut Vec<Stream>,
 }
@@ -67,9 +68,6 @@ enum AgentCommand {
         name: String,
         persistence: AgentNamePersistence,
         reply: oneshot::Sender<bool>,
-    },
-    Snapshot {
-        reply: oneshot::Sender<AgentStartPayload>,
     },
     ReadOutput {
         after_seq: Option<u64>,
@@ -93,6 +91,12 @@ enum AgentNamePersistence {
 pub(crate) struct AgentHandle {
     tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
+    /// Live view of the actor's `AgentStartPayload`. Populated synchronously at
+    /// handle construction and updated by the actor on name changes. Owning a
+    /// clone of the receiver here means callers can snapshot the start payload
+    /// without a message round-trip — which makes it structurally impossible
+    /// for a stopped actor to cause the old "agent disappeared" panic.
+    start: watch::Receiver<AgentStartPayload>,
 }
 
 impl AgentHandle {
@@ -135,16 +139,8 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
-    pub async fn snapshot(&self) -> Option<AgentStartPayload> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(AgentCommand::Snapshot { reply: reply_tx })
-            .is_err()
-        {
-            return None;
-        }
-        reply_rx.await.ok()
+    pub fn snapshot(&self) -> AgentStartPayload {
+        self.start.borrow().clone()
     }
 
     pub async fn read_output(&self, after_seq: Option<u64>, limit: usize) -> Option<Vec<Envelope>> {
@@ -509,6 +505,7 @@ pub(crate) fn spawn_agent_actor(
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
     let (startup_tx, startup_rx) = oneshot::channel();
+    let (start_tx, start_rx) = watch::channel(start.clone());
 
     tokio::spawn(async move {
         let ResolvedSpawnRequest {
@@ -654,6 +651,7 @@ pub(crate) fn spawn_agent_actor(
                     current_session_id.as_ref(),
                     &mut pending_alias,
                     &mut current_start,
+                    &start_tx,
                     &mut event_log,
                     &mut subscribers,
                     &mut rx,
@@ -771,6 +769,7 @@ pub(crate) fn spawn_agent_actor(
                     current_session_id.as_ref(),
                     &mut pending_alias,
                     &mut current_start,
+                    &start_tx,
                     &mut event_log,
                     &mut subscribers,
                     &mut rx,
@@ -817,6 +816,7 @@ pub(crate) fn spawn_agent_actor(
                             current_session_id.as_ref(),
                             &mut pending_alias,
                             &mut current_start,
+                            &start_tx,
                             &mut event_log,
                             &mut subscribers,
                             &mut rx,
@@ -955,6 +955,7 @@ pub(crate) fn spawn_agent_actor(
                                 current_session_id.as_ref(),
                                 &mut pending_alias,
                                 &mut current_start,
+                                &start_tx,
                                 &mut event_log,
                                 &mut subscribers,
                                 &mut rx,
@@ -1032,6 +1033,7 @@ pub(crate) fn spawn_agent_actor(
                                                 current_session_id.as_ref(),
                                                 &mut pending_alias,
                                                 &mut current_start,
+                                                &start_tx,
                                                 &mut event_log,
                                                 &mut subscribers,
                                                 &mut rx,
@@ -1194,6 +1196,7 @@ pub(crate) fn spawn_agent_actor(
                                             current_session_id.as_ref(),
                                             &mut pending_alias,
                                             &mut current_start,
+                                            &start_tx,
                                             &mut event_log,
                                             &mut subscribers,
                                             &mut rx,
@@ -1299,6 +1302,7 @@ pub(crate) fn spawn_agent_actor(
                                     session_id: current_session_id.as_ref(),
                                     pending_alias: &mut pending_alias,
                                     current_start: &mut current_start,
+                                    start_tx: &start_tx,
                                     event_log: &mut event_log,
                                     subscribers: &mut subscribers,
                                 },
@@ -1307,9 +1311,6 @@ pub(crate) fn spawn_agent_actor(
                             )
                             .await;
                             let _ = reply.send(applied);
-                        }
-                        AgentCommand::Snapshot { reply } => {
-                            let _ = reply.send(current_start.clone());
                         }
                         AgentCommand::ReadOutput {
                             after_seq,
@@ -1387,6 +1388,7 @@ pub(crate) fn spawn_agent_actor(
         AgentHandle {
             tx,
             accepting_input,
+            start: start_rx,
         },
         startup_rx,
     )
@@ -1403,6 +1405,7 @@ pub(crate) fn spawn_relay_agent_actor(
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(true));
     let accepting_input_task = Arc::clone(&accepting_input);
+    let (start_tx, start_rx) = watch::channel(start.clone());
 
     tokio::spawn(async move {
         let canonical_stream = format!("/agent/{}", agent_id);
@@ -1459,6 +1462,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             &session_id,
                             &mut pending_alias,
                             &mut current_start,
+                            &start_tx,
                             &mut event_log,
                             &mut subscribers,
                             &mut rx,
@@ -1570,6 +1574,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     session_id: Some(&session_id),
                                     pending_alias: &mut pending_alias,
                                     current_start: &mut current_start,
+                                    start_tx: &start_tx,
                                     event_log: &mut event_log,
                                     subscribers: &mut subscribers,
                                 },
@@ -1578,9 +1583,6 @@ pub(crate) fn spawn_relay_agent_actor(
                             )
                             .await;
                             let _ = reply.send(applied);
-                        }
-                        AgentCommand::Snapshot { reply } => {
-                            let _ = reply.send(current_start.clone());
                         }
                         AgentCommand::ReadOutput {
                             after_seq,
@@ -1617,6 +1619,7 @@ pub(crate) fn spawn_relay_agent_actor(
     AgentHandle {
         tx,
         accepting_input,
+        start: start_rx,
     }
 }
 
@@ -1696,11 +1699,13 @@ async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &A
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn park_terminal_agent(
     session_store: &Arc<Mutex<SessionStore>>,
     session_id: Option<&SessionId>,
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
+    start_tx: &watch::Sender<AgentStartPayload>,
     event_log: &mut [Envelope],
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
@@ -1721,6 +1726,7 @@ async fn park_terminal_agent(
                         session_id,
                         pending_alias,
                         current_start,
+                        start_tx,
                         event_log,
                         subscribers,
                     },
@@ -1729,9 +1735,6 @@ async fn park_terminal_agent(
                 )
                 .await;
                 let _ = reply.send(applied);
-            }
-            AgentCommand::Snapshot { reply } => {
-                let _ = reply.send(current_start.clone());
             }
             AgentCommand::ReadOutput {
                 after_seq,
@@ -1758,6 +1761,7 @@ async fn park_relay_terminal_agent(
     session_id: &SessionId,
     pending_alias: &mut Option<InitialAgentAlias>,
     current_start: &mut AgentStartPayload,
+    start_tx: &watch::Sender<AgentStartPayload>,
     event_log: &mut Vec<Envelope>,
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
@@ -1781,6 +1785,7 @@ async fn park_relay_terminal_agent(
                         session_id: Some(session_id),
                         pending_alias,
                         current_start,
+                        start_tx,
                         event_log,
                         subscribers,
                     },
@@ -1789,9 +1794,6 @@ async fn park_relay_terminal_agent(
                 )
                 .await;
                 let _ = reply.send(applied);
-            }
-            AgentCommand::Snapshot { reply } => {
-                let _ = reply.send(current_start.clone());
             }
             AgentCommand::ReadOutput {
                 after_seq,
@@ -1896,6 +1898,9 @@ async fn apply_agent_name_change(
 
     context.current_start.name = trimmed.to_string();
     overwrite_agent_start_payload(context.event_log, context.current_start);
+    // Keep the handle's snapshot view in sync so `AgentHandle::snapshot()`
+    // reflects the rename without a round-trip to the actor.
+    let _ = context.start_tx.send_replace(context.current_start.clone());
 
     let payload = AgentRenamedPayload {
         agent_id: context.current_start.agent_id.clone(),
@@ -2303,7 +2308,7 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{AgentInput, AgentStartPayload, FrameKind, StreamPath};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
 
     use super::{
@@ -2321,6 +2326,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
         let accepting_input = Arc::new(AtomicBool::new(false));
         let accepting_input_task = Arc::clone(&accepting_input);
+        let (_start_tx, start_rx) = watch::channel(start.clone());
 
         tokio::spawn(async move {
             let payload = protocol::AgentErrorPayload {
@@ -2351,9 +2357,6 @@ mod tests {
 
             while let Some(command) = rx.recv().await {
                 match command {
-                    AgentCommand::Snapshot { reply } => {
-                        let _ = reply.send(start.clone());
-                    }
                     AgentCommand::ReadOutput {
                         after_seq,
                         limit,
@@ -2379,6 +2382,7 @@ mod tests {
         AgentHandle {
             tx,
             accepting_input: accepting_input_task,
+            start: start_rx,
         }
     }
 
@@ -2437,10 +2441,7 @@ mod tests {
                 }))
                 .await
         );
-        let snapshot = handle
-            .snapshot()
-            .await
-            .expect("snapshot should survive failure");
+        let snapshot = handle.snapshot();
         assert_eq!(snapshot.agent_id.0, "agent-failed");
         assert_eq!(snapshot.name, "Chat");
 

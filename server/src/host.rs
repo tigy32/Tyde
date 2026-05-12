@@ -428,12 +428,7 @@ impl HostHandle {
                     agent_id
                 )
             });
-            let start = agent_handle.snapshot().await.unwrap_or_else(|| {
-                panic!(
-                    "agent {} disappeared while replaying host registration",
-                    agent_id
-                )
-            });
+            let start = agent_handle.snapshot();
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
                     "host stream {} disappeared during registration replay",
@@ -1699,9 +1694,7 @@ impl HostHandle {
 
         let mut tyde_owned_children = Vec::new();
         for handle in candidate_handles {
-            let Some(start) = handle.snapshot().await else {
-                continue;
-            };
+            let start = handle.snapshot();
             if start.parent_agent_id.as_ref() == Some(agent_id)
                 && start.origin != AgentOrigin::BackendNative
             {
@@ -1808,9 +1801,7 @@ impl HostHandle {
 
         let mut starts = Vec::with_capacity(handles.len());
         for handle in handles {
-            if let Some(start) = handle.snapshot().await {
-                starts.push(start);
-            }
+            starts.push(handle.snapshot());
         }
         starts
     }
@@ -1965,12 +1956,7 @@ impl HostHandle {
             .wait_for_parent_session_id(&request.parent_agent_id)
             .await;
 
-        let parent_start = parent_handle.snapshot().await.unwrap_or_else(|| {
-            panic!(
-                "parent agent {} disappeared before backend-native child spawn",
-                request.parent_agent_id
-            )
-        });
+        let parent_start = parent_handle.snapshot();
         assert_eq!(
             parent_start.workspace_roots, request.workspace_roots,
             "backend-native child workspace roots must match parent {}",
@@ -2481,12 +2467,7 @@ impl HostHandle {
         }
 
         let project = load_project(&project_store, &project_id, OPERATION).await?;
-        let origin_start = origin_agent.snapshot().await.ok_or_else(|| {
-            AppError::not_found(
-                OPERATION,
-                format!("origin agent {} stopped", payload.origin_agent_id),
-            )
-        })?;
+        let origin_start = origin_agent.snapshot();
         if origin_start.project_id.as_ref() != Some(&project_id) {
             return Err(AppError::invalid(
                 OPERATION,

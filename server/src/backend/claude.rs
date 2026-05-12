@@ -475,6 +475,16 @@ enum TurnOutcome {
     },
 }
 
+impl TurnOutcome {
+    fn summary(&self) -> &ClaudeStdoutSummary {
+        match self {
+            TurnOutcome::Completed { summary, .. } => summary,
+            TurnOutcome::Cancelled { summary } => summary,
+            TurnOutcome::Failed { summary, .. } => summary,
+        }
+    }
+}
+
 struct RunTurnParams<'a> {
     message_id: &'a str,
     workspace_root: &'a str,
@@ -654,19 +664,25 @@ impl ClaudeInner {
                 )
                 .await;
 
+            // Persist the CLI-assigned session id regardless of turn outcome.
+            // The Claude CLI writes its JSONL to disk the moment it emits
+            // events; our backend state must track that id so the next turn
+            // can `--resume` it. Doing this only in the Completed arm loses
+            // the id on Cancelled/Failed and orphans the session on disk.
+            if !ephemeral && let Some(session_id) = outcome.summary().session_id.clone() {
+                self.set_session_id(session_id.clone()).await;
+                self.emit_event(json!({
+                    "kind": "SessionStarted",
+                    "data": { "session_id": session_id }
+                }));
+            }
+
             match outcome {
                 TurnOutcome::Completed {
                     summary,
                     model_hint,
                 } => {
                     let mut summary = summary;
-                    if !ephemeral && let Some(session_id) = summary.session_id.clone() {
-                        self.set_session_id(turn_id, session_id.clone()).await;
-                        self.emit_event(json!({
-                            "kind": "SessionStarted",
-                            "data": { "session_id": session_id }
-                        }));
-                    }
 
                     // result_cumulative_usage holds cumulative session totals
                     // from the `result` event — feed that into the cross-turn
@@ -1040,14 +1056,28 @@ impl ClaudeInner {
         }
     }
 
-    async fn set_session_id(&self, turn_id: u64, session_id: String) {
+    /// Commit the Claude CLI session_id into backend state.
+    ///
+    /// Session ids are immutable for the lifetime of a `ClaudeBackend`. The
+    /// first CLI session_id observed wins; any subsequent attempt to commit a
+    /// different id is a protocol invariant violation (the Claude CLI rotated
+    /// our session, which must never happen silently) and surfaces as a
+    /// user-visible error.
+    async fn set_session_id(&self, session_id: String) {
         let mut state = self.state.lock().await;
-        if state
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.id == turn_id)
-        {
-            state.session_id = Some(session_id);
+        match &state.session_id {
+            Some(existing) if existing == &session_id => {}
+            Some(existing) => {
+                let existing = existing.clone();
+                drop(state);
+                self.emit_error(&format!(
+                    "Claude CLI rotated session id from {existing} to {session_id}; \
+                     session ids must be immutable. This turn's output is orphaned."
+                ));
+            }
+            None => {
+                state.session_id = Some(session_id);
+            }
         }
     }
 
@@ -3991,10 +4021,16 @@ fn encode_workspace_root(workspace_root: &str) -> String {
     if trimmed.is_empty() {
         return "-".to_string();
     }
+    // Matches Claude CLI's project-directory naming: it replaces path separators,
+    // the drive-letter colon, dots, and underscores with '-' so that any filesystem
+    // path collapses into a single flat directory name under ~/.claude/projects/.
+    // Missing `_` caused macOS temp-dir paths like
+    // /var/folders/<dir>/29t_skrx.../T/tmp.XXX to encode differently than Claude's
+    // own path, so --resume pointed at a path that didn't exist.
     trimmed
         .chars()
         .map(|ch| {
-            if ch == '/' || ch == '\\' || ch == ':' || ch == '.' {
+            if ch == '/' || ch == '\\' || ch == ':' || ch == '.' || ch == '_' {
                 '-'
             } else {
                 ch
