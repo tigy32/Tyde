@@ -541,6 +541,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         host_id: host_id.to_string(),
                         summary,
                     }));
+                    sessions.sort_by(|a, b| b.summary.updated_at_ms.cmp(&a.summary.updated_at_ms));
                 });
             }
             Err(error) => report_dispatch_error(

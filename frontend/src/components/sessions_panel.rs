@@ -183,7 +183,7 @@ fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl Int
     let short_id = session_id_short(&session);
     let full_id = session.summary.id.0.clone();
     let backend = session.summary.backend_kind;
-    let created = format_date(session.summary.created_at_ms);
+    let last_active = format_date(session.summary.updated_at_ms);
     let workspace = session
         .summary
         .workspace_roots
@@ -326,7 +326,7 @@ fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl Int
                 </div>
             </div>
             <div class="session-card-meta">
-                <span class="session-card-date">{created}</span>
+                <span class="session-card-date">{last_active}</span>
                 {(!workspace.is_empty()).then(|| view! {
                     <span class="session-card-workspace">{workspace}</span>
                 })}
