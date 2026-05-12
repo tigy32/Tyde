@@ -6,6 +6,7 @@ pub mod kiro;
 pub mod mock;
 pub mod setup;
 pub mod subprocess;
+pub mod turn_emitter;
 pub mod tycode;
 
 use std::collections::HashMap;

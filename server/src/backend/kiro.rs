@@ -12,6 +12,7 @@ use crate::acp::{
     extract_text_from_update, extract_tool_call_id, map_plan_status, normalize_update_type,
     parse_tool_call_completion, parse_tool_call_request,
 };
+use crate::backend::turn_emitter::{AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter};
 use crate::backend::{SessionCommand, StartupMcpServer, render_combined_spawn_instructions};
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
@@ -231,7 +232,7 @@ impl KiroSession {
 
         let inner = Arc::new(KiroInner {
             bridge,
-            event_tx,
+            emitter: Arc::new(TurnEmitter::new(event_tx)),
             shutting_down: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             state: Mutex::new(KiroState {
@@ -268,12 +269,7 @@ impl KiroSession {
         // Emit SessionStarted so forward_events sets backend_session_id on the store record
         {
             let state = inner.state.lock().await;
-            if let Err(e) = inner.event_tx.send(json!({
-                "kind": "SessionStarted",
-                "data": { "session_id": &state.session_id }
-            })) {
-                tracing::error!("Failed to emit SessionStarted: {e}");
-            }
+            inner.emitter.session_started(&state.session_id);
         }
 
         Ok((Self { inner }, event_rx))
@@ -330,7 +326,7 @@ struct KiroToolContext {
 
 struct KiroInner {
     bridge: AcpBridge,
-    event_tx: mpsc::UnboundedSender<Value>,
+    emitter: Arc<TurnEmitter>,
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
     ssh_host: Option<String>,
@@ -341,7 +337,7 @@ impl KiroInner {
         match command {
             SessionCommand::SendMessage { message, images } => {
                 self.emit_user_message_added(&message, images.as_deref());
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
+                self.emitter.typing_status_changed(true);
 
                 let (session_id, model, mode, steering) = {
                     let state = self.state.lock().await;
@@ -404,7 +400,7 @@ impl KiroInner {
                             return Ok(());
                         }
                         drop(state);
-                        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                        self.emitter.typing_status_changed(false);
                         return Err(err);
                     }
                 };
@@ -434,10 +430,17 @@ impl KiroInner {
                 if stop_reason == "cancelled" {
                     self.force_finalize_active_stream_if_any(Some(response.clone()), true)
                         .await;
-                    self.emit_event(json!({
-                        "kind": "OperationCancelled",
-                        "data": { "message": "Operation cancelled" }
-                    }));
+                    // If the user initiated the cancel, `CancelConversation` already
+                    // fired OperationCancelled + TypingStatusChanged — don't double-emit.
+                    let user_initiated = {
+                        let mut state = self.state.lock().await;
+                        let was = state.cancelled;
+                        state.cancelled = false;
+                        was
+                    };
+                    if !user_initiated {
+                        self.emitter.operation_cancelled("Operation cancelled");
+                    }
                     return Ok(());
                 }
 
@@ -451,7 +454,7 @@ impl KiroInner {
                         .to_string();
                     self.force_finalize_active_stream_if_any(Some(response.clone()), true)
                         .await;
-                    self.emit_event(json!({ "kind": "Error", "data": message }));
+                    self.emitter.backend_error(&message);
                     return Ok(());
                 }
 
@@ -468,20 +471,14 @@ impl KiroInner {
                     .notify("session/cancel", json!({ "sessionId": session_id }))
                     .await?;
                 self.force_finalize_active_stream_if_any(None, true).await;
-                self.emit_event(json!({
-                    "kind": "OperationCancelled",
-                    "data": { "message": "Operation cancelled" }
-                }));
+                self.emitter.operation_cancelled("Operation cancelled");
                 Ok(())
             }
             SessionCommand::GetSettings => {
                 let state = self.state.lock().await;
-                self.emit_event(json!({
-                    "kind": "Settings",
-                    "data": {
-                        "model": state.model,
-                        "mode": state.mode,
-                    }
+                self.emitter.settings(json!({
+                    "model": state.model,
+                    "mode": state.mode,
                 }));
                 Ok(())
             }
@@ -489,26 +486,17 @@ impl KiroInner {
             SessionCommand::ResumeSession { session_id } => self.resume_session(session_id).await,
             SessionCommand::DeleteSession { session_id } => self.delete_session(session_id).await,
             SessionCommand::ListProfiles => {
-                self.emit_event(json!({
-                    "kind": "ProfilesList",
-                    "data": { "profiles": [] }
-                }));
+                self.emitter.profiles_list(Vec::new());
                 Ok(())
             }
             SessionCommand::SwitchProfile { profile_name: _ } => Ok(()),
             SessionCommand::GetModuleSchemas => {
-                self.emit_event(json!({
-                    "kind": "ModuleSchemas",
-                    "data": { "schemas": [] }
-                }));
+                self.emitter.module_schemas(Vec::new());
                 Ok(())
             }
             SessionCommand::ListModels => {
                 let models = self.state.lock().await.known_models.clone();
-                self.emit_event(json!({
-                    "kind": "ModelsList",
-                    "data": { "models": models }
-                }));
+                self.emitter.models_list(models);
                 Ok(())
             }
             SessionCommand::UpdateSettings {
@@ -561,12 +549,9 @@ impl KiroInner {
                 }
 
                 let state = self.state.lock().await;
-                self.emit_event(json!({
-                    "kind": "Settings",
-                    "data": {
-                        "model": state.model,
-                        "mode": state.mode,
-                    }
+                self.emitter.settings(json!({
+                    "model": state.model,
+                    "mode": state.mode,
                 }));
                 Ok(())
             }
@@ -624,10 +609,7 @@ impl KiroInner {
             b_ts.cmp(&a_ts)
         });
 
-        self.emit_event(json!({
-            "kind": "SessionsList",
-            "data": { "sessions": sessions }
-        }));
+        self.emitter.sessions_list(sessions);
         Ok(())
     }
 
@@ -656,8 +638,8 @@ impl KiroInner {
         };
 
         self.clear_active_stream().await;
-        self.emit_event(json!({ "kind": "ConversationCleared" }));
-        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+        self.emitter.conversation_cleared();
+        self.emitter.typing_status_changed(false);
 
         // kiro-cli-chat doesn't check PID liveness when reading .lock files,
         // so stale locks from dead processes block session/load. Remove the
@@ -687,7 +669,7 @@ impl KiroInner {
                 state.replay_assistant_text.clear();
                 state.replay_assistant_message_emitted_since_user = false;
                 state.replay_error = None;
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                self.emitter.typing_status_changed(false);
                 return Err(err);
             }
         };
@@ -699,7 +681,7 @@ impl KiroInner {
             state.replay_assistant_text.clear();
             state.replay_assistant_message_emitted_since_user = false;
             state.replay_error = None;
-            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+            self.emitter.typing_status_changed(false);
             return Err(format!("Failed to finish Kiro session replay: {err}"));
         }
 
@@ -710,7 +692,7 @@ impl KiroInner {
                 state.replay_assistant_message_id = None;
                 state.replay_assistant_text.clear();
                 state.replay_assistant_message_emitted_since_user = false;
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                self.emitter.typing_status_changed(false);
                 return Err(error);
             }
             if !state.active_tool_contexts.is_empty() {
@@ -726,7 +708,7 @@ impl KiroInner {
                 state.replay_assistant_message_emitted_since_user = false;
                 state.active_tool_contexts.clear();
                 state.tool_call_aliases.clear();
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                self.emitter.typing_status_changed(false);
                 return Err(format!(
                     "Kiro session replay ended with unresolved tool calls: {pending}"
                 ));
@@ -745,16 +727,11 @@ impl KiroInner {
             state.replaying_history = false;
 
             // Emit SessionStarted so forward_events sets backend_session_id on resume
-            if let Err(e) = self.event_tx.send(json!({
-                "kind": "SessionStarted",
-                "data": { "session_id": &state.session_id }
-            })) {
-                tracing::error!("Failed to emit SessionStarted on resume: {e}");
-            }
+            self.emitter.session_started(&state.session_id);
         }
 
         self.flush_replay_assistant_message().await;
-        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+        self.emitter.typing_status_changed(false);
         Ok(())
     }
 
@@ -781,7 +758,7 @@ impl KiroInner {
     async fn handle_inbound(&self, inbound: AcpInbound) {
         match inbound {
             AcpInbound::Stderr(line) => {
-                self.emit_event(json!({ "kind": "SubprocessStderr", "data": line }));
+                self.emitter.subprocess_stderr(&line);
             }
             AcpInbound::Closed { exit_code } => {
                 let code = if self.shutting_down.load(Ordering::Acquire) {
@@ -789,10 +766,7 @@ impl KiroInner {
                 } else {
                     exit_code
                 };
-                self.emit_event(json!({
-                    "kind": "SubprocessExit",
-                    "data": { "exit_code": code }
-                }));
+                self.emitter.subprocess_exit(code);
             }
             AcpInbound::Notification { method, params } => {
                 self.handle_notification(&method, &params).await;
@@ -808,10 +782,9 @@ impl KiroInner {
                         let _ = self.bridge.respond(id, json!({ "ignored": true })).await;
                     }
                     Err(err) => {
-                        self.emit_event(json!({
-                            "kind": "SubprocessStderr",
-                            "data": format!("Failed to handle server request '{method}': {err}"),
-                        }));
+                        self.emitter.subprocess_stderr(&format!(
+                            "Failed to handle server request '{method}': {err}"
+                        ));
                         let _ = self.bridge.respond_error(id, -32_000, &err).await;
                     }
                 }
@@ -942,16 +915,7 @@ impl KiroInner {
         }
 
         self.flush_replay_assistant_message().await;
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": "User",
-                "content": text,
-                "tool_calls": [],
-                "images": []
-            }
-        }));
+        self.emitter.user_message(&text, Vec::new());
         self.state
             .lock()
             .await
@@ -976,15 +940,9 @@ impl KiroInner {
                 state.active_stream_text.clear();
                 state.active_stream_tool_calls.clear();
                 let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
-                self.emit_event(json!({
-                    "kind": "StreamStart",
-                    "data": {
-                        "message_id": id,
-                        "agent": KIRO_AGENT_NAME,
-                        "model": model
-                    }
-                }));
+                self.emitter.typing_status_changed(true);
+                self.emitter
+                    .stream_start(&id, AgentName(KIRO_AGENT_NAME), Some(&model));
             }
             state
                 .active_message_id
@@ -992,13 +950,7 @@ impl KiroInner {
                 .unwrap_or_else(|| format!("kiro-msg-{}", unix_now_ms()))
         };
 
-        self.emit_event(json!({
-            "kind": "StreamReasoningDelta",
-            "data": {
-                "message_id": message_id,
-                "text": delta
-            }
-        }));
+        self.emitter.stream_reasoning_delta(&message_id, &delta);
     }
 
     async fn handle_agent_message_chunk(&self, params: &Value) {
@@ -1112,24 +1064,15 @@ impl KiroInner {
         }
 
         if let Some(start_message_id) = started_message_id {
-            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
-            self.emit_event(json!({
-                "kind": "StreamStart",
-                "data": {
-                    "message_id": start_message_id,
-                    "agent": KIRO_AGENT_NAME,
-                    "model": model,
-                }
-            }));
+            self.emitter.typing_status_changed(true);
+            self.emitter.stream_start(
+                &start_message_id,
+                AgentName(KIRO_AGENT_NAME),
+                Some(&model),
+            );
         }
 
-        self.emit_event(json!({
-            "kind": "StreamDelta",
-            "data": {
-                "message_id": stream_message_id,
-                "text": delta,
-            }
-        }));
+        self.emitter.stream_delta(&stream_message_id, &delta);
     }
 
     async fn set_replay_error(&self, message: String) {
@@ -1210,14 +1153,8 @@ impl KiroInner {
             return;
         }
 
-        self.emit_event(json!({
-            "kind": "ToolRequest",
-            "data": {
-                "tool_call_id": canonical_id,
-                "tool_name": request.tool_name,
-                "tool_type": tool_type,
-            }
-        }));
+        self.emitter
+            .tool_request(&canonical_id, &request.tool_name, tool_type);
     }
 
     async fn handle_replay_tool_call_update(&self, params: &Value) {
@@ -1286,16 +1223,13 @@ impl KiroInner {
         };
 
         let (tool_call_id, tool_name, tool_result, success, error) = completion_to_emit;
-        self.emit_event(json!({
-            "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_result": tool_result,
-                "success": success,
-                "error": error,
-            }
-        }));
+        self.emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: &tool_call_id,
+            tool_name: &tool_name,
+            tool_result,
+            success,
+            error: error.as_deref(),
+        });
     }
 
     async fn handle_tool_call(&self, params: &Value) {
@@ -1305,10 +1239,9 @@ impl KiroInner {
         }
 
         let Some(request) = parse_tool_call_request(params) else {
-            self.emit_event(json!({
-                "kind": "SubprocessStderr",
-                "data": format!("Ignoring ACP tool_call without toolCallId: {params}"),
-            }));
+            self.emitter.subprocess_stderr(&format!(
+                "Ignoring ACP tool_call without toolCallId: {params}"
+            ));
             return;
         };
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
@@ -1414,15 +1347,9 @@ impl KiroInner {
         }
 
         if let Some((message_id, model)) = start_event {
-            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
-            self.emit_event(json!({
-                "kind": "StreamStart",
-                "data": {
-                    "message_id": message_id,
-                    "agent": KIRO_AGENT_NAME,
-                    "model": model,
-                }
-            }));
+            self.emitter.typing_status_changed(true);
+            self.emitter
+                .stream_start(&message_id, AgentName(KIRO_AGENT_NAME), Some(&model));
         }
 
         if should_finalize_current {
@@ -1430,14 +1357,8 @@ impl KiroInner {
         }
 
         if let Some((tool_call_id, tool_name, tool_type)) = refresh_tool_request {
-            self.emit_event(json!({
-                "kind": "ToolRequest",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_type": tool_type,
-                }
-            }));
+            self.emitter
+                .tool_request(&tool_call_id, &tool_name, tool_type);
         }
     }
 
@@ -1589,27 +1510,18 @@ impl KiroInner {
         }
 
         if let Some((tool_call_id, tool_name, tool_type)) = refresh_tool_request {
-            self.emit_event(json!({
-                "kind": "ToolRequest",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_type": tool_type,
-                }
-            }));
+            self.emitter
+                .tool_request(&tool_call_id, &tool_name, tool_type);
         }
 
         if let Some((tool_call_id, tool_name, tool_result, success, error)) = emit_completion_now {
-            self.emit_event(json!({
-                "kind": "ToolExecutionCompleted",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_result": tool_result,
-                    "success": success,
-                    "error": error,
-                }
-            }));
+            self.emitter.tool_completed(ToolCompletedPayload {
+                tool_call_id: &tool_call_id,
+                tool_name: &tool_name,
+                tool_result,
+                success,
+                error: error.as_deref(),
+            });
         }
     }
 
@@ -1637,28 +1549,22 @@ impl KiroInner {
                     .get("title")
                     .or_else(|| step.get("description"))
                     .and_then(Value::as_str)
-                    .unwrap_or("step");
-                let status = step
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(map_plan_status)
-                    .unwrap_or("pending");
+                    .unwrap_or("step")
+                    .to_string();
+                let status = kiro_plan_status_to_task_status(
+                    step.get("status").and_then(Value::as_str).unwrap_or(""),
+                );
 
-                json!({
-                    "id": index as u64 + 1,
-                    "description": description,
-                    "status": status,
-                })
+                protocol::Task {
+                    id: index as u64 + 1,
+                    description,
+                    status,
+                }
             })
             .collect::<Vec<_>>();
 
-        self.emit_event(json!({
-            "kind": "TaskUpdate",
-            "data": {
-                "title": title,
-                "tasks": tasks,
-            }
-        }));
+        self.emitter
+            .task_update(&protocol::TaskList { title, tasks });
     }
 
     async fn handle_error_notification(&self, params: &Value) {
@@ -1676,8 +1582,8 @@ impl KiroInner {
         }
 
         self.clear_active_stream().await;
-        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-        self.emit_event(json!({ "kind": "Error", "data": message }));
+        self.emitter.typing_status_changed(false);
+        self.emitter.backend_error(&message);
     }
 
     async fn emit_replay_message(&self, replay: Option<(String, String)>) {
@@ -1702,17 +1608,18 @@ impl KiroInner {
                 .unwrap_or_else(|| "kiro".to_string())
         };
 
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": { "Assistant": { "agent": KIRO_AGENT_NAME } },
-                "content": text,
-                "tool_calls": [],
-                "model_info": { "model": model },
-                "images": [],
-            }
-        }));
+        self.emitter.assistant_message(
+            crate::backend::turn_emitter::AssistantMessagePayload {
+                agent: AgentName(KIRO_AGENT_NAME),
+                content: text,
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: Some(json!({ "model": model })),
+                token_usage: None,
+                context_breakdown: None,
+                images: Vec::new(),
+            },
+        );
         self.state
             .lock()
             .await
@@ -1761,7 +1668,7 @@ impl KiroInner {
             self.emit_stream_end(message_id, text, usage, tool_calls, force_emit, end_typing)
                 .await;
         } else if end_typing {
-            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+            self.emitter.typing_status_changed(false);
         }
     }
 
@@ -1786,7 +1693,7 @@ impl KiroInner {
         let cleaned_text = strip_ansi_and_controls(&text);
         if !force_emit && !has_renderable_stream_text(&cleaned_text) && tool_calls.is_empty() {
             if end_typing {
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                self.emitter.typing_status_changed(false);
             }
             return;
         }
@@ -1806,25 +1713,23 @@ impl KiroInner {
             .unwrap_or(Value::Null);
         let tool_calls_for_events = tool_calls.clone();
 
-        self.emit_event(json!({
-            "kind": "StreamEnd",
-            "data": {
-                "message": {
-                    "timestamp": unix_now_ms(),
-                    "sender": { "Assistant": { "agent": KIRO_AGENT_NAME } },
-                    "content": cleaned_text,
-                    "tool_calls": tool_calls,
-                    "model_info": { "model": model },
-                    "token_usage": normalized_usage,
-                    "context_breakdown": context_breakdown,
-                    "images": [],
-                }
-            }
-        }));
+        self.emitter.stream_end(StreamEndPayload {
+            content: cleaned_text,
+            agent: Some(AgentName(KIRO_AGENT_NAME)),
+            model: Some(model.clone()),
+            usage: normalized_usage,
+            reasoning: None,
+            tool_calls: tool_calls.clone(),
+            context_breakdown: if context_breakdown.is_null() {
+                None
+            } else {
+                Some(context_breakdown)
+            },
+        });
         self.flush_tool_events_after_stream_end(&tool_calls_for_events)
             .await;
         if end_typing {
-            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+            self.emitter.typing_status_changed(false);
         }
     }
 
@@ -1872,27 +1777,18 @@ impl KiroInner {
         }
 
         for (tool_call_id, tool_name, tool_type) in requests_to_emit {
-            self.emit_event(json!({
-                "kind": "ToolRequest",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_type": tool_type,
-                }
-            }));
+            self.emitter
+                .tool_request(&tool_call_id, &tool_name, tool_type);
         }
 
         for (tool_call_id, tool_name, tool_result, success, error) in completions_to_emit {
-            self.emit_event(json!({
-                "kind": "ToolExecutionCompleted",
-                "data": {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_result": tool_result,
-                    "success": success,
-                    "error": error,
-                }
-            }));
+            self.emitter.tool_completed(ToolCompletedPayload {
+                tool_call_id: &tool_call_id,
+                tool_name: &tool_name,
+                tool_result,
+                success,
+                error: error.as_deref(),
+            });
         }
     }
 
@@ -1907,23 +1803,16 @@ impl KiroInner {
                 })
             })
             .collect::<Vec<_>>();
-
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": "User",
-                "content": content,
-                "tool_calls": [],
-                "images": image_payload,
-            }
-        }));
+        self.emitter.user_message(content, image_payload);
     }
+}
 
-    fn emit_event(&self, event: Value) {
-        if let Err(err) = self.event_tx.send(event) {
-            tracing::trace!("event send failed: {err}");
-        }
+fn kiro_plan_status_to_task_status(raw: &str) -> protocol::TaskStatus {
+    match map_plan_status(raw) {
+        "completed" => protocol::TaskStatus::Completed,
+        "in_progress" => protocol::TaskStatus::InProgress,
+        "failed" => protocol::TaskStatus::Failed,
+        _ => protocol::TaskStatus::Pending,
     }
 }
 

@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use protocol::BackendAccessMode;
 
+use crate::backend::turn_emitter::{AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter};
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
@@ -118,7 +119,7 @@ impl GeminiSession {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(GeminiInner {
-            event_tx,
+            emitter: Arc::new(TurnEmitter::new(event_tx)),
             state: Mutex::new(GeminiState {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
@@ -167,7 +168,7 @@ struct GeminiState {
 }
 
 struct GeminiInner {
-    event_tx: mpsc::UnboundedSender<Value>,
+    emitter: Arc<TurnEmitter>,
     state: Mutex<GeminiState>,
 }
 
@@ -263,19 +264,17 @@ impl GeminiInner {
                 Ok(())
             }
             SessionCommand::ListModels => {
-                this.emit_event(json!({
-                    "kind": "ModelsList",
-                    "data": {
-                        "models": gemini_known_models()
-                            .into_iter()
-                            .map(|model| json!({
-                                "id": model.value,
-                                "displayName": model.label,
-                                "isDefault": false,
-                            }))
-                            .collect::<Vec<_>>()
-                    }
-                }));
+                let models = gemini_known_models()
+                    .into_iter()
+                    .map(|model| {
+                        json!({
+                            "id": model.value,
+                            "displayName": model.label,
+                            "isDefault": false,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                this.emitter.models_list(models);
                 Ok(())
             }
             SessionCommand::UpdateSettings {
@@ -298,10 +297,7 @@ impl GeminiInner {
                 Ok(())
             }
             SessionCommand::ListSessions => {
-                this.emit_event(json!({
-                    "kind": "SessionsList",
-                    "data": { "sessions": [] }
-                }));
+                this.emitter.sessions_list(Vec::new());
                 Ok(())
             }
             SessionCommand::ResumeSession { session_id } => {
@@ -311,10 +307,7 @@ impl GeminiInner {
                     let mut state = this.state.lock().await;
                     state.session_id = Some(normalized.clone());
                 }
-                this.emit_event(json!({
-                    "kind": "SessionStarted",
-                    "data": { "session_id": normalized }
-                }));
+                this.emitter.session_started(&normalized);
                 Ok(())
             }
             SessionCommand::DeleteSession { session_id } => {
@@ -327,18 +320,12 @@ impl GeminiInner {
                 Ok(())
             }
             SessionCommand::ListProfiles => {
-                this.emit_event(json!({
-                    "kind": "ProfilesList",
-                    "data": { "profiles": [] }
-                }));
+                this.emitter.profiles_list(Vec::new());
                 Ok(())
             }
             SessionCommand::SwitchProfile { profile_name: _ } => Ok(()),
             SessionCommand::GetModuleSchemas => {
-                this.emit_event(json!({
-                    "kind": "ModuleSchemas",
-                    "data": { "schemas": [] }
-                }));
+                this.emitter.module_schemas(Vec::new());
                 Ok(())
             }
         }
@@ -414,10 +401,7 @@ impl GeminiInner {
                 TurnOutcome::Completed { mut summary } => {
                     if let Some(session_id) = summary.session_id.clone() {
                         self.set_session_id(turn_id, session_id.clone()).await;
-                        self.emit_event(json!({
-                            "kind": "SessionStarted",
-                            "data": { "session_id": session_id }
-                        }));
+                        self.emitter.session_started(&session_id);
                     }
                     if !self.emit_summary_or_placeholder_stream_end(&mut summary) {
                         let error = summary
@@ -716,12 +700,9 @@ impl GeminiInner {
             let state = self.state.lock().await;
             (state.model.clone(), state.permission_mode.clone())
         };
-        self.emit_event(json!({
-            "kind": "Settings",
-            "data": {
-                "model": model,
-                "permission_mode": permission_mode,
-            }
+        self.emitter.settings(json!({
+            "model": model,
+            "permission_mode": permission_mode,
         }));
     }
 
@@ -771,29 +752,13 @@ impl GeminiInner {
         false
     }
 
-    fn emit_event(&self, event: Value) {
-        if let Err(e) = self.event_tx.send(event) {
-            tracing::trace!("event send failed: {e}");
-        }
-    }
-
     fn emit_typing_status(&self, typing: bool) {
-        self.emit_event(json!({
-            "kind": "TypingStatusChanged",
-            "data": typing,
-        }));
+        self.emitter.typing_status_changed(typing);
     }
 
     fn emit_stream_start(&self, message_id: &str, model: Option<String>) {
-        let model_value = model.map(Value::String).unwrap_or(Value::Null);
-        self.emit_event(json!({
-            "kind": "StreamStart",
-            "data": {
-                "message_id": message_id,
-                "agent": GEMINI_AGENT_NAME,
-                "model": model_value,
-            }
-        }));
+        self.emitter
+            .stream_start(message_id, AgentName(GEMINI_AGENT_NAME), model.as_deref());
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
@@ -807,30 +772,11 @@ impl GeminiInner {
                 })
             })
             .collect::<Vec<_>>();
-
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": "User",
-                "content": content,
-                "tool_calls": [],
-                "images": image_payload,
-            }
-        }));
+        self.emitter.user_message(content, image_payload);
     }
 
     fn emit_stream_delta(&self, message_id: &str, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.emit_event(json!({
-            "kind": "StreamDelta",
-            "data": {
-                "message_id": message_id,
-                "text": text,
-            }
-        }));
+        self.emitter.stream_delta(message_id, text);
     }
 
     fn emit_stream_end(
@@ -841,59 +787,31 @@ impl GeminiInner {
         reasoning: Option<String>,
         tool_calls: Vec<Value>,
     ) {
-        let model_info = model
-            .filter(|m| !m.trim().is_empty())
-            .map(|m| json!({ "model": m }))
-            .unwrap_or(Value::Null);
-        let usage_value = usage.unwrap_or(Value::Null);
-        let reasoning_value = reasoning
-            .filter(|v| !v.trim().is_empty())
-            .map(|text| json!({ "text": text }))
-            .unwrap_or(Value::Null);
-
-        self.emit_event(json!({
-            "kind": "StreamEnd",
-            "data": {
-                "message": {
-                    "timestamp": unix_now_ms(),
-                    "sender": { "Assistant": { "agent": GEMINI_AGENT_NAME } },
-                    "content": content,
-                    "reasoning": reasoning_value,
-                    "tool_calls": tool_calls,
-                    "model_info": model_info,
-                    "token_usage": usage_value,
-                    "context_breakdown": Value::Null,
-                    "images": [],
-                }
-            }
-        }));
+        self.emitter.stream_end(StreamEndPayload {
+            content,
+            agent: Some(AgentName(GEMINI_AGENT_NAME)),
+            model,
+            usage,
+            reasoning,
+            tool_calls,
+            context_breakdown: None,
+        });
     }
 
     fn emit_operation_cancelled(&self, message: &str) {
-        self.emit_event(json!({
-            "kind": "OperationCancelled",
-            "data": {
-                "message": message,
-            }
-        }));
+        self.emitter.operation_cancelled(message);
     }
 
     fn emit_error(&self, message: &str) {
-        self.emit_event(json!({
-            "kind": "Error",
-            "data": message,
-        }));
+        self.emitter.backend_error(message);
     }
 
     fn emit_tool_request(&self, tool_call: &GeminiToolCall) {
-        self.emit_event(json!({
-            "kind": "ToolRequest",
-            "data": {
-                "tool_call_id": tool_call.id,
-                "tool_name": tool_call.name,
-                "tool_type": gemini_tool_request_type(&tool_call.name, &tool_call.arguments),
-            }
-        }));
+        self.emitter.tool_request(
+            &tool_call.id,
+            &tool_call.name,
+            gemini_tool_request_type(&tool_call.name, &tool_call.arguments),
+        );
     }
 
     fn emit_tool_execution_completed(
@@ -904,16 +822,13 @@ impl GeminiInner {
         tool_result: Value,
         error: Option<String>,
     ) {
-        self.emit_event(json!({
-            "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_result": tool_result,
-                "success": success,
-                "error": error,
-            }
-        }));
+        self.emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id,
+            tool_name,
+            tool_result,
+            success,
+            error: error.as_deref(),
+        });
     }
 }
 
@@ -990,10 +905,7 @@ fn consume_gemini_event(
         let is_new_session = summary.session_id.as_deref() != Some(session_id);
         summary.session_id = Some(session_id.to_string());
         if is_new_session {
-            inner.emit_event(json!({
-                "kind": "SessionStarted",
-                "data": { "session_id": session_id }
-            }));
+            inner.emitter.session_started(session_id);
         }
     }
 

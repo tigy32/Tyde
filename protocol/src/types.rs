@@ -1725,6 +1725,43 @@ pub struct AgentErrorPayload {
     pub fatal: bool,
 }
 
+/// Events a backend emits on a chat stream. Mirrors the Tycode
+/// `ChatEvent` enum in `tycode-core/src/chat/events.rs`; any semantic
+/// change must be made there first so every backend (Claude, Codex,
+/// Gemini, Kiro, Tycode) shares one contract.
+///
+/// ## Invariants backends MUST uphold
+///
+/// These are the rules the server-side `ProtocolValidator` enforces.
+/// If a backend violates one the stream is terminated with a protocol
+/// error — do not paper over it in the validator.
+///
+/// ### Stream pairing
+/// Every `StreamStart` on a stream must be followed by exactly one
+/// `StreamEnd` (possibly with a placeholder empty message) before the
+/// next `StreamStart` on the same stream. `StreamDelta` /
+/// `StreamReasoningDelta` are only valid between a `StreamStart` and
+/// its matching `StreamEnd`.
+///
+/// ### Tool pairing
+/// `ToolRequest` is only valid while an assistant turn is open (after a
+/// `MessageAdded { Assistant }` or a `StreamStart`). Every emitted
+/// `ToolRequest` must be answered by exactly one
+/// `ToolExecutionCompleted` with the same `tool_call_id`.
+///
+/// ### Cancellation ordering
+/// When a turn is cancelled the backend must, in this order:
+///   1. If a stream is currently open, emit `StreamEnd` (with an empty
+///      or error placeholder message) to close it.
+///   2. Emit `ToolExecutionCompleted` for any outstanding
+///      `ToolRequest`s the backend originated in this turn (mark them
+///      unsuccessful / cancelled).
+///   3. Emit exactly one `OperationCancelled`.
+///   4. Emit `TypingStatusChanged(false)`.
+///
+/// This matches `tycode-core::chat::protocol::TurnProtocol::abort`.
+/// Without step 1, the next turn's `StreamStart` violates the stream
+/// pairing invariant above.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {

@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use protocol::BackendAccessMode;
 
+use crate::backend::turn_emitter::{AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter};
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
@@ -182,10 +183,11 @@ impl CodexSession {
             .map(|s| s.to_string());
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let emitter = Arc::new(TurnEmitter::new(event_tx));
 
         let inner = Arc::new(CodexInner {
             rpc,
-            event_tx,
+            emitter,
             state: Mutex::new(CodexState {
                 thread_id,
                 model,
@@ -486,7 +488,7 @@ struct TurnContextEstimate {
 }
 
 struct CodexSubAgentStream {
-    raw_event_tx: mpsc::UnboundedSender<Value>,
+    emitter: Arc<TurnEmitter>,
     receiver_thread_id: Option<String>,
     external_agent_id: Option<String>,
 }
@@ -526,7 +528,7 @@ struct CodexState {
 
 struct CodexInner {
     rpc: CodexRpc,
-    event_tx: mpsc::UnboundedSender<Value>,
+    emitter: Arc<TurnEmitter>,
     state: Mutex<CodexState>,
     steering_tempfile: Option<std::path::PathBuf>,
 }
@@ -558,7 +560,7 @@ impl CodexInner {
                 self.emit_user_message_added(&message, images.as_deref());
                 // UI contract: show typing immediately when a user turn is submitted,
                 // without waiting for Codex to acknowledge turn/started.
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
+                self.emitter.typing_status_changed(true);
 
                 if self.respond_pending_request(&message).await? {
                     return Ok(());
@@ -618,7 +620,7 @@ impl CodexInner {
                 params["sandboxPolicy"] = codex_sandbox_policy(access_mode, turn_network_access);
 
                 if let Err(err) = self.rpc.request("turn/start", params).await {
-                    self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+                    self.emitter.typing_status_changed(false);
                     return Err(err);
                 }
                 Ok(())
@@ -740,12 +742,7 @@ impl CodexInner {
             }
         }
 
-        self.emit_event(json!({
-            "kind": "SessionsList",
-            "data": {
-                "sessions": sessions
-            }
-        }));
+        self.emitter.sessions_list(sessions);
         Ok(())
     }
 
@@ -797,8 +794,8 @@ impl CodexInner {
             state.conversation_bytes_total = 0;
         }
 
-        self.emit_event(json!({ "kind": "ConversationCleared" }));
-        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+        self.emitter.conversation_cleared();
+        self.emitter.typing_status_changed(false);
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
         let restored_bytes = self.emit_resumed_thread_history(&turns, &model).await;
@@ -862,12 +859,7 @@ impl CodexInner {
             })
             .collect();
 
-        self.emit_event(json!({
-            "kind": "ModelsList",
-            "data": {
-                "models": models
-            }
-        }));
+        self.emitter.models_list(models);
         Ok(())
     }
 
@@ -889,16 +881,7 @@ impl CodexInner {
                             continue;
                         }
                         total_bytes = total_bytes.saturating_add(text.len() as u64);
-                        self.emit_event(json!({
-                            "kind": "MessageAdded",
-                            "data": {
-                                "timestamp": unix_now_ms(),
-                                "sender": "User",
-                                "content": text,
-                                "tool_calls": [],
-                                "images": []
-                            }
-                        }));
+                        self.emitter.user_message(&text, Vec::new());
                     }
                     "agentMessage" => {
                         let text = extract_codex_item_text(item);
@@ -907,18 +890,18 @@ impl CodexInner {
                         }
                         let reasoning = extract_codex_item_reasoning(item);
                         total_bytes = total_bytes.saturating_add(text.len() as u64);
-                        self.emit_event(json!({
-                            "kind": "MessageAdded",
-                            "data": {
-                                "timestamp": unix_now_ms(),
-                                "sender": { "Assistant": { "agent": CODEX_AGENT_NAME } },
-                                "content": text,
-                                "reasoning": reasoning.map(|summary| json!({ "text": summary })).unwrap_or(Value::Null),
-                                "tool_calls": [],
-                                "model_info": { "model": model },
-                                "images": []
-                            }
-                        }));
+                        self.emitter.assistant_message(
+                            crate::backend::turn_emitter::AssistantMessagePayload {
+                                agent: AgentName(CODEX_AGENT_NAME),
+                                content: text,
+                                reasoning: reasoning.map(|summary| json!({ "text": summary })),
+                                tool_calls: Vec::new(),
+                                model_info: Some(json!({ "model": model })),
+                                token_usage: None,
+                                context_breakdown: None,
+                                images: Vec::new(),
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -1045,17 +1028,11 @@ impl CodexInner {
     async fn handle_inbound(&self, inbound: CodexInbound) {
         match inbound {
             CodexInbound::Stderr(line) => {
-                self.emit_event(json!({
-                    "kind": "SubprocessStderr",
-                    "data": line
-                }));
+                self.emitter.subprocess_stderr(&line);
             }
             CodexInbound::Closed { exit_code } => {
                 self.complete_all_codex_subagents().await;
-                self.emit_event(json!({
-                    "kind": "SubprocessExit",
-                    "data": { "exit_code": exit_code }
-                }));
+                self.emitter.subprocess_exit(exit_code);
             }
             CodexInbound::Notification { method, params } => {
                 if method.starts_with("codex/event/") {
@@ -1110,15 +1087,9 @@ impl CodexInner {
                     );
                     state.model.clone().unwrap_or_else(|| "codex".to_string())
                 };
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
-                self.emit_event(json!({
-                    "kind": "StreamStart",
-                    "data": {
-                        "message_id": turn_id,
-                        "agent": CODEX_AGENT_NAME,
-                        "model": model
-                    }
-                }));
+                self.emitter.typing_status_changed(true);
+                self.emitter
+                    .stream_start(&turn_id, AgentName(CODEX_AGENT_NAME), Some(&model));
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -1137,15 +1108,12 @@ impl CodexInner {
                 if let Some((stream_message_id, model)) =
                     self.ensure_active_stream_for_message(&message_id).await
                 {
-                    self.emit_event(json!({ "kind": "TypingStatusChanged", "data": true }));
-                    self.emit_event(json!({
-                        "kind": "StreamStart",
-                        "data": {
-                            "message_id": stream_message_id,
-                            "agent": CODEX_AGENT_NAME,
-                            "model": model
-                        }
-                    }));
+                    self.emitter.typing_status_changed(true);
+                    self.emitter.stream_start(
+                        &stream_message_id,
+                        AgentName(CODEX_AGENT_NAME),
+                        Some(&model),
+                    );
                 }
                 {
                     let mut state = self.state.lock().await;
@@ -1154,13 +1122,7 @@ impl CodexInner {
                         stream.text.push_str(&delta);
                     }
                 }
-                self.emit_event(json!({
-                    "kind": "StreamDelta",
-                    "data": {
-                        "message_id": message_id,
-                        "text": delta
-                    }
-                }));
+                self.emitter.stream_delta(&message_id, &delta);
             }
             reasoning_method if is_reasoning_notification_method(reasoning_method) => {
                 let Some(delta) = extract_codex_reasoning_delta_text(params) else {
@@ -1206,19 +1168,19 @@ impl CodexInner {
             return false;
         };
 
-        let (event_tx, model) = {
+        let (emitter, model) = {
             let state = self.state.lock().await;
             if thread_id == state.thread_id {
                 return false;
             }
-            let Some(event_tx) = find_subagent_event_tx_for_thread(&state, &thread_id) else {
+            let Some(emitter) = find_subagent_emitter_for_thread(&state, &thread_id) else {
                 return false;
             };
             let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
-            (event_tx, model)
+            (emitter, model)
         };
 
-        self.handle_subagent_notification(method, params, &event_tx, &model)
+        self.handle_subagent_notification(method, params, emitter.as_ref(), &model)
             .await;
         true
     }
@@ -1227,7 +1189,7 @@ impl CodexInner {
         &self,
         method: &str,
         params: &Value,
-        event_tx: &mpsc::UnboundedSender<Value>,
+        emitter: &TurnEmitter,
         model: &str,
     ) {
         match method {
@@ -1238,21 +1200,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("turn")
                     .to_string();
-                emit_event_to(
-                    event_tx,
-                    json!({ "kind": "TypingStatusChanged", "data": true }),
-                );
-                emit_event_to(
-                    event_tx,
-                    json!({
-                        "kind": "StreamStart",
-                        "data": {
-                            "message_id": turn_id,
-                            "agent": CODEX_AGENT_NAME,
-                            "model": model
-                        }
-                    }),
-                );
+                emitter.typing_status_changed(true);
+                emitter.stream_start(&turn_id, AgentName(CODEX_AGENT_NAME), Some(model));
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -1266,18 +1215,8 @@ impl CodexInner {
                 let message_id = params
                     .get("itemId")
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_string();
-                emit_event_to(
-                    event_tx,
-                    json!({
-                        "kind": "StreamDelta",
-                        "data": {
-                            "message_id": message_id,
-                            "text": delta
-                        }
-                    }),
-                );
+                    .unwrap_or("assistant");
+                emitter.stream_delta(message_id, &delta);
             }
             reasoning_method if is_reasoning_notification_method(reasoning_method) => {
                 let Some(delta) = extract_codex_reasoning_delta_text(params) else {
@@ -1286,41 +1225,25 @@ impl CodexInner {
                 let message_id = params
                     .get("itemId")
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_string();
-                emit_event_to(
-                    event_tx,
-                    json!({
-                        "kind": "StreamReasoningDelta",
-                        "data": {
-                            "message_id": message_id,
-                            "text": delta
-                        }
-                    }),
-                );
+                    .unwrap_or("assistant");
+                emitter.stream_reasoning_delta(message_id, &delta);
             }
             "item/started" => {
-                self.handle_subagent_item_started(params, event_tx);
+                self.handle_subagent_item_started(params, emitter);
             }
             "item/completed" => {
-                self.handle_subagent_item_completed(params, event_tx, model);
+                self.handle_subagent_item_completed(params, emitter, model);
             }
             "turn/plan/updated" => {
-                emit_event_to(
-                    event_tx,
-                    codex_plan_update_event_from_params(params).unwrap_or_else(|| {
-                        json!({
-                            "kind": "TaskUpdate",
-                            "data": {
-                                "title": "Plan",
-                                "tasks": []
-                            }
-                        })
-                    }),
-                );
+                let tasks = codex_plan_update_task_list_from_params(params)
+                    .unwrap_or_else(|| protocol::TaskList {
+                        title: "Plan".to_string(),
+                        tasks: Vec::new(),
+                    });
+                emitter.task_update(&tasks);
             }
             "turn/completed" => {
-                self.handle_subagent_turn_completed(params, event_tx);
+                self.handle_subagent_turn_completed(params, emitter);
             }
             "error" => {
                 let message = params
@@ -1328,11 +1251,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("Codex error")
                     .to_string();
-                emit_event_to(event_tx, json!({ "kind": "Error", "data": message }));
-                emit_event_to(
-                    event_tx,
-                    json!({ "kind": "TypingStatusChanged", "data": false }),
-                );
+                emitter.backend_error(&message);
+                emitter.typing_status_changed(false);
             }
             _ => {}
         }
@@ -1341,7 +1261,7 @@ impl CodexInner {
     fn handle_subagent_item_started(
         &self,
         params: &Value,
-        event_tx: &mpsc::UnboundedSender<Value>,
+        emitter: &TurnEmitter,
     ) {
         let Some(item) = params.get("item") else {
             return;
@@ -1365,19 +1285,13 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                emit_event_to(
-                    event_tx,
+                emitter.tool_request(
+                    &item_id,
+                    "run_command",
                     json!({
-                        "kind": "ToolRequest",
-                        "data": {
-                            "tool_call_id": item_id,
-                            "tool_name": "run_command",
-                            "tool_type": {
-                                "kind": "RunCommand",
-                                "command": command,
-                                "working_directory": cwd
-                            }
-                        }
+                        "kind": "RunCommand",
+                        "command": command,
+                        "working_directory": cwd
                     }),
                 );
             }
@@ -1390,7 +1304,7 @@ impl CodexInner {
                 for (idx, change) in file_changes.iter().enumerate() {
                     let call_id = codex_file_change_call_id(&item_id, idx, total);
                     emit_modify_file_request_to(
-                        event_tx,
+                        emitter,
                         &call_id,
                         &change.path,
                         &change.before,
@@ -1404,18 +1318,12 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or(item_type)
                     .to_string();
-                emit_event_to(
-                    event_tx,
+                emitter.tool_request(
+                    &item_id,
+                    &tool_name,
                     json!({
-                        "kind": "ToolRequest",
-                        "data": {
-                            "tool_call_id": item_id,
-                            "tool_name": tool_name,
-                            "tool_type": {
-                                "kind": "Other",
-                                "args": item
-                            }
-                        }
+                        "kind": "Other",
+                        "args": item
                     }),
                 );
             }
@@ -1426,7 +1334,7 @@ impl CodexInner {
     fn handle_subagent_item_completed(
         &self,
         params: &Value,
-        event_tx: &mpsc::UnboundedSender<Value>,
+        emitter: &TurnEmitter,
         model: &str,
     ) {
         let Some(item) = params.get("item") else {
@@ -1443,23 +1351,15 @@ impl CodexInner {
             "agentMessage" => {
                 let text = extract_codex_item_text(item);
                 let reasoning = extract_codex_item_reasoning(item);
-                emit_event_to(
-                    event_tx,
-                    json!({
-                        "kind": "StreamEnd",
-                        "data": {
-                            "message": {
-                                "timestamp": unix_now_ms(),
-                                "sender": { "Assistant": { "agent": CODEX_AGENT_NAME } },
-                                "content": text,
-                                "reasoning": reasoning.map(|summary| json!({ "text": summary })).unwrap_or(Value::Null),
-                                "tool_calls": [],
-                                "model_info": { "model": model },
-                                "images": []
-                            }
-                        }
-                    }),
-                );
+                emitter.stream_end(StreamEndPayload {
+                    content: text,
+                    agent: Some(AgentName(CODEX_AGENT_NAME)),
+                    model: Some(model.to_string()),
+                    usage: None,
+                    reasoning,
+                    tool_calls: Vec::new(),
+                    context_breakdown: None,
+                });
             }
             "reasoning" => {
                 let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
@@ -1468,16 +1368,7 @@ impl CodexInner {
                 if !contains_non_whitespace(&reasoning_text) {
                     return;
                 }
-                emit_event_to(
-                    event_tx,
-                    json!({
-                        "kind": "StreamReasoningDelta",
-                        "data": {
-                            "message_id": item_id,
-                            "text": reasoning_text
-                        }
-                    }),
-                );
+                emitter.stream_reasoning_delta(&item_id, &reasoning_text);
             }
             "commandExecution" => {
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
@@ -1487,64 +1378,59 @@ impl CodexInner {
                     .unwrap_or("")
                     .to_string();
                 let success = exit_code == 0;
-                emit_tool_execution_completed_to(
-                    event_tx,
-                    &item_id,
-                    "run_command",
-                    success,
-                    json!({
+                let error_message = if success {
+                    None
+                } else {
+                    Some(format!("Command failed with exit code {exit_code}"))
+                };
+                emitter.tool_completed(ToolCompletedPayload {
+                    tool_call_id: &item_id,
+                    tool_name: "run_command",
+                    tool_result: json!({
                         "kind": "RunCommand",
                         "exit_code": exit_code,
                         "stdout": output,
                         "stderr": ""
                     }),
-                    if success {
-                        None
-                    } else {
-                        Some(format!("Command failed with exit code {exit_code}"))
-                    },
-                );
+                    success,
+                    error: error_message.as_deref(),
+                });
             }
             "fileChange" => {
                 let success = item.get("status").and_then(Value::as_str) == Some("completed");
                 let file_changes = parse_codex_file_changes(item);
+                let err_str = if success {
+                    None
+                } else {
+                    Some("File changes were not applied")
+                };
                 if file_changes.is_empty() {
-                    emit_tool_execution_completed_to(
-                        event_tx,
-                        &item_id,
-                        "file_change",
-                        success,
-                        json!({
+                    emitter.tool_completed(ToolCompletedPayload {
+                        tool_call_id: &item_id,
+                        tool_name: "file_change",
+                        tool_result: json!({
                             "kind": "Other",
                             "result": item
                         }),
-                        if success {
-                            None
-                        } else {
-                            Some("File changes were not applied".to_string())
-                        },
-                    );
+                        success,
+                        error: err_str,
+                    });
                     return;
                 }
                 let total = file_changes.len();
                 for (idx, change) in file_changes.iter().enumerate() {
                     let call_id = codex_file_change_call_id(&item_id, idx, total);
-                    emit_tool_execution_completed_to(
-                        event_tx,
-                        &call_id,
-                        "modify_file",
-                        success,
-                        json!({
+                    emitter.tool_completed(ToolCompletedPayload {
+                        tool_call_id: &call_id,
+                        tool_name: "modify_file",
+                        tool_result: json!({
                             "kind": "ModifyFile",
                             "lines_added": change.lines_added,
                             "lines_removed": change.lines_removed
                         }),
-                        if success {
-                            None
-                        } else {
-                            Some("File changes were not applied".to_string())
-                        },
-                    );
+                        success,
+                        error: err_str,
+                    });
                 }
             }
             "mcpToolCall" | "dynamicToolCall" => {
@@ -1554,21 +1440,21 @@ impl CodexInner {
                     .unwrap_or(item_type);
                 let success = item.get("status").and_then(Value::as_str) == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
-                emit_tool_execution_completed_to(
-                    event_tx,
-                    &item_id,
+                let error_message = if success {
+                    None
+                } else {
+                    Some(format!("{tool_name} failed"))
+                };
+                emitter.tool_completed(ToolCompletedPayload {
+                    tool_call_id: &item_id,
                     tool_name,
-                    success,
-                    json!({
+                    tool_result: json!({
                         "kind": "Other",
                         "result": item
                     }),
-                    if success {
-                        None
-                    } else {
-                        Some(format!("{tool_name} failed"))
-                    },
-                );
+                    success,
+                    error: error_message.as_deref(),
+                });
             }
             "collabToolCall" | "collabAgentToolCall" => {
                 let tool_name = item
@@ -1576,21 +1462,21 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool");
                 let success = codex_item_success(item);
-                emit_tool_execution_completed_to(
-                    event_tx,
-                    &item_id,
+                let error_message = if success {
+                    None
+                } else {
+                    Some(format!("{tool_name} failed"))
+                };
+                emitter.tool_completed(ToolCompletedPayload {
+                    tool_call_id: &item_id,
                     tool_name,
-                    success,
-                    json!({
+                    tool_result: json!({
                         "kind": "Other",
                         "result": item
                     }),
-                    if success {
-                        None
-                    } else {
-                        Some(format!("{tool_name} failed"))
-                    },
-                );
+                    success,
+                    error: error_message.as_deref(),
+                });
             }
             _ => {}
         }
@@ -1599,7 +1485,7 @@ impl CodexInner {
     fn handle_subagent_turn_completed(
         &self,
         params: &Value,
-        event_tx: &mpsc::UnboundedSender<Value>,
+        emitter: &TurnEmitter,
     ) {
         let turn_status = params
             .get("turn")
@@ -1608,20 +1494,13 @@ impl CodexInner {
             .unwrap_or("completed")
             .to_string();
 
-        emit_event_to(
-            event_tx,
-            json!({ "kind": "TypingStatusChanged", "data": false }),
-        );
         if turn_status == "interrupted" {
-            emit_event_to(
-                event_tx,
-                json!({
-                    "kind": "OperationCancelled",
-                    "data": { "message": "Operation cancelled" }
-                }),
-            );
+            emitter.operation_cancelled("Operation cancelled");
             return;
         }
+
+        emitter.typing_status_changed(false);
+
         if turn_status == "failed" {
             let message = params
                 .get("turn")
@@ -1630,7 +1509,7 @@ impl CodexInner {
                 .and_then(Value::as_str)
                 .unwrap_or("Codex turn failed")
                 .to_string();
-            emit_event_to(event_tx, json!({ "kind": "Error", "data": message }));
+            emitter.backend_error(&message);
         }
     }
 
@@ -1642,12 +1521,12 @@ impl CodexInner {
     }
 
     async fn emit_reasoning_delta(&self, params: &Value, delta: String) {
-        let event = {
+        let emission = {
             let mut state = self.state.lock().await;
             apply_reasoning_delta_to_state(&mut state, params, &delta)
         };
-        if let Some(event) = event {
-            self.emit_event(event);
+        if let Some((message_id, text)) = emission {
+            self.emitter.stream_reasoning_delta(&message_id, &text);
         }
     }
 
@@ -1664,15 +1543,13 @@ impl CodexInner {
 
         if terminal {
             self.complete_all_codex_subagents().await;
-            self.emit_event(json!({ "kind": "Error", "data": message }));
-            self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+            self.emitter.backend_error(&message);
+            self.emitter.typing_status_changed(false);
             return;
         }
 
-        self.emit_event(json!({
-            "kind": "SubprocessStderr",
-            "data": format!("Codex warning: {message}")
-        }));
+        self.emitter
+            .subprocess_stderr(&format!("Codex warning: {message}"));
     }
 
     async fn handle_server_request(&self, id: Value, method: &str, params: &Value) {
@@ -1705,21 +1582,18 @@ impl CodexInner {
                     });
                 }
 
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "ask_user_question",
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": {
-                                "question": question,
-                                "type": "command_approval"
-                            }
+                self.emitter.typing_status_changed(false);
+                self.emitter.tool_request(
+                    &tool_call_id,
+                    "ask_user_question",
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "question": question,
+                            "type": "command_approval"
                         }
-                    }
-                }));
+                    }),
+                );
             }
             "item/fileChange/requestApproval" => {
                 let item_id = params
@@ -1743,21 +1617,18 @@ impl CodexInner {
                     });
                 }
 
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "ask_user_question",
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": {
-                                "question": question,
-                                "type": "file_change_approval"
-                            }
+                self.emitter.typing_status_changed(false);
+                self.emitter.tool_request(
+                    &tool_call_id,
+                    "ask_user_question",
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "question": question,
+                            "type": "file_change_approval"
                         }
-                    }
-                }));
+                    }),
+                );
             }
             "execCommandApproval" => {
                 let call_id = params
@@ -1799,21 +1670,18 @@ impl CodexInner {
                     });
                 }
 
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "ask_user_question",
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": {
-                                "question": question,
-                                "type": "command_approval"
-                            }
+                self.emitter.typing_status_changed(false);
+                self.emitter.tool_request(
+                    &tool_call_id,
+                    "ask_user_question",
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "question": question,
+                            "type": "command_approval"
                         }
-                    }
-                }));
+                    }),
+                );
             }
             "applyPatchApproval" => {
                 let call_id = params
@@ -1837,21 +1705,18 @@ impl CodexInner {
                     });
                 }
 
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "ask_user_question",
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": {
-                                "question": question,
-                                "type": "file_change_approval"
-                            }
+                self.emitter.typing_status_changed(false);
+                self.emitter.tool_request(
+                    &tool_call_id,
+                    "ask_user_question",
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "question": question,
+                            "type": "file_change_approval"
                         }
-                    }
-                }));
+                    }),
+                );
             }
             "item/tool/requestUserInput" => {
                 let item_id = params
@@ -1881,29 +1746,25 @@ impl CodexInner {
                     });
                 }
 
-                self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "ask_user_question",
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": {
-                                "questions": questions,
-                                "type": "request_user_input"
-                            }
+                self.emitter.typing_status_changed(false);
+                self.emitter.tool_request(
+                    &tool_call_id,
+                    "ask_user_question",
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "questions": questions,
+                            "type": "request_user_input"
                         }
-                    }
-                }));
+                    }),
+                );
             }
             "mcpServer/elicitation/request" => {
                 let result = codex_mcp_elicitation_result(params);
                 if let Err(err) = self.rpc.respond(id, result).await {
-                    self.emit_event(json!({
-                        "kind": "SubprocessStderr",
-                        "data": format!("Failed to resolve Codex MCP elicitation request: {err}")
-                    }));
+                    self.emitter.subprocess_stderr(&format!(
+                        "Failed to resolve Codex MCP elicitation request: {err}"
+                    ));
                 }
             }
             "item/tool/call" => {
@@ -1916,20 +1777,17 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("dynamic_tool");
 
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": call_id,
-                        "tool_name": tool_name,
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": {
-                                "type": "dynamic_tool_call",
-                                "arguments": params.get("arguments").cloned().unwrap_or(Value::Null)
-                            }
+                self.emitter.tool_request(
+                    call_id,
+                    tool_name,
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "type": "dynamic_tool_call",
+                            "arguments": params.get("arguments").cloned().unwrap_or(Value::Null)
                         }
-                    }
-                }));
+                    }),
+                );
 
                 let response_payload = json!({
                     "success": false,
@@ -2000,18 +1858,15 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": item_id,
-                        "tool_name": "run_command",
-                        "tool_type": {
-                            "kind": "RunCommand",
-                            "command": command,
-                            "working_directory": cwd
-                        }
-                    }
-                }));
+                self.emitter.tool_request(
+                    &item_id,
+                    "run_command",
+                    json!({
+                        "kind": "RunCommand",
+                        "command": command,
+                        "working_directory": cwd
+                    }),
+                );
             }
             "fileChange" => {
                 let file_changes = parse_codex_file_changes(item);
@@ -2048,17 +1903,14 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool")
                     .to_string();
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": item_id,
-                        "tool_name": tool_name,
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": item
-                        }
-                    }
-                }));
+                self.emitter.tool_request(
+                    &item_id,
+                    &tool_name,
+                    json!({
+                        "kind": "Other",
+                        "args": item
+                    }),
+                );
                 self.spawn_codex_subagent_if_needed(item).await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
@@ -2067,17 +1919,14 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or(item_type)
                     .to_string();
-                self.emit_event(json!({
-                    "kind": "ToolRequest",
-                    "data": {
-                        "tool_call_id": item_id,
-                        "tool_name": tool_name,
-                        "tool_type": {
-                            "kind": "Other",
-                            "args": item
-                        }
-                    }
-                }));
+                self.emitter.tool_request(
+                    &item_id,
+                    &tool_name,
+                    json!({
+                        "kind": "Other",
+                        "args": item
+                    }),
+                );
                 self.spawn_codex_subagent_if_needed(item).await;
             }
             _ => {}
@@ -2136,26 +1985,19 @@ impl CodexInner {
                 };
                 let context_breakdown =
                     estimate_context_breakdown(token_usage.as_ref(), &turn_context, Some(&model));
-                self.emit_event(json!({
-                    "kind": "StreamEnd",
-                    "data": {
-                        "message": {
-                            "timestamp": unix_now_ms(),
-                            "sender": { "Assistant": { "agent": CODEX_AGENT_NAME } },
-                            "content": text,
-                            "reasoning": if reasoning.is_empty() {
-                                Value::Null
-                            } else {
-                                json!({ "text": reasoning })
-                            },
-                            "tool_calls": [],
-                            "model_info": { "model": model },
-                            "token_usage": token_usage,
-                            "context_breakdown": context_breakdown,
-                            "images": []
-                        }
-                    }
-                }));
+                self.emitter.stream_end(StreamEndPayload {
+                    content: text,
+                    agent: Some(AgentName(CODEX_AGENT_NAME)),
+                    model: Some(model.clone()),
+                    usage: token_usage,
+                    reasoning: if reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(reasoning)
+                    },
+                    tool_calls: Vec::new(),
+                    context_breakdown: Some(context_breakdown),
+                });
 
                 // If turn completion arrived before this message item, clean up now.
                 // Otherwise keep usage/context until turn completion so follow-up
@@ -2207,13 +2049,7 @@ impl CodexInner {
                 }
 
                 if should_emit {
-                    self.emit_event(json!({
-                        "kind": "StreamReasoningDelta",
-                        "data": {
-                            "message_id": item_id,
-                            "text": reasoning_text
-                        }
-                    }));
+                    self.emitter.stream_reasoning_delta(&item_id, &reasoning_text);
                 }
             }
             "commandExecution" => {
@@ -2426,18 +2262,18 @@ impl CodexInner {
             return;
         };
 
-        let emitter = {
+        let subagent_sink = {
             let state = self.state.lock().await;
             if state.subagent_streams.contains_key(&spawn.item_id) {
                 return;
             }
             state.subagent_emitter.clone()
         };
-        let Some(emitter) = emitter else {
+        let Some(subagent_sink) = subagent_sink else {
             return;
         };
 
-        let handle = emitter
+        let handle = subagent_sink
             .on_subagent_spawned(
                 spawn.item_id.clone(),
                 spawn.name,
@@ -2448,6 +2284,7 @@ impl CodexInner {
             .await;
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
         spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx.clone());
+        let emitter = Arc::new(TurnEmitter::new(raw_event_tx));
 
         let mut state = self.state.lock().await;
         tracing::info!(
@@ -2459,7 +2296,7 @@ impl CodexInner {
             .subagent_streams
             .entry(spawn.item_id)
             .or_insert(CodexSubAgentStream {
-                raw_event_tx,
+                emitter,
                 receiver_thread_id: spawn.receiver_thread_id,
                 external_agent_id: None,
             });
@@ -2562,27 +2399,19 @@ impl CodexInner {
             .unwrap_or_default()
             .into_iter()
             .enumerate()
-            .map(|(idx, step)| {
-                let status = step
-                    .get("status")
+            .map(|(idx, step)| protocol::Task {
+                id: idx as u64 + 1,
+                description: step
+                    .get("step")
                     .and_then(Value::as_str)
-                    .map(map_plan_status)
-                    .unwrap_or("pending");
-                json!({
-                    "id": idx as u64 + 1,
-                    "description": step.get("step").and_then(Value::as_str).unwrap_or("step"),
-                    "status": status
-                })
+                    .unwrap_or("step")
+                    .to_string(),
+                status: map_plan_status(step.get("status").and_then(Value::as_str).unwrap_or("")),
             })
             .collect::<Vec<_>>();
 
-        self.emit_event(json!({
-            "kind": "TaskUpdate",
-            "data": {
-                "title": title,
-                "tasks": tasks
-            }
-        }));
+        self.emitter
+            .task_update(&protocol::TaskList { title, tasks });
     }
 
     async fn handle_turn_completed(&self, params: &Value) {
@@ -2623,16 +2452,15 @@ impl CodexInner {
             state.pending_user_input_bytes = 0;
         }
 
-        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
-
         if turn_status == "interrupted" {
             self.complete_all_codex_subagents().await;
-            self.emit_event(json!({
-                "kind": "OperationCancelled",
-                "data": { "message": "Operation cancelled" }
-            }));
+            // emitter.operation_cancelled runs the full cancel tail:
+            // flush pending tools → OperationCancelled → TypingStatusChanged(false).
+            self.emitter.operation_cancelled("Operation cancelled");
             return;
         }
+
+        self.emitter.typing_status_changed(false);
 
         if turn_status == "failed" {
             let message = params
@@ -2643,7 +2471,7 @@ impl CodexInner {
                 .unwrap_or("Codex turn failed")
                 .to_string();
             self.complete_all_codex_subagents().await;
-            self.emit_event(json!({ "kind": "Error", "data": message }));
+            self.emitter.backend_error(&message);
         }
     }
 
@@ -2655,16 +2483,13 @@ impl CodexInner {
         tool_result: Value,
         error: Option<String>,
     ) {
-        self.emit_event(json!({
-            "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_result": tool_result,
-                "success": success,
-                "error": error
-            }
-        }));
+        self.emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id,
+            tool_name,
+            tool_result,
+            success,
+            error: error.as_deref(),
+        });
     }
 
     fn emit_modify_file_request(
@@ -2674,19 +2499,16 @@ impl CodexInner {
         before: &str,
         after: &str,
     ) {
-        self.emit_event(json!({
-            "kind": "ToolRequest",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": "modify_file",
-                "tool_type": {
-                    "kind": "ModifyFile",
-                    "file_path": file_path,
-                    "before": before,
-                    "after": after
-                }
-            }
-        }));
+        self.emitter.tool_request(
+            tool_call_id,
+            "modify_file",
+            json!({
+                "kind": "ModifyFile",
+                "file_path": file_path,
+                "before": before,
+                "after": after
+            }),
+        );
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
@@ -2700,76 +2522,26 @@ impl CodexInner {
                 })
             })
             .collect::<Vec<_>>();
-
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": "User",
-                "content": content,
-                "tool_calls": [],
-                "images": image_payload
-            }
-        }));
+        self.emitter.user_message(content, image_payload);
     }
 
-    fn emit_event(&self, event: Value) {
-        if let Err(e) = self.event_tx.send(event) {
-            tracing::trace!("event send failed: {e}");
-        }
-    }
-}
-
-fn emit_event_to(event_tx: &mpsc::UnboundedSender<Value>, event: Value) {
-    if let Err(e) = event_tx.send(event) {
-        tracing::trace!("sub-agent event send failed: {e}");
-    }
-}
-
-fn emit_tool_execution_completed_to(
-    event_tx: &mpsc::UnboundedSender<Value>,
-    tool_call_id: &str,
-    tool_name: &str,
-    success: bool,
-    tool_result: Value,
-    error: Option<String>,
-) {
-    emit_event_to(
-        event_tx,
-        json!({
-            "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_result": tool_result,
-                "success": success,
-                "error": error
-            }
-        }),
-    );
 }
 
 fn emit_modify_file_request_to(
-    event_tx: &mpsc::UnboundedSender<Value>,
+    emitter: &TurnEmitter,
     tool_call_id: &str,
     file_path: &str,
     before: &str,
     after: &str,
 ) {
-    emit_event_to(
-        event_tx,
+    emitter.tool_request(
+        tool_call_id,
+        "modify_file",
         json!({
-            "kind": "ToolRequest",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": "modify_file",
-                "tool_type": {
-                    "kind": "ModifyFile",
-                    "file_path": file_path,
-                    "before": before,
-                    "after": after
-                }
-            }
+            "kind": "ModifyFile",
+            "file_path": file_path,
+            "before": before,
+            "after": after
         }),
     );
 }
@@ -2801,10 +2573,10 @@ fn extract_notification_thread_id(params: &Value) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-fn find_subagent_event_tx_for_thread(
+fn find_subagent_emitter_for_thread(
     state: &CodexState,
     thread_id: &str,
-) -> Option<mpsc::UnboundedSender<Value>> {
+) -> Option<Arc<TurnEmitter>> {
     let thread_id = thread_id.trim();
     if thread_id.is_empty() {
         return None;
@@ -2814,7 +2586,7 @@ fn find_subagent_event_tx_for_thread(
         stream.receiver_thread_id.as_deref() == Some(thread_id)
             || stream.external_agent_id.as_deref() == Some(thread_id)
     }) {
-        return Some(stream.raw_event_tx.clone());
+        return Some(Arc::clone(&stream.emitter));
     }
 
     // Early in a spawn, Codex may start emitting sub-agent notifications before
@@ -2824,7 +2596,7 @@ fn find_subagent_event_tx_for_thread(
         .subagent_streams
         .values()
         .filter(|stream| stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none())
-        .map(|stream| stream.raw_event_tx.clone());
+        .map(|stream| Arc::clone(&stream.emitter));
     let first = unresolved.next()?;
     if unresolved.next().is_some() {
         return None;
@@ -2832,7 +2604,7 @@ fn find_subagent_event_tx_for_thread(
     Some(first)
 }
 
-fn codex_plan_update_event_from_params(params: &Value) -> Option<Value> {
+fn codex_plan_update_task_list_from_params(params: &Value) -> Option<protocol::TaskList> {
     let title = params
         .get("explanation")
         .and_then(Value::as_str)
@@ -2843,27 +2615,18 @@ fn codex_plan_update_event_from_params(params: &Value) -> Option<Value> {
     let tasks = plan
         .iter()
         .enumerate()
-        .map(|(idx, step)| {
-            let status = step
-                .get("status")
+        .map(|(idx, step)| protocol::Task {
+            id: idx as u64 + 1,
+            description: step
+                .get("step")
                 .and_then(Value::as_str)
-                .map(map_plan_status)
-                .unwrap_or("pending");
-            json!({
-                "id": idx as u64 + 1,
-                "description": step.get("step").and_then(Value::as_str).unwrap_or("step"),
-                "status": status
-            })
+                .unwrap_or("step")
+                .to_string(),
+            status: map_plan_status(step.get("status").and_then(Value::as_str).unwrap_or("")),
         })
         .collect::<Vec<_>>();
 
-    Some(json!({
-        "kind": "TaskUpdate",
-        "data": {
-            "title": title,
-            "tasks": tasks
-        }
-    }))
+    Some(protocol::TaskList { title, tasks })
 }
 
 fn codex_thread_to_session_metadata(thread: &Value) -> Option<Value> {
@@ -3451,7 +3214,7 @@ fn apply_reasoning_delta_to_state(
     state: &mut CodexState,
     params: &Value,
     delta: &str,
-) -> Option<Value> {
+) -> Option<(String, String)> {
     if delta.is_empty() {
         return None;
     }
@@ -3489,13 +3252,7 @@ fn apply_reasoning_delta_to_state(
         estimate.reasoning_bytes = estimate.reasoning_bytes.saturating_add(delta.len() as u64);
     }
 
-    Some(json!({
-        "kind": "StreamReasoningDelta",
-        "data": {
-            "message_id": message_id,
-            "text": delta
-        }
-    }))
+    Some((message_id, delta))
 }
 
 fn merge_reasoning_delta(existing: &str, incoming: &str) -> String {
@@ -3691,12 +3448,11 @@ fn contains_non_whitespace(text: &str) -> bool {
     text.chars().any(|ch| !ch.is_whitespace())
 }
 
-fn map_plan_status(status: &str) -> &'static str {
+fn map_plan_status(status: &str) -> protocol::TaskStatus {
     match status {
-        "completed" => "completed",
-        "inProgress" => "in_progress",
-        "pending" => "pending",
-        _ => "pending",
+        "completed" => protocol::TaskStatus::Completed,
+        "inProgress" => protocol::TaskStatus::InProgress,
+        _ => protocol::TaskStatus::Pending,
     }
 }
 
@@ -6203,7 +5959,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(CodexInner {
             rpc,
-            event_tx,
+            emitter: Arc::new(TurnEmitter::new(event_tx)),
             state: Mutex::new(test_codex_state()),
             steering_tempfile: None,
         });
@@ -7105,7 +6861,7 @@ Do not describe the tool, and do not skip the tool call."#;
                 state.subagent_streams.insert(
                     "spawn-1".to_string(),
                     CodexSubAgentStream {
-                        raw_event_tx: subagent_tx,
+                        emitter: Arc::new(TurnEmitter::new(subagent_tx)),
                         receiver_thread_id: Some("thread-sub-1".to_string()),
                         external_agent_id: Some("thread-sub-1".to_string()),
                     },
@@ -7226,12 +6982,12 @@ Do not describe the tool, and do not skip the tool call."#;
         let mut state = test_codex_state();
         let params = json!({ "itemId": "reason-item-1" });
 
-        let event = apply_reasoning_delta_to_state(&mut state, &params, "Inspecting constraints.")
-            .expect("reasoning event");
+        let (message_id, text) =
+            apply_reasoning_delta_to_state(&mut state, &params, "Inspecting constraints.")
+                .expect("reasoning event");
 
-        assert_eq!(event["kind"], json!("StreamReasoningDelta"));
-        assert_eq!(event["data"]["message_id"], json!("reason-item-1"));
-        assert_eq!(event["data"]["text"], json!("Inspecting constraints."));
+        assert_eq!(message_id, "reason-item-1");
+        assert_eq!(text, "Inspecting constraints.");
 
         let stream = state.active_stream.as_ref().expect("active stream");
         assert_eq!(stream.message_id, "reason-item-1");
@@ -7251,10 +7007,11 @@ Do not describe the tool, and do not skip the tool call."#;
         state.active_turn_id = None;
         let params = json!({});
 
-        let event = apply_reasoning_delta_to_state(&mut state, &params, "No item id present.")
-            .expect("reasoning event");
+        let (message_id, _) =
+            apply_reasoning_delta_to_state(&mut state, &params, "No item id present.")
+                .expect("reasoning event");
 
-        assert_eq!(event["data"]["message_id"], json!("assistant"));
+        assert_eq!(message_id, "assistant");
     }
 
     #[test]
@@ -7262,10 +7019,10 @@ Do not describe the tool, and do not skip the tool call."#;
         let mut state = test_codex_state();
         let params = json!({ "itemId": "reason-item-1" });
 
-        let first =
+        let (_, first_text) =
             apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted web search")
                 .expect("first reasoning event");
-        assert_eq!(first["data"]["text"], json!("Planning targeted web search"));
+        assert_eq!(first_text, "Planning targeted web search");
 
         let second =
             apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted web search");
@@ -7285,11 +7042,11 @@ Do not describe the tool, and do not skip the tool call."#;
 
         let _ = apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted")
             .expect("first reasoning event");
-        let second =
+        let (_, second_text) =
             apply_reasoning_delta_to_state(&mut state, &params, "Planning targeted web search")
                 .expect("second reasoning event");
 
-        assert_eq!(second["data"]["text"], json!(" web search"));
+        assert_eq!(second_text, " web search");
 
         let stream = state.active_stream.as_ref().expect("active stream");
         assert_eq!(stream.reasoning, "Planning targeted web search");

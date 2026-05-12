@@ -13,6 +13,9 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use protocol::{BackendAccessMode, ToolPolicy};
 
+use crate::backend::turn_emitter::{
+    AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+};
 use crate::backend::{AgentIdentity, SessionCommand, StartupMcpServer, StartupMcpTransport};
 use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
@@ -140,7 +143,7 @@ impl ClaudeSession {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(ClaudeInner {
-            event_tx,
+            emitter: Arc::new(TurnEmitter::new(event_tx)),
             state: Mutex::new(ClaudeState {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
@@ -227,7 +230,11 @@ impl Default for ClaudeState {
 }
 
 struct ClaudeInner {
-    event_tx: mpsc::UnboundedSender<Value>,
+    /// Typed emitter enforcing protocol ordering (stream pairing, tool
+    /// pairing, cancellation sequence). Every wire event — including
+    /// session-control ones like `SessionStarted` / `Error` — goes
+    /// through here; there is no raw `event_tx` fallback.
+    emitter: Arc<TurnEmitter>,
     state: Mutex<ClaudeState>,
 }
 
@@ -522,27 +529,16 @@ impl ClaudeInner {
             SessionCommand::ResumeSession { session_id } => this.resume_session(session_id).await,
             SessionCommand::DeleteSession { session_id } => this.delete_session(session_id).await,
             SessionCommand::ListProfiles => {
-                this.emit_event(json!({
-                    "kind": "ProfilesList",
-                    "data": { "profiles": [] }
-                }));
+                this.emitter.profiles_list(Vec::new());
                 Ok(())
             }
             SessionCommand::SwitchProfile { profile_name: _ } => Ok(()),
             SessionCommand::GetModuleSchemas => {
-                this.emit_event(json!({
-                    "kind": "ModuleSchemas",
-                    "data": { "schemas": [] }
-                }));
+                this.emitter.module_schemas(Vec::new());
                 Ok(())
             }
             SessionCommand::ListModels => {
-                this.emit_event(json!({
-                    "kind": "ModelsList",
-                    "data": {
-                        "models": claude_known_models()
-                    }
-                }));
+                this.emitter.models_list(claude_known_models());
                 Ok(())
             }
             SessionCommand::UpdateSettings {
@@ -671,10 +667,7 @@ impl ClaudeInner {
             // the id on Cancelled/Failed and orphans the session on disk.
             if !ephemeral && let Some(session_id) = outcome.summary().session_id.clone() {
                 self.set_session_id(session_id.clone()).await;
-                self.emit_event(json!({
-                    "kind": "SessionStarted",
-                    "data": { "session_id": session_id }
-                }));
+                self.emitter.session_started(&session_id);
             }
 
             match outcome {
@@ -1099,15 +1092,12 @@ impl ClaudeInner {
             )
         };
 
-        self.emit_event(json!({
-            "kind": "Settings",
-            "data": {
-                "model": model,
-                "effort": effort,
-                // Alias for existing settings UI consumers.
-                "reasoning_effort": effort,
-                "permission_mode": permission_mode,
-            }
+        self.emitter.settings(json!({
+            "model": model,
+            "effort": effort,
+            // Alias for existing settings UI consumers.
+            "reasoning_effort": effort,
+            "permission_mode": permission_mode,
         }));
     }
 
@@ -1122,10 +1112,7 @@ impl ClaudeInner {
         } else {
             list_claude_sessions(&workspace_root).await?
         };
-        self.emit_event(json!({
-            "kind": "SessionsList",
-            "data": { "sessions": sessions }
-        }));
+        self.emitter.sessions_list(sessions);
         Ok(())
     }
 
@@ -1139,12 +1126,9 @@ impl ClaudeInner {
             (state.workspace_root.clone(), state.ssh_host.clone())
         };
 
-        self.emit_event(json!({
-            "kind": "SessionStarted",
-            "data": { "session_id": &normalized }
-        }));
-        self.emit_event(json!({ "kind": "ConversationCleared" }));
-        self.emit_event(json!({ "kind": "TypingStatusChanged", "data": false }));
+        self.emitter.session_started(&normalized);
+        self.emitter.conversation_cleared();
+        self.emitter.typing_status_changed(false);
 
         let replay = if let Some(host) = &ssh_host {
             load_claude_session_history_remote(host, &workspace_root, &normalized).await?
@@ -1154,10 +1138,7 @@ impl ClaudeInner {
         for item in replay.items {
             match item {
                 ClaudeHistoryReplayItem::Message(message) => {
-                    self.emit_event(json!({
-                        "kind": "MessageAdded",
-                        "data": message,
-                    }));
+                    self.emit_replay_message(message);
                 }
                 ClaudeHistoryReplayItem::ToolRequest(tool_call) => {
                     self.emit_tool_request(&tool_call);
@@ -1211,18 +1192,15 @@ impl ClaudeInner {
 
     fn emit_tool_request(&self, tool_call: &ClaudeToolCall) {
         if claude_is_todo_write_tool_name(&tool_call.name)
-            && let Some(task_update) = claude_task_update_from_todo_write(&tool_call.arguments)
+            && let Some(tasks) = claude_task_update_from_todo_write(&tool_call.arguments)
         {
-            self.emit_event(task_update);
+            self.emitter.task_update(&tasks);
         }
-        self.emit_event(json!({
-            "kind": "ToolRequest",
-            "data": {
-                "tool_call_id": tool_call.id,
-                "tool_name": tool_call.name,
-                "tool_type": claude_tool_request_type(&tool_call.name, &tool_call.arguments),
-            }
-        }));
+        self.emitter.tool_request(
+            &tool_call.id,
+            &tool_call.name,
+            claude_tool_request_type(&tool_call.name, &tool_call.arguments),
+        );
     }
 
     fn emit_tool_execution_completed(
@@ -1233,45 +1211,26 @@ impl ClaudeInner {
         tool_result: Value,
         error: Option<String>,
     ) {
-        self.emit_event(json!({
-            "kind": "ToolExecutionCompleted",
-            "data": {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_result": tool_result,
-                "success": success,
-                "error": error,
-            }
-        }));
+        self.emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id,
+            tool_name,
+            tool_result,
+            success,
+            error: error.as_deref(),
+        });
     }
 
     async fn shutdown(&self) {
         self.cancel_active_turn().await;
     }
 
-    fn emit_event(&self, event: Value) {
-        if let Err(e) = self.event_tx.send(event) {
-            tracing::trace!("event send failed: {e}");
-        }
-    }
-
     fn emit_typing_status(&self, typing: bool) {
-        self.emit_event(json!({
-            "kind": "TypingStatusChanged",
-            "data": typing,
-        }));
+        self.emitter.typing_status_changed(typing);
     }
 
     fn emit_stream_start(&self, message_id: &str, model: Option<String>) {
-        let model_value = model.map(Value::String).unwrap_or(Value::Null);
-        self.emit_event(json!({
-            "kind": "StreamStart",
-            "data": {
-                "message_id": message_id,
-                "agent": CLAUDE_AGENT_NAME,
-                "model": model_value,
-            }
-        }));
+        self.emitter
+            .stream_start(message_id, AgentName(CLAUDE_AGENT_NAME), model.as_deref());
     }
 
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
@@ -1281,60 +1240,23 @@ impl ClaudeInner {
             .map(|image| {
                 json!({
                     "media_type": image.media_type,
-                    "data": image.data
+                    "data": image.data,
                 })
             })
             .collect::<Vec<_>>();
-
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": "User",
-                "content": content,
-                "tool_calls": [],
-                "images": image_payload
-            }
-        }));
+        self.emitter.user_message(content, image_payload);
     }
 
     fn emit_stream_delta(&self, message_id: &str, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.emit_event(json!({
-            "kind": "StreamDelta",
-            "data": {
-                "message_id": message_id,
-                "text": text,
-            }
-        }));
+        self.emitter.stream_delta(message_id, text);
     }
 
     fn emit_stream_reasoning_delta(&self, message_id: &str, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.emit_event(json!({
-            "kind": "StreamReasoningDelta",
-            "data": {
-                "message_id": message_id,
-                "text": text,
-            }
-        }));
+        self.emitter.stream_reasoning_delta(message_id, text);
     }
 
     fn emit_system_message(&self, content: &str) {
-        self.emit_event(json!({
-            "kind": "MessageAdded",
-            "data": {
-                "timestamp": unix_now_ms(),
-                "sender": "System",
-                "content": content,
-                "tool_calls": [],
-                "images": [],
-            }
-        }));
+        self.emitter.system_message(content);
     }
 
     fn emit_stream_end(
@@ -1346,33 +1268,15 @@ impl ClaudeInner {
         tool_calls: Vec<Value>,
         context_breakdown: Option<Value>,
     ) {
-        let model_info = model
-            .filter(|m| !m.trim().is_empty())
-            .map(|m| json!({ "model": m }))
-            .unwrap_or(Value::Null);
-        let usage_value = usage.unwrap_or(Value::Null);
-        let reasoning_value = reasoning
-            .filter(|value| !value.trim().is_empty())
-            .map(|text| json!({ "text": text }))
-            .unwrap_or(Value::Null);
-        let context_breakdown_value = context_breakdown.unwrap_or(Value::Null);
-
-        self.emit_event(json!({
-            "kind": "StreamEnd",
-            "data": {
-                "message": {
-                    "timestamp": unix_now_ms(),
-                    "sender": { "Assistant": { "agent": CLAUDE_AGENT_NAME } },
-                    "content": content,
-                    "reasoning": reasoning_value,
-                    "tool_calls": tool_calls,
-                    "model_info": model_info,
-                    "token_usage": usage_value,
-                    "context_breakdown": context_breakdown_value,
-                    "images": [],
-                }
-            }
-        }));
+        self.emitter.stream_end(StreamEndPayload {
+            content,
+            agent: Some(AgentName(CLAUDE_AGENT_NAME)),
+            model,
+            usage,
+            reasoning,
+            tool_calls,
+            context_breakdown,
+        });
     }
 
     fn emit_placeholder_stream_end(&self, model: Option<String>, context_breakdown: Option<Value>) {
@@ -1387,19 +1291,66 @@ impl ClaudeInner {
     }
 
     fn emit_operation_cancelled(&self, message: &str) {
-        self.emit_event(json!({
-            "kind": "OperationCancelled",
-            "data": {
-                "message": message,
-            }
-        }));
+        self.emitter.operation_cancelled(message);
+    }
+
+    /// Re-emit a persisted message from the session replay. Dispatches
+    /// to the right typed method on the emitter based on the sender
+    /// shape. User messages carry an image list; assistant messages
+    /// carry reasoning / tool_calls / usage.
+    fn emit_replay_message(&self, message: Value) {
+        let sender = message.get("sender");
+        if sender.and_then(Value::as_str) == Some("User") {
+            let content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let images = message
+                .get("images")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            self.emitter.user_message(content, images);
+            return;
+        }
+
+        // Anything non-User during replay is an assistant message.
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let reasoning = message.get("reasoning").cloned().filter(|v| !v.is_null());
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let model_info = message.get("model_info").cloned().filter(|v| !v.is_null());
+        let token_usage = message.get("token_usage").cloned().filter(|v| !v.is_null());
+        let context_breakdown = message
+            .get("context_breakdown")
+            .cloned()
+            .filter(|v| !v.is_null());
+        let images = message
+            .get("images")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.emitter.assistant_message(AssistantMessagePayload {
+            agent: AgentName(CLAUDE_AGENT_NAME),
+            content,
+            reasoning,
+            tool_calls,
+            model_info,
+            token_usage,
+            context_breakdown,
+            images,
+        });
     }
 
     fn emit_error(&self, message: &str) {
-        self.emit_event(json!({
-            "kind": "Error",
-            "data": message,
-        }));
+        self.emitter.backend_error(message);
     }
 
     async fn normalize_usage_for_turn(&self, usage: Option<Value>) -> Option<Value> {
@@ -1489,7 +1440,12 @@ impl ClaudeInner {
             return true;
         }
 
-        if summary.emitted_phase_count == 0 {
+        // Close any still-open stream BEFORE emitting tool cleanups, so the
+        // ordering matches the protocol spec (StreamEnd → ToolExecutionCompleted
+        // → OperationCancelled). `emitted_phase_count == 0` catches the
+        // no-content-yet case; `emitter.is_stream_open()` catches a mid-turn
+        // segment that emitted StreamStart without any content before cancel.
+        if summary.emitted_phase_count == 0 || self.emitter.is_stream_open() {
             let selected_model = summary.model.clone().or(model_hint);
             let context_breakdown = estimate_context_breakdown(
                 None,
@@ -1756,16 +1712,7 @@ fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description:
         return;
     }
     stream.has_explicit_task_prompt = true;
-    stream.inner.emit_event(json!({
-        "kind": "MessageAdded",
-        "data": {
-            "timestamp": unix_now_ms(),
-            "sender": "User",
-            "content": trimmed,
-            "tool_calls": [],
-            "images": [],
-        }
-    }));
+    stream.inner.emitter.user_message(trimmed, Vec::new());
 }
 
 async fn ensure_subagent_stream(
@@ -1798,7 +1745,7 @@ async fn ensure_subagent_stream(
 
     // Create a ClaudeInner that routes events to the sub-agent's channel.
     let sa_inner = Arc::new(ClaudeInner {
-        event_tx: raw_event_tx,
+        emitter: Arc::new(TurnEmitter::new(raw_event_tx)),
         state: Mutex::new(ClaudeState::default()),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
@@ -2130,10 +2077,7 @@ fn consume_claude_stream_value(
         let is_new_session = summary.session_id.as_deref() != Some(session_id);
         summary.session_id = Some(session_id.to_string());
         if is_new_session {
-            inner.emit_event(json!({
-                "kind": "SessionStarted",
-                "data": { "session_id": session_id }
-            }));
+            inner.emitter.session_started(session_id);
         }
     }
 
@@ -3540,7 +3484,11 @@ fn claude_is_user_input_tool_name(tool_name: &str) -> bool {
 /// We map this to our protocol's `TaskUpdate` → `TaskList { title, tasks: [Task { id, description, status }] }`.
 /// For in-progress tasks the `activeForm` field is used as the description (present-tense),
 /// otherwise `content` (imperative form).
-fn claude_task_update_from_todo_write(arguments: &Value) -> Option<Value> {
+/// Build a `TaskList` payload from a Claude `TodoWrite` tool call's
+/// `arguments`. Returns `None` when the call does not carry a todos
+/// array. Emission goes through `emitter.task_update`; callers must
+/// deserialize into `protocol::TaskList` before passing on.
+fn claude_task_update_from_todo_write(arguments: &Value) -> Option<protocol::TaskList> {
     let todos = arguments.get("todos")?.as_array()?;
     let mut tasks = Vec::with_capacity(todos.len());
     for (i, todo) in todos.iter().enumerate() {
@@ -3564,13 +3512,11 @@ fn claude_task_update_from_todo_write(arguments: &Value) -> Option<Value> {
             "status": status,
         }));
     }
-    Some(json!({
-        "kind": "TaskUpdate",
-        "data": {
-            "title": "",
-            "tasks": tasks,
-        }
-    }))
+    let value = json!({
+        "title": "",
+        "tasks": tasks,
+    });
+    serde_json::from_value::<protocol::TaskList>(value).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -5859,7 +5805,7 @@ mod tests {
     fn make_test_inner() -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = ClaudeInner {
-            event_tx,
+            emitter: Arc::new(TurnEmitter::new(event_tx)),
             state: Mutex::new(ClaudeState {
                 workspace_root: "/tmp/test-workspace".to_string(),
                 ssh_host: None,
@@ -5879,6 +5825,98 @@ mod tests {
             }),
         };
         (inner, event_rx)
+    }
+
+    #[tokio::test]
+    async fn operation_cancelled_after_mid_turn_stream_start_synthesizes_stream_end() {
+        // Regression: when a cancel arrives after a mid-turn segment StreamStart
+        // but before any content for that segment was emitted, the backend used
+        // to emit OperationCancelled with no closing StreamEnd. That tripped
+        // the protocol validator on the next turn's StreamStart. Per the
+        // protocol spec (ChatEvent::OperationCancelled doc), cancel must first
+        // close any open stream.
+        let (inner, mut rx) = make_test_inner();
+        inner.emit_stream_start("claude-msg-1-seg-1", None);
+        let _ = rx.recv().await.expect("stream_start");
+        inner.emit_operation_cancelled("Claude turn cancelled.");
+        let first = rx.recv().await.expect("first event after cancel");
+        assert_eq!(event_kind(&first), Some("StreamEnd"));
+        let second = rx.recv().await.expect("second event after cancel");
+        assert_eq!(event_kind(&second), Some("OperationCancelled"));
+    }
+
+    #[tokio::test]
+    async fn terminal_cancel_emits_stream_end_then_tool_completed_then_cancelled() {
+        // Full spec ordering: mid-turn, a segment StreamStart fires and a
+        // tool_use arrives. Cancel races before the tool executes. The
+        // terminal handler must emit events in this exact order:
+        //   StreamEnd → ToolExecutionCompleted → OperationCancelled
+        // (see ChatEvent docs in protocol/src/types.rs).
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        let mut segment = SegmentState::default();
+        let base_id = "claude-msg-1".to_string();
+        let mut current_id = base_id.clone();
+
+        // Previous phase emitted a StreamEnd — simulate its effect.
+        summary.emitted_phase_count = 1;
+        // Mid-turn, Claude starts a new segment.
+        inner.emit_stream_start("claude-msg-1-seg-1", None);
+        let _ = rx.recv().await;
+
+        // Inject an unresolved tool request for that segment.
+        consume_claude_stream_value(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_cancelled",
+                        "name": "Bash",
+                        "input": { "command": "sleep 9999" }
+                    }
+                }
+            }),
+            &mut summary,
+            &mut segment,
+            &inner,
+            &base_id,
+            &mut current_id,
+        );
+        // Drain anything consume_claude_stream_value emitted (nothing expected
+        // here, but don't leak into the cancel sequence below).
+        while rx.try_recv().is_ok() {}
+
+        // Cancel fires the terminal path.
+        inner
+            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None)
+            .await;
+        inner.emit_operation_cancelled("Claude turn cancelled.");
+
+        let first = rx.recv().await.expect("first");
+        assert_eq!(event_kind(&first), Some("StreamEnd"));
+        let second = rx.recv().await.expect("second");
+        assert_eq!(event_kind(&second), Some("ToolRequest"));
+        let third = rx.recv().await.expect("third");
+        assert_eq!(event_kind(&third), Some("ToolExecutionCompleted"));
+        let fourth = rx.recv().await.expect("fourth");
+        assert_eq!(event_kind(&fourth), Some("OperationCancelled"));
+    }
+
+    #[tokio::test]
+    async fn operation_cancelled_without_open_stream_does_not_synthesize_stream_end() {
+        let (inner, mut rx) = make_test_inner();
+        inner.emit_operation_cancelled("Claude turn cancelled.");
+        // Protocol contract: cancel without an open stream emits the
+        // OperationCancelled → TypingStatusChanged(false) tail only —
+        // no synthesized StreamEnd.
+        let first = rx.recv().await.expect("OperationCancelled");
+        assert_eq!(event_kind(&first), Some("OperationCancelled"));
+        let second = rx.recv().await.expect("TypingStatusChanged");
+        assert_eq!(event_kind(&second), Some("TypingStatusChanged"));
+        assert!(rx.try_recv().is_err(), "no synthesized StreamEnd expected");
     }
 
     #[test]
@@ -7461,7 +7499,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         (
             Arc::new(ClaudeInner {
-                event_tx,
+                emitter: Arc::new(TurnEmitter::new(event_tx)),
                 state: Mutex::new(ClaudeState {
                     workspace_root,
                     ssh_host: None,
@@ -8391,6 +8429,7 @@ mod tests {
 
     #[test]
     fn todo_write_emits_task_update() {
+        use protocol::TaskStatus;
         let arguments = json!({
             "todos": [
                 {"content": "Fix the bug", "status": "completed", "activeForm": "Fixing the bug"},
@@ -8398,48 +8437,16 @@ mod tests {
                 {"content": "Deploy", "status": "pending", "activeForm": "Deploying"},
             ]
         });
-        let event = claude_task_update_from_todo_write(&arguments)
-            .expect("should produce a TaskUpdate event");
-        assert_eq!(
-            event.get("kind").and_then(Value::as_str),
-            Some("TaskUpdate")
-        );
-        let data = event.get("data").expect("should have data");
-        let tasks = data
-            .get("tasks")
-            .and_then(Value::as_array)
-            .expect("should have tasks");
-        assert_eq!(tasks.len(), 3);
-
-        // Completed task uses `content` (imperative form).
-        assert_eq!(
-            tasks[0].get("description").and_then(Value::as_str),
-            Some("Fix the bug")
-        );
-        assert_eq!(
-            tasks[0].get("status").and_then(Value::as_str),
-            Some("completed")
-        );
-
-        // In-progress task uses `activeForm` (present-tense).
-        assert_eq!(
-            tasks[1].get("description").and_then(Value::as_str),
-            Some("Running tests")
-        );
-        assert_eq!(
-            tasks[1].get("status").and_then(Value::as_str),
-            Some("in_progress")
-        );
-
-        // Pending task uses `content`.
-        assert_eq!(
-            tasks[2].get("description").and_then(Value::as_str),
-            Some("Deploy")
-        );
-        assert_eq!(
-            tasks[2].get("status").and_then(Value::as_str),
-            Some("pending")
-        );
+        let tasks = claude_task_update_from_todo_write(&arguments)
+            .expect("should produce a TaskList payload");
+        assert_eq!(tasks.title, "");
+        assert_eq!(tasks.tasks.len(), 3);
+        assert_eq!(tasks.tasks[0].description, "Fix the bug");
+        assert!(matches!(tasks.tasks[0].status, TaskStatus::Completed));
+        assert_eq!(tasks.tasks[1].description, "Running tests");
+        assert!(matches!(tasks.tasks[1].status, TaskStatus::InProgress));
+        assert_eq!(tasks.tasks[2].description, "Deploy");
+        assert!(matches!(tasks.tasks[2].status, TaskStatus::Pending));
     }
 
     #[test]
@@ -8474,7 +8481,7 @@ mod tests {
                 message_id: "subagent-toolu_spawn".to_string(),
                 has_explicit_task_prompt: false,
                 inner: Arc::new(ClaudeInner {
-                    event_tx: raw_event_tx,
+                    emitter: Arc::new(TurnEmitter::new(raw_event_tx)),
                     state: Mutex::new(ClaudeState::default()),
                 }),
             },
