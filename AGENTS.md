@@ -53,6 +53,23 @@ any action that affects the remote without explicit user approval. The same
 goes for tags, branches on the remote, or anything else that leaves the
 local machine.
 
+### 5. Commits don't need to be strictly standalone
+
+Commits don't need to be surgically scoped to your own change. Previous
+agents sometimes leave the tree in a slightly broken state — unformatted
+files, a test that's flaky or outright broken, a clippy lint that slipped
+in. When pre-commit checks surface that kind of collateral:
+
+- If `cargo fmt` rewrites whitespace in files another agent forgot to
+  format, include those fmt-only hunks in your commit rather than
+  reverting them.
+- If `cargo test` or clippy fails on code you didn't touch because of a
+  previous agent's mistake, debug and fix it as part of your commit. Do
+  not skip the check or stash the failure for someone else.
+
+Mention the collateral fix in the commit body so it's discoverable, but
+don't split it into a separate commit just for purity.
+
 ## Frontend UI tests are inviolate
 
 Component-level wasm tests live inline in their component file under
