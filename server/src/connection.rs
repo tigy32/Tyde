@@ -65,34 +65,52 @@ pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<
     };
 
     // Wait for the first task to finish, then tear the scope down.
+    // Drain only the two losers — re-polling a JoinHandle that tokio::select!
+    // already resolved panics with "JoinHandle polled after completion".
+    enum SelectWinner {
+        Reader,
+        Writer,
+        App,
+    }
     let mut reader_task = reader_task;
     let mut writer_task = writer_task;
     let mut app_task = app_task;
-    let result = tokio::select! {
+    let (result, winner) = tokio::select! {
         res = &mut reader_task => {
             cancel.cancel();
             writer_task.abort();
             app_task.abort();
-            res.unwrap_or(Ok(()))
+            (res.unwrap_or(Ok(())), SelectWinner::Reader)
         }
         res = &mut writer_task => {
             cancel.cancel();
             reader_task.abort();
             app_task.abort();
-            res.unwrap_or(Ok(()))
+            (res.unwrap_or(Ok(())), SelectWinner::Writer)
         }
         res = &mut app_task => {
             cancel.cancel();
             reader_task.abort();
             writer_task.abort();
-            res.unwrap_or(Ok(()))
+            (res.unwrap_or(Ok(())), SelectWinner::App)
         }
     };
 
-    // Drain join handles so Drop runs (socket halves close, fd released).
-    let _ = reader_task.await;
-    let _ = writer_task.await;
-    let _ = app_task.await;
+    // Drain the two aborted tasks so their Drop runs (socket halves close, fd released).
+    match winner {
+        SelectWinner::Reader => {
+            let _ = writer_task.await;
+            let _ = app_task.await;
+        }
+        SelectWinner::Writer => {
+            let _ = reader_task.await;
+            let _ = app_task.await;
+        }
+        SelectWinner::App => {
+            let _ = reader_task.await;
+            let _ = writer_task.await;
+        }
+    }
 
     host.unregister_host_stream(&host_stream).await;
     result
