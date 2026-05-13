@@ -12,7 +12,9 @@ use crate::acp::{
     extract_text_from_update, extract_tool_call_id, map_plan_status, normalize_update_type,
     parse_tool_call_completion, parse_tool_call_request,
 };
-use crate::backend::turn_emitter::{AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter};
+use crate::backend::turn_emitter::{
+    AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+};
 use crate::backend::{SessionCommand, StartupMcpServer, render_combined_spawn_instructions};
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
@@ -1065,11 +1067,8 @@ impl KiroInner {
 
         if let Some(start_message_id) = started_message_id {
             self.emitter.typing_status_changed(true);
-            self.emitter.stream_start(
-                &start_message_id,
-                AgentName(KIRO_AGENT_NAME),
-                Some(&model),
-            );
+            self.emitter
+                .stream_start(&start_message_id, AgentName(KIRO_AGENT_NAME), Some(&model));
         }
 
         self.emitter.stream_delta(&stream_message_id, &delta);
@@ -1608,8 +1607,8 @@ impl KiroInner {
                 .unwrap_or_else(|| "kiro".to_string())
         };
 
-        self.emitter.assistant_message(
-            crate::backend::turn_emitter::AssistantMessagePayload {
+        self.emitter
+            .assistant_message(crate::backend::turn_emitter::AssistantMessagePayload {
                 agent: AgentName(KIRO_AGENT_NAME),
                 content: text,
                 reasoning: None,
@@ -1618,8 +1617,7 @@ impl KiroInner {
                 token_usage: None,
                 context_breakdown: None,
                 images: Vec::new(),
-            },
-        );
+            });
         self.state
             .lock()
             .await

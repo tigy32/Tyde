@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::process_env;
@@ -22,7 +23,7 @@ pub struct ImageAttachment {
 
 pub struct SubprocessBridge {
     stdin: Arc<Mutex<ChildStdin>>,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<AsyncGroupChild>>>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -72,13 +73,25 @@ impl SubprocessBridge {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
+                .group_spawn()
                 .map_err(|e| format!("Failed to spawn subprocess: {e:?}"))?
         };
 
-        let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
-        let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-        let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+        let stdin = child
+            .inner()
+            .stdin
+            .take()
+            .ok_or("Failed to capture stdin")?;
+        let stdout = child
+            .inner()
+            .stdout
+            .take()
+            .ok_or("Failed to capture stdout")?;
+        let stderr = child
+            .inner()
+            .stderr
+            .take()
+            .ok_or("Failed to capture stderr")?;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 

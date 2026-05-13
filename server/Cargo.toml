@@ -13,6 +13,7 @@ devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
 axum = "0.8"
 base64 = "0.22"
+command-group = { version = "5", features = ["with-tokio"] }
 indexmap = "2"
 notify = "8"
 portable-pty = "0.8"

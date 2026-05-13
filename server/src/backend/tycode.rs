@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use command_group::AsyncCommandGroup;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -184,7 +185,7 @@ impl Backend for TycodeBackend {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let mut child = match command.spawn() {
+            let mut child = match command.group_spawn() {
                 Ok(c) => c,
                 Err(err) => {
                     tracing::error!("Failed to spawn tycode-subprocess: {err}");
@@ -193,7 +194,7 @@ impl Backend for TycodeBackend {
                 }
             };
 
-            let stdin = match child.stdin.take() {
+            let stdin = match child.inner().stdin.take() {
                 Some(s) => s,
                 None => {
                     tracing::error!("Failed to capture tycode-subprocess stdin");
@@ -202,7 +203,7 @@ impl Backend for TycodeBackend {
                     return;
                 }
             };
-            let stdout = match child.stdout.take() {
+            let stdout = match child.inner().stdout.take() {
                 Some(s) => s,
                 None => {
                     tracing::error!("Failed to capture tycode-subprocess stdout");
@@ -211,7 +212,7 @@ impl Backend for TycodeBackend {
                     return;
                 }
             };
-            let stderr = match child.stderr.take() {
+            let stderr = match child.inner().stderr.take() {
                 Some(s) => s,
                 None => {
                     tracing::error!("Failed to capture tycode-subprocess stderr");
@@ -444,7 +445,7 @@ impl Backend for TycodeBackend {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let mut child = match command.spawn() {
+            let mut child = match command.group_spawn() {
                 Ok(c) => c,
                 Err(err) => {
                     tracing::error!("Failed to spawn tycode-subprocess for resume: {err}");
@@ -452,21 +453,21 @@ impl Backend for TycodeBackend {
                 }
             };
 
-            let stdin = match child.stdin.take() {
+            let stdin = match child.inner().stdin.take() {
                 Some(s) => s,
                 None => {
                     tracing::error!("Failed to capture tycode-subprocess stdin for resume");
                     return;
                 }
             };
-            let stdout = match child.stdout.take() {
+            let stdout = match child.inner().stdout.take() {
                 Some(s) => s,
                 None => {
                     tracing::error!("Failed to capture tycode-subprocess stdout for resume");
                     return;
                 }
             };
-            let stderr = match child.stderr.take() {
+            let stderr = match child.inner().stderr.take() {
                 Some(s) => s,
                 None => {
                     tracing::error!("Failed to capture tycode-subprocess stderr for resume");

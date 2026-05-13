@@ -3,9 +3,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use protocol::BackendAccessMode;
@@ -345,11 +346,11 @@ impl AcpBridge {
         }
 
         let mut child = cmd
-            .spawn()
+            .group_spawn()
             .map_err(|err| format!("Failed to spawn terminal command '{command}': {err}"))?;
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = child.inner().stdout.take();
+        let stderr = child.inner().stderr.take();
 
         let terminal = Arc::new(Mutex::new(AcpTerminal {
             child: Some(child),
@@ -796,7 +797,7 @@ pub fn acp_mcp_servers_json(startup_mcp_servers: &[StartupMcpServer]) -> Vec<Val
 }
 
 struct AcpTerminal {
-    child: Option<Child>,
+    child: Option<AsyncGroupChild>,
     output: Vec<u8>,
     output_limit: usize,
     truncated: bool,
@@ -1042,7 +1043,7 @@ struct AcpRpc {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingRpcMap,
     next_id: AtomicU64,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<AsyncGroupChild>>>,
 }
 
 impl AcpRpc {
@@ -1083,13 +1084,25 @@ impl AcpRpc {
             {
                 cmd.current_dir(path);
             }
-            cmd.spawn()
+            cmd.group_spawn()
                 .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?
         };
 
-        let stdin = child.stdin.take().ok_or("Failed to capture ACP stdin")?;
-        let stdout = child.stdout.take().ok_or("Failed to capture ACP stdout")?;
-        let stderr = child.stderr.take().ok_or("Failed to capture ACP stderr")?;
+        let stdin = child
+            .inner()
+            .stdin
+            .take()
+            .ok_or("Failed to capture ACP stdin")?;
+        let stdout = child
+            .inner()
+            .stdout
+            .take()
+            .ok_or("Failed to capture ACP stdout")?;
+        let stderr = child
+            .inner()
+            .stderr
+            .take()
+            .ok_or("Failed to capture ACP stderr")?;
 
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));

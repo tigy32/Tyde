@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use command_group::AsyncCommandGroup;
 use serde_json::{Map, Value, from_str, json, to_value};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -14,7 +15,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use protocol::BackendAccessMode;
 
-use crate::backend::turn_emitter::{AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter};
+use crate::backend::turn_emitter::{
+    AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+};
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
@@ -569,7 +572,7 @@ impl GeminiInner {
             cmd
         };
 
-        let mut child = match command.spawn() {
+        let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(err) => {
                 restore_gemini_mcp_settings(mcp_cleanup.take());
@@ -580,7 +583,7 @@ impl GeminiInner {
             }
         };
 
-        let stdout = match child.stdout.take() {
+        let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
             None => {
                 restore_gemini_mcp_settings(mcp_cleanup.take());
@@ -591,7 +594,7 @@ impl GeminiInner {
             }
         };
 
-        let stderr = match child.stderr.take() {
+        let stderr = match child.inner().stderr.take() {
             Some(stderr) => stderr,
             None => {
                 restore_gemini_mcp_settings(mcp_cleanup.take());

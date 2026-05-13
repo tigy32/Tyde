@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use command_group::AsyncCommandGroup;
 use protocol::{
     BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupInfo, BackendSetupPayload,
     BackendSetupStatus, HostPlatform,
@@ -198,9 +199,9 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
     }
-    let mut child = command.spawn().ok()?;
-    let mut stdout_pipe = child.stdout.take()?;
-    let mut stderr_pipe = child.stderr.take()?;
+    let mut child = command.group_spawn().ok()?;
+    let mut stdout_pipe = child.inner().stdout.take()?;
+    let mut stderr_pipe = child.inner().stderr.take()?;
 
     let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
         Ok(Ok(status)) => status,

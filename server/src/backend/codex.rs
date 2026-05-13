@@ -6,14 +6,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use protocol::BackendAccessMode;
 
-use crate::backend::turn_emitter::{AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter};
+use crate::backend::turn_emitter::{
+    AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
+};
 use crate::backend::{
     SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
 };
@@ -1235,11 +1238,12 @@ impl CodexInner {
                 self.handle_subagent_item_completed(params, emitter, model);
             }
             "turn/plan/updated" => {
-                let tasks = codex_plan_update_task_list_from_params(params)
-                    .unwrap_or_else(|| protocol::TaskList {
+                let tasks = codex_plan_update_task_list_from_params(params).unwrap_or_else(|| {
+                    protocol::TaskList {
                         title: "Plan".to_string(),
                         tasks: Vec::new(),
-                    });
+                    }
+                });
                 emitter.task_update(&tasks);
             }
             "turn/completed" => {
@@ -1258,11 +1262,7 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_item_started(
-        &self,
-        params: &Value,
-        emitter: &TurnEmitter,
-    ) {
+    fn handle_subagent_item_started(&self, params: &Value, emitter: &TurnEmitter) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -1331,12 +1331,7 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_item_completed(
-        &self,
-        params: &Value,
-        emitter: &TurnEmitter,
-        model: &str,
-    ) {
+    fn handle_subagent_item_completed(&self, params: &Value, emitter: &TurnEmitter, model: &str) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -1482,11 +1477,7 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_turn_completed(
-        &self,
-        params: &Value,
-        emitter: &TurnEmitter,
-    ) {
+    fn handle_subagent_turn_completed(&self, params: &Value, emitter: &TurnEmitter) {
         let turn_status = params
             .get("turn")
             .and_then(|v| v.get("status"))
@@ -2049,7 +2040,8 @@ impl CodexInner {
                 }
 
                 if should_emit {
-                    self.emitter.stream_reasoning_delta(&item_id, &reasoning_text);
+                    self.emitter
+                        .stream_reasoning_delta(&item_id, &reasoning_text);
                 }
             }
             "commandExecution" => {
@@ -2524,7 +2516,6 @@ impl CodexInner {
             .collect::<Vec<_>>();
         self.emitter.user_message(content, image_payload);
     }
-
 }
 
 fn emit_modify_file_request_to(
@@ -4196,7 +4187,7 @@ struct CodexRpc {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingRpcMap,
     next_id: AtomicU64,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<AsyncGroupChild>>>,
 }
 
 impl CodexRpc {
@@ -4227,16 +4218,22 @@ impl CodexRpc {
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()
+                .group_spawn()
                 .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?
         };
 
-        let stdin = child.stdin.take().ok_or("Failed to capture Codex stdin")?;
+        let stdin = child
+            .inner()
+            .stdin
+            .take()
+            .ok_or("Failed to capture Codex stdin")?;
         let stdout = child
+            .inner()
             .stdout
             .take()
             .ok_or("Failed to capture Codex stdout")?;
         let stderr = child
+            .inner()
             .stderr
             .take()
             .ok_or("Failed to capture Codex stderr")?;
@@ -4666,7 +4663,7 @@ impl Backend for CodexBackend {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()
+                .group_spawn()
             {
                 Ok(c) => c,
                 Err(e) => {
@@ -4678,8 +4675,8 @@ impl Backend for CodexBackend {
                 }
             };
 
-            let stdin = child.stdin.take().expect("capture codex stdin");
-            let stdout = child.stdout.take().expect("capture codex stdout");
+            let stdin = child.inner().stdin.take().expect("capture codex stdin");
+            let stdout = child.inner().stdout.take().expect("capture codex stdout");
 
             let stdin = Arc::new(Mutex::new(stdin));
             let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
@@ -5947,9 +5944,13 @@ mod tests {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
+            .group_spawn()
             .expect("spawn test child");
-        let stdin = child.stdin.take().expect("capture test child stdin");
+        let stdin = child
+            .inner()
+            .stdin
+            .take()
+            .expect("capture test child stdin");
         let rpc = CodexRpc {
             stdin: Arc::new(Mutex::new(stdin)),
             pending: Arc::new(Mutex::new(HashMap::new())),

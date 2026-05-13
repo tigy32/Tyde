@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use command_group::AsyncCommandGroup;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs as tokio_fs;
@@ -873,7 +874,7 @@ impl ClaudeInner {
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            match cmd.spawn() {
+            match cmd.group_spawn() {
                 Ok(child) => child,
                 Err(err) => {
                     return TurnOutcome::Failed {
@@ -884,7 +885,7 @@ impl ClaudeInner {
             }
         };
 
-        let mut stdin = match child.stdin.take() {
+        let mut stdin = match child.inner().stdin.take() {
             Some(stdin) => stdin,
             None => {
                 return TurnOutcome::Failed {
@@ -919,7 +920,7 @@ impl ClaudeInner {
         }
         drop(stdin);
 
-        let stdout = match child.stdout.take() {
+        let stdout = match child.inner().stdout.take() {
             Some(stdout) => stdout,
             None => {
                 return TurnOutcome::Failed {
@@ -929,7 +930,7 @@ impl ClaudeInner {
             }
         };
 
-        let stderr = match child.stderr.take() {
+        let stderr = match child.inner().stderr.take() {
             Some(stderr) => stderr,
             None => {
                 return TurnOutcome::Failed {

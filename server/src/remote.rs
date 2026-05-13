@@ -1,6 +1,7 @@
 use std::process::Output;
 
-use tokio::process::{Child, Command};
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use tokio::process::Command;
 
 pub fn parse_remote_workspace_roots(
     workspace_roots: &[String],
@@ -64,7 +65,7 @@ pub async fn spawn_remote_process(
     program: &str,
     args: &[String],
     cwd: Option<&str>,
-) -> Result<Child, String> {
+) -> Result<AsyncGroupChild, String> {
     let mut remote_parts = Vec::new();
     if let Some(path) = cwd.map(str::trim).filter(|v| !v.is_empty()) {
         remote_parts.push(format!("cd {} &&", shell_quote_arg(path)));
@@ -82,6 +83,6 @@ pub async fn spawn_remote_process(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .group_spawn()
         .map_err(|err| format!("Failed to spawn remote process over ssh: {err}"))
 }

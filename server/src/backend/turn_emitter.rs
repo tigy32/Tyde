@@ -37,7 +37,7 @@
 use std::collections::HashSet;
 
 use indexmap::IndexMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use protocol::TaskList;
