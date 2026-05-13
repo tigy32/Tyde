@@ -377,14 +377,7 @@ fn failed_result_body(result: Option<&ToolExecutionResult>) -> AnyView {
 fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static str, Option<String>) {
     match tool_type {
         ToolRequestType::ModifyFile { file_path, .. } => ("\u{270f}", Some(short_path(file_path))),
-        ToolRequestType::RunCommand { command, .. } => {
-            let short = if command.len() > 60 {
-                format!("{}\u{2026}", &command[..57])
-            } else {
-                command.clone()
-            };
-            ("\u{25b6}", Some(short))
-        }
+        ToolRequestType::RunCommand { command, .. } => ("\u{25b6}", Some(command.clone())),
         ToolRequestType::ReadFiles { file_paths } => {
             let label = if file_paths.len() == 1 {
                 short_path(&file_paths[0])
