@@ -1,7 +1,37 @@
 use std::path::{Path, PathBuf};
 
-use protocol::{AgentId, FrameKind};
+use protocol::{AgentId, CustomAgentNotifyPayload, Envelope, FrameKind};
 use tyde_dev_driver::agent_control::AgentControlHandle;
+
+// `cargo` compiles each integration test file as its own binary, so a
+// helper used in only some of them looks dead in the others. The
+// `#[allow(dead_code)]` covers that — every test file that needs to
+// skip the host's built-in team CustomAgent replay calls
+// `is_builtin_team_custom_agent_notify`.
+#[allow(dead_code)]
+const BUILTIN_TEAM_CUSTOM_AGENT_IDS: &[&str] = &[
+    "tyde-team-lead",
+    "tyde-code-reviewer",
+    "tyde-frontend-engineer",
+    "tyde-backend-engineer",
+    "tyde-test-qa-engineer",
+];
+
+#[allow(dead_code)]
+pub fn is_builtin_team_custom_agent_notify(env: &Envelope) -> bool {
+    if env.kind != FrameKind::CustomAgentNotify {
+        return false;
+    }
+    let payload = env
+        .parse_payload::<CustomAgentNotifyPayload>()
+        .expect("parse CustomAgentNotifyPayload while checking built-in team custom agent");
+    match payload {
+        CustomAgentNotifyPayload::Upsert { custom_agent } => {
+            BUILTIN_TEAM_CUSTOM_AGENT_IDS.contains(&custom_agent.id.0.as_str())
+        }
+        CustomAgentNotifyPayload::Delete { .. } => false,
+    }
+}
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()

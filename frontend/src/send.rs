@@ -5,10 +5,13 @@ use protocol::{
     CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
     McpServerDeletePayload, McpServerId, McpServerUpsertPayload, SkillRefreshPayload, Steering,
-    SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
-    TeamDeletePayload, TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload,
-    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberUpdatePayload,
-    TeamSetManagerPayload,
+    SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
+    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload, TeamMemberUpdatePayload,
+    TeamSetManagerPayload, TeamTemplateId,
 };
 use serde::Serialize;
 
@@ -166,26 +169,7 @@ pub async fn skill_refresh(host_id: &str, host_stream: StreamPath) -> Result<(),
     .await
 }
 
-pub async fn team_create(
-    host_id: &str,
-    host_stream: StreamPath,
-    name: String,
-    manager: TeamMemberCreateSpec,
-) -> Result<(), String> {
-    send_frame(
-        host_id,
-        host_stream,
-        FrameKind::TeamCreate,
-        &TeamCreatePayload { name, manager },
-    )
-    .await
-}
-
-pub async fn team_delete(
-    host_id: &str,
-    host_stream: StreamPath,
-    id: TeamId,
-) -> Result<(), String> {
+pub async fn team_delete(host_id: &str, host_stream: StreamPath, id: TeamId) -> Result<(), String> {
     send_frame(
         host_id,
         host_stream,
@@ -270,6 +254,170 @@ pub async fn team_member_activate(
             prompt,
             images,
         },
+    )
+    .await
+}
+
+pub async fn team_draft_create(
+    host_id: &str,
+    host_stream: StreamPath,
+    template_id: Option<TeamTemplateId>,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftCreate,
+        &TeamDraftCreatePayload { template_id },
+    )
+    .await
+}
+
+pub async fn team_draft_set_name(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+    name: String,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftUpdate,
+        &TeamDraftUpdatePayload::SetName { draft_id, name },
+    )
+    .await
+}
+
+pub async fn team_draft_replace_member(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+    member: TeamDraftMemberEdit,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftUpdate,
+        &TeamDraftUpdatePayload::ReplaceMember { draft_id, member },
+    )
+    .await
+}
+
+pub async fn team_draft_add_report(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftUpdate,
+        &TeamDraftUpdatePayload::AddReport { draft_id },
+    )
+    .await
+}
+
+pub async fn team_draft_remove_member(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+    member_id: TeamDraftMemberId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftUpdate,
+        &TeamDraftUpdatePayload::RemoveMember {
+            draft_id,
+            member_id,
+        },
+    )
+    .await
+}
+
+pub async fn team_draft_set_member_profile(
+    host_id: &str,
+    host_stream: StreamPath,
+    payload: TeamDraftUpdatePayload,
+) -> Result<(), String> {
+    send_frame(host_id, host_stream, FrameKind::TeamDraftUpdate, &payload).await
+}
+
+pub async fn team_draft_shuffle(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+    member_id: Option<TeamDraftMemberId>,
+    scope: TeamDraftShuffleScope,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftShuffle,
+        &TeamDraftShufflePayload {
+            draft_id,
+            member_id,
+            scope,
+        },
+    )
+    .await
+}
+
+pub async fn team_member_shuffle(
+    host_id: &str,
+    host_stream: StreamPath,
+    team_id: TeamId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamMemberShuffle,
+        &TeamMemberShufflePayload { team_id },
+    )
+    .await
+}
+
+pub async fn team_draft_apply_template(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+    template_id: TeamTemplateId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftApplyTemplate,
+        &TeamDraftApplyTemplatePayload {
+            draft_id,
+            template_id,
+        },
+    )
+    .await
+}
+
+pub async fn team_draft_commit(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftCommit,
+        &TeamDraftCommitPayload { draft_id },
+    )
+    .await
+}
+
+pub async fn team_draft_discard(
+    host_id: &str,
+    host_stream: StreamPath,
+    draft_id: TeamDraftId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDraftDiscard,
+        &TeamDraftDiscardPayload { draft_id },
     )
     .await
 }

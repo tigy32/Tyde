@@ -454,24 +454,6 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                     }
                                 })
                             });
-                        // Reactive pending_team_member for draft manager tabs.
-                        let pending_state = state.clone();
-                        let pending_signal: Signal<Option<crate::state::PendingTeamMember>> =
-                            Signal::derive(move || {
-                                pending_state.center_zone.with(|cz| {
-                                    match cz
-                                        .tabs
-                                        .iter()
-                                        .find(|t| t.id == tab_id)
-                                        .map(|t| &t.content)
-                                    {
-                                        Some(TabContent::Chat { pending_team_member, .. }) => {
-                                            pending_team_member.clone()
-                                        }
-                                        _ => None,
-                                    }
-                                })
-                            });
                         // `is_active` Signal lets `ChatView` gate the
                         // `ChatInput` on active-tab. Without this every
                         // hidden chat tab kept its `ChatInput` mounted,
@@ -490,7 +472,6 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                 tab_id=tab_id
                                 agent_ref=agent_ref_signal
                                 is_active=is_active_signal
-                                pending_team_member=pending_signal
                             />
                         }.into_any()
                     }

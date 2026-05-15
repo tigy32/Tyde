@@ -78,7 +78,10 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::McpServerNotify(_)
                 | HostEvent::TeamNotify(_)
                 | HostEvent::TeamMemberNotify(_)
-                | HostEvent::TeamMemberBindingNotify(_) => {}
+                | HostEvent::TeamMemberBindingNotify(_)
+                | HostEvent::TeamPresetCatalogNotify(_)
+                | HostEvent::TeamDraftNotify(_)
+                | HostEvent::TeamMemberShuffleSuggestionNotify(_) => {}
             }
 
             if session_list_tx.is_none() && new_agent_tx.is_none() {

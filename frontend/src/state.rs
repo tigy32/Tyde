@@ -10,8 +10,10 @@ use protocol::{
     ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
     ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId,
     ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
-    Steering, SteeringId, StreamPath, TaskList, Team, TeamId, TeamMember, TeamMemberBindingPayload,
-    TeamMemberId, TerminalId, ToolExecutionCompletedData, ToolRequest,
+    Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
+    ToolExecutionCompletedData, ToolRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -570,6 +572,15 @@ pub struct ActiveProjectRef {
     pub project_id: ProjectId,
 }
 
+/// Latest server-emitted Add-report shuffle suggestion plus a monotonic
+/// `serial` so the open dialog can apply only fresh suggestions and
+/// ignore stale ones still sitting in state on re-open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamMemberShuffleSuggestionEntry {
+    pub suggestion: TeamMemberShuffleSuggestion,
+    pub serial: u64,
+}
+
 /// Per-project filter state for the Agents panel. Stored per active project
 /// (keyed by `Option<ActiveProjectRef>`, where `None` represents the Home
 /// project) so user toggles persist across project switches for the life of
@@ -695,6 +706,18 @@ pub struct AppState {
     /// reactivated.
     pub team_member_bindings:
         RwSignal<HashMap<String, HashMap<TeamMemberId, TeamMemberBindingPayload>>>,
+    /// Server-owned team creation catalog records. The frontend renders these
+    /// options but does not define preset/template semantics locally.
+    pub team_preset_catalogs: RwSignal<HashMap<String, TeamPresetCatalog>>,
+    /// Server-owned in-progress team drafts, keyed by host then draft id.
+    pub team_drafts: RwSignal<HashMap<String, HashMap<TeamDraftId, TeamDraft>>>,
+    /// Latest server-emitted Add-report shuffle suggestion per host/team.
+    /// The frontend bumps `serial` each time a notify arrives so the open
+    /// dialog can detect a fresh suggestion and apply it without
+    /// re-applying stale ones on re-open. Suggestions are ephemeral
+    /// (never replayed on host attach).
+    pub team_member_shuffle_suggestions:
+        RwSignal<HashMap<String, HashMap<TeamId, TeamMemberShuffleSuggestionEntry>>>,
     pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
     /// Per-review full state. Server is the source of truth: a `ReviewView`
     /// subscribes to `/review/<id>` and dispatch applies `ReviewEvent`
@@ -845,6 +868,9 @@ impl AppState {
             teams: RwSignal::new(HashMap::new()),
             team_members: RwSignal::new(HashMap::new()),
             team_member_bindings: RwSignal::new(HashMap::new()),
+            team_preset_catalogs: RwSignal::new(HashMap::new()),
+            team_drafts: RwSignal::new(HashMap::new()),
+            team_member_shuffle_suggestions: RwSignal::new(HashMap::new()),
             agents_panel_filters: RwSignal::new(HashMap::new()),
             reviews: RwSignal::new(HashMap::new()),
             review_summaries: RwSignal::new(HashMap::new()),
@@ -1036,6 +1062,34 @@ impl AppState {
         self.command_errors_by_host.get().get(&host_id).cloned()
     }
 
+    /// Apply a server-emitted Add-report shuffle suggestion notify. Each
+    /// notify bumps a per-(host, team) serial so the open dialog can
+    /// detect fresh suggestions without re-applying stale ones.
+    pub fn record_team_member_shuffle_suggestion(
+        &self,
+        host_id: &str,
+        payload: TeamMemberShuffleSuggestionNotifyPayload,
+    ) {
+        let TeamMemberShuffleSuggestionNotifyPayload {
+            team_id,
+            suggestion,
+        } = payload;
+        self.team_member_shuffle_suggestions.update(|map| {
+            let host_map = map.entry(host_id.to_owned()).or_default();
+            let previous_serial = host_map
+                .get(&team_id)
+                .map(|entry| entry.serial)
+                .unwrap_or(0);
+            host_map.insert(
+                team_id,
+                TeamMemberShuffleSuggestionEntry {
+                    suggestion,
+                    serial: previous_serial.saturating_add(1),
+                },
+            );
+        });
+    }
+
     pub fn active_project_ref_untracked(&self) -> Option<ActiveProjectRef> {
         self.active_project.get_untracked()
     }
@@ -1215,6 +1269,15 @@ impl AppState {
             map.remove(host_id);
         });
         self.team_member_bindings.update(|map| {
+            map.remove(host_id);
+        });
+        self.team_preset_catalogs.update(|map| {
+            map.remove(host_id);
+        });
+        self.team_drafts.update(|map| {
+            map.remove(host_id);
+        });
+        self.team_member_shuffle_suggestions.update(|map| {
             map.remove(host_id);
         });
         self.projects

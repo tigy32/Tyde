@@ -25,6 +25,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::host::HostHandle;
+use crate::team_registry::team_preset_catalog;
 
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
@@ -210,8 +211,16 @@ struct TeamDescribeResult {
 #[derive(Debug, Serialize)]
 struct TeamDescribeMember {
     member: TeamMember,
-    custom_agent: TeamCustomAgentSummary,
+    profile: Option<TeamProfileSummary>,
+    custom_agent: Option<TeamCustomAgentSummary>,
     binding: TeamMemberBindingPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamProfileSummary {
+    role_preset: Option<String>,
+    personality_preset: Option<String>,
+    traits: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,7 +364,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Describe the calling team member's team, roster, custom-agent summaries, and live bindings."
+        description = "Describe the calling team member's team, roster, optional custom-agent summaries, and live bindings."
     )]
     async fn tyde_team_describe(
         &self,
@@ -647,35 +656,33 @@ async fn do_team_describe(
     caller_agent_id: AgentId,
 ) -> Result<TeamDescribeResult, String> {
     let data = host.describe_team_for_agent(caller_agent_id).await?;
+    let catalog = team_preset_catalog();
     let mut members = Vec::with_capacity(data.members.len());
     for member in data.members {
-        let custom_agent = host
-            .custom_agent_by_id(&member.custom_agent_id)
-            .await?
-            .ok_or_else(|| {
-                format!(
-                    "team member {} references missing custom agent {}",
-                    member.id, member.custom_agent_id
-                )
-            })?;
-        let binding = data
-            .bindings
-            .iter()
-            .find(|binding| binding.member_id == member.id)
-            .cloned()
-            .unwrap_or_else(|| TeamMemberBindingPayload {
-                member_id: member.id.clone(),
-                current_agent_id: None,
-                status: AgentControlStatus::Idle,
-                last_active_at_ms: None,
-            });
-        members.push(TeamDescribeMember {
-            member,
-            custom_agent: TeamCustomAgentSummary {
+        let profile = describe_member_profile(member.profile.as_ref(), &catalog)?;
+        let custom_agent = if let Some(custom_agent_id) = member.custom_agent_id.as_ref() {
+            let custom_agent =
+                host.custom_agent_by_id(custom_agent_id)
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "team member {} references missing custom agent {}",
+                            member.id, custom_agent_id
+                        )
+                    })?;
+            Some(TeamCustomAgentSummary {
                 id: custom_agent.id,
                 name: custom_agent.name,
                 description: custom_agent.description,
-            },
+            })
+        } else {
+            None
+        };
+        let binding = team_describe_binding(&data.bindings, &member.id)?;
+        members.push(TeamDescribeMember {
+            member,
+            profile,
+            custom_agent,
             binding,
         });
     }
@@ -683,6 +690,66 @@ async fn do_team_describe(
         team: data.team,
         members,
     })
+}
+
+fn describe_member_profile(
+    profile: Option<&protocol::TeamMemberPresetProfile>,
+    catalog: &protocol::TeamPresetCatalog,
+) -> Result<Option<TeamProfileSummary>, String> {
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+    let role_preset = match profile.role_preset_id.as_ref() {
+        Some(role_preset_id) => Some(
+            catalog
+                .role_presets
+                .iter()
+                .find(|preset| preset.id == *role_preset_id)
+                .ok_or_else(|| format!("missing role preset {role_preset_id}"))?
+                .name
+                .clone(),
+        ),
+        None => None,
+    };
+    let personality_preset = match profile.personality_preset_id.as_ref() {
+        Some(personality_preset_id) => Some(
+            catalog
+                .personality_presets
+                .iter()
+                .find(|preset| preset.id == *personality_preset_id)
+                .ok_or_else(|| format!("missing personality preset {personality_preset_id}"))?
+                .name
+                .clone(),
+        ),
+        None => None,
+    };
+    let mut traits = Vec::new();
+    for trait_id in &profile.personality_traits {
+        let name = catalog
+            .personality_traits
+            .iter()
+            .find(|preset| preset.trait_id == *trait_id)
+            .ok_or_else(|| format!("missing personality trait {trait_id:?}"))?
+            .name
+            .clone();
+        traits.push(name);
+    }
+    Ok(Some(TeamProfileSummary {
+        role_preset,
+        personality_preset,
+        traits,
+    }))
+}
+
+fn team_describe_binding(
+    bindings: &[TeamMemberBindingPayload],
+    member_id: &TeamMemberId,
+) -> Result<TeamMemberBindingPayload, String> {
+    bindings
+        .iter()
+        .find(|binding| binding.member_id == *member_id)
+        .cloned()
+        .ok_or_else(|| format!("team member {member_id} has no team registry binding"))
 }
 
 async fn do_team_message_member(
@@ -1005,5 +1072,16 @@ mod tests {
         let err = split_request_target("/mcp?agent_id=not-a-uuid")
             .expect_err("invalid agent_id should fail");
         assert!(err.contains("invalid agent_id"));
+    }
+
+    #[test]
+    fn team_describe_binding_rejects_missing_member_binding() {
+        let member_id = TeamMemberId("member-without-binding".to_owned());
+        let err =
+            team_describe_binding(&[], &member_id).expect_err("missing binding should be surfaced");
+        assert!(
+            err.contains("team member member-without-binding has no team registry binding"),
+            "unexpected missing-binding error: {err}"
+        );
     }
 }

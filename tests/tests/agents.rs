@@ -23,10 +23,14 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
 
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
@@ -48,9 +52,13 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
@@ -127,15 +135,17 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
             Err(_) => return,
             Ok(Ok(None)) => return,
             Ok(Ok(Some(env)))
-                if matches!(
-                    env.kind,
-                    FrameKind::SessionSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionList
-                        | FrameKind::HostSettings
-                ) =>
+                if fixture::is_builtin_team_custom_agent_notify(&env)
+                    || matches!(
+                        env.kind,
+                        FrameKind::SessionSettings
+                            | FrameKind::TeamPresetCatalogNotify
+                            | FrameKind::SessionSchemas
+                            | FrameKind::BackendSetup
+                            | FrameKind::QueuedMessages
+                            | FrameKind::SessionList
+                            | FrameKind::HostSettings
+                    ) =>
             {
                 continue;
             }
@@ -373,15 +383,17 @@ async fn expect_connection_close(client: &mut client::Connection, context: &str)
         {
             None => return,
             Some(env)
-                if matches!(
-                    env.kind,
-                    FrameKind::HostSettings
-                        | FrameKind::SessionSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionList
-                ) =>
+                if fixture::is_builtin_team_custom_agent_notify(&env)
+                    || matches!(
+                        env.kind,
+                        FrameKind::HostSettings
+                            | FrameKind::SessionSettings
+                            | FrameKind::TeamPresetCatalogNotify
+                            | FrameKind::SessionSchemas
+                            | FrameKind::BackendSetup
+                            | FrameKind::QueuedMessages
+                            | FrameKind::SessionList
+                    ) =>
             {
                 continue;
             }
@@ -1656,9 +1668,13 @@ async fn multiple_agents() {
             .await
             .expect("next_event failed")
             .expect("connection closed before all events received");
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
@@ -2322,15 +2338,17 @@ async fn spawn_with_missing_project_id_closes_the_connection() {
         {
             None => break,
             Some(env)
-                if matches!(
-                    env.kind,
-                    FrameKind::SessionSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionList
-                        | FrameKind::HostSettings
-                ) =>
+                if fixture::is_builtin_team_custom_agent_notify(&env)
+                    || matches!(
+                        env.kind,
+                        FrameKind::SessionSettings
+                            | FrameKind::TeamPresetCatalogNotify
+                            | FrameKind::SessionSchemas
+                            | FrameKind::BackendSetup
+                            | FrameKind::QueuedMessages
+                            | FrameKind::SessionList
+                            | FrameKind::HostSettings
+                    ) =>
             {
                 continue;
             }

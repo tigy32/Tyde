@@ -13,10 +13,13 @@ use crate::{
     SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
     SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, ToolExecutionCompletedData,
-    ToolRequest,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
+    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalCreatePayload, ToolExecutionCompletedData, ToolRequest,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -179,6 +182,21 @@ impl ProtocolValidator {
             >(
                 self, envelope, "TeamMemberBindingNotify"
             ),
+            FrameKind::TeamPresetCatalogNotify => parse_host_payload::<
+                TeamPresetCatalogNotifyPayload,
+            >(
+                self, envelope, "TeamPresetCatalogNotify"
+            ),
+            FrameKind::TeamDraftNotify => {
+                parse_host_payload::<TeamDraftNotifyPayload>(self, envelope, "TeamDraftNotify")
+            }
+            FrameKind::TeamMemberShuffleSuggestionNotify => {
+                parse_host_payload::<TeamMemberShuffleSuggestionNotifyPayload>(
+                    self,
+                    envelope,
+                    "TeamMemberShuffleSuggestionNotify",
+                )
+            }
             FrameKind::SetSetting => {
                 parse_host_payload::<SetSettingPayload>(self, envelope, "SetSetting")
             }
@@ -256,6 +274,31 @@ impl ProtocolValidator {
                 envelope,
                 "TeamMemberActivate",
             ),
+            FrameKind::TeamDraftCreate => {
+                parse_host_payload::<TeamDraftCreatePayload>(self, envelope, "TeamDraftCreate")
+            }
+            FrameKind::TeamDraftUpdate => {
+                parse_host_payload::<TeamDraftUpdatePayload>(self, envelope, "TeamDraftUpdate")
+            }
+            FrameKind::TeamDraftShuffle => {
+                parse_host_payload::<TeamDraftShufflePayload>(self, envelope, "TeamDraftShuffle")
+            }
+            FrameKind::TeamMemberShuffle => {
+                parse_host_payload::<TeamMemberShufflePayload>(self, envelope, "TeamMemberShuffle")
+            }
+            FrameKind::TeamDraftApplyTemplate => {
+                parse_host_payload::<TeamDraftApplyTemplatePayload>(
+                    self,
+                    envelope,
+                    "TeamDraftApplyTemplate",
+                )
+            }
+            FrameKind::TeamDraftCommit => {
+                parse_host_payload::<TeamDraftCommitPayload>(self, envelope, "TeamDraftCommit")
+            }
+            FrameKind::TeamDraftDiscard => {
+                parse_host_payload::<TeamDraftDiscardPayload>(self, envelope, "TeamDraftDiscard")
+            }
             FrameKind::HostBrowseStart => {
                 parse_host_payload::<HostBrowseStartPayload>(self, envelope, "HostBrowseStart")
             }

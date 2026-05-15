@@ -4,20 +4,26 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    CustomAgentId, ProjectId, SessionId, Team, TeamCreatePayload, TeamId, TeamMember,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberRole,
-    TeamMemberState, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    BackendKind, CustomAgentId, ProjectId, SessionId, Team, TeamCreateFromDraftPayload,
+    TeamCreatePayload, TeamId, TeamMember, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
+    TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamRenamePayload, TeamRolePresetId,
+    TeamSetManagerPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-const STORE_VERSION: u32 = 3;
+const STORE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentTeamValidationRefs {
     pub custom_agent_ids: HashSet<CustomAgentId>,
     pub project_ids: HashSet<ProjectId>,
+    pub enabled_backend_kinds: HashSet<BackendKind>,
+    pub role_preset_ids: HashSet<TeamRolePresetId>,
+    pub personality_preset_ids: HashSet<TeamPersonalityPresetId>,
+    pub legacy_backend_kind: Option<BackendKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +51,7 @@ pub struct AgentTeamsStore {
 
 impl AgentTeamsStore {
     pub fn load(path: PathBuf, refs: &AgentTeamValidationRefs) -> Result<Self, String> {
-        let file = Self::read_from_disk(&path)?;
+        let file = Self::read_from_disk(&path, refs)?;
         validate_store_file(&file, refs)?;
         Ok(Self { path, file })
     }
@@ -118,7 +124,9 @@ impl AgentTeamsStore {
     ) -> Result<(Team, TeamMember), String> {
         validate_team_name(&payload.name)?;
         validate_member_create_fields(&payload.manager)?;
-        validate_custom_agent_ref(&payload.manager.custom_agent_id, refs)?;
+        validate_custom_agent_ref(payload.manager.custom_agent_id.as_ref(), refs)?;
+        validate_backend_kind(payload.manager.backend_kind, refs)?;
+        validate_member_profile(payload.manager.profile.as_ref(), refs)?;
         validate_project_refs(&payload.manager.project_ids, refs)?;
 
         let now = now_ms()?;
@@ -138,7 +146,10 @@ impl AgentTeamsStore {
             state: TeamMemberState::Active,
             name: payload.manager.name,
             description: payload.manager.description,
+            profile: payload.manager.profile,
             custom_agent_id: payload.manager.custom_agent_id,
+            backend_kind: payload.manager.backend_kind,
+            cost_hint: payload.manager.cost_hint,
             session_id: None,
             project_ids: payload.manager.project_ids,
             created_at_ms: now,
@@ -149,6 +160,80 @@ impl AgentTeamsStore {
         insert_unique_member(&mut self.file.members, manager.clone())?;
         self.validate_and_save(refs)?;
         Ok((team, manager))
+    }
+
+    pub fn create_team_from_draft(
+        &mut self,
+        payload: TeamCreateFromDraftPayload,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<(Team, Vec<TeamMember>), String> {
+        validate_team_name(&payload.name)?;
+        validate_member_create_fields(&payload.manager)?;
+        validate_custom_agent_ref(payload.manager.custom_agent_id.as_ref(), refs)?;
+        validate_backend_kind(payload.manager.backend_kind, refs)?;
+        validate_member_profile(payload.manager.profile.as_ref(), refs)?;
+        validate_project_refs(&payload.manager.project_ids, refs)?;
+        for report in &payload.reports {
+            validate_member_create_fields(report)?;
+            validate_custom_agent_ref(report.custom_agent_id.as_ref(), refs)?;
+            validate_backend_kind(report.backend_kind, refs)?;
+            validate_member_profile(report.profile.as_ref(), refs)?;
+            validate_project_refs(&report.project_ids, refs)?;
+        }
+
+        let now = now_ms()?;
+        let team_id = TeamId(Uuid::new_v4().to_string());
+        let manager_member_id = TeamMemberId(Uuid::new_v4().to_string());
+        let team = Team {
+            id: team_id.clone(),
+            name: payload.name,
+            manager_member_id: manager_member_id.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let manager = TeamMember {
+            id: manager_member_id,
+            team_id: team_id.clone(),
+            role: TeamMemberRole::Manager,
+            state: TeamMemberState::Active,
+            name: payload.manager.name,
+            description: payload.manager.description,
+            profile: payload.manager.profile,
+            custom_agent_id: payload.manager.custom_agent_id,
+            backend_kind: payload.manager.backend_kind,
+            cost_hint: payload.manager.cost_hint,
+            session_id: None,
+            project_ids: payload.manager.project_ids,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+
+        let mut members = vec![manager];
+        for report in payload.reports {
+            members.push(TeamMember {
+                id: TeamMemberId(Uuid::new_v4().to_string()),
+                team_id: team_id.clone(),
+                role: TeamMemberRole::Report,
+                state: TeamMemberState::Active,
+                name: report.name,
+                description: report.description,
+                profile: report.profile,
+                custom_agent_id: report.custom_agent_id,
+                backend_kind: report.backend_kind,
+                cost_hint: report.cost_hint,
+                session_id: None,
+                project_ids: report.project_ids,
+                created_at_ms: now,
+                updated_at_ms: now,
+            });
+        }
+
+        insert_unique_team(&mut self.file.teams, team.clone())?;
+        for member in &members {
+            insert_unique_member(&mut self.file.members, member.clone())?;
+        }
+        self.validate_and_save(refs)?;
+        Ok((team, members))
     }
 
     pub fn rename_team(
@@ -292,7 +377,9 @@ impl AgentTeamsStore {
             return Err("team_member_create session_id must be absent".to_string());
         }
         validate_member_create_fields(&payload.member)?;
-        validate_custom_agent_ref(&payload.member.custom_agent_id, refs)?;
+        validate_custom_agent_ref(payload.member.custom_agent_id.as_ref(), refs)?;
+        validate_backend_kind(payload.member.backend_kind, refs)?;
+        validate_member_profile(payload.member.profile.as_ref(), refs)?;
         validate_project_refs(&payload.member.project_ids, refs)?;
 
         let now = now_ms()?;
@@ -303,7 +390,10 @@ impl AgentTeamsStore {
             state: TeamMemberState::Active,
             name: payload.member.name,
             description: payload.member.description,
+            profile: payload.member.profile,
             custom_agent_id: payload.member.custom_agent_id,
+            backend_kind: payload.member.backend_kind,
+            cost_hint: payload.member.cost_hint,
             session_id: None,
             project_ids: payload.member.project_ids,
             created_at_ms: now,
@@ -328,6 +418,7 @@ impl AgentTeamsStore {
         self.assert_team_active(&member.team_id)?;
         validate_member_name(&payload.name)?;
         validate_member_description(&payload.description)?;
+        validate_member_profile(payload.profile.as_ref(), refs)?;
         validate_project_ids(&payload.project_ids)?;
         validate_project_refs(&payload.project_ids, refs)?;
 
@@ -338,6 +429,7 @@ impl AgentTeamsStore {
             .ok_or_else(|| format!("cannot update missing team member {}", payload.id))?;
         member.name = payload.name;
         member.description = payload.description;
+        member.profile = payload.profile;
         member.project_ids = payload.project_ids;
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
@@ -450,9 +542,12 @@ impl AgentTeamsStore {
         Self::save(&self.path, &self.file)
     }
 
-    fn read_from_disk(path: &Path) -> Result<AgentTeamsStoreFile, String> {
+    fn read_from_disk(
+        path: &Path,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<AgentTeamsStoreFile, String> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => migrate_store_file(path, &contents),
+            Ok(contents) => migrate_store_file(path, &contents, refs),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Ok(AgentTeamsStoreFile::default())
             }
@@ -536,7 +631,9 @@ pub fn validate_store_file(
                 member.id, member.team_id
             ));
         }
-        validate_custom_agent_ref(&member.custom_agent_id, refs)?;
+        validate_custom_agent_ref(member.custom_agent_id.as_ref(), refs)?;
+        validate_backend_kind(member.backend_kind, refs)?;
+        validate_member_profile(member.profile.as_ref(), refs)?;
         validate_project_refs(&member.project_ids, refs)?;
         if let Some(session_id) = member.session_id.as_ref()
             && !session_ids.insert(session_id.clone())
@@ -589,7 +686,11 @@ pub fn validate_store_file(
     Ok(())
 }
 
-fn migrate_store_file(path: &Path, contents: &str) -> Result<AgentTeamsStoreFile, String> {
+fn migrate_store_file(
+    path: &Path,
+    contents: &str,
+    refs: &AgentTeamValidationRefs,
+) -> Result<AgentTeamsStoreFile, String> {
     let mut value = serde_json::from_str::<Value>(contents).map_err(|err| {
         format!(
             "Failed to parse agent teams store {}: {err}",
@@ -609,8 +710,19 @@ fn migrate_store_file(path: &Path, contents: &str) -> Result<AgentTeamsStoreFile
         1 => {
             migrate_v1_to_v2(path, &mut value)?;
             migrate_v2_to_v3(path, &mut value)?;
+            migrate_v3_to_v4(path, &mut value, refs)?;
+            migrate_v4_to_v5(&mut value);
         }
-        2 => migrate_v2_to_v3(path, &mut value)?,
+        2 => {
+            migrate_v2_to_v3(path, &mut value)?;
+            migrate_v3_to_v4(path, &mut value, refs)?;
+            migrate_v4_to_v5(&mut value);
+        }
+        3 => {
+            migrate_v3_to_v4(path, &mut value, refs)?;
+            migrate_v4_to_v5(&mut value);
+        }
+        4 => migrate_v4_to_v5(&mut value),
         version if version == u64::from(STORE_VERSION) => {}
         other => {
             return Err(format!(
@@ -770,8 +882,53 @@ fn migrate_v2_to_v3(path: &Path, value: &mut Value) -> Result<(), String> {
         }
         true
     });
-    value["version"] = Value::from(STORE_VERSION);
+    value["version"] = Value::from(3);
     Ok(())
+}
+
+fn migrate_v3_to_v4(
+    path: &Path,
+    value: &mut Value,
+    refs: &AgentTeamValidationRefs,
+) -> Result<(), String> {
+    let members = value
+        .get_mut("members")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            format!(
+                "Failed to migrate agent teams store {}: members must be an object",
+                path.display()
+            )
+        })?;
+    for member in members.values_mut() {
+        let member = member.as_object_mut().ok_or_else(|| {
+            format!(
+                "Failed to migrate agent teams store {}: member must be an object",
+                path.display()
+            )
+        })?;
+        if !member.contains_key("backend_kind") {
+            let backend_kind = refs.legacy_backend_kind.ok_or_else(|| {
+                format!(
+                    "Failed to migrate agent teams store {} to v4: legacy team members require a host default_backend",
+                    path.display()
+                )
+            })?;
+            let backend_kind = serde_json::to_value(backend_kind).map_err(|err| {
+                format!(
+                    "Failed to serialize legacy backend_kind while migrating agent teams store {} to v4: {err}",
+                    path.display()
+                )
+            })?;
+            member.insert("backend_kind".to_string(), backend_kind);
+        }
+    }
+    value["version"] = Value::from(4);
+    Ok(())
+}
+
+fn migrate_v4_to_v5(value: &mut Value) {
+    value["version"] = Value::from(STORE_VERSION);
 }
 
 fn insert_unique_team(records: &mut HashMap<TeamId, Team>, team: Team) -> Result<(), String> {
@@ -802,7 +959,10 @@ fn validate_member(member: &TeamMember) -> Result<(), String> {
     validate_id("team member team_id", &member.team_id.0)?;
     validate_member_name(&member.name)?;
     validate_member_description(&member.description)?;
-    validate_id("team member custom_agent_id", &member.custom_agent_id.0)?;
+    if let Some(custom_agent_id) = member.custom_agent_id.as_ref() {
+        validate_id("team member custom_agent_id", &custom_agent_id.0)?;
+    }
+    validate_profile_ids(member.profile.as_ref())?;
     validate_project_ids(&member.project_ids)?;
     Ok(())
 }
@@ -810,6 +970,7 @@ fn validate_member(member: &TeamMember) -> Result<(), String> {
 fn validate_member_create_fields(member: &protocol::TeamMemberCreateSpec) -> Result<(), String> {
     validate_member_name(&member.name)?;
     validate_member_description(&member.description)?;
+    validate_profile_ids(member.profile.as_ref())?;
     validate_project_ids(&member.project_ids)
 }
 
@@ -842,14 +1003,73 @@ fn validate_id(label: &str, id: &str) -> Result<(), String> {
 }
 
 fn validate_custom_agent_ref(
-    custom_agent_id: &CustomAgentId,
+    custom_agent_id: Option<&CustomAgentId>,
     refs: &AgentTeamValidationRefs,
 ) -> Result<(), String> {
+    let Some(custom_agent_id) = custom_agent_id else {
+        return Ok(());
+    };
     if !refs.custom_agent_ids.contains(custom_agent_id) {
         return Err(format!(
             "team member references missing custom agent {}",
             custom_agent_id
         ));
+    }
+    Ok(())
+}
+
+fn validate_backend_kind(
+    backend_kind: BackendKind,
+    refs: &AgentTeamValidationRefs,
+) -> Result<(), String> {
+    if !refs.enabled_backend_kinds.contains(&backend_kind) {
+        return Err(format!(
+            "team member references disabled backend {:?}",
+            backend_kind
+        ));
+    }
+    Ok(())
+}
+
+fn validate_member_profile(
+    profile: Option<&TeamMemberPresetProfile>,
+    refs: &AgentTeamValidationRefs,
+) -> Result<(), String> {
+    validate_profile_ids(profile)?;
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if let Some(role_preset_id) = profile.role_preset_id.as_ref()
+        && !refs.role_preset_ids.contains(role_preset_id)
+    {
+        return Err(format!(
+            "team member profile references missing role preset {}",
+            role_preset_id
+        ));
+    }
+    if let Some(personality_preset_id) = profile.personality_preset_id.as_ref()
+        && !refs.personality_preset_ids.contains(personality_preset_id)
+    {
+        return Err(format!(
+            "team member profile references missing personality preset {}",
+            personality_preset_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_ids(profile: Option<&TeamMemberPresetProfile>) -> Result<(), String> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if let Some(role_preset_id) = profile.role_preset_id.as_ref() {
+        validate_id("team member role_preset_id", &role_preset_id.0)?;
+    }
+    if let Some(personality_preset_id) = profile.personality_preset_id.as_ref() {
+        validate_id(
+            "team member personality_preset_id",
+            &personality_preset_id.0,
+        )?;
     }
     Ok(())
 }
@@ -904,11 +1124,22 @@ fn now_ms() -> Result<u64, String> {
 mod tests {
     use super::*;
     use protocol::{TeamMemberCreateSpec, TeamMemberUpdatePayload};
+    use serde_json::json;
 
     fn refs() -> AgentTeamValidationRefs {
         AgentTeamValidationRefs {
             custom_agent_ids: [CustomAgentId("custom-1".to_owned())].into_iter().collect(),
             project_ids: [ProjectId("project-1".to_owned())].into_iter().collect(),
+            enabled_backend_kinds: [BackendKind::Claude, BackendKind::Codex]
+                .into_iter()
+                .collect(),
+            role_preset_ids: [TeamRolePresetId("tech-lead-planner".to_owned())]
+                .into_iter()
+                .collect(),
+            personality_preset_ids: [TeamPersonalityPresetId("careful-architect".to_owned())]
+                .into_iter()
+                .collect(),
+            legacy_backend_kind: Some(BackendKind::Claude),
         }
     }
 
@@ -916,7 +1147,10 @@ mod tests {
         TeamMemberCreateSpec {
             name: "Manager".to_owned(),
             description: "Coordinates the team".to_owned(),
-            custom_agent_id: CustomAgentId("custom-1".to_owned()),
+            profile: None,
+            custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+            backend_kind: BackendKind::Claude,
+            cost_hint: None,
             project_ids: vec![ProjectId("project-1".to_owned())],
         }
     }
@@ -943,7 +1177,10 @@ mod tests {
                     member: TeamMemberCreateSpec {
                         name: "Frontend".to_owned(),
                         description: "Builds UI".to_owned(),
-                        custom_agent_id: CustomAgentId("custom-1".to_owned()),
+                        profile: None,
+                        custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+                        backend_kind: BackendKind::Claude,
+                        cost_hint: None,
                         project_ids: vec![ProjectId("project-1".to_owned())],
                     },
                     session_id: None,
@@ -954,6 +1191,196 @@ mod tests {
 
         let loaded = AgentTeamsStore::load(path, &refs).expect("reload store");
         assert_eq!(loaded.get_team(&team.id), Some(team));
+        assert_eq!(loaded.get_member(&member.id), Some(member));
+    }
+
+    fn write_v3_store(path: &Path) {
+        let contents = json!({
+            "version": 3,
+            "teams": {
+                "team-1": {
+                    "id": "team-1",
+                    "name": "Legacy Team",
+                    "manager_member_id": "member-manager",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            },
+            "members": {
+                "member-manager": {
+                    "id": "member-manager",
+                    "team_id": "team-1",
+                    "role": "manager",
+                    "state": "active",
+                    "name": "Legacy Manager",
+                    "description": "Coordinates legacy work",
+                    "custom_agent_id": "custom-1",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                },
+                "member-report": {
+                    "id": "member-report",
+                    "team_id": "team-1",
+                    "role": "report",
+                    "state": "active",
+                    "name": "Legacy Report",
+                    "description": "Handles legacy work",
+                    "custom_agent_id": "custom-1",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            }
+        });
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&contents).expect("serialize v3 store"),
+        )
+        .expect("write v3 store");
+    }
+
+    fn write_v4_store(path: &Path) {
+        let contents = json!({
+            "version": 4,
+            "teams": {
+                "team-1": {
+                    "id": "team-1",
+                    "name": "V4 Team",
+                    "manager_member_id": "member-manager",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            },
+            "members": {
+                "member-manager": {
+                    "id": "member-manager",
+                    "team_id": "team-1",
+                    "role": "manager",
+                    "state": "active",
+                    "name": "V4 Manager",
+                    "description": "Coordinates v4 work",
+                    "custom_agent_id": "custom-1",
+                    "backend_kind": "claude",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            }
+        });
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&contents).expect("serialize v4 store"),
+        )
+        .expect("write v4 store");
+    }
+
+    #[test]
+    fn v3_migration_assigns_legacy_default_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        write_v3_store(&path);
+        let mut refs = refs();
+        refs.legacy_backend_kind = Some(BackendKind::Codex);
+
+        let store = AgentTeamsStore::load(path, &refs).expect("load migrated store");
+        let snapshot = store.snapshot();
+
+        assert_eq!(snapshot.version, STORE_VERSION);
+        let manager = snapshot
+            .members
+            .get(&TeamMemberId("member-manager".to_owned()))
+            .expect("migrated manager");
+        let report = snapshot
+            .members
+            .get(&TeamMemberId("member-report".to_owned()))
+            .expect("migrated report");
+        assert_eq!(manager.backend_kind, BackendKind::Codex);
+        assert_eq!(report.backend_kind, BackendKind::Codex);
+        assert_eq!(manager.profile, None);
+        assert_eq!(report.profile, None);
+        assert_eq!(
+            manager.custom_agent_id,
+            Some(CustomAgentId("custom-1".to_owned()))
+        );
+        assert_eq!(
+            report.custom_agent_id,
+            Some(CustomAgentId("custom-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn v4_migration_defaults_member_profile_to_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        write_v4_store(&path);
+
+        let store = AgentTeamsStore::load(path, &refs()).expect("load migrated v4 store");
+        let snapshot = store.snapshot();
+
+        assert_eq!(snapshot.version, STORE_VERSION);
+        let manager = snapshot
+            .members
+            .get(&TeamMemberId("member-manager".to_owned()))
+            .expect("migrated manager");
+        assert_eq!(manager.backend_kind, BackendKind::Claude);
+        assert_eq!(manager.profile, None);
+    }
+
+    #[test]
+    fn v3_migration_rejects_missing_legacy_default_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        write_v3_store(&path);
+        let mut refs = refs();
+        refs.legacy_backend_kind = None;
+
+        let err = AgentTeamsStore::load(path, &refs).expect_err("migration should fail loudly");
+        assert!(
+            err.contains("legacy team members require a host default_backend"),
+            "unexpected migration error: {err}"
+        );
+    }
+
+    #[test]
+    fn member_create_allows_no_custom_agent_with_explicit_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        let refs = refs();
+        let mut store = AgentTeamsStore::load(path.clone(), &refs).expect("load empty store");
+        let (team, _manager) = store
+            .create_team(
+                TeamCreatePayload {
+                    name: "Product Team".to_owned(),
+                    manager: manager_spec(),
+                },
+                &refs,
+            )
+            .expect("create team");
+        let member = store
+            .create_member(
+                TeamMemberCreatePayload {
+                    team_id: team.id,
+                    member: TeamMemberCreateSpec {
+                        name: "Default Agent".to_owned(),
+                        description: "Uses the built-in agent profile".to_owned(),
+                        profile: None,
+                        custom_agent_id: None,
+                        backend_kind: BackendKind::Codex,
+                        cost_hint: Some(protocol::SpawnCostHint::Low),
+                        project_ids: vec![ProjectId("project-1".to_owned())],
+                    },
+                    session_id: None,
+                },
+                &refs,
+            )
+            .expect("create default-agent member");
+
+        assert_eq!(member.custom_agent_id, None);
+        assert_eq!(member.backend_kind, BackendKind::Codex);
+        assert_eq!(member.cost_hint, Some(protocol::SpawnCostHint::Low));
+
+        let loaded = AgentTeamsStore::load(path, &refs).expect("reload store");
         assert_eq!(loaded.get_member(&member.id), Some(member));
     }
 
@@ -1001,7 +1428,10 @@ mod tests {
                     member: TeamMemberCreateSpec {
                         name: "A".to_owned(),
                         description: "Does A".to_owned(),
-                        custom_agent_id: CustomAgentId("custom-1".to_owned()),
+                        profile: None,
+                        custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+                        backend_kind: BackendKind::Claude,
+                        cost_hint: None,
                         project_ids: vec![ProjectId("project-1".to_owned())],
                     },
                     session_id: None,
@@ -1016,7 +1446,10 @@ mod tests {
                     member: TeamMemberCreateSpec {
                         name: "B".to_owned(),
                         description: "Does B".to_owned(),
-                        custom_agent_id: CustomAgentId("custom-1".to_owned()),
+                        profile: None,
+                        custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+                        backend_kind: BackendKind::Claude,
+                        cost_hint: None,
                         project_ids: vec![ProjectId("project-1".to_owned())],
                     },
                     session_id: None,
@@ -1057,7 +1490,10 @@ mod tests {
                     member: TeamMemberCreateSpec {
                         name: "Frontend".to_owned(),
                         description: "Builds UI".to_owned(),
-                        custom_agent_id: CustomAgentId("custom-1".to_owned()),
+                        profile: None,
+                        custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+                        backend_kind: BackendKind::Claude,
+                        cost_hint: None,
                         project_ids: vec![ProjectId("project-1".to_owned())],
                     },
                     session_id: None,
@@ -1071,6 +1507,7 @@ mod tests {
                     id: member.id,
                     name: "Frontend".to_owned(),
                     description: "Builds UI".to_owned(),
+                    profile: None,
                     project_ids: vec![ProjectId("missing".to_owned())],
                 },
                 &refs,
@@ -1102,7 +1539,10 @@ mod tests {
                     member: TeamMemberCreateSpec {
                         name: "Frontend".to_owned(),
                         description: "Builds UI".to_owned(),
-                        custom_agent_id: CustomAgentId("custom-1".to_owned()),
+                        profile: None,
+                        custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+                        backend_kind: BackendKind::Claude,
+                        cost_hint: None,
                         project_ids: Vec::new(),
                     },
                     session_id: None,

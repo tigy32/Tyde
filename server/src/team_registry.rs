@@ -1,16 +1,28 @@
 use std::collections::HashMap;
 
 use protocol::{
-    AgentControlStatus, AgentId, SessionId, Team, TeamCreatePayload, TeamDeletePayload, TeamMember,
+    AgentControlStatus, AgentId, CustomAgentId, SessionId, Team, TeamCreateFromDraftPayload,
+    TeamCreatePayload, TeamDeletePayload, TeamDraft, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId,
+    TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamMember,
     TeamMemberBindingNotifyPayload, TeamMemberBindingPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberRole,
-    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload,
+    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberPresetProfile, TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestion,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamPersonalityPreset, TeamPersonalityPresetId, TeamPersonalityTrait,
+    TeamPersonalityTraitPreset, TeamPresetCatalog, TeamRenamePayload, TeamRolePreset,
+    TeamRolePresetId, TeamSetManagerPayload, TeamTemplate, TeamTemplateId, TeamTemplateMember,
 };
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 use crate::agent::now_ms;
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
+use crate::store::custom_agents::{
+    BACKEND_ENGINEER_CUSTOM_AGENT_ID, CODE_REVIEWER_CUSTOM_AGENT_ID,
+    FRONTEND_ENGINEER_CUSTOM_AGENT_ID, TEAM_LEAD_CUSTOM_AGENT_ID, TEST_QA_ENGINEER_CUSTOM_AGENT_ID,
+};
 
 const ACTIVATION_RESERVATION_TIMEOUT_MS: u64 = 35_000;
 
@@ -21,6 +33,8 @@ pub(crate) struct TeamRegistryHandle {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TeamRegistrySnapshot {
+    pub catalog: TeamPresetCatalog,
+    pub drafts: Vec<TeamDraft>,
     pub teams: Vec<Team>,
     pub members: Vec<TeamMember>,
     pub bindings: Vec<TeamMemberBindingPayload>,
@@ -31,6 +45,8 @@ pub(crate) struct TeamRegistryEvents {
     pub team_notifies: Vec<TeamNotifyPayload>,
     pub member_notifies: Vec<TeamMemberNotifyPayload>,
     pub binding_notifies: Vec<TeamMemberBindingNotifyPayload>,
+    pub draft_notifies: Vec<TeamDraftNotifyPayload>,
+    pub shuffle_suggestion_notifies: Vec<TeamMemberShuffleSuggestionNotifyPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,12 +153,43 @@ enum TeamRegistryCommand {
         refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
+    CreateDraft {
+        payload: TeamDraftCreatePayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    UpdateDraft {
+        payload: TeamDraftUpdatePayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    ShuffleDraft {
+        payload: TeamDraftShufflePayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    ShuffleMemberSuggestion {
+        payload: TeamMemberShufflePayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    ApplyDraftTemplate {
+        payload: TeamDraftApplyTemplatePayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    CommitDraft {
+        payload: TeamDraftCommitPayload,
+        refs: AgentTeamValidationRefs,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    DiscardDraft {
+        payload: TeamDraftDiscardPayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
 }
 
 struct TeamRegistryActor {
     store: AgentTeamsStore,
+    drafts: Vec<TeamDraft>,
     bindings: Vec<TeamMemberBindingPayload>,
     pending_activations: HashMap<TeamMemberId, u64>,
+    shuffle_counter: u64,
 }
 
 impl TeamRegistryHandle {
@@ -160,8 +207,10 @@ impl TeamRegistryHandle {
             .collect();
         let actor = TeamRegistryActor {
             store,
+            drafts: Vec::new(),
             bindings,
             pending_activations: HashMap::new(),
+            shuffle_counter: 0,
         };
         spawn_team_registry_actor(actor, rx);
         Self { tx }
@@ -395,6 +444,67 @@ impl TeamRegistryHandle {
         .await
     }
 
+    pub(crate) async fn create_draft(
+        &self,
+        payload: TeamDraftCreatePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::CreateDraft { payload, reply })
+            .await
+    }
+
+    pub(crate) async fn update_draft(
+        &self,
+        payload: TeamDraftUpdatePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::UpdateDraft { payload, reply })
+            .await
+    }
+
+    pub(crate) async fn shuffle_draft(
+        &self,
+        payload: TeamDraftShufflePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::ShuffleDraft { payload, reply })
+            .await
+    }
+
+    pub(crate) async fn shuffle_member_suggestion(
+        &self,
+        payload: TeamMemberShufflePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::ShuffleMemberSuggestion { payload, reply })
+            .await
+    }
+
+    pub(crate) async fn apply_draft_template(
+        &self,
+        payload: TeamDraftApplyTemplatePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::ApplyDraftTemplate { payload, reply })
+            .await
+    }
+
+    pub(crate) async fn commit_draft(
+        &self,
+        payload: TeamDraftCommitPayload,
+        refs: AgentTeamValidationRefs,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::CommitDraft {
+            payload,
+            refs,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn discard_draft(
+        &self,
+        payload: TeamDraftDiscardPayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::DiscardDraft { payload, reply })
+            .await
+    }
+
     async fn mutate<F>(&self, build: F) -> Result<TeamRegistryEvents, String>
     where
         F: FnOnce(oneshot::Sender<Result<TeamRegistryEvents, String>>) -> TeamRegistryCommand,
@@ -534,12 +644,46 @@ impl TeamRegistryActor {
                     let result = self.delete_member(payload, &refs);
                     let _ = reply.send(result);
                 }
+                TeamRegistryCommand::CreateDraft { payload, reply } => {
+                    let result = self.create_draft(payload);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::UpdateDraft { payload, reply } => {
+                    let result = self.update_draft(payload);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::ShuffleDraft { payload, reply } => {
+                    let result = self.shuffle_draft(payload);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::ShuffleMemberSuggestion { payload, reply } => {
+                    let result = self.shuffle_member_suggestion(payload);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::ApplyDraftTemplate { payload, reply } => {
+                    let result = self.apply_draft_template(payload);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::CommitDraft {
+                    payload,
+                    refs,
+                    reply,
+                } => {
+                    let result = self.commit_draft(payload, &refs);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::DiscardDraft { payload, reply } => {
+                    let result = self.discard_draft(payload);
+                    let _ = reply.send(result);
+                }
             }
         }
     }
 
     fn snapshot(&self) -> TeamRegistrySnapshot {
         TeamRegistrySnapshot {
+            catalog: team_preset_catalog(),
+            drafts: self.drafts.clone(),
             teams: self.store.teams(),
             members: self.store.members(),
             bindings: self.bindings.clone(),
@@ -832,6 +976,7 @@ impl TeamRegistryActor {
             team_notifies: vec![TeamNotifyPayload::Upsert { team }],
             member_notifies: vec![TeamMemberNotifyPayload::Upsert { member: manager }],
             binding_notifies: vec![TeamMemberBindingNotifyPayload::Upsert { binding }],
+            ..TeamRegistryEvents::default()
         })
     }
 
@@ -866,6 +1011,7 @@ impl TeamRegistryActor {
             team_notifies: vec![TeamNotifyPayload::Delete { team }],
             member_notifies,
             binding_notifies,
+            ..TeamRegistryEvents::default()
         })
     }
 
@@ -941,6 +1087,221 @@ impl TeamRegistryActor {
             binding_notifies,
             ..TeamRegistryEvents::default()
         })
+    }
+
+    fn create_draft(
+        &mut self,
+        payload: TeamDraftCreatePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        if let Some(existing) = self.drafts.first() {
+            return Err(format!("team draft {} already exists", existing.id));
+        }
+        let draft = build_team_draft(payload.template_id.as_ref(), now_ms())?;
+        self.drafts.push(draft.clone());
+        Ok(TeamRegistryEvents {
+            draft_notifies: vec![TeamDraftNotifyPayload::Upsert { draft }],
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    fn update_draft(
+        &mut self,
+        payload: TeamDraftUpdatePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        let draft_id = team_draft_update_id(&payload).clone();
+        let mut draft = self.take_draft(&draft_id)?;
+        let original = draft.clone();
+        let result = (|| -> Result<(), String> {
+            match payload {
+                TeamDraftUpdatePayload::SetName { name, .. } => {
+                    draft.name = name;
+                }
+                TeamDraftUpdatePayload::ReplaceMember { member, .. } => {
+                    let index = draft_member_index(&draft, &member.id)?;
+                    validate_draft_member_edit(&member)?;
+                    apply_draft_member_edit(&mut draft.members[index], member);
+                }
+                TeamDraftUpdatePayload::AddReport { .. } => {
+                    draft
+                        .members
+                        .push(blank_draft_member(TeamMemberRole::Report));
+                }
+                TeamDraftUpdatePayload::RemoveMember { member_id, .. } => {
+                    let index = draft_member_index(&draft, &member_id)?;
+                    if draft.members[index].org_role == TeamMemberRole::Manager {
+                        return Err(format!("cannot remove draft manager member {member_id}"));
+                    }
+                    draft.members.remove(index);
+                }
+                TeamDraftUpdatePayload::SetMemberProfile {
+                    member_id,
+                    role_preset_id,
+                    personality_preset_id,
+                    personality_traits,
+                    ..
+                } => {
+                    let index = draft_member_index(&draft, &member_id)?;
+                    let profile = build_profile(
+                        role_preset_id.as_ref(),
+                        personality_preset_id.as_ref(),
+                        personality_traits,
+                    )?;
+                    apply_profile_to_draft_member(&mut draft.members[index], profile)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            self.drafts.push(original);
+            return Err(err);
+        }
+        draft.updated_at_ms = now_ms();
+        self.drafts.push(draft.clone());
+        Ok(TeamRegistryEvents {
+            draft_notifies: vec![TeamDraftNotifyPayload::Upsert { draft }],
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    /// Compute a server-owned shuffle suggestion for the Add-report dialog
+    /// of an existing team. Returns a notify event payload; persists
+    /// nothing. The frontend applies the suggestion to its open form.
+    fn shuffle_member_suggestion(
+        &mut self,
+        payload: TeamMemberShufflePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        // Authorize: the team must exist on this host.
+        let _team = self
+            .store
+            .get_team(&payload.team_id)
+            .ok_or_else(|| format!("team {} not found", payload.team_id))?;
+        self.shuffle_counter = self.shuffle_counter.saturating_add(1);
+        let suggestion = build_member_shuffle_suggestion(self.shuffle_counter as usize)?;
+        Ok(TeamRegistryEvents {
+            shuffle_suggestion_notifies: vec![TeamMemberShuffleSuggestionNotifyPayload {
+                team_id: payload.team_id,
+                suggestion,
+            }],
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    fn shuffle_draft(
+        &mut self,
+        payload: TeamDraftShufflePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        let mut draft = self.take_draft(&payload.draft_id)?;
+        let original = draft.clone();
+        self.shuffle_counter = self.shuffle_counter.saturating_add(1);
+        let result = (|| -> Result<(), String> {
+            if let Some(member_id) = payload.member_id {
+                let index = draft_member_index(&draft, &member_id)?;
+                shuffle_draft_member(
+                    &mut draft.members[index],
+                    payload.scope,
+                    self.shuffle_counter as usize,
+                )
+            } else {
+                for (index, member) in draft.members.iter_mut().enumerate() {
+                    shuffle_draft_member(
+                        member,
+                        payload.scope,
+                        self.shuffle_counter as usize + index,
+                    )?;
+                }
+                Ok(())
+            }
+        })();
+        if let Err(err) = result {
+            self.drafts.push(original);
+            return Err(err);
+        }
+        draft.updated_at_ms = now_ms();
+        self.drafts.push(draft.clone());
+        Ok(TeamRegistryEvents {
+            draft_notifies: vec![TeamDraftNotifyPayload::Upsert { draft }],
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    fn apply_draft_template(
+        &mut self,
+        payload: TeamDraftApplyTemplatePayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        let mut draft = self.take_draft(&payload.draft_id)?;
+        let original = draft.clone();
+        let result = find_template(&payload.template_id)
+            .and_then(|template| draft_members_from_template(&template))
+            .map(|members| {
+                draft.members = members;
+            });
+        if let Err(err) = result {
+            self.drafts.push(original);
+            return Err(err);
+        }
+        draft.updated_at_ms = now_ms();
+        self.drafts.push(draft.clone());
+        Ok(TeamRegistryEvents {
+            draft_notifies: vec![TeamDraftNotifyPayload::Upsert { draft }],
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    fn commit_draft(
+        &mut self,
+        payload: TeamDraftCommitPayload,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<TeamRegistryEvents, String> {
+        let draft = self.take_draft(&payload.draft_id)?;
+        let create = match team_create_from_draft(&draft) {
+            Ok(create) => create,
+            Err(err) => {
+                self.drafts.push(draft);
+                return Err(err);
+            }
+        };
+        match self.store.create_team_from_draft(create, refs) {
+            Ok((team, members)) => {
+                let mut member_notifies = Vec::new();
+                let mut binding_notifies = Vec::new();
+                for member in members {
+                    let binding = self.ensure_binding_payload(&member.id)?;
+                    binding_notifies.push(TeamMemberBindingNotifyPayload::Upsert { binding });
+                    member_notifies.push(TeamMemberNotifyPayload::Upsert { member });
+                }
+                Ok(TeamRegistryEvents {
+                    team_notifies: vec![TeamNotifyPayload::Upsert { team }],
+                    member_notifies,
+                    binding_notifies,
+                    draft_notifies: vec![TeamDraftNotifyPayload::Delete { draft_id: draft.id }],
+                    shuffle_suggestion_notifies: Vec::new(),
+                })
+            }
+            Err(err) => {
+                self.drafts.push(draft);
+                Err(err)
+            }
+        }
+    }
+
+    fn discard_draft(
+        &mut self,
+        payload: TeamDraftDiscardPayload,
+    ) -> Result<TeamRegistryEvents, String> {
+        let draft = self.take_draft(&payload.draft_id)?;
+        Ok(TeamRegistryEvents {
+            draft_notifies: vec![TeamDraftNotifyPayload::Delete { draft_id: draft.id }],
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    fn take_draft(&mut self, draft_id: &TeamDraftId) -> Result<TeamDraft, String> {
+        let index = self
+            .drafts
+            .iter()
+            .position(|draft| draft.id == *draft_id)
+            .ok_or_else(|| format!("missing team draft {draft_id}"))?;
+        Ok(self.drafts.remove(index))
     }
 
     fn member_for_agent(&self, agent_id: &AgentId) -> Result<Option<TeamMember>, String> {
@@ -1046,6 +1407,736 @@ impl TeamRegistryActor {
     }
 }
 
+pub(crate) fn team_preset_catalog() -> TeamPresetCatalog {
+    TeamPresetCatalog {
+        role_presets: role_presets(),
+        personality_traits: personality_trait_presets(),
+        personality_presets: personality_presets(),
+        team_templates: team_templates(),
+    }
+}
+
+pub(crate) fn team_preset_validation_refs() -> (
+    std::collections::HashSet<TeamRolePresetId>,
+    std::collections::HashSet<TeamPersonalityPresetId>,
+) {
+    let catalog = team_preset_catalog();
+    (
+        catalog
+            .role_presets
+            .into_iter()
+            .map(|preset| preset.id)
+            .collect(),
+        catalog
+            .personality_presets
+            .into_iter()
+            .map(|preset| preset.id)
+            .collect(),
+    )
+}
+
+fn role_presets() -> Vec<TeamRolePreset> {
+    vec![
+        TeamRolePreset {
+            id: role_id("tech-lead-planner"),
+            name: "Tech lead / planner".to_owned(),
+            summary: "Breaks work into crisp tasks and keeps the team aligned.".to_owned(),
+            default_member_name: "Tech Lead".to_owned(),
+            default_description:
+                "Plans the implementation, coordinates reports, and keeps scope tight.".to_owned(),
+            default_custom_agent_id: Some(CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned())),
+        },
+        TeamRolePreset {
+            id: role_id("senior-reviewer"),
+            name: "Senior reviewer".to_owned(),
+            summary: "Reviews architecture, correctness, and maintainability.".to_owned(),
+            default_member_name: "Senior Reviewer".to_owned(),
+            default_description:
+                "Reviews the plan and code for correctness, design fit, and maintainability."
+                    .to_owned(),
+            default_custom_agent_id: Some(CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned())),
+        },
+        TeamRolePreset {
+            id: role_id("frontend-specialist"),
+            name: "Frontend specialist".to_owned(),
+            summary: "Owns UI, state projection, and interaction polish.".to_owned(),
+            default_member_name: "Frontend Specialist".to_owned(),
+            default_description:
+                "Implements UI behavior, typed frontend state projection, and user-facing polish."
+                    .to_owned(),
+            default_custom_agent_id: Some(CustomAgentId(
+                FRONTEND_ENGINEER_CUSTOM_AGENT_ID.to_owned(),
+            )),
+        },
+        TeamRolePreset {
+            id: role_id("backend-specialist"),
+            name: "Backend specialist".to_owned(),
+            summary: "Owns server behavior, persistence, and protocol plumbing.".to_owned(),
+            default_member_name: "Backend Specialist".to_owned(),
+            default_description:
+                "Implements server-owned behavior, persistence, validation, and protocol flow."
+                    .to_owned(),
+            default_custom_agent_id: Some(CustomAgentId(
+                BACKEND_ENGINEER_CUSTOM_AGENT_ID.to_owned(),
+            )),
+        },
+        TeamRolePreset {
+            id: role_id("test-author-qa"),
+            name: "Test author / QA".to_owned(),
+            summary: "Writes focused tests and checks user-visible behavior.".to_owned(),
+            default_member_name: "Test Author".to_owned(),
+            default_description:
+                "Adds focused tests, exercises edge cases, and verifies observable behavior."
+                    .to_owned(),
+            default_custom_agent_id: Some(CustomAgentId(
+                TEST_QA_ENGINEER_CUSTOM_AGENT_ID.to_owned(),
+            )),
+        },
+        TeamRolePreset {
+            id: role_id("bug-hunter-debugger"),
+            name: "Bug hunter / debugger".to_owned(),
+            summary: "Gathers evidence, identifies root causes, and fixes defects.".to_owned(),
+            default_member_name: "Bug Hunter".to_owned(),
+            default_description:
+                "Reproduces failures, gathers evidence, identifies root causes, and fixes the bug."
+                    .to_owned(),
+            default_custom_agent_id: Some(CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned())),
+        },
+    ]
+}
+
+fn personality_trait_presets() -> Vec<TeamPersonalityTraitPreset> {
+    vec![
+        trait_preset(
+            TeamPersonalityTrait::Cautious,
+            "Cautious",
+            "Surfaces risks before acting.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Pragmatic,
+            "Pragmatic",
+            "Balances quality with delivery.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Bold,
+            "Bold",
+            "Pushes decisive approaches when warranted.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Contrarian,
+            "Contrarian",
+            "Challenges assumptions and weak plans.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Terse,
+            "Terse",
+            "Keeps communication compact.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Conversational,
+            "Conversational",
+            "Explains tradeoffs naturally.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Pedagogical,
+            "Pedagogical",
+            "Teaches while explaining choices.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Skeptical,
+            "Skeptical",
+            "Looks for hidden failure modes.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::RefactorLeaning,
+            "Refactor-leaning",
+            "Prefers improving structure when scope allows.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::ShipIt,
+            "Ship-it",
+            "Optimizes for a safe shippable slice.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::TestFirst,
+            "Test-first",
+            "Starts with observable coverage.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::TypeSystem,
+            "Type-system",
+            "Leans on types and invariants.",
+        ),
+        trait_preset(
+            TeamPersonalityTrait::Yagni,
+            "YAGNI",
+            "Avoids speculative abstractions.",
+        ),
+    ]
+}
+
+fn personality_presets() -> Vec<TeamPersonalityPreset> {
+    vec![
+        TeamPersonalityPreset {
+            id: personality_id("skeptical-reviewer"),
+            name: "Skeptical reviewer".to_owned(),
+            summary: "Challenges assumptions with concise risk-focused feedback.".to_owned(),
+            traits: vec![
+                TeamPersonalityTrait::Skeptical,
+                TeamPersonalityTrait::Contrarian,
+                TeamPersonalityTrait::Terse,
+            ],
+        },
+        TeamPersonalityPreset {
+            id: personality_id("pragmatic-shipper"),
+            name: "Pragmatic shipper".to_owned(),
+            summary: "Finds the smallest safe implementation that can ship.".to_owned(),
+            traits: vec![
+                TeamPersonalityTrait::Pragmatic,
+                TeamPersonalityTrait::ShipIt,
+                TeamPersonalityTrait::Yagni,
+            ],
+        },
+        TeamPersonalityPreset {
+            id: personality_id("careful-architect"),
+            name: "Careful architect".to_owned(),
+            summary: "Designs around invariants and long-term maintainability.".to_owned(),
+            traits: vec![
+                TeamPersonalityTrait::Cautious,
+                TeamPersonalityTrait::TypeSystem,
+                TeamPersonalityTrait::Pedagogical,
+            ],
+        },
+        TeamPersonalityPreset {
+            id: personality_id("test-first-engineer"),
+            name: "Test-first engineer".to_owned(),
+            summary: "Starts with coverage and verifies behavior before polishing.".to_owned(),
+            traits: vec![
+                TeamPersonalityTrait::TestFirst,
+                TeamPersonalityTrait::Cautious,
+                TeamPersonalityTrait::Conversational,
+            ],
+        },
+        TeamPersonalityPreset {
+            id: personality_id("refactor-minded-senior"),
+            name: "Refactor-minded senior".to_owned(),
+            summary: "Improves structure while staying alert to scope.".to_owned(),
+            traits: vec![
+                TeamPersonalityTrait::RefactorLeaning,
+                TeamPersonalityTrait::Pragmatic,
+                TeamPersonalityTrait::TypeSystem,
+            ],
+        },
+    ]
+}
+
+fn team_templates() -> Vec<TeamTemplate> {
+    vec![
+        TeamTemplate {
+            id: template_id("solo-reviewer"),
+            name: "Solo + reviewer".to_owned(),
+            summary: "A manager/implementer paired with one senior reviewer.".to_owned(),
+            balanced: false,
+            members: vec![
+                template_member(
+                    TeamMemberRole::Manager,
+                    "tech-lead-planner",
+                    Some("pragmatic-shipper"),
+                    "Lead Engineer",
+                    "Implements the main slice and coordinates review feedback.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "senior-reviewer",
+                    Some("skeptical-reviewer"),
+                    "Reviewer",
+                    "Reviews the implementation for correctness, architecture, and missing tests.",
+                ),
+            ],
+        },
+        TeamTemplate {
+            id: template_id("small-feature-team"),
+            name: "Small feature team".to_owned(),
+            summary: "A balanced planner, frontend, backend, and QA team.".to_owned(),
+            balanced: true,
+            members: vec![
+                template_member(
+                    TeamMemberRole::Manager,
+                    "tech-lead-planner",
+                    Some("careful-architect"),
+                    "Feature Lead",
+                    "Plans the feature and coordinates implementation across the team.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "frontend-specialist",
+                    Some("pragmatic-shipper"),
+                    "Frontend Engineer",
+                    "Implements UI behavior and keeps the user interaction shippable.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "backend-specialist",
+                    Some("careful-architect"),
+                    "Backend Engineer",
+                    "Implements server-owned behavior, validation, and persistence.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "test-author-qa",
+                    Some("test-first-engineer"),
+                    "QA Engineer",
+                    "Adds focused tests and verifies the feature end to end.",
+                ),
+            ],
+        },
+        TeamTemplate {
+            id: template_id("review-panel"),
+            name: "Review panel".to_owned(),
+            summary: "Multiple reviewers with different review lenses.".to_owned(),
+            balanced: false,
+            members: vec![
+                template_member(
+                    TeamMemberRole::Manager,
+                    "tech-lead-planner",
+                    Some("pragmatic-shipper"),
+                    "Review Lead",
+                    "Coordinates the review panel and resolves conflicting feedback.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "senior-reviewer",
+                    Some("skeptical-reviewer"),
+                    "Skeptical Reviewer",
+                    "Looks for correctness gaps, hidden assumptions, and unsafe shortcuts.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "senior-reviewer",
+                    Some("refactor-minded-senior"),
+                    "Maintainability Reviewer",
+                    "Reviews structure, naming, and maintainability risks.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "test-author-qa",
+                    Some("test-first-engineer"),
+                    "Test Reviewer",
+                    "Checks that behavior is covered by focused tests.",
+                ),
+            ],
+        },
+        TeamTemplate {
+            id: template_id("debug-squad"),
+            name: "Debug squad".to_owned(),
+            summary: "Evidence gathering, root-cause analysis, and regression coverage.".to_owned(),
+            balanced: false,
+            members: vec![
+                template_member(
+                    TeamMemberRole::Manager,
+                    "bug-hunter-debugger",
+                    Some("careful-architect"),
+                    "Debug Lead",
+                    "Coordinates reproduction, evidence gathering, and the final fix.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "bug-hunter-debugger",
+                    Some("skeptical-reviewer"),
+                    "Root Cause Debugger",
+                    "Reproduces the failure and identifies the root cause from evidence.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "backend-specialist",
+                    Some("pragmatic-shipper"),
+                    "Fix Engineer",
+                    "Implements the smallest server or integration fix that addresses the cause.",
+                ),
+                template_member(
+                    TeamMemberRole::Report,
+                    "test-author-qa",
+                    Some("test-first-engineer"),
+                    "Regression Tester",
+                    "Adds regression coverage and verifies the bug stays fixed.",
+                ),
+            ],
+        },
+    ]
+}
+
+fn template_member(
+    org_role: TeamMemberRole,
+    role_preset_id: &str,
+    personality_preset_id: Option<&str>,
+    name: &str,
+    description: &str,
+) -> TeamTemplateMember {
+    TeamTemplateMember {
+        org_role,
+        role_preset_id: role_id(role_preset_id),
+        personality_preset_id: personality_preset_id.map(personality_id),
+        name: name.to_owned(),
+        description: description.to_owned(),
+    }
+}
+
+fn trait_preset(
+    trait_id: TeamPersonalityTrait,
+    name: &str,
+    summary: &str,
+) -> TeamPersonalityTraitPreset {
+    TeamPersonalityTraitPreset {
+        trait_id,
+        name: name.to_owned(),
+        summary: summary.to_owned(),
+    }
+}
+
+fn role_id(id: &str) -> TeamRolePresetId {
+    TeamRolePresetId(id.to_owned())
+}
+
+fn personality_id(id: &str) -> TeamPersonalityPresetId {
+    TeamPersonalityPresetId(id.to_owned())
+}
+
+fn template_id(id: &str) -> TeamTemplateId {
+    TeamTemplateId(id.to_owned())
+}
+
+fn active_draft_id() -> TeamDraftId {
+    TeamDraftId("active-team-draft".to_owned())
+}
+
+fn build_team_draft(
+    template_id: Option<&TeamTemplateId>,
+    now_ms: u64,
+) -> Result<TeamDraft, String> {
+    let members = match template_id {
+        Some(template_id) => draft_members_from_template(&find_template(template_id)?)?,
+        None => vec![blank_draft_member(TeamMemberRole::Manager)],
+    };
+    Ok(TeamDraft {
+        id: active_draft_id(),
+        name: String::new(),
+        members,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    })
+}
+
+fn blank_draft_member(org_role: TeamMemberRole) -> TeamDraftMember {
+    TeamDraftMember {
+        id: TeamDraftMemberId(Uuid::new_v4().to_string()),
+        org_role,
+        name: String::new(),
+        description: String::new(),
+        profile: None,
+        custom_agent_id: None,
+        backend_kind: None,
+        cost_hint: None,
+        project_ids: Vec::new(),
+    }
+}
+
+fn draft_members_from_template(template: &TeamTemplate) -> Result<Vec<TeamDraftMember>, String> {
+    let mut members = Vec::new();
+    for member in &template.members {
+        let profile = build_profile(
+            Some(&member.role_preset_id),
+            member.personality_preset_id.as_ref(),
+            Vec::new(),
+        )?;
+        members.push(TeamDraftMember {
+            id: TeamDraftMemberId(Uuid::new_v4().to_string()),
+            org_role: member.org_role,
+            name: member.name.clone(),
+            description: member.description.clone(),
+            profile: Some(profile),
+            custom_agent_id: default_custom_agent_id_for_role(&member.role_preset_id),
+            backend_kind: None,
+            cost_hint: None,
+            project_ids: Vec::new(),
+        });
+    }
+    validate_draft_org(&members)?;
+    Ok(members)
+}
+
+fn find_template(template_id: &TeamTemplateId) -> Result<TeamTemplate, String> {
+    team_templates()
+        .into_iter()
+        .find(|template| template.id == *template_id)
+        .ok_or_else(|| format!("missing team template {template_id}"))
+}
+
+fn find_role(role_preset_id: &TeamRolePresetId) -> Result<TeamRolePreset, String> {
+    role_presets()
+        .into_iter()
+        .find(|preset| preset.id == *role_preset_id)
+        .ok_or_else(|| format!("missing role preset {role_preset_id}"))
+}
+
+fn find_personality(
+    personality_preset_id: &TeamPersonalityPresetId,
+) -> Result<TeamPersonalityPreset, String> {
+    personality_presets()
+        .into_iter()
+        .find(|preset| preset.id == *personality_preset_id)
+        .ok_or_else(|| format!("missing personality preset {personality_preset_id}"))
+}
+
+fn build_profile(
+    role_preset_id: Option<&TeamRolePresetId>,
+    personality_preset_id: Option<&TeamPersonalityPresetId>,
+    personality_traits: Vec<TeamPersonalityTrait>,
+) -> Result<TeamMemberPresetProfile, String> {
+    if let Some(role_preset_id) = role_preset_id {
+        find_role(role_preset_id)?;
+    }
+    let traits = match personality_preset_id {
+        Some(personality_preset_id) => find_personality(personality_preset_id)?.traits,
+        None => personality_traits,
+    };
+    Ok(TeamMemberPresetProfile {
+        role_preset_id: role_preset_id.cloned(),
+        personality_preset_id: personality_preset_id.cloned(),
+        personality_traits: traits,
+    })
+}
+
+fn apply_profile_to_draft_member(
+    member: &mut TeamDraftMember,
+    profile: TeamMemberPresetProfile,
+) -> Result<(), String> {
+    if profile.role_preset_id.is_none()
+        && profile.personality_preset_id.is_none()
+        && profile.personality_traits.is_empty()
+    {
+        member.profile = None;
+        return Ok(());
+    }
+    let role_changed = member
+        .profile
+        .as_ref()
+        .and_then(|previous| previous.role_preset_id.as_ref())
+        != profile.role_preset_id.as_ref();
+    if let Some(role_preset_id) = profile.role_preset_id.as_ref()
+        && role_changed
+    {
+        let role = find_role(role_preset_id)?;
+        member.name = role.default_member_name;
+        member.description = role.default_description;
+        member.custom_agent_id = default_custom_agent_id_for_role(role_preset_id);
+    }
+    if let Some(personality_preset_id) = profile.personality_preset_id.as_ref() {
+        let personality = find_personality(personality_preset_id)?;
+        if role_changed && !member.description.trim().is_empty() {
+            member.description = format!("{} {}", member.description, personality.summary);
+        }
+    }
+    member.profile = Some(profile);
+    Ok(())
+}
+
+fn shuffle_draft_member(
+    member: &mut TeamDraftMember,
+    scope: TeamDraftShuffleScope,
+    seed: usize,
+) -> Result<(), String> {
+    let roles = role_presets();
+    let personalities = personality_presets();
+    let role_index = if member.org_role == TeamMemberRole::Manager {
+        seed % roles.len().min(2)
+    } else {
+        1 + (seed % (roles.len() - 1))
+    };
+    let role_id = match scope {
+        TeamDraftShuffleScope::Member => Some(roles[role_index].id.clone()),
+        TeamDraftShuffleScope::Personality => member
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.role_preset_id.clone())
+            .or_else(|| Some(roles[role_index].id.clone())),
+    };
+    let personality_id = personalities[seed % personalities.len()].id.clone();
+    let profile = build_profile(role_id.as_ref(), Some(&personality_id), Vec::new())?;
+    apply_profile_to_draft_member(member, profile)?;
+    if scope == TeamDraftShuffleScope::Member {
+        member.name = shuffled_member_name(member, seed);
+    }
+    Ok(())
+}
+
+fn default_custom_agent_id_for_role(role_preset_id: &TeamRolePresetId) -> Option<CustomAgentId> {
+    role_presets()
+        .into_iter()
+        .find(|preset| preset.id == *role_preset_id)
+        .and_then(|preset| preset.default_custom_agent_id)
+}
+
+/// Server-owned shuffle for the Add-report dialog. Picks a non-manager
+/// role and a personality preset from the catalog and returns a fully
+/// formed suggestion. The frontend renders the result; it does not pick
+/// names, agents, or personalities locally.
+fn build_member_shuffle_suggestion(seed: usize) -> Result<TeamMemberShuffleSuggestion, String> {
+    let roles = role_presets();
+    let personalities = personality_presets();
+    if roles.is_empty() {
+        return Err("team registry has no role presets".to_owned());
+    }
+    if personalities.is_empty() {
+        return Err("team registry has no personality presets".to_owned());
+    }
+    let role_index = if roles.len() > 1 {
+        1 + (seed % (roles.len() - 1))
+    } else {
+        0
+    };
+    let role = &roles[role_index];
+    let personality_index = seed % personalities.len();
+    let personality = &personalities[personality_index];
+    let profile = TeamMemberPresetProfile {
+        role_preset_id: Some(role.id.clone()),
+        personality_preset_id: Some(personality.id.clone()),
+        personality_traits: personality.traits.clone(),
+    };
+    let name = shuffled_role_name(&role.id, seed);
+    let description = format!("{} {}", role.default_description, personality.summary);
+    Ok(TeamMemberShuffleSuggestion {
+        name,
+        description,
+        profile,
+        custom_agent_id: role.default_custom_agent_id.clone(),
+    })
+}
+
+fn shuffled_role_name(role_preset_id: &TeamRolePresetId, seed: usize) -> String {
+    let variants = role_name_variants(role_preset_id);
+    variants[seed % variants.len()].to_owned()
+}
+
+fn role_name_variants(role_preset_id: &TeamRolePresetId) -> &'static [&'static str] {
+    match role_preset_id.0.as_str() {
+        "tech-lead-planner" => &["Lead Planner", "Team Coordinator", "Feature Captain"],
+        "senior-reviewer" => &["Code Reviewer", "Review Partner", "Quality Reviewer"],
+        "frontend-specialist" => &["Frontend Engineer", "UI Builder", "Interaction Engineer"],
+        "backend-specialist" => &["Backend Engineer", "Server Engineer", "Protocol Engineer"],
+        "test-author-qa" => &["Test Engineer", "QA Partner", "Regression Tester"],
+        "bug-hunter-debugger" => &["Bug Hunter", "Root Cause Debugger", "Fix Investigator"],
+        _ => &["Team Member", "Teammate", "Agent Teammate"],
+    }
+}
+
+fn shuffled_member_name(member: &TeamDraftMember, seed: usize) -> String {
+    let role_id = member
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.role_preset_id.as_ref());
+    match role_id {
+        Some(id) => shuffled_role_name(id, seed),
+        None => {
+            // No role preset on this draft member: fall back to a
+            // role-agnostic variant list. role_name_variants(&unknown)
+            // returns the same generic list for any non-catalog id.
+            shuffled_role_name(&TeamRolePresetId(String::new()), seed)
+        }
+    }
+}
+
+fn draft_member_index(draft: &TeamDraft, member_id: &TeamDraftMemberId) -> Result<usize, String> {
+    draft
+        .members
+        .iter()
+        .position(|member| member.id == *member_id)
+        .ok_or_else(|| format!("missing team draft member {member_id}"))
+}
+
+fn team_draft_update_id(payload: &TeamDraftUpdatePayload) -> &TeamDraftId {
+    match payload {
+        TeamDraftUpdatePayload::SetName { draft_id, .. }
+        | TeamDraftUpdatePayload::ReplaceMember { draft_id, .. }
+        | TeamDraftUpdatePayload::AddReport { draft_id }
+        | TeamDraftUpdatePayload::RemoveMember { draft_id, .. }
+        | TeamDraftUpdatePayload::SetMemberProfile { draft_id, .. } => draft_id,
+    }
+}
+
+fn validate_draft_member_edit(edit: &TeamDraftMemberEdit) -> Result<(), String> {
+    if edit.id.0.trim().is_empty() {
+        return Err("team draft member id must not be empty".to_owned());
+    }
+    Ok(())
+}
+
+/// Apply user-supplied editable fields onto the existing draft member.
+/// Server-owned fields — `id`, `org_role`, `profile` — are intentionally
+/// not overwritten; profile changes only flow through
+/// `SetMemberProfile` / shuffle / template-apply, and `org_role` is fixed
+/// by the slot the member was created in.
+fn apply_draft_member_edit(member: &mut TeamDraftMember, edit: TeamDraftMemberEdit) {
+    member.name = edit.name;
+    member.description = edit.description;
+    member.custom_agent_id = edit.custom_agent_id;
+    member.backend_kind = edit.backend_kind;
+    member.cost_hint = edit.cost_hint;
+    member.project_ids = edit.project_ids;
+}
+
+fn validate_draft_org(members: &[TeamDraftMember]) -> Result<(), String> {
+    let manager_count = members
+        .iter()
+        .filter(|member| member.org_role == TeamMemberRole::Manager)
+        .count();
+    if manager_count != 1 {
+        return Err(format!(
+            "team draft must have exactly one manager, got {manager_count}"
+        ));
+    }
+    Ok(())
+}
+
+fn team_create_from_draft(draft: &TeamDraft) -> Result<TeamCreateFromDraftPayload, String> {
+    if draft.name.trim().is_empty() {
+        return Err("team draft name must not be empty".to_owned());
+    }
+    validate_draft_org(&draft.members)?;
+    let mut manager = None;
+    let mut reports = Vec::new();
+    for member in &draft.members {
+        let spec = draft_member_create_spec(member)?;
+        match member.org_role {
+            TeamMemberRole::Manager => manager = Some(spec),
+            TeamMemberRole::Report => reports.push(spec),
+        }
+    }
+    let manager = manager.ok_or_else(|| "team draft manager is missing".to_owned())?;
+    Ok(TeamCreateFromDraftPayload {
+        name: draft.name.trim().to_owned(),
+        manager,
+        reports,
+    })
+}
+
+fn draft_member_create_spec(member: &TeamDraftMember) -> Result<TeamMemberCreateSpec, String> {
+    let backend_kind = member.backend_kind.ok_or_else(|| {
+        format!(
+            "team draft member {} must choose a backend before commit",
+            member.id
+        )
+    })?;
+    Ok(TeamMemberCreateSpec {
+        name: member.name.trim().to_owned(),
+        description: member.description.trim().to_owned(),
+        profile: member.profile.clone(),
+        custom_agent_id: member.custom_agent_id.clone(),
+        backend_kind,
+        cost_hint: member.cost_hint,
+        project_ids: member.project_ids.clone(),
+    })
+}
+
 fn spawn_team_registry_actor(actor: TeamRegistryActor, rx: mpsc::Receiver<TeamRegistryCommand>) {
     let worker = actor.run(rx);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1077,13 +2168,22 @@ fn spawn_team_registry_actor(actor: TeamRegistryActor, rx: mpsc::Receiver<TeamRe
 mod tests {
     use super::*;
     use crate::store::agent_teams::AgentTeamsStore;
-    use protocol::{CustomAgentId, ProjectId, TeamCreatePayload, TeamMemberCreateSpec};
+    use protocol::{
+        BackendKind, CustomAgentId, ProjectId, TeamCreatePayload, TeamMemberCreateSpec,
+    };
     use tempfile::TempDir;
 
     fn refs() -> AgentTeamValidationRefs {
+        let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
         AgentTeamValidationRefs {
             custom_agent_ids: [CustomAgentId("custom-1".to_owned())].into_iter().collect(),
             project_ids: [ProjectId("project-1".to_owned())].into_iter().collect(),
+            enabled_backend_kinds: [BackendKind::Claude, BackendKind::Codex]
+                .into_iter()
+                .collect(),
+            role_preset_ids,
+            personality_preset_ids,
+            legacy_backend_kind: Some(BackendKind::Claude),
         }
     }
 
@@ -1091,7 +2191,10 @@ mod tests {
         TeamMemberCreateSpec {
             name: "Manager".to_owned(),
             description: "Coordinates".to_owned(),
-            custom_agent_id: CustomAgentId("custom-1".to_owned()),
+            profile: None,
+            custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+            backend_kind: BackendKind::Claude,
+            cost_hint: None,
             project_ids: vec![ProjectId("project-1".to_owned())],
         }
     }
@@ -1100,7 +2203,10 @@ mod tests {
         TeamMemberCreateSpec {
             name: name.to_owned(),
             description: format!("{name} description"),
-            custom_agent_id: CustomAgentId("custom-1".to_owned()),
+            profile: None,
+            custom_agent_id: Some(CustomAgentId("custom-1".to_owned())),
+            backend_kind: BackendKind::Claude,
+            cost_hint: None,
             project_ids: vec![ProjectId("project-1".to_owned())],
         }
     }
@@ -1121,8 +2227,10 @@ mod tests {
             .collect();
         let actor = TeamRegistryActor {
             store,
+            drafts: Vec::new(),
             bindings,
             pending_activations: HashMap::new(),
+            shuffle_counter: 0,
         };
         (actor, dir)
     }

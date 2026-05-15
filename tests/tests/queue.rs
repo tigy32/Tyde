@@ -45,9 +45,13 @@ async fn expect_queued_messages_with_count(
 async fn skip_noise(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
         let env = raw_next(client, context).await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
@@ -430,6 +434,9 @@ async fn queue_cleared_on_agent_termination() {
     // The fatal AgentError must follow.
     loop {
         let env = raw_next(&mut fixture.client, "fatal AgentError after termination").await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if env.kind == FrameKind::AgentError && env.stream == agent_stream {
             let err: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
             assert!(err.fatal, "termination must produce a fatal AgentError");
@@ -439,6 +446,7 @@ async fn queue_cleared_on_agent_termination() {
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages

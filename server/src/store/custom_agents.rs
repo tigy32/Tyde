@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 use protocol::{CustomAgent, CustomAgentId, ToolPolicy};
 use serde::{Deserialize, Serialize};
 
+pub const TEAM_LEAD_CUSTOM_AGENT_ID: &str = "tyde-team-lead";
+pub const CODE_REVIEWER_CUSTOM_AGENT_ID: &str = "tyde-code-reviewer";
+pub const FRONTEND_ENGINEER_CUSTOM_AGENT_ID: &str = "tyde-frontend-engineer";
+pub const BACKEND_ENGINEER_CUSTOM_AGENT_ID: &str = "tyde-backend-engineer";
+pub const TEST_QA_ENGINEER_CUSTOM_AGENT_ID: &str = "tyde-test-qa-engineer";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
     records: HashMap<String, CustomAgent>,
@@ -17,8 +23,20 @@ pub struct CustomAgentStore {
 
 impl CustomAgentStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        let _ = Self::read_from_disk(&path)?;
-        Ok(Self { path })
+        let mut records = Self::read_from_disk(&path)?;
+        let mut changed = false;
+        for custom_agent in builtin_team_custom_agents() {
+            if !records.contains_key(&custom_agent.id.0) {
+                validate_custom_agent(&custom_agent)?;
+                records.insert(custom_agent.id.0.clone(), custom_agent);
+                changed = true;
+            }
+        }
+        let store = Self { path };
+        if changed {
+            store.save(&records)?;
+        }
+        Ok(store)
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -120,6 +138,71 @@ impl CustomAgentStore {
         })?;
         Ok(())
     }
+}
+
+pub fn builtin_team_custom_agents() -> Vec<CustomAgent> {
+    vec![
+        CustomAgent {
+            id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
+            name: "Team Lead".to_owned(),
+            description: "Plans work, coordinates teammates, and keeps scope tight.".to_owned(),
+            instructions: Some(
+                "Act as a pragmatic team lead. Break work into clear tasks, coordinate other agents, surface risks early, and keep the implementation focused on the requested outcome."
+                    .to_owned(),
+            ),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned()),
+            name: "Code Reviewer".to_owned(),
+            description: "Reviews correctness, maintainability, tests, and architecture.".to_owned(),
+            instructions: Some(
+                "Act as a code reviewer. Look for correctness bugs, missing tests, broken invariants, architecture drift, and maintainability risks. Be specific and actionable."
+                    .to_owned(),
+            ),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(FRONTEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
+            name: "Frontend Engineer".to_owned(),
+            description: "Builds UI behavior, state projection, and interaction polish.".to_owned(),
+            instructions: Some(
+                "Act as a frontend engineer. Focus on typed UI state, reactive rendering, accessibility, and user-visible behavior. Avoid frontend-owned domain semantics."
+                    .to_owned(),
+            ),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(BACKEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
+            name: "Backend Engineer".to_owned(),
+            description: "Owns server behavior, persistence, validation, and protocol flow.".to_owned(),
+            instructions: Some(
+                "Act as a backend engineer. Keep behavior server-owned, validate invariants loudly, preserve typed protocol flow, and avoid silent fallbacks."
+                    .to_owned(),
+            ),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(TEST_QA_ENGINEER_CUSTOM_AGENT_ID.to_owned()),
+            name: "Test / QA Engineer".to_owned(),
+            description: "Adds focused tests and verifies observable behavior.".to_owned(),
+            instructions: Some(
+                "Act as a test and QA engineer. Start from observable behavior, add focused coverage, reproduce failures before fixing them, and report exact checks."
+                    .to_owned(),
+            ),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+    ]
 }
 
 fn validate_custom_agent(custom_agent: &CustomAgent) -> Result<(), String> {

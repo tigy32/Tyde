@@ -1516,10 +1516,6 @@ kbd {
     position: relative;
 }
 
-/* Horizontal split: main chat column on the left, optional team-roster
- * sidebar on the right. The sidebar mounts only when the active chat's
- * agent is the live binding for a team's manager (see `chat_view.rs`
- * `manager_team` Memo + `dev-docs/19-agent-teams.md` §9.2). */
 .chat-view-body {
     flex: 1;
     display: flex;
@@ -1553,6 +1549,11 @@ kbd {
     border-radius: 0.4rem;
     background: var(--surface-1);
     overflow: hidden;
+}
+
+.team-card-active {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 1px var(--accent-subtle);
 }
 
 .team-card-header {
@@ -1595,6 +1596,18 @@ kbd {
     color: var(--text-tertiary);
 }
 
+.team-card-active-badge,
+.team-member-active-badge {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--accent-subtle);
+    border: 1px solid var(--accent-primary);
+    color: var(--accent-link);
+}
+
 .team-card-actions {
     display: flex;
     align-items: center;
@@ -1623,6 +1636,14 @@ kbd {
 
 .team-member-row:hover {
     background: var(--surface-2);
+}
+
+.team-member-row-active {
+    background: var(--accent-subtle);
+}
+
+.team-member-row-active:hover {
+    background: var(--accent-subtle);
 }
 
 .team-member-main {
@@ -1657,7 +1678,8 @@ kbd {
 }
 
 .team-member-state,
-.team-member-status {
+.team-member-status,
+.team-member-last-active {
     font-size: 0.78rem;
     color: var(--text-tertiary);
 }
@@ -1724,123 +1746,108 @@ kbd {
     flex-shrink: 0;
 }
 
-/* New-team wizard, step 3 (reports). The pending form and the chip list
- * share a vertical stack with comfortable spacing so the Remove button
- * never crowds the report name. */
-.team-wizard-reports {
+.team-draft-start,
+.team-draft-editor {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
-    margin: 0.5rem 0 1rem;
-}
-
-.team-wizard-report-chip {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.75rem;
-    padding: 0.4rem 0.6rem;
-    background: var(--surface-2);
-    border: 1px solid var(--border-primary);
-    border-radius: 0.4rem;
-}
-
-.team-wizard-report-name {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 500;
-}
-
-.team-wizard-pending-report {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    padding: 0.75rem;
-    background: var(--surface-2);
-    border: 1px solid var(--border-primary);
-    border-radius: 0.4rem;
-}
-
-.team-wizard-pending-report .settings-form-row {
-    margin-top: 0.5rem;
-}
-
-.team-roster-sidebar {
-    display: flex;
-    flex-direction: column;
-    width: 260px;
-    flex-shrink: 0;
-    border-left: 1px solid var(--border-primary);
-    background: var(--surface-1);
-    overflow-y: auto;
+    gap: var(--space-3);
+    /* Live inside a height-capped modal: shrink so the scrollable child
+     * (.team-draft-member-list) actually scrolls instead of pushing the
+     * commit footer off-screen. */
+    flex: 1;
     min-height: 0;
 }
 
-.team-roster-header {
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--border-primary);
-}
-
-.team-roster-title {
-    font-size: 0.85rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-secondary);
-}
-
-.team-roster-list {
+.team-draft-template-actions {
     display: flex;
-    flex-direction: column;
-}
-
-.team-roster-row {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--border-subtle);
-    cursor: pointer;
-}
-
-.team-roster-row:hover {
-    background: var(--surface-2);
-}
-
-.team-roster-row-line {
-    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
     align-items: center;
+}
+
+.team-draft-template-list,
+.team-draft-member-list {
+    display: flex;
+    flex-direction: column;
     gap: var(--space-2);
 }
 
-.team-roster-row-name {
-    font-weight: 600;
-    color: var(--text-primary);
+/* Member cards can grow arbitrarily tall when the draft has many reports.
+ * Make the member list the modal's scrollable region so the team name,
+ * template actions, add-report button, error, and commit footer stay in
+ * view. */
+.team-draft-editor > .team-draft-member-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: var(--space-1);
 }
 
-.team-roster-row-role,
-.team-roster-row-status,
-.team-roster-row-custom-agent,
-.team-roster-row-project,
-.team-roster-row-roots,
-.team-roster-row-active {
-    font-size: 0.78rem;
-    color: var(--text-secondary);
+/* Start view template list also scrolls if many templates exist. */
+.team-draft-start > .team-draft-template-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: var(--space-1);
 }
 
-.team-roster-row-meta {
+.team-draft-template-card {
     display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-3);
+    border: 1px solid var(--border-primary);
+    border-radius: 0.4rem;
+    background: var(--surface-1);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+}
+
+.team-draft-template-card:hover {
+    background: var(--surface-2);
+    border-color: var(--border-secondary);
+}
+
+.team-draft-template-name {
+    font-weight: 600;
+}
+
+.team-draft-template-summary {
+    font-size: 0.82rem;
+    color: var(--text-tertiary);
+}
+
+.team-draft-member-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    border: 1px solid var(--border-primary);
+    border-radius: 0.4rem;
+    background: var(--surface-1);
+}
+
+.team-draft-member-header {
+    display: flex;
+    align-items: center;
     flex-wrap: wrap;
     gap: var(--space-2);
 }
 
-.team-roster-empty {
-    padding: var(--space-3) var(--space-4);
-    color: var(--text-tertiary);
-    font-style: italic;
+.team-draft-member-header strong {
+    margin-right: auto;
+}
+
+.team-draft-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    gap: var(--space-3);
+    align-items: start;
+}
+
+.team-draft-grid .team-member-projects {
+    grid-column: 1 / -1;
 }
 
 .chat-agent-header {
@@ -5585,6 +5592,8 @@ kbd {
 
 .settings-confirm-modal {
     width: min(420px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -5593,6 +5602,24 @@ kbd {
     border: 1px solid var(--border-primary);
     border-radius: 10px;
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+/* Wider variant for multi-column dialogs like the team draft editor, which
+ * renders a grid of member cards that doesn't fit a 420px column. */
+.settings-confirm-modal-wide {
+    width: min(820px, calc(100vw - 32px));
+}
+
+/* Header row holds the title and any per-dialog toolbar buttons (e.g. the
+ * Add report Shuffle button) so they sit on the same line. */
+.settings-confirm-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-confirm-header .settings-confirm-title {
+    margin-right: auto;
 }
 
 .settings-confirm-title {

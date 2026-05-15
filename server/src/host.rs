@@ -23,9 +23,13 @@ use protocol::{
     SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
-    TeamDeletePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberRole,
-    TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
+    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
     TerminalSendPayload,
 };
@@ -80,7 +84,7 @@ use crate::sub_agent::{
 };
 use crate::team_registry::{
     TeamDescribeData, TeamMemberActivation, TeamMessagePlan, TeamRegistryEvents,
-    TeamRegistryHandle, TeamRegistrySnapshot,
+    TeamRegistryHandle, TeamRegistrySnapshot, team_preset_validation_refs,
 };
 use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal};
 
@@ -541,6 +545,42 @@ impl HostHandle {
                 return Vec::new();
             }
         };
+        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+            panic!(
+                "host stream {} disappeared during team catalog registration replay",
+                host_path
+            );
+        };
+        if emit_team_preset_catalog_notify_for_subscriber(
+            &TeamPresetCatalogNotifyPayload {
+                catalog: team_snapshot.catalog,
+            },
+            subscriber,
+        )
+        .await
+        .is_err()
+        {
+            state.host_streams.remove(&host_path);
+            return Vec::new();
+        }
+        for draft in team_snapshot.drafts {
+            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+                panic!(
+                    "host stream {} disappeared during team draft registration replay",
+                    host_path
+                );
+            };
+            if emit_team_draft_notify_for_subscriber(
+                &TeamDraftNotifyPayload::Upsert { draft },
+                subscriber,
+            )
+            .await
+            .is_err()
+            {
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+        }
         for team in team_snapshot.teams {
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
@@ -1512,10 +1552,29 @@ impl HostHandle {
             .snapshot()
             .await
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        // Built-in team custom agents are wired into the role-preset
+        // catalog as the default agent for each role. If we let those
+        // records be deleted, the catalog would advertise stale ids that
+        // drafts/templates would happily copy into draft members. Keep
+        // invalid states unrepresentable by rejecting the delete.
+        if snapshot
+            .catalog
+            .role_presets
+            .iter()
+            .any(|role| role.default_custom_agent_id.as_ref() == Some(&payload.id))
+        {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot delete built-in custom agent {} that backs a team role preset",
+                    payload.id
+                ),
+            ));
+        }
         let referenced_team_members = snapshot
             .members
             .iter()
-            .filter(|member| member.custom_agent_id == payload.id)
+            .filter(|member| member.custom_agent_id.as_ref() == Some(&payload.id))
             .map(|member| member.id.clone())
             .collect::<Vec<_>>();
         if !referenced_team_members.is_empty() {
@@ -1711,7 +1770,6 @@ impl HostHandle {
                     &registry,
                     &plan,
                     SpawnAgentParams::Resume { session_id, prompt },
-                    None,
                 )
                 .await
                 .map_err(|error| team_member_activation_error(OPERATION, error))
@@ -1742,17 +1800,7 @@ impl HostHandle {
                 } else {
                     message
                 };
-                let backend_kind = match self.team_member_backend_kind().await {
-                    Ok(backend_kind) => backend_kind,
-                    Err(err) => {
-                        let events = registry
-                            .record_binding_failure(plan.member.id.clone())
-                            .await
-                            .map_err(|error| team_member_activation_error(OPERATION, error))?;
-                        self.fan_out_team_registry_events(events).await;
-                        return Err(team_member_activation_error(OPERATION, err));
-                    }
-                };
+                let backend_kind = plan.member.backend_kind;
                 let workspace_roots = match self.team_member_workspace_roots(&plan.member).await {
                     Ok(workspace_roots) => workspace_roots,
                     Err(err) => {
@@ -1772,11 +1820,10 @@ impl HostHandle {
                         prompt,
                         images,
                         backend_kind,
-                        cost_hint: None,
+                        cost_hint: plan.member.cost_hint,
                         access_mode: Default::default(),
                         session_settings: None,
                     },
-                    Some(backend_kind),
                 )
                 .await
                 .map_err(|error| team_member_activation_error(OPERATION, error))
@@ -1813,7 +1860,6 @@ impl HostHandle {
                         session_id,
                         prompt: Some(message),
                     },
-                    None,
                 )
                 .await
             }
@@ -1834,16 +1880,7 @@ impl HostHandle {
                 } else {
                     message
                 };
-                let backend_kind = match self.team_member_backend_kind().await {
-                    Ok(backend_kind) => backend_kind,
-                    Err(err) => {
-                        let events = registry
-                            .record_binding_failure(plan.member.id.clone())
-                            .await?;
-                        self.fan_out_team_registry_events(events).await;
-                        return Err(err);
-                    }
-                };
+                let backend_kind = plan.member.backend_kind;
                 let workspace_roots = match self.team_member_workspace_roots(&plan.member).await {
                     Ok(workspace_roots) => workspace_roots,
                     Err(err) => {
@@ -1862,11 +1899,10 @@ impl HostHandle {
                         prompt,
                         images,
                         backend_kind,
-                        cost_hint: None,
+                        cost_hint: plan.member.cost_hint,
                         access_mode: Default::default(),
                         session_settings: None,
                     },
-                    Some(backend_kind),
                 )
                 .await
             }
@@ -1925,12 +1961,11 @@ impl HostHandle {
         registry: &TeamRegistryHandle,
         plan: &TeamMessagePlan,
         params: SpawnAgentParams,
-        _backend_kind: Option<protocol::BackendKind>,
     ) -> Result<TeamMemberMessageOutcome, String> {
         let clear_session_on_failure = matches!(&params, SpawnAgentParams::Resume { .. });
         let payload = SpawnAgentPayload {
             name: Some(plan.member.name.clone()),
-            custom_agent_id: Some(plan.member.custom_agent_id.clone()),
+            custom_agent_id: plan.member.custom_agent_id.clone(),
             parent_agent_id: None,
             project_id: Some(team_member_primary_project_id(&plan.member)?),
             params,
@@ -2059,13 +2094,6 @@ impl HostHandle {
         Ok(())
     }
 
-    async fn team_member_backend_kind(&self) -> Result<protocol::BackendKind, String> {
-        let settings = self.read_settings().await?;
-        settings.default_backend.ok_or_else(|| {
-            "cannot activate fresh team member because host has no default_backend".to_string()
-        })
-    }
-
     async fn team_member_workspace_roots(
         &self,
         member: &TeamMember,
@@ -2187,6 +2215,95 @@ impl HostHandle {
                 registry.delete_member(payload, refs).await
             })
             .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn create_team_draft(&self, payload: TeamDraftCreatePayload) -> AppResult<()> {
+        const OPERATION: &str = "team_draft_create";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .create_draft(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn update_team_draft(&self, payload: TeamDraftUpdatePayload) -> AppResult<()> {
+        const OPERATION: &str = "team_draft_update";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .update_draft(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn shuffle_team_draft(
+        &self,
+        payload: TeamDraftShufflePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_draft_shuffle";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .shuffle_draft(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn shuffle_team_member(
+        &self,
+        payload: TeamMemberShufflePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_member_shuffle";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .shuffle_member_suggestion(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn apply_team_draft_template(
+        &self,
+        payload: TeamDraftApplyTemplatePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_draft_apply_template";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .apply_draft_template(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn commit_team_draft(&self, payload: TeamDraftCommitPayload) -> AppResult<()> {
+        const OPERATION: &str = "team_draft_commit";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.commit_draft(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn discard_team_draft(
+        &self,
+        payload: TeamDraftDiscardPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_draft_discard";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .discard_draft(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
         self.fan_out_team_registry_events(events).await;
         Ok(())
     }
@@ -4002,7 +4119,9 @@ fn spawn_host_inner(
     let project_store = ProjectStore::load(paths.project)?;
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
+    let host_settings = settings_store.get()?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
+    let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
     let team_refs = AgentTeamValidationRefs {
         custom_agent_ids: custom_agent_store
             .list()?
@@ -4014,6 +4133,10 @@ fn spawn_host_inner(
             .into_iter()
             .map(|project| project.id)
             .collect(),
+        enabled_backend_kinds: host_settings.enabled_backends.iter().copied().collect(),
+        role_preset_ids,
+        personality_preset_ids,
+        legacy_backend_kind: host_settings.default_backend,
     };
     let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs)?;
     let project_store = Arc::new(Mutex::new(project_store));
@@ -4410,6 +4533,23 @@ Report:
 ",
             member.description
         ));
+        if let Some(profile) = member.profile.as_ref() {
+            if let Some(role_preset_id) = profile.role_preset_id.as_ref() {
+                block.push_str(&format!("- role_preset_id: {}\n", role_preset_id));
+            }
+            if let Some(personality_preset_id) = profile.personality_preset_id.as_ref() {
+                block.push_str(&format!(
+                    "- personality_preset_id: {}\n",
+                    personality_preset_id
+                ));
+            }
+            if !profile.personality_traits.is_empty() {
+                block.push_str(&format!(
+                    "- personality_traits: {:?}\n",
+                    profile.personality_traits
+                ));
+            }
+        }
         let project_ids = member
             .project_ids
             .iter()
@@ -4655,6 +4795,36 @@ async fn fan_out_team_registry_events(state: &mut HostState, events: TeamRegistr
     for payload in events.binding_notifies {
         fan_out_team_member_binding_notify(state, payload).await;
     }
+    for payload in events.draft_notifies {
+        fan_out_team_draft_notify(state, payload).await;
+    }
+    for payload in events.shuffle_suggestion_notifies {
+        fan_out_team_member_shuffle_suggestion(state, payload).await;
+    }
+}
+
+async fn fan_out_team_member_shuffle_suggestion(
+    state: &mut HostState,
+    payload: TeamMemberShuffleSuggestionNotifyPayload,
+) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_team_member_shuffle_suggestion_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
 }
 
 async fn fan_out_team_notify(state: &mut HostState, payload: TeamNotifyPayload) {
@@ -4723,6 +4893,27 @@ async fn fan_out_team_member_binding_notify(
     }
 }
 
+async fn fan_out_team_draft_notify(state: &mut HostState, payload: TeamDraftNotifyPayload) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_team_draft_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
 async fn agent_team_validation_refs(
     state: &HostState,
     operation: &'static str,
@@ -4745,9 +4936,23 @@ async fn agent_team_validation_refs(
         .into_iter()
         .map(|project| project.id)
         .collect::<HashSet<_>>();
+    let enabled_backend_kinds = state
+        .settings_store
+        .lock()
+        .await
+        .get()
+        .map_err(|error| AppError::internal(operation, anyhow!(error)))?
+        .enabled_backends
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
     Ok(AgentTeamValidationRefs {
         custom_agent_ids,
         project_ids,
+        enabled_backend_kinds,
+        role_preset_ids,
+        personality_preset_ids,
+        legacy_backend_kind: None,
     })
 }
 
@@ -4907,6 +5112,40 @@ async fn emit_team_member_binding_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::TeamMemberBindingNotify, payload)
+}
+
+async fn emit_team_preset_catalog_notify_for_subscriber(
+    payload: &TeamPresetCatalogNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TeamPresetCatalogNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::TeamPresetCatalogNotify, payload)
+}
+
+async fn emit_team_draft_notify_for_subscriber(
+    payload: &TeamDraftNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TeamDraftNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::TeamDraftNotify, payload)
+}
+
+async fn emit_team_member_shuffle_suggestion_for_subscriber(
+    payload: &TeamMemberShuffleSuggestionNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload).expect(
+        "failed to serialize TeamMemberShuffleSuggestionNotify payload for host stream fanout",
+    );
+    subscriber
+        .stream
+        .send_value(FrameKind::TeamMemberShuffleSuggestionNotify, payload)
 }
 
 async fn emit_project_notify_for_subscriber(
@@ -5340,7 +5579,10 @@ mod tests {
             manager: TeamMemberCreateSpec {
                 name: "Manager".to_owned(),
                 description: "Coordinates reports".to_owned(),
-                custom_agent_id: custom_agent_id.clone(),
+                profile: None,
+                custom_agent_id: Some(custom_agent_id.clone()),
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
                 project_ids: vec![project_id.clone()],
             },
         })
@@ -5366,7 +5608,10 @@ mod tests {
             member: TeamMemberCreateSpec {
                 name: "Report".to_owned(),
                 description: "Implements delegated work".to_owned(),
-                custom_agent_id: custom_agent_id.clone(),
+                profile: None,
+                custom_agent_id: Some(custom_agent_id.clone()),
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
                 project_ids: vec![project_id.clone()],
             },
             session_id: None,
@@ -5407,6 +5652,21 @@ mod tests {
         let agent_team_store_path = temp_dir.path().join("agent_teams.json");
         let host = spawn_host_with_mock_backend(session_path, project_path, settings_path)
             .expect("spawn mock host");
+
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable backend");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(BackendKind::Claude),
+            },
+        })
+        .await
+        .expect("set default backend");
 
         let manager_custom_agent_id = CustomAgentId(format!("manager-{}", Uuid::new_v4()));
         host.upsert_custom_agent(CustomAgentUpsertPayload {
@@ -5483,7 +5743,10 @@ mod tests {
             manager: TeamMemberCreateSpec {
                 name: "Race Manager".to_owned(),
                 description: "Coordinates the race test".to_owned(),
-                custom_agent_id: manager_custom_agent_id,
+                profile: None,
+                custom_agent_id: Some(manager_custom_agent_id),
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
                 project_ids: vec![manager_project_id],
             },
         })
@@ -5567,7 +5830,10 @@ mod tests {
             member: TeamMemberCreateSpec {
                 name: "Race Report".to_owned(),
                 description: "Created while a referenced record is deleting".to_owned(),
-                custom_agent_id,
+                profile: None,
+                custom_agent_id: Some(custom_agent_id),
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
                 project_ids,
             },
             session_id: None,
@@ -5675,6 +5941,7 @@ mod tests {
                 id: fixture.report.id.clone(),
                 name: fixture.report.name.clone(),
                 description: fixture.report.description.clone(),
+                profile: fixture.report.profile.clone(),
                 project_ids: vec![fixture.project_id.clone(), second_project_id],
             })
             .await
@@ -5825,7 +6092,7 @@ mod tests {
                     },
                     None,
                     Some(report.project_ids[0].clone()),
-                    Some(report.custom_agent_id.clone()),
+                    report.custom_agent_id.clone(),
                 )
                 .expect("persist fake session");
         }

@@ -15,9 +15,10 @@ use protocol::{
     ProtocolValidator, QueuedMessagesPayload, RejectPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
-    StreamPath, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamNotifyPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    TerminalStartPayload,
+    StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TerminalErrorPayload, TerminalExitPayload,
+    TerminalOutputPayload, TerminalStartPayload,
 };
 
 use crate::send::send_frame;
@@ -1273,6 +1274,60 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse team_member_binding_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::TeamPresetCatalogNotify => {
+            match envelope.parse_payload::<TeamPresetCatalogNotifyPayload>() {
+                Ok(payload) => {
+                    state.team_preset_catalogs.update(|map| {
+                        map.insert(host_id.to_string(), payload.catalog);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse team_preset_catalog_notify payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::TeamDraftNotify => match envelope.parse_payload::<TeamDraftNotifyPayload>() {
+            Ok(TeamDraftNotifyPayload::Upsert { draft }) => {
+                state.team_drafts.update(|map| {
+                    let host_map = map.entry(host_id.to_string()).or_default();
+                    host_map.insert(draft.id.clone(), draft);
+                });
+            }
+            Ok(TeamDraftNotifyPayload::Delete { draft_id }) => {
+                state.team_drafts.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&draft_id);
+                    }
+                });
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse team_draft_notify payload: {error}"),
+            ),
+        },
+        FrameKind::TeamMemberShuffleSuggestionNotify => {
+            match envelope.parse_payload::<TeamMemberShuffleSuggestionNotifyPayload>() {
+                Ok(payload) => {
+                    state.record_team_member_shuffle_suggestion(host_id, payload);
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!(
+                        "failed to parse team_member_shuffle_suggestion_notify payload: {error}"
+                    ),
                 ),
             }
         }

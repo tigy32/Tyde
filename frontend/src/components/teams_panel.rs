@@ -1,16 +1,20 @@
-use std::collections::HashSet;
-
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    CustomAgent, CustomAgentId, ProjectId, Team, TeamId, TeamMember, TeamMemberCreateSpec,
-    TeamMemberId, TeamMemberRole, TeamMemberState, TeamMemberUpdatePayload,
+    AgentControlStatus, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint, Team,
+    TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
+    TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberCreateSpec,
+    TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
+    TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId,
+    TeamTemplateId,
 };
 
 use crate::send::{
-    team_create, team_delete, team_member_create, team_member_delete, team_member_update,
-    team_set_manager,
+    team_delete, team_draft_add_report, team_draft_apply_template, team_draft_commit,
+    team_draft_create, team_draft_discard, team_draft_remove_member, team_draft_replace_member,
+    team_draft_set_member_profile, team_draft_set_name, team_draft_shuffle, team_member_create,
+    team_member_delete, team_member_shuffle, team_member_update, team_set_manager,
 };
 use crate::state::{ActiveAgentRef, AppState, TabContent};
 
@@ -21,23 +25,14 @@ pub(crate) struct MemberFormState {
     pub(crate) is_manager: bool,
     pub(crate) name: RwSignal<String>,
     pub(crate) description: RwSignal<String>,
+    pub(crate) profile: RwSignal<Option<TeamMemberPresetProfile>>,
     pub(crate) custom_agent_id: RwSignal<Option<CustomAgentId>>,
+    pub(crate) backend_kind: RwSignal<Option<BackendKind>>,
+    pub(crate) cost_hint: RwSignal<Option<SpawnCostHint>>,
     pub(crate) project_ids: RwSignal<Vec<ProjectId>>,
 }
 
 impl MemberFormState {
-    fn new_manager(team_id_placeholder: TeamId) -> Self {
-        Self {
-            team_id: team_id_placeholder,
-            editing_id: None,
-            is_manager: true,
-            name: RwSignal::new(String::new()),
-            description: RwSignal::new(String::new()),
-            custom_agent_id: RwSignal::new(None),
-            project_ids: RwSignal::new(Vec::new()),
-        }
-    }
-
     fn new_report(team_id: TeamId) -> Self {
         Self {
             team_id,
@@ -45,7 +40,10 @@ impl MemberFormState {
             is_manager: false,
             name: RwSignal::new(String::new()),
             description: RwSignal::new(String::new()),
+            profile: RwSignal::new(None),
             custom_agent_id: RwSignal::new(None),
+            backend_kind: RwSignal::new(None),
+            cost_hint: RwSignal::new(None),
             project_ids: RwSignal::new(Vec::new()),
         }
     }
@@ -57,7 +55,10 @@ impl MemberFormState {
             is_manager,
             name: RwSignal::new(member.name.clone()),
             description: RwSignal::new(member.description.clone()),
-            custom_agent_id: RwSignal::new(Some(member.custom_agent_id.clone())),
+            profile: RwSignal::new(member.profile.clone()),
+            custom_agent_id: RwSignal::new(member.custom_agent_id.clone()),
+            backend_kind: RwSignal::new(Some(member.backend_kind)),
+            cost_hint: RwSignal::new(member.cost_hint),
             project_ids: RwSignal::new(member.project_ids.clone()),
         }
     }
@@ -72,10 +73,12 @@ fn build_spec(form: &MemberFormState) -> Result<TeamMemberCreateSpec, String> {
     if description.is_empty() {
         return Err("Description is required.".to_string());
     }
-    let custom_agent_id = form
-        .custom_agent_id
+    let custom_agent_id = form.custom_agent_id.get_untracked();
+    let backend_kind = form
+        .backend_kind
         .get_untracked()
-        .ok_or_else(|| "Pick a custom agent.".to_string())?;
+        .ok_or_else(|| "Pick a backend.".to_string())?;
+    let cost_hint = form.cost_hint.get_untracked();
     let project_ids = form.project_ids.get_untracked();
     if project_ids.is_empty() {
         return Err("Pick at least one project.".to_string());
@@ -83,7 +86,10 @@ fn build_spec(form: &MemberFormState) -> Result<TeamMemberCreateSpec, String> {
     Ok(TeamMemberCreateSpec {
         name,
         description,
+        profile: form.profile.get_untracked(),
         custom_agent_id,
+        backend_kind,
+        cost_hint,
         project_ids,
     })
 }
@@ -108,55 +114,63 @@ fn build_update(
         id: member_id,
         name,
         description,
+        profile: form.profile.get_untracked(),
         project_ids,
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum WizardStep {
-    Name,
-    Manager,
-    Reports,
-}
-
-type ReportDispatchState = Option<(String, Vec<TeamMemberCreateSpec>, HashSet<TeamId>)>;
-
-#[derive(Clone)]
-struct NewTeamForm {
-    name: RwSignal<String>,
-    manager: MemberFormState,
-    step: RwSignal<WizardStep>,
-    /// Finalized reports stored as plain data (no live signals) to avoid
-    /// reactive-owner disposal issues. Each entry is (display_name, spec).
-    finalized_reports: RwSignal<Vec<(String, TeamMemberCreateSpec)>>,
-}
-
-impl NewTeamForm {
-    fn blank() -> Self {
-        Self {
-            name: RwSignal::new(String::new()),
-            // The team_id is a placeholder until create returns; we never
-            // serialize this field — create_team payload bundles the manager
-            // spec with the team name. Use a dummy id.
-            manager: MemberFormState::new_manager(TeamId(String::new())),
-            step: RwSignal::new(WizardStep::Name),
-            finalized_reports: RwSignal::new(Vec::new()),
-        }
-    }
-}
+type ActiveTeamSelection = Option<(String, TeamMemberId, TeamId)>;
 
 #[component]
 pub fn TeamsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let new_team: RwSignal<Option<NewTeamForm>> = RwSignal::new(None);
+    let new_team_open: RwSignal<bool> = RwSignal::new(false);
     let member_form: RwSignal<Option<MemberFormState>> = RwSignal::new(None);
+
+    let active_team_state = state.clone();
+    let active_team_selection: Memo<ActiveTeamSelection> = Memo::new(move |_| {
+        if let Some(active) = active_team_state.active_agent.get() {
+            let host_id = active.host_id.clone();
+            let agent_id = active.agent_id.clone();
+            return active_team_state.team_member_bindings.with(|bindings_map| {
+                let member_id = bindings_map
+                    .get(&host_id)?
+                    .values()
+                    .find(|binding| binding.current_agent_id.as_ref() == Some(&agent_id))
+                    .map(|binding| binding.member_id.clone())?;
+                active_team_state.team_members.with(|members_map| {
+                    let member = members_map.get(&host_id)?.get(&member_id)?;
+                    Some((host_id.clone(), member_id, member.team_id.clone()))
+                })
+            });
+        }
+
+        active_team_state.center_zone.with(|cz| {
+            let pending = match &cz.active_tab()?.content {
+                TabContent::Chat {
+                    agent_ref: None,
+                    pending_team_member: Some(pending),
+                } => pending.clone(),
+                _ => return None,
+            };
+            active_team_state.team_members.with(|members_map| {
+                let member = members_map.get(&pending.host_id)?.get(&pending.member_id)?;
+                Some((
+                    pending.host_id.clone(),
+                    pending.member_id.clone(),
+                    member.team_id.clone(),
+                ))
+            })
+        })
+    });
 
     let teams_state = state.clone();
     // Pair each team with its host_id at the source, so downstream rows never
     // need to read the ambient `selected_host_id` to know which host they belong
     // to. That removes the bug where a user switches hosts while a team tab is
     // open and the row's actions read from the wrong host's signals.
+    let active_team_for_sort = active_team_selection;
     let teams_for_host: Memo<Vec<(String, Team)>> = Memo::new(move |_| {
         let Some(host_id) = teams_state.selected_host_id.get() else {
             return Vec::new();
@@ -168,7 +182,16 @@ pub fn TeamsPanel() -> impl IntoView {
             .cloned()
             .map(|m| m.into_values().collect())
             .unwrap_or_default();
-        teams.sort_by(|a, b| a.name.cmp(&b.name));
+        let active = active_team_for_sort.get();
+        teams.sort_by(|a, b| {
+            let a_active = active.as_ref().is_some_and(|(active_host, _, team_id)| {
+                active_host == &host_id && team_id == &a.id
+            });
+            let b_active = active.as_ref().is_some_and(|(active_host, _, team_id)| {
+                active_host == &host_id && team_id == &b.id
+            });
+            b_active.cmp(&a_active).then(a.name.cmp(&b.name))
+        });
         teams.into_iter().map(|t| (host_id.clone(), t)).collect()
     });
 
@@ -177,7 +200,7 @@ pub fn TeamsPanel() -> impl IntoView {
         if state_new.selected_host_id.get_untracked().is_none() {
             return;
         }
-        new_team.set(Some(NewTeamForm::blank()));
+        new_team_open.set(true);
     };
 
     view! {
@@ -220,6 +243,7 @@ pub fn TeamsPanel() -> impl IntoView {
                                 <TeamCard
                                     host_id=host_for_card
                                     team_id=team_id
+                                    active_team_selection=active_team_selection
                                     on_open=Callback::new(move |_: ()| {
                                         open_team(&state_open, host_for_open.clone(), tid_open.clone())
                                     })
@@ -251,8 +275,8 @@ pub fn TeamsPanel() -> impl IntoView {
                 })}
             </div>
 
-            {move || new_team.get().map(|form| view! {
-                <NewTeamDialog form=form on_close=Callback::new(move |_: ()| new_team.set(None)) />
+            {move || new_team_open.get().then(|| view! {
+                <NewTeamDialog on_close=Callback::new(move |_: ()| new_team_open.set(false)) />
             })}
             {move || member_form.get().map(|form| view! {
                 <MemberDialog form=form on_close=Callback::new(move |_: ()| member_form.set(None)) />
@@ -265,6 +289,7 @@ pub fn TeamsPanel() -> impl IntoView {
 fn TeamCard(
     host_id: String,
     team_id: TeamId,
+    active_team_selection: Memo<ActiveTeamSelection>,
     on_open: Callback<()>,
     on_add_report: Callback<()>,
     on_delete: Callback<()>,
@@ -319,10 +344,29 @@ fn TeamCard(
 
     let name = move || team_record.get().map(|t| t.name).unwrap_or_default();
     let member_count = move || members.get().len();
+    let host_for_active = host_id.clone();
+    let team_id_for_active = team_id.clone();
+    let is_active_team: Memo<bool> = Memo::new(move |_| {
+        active_team_selection
+            .get()
+            .as_ref()
+            .is_some_and(|(active_host, _, active_team_id)| {
+                active_host == &host_for_active && active_team_id == &team_id_for_active
+            })
+    });
 
     let host_for_rows = host_id.clone();
     view! {
-        <div class="team-card" data-team-id=team_id.0.clone()>
+        <div
+            class=move || {
+                if is_active_team.get() {
+                    "team-card team-card-active"
+                } else {
+                    "team-card"
+                }
+            }
+            data-team-id=team_id.0.clone()
+        >
             <div class="team-card-header">
                 <button
                     class="team-card-title"
@@ -333,6 +377,9 @@ fn TeamCard(
                     <span class="team-card-count">
                         {move || format!("{} members", member_count())}
                     </span>
+                    {move || is_active_team.get().then(|| view! {
+                        <span class="team-card-active-badge">"Active"</span>
+                    })}
                 </button>
                 <div class="team-card-actions">
                     <button
@@ -364,6 +411,7 @@ fn TeamCard(
                             <MemberRow
                                 host_id=host_for_row
                                 member_id=member_id
+                                active_team_selection=active_team_selection
                                 on_edit=on_edit_member
                                 on_delete=on_delete_member
                                 on_open=on_open_member
@@ -381,6 +429,7 @@ fn TeamCard(
 fn MemberRow(
     host_id: String,
     member_id: TeamMemberId,
+    active_team_selection: Memo<ActiveTeamSelection>,
     on_edit: Callback<MemberFormState>,
     on_delete: Callback<TeamMemberId>,
     on_open: Callback<TeamMemberId>,
@@ -401,22 +450,38 @@ fn MemberRow(
     let mid_for_binding = member_id.clone();
     let host_for_binding = host_id.clone();
     let state_for_binding = state.clone();
-    let binding_status = move || -> Option<protocol::AgentControlStatus> {
+    let binding: Memo<Option<TeamMemberBindingPayload>> = Memo::new(move |_| {
         state_for_binding.team_member_bindings.with(|map| {
             map.get(&host_for_binding)
                 .and_then(|m| m.get(&mid_for_binding))
-                .map(|b| b.status)
+                .cloned()
         })
+    });
+    let binding_status = move || binding.get().map(|binding| binding.status);
+    let last_active_label = move || {
+        binding
+            .get()
+            .and_then(|binding| binding.last_active_at_ms)
+            .map(|_| "last active recorded".to_owned())
     };
 
     let host_for_agent = host_id.clone();
     let custom_agent_state = state.clone();
-    let custom_agent_label = move || -> Option<String> {
+    let agent_profile_label = move || -> Option<String> {
         let m = member.get()?;
-        custom_agent_state.custom_agents.with(|map| {
-            map.get(&host_for_agent)
-                .and_then(|m2| m2.get(&m.custom_agent_id).map(|c| c.name.clone()))
-        })
+        let custom_agent = match m.custom_agent_id.as_ref() {
+            Some(custom_agent_id) => custom_agent_state.custom_agents.with(|map| {
+                map.get(&host_for_agent)
+                    .and_then(|m2| m2.get(custom_agent_id).map(|c| c.name.clone()))
+                    .unwrap_or_else(|| custom_agent_id.0.clone())
+            }),
+            None => "Default agent".to_owned(),
+        };
+        Some(format!(
+            "{custom_agent} · {}{}",
+            backend_kind_label(m.backend_kind),
+            cost_hint_suffix(m.cost_hint)
+        ))
     };
 
     let host_for_projects = host_id.clone();
@@ -442,23 +507,20 @@ fn MemberRow(
     };
 
     let mid_for_open = member_id.clone();
-    let mid_for_edit = member_id.clone();
     let mid_for_delete = member_id.clone();
-    let mid_for_promote = member_id;
+    let mid_for_promote = member_id.clone();
 
     let on_click = move |_: web_sys::MouseEvent| {
         on_open.run(mid_for_open.clone());
     };
 
     let on_edit_click = {
-        let mid = mid_for_edit.clone();
         move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
             let Some(m) = member.get_untracked() else {
                 return;
             };
             let is_manager = matches!(m.role, TeamMemberRole::Manager);
-            let _ = mid; // edit form keys off member's id field
             on_edit.run(MemberFormState::from_member(&m, is_manager));
         }
     };
@@ -474,12 +536,29 @@ fn MemberRow(
     };
 
     let can_promote = move || matches!(member.get().map(|m| m.role), Some(TeamMemberRole::Report));
+    let host_for_active = host_id.clone();
+    let member_id_for_active = member_id.clone();
+    let is_active_member: Memo<bool> = Memo::new(move |_| {
+        active_team_selection
+            .get()
+            .as_ref()
+            .is_some_and(|(active_host, active_member_id, _)| {
+                active_host == &host_for_active && active_member_id == &member_id_for_active
+            })
+    });
 
     view! {
         <div
-            class="team-member-row"
+            class=move || {
+                if is_active_member.get() {
+                    "team-member-row team-member-row-active"
+                } else {
+                    "team-member-row"
+                }
+            }
             role="button"
             tabindex="0"
+            aria-current=move || if is_active_member.get() { "true" } else { "false" }
             on:click=on_click
         >
             <div class="team-member-main">
@@ -487,6 +566,9 @@ fn MemberRow(
                     <span class="team-member-name">
                         {move || member.get().map(|m| m.name).unwrap_or_default()}
                     </span>
+                    {move || is_active_member.get().then(|| view! {
+                        <span class="team-member-active-badge">"Active"</span>
+                    })}
                     <span class="team-member-role-badge">
                         {move || match member.get().map(|m| m.role) {
                             Some(TeamMemberRole::Manager) => "Manager",
@@ -504,11 +586,14 @@ fn MemberRow(
                         })
                     }}
                     {move || binding_status().map(|status| view! {
-                        <span class="team-member-status">{format!("{status:?}").to_lowercase()}</span>
+                        <span class="team-member-status">{agent_control_status_label(status)}</span>
+                    })}
+                    {move || last_active_label().map(|label| view! {
+                        <span class="team-member-last-active">{label}</span>
                     })}
                 </div>
                 <div class="team-member-meta">
-                    {move || custom_agent_label().map(|s| view! {
+                    {move || agent_profile_label().map(|s| view! {
                         <span class="team-member-custom-agent">{s}</span>
                     })}
                     {move || {
@@ -533,316 +618,784 @@ fn MemberRow(
 }
 
 #[component]
-fn NewTeamDialog(form: NewTeamForm, on_close: Callback<()>) -> impl IntoView {
+fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
     let submitting: RwSignal<bool> = RwSignal::new(false);
 
-    let name_sig = form.name;
-    let manager_form = form.manager.clone();
-    let step_sig = form.step;
-    // finalized_reports stores (display_name, spec) as plain data so there are
-    // no live signal reads between confirmation and the eventual TeamCreate submit.
-    let finalized_reports_sig = form.finalized_reports;
-
-    // The inline add-report form. Created here (at component rendering time,
-    // under a proper reactive owner) so its RwSignal fields are never
-    // prematurely disposed. Wrapped in StoredValue<T: Copy> so it can be
-    // captured by multiple move closures without making any of them FnOnce.
-    let pending_report_store: StoredValue<MemberFormState> =
-        StoredValue::new(MemberFormState::new_report(TeamId(String::new())));
-    let show_pending_report: RwSignal<bool> = RwSignal::new(false);
-
-    // Step 1 → 2: validate name only
-    let on_next_name = move |_| {
-        let team_name = name_sig.get_untracked().trim().to_string();
-        if team_name.is_empty() {
-            error_sig.set(Some("Team name is required.".to_string()));
-            return;
-        }
-        error_sig.set(None);
-        step_sig.set(WizardStep::Manager);
-    };
-
-    // Step 2 → 3: validate manager spec
-    let manager_form_for_next = manager_form.clone();
-    let on_next_manager = move |_| {
-        if let Err(e) = build_spec(&manager_form_for_next) {
-            error_sig.set(Some(e));
-            return;
-        }
-        error_sig.set(None);
-        step_sig.set(WizardStep::Reports);
-    };
-
-    // Open the inline add-report form (reset fields then reveal)
-    let on_add_report = move |_| {
-        pending_report_store.with_value(|form| {
-            form.name.set(String::new());
-            form.description.set(String::new());
-            form.custom_agent_id.set(None);
-            form.project_ids.set(Vec::new());
-        });
-        show_pending_report.set(true);
-        error_sig.set(None);
-    };
-
-    // Confirm the inline report (validate → build spec → store plain data → hide form)
-    let on_confirm_pending = move |_| {
-        let result = pending_report_store.with_value(build_spec);
-        match result {
-            Ok(spec) => {
-                let display_name = spec.name.clone();
-                finalized_reports_sig.update(|reports| reports.push((display_name, spec)));
-                show_pending_report.set(false);
-                error_sig.set(None);
-            }
-            Err(e) => {
-                error_sig.set(Some(format!("Report: {e}")));
-            }
-        }
-    };
-
-    // Cancel the inline report form without adding
-    let on_cancel_pending = move |_| {
-        show_pending_report.set(false);
-        error_sig.set(None);
-    };
-
-    let on_remove_report = move |idx: usize| {
-        finalized_reports_sig.update(|reports| {
-            if idx < reports.len() {
-                reports.remove(idx);
-            }
-        });
-    };
-
-    // Holds the context needed to dispatch TeamMemberCreate calls once the
-    // server's TeamNotify::Upsert for the newly-created team arrives. Written
-    // by on_save after team_create succeeds; read by the component-scope
-    // Effect below which has a proper reactive owner (unlike an Effect created
-    // inside spawn_local, which would be dropped after its first run).
-    let report_dispatch: RwSignal<ReportDispatchState> = RwSignal::new(None);
-
-    let state_for_effect = state.clone();
-    Effect::new(move |_| {
-        let Some((host_id, specs, pre)) = report_dispatch.get() else {
-            return;
-        };
-        let new_team_id = state_for_effect.teams.with(|map| {
-            map.get(&host_id)
-                .and_then(|m| m.keys().find(|tid| !pre.contains(*tid)).cloned())
-        });
-        let Some(new_team_id) = new_team_id else {
-            return;
-        };
-        // Clear so this Effect body won't re-enter on subsequent team updates.
-        report_dispatch.set(None);
-        let Some(stream) = state_for_effect.host_stream_untracked(&host_id) else {
-            log::error!("report dispatch: host stream gone for {host_id}");
-            submitting.set(false);
-            on_close.run(());
-            return;
-        };
-        spawn_local(async move {
-            for spec in specs {
-                if let Err(error) =
-                    team_member_create(&host_id, stream.clone(), new_team_id.clone(), spec).await
-                {
-                    log::error!("team_member_create failed: {error}");
-                }
-            }
-            submitting.set(false);
-            on_close.run(());
-        });
+    let draft_state = state.clone();
+    let current_draft: Memo<Option<(String, TeamDraft)>> = Memo::new(move |_| {
+        let host_id = draft_state.selected_host_id.get()?;
+        draft_state.team_drafts.with(|drafts| {
+            let mut values = drafts.get(&host_id)?.values().cloned().collect::<Vec<_>>();
+            values.sort_by(|a, b| {
+                a.created_at_ms
+                    .cmp(&b.created_at_ms)
+                    .then(a.id.0.cmp(&b.id.0))
+            });
+            values
+                .into_iter()
+                .next()
+                .map(|draft| (host_id.clone(), draft))
+        })
     });
 
-    let state_for_save = state.clone();
-    let manager_for_save = manager_form.clone();
-    let on_save = move |_| {
-        let team_name = name_sig.get_untracked().trim().to_string();
-        if team_name.is_empty() {
-            error_sig.set(Some("Team name is required.".to_string()));
-            return;
-        }
-        let manager_spec = match build_spec(&manager_for_save) {
-            Ok(s) => s,
-            Err(e) => {
-                error_sig.set(Some(e));
-                return;
-            }
-        };
-        // Reports were validated and converted to plain specs when added.
-        let report_specs: Vec<TeamMemberCreateSpec> = finalized_reports_sig
-            .get_untracked()
-            .into_iter()
-            .map(|(_, spec)| spec)
-            .collect();
-        let Some(host_id) = state_for_save.selected_host_id.get_untracked() else {
-            error_sig.set(Some("No host selected.".to_string()));
-            return;
-        };
-        let Some(stream) = state_for_save.host_stream_untracked(&host_id) else {
-            error_sig.set(Some("Host is not connected.".to_string()));
-            return;
-        };
-        error_sig.set(None);
-        submitting.set(true);
+    let catalog_state = state.clone();
+    let catalog = Memo::new(move |_| {
+        let host_id = catalog_state.selected_host_id.get()?;
+        catalog_state
+            .team_preset_catalogs
+            .with(|catalogs| catalogs.get(&host_id).cloned())
+    });
 
-        // Snapshot existing team ids on this host so we can spot the new one
-        // when the server's TeamNotify::Upsert lands.
-        let pre_existing: HashSet<TeamId> = state_for_save.teams.with_untracked(|map| {
-            map.get(&host_id)
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default()
-        });
-
-        let team_name_for_call = team_name.clone();
-        let host_for_call = host_id.clone();
-        spawn_local(async move {
-            if let Err(error) =
-                team_create(&host_for_call, stream, team_name_for_call, manager_spec).await
-            {
-                log::error!("team_create failed: {error}");
-                error_sig.set(Some(error));
-                submitting.set(false);
-                return;
-            }
-            if report_specs.is_empty() {
-                submitting.set(false);
-                on_close.run(());
-                return;
-            }
-            // Signal the component-scope Effect to watch for the Upsert echo
-            // and then dispatch TeamMemberCreate for each report.
-            report_dispatch.set(Some((host_for_call, report_specs, pre_existing)));
-        });
+    let command_error_state = state.clone();
+    let command_error = move || {
+        let host_id = command_error_state.selected_host_id.get()?;
+        command_error_state
+            .command_errors_by_host
+            .with(|errors| errors.get(&host_id).cloned())
     };
 
-    let on_cancel = move |_| on_close.run(());
-    let manager_form_for_fields = manager_form.clone();
+    let close_when_committed = on_close;
+    let command_error_for_effect = command_error_state.clone();
+    Effect::new(move |_| {
+        if !submitting.get() {
+            return;
+        }
+        if current_draft.get().is_none() {
+            // Successful commit: the host's draft was deleted, so the
+            // dialog can close.
+            submitting.set(false);
+            close_when_committed.run(());
+            return;
+        }
+        // Server rejected the commit; the draft is preserved on the host
+        // so the user can fix it. Re-enable retry/discard. We probe the
+        // host's command_errors signal reactively here so a new error
+        // (e.g. validation failure from the registry) clears the
+        // submitting flag without inventing a silent fallback.
+        let Some(host_id) = command_error_for_effect.selected_host_id.get() else {
+            return;
+        };
+        if command_error_for_effect
+            .command_errors_by_host
+            .with(|errors| errors.get(&host_id).is_some())
+        {
+            submitting.set(false);
+        }
+    });
+
+    let send_create: Callback<Option<TeamTemplateId>> = {
+        let state = state.clone();
+        Callback::new(move |template_id: Option<TeamTemplateId>| {
+            let Some(host_id) = state.selected_host_id.get_untracked() else {
+                error_sig.set(Some("No host selected.".to_string()));
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                error_sig.set(Some("Host is not connected.".to_string()));
+                return;
+            };
+            error_sig.set(None);
+            spawn_local(async move {
+                if let Err(error) = team_draft_create(&host_id, stream, template_id).await {
+                    log::error!("team_draft_create failed: {error}");
+                }
+            });
+        })
+    };
+
+    let send_apply_template: Callback<(TeamDraftId, TeamTemplateId)> = {
+        let state = state.clone();
+        Callback::new(
+            move |(draft_id, template_id): (TeamDraftId, TeamTemplateId)| {
+                let Some(host_id) = state.selected_host_id.get_untracked() else {
+                    error_sig.set(Some("No host selected.".to_string()));
+                    return;
+                };
+                let Some(stream) = state.host_stream_untracked(&host_id) else {
+                    error_sig.set(Some("Host is not connected.".to_string()));
+                    return;
+                };
+                error_sig.set(None);
+                spawn_local(async move {
+                    if let Err(error) =
+                        team_draft_apply_template(&host_id, stream, draft_id, template_id).await
+                    {
+                        log::error!("team_draft_apply_template failed: {error}");
+                    }
+                });
+            },
+        )
+    };
+
+    let send_commit: Callback<TeamDraftId> = {
+        let state = state.clone();
+        Callback::new(move |draft_id: TeamDraftId| {
+            let Some(host_id) = state.selected_host_id.get_untracked() else {
+                error_sig.set(Some("No host selected.".to_string()));
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                error_sig.set(Some("Host is not connected.".to_string()));
+                return;
+            };
+            error_sig.set(None);
+            // Clear any prior host-level command error so the Effect can
+            // detect a *new* error from this commit and re-enable
+            // retry/discard. Without this, a previous error would keep
+            // the dialog enabled indefinitely or the new error would
+            // never be observed as a transition.
+            let host_id_for_clear = host_id.clone();
+            state.command_errors_by_host.update(|errors| {
+                errors.remove(&host_id_for_clear);
+            });
+            submitting.set(true);
+            spawn_local(async move {
+                if let Err(error) = team_draft_commit(&host_id, stream, draft_id).await {
+                    log::error!("team_draft_commit failed: {error}");
+                    error_sig.set(Some(error));
+                    submitting.set(false);
+                }
+            });
+        })
+    };
+
+    let send_discard: Callback<TeamDraftId> = {
+        let state = state.clone();
+        Callback::new(move |draft_id: TeamDraftId| {
+            let Some(host_id) = state.selected_host_id.get_untracked() else {
+                error_sig.set(Some("No host selected.".to_string()));
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                error_sig.set(Some("Host is not connected.".to_string()));
+                return;
+            };
+            error_sig.set(None);
+            spawn_local(async move {
+                if let Err(error) = team_draft_discard(&host_id, stream, draft_id).await {
+                    log::error!("team_draft_discard failed: {error}");
+                    error_sig.set(Some(error));
+                    return;
+                }
+                on_close.run(());
+            });
+        })
+    };
+
+    let send_name: Callback<(TeamDraftId, String)> = {
+        let state = state.clone();
+        Callback::new(move |(draft_id, name): (TeamDraftId, String)| {
+            let Some(host_id) = state.selected_host_id.get_untracked() else {
+                error_sig.set(Some("No host selected.".to_string()));
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                error_sig.set(Some("Host is not connected.".to_string()));
+                return;
+            };
+            spawn_local(async move {
+                if let Err(error) = team_draft_set_name(&host_id, stream, draft_id, name).await {
+                    log::error!("team_draft_set_name failed: {error}");
+                }
+            });
+        })
+    };
+
+    let send_add_report: Callback<TeamDraftId> = {
+        let state = state.clone();
+        Callback::new(move |draft_id: TeamDraftId| {
+            let Some(host_id) = state.selected_host_id.get_untracked() else {
+                error_sig.set(Some("No host selected.".to_string()));
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                error_sig.set(Some("Host is not connected.".to_string()));
+                return;
+            };
+            spawn_local(async move {
+                if let Err(error) = team_draft_add_report(&host_id, stream, draft_id).await {
+                    log::error!("team_draft_add_report failed: {error}");
+                }
+            });
+        })
+    };
+
+    let send_shuffle_all: Callback<TeamDraftId> = {
+        let state = state.clone();
+        Callback::new(move |draft_id: TeamDraftId| {
+            let Some(host_id) = state.selected_host_id.get_untracked() else {
+                error_sig.set(Some("No host selected.".to_string()));
+                return;
+            };
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                error_sig.set(Some("Host is not connected.".to_string()));
+                return;
+            };
+            spawn_local(async move {
+                if let Err(error) = team_draft_shuffle(
+                    &host_id,
+                    stream,
+                    draft_id,
+                    None,
+                    TeamDraftShuffleScope::Member,
+                )
+                .await
+                {
+                    log::error!("team_draft_shuffle all failed: {error}");
+                }
+            });
+        })
+    };
+
     view! {
-        <ModalOverlay on_close=on_close>
-            // Step 1: name only
-            <Show when=move || step_sig.get() == WizardStep::Name>
-                <h3 class="settings-confirm-title">"New team — name"</h3>
+        <ModalOverlay on_close=on_close wide=true>
+            <h3 class="settings-confirm-title">"New team"</h3>
+            {move || match current_draft.get() {
+                None => view! {
+                    <div class="team-draft-start">
+                        <p class="settings-form-hint">
+                            "Start blank, generate a balanced team, or choose a server-owned template."
+                        </p>
+                        <div class="team-draft-template-actions">
+                            <button
+                                class="settings-btn settings-btn-primary team-draft-start-blank"
+                                type="button"
+                                on:click=move |_| send_create.run(None)
+                            >"Start blank"</button>
+                            {move || catalog.get().and_then(|catalog| {
+                                catalog.team_templates.into_iter().find(|template| template.balanced)
+                            }).map(|template| {
+                                let template_id = template.id.clone();
+                                view! {
+                                    <button
+                                        class="settings-btn team-draft-balanced"
+                                        type="button"
+                                        on:click=move |_| send_create.run(Some(template_id.clone()))
+                                    >"Generate balanced team"</button>
+                                }
+                            })}
+                        </div>
+                        <div class="team-draft-template-list">
+                            {move || catalog.get().map(|catalog| {
+                                catalog.team_templates.into_iter().filter(|template| !template.balanced).map(|template| {
+                                    let template_id = template.id.clone();
+                                    let summary = template.summary.clone();
+                                    view! {
+                                        <button
+                                            class="team-draft-template-card"
+                                            type="button"
+                                            on:click=move |_| send_create.run(Some(template_id.clone()))
+                                        >
+                                            <span class="team-draft-template-name">{template.name}</span>
+                                            <span class="team-draft-template-summary">{summary}</span>
+                                        </button>
+                                    }
+                                }).collect_view()
+                            })}
+                        </div>
+                    </div>
+                }.into_any(),
+                Some((host_id, draft)) => {
+                    let draft_id_for_name = draft.id.clone();
+                    let draft_id_for_apply = draft.id.clone();
+                    let draft_id_for_add = draft.id.clone();
+                    let draft_id_for_shuffle = draft.id.clone();
+                    let draft_id_for_commit = draft.id.clone();
+                    let draft_id_for_discard = draft.id.clone();
+                    let draft_id_for_rows = draft.id.clone();
+                    let draft_id_attr = draft.id.0.clone();
+                    view! {
+                        <div class="team-draft-editor" data-draft-id=draft_id_attr>
+                            <label class="settings-form-label">
+                                <span>"Team name"</span>
+                                <input
+                                    class="settings-text-input team-draft-name"
+                                    type="text"
+                                    prop:value=draft.name.clone()
+                                    on:input=move |ev| {
+                                        send_name.run((draft_id_for_name.clone(), event_target_value(&ev)));
+                                    }
+                                    spellcheck="false"
+                                    autocapitalize="none"
+                                    autocomplete="off"
+                                />
+                            </label>
+                            <div class="team-draft-template-actions">
+                                {move || catalog.get().and_then(|catalog| {
+                                    catalog.team_templates.into_iter().find(|template| template.balanced)
+                                }).map(|template| {
+                                    let template_id = template.id.clone();
+                                    let draft_id = draft_id_for_apply.clone();
+                                    view! {
+                                        <button
+                                            class="settings-btn team-draft-balanced"
+                                            type="button"
+                                            on:click=move |_| send_apply_template.run((draft_id.clone(), template_id.clone()))
+                                        >"Regenerate balanced team"</button>
+                                    }
+                                })}
+                                <button
+                                    class="settings-btn team-draft-shuffle-all"
+                                    type="button"
+                                    on:click=move |_| send_shuffle_all.run(draft_id_for_shuffle.clone())
+                                >"Shuffle all members"</button>
+                            </div>
+                            <div class="team-draft-member-list">
+                                <For
+                                    each=move || current_draft.get().map(|(_, draft)| {
+                                        draft.members.into_iter().map(|member| member.id).collect::<Vec<_>>()
+                                    }).unwrap_or_default()
+                                    key=|member_id| member_id.clone()
+                                    let:member_id
+                                >
+                                    <DraftMemberRow
+                                        host_id=host_id.clone()
+                                        draft_id=draft_id_for_rows.clone()
+                                        member_id=member_id
+                                    />
+                                </For>
+                            </div>
+                            <button
+                                class="settings-btn team-draft-add-report"
+                                type="button"
+                                on:click=move |_| send_add_report.run(draft_id_for_add.clone())
+                            >"+ Add report"</button>
+                            <Show when=move || error_sig.get().is_some() || command_error().is_some()>
+                                <p class="settings-error">
+                                    {move || error_sig.get().or_else(command_error).unwrap_or_default()}
+                                </p>
+                            </Show>
+                            <div class="settings-form-footer">
+                                <button
+                                    class="settings-btn"
+                                    type="button"
+                                    disabled=move || submitting.get()
+                                    on:click=move |_| send_discard.run(draft_id_for_discard.clone())
+                                >"Discard"</button>
+                                <button
+                                    class="settings-btn settings-btn-primary team-draft-commit"
+                                    type="button"
+                                    disabled=move || submitting.get()
+                                    on:click=move |_| send_commit.run(draft_id_for_commit.clone())
+                                >{move || if submitting.get() { "Creating…" } else { "Create team" }}</button>
+                            </div>
+                        </div>
+                    }.into_any()
+                }
+            }}
+        </ModalOverlay>
+    }
+}
+
+#[component]
+fn DraftMemberRow(
+    host_id: String,
+    draft_id: TeamDraftId,
+    member_id: TeamDraftMemberId,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let host_for_member = host_id.clone();
+    let draft_for_member = draft_id.clone();
+    let member_for_lookup = member_id.clone();
+    let state_for_member = state.clone();
+    let member: Memo<Option<TeamDraftMember>> = Memo::new(move |_| {
+        state_for_member.team_drafts.with(|drafts| {
+            drafts
+                .get(&host_for_member)?
+                .get(&draft_for_member)?
+                .members
+                .iter()
+                .find(|member| member.id == member_for_lookup)
+                .cloned()
+        })
+    });
+
+    let catalog_state = state.clone();
+    let host_for_catalog = host_id.clone();
+    let catalog = Memo::new(move |_| {
+        catalog_state
+            .team_preset_catalogs
+            .with(|catalogs| catalogs.get(&host_for_catalog).cloned())
+    });
+
+    let state_for_agents = state.clone();
+    let host_for_agents = host_id.clone();
+    let available_agents: Memo<Vec<CustomAgent>> = Memo::new(move |_| {
+        let mut agents: Vec<CustomAgent> = state_for_agents
+            .custom_agents
+            .get()
+            .get(&host_for_agents)
+            .cloned()
+            .map(|m| m.into_values().collect())
+            .unwrap_or_default();
+        agents.sort_by(|a, b| a.name.cmp(&b.name));
+        agents
+    });
+
+    let state_for_projects = state.clone();
+    let host_for_projects = host_id.clone();
+    let available_projects: Memo<Vec<protocol::Project>> = Memo::new(move |_| {
+        let mut projects: Vec<protocol::Project> = state_for_projects
+            .projects
+            .get()
+            .into_iter()
+            .filter(|p| p.host_id == host_for_projects)
+            .map(|p| p.project)
+            .collect();
+        projects.sort_by(|a, b| a.name.cmp(&b.name));
+        projects
+    });
+
+    let state_for_backends = state.clone();
+    let host_for_backends = host_id.clone();
+    let available_backends: Memo<Vec<BackendKind>> = Memo::new(move |_| {
+        state_for_backends
+            .host_settings_by_host
+            .get()
+            .get(&host_for_backends)
+            .map(|settings| settings.enabled_backends.clone())
+            .unwrap_or_default()
+    });
+
+    let send_replace: Callback<TeamDraftMember> = {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let draft_id = draft_id.clone();
+        Callback::new(move |updated: TeamDraftMember| {
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                log::error!("team draft replace: host stream missing for {host_id}");
+                return;
+            };
+            let host = host_id.clone();
+            let draft = draft_id.clone();
+            // The protocol only accepts the user-editable fields here;
+            // org_role/profile stay server-owned and move through
+            // dedicated update events (SetMemberProfile/shuffle/template).
+            let edit = TeamDraftMemberEdit {
+                id: updated.id,
+                name: updated.name,
+                description: updated.description,
+                custom_agent_id: updated.custom_agent_id,
+                backend_kind: updated.backend_kind,
+                cost_hint: updated.cost_hint,
+                project_ids: updated.project_ids,
+            };
+            spawn_local(async move {
+                if let Err(error) = team_draft_replace_member(&host, stream, draft, edit).await {
+                    log::error!("team_draft_replace_member failed: {error}");
+                }
+            });
+        })
+    };
+
+    let send_profile: Callback<(
+        Option<TeamRolePresetId>,
+        Option<TeamPersonalityPresetId>,
+        Vec<TeamPersonalityTrait>,
+    )> = {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let draft_id = draft_id.clone();
+        let member_id = member_id.clone();
+        Callback::new(
+            move |(role_preset_id, personality_preset_id, personality_traits)| {
+                let Some(stream) = state.host_stream_untracked(&host_id) else {
+                    log::error!("team draft profile: host stream missing for {host_id}");
+                    return;
+                };
+                let host = host_id.clone();
+                let payload = protocol::TeamDraftUpdatePayload::SetMemberProfile {
+                    draft_id: draft_id.clone(),
+                    member_id: member_id.clone(),
+                    role_preset_id,
+                    personality_preset_id,
+                    personality_traits,
+                };
+                spawn_local(async move {
+                    if let Err(error) = team_draft_set_member_profile(&host, stream, payload).await
+                    {
+                        log::error!("team_draft_set_member_profile failed: {error}");
+                    }
+                });
+            },
+        )
+    };
+
+    let send_shuffle_member: Callback<TeamDraftShuffleScope> = {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let draft_id = draft_id.clone();
+        let member_id = member_id.clone();
+        Callback::new(move |scope: TeamDraftShuffleScope| {
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                log::error!("team draft shuffle: host stream missing for {host_id}");
+                return;
+            };
+            let host = host_id.clone();
+            let draft = draft_id.clone();
+            let member = member_id.clone();
+            spawn_local(async move {
+                if let Err(error) =
+                    team_draft_shuffle(&host, stream, draft, Some(member), scope).await
+                {
+                    log::error!("team_draft_shuffle failed: {error}");
+                }
+            });
+        })
+    };
+
+    let send_remove: Callback<()> = {
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let draft_id = draft_id.clone();
+        let member_id = member_id.clone();
+        Callback::new(move |_: ()| {
+            let Some(stream) = state.host_stream_untracked(&host_id) else {
+                log::error!("team draft remove: host stream missing for {host_id}");
+                return;
+            };
+            let host = host_id.clone();
+            let draft = draft_id.clone();
+            let member = member_id.clone();
+            spawn_local(async move {
+                if let Err(error) = team_draft_remove_member(&host, stream, draft, member).await {
+                    log::error!("team_draft_remove_member failed: {error}");
+                }
+            });
+        })
+    };
+
+    view! {
+        <div class="team-draft-member-card" data-draft-member-id=member_id.0.clone()>
+            <div class="team-draft-member-header">
+                <strong>{move || member.get().map(|member| member.name).filter(|name| !name.is_empty()).unwrap_or_else(|| "Unnamed member".to_owned())}</strong>
+                <span class="team-member-role-badge">
+                    {move || match member.get().map(|member| member.org_role) {
+                        Some(TeamMemberRole::Manager) => "Manager",
+                        Some(TeamMemberRole::Report) => "Report",
+                        None => "",
+                    }}
+                </span>
+                <button
+                    class="settings-btn team-draft-shuffle-member"
+                    type="button"
+                    on:click=move |_| send_shuffle_member.run(TeamDraftShuffleScope::Member)
+                >"Shuffle member"</button>
+                <button
+                    class="settings-btn team-draft-shuffle-personality"
+                    type="button"
+                    on:click=move |_| send_shuffle_member.run(TeamDraftShuffleScope::Personality)
+                >"Shuffle personality"</button>
+                {move || matches!(member.get().map(|member| member.org_role), Some(TeamMemberRole::Report)).then(|| view! {
+                    <button class="settings-btn" type="button" on:click=move |_| send_remove.run(())>"Remove"</button>
+                })}
+            </div>
+            <div class="team-draft-grid">
                 <label class="settings-form-label">
-                    <span>"Team name"</span>
+                    <span>"Role / specialty"</span>
+                    <select
+                        class="settings-text-input team-draft-role-select"
+                        on:change=move |ev| {
+                            let value = event_target_value(&ev);
+                            let role = (!value.is_empty()).then_some(TeamRolePresetId(value));
+                            let personality = member.get_untracked().and_then(|member| member.profile.and_then(|profile| profile.personality_preset_id));
+                            send_profile.run((role, personality, Vec::new()));
+                        }
+                    >
+                        <option value="" prop:selected=move || member.get().and_then(|m| m.profile.and_then(|p| p.role_preset_id)).is_none()>"Manual / no preset"</option>
+                        {move || catalog.get().map(|catalog| {
+                            catalog.role_presets.into_iter().map(|preset| {
+                                let id = preset.id.clone();
+                                let value = preset.id.0.clone();
+                                view! {
+                                    <option
+                                        value=value
+                                        prop:selected=move || member.get().and_then(|m| m.profile.and_then(|p| p.role_preset_id)) == Some(id.clone())
+                                    >{preset.name}</option>
+                                }
+                            }).collect_view()
+                        })}
+                    </select>
+                </label>
+                <label class="settings-form-label">
+                    <span>"Personality"</span>
+                    <select
+                        class="settings-text-input team-draft-personality-select"
+                        on:change=move |ev| {
+                            let value = event_target_value(&ev);
+                            let personality = (!value.is_empty()).then_some(TeamPersonalityPresetId(value));
+                            let role = member.get_untracked().and_then(|member| member.profile.and_then(|profile| profile.role_preset_id));
+                            send_profile.run((role, personality, Vec::new()));
+                        }
+                    >
+                        <option value="" prop:selected=move || member.get().and_then(|m| m.profile.and_then(|p| p.personality_preset_id)).is_none()>"Manual / no preset"</option>
+                        {move || catalog.get().map(|catalog| {
+                            catalog.personality_presets.into_iter().map(|preset| {
+                                let id = preset.id.clone();
+                                let value = preset.id.0.clone();
+                                view! {
+                                    <option
+                                        value=value
+                                        prop:selected=move || member.get().and_then(|m| m.profile.and_then(|p| p.personality_preset_id)) == Some(id.clone())
+                                    >{preset.name}</option>
+                                }
+                            }).collect_view()
+                        })}
+                    </select>
+                </label>
+                <label class="settings-form-label">
+                    <span>"Name"</span>
                     <input
                         class="settings-text-input"
                         type="text"
-                        prop:value=move || name_sig.get()
-                        on:input=move |ev| name_sig.set(event_target_value(&ev))
-                        spellcheck="false"
-                        autocapitalize="none"
-                        autocomplete="off"
+                        prop:value=move || member.get().map(|member| member.name).unwrap_or_default()
+                        on:input=move |ev| {
+                            let value = event_target_value(&ev);
+                            if let Some(mut current) = member.get_untracked() {
+                                current.name = value;
+                                send_replace.run(current);
+                            }
+                        }
                     />
                 </label>
-            </Show>
-
-            // Step 2: manager form
-            <Show when=move || step_sig.get() == WizardStep::Manager>
-                <h3 class="settings-confirm-title">"New team — manager"</h3>
-                <MemberFormFields form=manager_form_for_fields.clone() />
-            </Show>
-
-            // Step 3: optional reports
-            <Show when=move || step_sig.get() == WizardStep::Reports>
-                <h3 class="settings-confirm-title">"New team — reports (optional)"</h3>
-                <p class="settings-form-hint">
-                    "Add any reports now, or finish and add them later from the team card."
-                </p>
-                <div class="team-wizard-reports">
-                    // Finalized reports as chips (plain data, no live signals)
-                    {move || finalized_reports_sig.get().into_iter().enumerate().map(|(idx, (name, _spec))| {
-                        view! {
-                            <div class="team-wizard-report-chip">
-                                <span class="team-wizard-report-name">{name}</span>
-                                <button
-                                    class="settings-btn"
-                                    type="button"
-                                    on:click=move |_| on_remove_report(idx)
-                                >"Remove"</button>
-                            </div>
+                <label class="settings-form-label">
+                    <span>"Description"</span>
+                    <input
+                        class="settings-text-input"
+                        type="text"
+                        prop:value=move || member.get().map(|member| member.description).unwrap_or_default()
+                        on:input=move |ev| {
+                            let value = event_target_value(&ev);
+                            if let Some(mut current) = member.get_untracked() {
+                                current.description = value;
+                                send_replace.run(current);
+                            }
                         }
-                    }).collect_view()}
-                    // Inline pending-report form (shown via show_pending_report)
-                    <Show when=move || show_pending_report.get()>
-                        <div class="team-wizard-pending-report">
-                            <MemberFormFields form=pending_report_store.with_value(|f| f.clone()) />
-                            <div class="settings-form-row">
-                                <button
-                                    class="settings-btn"
-                                    type="button"
-                                    on:click=on_cancel_pending
-                                >"Cancel"</button>
-                                <button
-                                    class="settings-btn settings-btn-primary"
-                                    type="button"
-                                    on:click=on_confirm_pending
-                                >"Add"</button>
-                            </div>
-                        </div>
-                    </Show>
-                    <Show when=move || !show_pending_report.get()>
-                        <button
-                            class="settings-btn"
-                            type="button"
-                            on:click=on_add_report
-                        >"+ Add a report"</button>
-                    </Show>
-                </div>
-            </Show>
-
-            <Show when=move || error_sig.get().is_some()>
-                <p class="settings-error">{move || error_sig.get().unwrap_or_default()}</p>
-            </Show>
-            <div class="settings-form-footer">
-                // Step 1: Cancel + Next
-                <Show when=move || step_sig.get() == WizardStep::Name>
-                    <button
-                        class="settings-btn"
-                        on:click=on_cancel
-                        disabled=move || submitting.get()
-                    >"Cancel"</button>
-                    <button
-                        class="settings-btn settings-btn-primary"
-                        on:click=on_next_name
-                        disabled=move || submitting.get()
-                    >"Next"</button>
-                </Show>
-                // Step 2: Back + Next
-                <Show when=move || step_sig.get() == WizardStep::Manager>
-                    <button
-                        class="settings-btn"
-                        on:click=move |_| step_sig.set(WizardStep::Name)
-                        disabled=move || submitting.get()
-                    >"Back"</button>
-                    <button
-                        class="settings-btn settings-btn-primary"
-                        on:click=on_next_manager.clone()
-                        disabled=move || submitting.get()
-                    >"Next"</button>
-                </Show>
-                // Step 3: Back + Finish. Hidden while the inline pending-report
-                // form is open — the user is in a sub-flow and only Cancel/Add
-                // should be reachable until that resolves.
-                <Show when=move || step_sig.get() == WizardStep::Reports && !show_pending_report.get()>
-                    <button
-                        class="settings-btn"
-                        on:click=move |_| step_sig.set(WizardStep::Manager)
-                        disabled=move || submitting.get()
-                    >"Back"</button>
-                    <button
-                        class="settings-btn settings-btn-primary"
-                        on:click=on_save.clone()
-                        disabled=move || submitting.get()
+                    />
+                </label>
+                <label class="settings-form-label">
+                    <span>"Custom agent"</span>
+                    <select
+                        class="settings-text-input"
+                        on:change=move |ev| {
+                            let value = event_target_value(&ev);
+                            if let Some(mut current) = member.get_untracked() {
+                                current.custom_agent_id = (!value.is_empty()).then_some(CustomAgentId(value));
+                                send_replace.run(current);
+                            }
+                        }
                     >
-                        {move || if submitting.get() { "Creating…" } else { "Finish" }}
-                    </button>
-                </Show>
+                        <option value="" prop:selected=move || member.get().and_then(|member| member.custom_agent_id).is_none()>"Default agent"</option>
+                        {move || available_agents.get().into_iter().map(|agent| {
+                            let id = agent.id.clone();
+                            let value = agent.id.0.clone();
+                            view! {
+                                <option
+                                    value=value
+                                    prop:selected=move || member.get().and_then(|member| member.custom_agent_id) == Some(id.clone())
+                                >{agent.name}</option>
+                            }
+                        }).collect_view()}
+                    </select>
+                </label>
+                <label class="settings-form-label">
+                    <span>"Backend"</span>
+                    <select
+                        class="settings-text-input team-draft-backend-select"
+                        on:change=move |ev| {
+                            let parsed = parse_backend_kind(&event_target_value(&ev));
+                            if let Some(mut current) = member.get_untracked() {
+                                current.backend_kind = parsed;
+                                send_replace.run(current);
+                            }
+                        }
+                    >
+                        <option value="" prop:selected=move || member.get().and_then(|member| member.backend_kind).is_none()>"— select backend —"</option>
+                        {move || available_backends.get().into_iter().map(|backend| {
+                            let value = backend_kind_value(backend);
+                            let label = backend_kind_label(backend);
+                            view! {
+                                <option
+                                    value=value
+                                    prop:selected=move || member.get().and_then(|member| member.backend_kind) == Some(backend)
+                                >{label}</option>
+                            }
+                        }).collect_view()}
+                    </select>
+                </label>
+                <label class="settings-form-label">
+                    <span>"Cost effort"</span>
+                    <select
+                        class="settings-text-input"
+                        on:change=move |ev| {
+                            let parsed = parse_cost_hint(&event_target_value(&ev));
+                            if let Some(mut current) = member.get_untracked() {
+                                current.cost_hint = parsed;
+                                send_replace.run(current);
+                            }
+                        }
+                    >
+                        <option value="" prop:selected=move || member.get().and_then(|member| member.cost_hint).is_none()>"Backend default"</option>
+                        {[SpawnCostHint::Low, SpawnCostHint::Medium, SpawnCostHint::High]
+                            .into_iter()
+                            .map(|hint| {
+                                let value = cost_hint_value(hint);
+                                let label = cost_hint_label(hint);
+                                view! {
+                                    <option
+                                        value=value
+                                        prop:selected=move || member.get().and_then(|member| member.cost_hint) == Some(hint)
+                                    >{label}</option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                </label>
+                <div class="settings-form-label team-member-projects">
+                    <span>"Projects"<span class="settings-form-hint">" (pick one or more)"</span></span>
+                    <div class="team-member-project-list">
+                        <For
+                            each=move || available_projects.get()
+                            key=|project| project.id.clone()
+                            let:project
+                        >
+                            {
+                                let id_for_checked = project.id.clone();
+                                let id_for_change = project.id.clone();
+                                let input_id = project.id.0.clone();
+                                view! {
+                                    <label class="team-member-project-row">
+                                        <input
+                                            id=input_id
+                                            type="checkbox"
+                                            prop:checked=move || member.get().map(|member| member.project_ids.iter().any(|id| id == &id_for_checked)).unwrap_or(false)
+                                            on:change=move |ev| {
+                                                let checked = event_target_checked(&ev);
+                                                let project_id = id_for_change.clone();
+                                                if let Some(mut current) = member.get_untracked() {
+                                                    if checked {
+                                                        if !current.project_ids.iter().any(|id| id == &project_id) {
+                                                            current.project_ids.push(project_id);
+                                                        }
+                                                    } else {
+                                                        current.project_ids.retain(|id| id != &project_id);
+                                                    }
+                                                    send_replace.run(current);
+                                                }
+                                            }
+                                        />
+                                        <span class="team-member-project-name">{project.name}</span>
+                                    </label>
+                                }
+                            }
+                        </For>
+                    </div>
+                </div>
             </div>
-        </ModalOverlay>
+        </div>
     }
 }
 
@@ -854,13 +1407,69 @@ fn MemberDialog(form: MemberFormState, on_close: Callback<()>) -> impl IntoView 
     let team_id = form.team_id.clone();
     let form_for_save = form.clone();
     let form_for_fields = form.clone();
-    let title = if editing_id.is_some() {
+    let form_for_apply = form.clone();
+    let is_editing = editing_id.is_some();
+    let title = if is_editing {
         "Edit member"
     } else if form.is_manager {
         "Replace manager"
     } else {
         "Add report"
     };
+
+    // Track the last suggestion serial we've applied so the Effect only
+    // applies *new* server-emitted suggestions. Reading the latest serial
+    // at dialog open captures the baseline so a stale suggestion sitting
+    // in state from a prior dialog is not auto-applied here.
+    let baseline_serial: u64 = {
+        let host_id = state.selected_host_id.get_untracked();
+        let team_id_for_baseline = team_id.clone();
+        host_id
+            .and_then(|host_id| {
+                state.team_member_shuffle_suggestions.with_untracked(|map| {
+                    map.get(&host_id)
+                        .and_then(|m| m.get(&team_id_for_baseline))
+                        .map(|entry| entry.serial)
+                })
+            })
+            .unwrap_or(0)
+    };
+    let last_applied_serial: RwSignal<u64> = RwSignal::new(baseline_serial);
+
+    let state_for_shuffle = state.clone();
+    let team_id_for_shuffle = team_id.clone();
+    let on_shuffle = move |_| {
+        request_member_shuffle(&state_for_shuffle, &team_id_for_shuffle, error_sig);
+    };
+
+    // Apply server-emitted suggestions onto the form's editable signals
+    // when a new (higher-serial) suggestion arrives for this dialog's team.
+    let state_for_apply = state.clone();
+    let team_id_for_apply = team_id.clone();
+    Effect::new(move |_| {
+        let Some(host_id) = state_for_apply.selected_host_id.get() else {
+            return;
+        };
+        let entry = state_for_apply.team_member_shuffle_suggestions.with(|map| {
+            map.get(&host_id)
+                .and_then(|m| m.get(&team_id_for_apply))
+                .cloned()
+        });
+        let Some(entry) = entry else {
+            return;
+        };
+        if entry.serial <= last_applied_serial.get_untracked() {
+            return;
+        }
+        last_applied_serial.set(entry.serial);
+        let suggestion = entry.suggestion;
+        form_for_apply.name.set(suggestion.name);
+        form_for_apply.description.set(suggestion.description);
+        form_for_apply
+            .custom_agent_id
+            .set(suggestion.custom_agent_id);
+        form_for_apply.profile.set(Some(suggestion.profile));
+    });
 
     let state_for_save = state.clone();
     let on_save = move |_| {
@@ -913,7 +1522,16 @@ fn MemberDialog(form: MemberFormState, on_close: Callback<()>) -> impl IntoView 
     let on_cancel = move |_| on_close.run(());
     view! {
         <ModalOverlay on_close=on_close>
-            <h3 class="settings-confirm-title">{title}</h3>
+            <div class="settings-confirm-header">
+                <h3 class="settings-confirm-title">{title}</h3>
+                {(!is_editing).then(|| view! {
+                    <button
+                        class="settings-btn member-dialog-shuffle"
+                        type="button"
+                        on:click=on_shuffle
+                    >"Shuffle"</button>
+                })}
+            </div>
             <MemberFormFields form=form_for_fields />
             <Show when=move || error_sig.get().is_some()>
                 <p class="settings-error">{move || error_sig.get().unwrap_or_default()}</p>
@@ -926,12 +1544,38 @@ fn MemberDialog(form: MemberFormState, on_close: Callback<()>) -> impl IntoView 
     }
 }
 
+/// Fire a typed `TeamMemberShuffle` event so the server picks the random
+/// role/personality. The server emits a `TeamMemberShuffleSuggestionNotify`
+/// which dispatch stores; the dialog's Effect then applies the suggestion
+/// to the open form. The frontend never picks semantic names, agents, or
+/// personalities locally.
+fn request_member_shuffle(state: &AppState, team_id: &TeamId, error_sig: RwSignal<Option<String>>) {
+    let Some(host_id) = state.selected_host_id.get_untracked() else {
+        error_sig.set(Some("No host selected.".to_string()));
+        return;
+    };
+    let Some(stream) = state.host_stream_untracked(&host_id) else {
+        error_sig.set(Some("Host is not connected.".to_string()));
+        return;
+    };
+    error_sig.set(None);
+    let team_id = team_id.clone();
+    spawn_local(async move {
+        if let Err(error) = team_member_shuffle(&host_id, stream, team_id).await {
+            log::error!("team_member_shuffle failed: {error}");
+            error_sig.set(Some(error));
+        }
+    });
+}
+
 #[component]
 fn MemberFormFields(form: MemberFormState) -> impl IntoView {
     let state = expect_context::<AppState>();
     let name_sig = form.name;
     let description_sig = form.description;
     let custom_agent_sig = form.custom_agent_id;
+    let backend_sig = form.backend_kind;
+    let cost_sig = form.cost_hint;
     let project_ids_sig = form.project_ids;
     let is_editing = form.editing_id.is_some();
 
@@ -965,6 +1609,19 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
             .collect();
         projects.sort_by(|a, b| a.name.cmp(&b.name));
         projects
+    });
+
+    let state_for_backends = state.clone();
+    let available_backends: Memo<Vec<BackendKind>> = Memo::new(move |_| {
+        let Some(host_id) = state_for_backends.selected_host_id.get() else {
+            return Vec::new();
+        };
+        state_for_backends
+            .host_settings_by_host
+            .get()
+            .get(&host_id)
+            .map(|settings| settings.enabled_backends.clone())
+            .unwrap_or_default()
     });
 
     view! {
@@ -1010,7 +1667,7 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
                     value=""
                     prop:selected=move || custom_agent_sig.get().is_none()
                 >
-                    "— select —"
+                    "Default agent"
                 </option>
                 {move || available_agents.get().into_iter().map(|agent| {
                     let id_str = agent.id.0.clone();
@@ -1027,7 +1684,77 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
                 }).collect_view()}
             </select>
             {move || is_editing.then(|| view! {
-                <span class="settings-form-hint">"The custom agent is fixed once a member exists."</span>
+                <span class="settings-form-hint">"The agent profile is fixed once a member exists."</span>
+            })}
+        </label>
+        <label class="settings-form-label">
+            <span>"Backend"</span>
+            <select
+                class="settings-text-input"
+                disabled=is_editing
+                on:change=move |ev| {
+                    backend_sig.set(parse_backend_kind(&event_target_value(&ev)));
+                }
+            >
+                <option
+                    value=""
+                    prop:selected=move || backend_sig.get().is_none()
+                >
+                    "— select backend —"
+                </option>
+                {move || available_backends.get().into_iter().map(|backend| {
+                    let value = backend_kind_value(backend);
+                    let label = backend_kind_label(backend);
+                    view! {
+                        <option
+                            value=value
+                            prop:selected=move || backend_sig.get() == Some(backend)
+                        >
+                            {label}
+                        </option>
+                    }
+                }).collect_view()}
+            </select>
+            {move || available_backends.get().is_empty().then(|| view! {
+                <span class="settings-form-hint">"No enabled backends on this host."</span>
+            })}
+            {move || is_editing.then(|| view! {
+                <span class="settings-form-hint">"The backend is fixed once a member exists."</span>
+            })}
+        </label>
+        <label class="settings-form-label">
+            <span>"Cost effort"</span>
+            <select
+                class="settings-text-input"
+                disabled=is_editing
+                on:change=move |ev| {
+                    cost_sig.set(parse_cost_hint(&event_target_value(&ev)));
+                }
+            >
+                <option
+                    value=""
+                    prop:selected=move || cost_sig.get().is_none()
+                >
+                    "Backend default"
+                </option>
+                {[SpawnCostHint::Low, SpawnCostHint::Medium, SpawnCostHint::High]
+                    .into_iter()
+                    .map(|hint| {
+                        let value = cost_hint_value(hint);
+                        let label = cost_hint_label(hint);
+                        view! {
+                            <option
+                                value=value
+                                prop:selected=move || cost_sig.get() == Some(hint)
+                            >
+                                {label}
+                            </option>
+                        }
+                    })
+                    .collect_view()}
+            </select>
+            {move || is_editing.then(|| view! {
+                <span class="settings-form-hint">"The cost effort is fixed once a member exists."</span>
             })}
         </label>
         <div class="settings-form-label team-member-projects">
@@ -1088,8 +1815,82 @@ fn event_target_checked(ev: &web_sys::Event) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Kiro => "Kiro",
+        BackendKind::Claude => "Claude",
+        BackendKind::Codex => "Codex",
+        BackendKind::Gemini => "Gemini",
+    }
+}
+
+fn backend_kind_value(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "tycode",
+        BackendKind::Kiro => "kiro",
+        BackendKind::Claude => "claude",
+        BackendKind::Codex => "codex",
+        BackendKind::Gemini => "gemini",
+    }
+}
+
+fn parse_backend_kind(value: &str) -> Option<BackendKind> {
+    match value {
+        "tycode" => Some(BackendKind::Tycode),
+        "kiro" => Some(BackendKind::Kiro),
+        "claude" => Some(BackendKind::Claude),
+        "codex" => Some(BackendKind::Codex),
+        "gemini" => Some(BackendKind::Gemini),
+        _ => None,
+    }
+}
+
+fn agent_control_status_label(status: AgentControlStatus) -> &'static str {
+    match status {
+        AgentControlStatus::Thinking => "thinking",
+        AgentControlStatus::Idle => "idle",
+        AgentControlStatus::Failed => "failed",
+    }
+}
+
+fn cost_hint_label(cost_hint: SpawnCostHint) -> &'static str {
+    match cost_hint {
+        SpawnCostHint::Low => "Low",
+        SpawnCostHint::Medium => "Medium",
+        SpawnCostHint::High => "High",
+    }
+}
+
+fn cost_hint_value(cost_hint: SpawnCostHint) -> &'static str {
+    match cost_hint {
+        SpawnCostHint::Low => "low",
+        SpawnCostHint::Medium => "medium",
+        SpawnCostHint::High => "high",
+    }
+}
+
+fn parse_cost_hint(value: &str) -> Option<SpawnCostHint> {
+    match value {
+        "low" => Some(SpawnCostHint::Low),
+        "medium" => Some(SpawnCostHint::Medium),
+        "high" => Some(SpawnCostHint::High),
+        _ => None,
+    }
+}
+
+pub(crate) fn cost_hint_suffix(cost_hint: Option<SpawnCostHint>) -> String {
+    cost_hint
+        .map(|hint| format!(" · {}", cost_hint_label(hint)))
+        .unwrap_or_default()
+}
+
 #[component]
-fn ModalOverlay(on_close: Callback<()>, children: Children) -> impl IntoView {
+fn ModalOverlay(
+    on_close: Callback<()>,
+    #[prop(optional)] wide: bool,
+    children: Children,
+) -> impl IntoView {
     // Deliberately do NOT dismiss on backdrop click: these wizards carry
     // multi-step form state (name, manager spec, finalized reports). A stray
     // click outside the modal used to silently throw all of that away with no
@@ -1097,6 +1898,11 @@ fn ModalOverlay(on_close: Callback<()>, children: Children) -> impl IntoView {
     // in reality the wizard had been dismissed before Finish was clicked.
     // The user closes via the explicit Cancel button or Escape.
     let close_on_keydown = on_close;
+    let modal_class = if wide {
+        "settings-confirm-modal settings-confirm-modal-wide"
+    } else {
+        "settings-confirm-modal"
+    };
     view! {
         <div
             class="settings-confirm-overlay"
@@ -1107,7 +1913,7 @@ fn ModalOverlay(on_close: Callback<()>, children: Children) -> impl IntoView {
             }
             tabindex="0"
         >
-            <div class="settings-confirm-modal">
+            <div class=modal_class>
                 {children()}
             </div>
         </div>
@@ -1153,14 +1959,15 @@ pub(crate) fn open_member_chat(state: &AppState, host_id: String, member_id: Tea
     // user's current view (same trick `resume_session` uses). The first
     // project_id is the member's primary project — the same id the server
     // passes as the spawned agent's `project_id` (see §6.3 in 19-agent-teams).
-    let target_project = member
-        .project_ids
-        .first()
-        .cloned()
-        .map(|project_id| crate::state::ActiveProjectRef {
-            host_id: host_id.clone(),
-            project_id,
-        });
+    let target_project =
+        member
+            .project_ids
+            .first()
+            .cloned()
+            .map(|project_id| crate::state::ActiveProjectRef {
+                host_id: host_id.clone(),
+                project_id,
+            });
     state.switch_active_project(target_project);
 
     // Open the draft tab keyed to the member. The chat input is mounted
@@ -1209,11 +2016,8 @@ fn delete_team(state: &AppState, host_id: String, team_id: TeamId) {
         let Some(stream) = state.host_stream_untracked(&host_id) else {
             return;
         };
-        if !crate::bridge::confirm_dialog(
-            "Delete team",
-            "Delete this team? This cannot be undone.",
-        )
-        .await
+        if !crate::bridge::confirm_dialog("Delete team", "Delete this team? This cannot be undone.")
+            .await
         {
             return;
         }
@@ -1270,8 +2074,11 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use protocol::{
         AgentControlStatus, AgentId, CustomAgent, CustomAgentId, FrameKind, SessionId, StreamPath,
-        Team, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberRole,
-        TeamMemberState, ToolPolicy,
+        Team, TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberId, TeamId, TeamMember,
+        TeamMemberBindingPayload, TeamMemberId, TeamMemberPresetProfile, TeamMemberRole,
+        TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState,
+        TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId, TeamTemplateId,
+        ToolPolicy,
     };
     use std::collections::HashMap;
     use wasm_bindgen::JsCast;
@@ -1279,6 +2086,24 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Inject the production stylesheet once per test session so the layout
+    /// assertions in tests that probe geometry (e.g. modal sizing) reflect
+    /// real styling. Tests that only check DOM structure can skip this.
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document
+            .get_element_by_id("test-prod-styles-teams")
+            .is_none()
+        {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-teams");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+    }
 
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -1321,7 +2146,10 @@ mod wasm_tests {
             state: TeamMemberState::Active,
             name: name.to_owned(),
             description: String::new(),
-            custom_agent_id: protocol::CustomAgentId("ca-1".to_owned()),
+            profile: None,
+            custom_agent_id: Some(protocol::CustomAgentId("ca-1".to_owned())),
+            backend_kind: BackendKind::Claude,
+            cost_hint: None,
             session_id: None,
             project_ids: vec![protocol::ProjectId("p-1".to_owned())],
             created_at_ms: 0,
@@ -1332,6 +2160,17 @@ mod wasm_tests {
     fn install_state(host_id: &str, teams: Vec<Team>, members: Vec<TeamMember>) -> AppState {
         let state = AppState::new();
         state.selected_host_id.set(Some(host_id.to_owned()));
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
+                    default_backend: Some(BackendKind::Claude),
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+            );
+        });
         let mut team_map: HashMap<TeamId, Team> = HashMap::new();
         for team in teams {
             team_map.insert(team.id.clone(), team);
@@ -1488,7 +2327,7 @@ mod wasm_tests {
                     member_id: manager_id.clone(),
                     current_agent_id: None,
                     status: AgentControlStatus::Thinking,
-                    last_active_at_ms: None,
+                    last_active_at_ms: Some(123),
                 },
             );
         });
@@ -1498,6 +2337,129 @@ mod wasm_tests {
         assert!(
             text.to_lowercase().contains("thinking"),
             "expected 'thinking' text after binding update: {text:?}"
+        );
+        assert!(
+            text.contains("last active recorded"),
+            "expected last-active text after binding update: {text:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn teams_panel_marks_active_live_team_member() {
+        let container = make_container();
+        let host_id = "host-active-live";
+        let report_agent_id = AgentId("agent-report".to_owned());
+        let report_id = TeamMemberId("m-2".to_owned());
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![
+                make_member("m-1", "t-1", "Manager A", TeamMemberRole::Manager),
+                make_member("m-2", "t-1", "Report One", TeamMemberRole::Report),
+            ],
+        );
+        state.team_member_bindings.update(|m| {
+            m.entry(host_id.to_owned()).or_default().insert(
+                report_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: report_id.clone(),
+                    current_agent_id: Some(report_agent_id.clone()),
+                    status: AgentControlStatus::Idle,
+                    last_active_at_ms: Some(987),
+                },
+            );
+        });
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: report_agent_id,
+            }),
+            "Report One".to_owned(),
+            true,
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        let active_card = container
+            .query_selector(".team-card-active")
+            .unwrap()
+            .expect("active team card should be marked");
+        let active_card: HtmlElement = active_card.dyn_into().unwrap();
+        assert_eq!(
+            active_card.get_attribute("data-team-id").as_deref(),
+            Some("t-1")
+        );
+
+        let active_row = container
+            .query_selector(".team-member-row-active")
+            .unwrap()
+            .expect("active member row should be marked");
+        let active_row: HtmlElement = active_row.dyn_into().unwrap();
+        let text = active_row.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Report One"),
+            "active row should be the report chat: {text:?}"
+        );
+        assert!(
+            text.contains("Active"),
+            "active row should show an active marker: {text:?}"
+        );
+        assert!(
+            text.contains("last active recorded"),
+            "active row should still show binding last-active detail: {text:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn teams_panel_marks_active_draft_team_member() {
+        let container = make_container();
+        let host_id = "host-active-draft";
+        let report_id = TeamMemberId("m-2".to_owned());
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![
+                make_member("m-1", "t-1", "Manager A", TeamMemberRole::Manager),
+                make_member("m-2", "t-1", "Report One", TeamMemberRole::Report),
+            ],
+        );
+        state.open_tab(
+            TabContent::team_member_draft(host_id.to_owned(), report_id),
+            "Report One".to_owned(),
+            true,
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        let active_card = container
+            .query_selector(".team-card-active")
+            .unwrap()
+            .expect("draft team card should be marked active");
+        let active_card: HtmlElement = active_card.dyn_into().unwrap();
+        assert_eq!(
+            active_card.get_attribute("data-team-id").as_deref(),
+            Some("t-1")
+        );
+
+        let active_row = container
+            .query_selector(".team-member-row-active")
+            .unwrap()
+            .expect("draft team member row should be marked active");
+        let active_row: HtmlElement = active_row.dyn_into().unwrap();
+        let text = active_row.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Report One"),
+            "active draft row should be the pending report: {text:?}"
         );
     }
 
@@ -1848,11 +2810,10 @@ mod wasm_tests {
         );
     }
 
-    /// Blocker 2 — Clicking a report row in the roster sidebar opens
-    /// that report's chat through the same 3-state `open_member_chat`
-    /// flow used for the team-open click. We exercise the function
-    /// directly (the sidebar test in chat_view exercises the DOM path)
-    /// and assert that a draft team-member tab is opened for the report.
+    /// Clicking a report row in the Teams panel opens that report's chat
+    /// through the same 3-state `open_member_chat` flow used for the
+    /// team-open click. We exercise the function directly and assert that a
+    /// draft team-member tab is opened for the report.
     #[wasm_bindgen_test]
     async fn open_member_chat_on_report_opens_report_draft_tab() {
         let _calls = install_send_stub();
@@ -1890,7 +2851,7 @@ mod wasm_tests {
         );
     }
 
-    // ── New-team wizard helpers ──────────────────────────────────────────────
+    // ── New-team draft helpers ───────────────────────────────────────────────
 
     fn make_custom_agent(id: &str, name: &str) -> CustomAgent {
         CustomAgent {
@@ -1929,22 +2890,177 @@ mod wasm_tests {
         });
     }
 
-    /// Select the Nth `<select>` (0-indexed) and dispatch a `change` event.
-    fn set_nth_select(container: &HtmlElement, n: usize, value: &str) {
-        let selects = container.query_selector_all("select").unwrap();
-        let el: web_sys::HtmlSelectElement = selects
-            .item(n as u32)
-            .unwrap_or_else(|| panic!("no select at index {n}"))
-            .dyn_into()
-            .unwrap();
-        el.set_value(value);
-        let event = web_sys::Event::new("change").unwrap();
-        el.dispatch_event(&event).unwrap();
+    fn install_catalog(state: &AppState, host_id: &str) {
+        use protocol::{
+            TeamPersonalityPreset, TeamPersonalityTraitPreset, TeamPresetCatalog, TeamRolePreset,
+            TeamTemplate, TeamTemplateMember,
+        };
+        state.team_preset_catalogs.update(|catalogs| {
+            catalogs.insert(
+                host_id.to_owned(),
+                TeamPresetCatalog {
+                    role_presets: vec![
+                        TeamRolePreset {
+                            id: TeamRolePresetId("tech-lead-planner".to_owned()),
+                            name: "Tech lead / planner".to_owned(),
+                            summary: "Plans work".to_owned(),
+                            default_member_name: "Tech Lead".to_owned(),
+                            default_description: "Plans the team".to_owned(),
+                            default_custom_agent_id: Some(CustomAgentId(
+                                "tyde-team-lead".to_owned(),
+                            )),
+                        },
+                        TeamRolePreset {
+                            id: TeamRolePresetId("frontend-specialist".to_owned()),
+                            name: "Frontend specialist".to_owned(),
+                            summary: "Owns UI".to_owned(),
+                            default_member_name: "Frontend Specialist".to_owned(),
+                            default_description: "Builds UI".to_owned(),
+                            default_custom_agent_id: Some(CustomAgentId(
+                                "tyde-frontend-engineer".to_owned(),
+                            )),
+                        },
+                    ],
+                    personality_traits: vec![TeamPersonalityTraitPreset {
+                        trait_id: TeamPersonalityTrait::Pragmatic,
+                        name: "Pragmatic".to_owned(),
+                        summary: "Ships safely".to_owned(),
+                    }],
+                    personality_presets: vec![TeamPersonalityPreset {
+                        id: TeamPersonalityPresetId("pragmatic-shipper".to_owned()),
+                        name: "Pragmatic shipper".to_owned(),
+                        summary: "Small shippable slice".to_owned(),
+                        traits: vec![TeamPersonalityTrait::Pragmatic],
+                    }],
+                    team_templates: vec![
+                        TeamTemplate {
+                            id: TeamTemplateId("small-feature-team".to_owned()),
+                            name: "Small feature team".to_owned(),
+                            summary: "Balanced frontend/backend/test team".to_owned(),
+                            balanced: true,
+                            members: vec![TeamTemplateMember {
+                                org_role: TeamMemberRole::Manager,
+                                role_preset_id: TeamRolePresetId("tech-lead-planner".to_owned()),
+                                personality_preset_id: Some(TeamPersonalityPresetId(
+                                    "pragmatic-shipper".to_owned(),
+                                )),
+                                name: "Feature Lead".to_owned(),
+                                description: "Coordinates the feature".to_owned(),
+                            }],
+                        },
+                        TeamTemplate {
+                            id: TeamTemplateId("solo-reviewer".to_owned()),
+                            name: "Solo + reviewer".to_owned(),
+                            summary: "Manager plus a focused review partner".to_owned(),
+                            balanced: false,
+                            members: vec![
+                                TeamTemplateMember {
+                                    org_role: TeamMemberRole::Manager,
+                                    role_preset_id: TeamRolePresetId(
+                                        "tech-lead-planner".to_owned(),
+                                    ),
+                                    personality_preset_id: Some(TeamPersonalityPresetId(
+                                        "pragmatic-shipper".to_owned(),
+                                    )),
+                                    name: "Feature Lead".to_owned(),
+                                    description: "Coordinates the feature".to_owned(),
+                                },
+                                TeamTemplateMember {
+                                    org_role: TeamMemberRole::Report,
+                                    role_preset_id: TeamRolePresetId(
+                                        "frontend-specialist".to_owned(),
+                                    ),
+                                    personality_preset_id: Some(TeamPersonalityPresetId(
+                                        "pragmatic-shipper".to_owned(),
+                                    )),
+                                    name: "Reviewer".to_owned(),
+                                    description: "Reviews the implementation".to_owned(),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            );
+        });
     }
 
-    /// Check the project checkbox whose id matches `project_id` inside
-    /// `container` and dispatch a `change` event so the multi-select picker
-    /// reactive state updates.
+    fn make_draft_member(
+        id: &str,
+        org_role: TeamMemberRole,
+        name: &str,
+        description: &str,
+    ) -> TeamDraftMember {
+        TeamDraftMember {
+            id: TeamDraftMemberId(id.to_owned()),
+            org_role,
+            name: name.to_owned(),
+            description: description.to_owned(),
+            profile: Some(TeamMemberPresetProfile {
+                role_preset_id: Some(TeamRolePresetId("tech-lead-planner".to_owned())),
+                personality_preset_id: Some(TeamPersonalityPresetId(
+                    "pragmatic-shipper".to_owned(),
+                )),
+                personality_traits: vec![TeamPersonalityTrait::Pragmatic],
+            }),
+            custom_agent_id: None,
+            backend_kind: None,
+            cost_hint: None,
+            project_ids: Vec::new(),
+        }
+    }
+
+    fn install_draft(state: &AppState, host_id: &str, draft: TeamDraft) {
+        state.team_drafts.update(|drafts| {
+            drafts
+                .entry(host_id.to_owned())
+                .or_default()
+                .insert(draft.id.clone(), draft);
+        });
+    }
+
+    fn make_draft(name: &str, members: Vec<TeamDraftMember>) -> TeamDraft {
+        TeamDraft {
+            id: TeamDraftId("active-team-draft".to_owned()),
+            name: name.to_owned(),
+            members,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    /// Select the `<select>` nested in the form label with the given visible
+    /// field name. This keeps tests tied to user-facing labels instead of DOM
+    /// order.
+    fn set_select_by_label(container: &HtmlElement, label_text: &str, value: &str) {
+        let labels = container
+            .query_selector_all("label.settings-form-label")
+            .unwrap();
+        for i in 0..labels.length() {
+            let label = labels.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+            let Some(text) = label
+                .query_selector("span")
+                .unwrap()
+                .and_then(|span| span.text_content())
+            else {
+                continue;
+            };
+            if text.trim() != label_text {
+                continue;
+            }
+            let select: web_sys::HtmlSelectElement = label
+                .query_selector("select")
+                .unwrap()
+                .unwrap_or_else(|| panic!("label {label_text:?} has no select"))
+                .dyn_into()
+                .unwrap();
+            select.set_value(value);
+            let event = web_sys::Event::new("change").unwrap();
+            select.dispatch_event(&event).unwrap();
+            return;
+        }
+        panic!("select label {label_text:?} not found");
+    }
+
     fn check_project_checkbox(container: &HtmlElement, project_id: &str) {
         let selector = format!("input[type='checkbox'][id='{project_id}']");
         let el: web_sys::HtmlInputElement = container
@@ -1958,8 +3074,6 @@ mod wasm_tests {
         el.dispatch_event(&event).unwrap();
     }
 
-    /// Find a button by its exact trimmed text content and click it.
-    /// Panics if no button with that text is found.
     fn click_button_with_text(container: &HtmlElement, text: &str) {
         let btns = container.query_selector_all("button").unwrap();
         for i in 0..btns.length() {
@@ -1972,22 +3086,6 @@ mod wasm_tests {
         panic!("Button with text {text:?} not found in container");
     }
 
-    /// Set the value of the first `input[type='text']` inside `container`
-    /// and dispatch an `input` event so Leptos reactive handlers fire.
-    fn set_first_text_input(container: &HtmlElement, value: &str) {
-        let el: web_sys::HtmlInputElement = container
-            .query_selector("input[type='text']")
-            .unwrap()
-            .expect("no text input found")
-            .dyn_into()
-            .unwrap();
-        el.set_value(value);
-        let event = web_sys::Event::new("input").unwrap();
-        el.dispatch_event(&event).unwrap();
-    }
-
-    /// Set the value of the Nth `input[type='text']` (0-indexed) inside
-    /// `container` and dispatch an `input` event.
     fn set_nth_text_input(container: &HtmlElement, n: usize, value: &str) {
         let inputs = container.query_selector_all("input[type='text']").unwrap();
         let el: web_sys::HtmlInputElement = inputs
@@ -2000,84 +3098,267 @@ mod wasm_tests {
         el.dispatch_event(&event).unwrap();
     }
 
-    /// Walk through the wizard's name step: set team name and click Next.
-    async fn wizard_fill_name(container: &HtmlElement, name: &str) {
-        set_first_text_input(container, name);
+    #[wasm_bindgen_test]
+    async fn new_team_dialog_renders_catalog_and_sends_template_create() {
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-draft-catalog";
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
         next_tick().await;
-        click_button_with_text(container, "Next");
+
+        click_button_with_text(&container, "+ New team");
         next_tick().await;
+        let text = visible_text(&container);
+        assert!(
+            text.contains("Start blank"),
+            "blank start missing: {text:?}"
+        );
+        assert!(
+            text.contains("Generate balanced team"),
+            "balanced generation missing: {text:?}"
+        );
+        assert!(
+            text.contains("Solo + reviewer"),
+            "template catalog missing: {text:?}"
+        );
+        let template_cards = container
+            .query_selector_all(".team-draft-template-card")
+            .unwrap();
+        let card_text = (0..template_cards.length())
+            .map(|index| {
+                template_cards
+                    .item(index)
+                    .and_then(|node| node.text_content())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !card_text.contains("Small feature team"),
+            "balanced template should only appear as the generate button: {card_text:?}"
+        );
+        assert!(
+            !text.contains("New team — name"),
+            "old local wizard should not be rendered: {text:?}"
+        );
+
+        click_button_with_text(&container, "Generate balanced team");
+        next_tick().await;
+        let frames = recorded_frames(&calls);
+        let creates: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _)| kind == &FrameKind::TeamDraftCreate.to_string())
+            .collect();
+        assert_eq!(creates.len(), 1, "expected TeamDraftCreate: {frames:?}");
+        assert_eq!(
+            creates[0]
+                .1
+                .get("template_id")
+                .and_then(|value| value.as_str()),
+            Some("small-feature-team")
+        );
     }
 
-    /// Walk through the wizard's manager step: set member name + description,
-    /// pick the custom agent, check at least one project checkbox, then click
-    /// Next. All required fields must be filled to pass both frontend and
-    /// server validation — leaving any blank used to silently fail at server
-    /// time.
-    async fn wizard_fill_manager(
-        container: &HtmlElement,
-        member_name: &str,
-        agent_id: &str,
-        project_id: &str,
-    ) {
-        set_nth_text_input(container, 0, member_name);
-        next_tick().await;
-        set_nth_text_input(container, 1, "test description");
-        next_tick().await;
-        set_nth_select(container, 0, agent_id);
-        next_tick().await;
-        check_project_checkbox(container, project_id);
-        next_tick().await;
-        click_button_with_text(container, "Next");
-        next_tick().await;
-    }
+    #[wasm_bindgen_test]
+    async fn team_draft_notify_drives_member_controls_and_shuffle_sends_typed_events() {
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-draft-editor";
+        let draft_id = TeamDraftId("active-team-draft".to_owned());
+        let member_id = TeamDraftMemberId("draft-manager".to_owned());
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        install_draft(
+            &state,
+            host_id,
+            make_draft(
+                "Generated Team",
+                vec![make_draft_member(
+                    &member_id.0,
+                    TeamMemberRole::Manager,
+                    "Feature Lead",
+                    "Coordinates the feature",
+                )],
+            ),
+        );
 
-    /// Add a single report in the wizard's reports step via the inline form.
-    /// Fills name + description + custom agent + at least one project — all
-    /// required to pass validation.
-    async fn wizard_add_report(
-        container: &HtmlElement,
-        member_name: &str,
-        agent_id: &str,
-        project_id: &str,
-    ) {
-        click_button_with_text(container, "+ Add a report");
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
         next_tick().await;
-        let pending: HtmlElement = container
-            .query_selector(".team-wizard-pending-report")
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+
+        let name_input: web_sys::HtmlInputElement = container
+            .query_selector("input.team-draft-name")
             .unwrap()
-            .expect("no pending report form found")
+            .expect("draft name input")
             .dyn_into()
             .unwrap();
-        set_nth_text_input(&pending, 0, member_name);
+        assert_eq!(name_input.value(), "Generated Team");
+        let text = visible_text(&container);
+        assert!(
+            text.contains("Feature Lead"),
+            "draft member missing: {text:?}"
+        );
+        assert!(
+            text.contains("Tech lead / planner") && text.contains("Pragmatic shipper"),
+            "catalog-backed controls missing: {text:?}"
+        );
+
+        click_button_with_text(&container, "Shuffle member");
         next_tick().await;
-        set_nth_text_input(&pending, 1, "report description");
+        set_select_by_label(&container, "Role / specialty", "frontend-specialist");
         next_tick().await;
-        set_nth_select(&pending, 0, agent_id);
-        next_tick().await;
-        check_project_checkbox(&pending, project_id);
-        next_tick().await;
-        click_button_with_text(container, "Add");
-        next_tick().await;
+        let frames = recorded_frames(&calls);
+        assert!(
+            frames.iter().any(
+                |(kind, payload)| kind == &FrameKind::TeamDraftShuffle.to_string()
+                    && payload.get("draft_id") == Some(&JsonValue::String(draft_id.0.clone()))
+                    && payload.get("member_id") == Some(&JsonValue::String(member_id.0.clone()))
+            ),
+            "expected member shuffle frame: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|(kind, payload)| {
+                kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("set_member_profile")
+                    && payload.get("role_preset_id").and_then(|v| v.as_str())
+                        == Some("frontend-specialist")
+            }),
+            "expected SetMemberProfile frame: {frames:?}"
+        );
     }
 
-    /// Wizard advances through all 3 steps, adds one report, dispatches
-    /// TeamCreate then (after Upsert echo) exactly one TeamMemberCreate.
     #[wasm_bindgen_test]
-    async fn wizard_3steps_with_one_report_sends_create_then_member_create() {
+    async fn team_draft_editable_fields_and_commit_use_atomic_draft_events() {
         let calls = install_send_stub();
         let container = make_container();
-        let host_id = "host-a";
-        let agent_id = "ca-1";
+        let host_id = "host-draft-commit";
         let project_id = "p-1";
-
         let state = install_state(host_id, vec![], vec![]);
         install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        install_project(&state, host_id, project_id, "Test Project");
         install_custom_agents(
             &state,
             host_id,
-            vec![make_custom_agent(agent_id, "Test Agent")],
+            vec![make_custom_agent("ca-1", "Custom teammate")],
         );
-        install_project(&state, host_id, project_id, "Test Project");
+        install_draft(
+            &state,
+            host_id,
+            make_draft(
+                "",
+                vec![make_draft_member(
+                    "draft-manager",
+                    TeamMemberRole::Manager,
+                    "",
+                    "",
+                )],
+            ),
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+
+        set_nth_text_input(&container, 0, "Atomic Team");
+        next_tick().await;
+        set_nth_text_input(&container, 1, "Default Manager");
+        next_tick().await;
+        set_nth_text_input(&container, 2, "Coordinates the team");
+        next_tick().await;
+        set_select_by_label(&container, "Backend", "codex");
+        next_tick().await;
+        set_select_by_label(&container, "Cost effort", "low");
+        next_tick().await;
+        check_project_checkbox(&container, project_id);
+        next_tick().await;
+        click_button_with_text(&container, "Create team");
+        next_tick().await;
+
+        let frames = recorded_frames(&calls);
+        assert!(
+            frames.iter().any(
+                |(kind, payload)| kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("set_name")
+                    && payload.get("name").and_then(|v| v.as_str()) == Some("Atomic Team")
+            ),
+            "expected draft name update: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(
+                |(kind, payload)| kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+                    && payload
+                        .get("member")
+                        .and_then(|member| member.get("backend_kind"))
+                        .and_then(|v| v.as_str())
+                        == Some("codex")
+            ),
+            "expected replace_member backend update: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, _)| kind == &FrameKind::TeamDraftCommit.to_string()),
+            "expected atomic TeamDraftCommit: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|(kind, _)| kind != &FrameKind::TeamCreate.to_string()
+                    && kind != &FrameKind::TeamMemberCreate.to_string()),
+            "new team flow must not use create-then-member loop: {frames:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn add_report_dialog_shuffle_sends_typed_event_and_applies_server_suggestion() {
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-shuffle";
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![make_member(
+                "m-1",
+                "t-1",
+                "Manager",
+                TeamMemberRole::Manager,
+            )],
+        );
+        install_host_stream(&state, host_id);
+        install_project(&state, host_id, "p-1", "Test Project");
+        install_catalog(&state, host_id);
+        // The custom agent select only carries options for installed agents;
+        // install the agent the server-emitted suggestion will reference so
+        // the dropdown can actually display it.
+        install_custom_agents(
+            &state,
+            host_id,
+            vec![make_custom_agent(
+                "tyde-frontend-engineer",
+                "Frontend Engineer",
+            )],
+        );
 
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
@@ -2086,103 +3367,232 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // Step 1 should be visible after opening the wizard.
-        click_button_with_text(&container, "+ New team");
-        next_tick().await;
-        let text = visible_text(&container);
-        assert!(
-            text.contains("New team — name"),
-            "step 1 title not visible: {text:?}"
-        );
-
-        // Step 1 → Step 2
-        wizard_fill_name(&container, "My Team").await;
-        let text = visible_text(&container);
-        assert!(
-            text.contains("New team — manager"),
-            "step 2 title not visible after name step: {text:?}"
-        );
-
-        // Step 2 → Step 3
-        wizard_fill_manager(&container, "Alice", agent_id, project_id).await;
-        let text = visible_text(&container);
-        assert!(
-            text.contains("New team — reports"),
-            "step 3 title not visible after manager step: {text:?}"
-        );
-        assert!(
-            text.contains("+ Add a report"),
-            "'+ Add a report' button not visible: {text:?}"
-        );
-
-        // Add one report
-        wizard_add_report(&container, "Bob", agent_id, project_id).await;
-        let text = visible_text(&container);
-        assert!(
-            text.contains("Bob"),
-            "report chip 'Bob' not visible: {text:?}"
-        );
-
-        // Finish
-        click_button_with_text(&container, "Finish");
-        next_tick().await;
+        click_button_with_text(&container, "+ Report");
         next_tick().await;
 
-        // (a) TeamCreate should have been sent.
+        let shuffle_btn: HtmlElement = container
+            .query_selector(".member-dialog-shuffle")
+            .unwrap()
+            .expect("Add report dialog should expose a Shuffle button")
+            .dyn_into()
+            .unwrap();
+        shuffle_btn.click();
+        next_tick().await;
+
+        // Clicking Shuffle must send a typed `team_member_shuffle` frame
+        // targeting the dialog's team. The frontend never picks names,
+        // agents, or personalities locally.
         let frames = recorded_frames(&calls);
-        let creates: Vec<_> = frames
+        let shuffle_frame = frames
             .iter()
-            .filter(|(k, _)| k == &FrameKind::TeamCreate.to_string())
-            .collect();
-        assert_eq!(creates.len(), 1, "expected 1 TeamCreate: {frames:?}");
-
-        // (b) Synthesise the TeamNotify::Upsert by injecting a new team.
-        let new_team_id = TeamId("t-new".to_owned());
-        state.teams.update(|m| {
-            let entry = m.entry(host_id.to_owned()).or_default();
-            entry.insert(new_team_id.clone(), make_team("t-new", "My Team", "m-mgr"));
-        });
-        next_tick().await;
-        next_tick().await;
-        next_tick().await;
-
-        let frames = recorded_frames(&calls);
-        let member_creates: Vec<_> = frames
-            .iter()
-            .filter(|(k, _)| k == &FrameKind::TeamMemberCreate.to_string())
-            .collect();
+            .find(|(kind, _)| kind == &FrameKind::TeamMemberShuffle.to_string())
+            .expect("shuffle click must dispatch TeamMemberShuffle");
         assert_eq!(
-            member_creates.len(),
-            1,
-            "expected exactly 1 TeamMemberCreate for the report: {frames:?}"
+            shuffle_frame
+                .1
+                .get("team_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            "t-1",
+            "shuffle frame should carry the team id: {:?}",
+            shuffle_frame.1
         );
 
-        // (c) Wizard should be closed — no "reports (optional)" heading visible.
-        let text = visible_text(&container);
+        // The form starts empty; the server-emitted suggestion notify is
+        // what populates it.
+        let name_input: web_sys::HtmlInputElement = container
+            .query_selector_all("input[type='text']")
+            .unwrap()
+            .item(0)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let description_input: web_sys::HtmlInputElement = container
+            .query_selector_all("input[type='text']")
+            .unwrap()
+            .item(1)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
         assert!(
-            !text.contains("reports (optional)"),
-            "wizard should be closed after finish: {text:?}"
+            name_input.value().is_empty(),
+            "name should remain empty until server suggestion arrives, got {:?}",
+            name_input.value()
+        );
+
+        // Simulate the server-emitted notify by calling the dispatch helper
+        // directly. The dialog's Effect should then apply the suggestion to
+        // the form.
+        state.record_team_member_shuffle_suggestion(
+            host_id,
+            TeamMemberShuffleSuggestionNotifyPayload {
+                team_id: TeamId("t-1".to_owned()),
+                suggestion: TeamMemberShuffleSuggestion {
+                    name: "Server Picked Name".to_owned(),
+                    description: "Server picked description.".to_owned(),
+                    profile: TeamMemberPresetProfile {
+                        role_preset_id: Some(TeamRolePresetId("frontend-specialist".to_owned())),
+                        personality_preset_id: Some(TeamPersonalityPresetId(
+                            "pragmatic-shipper".to_owned(),
+                        )),
+                        personality_traits: vec![TeamPersonalityTrait::Pragmatic],
+                    },
+                    custom_agent_id: Some(CustomAgentId("tyde-frontend-engineer".to_owned())),
+                },
+            },
+        );
+        next_tick().await;
+
+        assert_eq!(
+            name_input.value(),
+            "Server Picked Name",
+            "name input should reflect server-emitted suggestion"
+        );
+        assert_eq!(
+            description_input.value(),
+            "Server picked description.",
+            "description input should reflect server-emitted suggestion"
+        );
+        let custom_agent_select =
+            find_form_select(&container, "Custom agent").expect("custom agent select should exist");
+        assert_eq!(
+            custom_agent_select.value(),
+            "tyde-frontend-engineer",
+            "custom agent should reflect server-emitted suggestion"
         );
     }
 
-    /// Wizard with zero reports: Finish dispatches only TeamCreate; no
-    /// TeamMemberCreate frames are sent at all.
-    #[wasm_bindgen_test]
-    async fn wizard_3steps_zero_reports_sends_only_team_create() {
-        let calls = install_send_stub();
-        let container = make_container();
-        let host_id = "host-b";
-        let agent_id = "ca-1";
-        let project_id = "p-1";
+    fn find_form_select(
+        container: &HtmlElement,
+        label_text: &str,
+    ) -> Option<web_sys::HtmlSelectElement> {
+        let labels = container
+            .query_selector_all("label.settings-form-label")
+            .unwrap();
+        for i in 0..labels.length() {
+            let label = labels.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+            let span_text = label
+                .query_selector("span")
+                .unwrap()
+                .and_then(|s| s.text_content());
+            if span_text.as_deref().map(str::trim) != Some(label_text) {
+                continue;
+            }
+            return label
+                .query_selector("select")
+                .unwrap()
+                .map(|el| el.dyn_into::<web_sys::HtmlSelectElement>().unwrap());
+        }
+        None
+    }
 
+    #[wasm_bindgen_test]
+    async fn add_report_dialog_does_not_apply_stale_suggestion_on_reopen() {
+        let _calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-shuffle-stale";
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![make_member(
+                "m-1",
+                "t-1",
+                "Manager",
+                TeamMemberRole::Manager,
+            )],
+        );
+        install_host_stream(&state, host_id);
+        install_project(&state, host_id, "p-1", "Test Project");
+        install_catalog(&state, host_id);
+
+        // A prior dialog session left a suggestion in state. Opening the
+        // dialog must NOT auto-apply that stale suggestion — only fresh
+        // notifies from a Shuffle click in this session should apply.
+        state.record_team_member_shuffle_suggestion(
+            host_id,
+            TeamMemberShuffleSuggestionNotifyPayload {
+                team_id: TeamId("t-1".to_owned()),
+                suggestion: TeamMemberShuffleSuggestion {
+                    name: "Stale Name".to_owned(),
+                    description: "Stale description.".to_owned(),
+                    profile: TeamMemberPresetProfile {
+                        role_preset_id: Some(TeamRolePresetId("frontend-specialist".to_owned())),
+                        personality_preset_id: None,
+                        personality_traits: Vec::new(),
+                    },
+                    custom_agent_id: None,
+                },
+            },
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        click_button_with_text(&container, "+ Report");
+        next_tick().await;
+
+        let name_input: web_sys::HtmlInputElement = container
+            .query_selector_all("input[type='text']")
+            .unwrap()
+            .item(0)
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            name_input.value().is_empty(),
+            "stale suggestion must not auto-apply on dialog open, got {:?}",
+            name_input.value()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn add_report_edit_member_has_no_shuffle_button() {
+        let _calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-edit-no-shuffle";
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![
+                make_member("m-1", "t-1", "Manager", TeamMemberRole::Manager),
+                make_member("m-2", "t-1", "Report One", TeamMemberRole::Report),
+            ],
+        );
+        install_host_stream(&state, host_id);
+        install_project(&state, host_id, "p-1", "Test Project");
+        install_catalog(&state, host_id);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        click_button_with_text(&container, "Edit");
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".member-dialog-shuffle")
+                .unwrap()
+                .is_none(),
+            "shuffle button should be hidden when editing an existing member"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn new_team_dialog_uses_wide_modal_for_draft_layout() {
+        let _calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-new-team-wide";
         let state = install_state(host_id, vec![], vec![]);
         install_host_stream(&state, host_id);
-        install_custom_agents(
-            &state,
-            host_id,
-            vec![make_custom_agent(agent_id, "Test Agent")],
-        );
-        install_project(&state, host_id, project_id, "Test Project");
+        install_catalog(&state, host_id);
 
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
@@ -2194,28 +3604,143 @@ mod wasm_tests {
         click_button_with_text(&container, "+ New team");
         next_tick().await;
 
-        wizard_fill_name(&container, "Solo Team").await;
-        wizard_fill_manager(&container, "Carol", agent_id, project_id).await;
-
-        // Skip adding any reports — just click Finish.
-        click_button_with_text(&container, "Finish");
-        next_tick().await;
-        next_tick().await;
-
-        let frames = recorded_frames(&calls);
-        let creates: Vec<_> = frames
-            .iter()
-            .filter(|(k, _)| k == &FrameKind::TeamCreate.to_string())
-            .collect();
-        assert_eq!(creates.len(), 1, "expected 1 TeamCreate: {frames:?}");
-
-        let member_creates: Vec<_> = frames
-            .iter()
-            .filter(|(k, _)| k == &FrameKind::TeamMemberCreate.to_string())
-            .collect();
+        let modal: HtmlElement = container
+            .query_selector(".settings-confirm-modal")
+            .unwrap()
+            .expect("new-team modal should render")
+            .dyn_into()
+            .unwrap();
+        let class_list = modal.class_name();
         assert!(
-            member_creates.is_empty(),
-            "expected no TeamMemberCreate with zero reports: {frames:?}"
+            class_list
+                .split_whitespace()
+                .any(|c| c == "settings-confirm-modal-wide"),
+            "new-team modal must use the wide variant so the member grid has room: {class_list:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn generated_balanced_team_draft_fits_in_viewport() {
+        ensure_styles_loaded();
+        let _calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-balanced-fit";
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+
+        // Install a draft that mirrors the balanced-team output: multiple
+        // member cards that would previously overflow the viewport.
+        let members = (0..6)
+            .map(|i| {
+                let id = format!("dm-{i}");
+                let role = if i == 0 {
+                    TeamMemberRole::Manager
+                } else {
+                    TeamMemberRole::Report
+                };
+                make_draft_member(&id, role, &format!("Member {i}"), &format!("Role {i}"))
+            })
+            .collect::<Vec<_>>();
+        let draft = make_draft("Balanced Team", members);
+        install_draft(&state, host_id, draft);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+
+        let modal: HtmlElement = container
+            .query_selector(".settings-confirm-modal")
+            .unwrap()
+            .expect("new-team modal should render the draft")
+            .dyn_into()
+            .unwrap();
+
+        // Viewport height in this harness is 800px. The modal must not exceed
+        // that height — otherwise commit/discard would be unreachable.
+        let modal_rect = modal.get_bounding_client_rect();
+        let viewport_height = web_sys::window()
+            .unwrap()
+            .inner_height()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(
+            modal_rect.height() <= viewport_height,
+            "modal height {} must fit viewport {}; member list should scroll internally",
+            modal_rect.height(),
+            viewport_height
+        );
+
+        // The commit footer must be visible — i.e. its bottom edge must be
+        // inside the viewport. This is the user-perceived assertion: the
+        // Create-team button is reachable.
+        let commit_btn: HtmlElement = container
+            .query_selector(".team-draft-commit")
+            .unwrap()
+            .expect("commit button should render")
+            .dyn_into()
+            .unwrap();
+        let commit_rect = commit_btn.get_bounding_client_rect();
+        assert!(
+            commit_rect.bottom() <= viewport_height,
+            "commit button bottom {} must be visible in viewport {}",
+            commit_rect.bottom(),
+            viewport_height
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn add_report_dialog_requires_backend_before_sending() {
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-backend-required";
+        let project_id = "p-1";
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![make_member(
+                "m-1",
+                "t-1",
+                "Manager",
+                TeamMemberRole::Manager,
+            )],
+        );
+        install_host_stream(&state, host_id);
+        install_project(&state, host_id, project_id, "Test Project");
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        click_button_with_text(&container, "+ Report");
+        next_tick().await;
+        set_nth_text_input(&container, 0, "Backendless Report");
+        next_tick().await;
+        set_nth_text_input(&container, 1, "Needs a backend");
+        next_tick().await;
+        check_project_checkbox(&container, project_id);
+        next_tick().await;
+        click_button_with_text(&container, "Save");
+        next_tick().await;
+
+        let text = visible_text(&container);
+        assert!(
+            text.contains("Pick a backend."),
+            "expected backend validation error: {text:?}"
+        );
+        assert!(
+            recorded_frames(&calls).is_empty(),
+            "validation should stop sends before any frames are written"
         );
     }
 }

@@ -16,9 +16,12 @@ use protocol::{
     SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
     TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -174,6 +177,7 @@ pub(crate) async fn route_client_envelope(
                     "description",
                     payload.description.as_str(),
                 )?;
+                validate_team_profile("team_member_update", payload.profile.as_ref())?;
                 validate_team_project_ids("team_member_update", &payload.project_ids)?;
                 host.update_team_member(payload).await?;
             }
@@ -193,6 +197,67 @@ pub(crate) async fn route_client_envelope(
                 )?;
                 host.activate_team_member(payload.member_id, payload.prompt, payload.images)
                     .await?;
+            }
+            FrameKind::TeamDraftCreate => {
+                let payload: TeamDraftCreatePayload =
+                    parse_payload(&envelope, "team_draft_create")?;
+                host.create_team_draft(payload).await?;
+            }
+            FrameKind::TeamDraftUpdate => {
+                let payload: TeamDraftUpdatePayload =
+                    parse_payload(&envelope, "team_draft_update")?;
+                validate_team_draft_update(&payload)?;
+                host.update_team_draft(payload).await?;
+            }
+            FrameKind::TeamDraftShuffle => {
+                let payload: TeamDraftShufflePayload =
+                    parse_payload(&envelope, "team_draft_shuffle")?;
+                ensure_non_empty(
+                    "team_draft_shuffle",
+                    "draft_id",
+                    payload.draft_id.0.as_str(),
+                )?;
+                if let Some(member_id) = payload.member_id.as_ref() {
+                    ensure_non_empty("team_draft_shuffle", "member_id", member_id.0.as_str())?;
+                }
+                host.shuffle_team_draft(payload).await?;
+            }
+            FrameKind::TeamMemberShuffle => {
+                let payload: TeamMemberShufflePayload =
+                    parse_payload(&envelope, "team_member_shuffle")?;
+                ensure_non_empty("team_member_shuffle", "team_id", payload.team_id.0.as_str())?;
+                host.shuffle_team_member(payload).await?;
+            }
+            FrameKind::TeamDraftApplyTemplate => {
+                let payload: TeamDraftApplyTemplatePayload =
+                    parse_payload(&envelope, "team_draft_apply_template")?;
+                ensure_non_empty(
+                    "team_draft_apply_template",
+                    "draft_id",
+                    payload.draft_id.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "team_draft_apply_template",
+                    "template_id",
+                    payload.template_id.0.as_str(),
+                )?;
+                host.apply_team_draft_template(payload).await?;
+            }
+            FrameKind::TeamDraftCommit => {
+                let payload: TeamDraftCommitPayload =
+                    parse_payload(&envelope, "team_draft_commit")?;
+                ensure_non_empty("team_draft_commit", "draft_id", payload.draft_id.0.as_str())?;
+                host.commit_team_draft(payload).await?;
+            }
+            FrameKind::TeamDraftDiscard => {
+                let payload: TeamDraftDiscardPayload =
+                    parse_payload(&envelope, "team_draft_discard")?;
+                ensure_non_empty(
+                    "team_draft_discard",
+                    "draft_id",
+                    payload.draft_id.0.as_str(),
+                )?;
+                host.discard_team_draft(payload).await?;
             }
             FrameKind::HostBrowseStart => {
                 let payload: HostBrowseStartPayload =
@@ -691,12 +756,86 @@ fn validate_team_member_create_spec(
 ) -> AppResult<()> {
     ensure_non_empty(operation, "name", spec.name.as_str())?;
     ensure_non_empty(operation, "description", spec.description.as_str())?;
-    ensure_non_empty(
-        operation,
-        "custom_agent_id",
-        spec.custom_agent_id.0.as_str(),
-    )?;
+    validate_team_profile(operation, spec.profile.as_ref())?;
+    if let Some(custom_agent_id) = spec.custom_agent_id.as_ref() {
+        ensure_non_empty(operation, "custom_agent_id", custom_agent_id.0.as_str())?;
+    }
     validate_team_project_ids(operation, &spec.project_ids)
+}
+
+fn validate_team_draft_update(payload: &TeamDraftUpdatePayload) -> AppResult<()> {
+    match payload {
+        TeamDraftUpdatePayload::SetName { draft_id, .. } => {
+            ensure_non_empty("team_draft_update", "draft_id", draft_id.0.as_str())
+        }
+        TeamDraftUpdatePayload::ReplaceMember { draft_id, member } => {
+            ensure_non_empty("team_draft_update", "draft_id", draft_id.0.as_str())?;
+            ensure_non_empty("team_draft_update", "member_id", member.id.0.as_str())?;
+            if let Some(custom_agent_id) = member.custom_agent_id.as_ref() {
+                ensure_non_empty(
+                    "team_draft_update",
+                    "custom_agent_id",
+                    custom_agent_id.0.as_str(),
+                )?;
+            }
+            validate_optional_team_project_ids("team_draft_update", &member.project_ids)
+        }
+        TeamDraftUpdatePayload::AddReport { draft_id } => {
+            ensure_non_empty("team_draft_update", "draft_id", draft_id.0.as_str())
+        }
+        TeamDraftUpdatePayload::RemoveMember {
+            draft_id,
+            member_id,
+        } => {
+            ensure_non_empty("team_draft_update", "draft_id", draft_id.0.as_str())?;
+            ensure_non_empty("team_draft_update", "member_id", member_id.0.as_str())
+        }
+        TeamDraftUpdatePayload::SetMemberProfile {
+            draft_id,
+            member_id,
+            role_preset_id,
+            personality_preset_id,
+            ..
+        } => {
+            ensure_non_empty("team_draft_update", "draft_id", draft_id.0.as_str())?;
+            ensure_non_empty("team_draft_update", "member_id", member_id.0.as_str())?;
+            if let Some(role_preset_id) = role_preset_id.as_ref() {
+                ensure_non_empty(
+                    "team_draft_update",
+                    "role_preset_id",
+                    role_preset_id.0.as_str(),
+                )?;
+            }
+            if let Some(personality_preset_id) = personality_preset_id.as_ref() {
+                ensure_non_empty(
+                    "team_draft_update",
+                    "personality_preset_id",
+                    personality_preset_id.0.as_str(),
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_team_profile(
+    operation: &'static str,
+    profile: Option<&protocol::TeamMemberPresetProfile>,
+) -> AppResult<()> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if let Some(role_preset_id) = profile.role_preset_id.as_ref() {
+        ensure_non_empty(operation, "role_preset_id", role_preset_id.0.as_str())?;
+    }
+    if let Some(personality_preset_id) = profile.personality_preset_id.as_ref() {
+        ensure_non_empty(
+            operation,
+            "personality_preset_id",
+            personality_preset_id.0.as_str(),
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_team_project_ids(operation: &'static str, project_ids: &[ProjectId]) -> AppResult<()> {
@@ -717,6 +856,16 @@ fn validate_team_project_ids(operation: &'static str, project_ids: &[ProjectId])
         }
     }
     Ok(())
+}
+
+fn validate_optional_team_project_ids(
+    operation: &'static str,
+    project_ids: &[ProjectId],
+) -> AppResult<()> {
+    if project_ids.is_empty() {
+        return Ok(());
+    }
+    validate_team_project_ids(operation, project_ids)
 }
 
 fn validate_project_reorder(payload: &ProjectReorderPayload) -> AppResult<()> {

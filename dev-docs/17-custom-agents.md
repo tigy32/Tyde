@@ -19,6 +19,11 @@ spawn for that host, plus any project-scoped steering for the selected
 directory globs, and frontend-owned interpretation with explicit protocol types,
 server stores, and replayed host events.
 
+Tyde may seed product-owned defaults into this same store. Agent teams seed a
+small set of built-in team custom agents (for example Code Reviewer) when their
+stable ids are missing. They are still normal `CustomAgent` records: users can
+edit them, and seeding does not overwrite an existing edited record.
+
 ---
 
 ## 2. Data Model

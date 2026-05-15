@@ -23,9 +23,12 @@ use protocol::{
     SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
     SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
+    StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
     TeamSetManagerPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
     TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
@@ -292,6 +295,62 @@ impl Connection {
         payload: TeamMemberActivatePayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::TeamMemberActivate, &payload)
+            .await
+    }
+
+    pub async fn team_draft_create(
+        &mut self,
+        payload: TeamDraftCreatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDraftCreate, &payload)
+            .await
+    }
+
+    pub async fn team_draft_update(
+        &mut self,
+        payload: TeamDraftUpdatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDraftUpdate, &payload)
+            .await
+    }
+
+    pub async fn team_draft_shuffle(
+        &mut self,
+        payload: TeamDraftShufflePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDraftShuffle, &payload)
+            .await
+    }
+
+    pub async fn team_member_shuffle(
+        &mut self,
+        payload: TeamMemberShufflePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamMemberShuffle, &payload)
+            .await
+    }
+
+    pub async fn team_draft_apply_template(
+        &mut self,
+        payload: TeamDraftApplyTemplatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDraftApplyTemplate, &payload)
+            .await
+    }
+
+    pub async fn team_draft_commit(
+        &mut self,
+        payload: TeamDraftCommitPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDraftCommit, &payload)
+            .await
+    }
+
+    pub async fn team_draft_discard(
+        &mut self,
+        payload: TeamDraftDiscardPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDraftDiscard, &payload)
             .await
     }
 
@@ -683,6 +742,18 @@ impl Connection {
                 }
                 FrameKind::TeamMemberBindingNotify => {
                     let _: TeamMemberBindingNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamPresetCatalogNotify => {
+                    let _: TeamPresetCatalogNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamDraftNotify => {
+                    let _: TeamDraftNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamMemberShuffleSuggestionNotify => {
+                    let _: protocol::TeamMemberShuffleSuggestionNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::HostSettings => {

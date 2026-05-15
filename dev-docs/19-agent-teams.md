@@ -4,8 +4,9 @@ Spec for **Agent Teams**: persistent, server-owned teams of agents
 organized as one manager and N direct reports. The user opens a chat
 with the manager (just like any agent chat) and assigns work
 conversationally. The manager delegates to its reports using MCP
-tools. Each member binds a `CustomAgent` (its role, tools, prompts)
-to a `SessionId` (its rolling memory). There is no kanban board, no
+tools. Each member has an explicit backend/cost profile, may
+optionally bind a `CustomAgent` (role, tools, prompts), and owns a
+`SessionId` (its rolling memory). There is no kanban board, no
 autonomous wake loop, and no Tyde-owned memory layer.
 
 Audience: implementation agents and future maintainers.
@@ -27,16 +28,17 @@ It builds on:
   v1 manager-to-report delegation surface.**
 - `15-sub-agents.md` — `AgentOrigin`, parent/child plumbing.
 - `16-queued-messages.md` — actor-owned per-agent queue.
-- `17-custom-agents.md` — `CustomAgent` (the agent definition each
-  team member is an instance of).
+- `17-custom-agents.md` — optional `CustomAgent` profiles team
+  members can use instead of the default agent profile.
 
 The whole spec reduces to:
 
 > A **team** is a host-scoped record of `(name, manager_member_id,
-> members[])`. A **team member** binds a `CustomAgent` (role / tools
-> / prompts / backend) to a `SessionId` (rolling memory) and declares
-> one or more `project_ids`. The server derives `workspace_roots`
-> from those projects at spawn time. The user
+> members[])`. A **team member** declares an explicit `backend_kind`
+> and optional `cost_hint`, may bind a `CustomAgent` (role / tools /
+> prompts), owns a `SessionId` (rolling memory), and declares one or
+> more `project_ids`. The server derives `workspace_roots` from those
+> projects at spawn time. The user
 > interacts with the team by opening the manager's chat — a normal
 > agent chat, resumed via `SpawnAgent::Resume`. The manager delegates
 > by calling `tyde_team_message_member`, which resolves the target
@@ -61,10 +63,14 @@ work across them.
 - **Per-member projects.** A team can span codebases. Each member
   declares one or more `project_ids`; `workspace_roots` is derived
   as the union of those projects' roots at spawn time.
-- **Members are `CustomAgent` instances.** Creating a member picks
-  which `CustomAgent` it embodies — that defines its backend, system
-  prompt, steering, skills, MCP servers. Two members can share the
-  same `CustomAgent`; their `SessionId`s diverge from first spawn.
+- **Members have explicit agent profiles.** Creating a member picks
+  `backend_kind`, optional `cost_hint`, and optionally a
+  `CustomAgent`. `None` means the default agent profile. A
+  `CustomAgent` supplies instructions, steering, skills, MCP
+  servers, and tool policy; backend and cost live directly on the
+  member. Tyde seeds a small set of team-oriented `CustomAgent`
+  records automatically when they are missing; these are normal
+  user-editable custom agents, not hidden frontend presets.
 - **Session resume is the memory mechanism.** A member owns one
   `SessionId`. Idle members are historical sessions; the team
   registry resumes them on demand. Whatever the backend does for
@@ -95,7 +101,8 @@ work across them.
 - **No nested teams, multi-manager, matrix orgs.**
 - **No agent-created teams.** Org changes are human-only.
 - **No Tyde-owned memory or compaction.** The session is the memory.
-- **No cost / budget tracking.** Real concern; deferred.
+- **No team-level budget tracking.** Per-member `cost_hint` is a
+  backend spawn hint, not accounting or spend enforcement.
 - **No migrating an existing live agent into a team.** Members are
   created with the team.
 - **No forking a member's session** (e.g. "branch the manager's
@@ -119,14 +126,17 @@ work across them.
 │  role: Manager|Report
 │  state: Active|Paused │
 │  project_ids: Vec │← 1+; teams span projects
+│  backend_kind     │
+│  cost_hint?       │
+│  preset profile?  │
 │  roots: derived   │
 └────┬──┬─────────────┘
      │  │
-     │  │ binds (required) ┌────────────────────────┐
+     │  │ optionally binds ┌────────────────────────┐
      │  └─────────────────▶│   CustomAgent          │
      │                     │   (17-custom-agents)   │
-     │                     │   backend, prompts,    │
-     │                     │   steering, tools, MCP │
+     │                     │   prompts, steering,   │
+     │                     │   tools, MCP, policy   │
      │                     └────────────────────────┘
      │
      │ owns 0..1            ┌────────────────────────┐
@@ -152,14 +162,26 @@ work across them.
   members. Teams have *no* `project_id` and *no* `workspace_roots`
   at the team level.
 - **TeamMember** — a durable persistent member identity
-  (`TeamMemberId`). Binds a `CustomAgent` and optionally a
-  `SessionId`. Has an org role (`Manager` or `Report`), a `state`
+  (`TeamMemberId`). Declares `backend_kind`, optional `cost_hint`,
+  optional `custom_agent_id`, and optionally a `SessionId`. Has an
+  org role (`Manager` or `Report`), a `state`
   (`Active`/`Paused`), and `project_ids` (one or more required).
   At spawn time the server derives `workspace_roots` as the
   deduped union of those projects' roots. Two members can share the
   same `CustomAgent`; their sessions are independent.
-- **CustomAgent** — defined in `17-custom-agents.md`. Owns backend
-  kind, system prompt, steering, skills, MCP server list.
+- **Preset profile** — optional structured creation metadata:
+  a role/specialty preset, optional personality preset, and concrete
+  personality traits. It is separate from `TeamMemberRole`, which is
+  only the org role (`Manager`/`Report`). It is also separate from
+  `description`, which stays editable free-form text for user
+  customization and backward compatibility. Manual members with no
+  preset profile are legal.
+- **CustomAgent** — defined in `17-custom-agents.md`. Owns system
+  prompt/instructions, steering, skills, MCP server list, and tool
+  policy. It is optional for team members. The built-in team custom
+  agents are ordinary `CustomAgent` records with stable ids; Tyde
+  creates missing records with defaults and never overwrites an
+  existing record with the same id.
 - **SessionId** — defined in `05-session-resume.md`. The
   backend-native resumable session identifier. The member's
   *memory* is this session's history. Tyde stores nothing
@@ -206,6 +228,11 @@ struct AgentTeamsStoreFile {
 The map keys mirror the typed-ID newtypes. Each field stores the
 protocol struct directly — no parallel persistence mirror types.
 Live `AgentId` bindings are runtime state, never persisted.
+Team drafts are also runtime state in v1: the server owns them and
+emits them, but they are not written to `agent_teams.json` until a
+draft commit creates a real team. That keeps incomplete project/backend
+choices out of the durable team store while preserving the event-driven
+UI model.
 
 `version` starts at 1; bump and add a migration step if shape
 changes.
@@ -223,10 +250,13 @@ The registry validates on load and on every mutation. No silent
 repair; loud failure on invariant violation:
 
 - Every member references an existing team.
-- Every member's `custom_agent_id` references an existing
-  `CustomAgent`.
+- Every `Some(custom_agent_id)` references an existing
+  `CustomAgent`; `None` means the default agent profile.
 - Every member has one or more `project_ids`, each referencing an
   existing `Project`.
+- Every member's `backend_kind` is enabled on the host.
+- Every present preset id in `profile` resolves against the server-owned
+  preset catalog.
 - Each team has exactly one active manager (`role == Manager &&
   state == Active`).
 - A `TeamMemberId` belongs to exactly one team.
@@ -282,12 +312,13 @@ A member is "activated" when someone (the user, or the manager via
 `session_id: None`:
 
 1. The registry issues `SpawnAgent::New` with:
-   - `custom_agent_id` = member's `CustomAgent`
+   - `custom_agent_id` = member's optional `CustomAgent`
    - `workspace_roots` = union of member project roots
    - `parent_agent_id: None`
    - `project_id` = first `member.project_ids` entry
    - `prompt` = the incoming message
-   - `backend_kind` = derived from the `CustomAgent`
+   - `backend_kind` = member's stored `backend_kind`
+   - `cost_hint` = member's stored `cost_hint`
 2. The backend produces a fresh `SessionId`. The registry records
    it on the member in one transaction, then emits
    `TeamMemberNotify::Upsert` (now with `session_id: Some(...)`)
@@ -328,7 +359,7 @@ Not Tyde's problem. The backend's own context handling keeps the
 session usable. If `Backend::resume()` fails because the session
 grew too large or the backend lost it, the registry surfaces a
 visible binding-failure event. The user can delete and recreate
-the member (`SpawnAgent::New` against the same `CustomAgent`).
+the member (`SpawnAgent::New` against the same member profile).
 **Tyde never silently falls back to `SpawnAgent::New` on resume
 failure** — that would lose memory without the user knowing.
 
@@ -361,10 +392,10 @@ agent; it acts only when it receives a message.
    follow up using existing `tyde_read_agent` /
    `tyde_await_agents` from `11-agent-control-mcp.md`.
 
-The manager's `CustomAgent` system prompt should explain its role
-and the available team tools. The roster (who exists, what they
-specialize in, their `project_ids`) is delivered as part of the
-manager's session context — see §6.2.
+If the manager uses a `CustomAgent`, its system prompt should
+explain the manager role and available team tools. The roster (who
+exists, what they specialize in, their `project_ids`) is delivered
+as part of the manager's session context — see §6.2.
 
 ### 6.2 How the manager knows who its reports are
 
@@ -373,7 +404,8 @@ Two paths, both supported:
 - **Spawn-time context.** The first message the manager ever sees
   (via `SpawnAgent::New.prompt`, when the manager is first
   activated) includes a server-authored roster block listing each
-  report's `member_id`, `name`, `description`, and `project_ids`.
+  report's `member_id`, `name`, `description`, `project_ids`,
+  backend/cost profile, and structured preset profile when present.
   The manager remembers it for the rest of the session.
 - **MCP query.** `tyde_team_describe` is always available and
   returns the current roster with live bindings. The manager calls
@@ -396,10 +428,11 @@ Manager calls
      prompt: Some(message) }`. Record any state changes
      (e.g. binding) and emit notifies.
    - Else → `SpawnAgent::New { custom_agent_id, workspace_roots,
-     project_id, prompt: message, ... }`, where `workspace_roots`
-     is the union of all bound project roots and `project_id` is
-     the first bound project. Record the new `SessionId` on the
-     member and emit notifies.
+     project_id, backend_kind, cost_hint, prompt: message, ... }`,
+     where `custom_agent_id`, `backend_kind`, and `cost_hint` come
+     from the member, `workspace_roots` is the union of all bound
+     project roots, and `project_id` is the first bound project.
+     Record the new `SessionId` on the member and emit notifies.
 3. If the member was already bound, the message is queued via the
    queue actor.
 4. Tool returns `{ member_id, agent_id, queued: bool }` so the
@@ -489,7 +522,10 @@ pub struct TeamMember {
     pub state: TeamMemberState,
     pub name: String,
     pub description: String,                   // free-form; surfaced to manager
-    pub custom_agent_id: CustomAgentId,        // required
+    pub profile: Option<TeamMemberPresetProfile>, // optional role/personality metadata
+    pub custom_agent_id: Option<CustomAgentId>,// None = default agent
+    pub backend_kind: BackendKind,             // explicit backend selection
+    pub cost_hint: Option<SpawnCostHint>,      // optional effort/cost hint
     pub session_id: Option<SessionId>,         // None until first spawn
     pub project_ids: Vec<ProjectId>,           // one or more required
     pub created_at_ms: u64,
@@ -503,6 +539,37 @@ pub struct TeamMemberBindingPayload {
     pub last_active_at_ms: Option<u64>,
 }
 ```
+
+`TeamMemberPresetProfile` is a protocol record, not frontend-only
+metadata. It stores optional `role_preset_id`, optional
+`personality_preset_id`, and the concrete `personality_traits` emitted
+by the server. The server-owned catalog provides the readable preset and
+trait names.
+
+Drafts use protocol records too:
+
+```rust
+pub struct TeamPresetCatalog {
+    pub role_presets: Vec<TeamRolePreset>,
+    pub personality_traits: Vec<TeamPersonalityTraitPreset>,
+    pub personality_presets: Vec<TeamPersonalityPreset>,
+    pub team_templates: Vec<TeamTemplate>,
+}
+
+pub struct TeamDraft {
+    pub id: TeamDraftId,
+    pub name: String,
+    pub members: Vec<TeamDraftMember>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+```
+
+`TeamDraftMember` mirrors the create-time member fields but keeps
+`backend_kind` optional because incomplete drafts are valid until
+commit. Commit converts the draft to `TeamCreateFromDraftPayload` and
+validates all required backend/project/member fields before anything is
+persisted.
 
 ### 7.5 Streams
 
@@ -518,9 +585,16 @@ TeamCreate
 TeamRename
 TeamDelete               // hard delete; cascades to all members
 TeamSetManager           // new manager must already be a Report of this team
-TeamMemberCreate         // requires custom_agent_id and project_ids
-TeamMemberUpdate         // mutable: name, description, project_ids
+TeamMemberCreate         // requires backend_kind and project_ids
+TeamMemberUpdate         // mutable: name, description, profile, project_ids
 TeamMemberDelete         // hard delete; rejects active manager / only member / live-bound
+TeamMemberShuffle        // request a server-owned Add-report shuffle suggestion
+TeamDraftCreate          // creates a server-owned blank or templated draft
+TeamDraftUpdate          // edits draft name/member/profile/add/remove
+TeamDraftShuffle         // server chooses new role/personality content
+TeamDraftApplyTemplate   // replaces draft members from a server template
+TeamDraftCommit          // atomic team + manager + reports create
+TeamDraftDiscard         // drops the server-owned draft
 ```
 
 No `TeamMember*Message`, no `TeamCard*` anything.
@@ -531,12 +605,70 @@ No `TeamMember*Message`, no `TeamCard*` anything.
 TeamNotify              // Upsert { team } | Delete { team }
 TeamMemberNotify        // Upsert { member } | Delete { member }
 TeamMemberBindingNotify // payload defined above
+TeamPresetCatalogNotify // server-owned role/personality/template catalog
+TeamDraftNotify         // Upsert { draft } | Delete { draft_id }
+TeamMemberShuffleSuggestionNotify // ephemeral Add-report shuffle suggestion
 ```
+
+`TeamMemberShuffleSuggestionNotify` is fire-and-forget: the server emits
+one in response to a `TeamMemberShuffle` request and never replays it on
+host attach. It currently fans out to every host subscriber rather than
+the requesting client only — sufficient because a stale suggestion is
+keyed per `(host, team_id)` and the open Add-report dialog applies only
+suggestions whose serial advances past its baseline. Tighten to caller-
+scoped routing if a future change makes that meaningful.
 
 `Notify` payloads use the tagged `Upsert | Delete` pattern from
 existing host domains; delete carries the full prior record.
 
-### 7.8 Replay ordering
+### 7.8 Server-owned catalog, templates, and drafts
+
+The server emits a `TeamPresetCatalogNotify` on every host replay before
+team drafts and committed teams. The frontend has no semantic preset
+lists: it renders whatever catalog the server sent and sends typed draft
+input events when the user chooses a template, changes a preset, or
+presses shuffle.
+
+The v1 catalog contains:
+
+- Built-in team custom agents: Team Lead, Code Reviewer, Frontend
+  Engineer, Backend Engineer, and Test / QA Engineer. These are
+  created in `custom_agents.json` if missing and replay as ordinary
+  `CustomAgentNotify::Upsert` events. Users can edit them in the
+  custom-agent UI to add local rules; seeding does not overwrite those
+  edits. These built-in custom agents are separate from the role and
+  personality catalogs below.
+- Role/specialty presets: Tech lead / planner, Senior reviewer,
+  Frontend specialist, Backend specialist, Test author / QA, and Bug
+  hunter / debugger.
+- Personality traits: Cautious, Pragmatic, Bold, Contrarian, Terse,
+  Conversational, Pedagogical, Skeptical, Refactor-leaning, Ship-it,
+  Test-first, Type-system, and YAGNI.
+- Personality presets: Skeptical reviewer, Pragmatic shipper, Careful
+  architect, Test-first engineer, and Refactor-minded senior.
+- Team templates: Solo + reviewer, Small feature team, Review panel,
+  and Debug squad. Small feature team is the balanced-team template.
+
+Draft lifecycle:
+
+1. `TeamDraftCreate { template_id }` creates one active server-owned
+   draft. `None` starts blank with a manager slot; a template id starts
+   with server-generated members/profile metadata. Creating another
+   draft while one exists is an explicit error.
+2. `TeamDraftUpdate`, `TeamDraftShuffle`, and
+   `TeamDraftApplyTemplate` mutate that server draft and emit
+   `TeamDraftNotify::Upsert`. Member/template shuffles are
+   server-owned: they choose an editable member name, a built-in
+   `custom_agent_id`, and personality profile data. The frontend does
+   not pick semantic names, agents, or personalities locally.
+3. `TeamDraftCommit` validates all derived create specs and performs
+   one store mutation that creates the team, manager, reports, and
+   initial member bindings. On validation/storage error the draft is
+   restored and no half-created team is emitted.
+4. `TeamDraftDiscard` emits `TeamDraftNotify::Delete` and removes the
+   draft from server memory.
+
+### 7.9 Replay ordering
 
 On host attach:
 
@@ -546,19 +678,28 @@ On host attach:
 4. `McpServerNotify`
 5. `SkillNotify`
 6. `SteeringNotify`
-7. `CustomAgentNotify` *(members reference CustomAgents)*
+7. `CustomAgentNotify` *(members may reference CustomAgents)*
 8. `SessionNotify` *(members reference sessions)*
-9. **`TeamNotify`** — team summaries
-10. **`TeamMemberNotify`** — for each member
-11. existing live `NewAgent` events (some may have
+9. **`TeamPresetCatalogNotify`** — catalog for role/personality/template UI
+10. **`TeamDraftNotify`** — any in-memory active draft
+11. **`TeamNotify`** — team summaries
+12. **`TeamMemberNotify`** — for each member
+13. existing live `NewAgent` events (some may have
     `AgentOrigin::TeamMember`)
-12. **`TeamMemberBindingNotify`** — for each member (current
+14. **`TeamMemberBindingNotify`** — for each member (current
     bindings, mostly `None` immediately after restart)
 
-### 7.9 Validation in `protocol/src/validator.rs`
+The registry owns one binding record for every active member. Missing
+bindings are an invariant violation; callers should surface an error
+rather than synthesizing an `Idle` binding.
 
-- `TeamMemberCreate.custom_agent_id` references an existing
-  `CustomAgent`.
+### 7.10 Validation in `protocol/src/validator.rs`
+
+- `TeamMemberCreate.backend_kind` is required and strongly typed.
+- `TeamMemberCreate.custom_agent_id`, when present, references an
+  existing `CustomAgent`; absence selects the default agent profile.
+- `TeamMemberCreate.profile`, when present, references role and
+  personality presets from the server-owned catalog.
 - `TeamMemberCreate.project_ids` is non-empty, and every id
   references an existing `Project`.
 - `TeamMemberCreate.session_id` must be absent — fresh members
@@ -574,6 +715,9 @@ On host attach:
   `TeamDelete` to remove an entire team; it cascades to all members.
 - `AgentOrigin::TeamMember` requires both `team_id` and
   `team_member_id`; other origins require both `None`.
+- `TeamDraftCommit` rejects incomplete drafts before persistence:
+  team name, member names/descriptions, backend kind, project ids, and
+  referenced custom agents/presets must all validate.
 
 ---
 
@@ -592,7 +736,7 @@ calling `TeamMemberId` (if any).
 
 | Tool                              | Visibility   | Behavior                                                                 |
 |-----------------------------------|--------------|--------------------------------------------------------------------------|
-| `tyde_team_describe`              | Any team member | Returns team metadata + roster with each member's `CustomAgent` summary, `project_ids`, current binding, last-active. |
+| `tyde_team_describe`              | Any team member | Returns team metadata + roster with each member's backend/cost profile, optional `CustomAgent` summary, structured/readable role/personality profile, `project_ids`, current binding, last-active. Missing member bindings are surfaced as registry errors. |
 | `tyde_team_message_member`        | Manager only | Sends a message to a teammate. Resolves member → live `AgentId`, resuming or first-spawning as needed. Returns `{ member_id, agent_id, queued: bool }`. |
 
 Deliberately omitted in v1:
@@ -619,10 +763,23 @@ Brief; Mike will iterate later.
 Sibling to existing Projects/Sessions/Agents panels:
 
 - List of teams: name and member count.
-- "New team" wizard: name, create the manager (pick `CustomAgent`,
-  one or more projects via a multi-project picker, name,
-  description), then add reports the same way.
+- "New team" wizard: start blank, generate the balanced template, or
+  choose a server-owned template. Once a draft exists, edit its team
+  name and member slots in place.
+- Each member slot renders server-emitted role/specialty and
+  personality controls, per-member and whole-draft shuffle buttons,
+  editable name/description, default/custom agent selection, backend,
+  cost effort, and project picker. The custom-agent selector includes
+  the seeded built-in team custom agents because they are normal
+  `CustomAgentNotify` records. Presets and shuffles seed editable
+  fields; they do not lock them.
+- The wizard commits by sending `TeamDraftCommit`. The frontend does
+  not create a team and then loop over `TeamMemberCreate`.
 - "Add report" / "Edit member" affordances inside a team.
+- If the active chat belongs to a team member, the matching team card
+  and member row are marked active from `TeamMemberBindingNotify` state
+  or the typed draft team-member tab state. Member rows show live
+  binding status and last-active time.
 
 ### 9.2 Opening a team
 
@@ -631,10 +788,14 @@ session resume from the Sessions tab). The chat stream is the
 manager's `/agent/<id>` stream; the chat history is the manager's
 session history.
 
-A sidebar in this view shows the team roster:
+The chat view does not mount a separate team roster sidebar. Team
+navigation stays in the Teams panel so the chat keeps its full width.
+The active team/member marker in that panel provides context while
+preserving the same actions:
 
-- Each report: name, role, `CustomAgent` label, selected projects
-  from the multi-project picker, live status (from
+- Each report: name, role, agent profile label (default/custom,
+  backend, cost), selected projects from the multi-project picker,
+  live status (from
   `TeamMemberBindingNotify`), last-active time.
 - Click a report → open *that report's* chat in another tab.
   Identical agent-chat view, different `AgentId`. No new UI.
@@ -642,8 +803,10 @@ A sidebar in this view shows the team roster:
 ### 9.3 No new dispatch primitives
 
 Everything renders from `TeamNotify`, `TeamMemberNotify`,
-`TeamMemberBindingNotify` + the existing agent stream. No refresh
-button.
+`TeamMemberBindingNotify`, `TeamPresetCatalogNotify`,
+`TeamDraftNotify` + the existing agent stream. No refresh button.
+The frontend may keep signal maps of received protocol records, but it
+does not own preset semantics or synthesize team-template content.
 
 ---
 
@@ -678,9 +841,15 @@ roster and the team store.
 
 ### `CustomAgent` deleted while in use
 
-`CustomAgentDelete` is rejected by `17-custom-agents.md` validation
-while any team member references it. (This rule needs to be added
-when teams ship.)
+`CustomAgentDelete` is rejected while any team member has
+`custom_agent_id: Some(id)` for that custom agent. Members using the
+default agent profile do not block custom-agent deletion.
+
+Built-in team custom agents are still normal custom agents: editing
+them persists the edited record, and seeding does not overwrite it. If
+a built-in team custom agent record is missing at host startup, Tyde
+recreates it with the default content and replays it through the normal
+custom-agent event path.
 
 ### Project deleted while a member references it
 
@@ -690,8 +859,10 @@ any team member's `project_ids` contains it.
 ### Server restart
 
 `TeamRegistry` loads `agent_teams.json` into memory. All bindings
-are `None`. The registry emits replay in §7.8 order. Members are
+are `None`. The registry emits replay in §7.9 order. Members are
 not auto-spawned; they come back to life when next messaged.
+In-memory team drafts are not restored after restart; users restart the
+draft from the server catalog.
 
 ### MCP disabled
 
@@ -727,8 +898,11 @@ needed because there is no shared mutable card state to race on.
    `tyde_team_message_member`.
 7. Roster injection into the manager's first `SpawnAgent::New`
    prompt.
-8. Frontend teams panel + member roster sidebar.
-9. Tests (§12).
+8. Server-owned preset catalog, in-memory drafts, typed draft events,
+   template/shuffle handling, and atomic draft commit.
+9. Frontend teams panel with active team/member markers and draft UI
+   rendered from catalog/draft notifies.
+10. Tests (§12).
 
 ---
 
@@ -748,6 +922,8 @@ Unit / integration:
 - `tyde_team_message_member` from a `Report` is rejected.
 - `tyde_team_message_member` from the manager to a member of
   another team is rejected.
+- `tyde_team_describe` returns default-agent members with no
+  `CustomAgent` summary and surfaces missing binding invariants.
 - `TeamDelete` hard-removes the team and cascades to all members.
 - `TeamMemberDelete` of the active manager is rejected;
   `TeamMemberDelete` of the only member is rejected;
@@ -755,7 +931,15 @@ Unit / integration:
 - `CustomAgentDelete` and `ProjectDelete` rejected while
   referenced.
 - Replay ordering: `CustomAgent`/`Project`/`Session` events
-  precede teams.
+  precede catalog, drafts, and teams; catalog precedes draft UI state.
+- Catalog replay includes all v1 role/personality/template records.
+- Draft create/update/shuffle/template emits `TeamDraftNotify` and
+  mutates only server-owned draft state.
+- Draft commit creates team + manager + reports atomically or emits a
+  visible command error while preserving the draft.
+- Profile metadata persists, replays, migrates from older store files,
+  appears in manager roster context, and appears in
+  `tyde_team_describe`.
 - Server restart: members load with `current_agent_id: None`;
   next message activates them correctly.
 
@@ -763,8 +947,17 @@ Frontend (wasm-bindgen-test, per `CLAUDE.md`):
 
 - Teams panel renders one row per `TeamId`.
 - Opening a team navigates to the manager's `/agent/<id>` stream.
-- Member sidebar shows live binding state and updates on
+- Teams panel member rows show live binding state and update on
   `TeamMemberBindingNotify`.
+- New-team dialog renders catalog-driven templates/role/personality
+  controls, and shuffle/template clicks update only through
+  `TeamDraftNotify`.
+- Editing derived draft fields keeps name/description/backend/cost/
+  project/custom-agent controls editable while preserving server-owned
+  profile semantics.
+- Creating from the dialog sends `TeamDraftCommit`; it does not emit
+  frontend `TeamCreate` + repeated `TeamMemberCreate`.
+- Chat view does not mount a separate team roster sidebar.
 - No frontend caches; clearing signals re-renders identical DOM.
 
 ---
@@ -790,7 +983,7 @@ These are deliberate unresolved points. Each is reversible.
    the user still picks at least one project. Confirm we don't need
    "manager has the union of all reports' projects" auto-magic.
 
-4. **Concurrency / cost cap per team.** Not in v1. Without the
+4. **Concurrency / budget cap per team.** Not in v1. Without the
    board and without autonomous wake, the manager spawns reports
    only as the user drives the conversation, so runaway loops are
    less of a concern — but a `HostSettings.team_max_concurrent_members`
@@ -824,10 +1017,11 @@ These are deliberate unresolved points. Each is reversible.
 ## 15. Summary
 
 A team is a host-scoped record `(Team, TeamMembers)`. Each member
-binds a `CustomAgent` (role / tools / instructions) to a
-`SessionId` (rolling memory), binds one or more projects, and is
-reanimated on demand via `SpawnAgent::Resume`. Workspace roots are
-derived as the union of the member's project roots at spawn time.
+has an explicit backend/cost profile, may bind a `CustomAgent`
+(role / tools / instructions), owns a `SessionId` (rolling memory),
+binds one or more projects, and is reanimated on demand via
+`SpawnAgent::Resume`. Workspace roots are derived as the union of
+the member's project roots at spawn time.
 The user works with the team by opening the
 manager's chat — a normal agent chat resumed from
 `manager.session_id`. The manager delegates by calling

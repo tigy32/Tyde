@@ -170,6 +170,56 @@ impl fmt::Display for TeamMemberId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct TeamDraftId(pub String);
+
+impl fmt::Display for TeamDraftId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TeamDraftMemberId(pub String);
+
+impl fmt::Display for TeamDraftMemberId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TeamRolePresetId(pub String);
+
+impl fmt::Display for TeamRolePresetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TeamPersonalityPresetId(pub String);
+
+impl fmt::Display for TeamPersonalityPresetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TeamTemplateId(pub String);
+
+impl fmt::Display for TeamTemplateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SteeringId(pub String);
 
 impl fmt::Display for SteeringId {
@@ -316,6 +366,13 @@ pub enum FrameKind {
     TeamMemberUpdate,
     TeamMemberDelete,
     TeamMemberActivate,
+    TeamMemberShuffle,
+    TeamDraftCreate,
+    TeamDraftUpdate,
+    TeamDraftShuffle,
+    TeamDraftApplyTemplate,
+    TeamDraftCommit,
+    TeamDraftDiscard,
     ProjectReadDiff,
     ProjectReadFile,
     ProjectStageFile,
@@ -353,6 +410,9 @@ pub enum FrameKind {
     TeamNotify,
     TeamMemberNotify,
     TeamMemberBindingNotify,
+    TeamPresetCatalogNotify,
+    TeamDraftNotify,
+    TeamMemberShuffleSuggestionNotify,
     ProjectFileList,
     ProjectGitStatus,
     ProjectFileContents,
@@ -415,6 +475,13 @@ impl fmt::Display for FrameKind {
             Self::TeamMemberUpdate => f.write_str("team_member_update"),
             Self::TeamMemberDelete => f.write_str("team_member_delete"),
             Self::TeamMemberActivate => f.write_str("team_member_activate"),
+            Self::TeamMemberShuffle => f.write_str("team_member_shuffle"),
+            Self::TeamDraftCreate => f.write_str("team_draft_create"),
+            Self::TeamDraftUpdate => f.write_str("team_draft_update"),
+            Self::TeamDraftShuffle => f.write_str("team_draft_shuffle"),
+            Self::TeamDraftApplyTemplate => f.write_str("team_draft_apply_template"),
+            Self::TeamDraftCommit => f.write_str("team_draft_commit"),
+            Self::TeamDraftDiscard => f.write_str("team_draft_discard"),
             Self::ProjectReadDiff => f.write_str("project_read_diff"),
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
@@ -448,6 +515,11 @@ impl fmt::Display for FrameKind {
             Self::TeamNotify => f.write_str("team_notify"),
             Self::TeamMemberNotify => f.write_str("team_member_notify"),
             Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
+            Self::TeamPresetCatalogNotify => f.write_str("team_preset_catalog_notify"),
+            Self::TeamDraftNotify => f.write_str("team_draft_notify"),
+            Self::TeamMemberShuffleSuggestionNotify => {
+                f.write_str("team_member_shuffle_suggestion_notify")
+            }
             Self::ProjectFileList => f.write_str("project_file_list"),
             Self::ProjectGitStatus => f.write_str("project_git_status"),
             Self::ProjectFileContents => f.write_str("project_file_contents"),
@@ -1075,6 +1147,114 @@ pub enum TeamMemberState {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamPersonalityTrait {
+    Cautious,
+    Pragmatic,
+    Bold,
+    Contrarian,
+    Terse,
+    Conversational,
+    Pedagogical,
+    Skeptical,
+    RefactorLeaning,
+    ShipIt,
+    TestFirst,
+    TypeSystem,
+    Yagni,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberPresetProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_preset_id: Option<TeamRolePresetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_preset_id: Option<TeamPersonalityPresetId>,
+    #[serde(default)]
+    pub personality_traits: Vec<TeamPersonalityTrait>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRolePreset {
+    pub id: TeamRolePresetId,
+    pub name: String,
+    pub summary: String,
+    pub default_member_name: String,
+    pub default_description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_custom_agent_id: Option<CustomAgentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamPersonalityTraitPreset {
+    pub trait_id: TeamPersonalityTrait,
+    pub name: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamPersonalityPreset {
+    pub id: TeamPersonalityPresetId,
+    pub name: String,
+    pub summary: String,
+    pub traits: Vec<TeamPersonalityTrait>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateMember {
+    pub org_role: TeamMemberRole,
+    pub role_preset_id: TeamRolePresetId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_preset_id: Option<TeamPersonalityPresetId>,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplate {
+    pub id: TeamTemplateId,
+    pub name: String,
+    pub summary: String,
+    pub balanced: bool,
+    pub members: Vec<TeamTemplateMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamPresetCatalog {
+    pub role_presets: Vec<TeamRolePreset>,
+    pub personality_traits: Vec<TeamPersonalityTraitPreset>,
+    pub personality_presets: Vec<TeamPersonalityPreset>,
+    pub team_templates: Vec<TeamTemplate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftMember {
+    pub id: TeamDraftMemberId,
+    pub org_role: TeamMemberRole,
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TeamMemberPresetProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<BackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_hint: Option<SpawnCostHint>,
+    #[serde(default)]
+    pub project_ids: Vec<ProjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraft {
+    pub id: TeamDraftId,
+    pub name: String,
+    pub members: Vec<TeamDraftMember>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Team {
     pub id: TeamId,
@@ -1092,7 +1272,13 @@ pub struct TeamMember {
     pub state: TeamMemberState,
     pub name: String,
     pub description: String,
-    pub custom_agent_id: CustomAgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TeamMemberPresetProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
+    pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_hint: Option<SpawnCostHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
     pub project_ids: Vec<ProjectId>,
@@ -1114,7 +1300,13 @@ pub struct TeamMemberBindingPayload {
 pub struct TeamMemberCreateSpec {
     pub name: String,
     pub description: String,
-    pub custom_agent_id: CustomAgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TeamMemberPresetProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
+    pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_hint: Option<SpawnCostHint>,
     pub project_ids: Vec<ProjectId>,
 }
 
@@ -1122,6 +1314,13 @@ pub struct TeamMemberCreateSpec {
 pub struct TeamCreatePayload {
     pub name: String,
     pub manager: TeamMemberCreateSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamCreateFromDraftPayload {
+    pub name: String,
+    pub manager: TeamMemberCreateSpec,
+    pub reports: Vec<TeamMemberCreateSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1154,6 +1353,8 @@ pub struct TeamMemberUpdatePayload {
     pub id: TeamMemberId,
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TeamMemberPresetProfile>,
     pub project_ids: Vec<ProjectId>,
 }
 
@@ -1196,6 +1397,132 @@ pub enum TeamMemberNotifyPayload {
 pub enum TeamMemberBindingNotifyPayload {
     Upsert { binding: TeamMemberBindingPayload },
     Delete { binding: TeamMemberBindingPayload },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamPresetCatalogNotifyPayload {
+    pub catalog: TeamPresetCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TeamDraftNotifyPayload {
+    Upsert { draft: TeamDraft },
+    Delete { draft_id: TeamDraftId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftCreatePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<TeamTemplateId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TeamDraftUpdatePayload {
+    SetName {
+        draft_id: TeamDraftId,
+        name: String,
+    },
+    ReplaceMember {
+        draft_id: TeamDraftId,
+        member: TeamDraftMemberEdit,
+    },
+    AddReport {
+        draft_id: TeamDraftId,
+    },
+    RemoveMember {
+        draft_id: TeamDraftId,
+        member_id: TeamDraftMemberId,
+    },
+    SetMemberProfile {
+        draft_id: TeamDraftId,
+        member_id: TeamDraftMemberId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_preset_id: Option<TeamRolePresetId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        personality_preset_id: Option<TeamPersonalityPresetId>,
+        #[serde(default)]
+        personality_traits: Vec<TeamPersonalityTrait>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamDraftShuffleScope {
+    Member,
+    Personality,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftShufflePayload {
+    pub draft_id: TeamDraftId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<TeamDraftMemberId>,
+    pub scope: TeamDraftShuffleScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftApplyTemplatePayload {
+    pub draft_id: TeamDraftId,
+    pub template_id: TeamTemplateId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftCommitPayload {
+    pub draft_id: TeamDraftId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftDiscardPayload {
+    pub draft_id: TeamDraftId,
+}
+
+/// Editable fields the frontend may change on a draft member via
+/// `TeamDraftUpdate::ReplaceMember`. Server-owned fields (`id`, `org_role`,
+/// `profile`) are intentionally absent: those move through dedicated
+/// updates (`SetMemberProfile`, etc.) so the client cannot mutate them
+/// behind the registry's back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDraftMemberEdit {
+    pub id: TeamDraftMemberId,
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<BackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_hint: Option<SpawnCostHint>,
+    #[serde(default)]
+    pub project_ids: Vec<ProjectId>,
+}
+
+/// User-driven request to shuffle a candidate member profile when adding a
+/// new report to an existing team. The server picks a random role and
+/// personality from its catalog and emits a `TeamMemberShuffleSuggestion`
+/// notify; the frontend then applies the suggestion to the open Add-report
+/// form. This keeps semantic preset selection on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberShufflePayload {
+    pub team_id: TeamId,
+}
+
+/// Server-emitted suggestion for an Add-report shuffle. The frontend
+/// applies these fields to the open dialog's editable form signals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberShuffleSuggestion {
+    pub name: String,
+    pub description: String,
+    pub profile: TeamMemberPresetProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_agent_id: Option<CustomAgentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberShuffleSuggestionNotifyPayload {
+    pub team_id: TeamId,
+    pub suggestion: TeamMemberShuffleSuggestion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

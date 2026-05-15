@@ -1,6 +1,6 @@
 mod fixture;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -26,6 +26,9 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -33,6 +36,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
@@ -40,6 +44,75 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             continue;
         }
         return env;
+    }
+}
+
+async fn raw_next_event(client: &mut client::Connection, context: &str) -> Envelope {
+    match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+        Ok(Ok(Some(env))) => env,
+        Ok(Ok(None)) => panic!("connection closed before {context}"),
+        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        Err(_) => panic!("timed out waiting for {context}"),
+    }
+}
+
+fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
+    [
+        "tyde-team-lead",
+        "tyde-code-reviewer",
+        "tyde-frontend-engineer",
+        "tyde-backend-engineer",
+        "tyde-test-qa-engineer",
+    ]
+    .into_iter()
+    .collect()
+}
+
+async fn collect_builtin_team_custom_agents(
+    client: &mut client::Connection,
+    context: &str,
+) -> HashMap<CustomAgentId, CustomAgent> {
+    let expected = builtin_team_custom_agent_ids();
+    let mut found = HashMap::new();
+    while found.len() < expected.len() {
+        let env = raw_next_event(client, context).await;
+        if !fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env
+            .parse_payload::<CustomAgentNotifyPayload>()
+            .expect("parse built-in CustomAgentNotifyPayload")
+        {
+            CustomAgentNotifyPayload::Upsert { custom_agent } => {
+                found.insert(custom_agent.id.clone(), custom_agent);
+            }
+            CustomAgentNotifyPayload::Delete { id } => {
+                panic!("unexpected built-in custom agent delete for {id}")
+            }
+        }
+    }
+    found
+}
+
+async fn expect_custom_agent_upsert_raw(
+    client: &mut client::Connection,
+    id: &CustomAgentId,
+    context: &str,
+) -> CustomAgent {
+    loop {
+        let env = raw_next_event(client, context).await;
+        if env.kind != FrameKind::CustomAgentNotify {
+            continue;
+        }
+        match env
+            .parse_payload::<CustomAgentNotifyPayload>()
+            .expect("parse CustomAgentNotifyPayload")
+        {
+            CustomAgentNotifyPayload::Upsert { custom_agent } if &custom_agent.id == id => {
+                return custom_agent;
+            }
+            CustomAgentNotifyPayload::Upsert { .. } | CustomAgentNotifyPayload::Delete { .. } => {}
+        }
     }
 }
 
@@ -64,6 +137,9 @@ async fn expect_session_list(
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -71,6 +147,7 @@ async fn expect_session_list(
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
         ) {
@@ -113,6 +190,9 @@ async fn wait_for_session_list(
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -120,6 +200,7 @@ async fn wait_for_session_list(
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
         ) {
@@ -207,6 +288,56 @@ fn sample_custom_agent(
         mcp_server_ids,
         tool_policy,
     }
+}
+
+#[tokio::test]
+async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
+    let mut fixture = Fixture::new().await;
+    let builtins =
+        collect_builtin_team_custom_agents(&mut fixture.client, "initial built-in custom agents")
+            .await;
+    assert_eq!(
+        builtins.len(),
+        5,
+        "expected five built-in team custom agents: {builtins:?}"
+    );
+    let reviewer_id = CustomAgentId("tyde-code-reviewer".to_owned());
+    let reviewer = builtins
+        .get(&reviewer_id)
+        .expect("built-in Code Reviewer should be seeded");
+    assert_eq!(reviewer.name, "Code Reviewer");
+    assert!(
+        reviewer
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains("correctness bugs")),
+        "Code Reviewer should start with review defaults: {reviewer:?}"
+    );
+
+    let mut edited = reviewer.clone();
+    edited.description = "Custom review policy".to_owned();
+    edited.instructions = Some("Always check migration tests before approval.".to_owned());
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: edited.clone(),
+        })
+        .await
+        .expect("custom_agent_upsert built-in override failed");
+    let notified =
+        expect_custom_agent_upsert_raw(&mut fixture.client, &reviewer_id, "edited built-in upsert")
+            .await;
+    assert_eq!(notified, edited);
+
+    let mut fresh = fixture.connect_fresh_host().await;
+    let replayed =
+        collect_builtin_team_custom_agents(&mut fresh, "fresh host built-in custom agent replay")
+            .await;
+    assert_eq!(
+        replayed.get(&reviewer_id),
+        Some(&edited),
+        "built-in seeding must not overwrite user edits"
+    );
 }
 
 #[tokio::test]

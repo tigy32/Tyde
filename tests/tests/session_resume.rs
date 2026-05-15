@@ -16,6 +16,9 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -23,6 +26,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
         ) {
             continue;
@@ -43,6 +47,9 @@ async fn wait_for_session_list(
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
             Err(_) => panic!("timed out waiting for {context}"),
         };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -50,6 +57,7 @@ async fn wait_for_session_list(
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::NewAgent
                 | FrameKind::AgentStart
                 | FrameKind::AgentError
@@ -111,15 +119,17 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
             Err(_) => return,
             Ok(Ok(None)) => return,
             Ok(Ok(Some(env)))
-                if matches!(
-                    env.kind,
-                    FrameKind::HostSettings
-                        | FrameKind::SessionSchemas
-                        | FrameKind::BackendSetup
-                        | FrameKind::QueuedMessages
-                        | FrameKind::SessionSettings
-                        | FrameKind::SessionList
-                ) =>
+                if fixture::is_builtin_team_custom_agent_notify(&env)
+                    || matches!(
+                        env.kind,
+                        FrameKind::HostSettings
+                            | FrameKind::SessionSchemas
+                            | FrameKind::BackendSetup
+                            | FrameKind::QueuedMessages
+                            | FrameKind::SessionSettings
+                            | FrameKind::TeamPresetCatalogNotify
+                            | FrameKind::SessionList
+                    ) =>
             {
                 continue;
             }
