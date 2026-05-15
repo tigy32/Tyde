@@ -150,6 +150,26 @@ impl fmt::Display for CustomAgentId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct TeamId(pub String);
+
+impl fmt::Display for TeamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TeamMemberId(pub String);
+
+impl fmt::Display for TeamMemberId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SteeringId(pub String);
 
 impl fmt::Display for SteeringId {
@@ -223,6 +243,8 @@ pub enum AgentOrigin {
     AgentControl,
     /// Spawned by the backend's own native sub-agent mechanism (e.g. Claude subagents).
     BackendNative,
+    /// Spawned as a persistent member of a server-owned agent team.
+    TeamMember,
 }
 
 /// Tool-visible status for agent-control MCP responses.
@@ -286,6 +308,14 @@ pub enum FrameKind {
     SkillRefresh,
     McpServerUpsert,
     McpServerDelete,
+    TeamCreate,
+    TeamRename,
+    TeamDelete,
+    TeamSetManager,
+    TeamMemberCreate,
+    TeamMemberUpdate,
+    TeamMemberDelete,
+    TeamMemberActivate,
     ProjectReadDiff,
     ProjectReadFile,
     ProjectStageFile,
@@ -320,6 +350,9 @@ pub enum FrameKind {
     SteeringNotify,
     SkillNotify,
     McpServerNotify,
+    TeamNotify,
+    TeamMemberNotify,
+    TeamMemberBindingNotify,
     ProjectFileList,
     ProjectGitStatus,
     ProjectFileContents,
@@ -374,6 +407,14 @@ impl fmt::Display for FrameKind {
             Self::SkillRefresh => f.write_str("skill_refresh"),
             Self::McpServerUpsert => f.write_str("mcp_server_upsert"),
             Self::McpServerDelete => f.write_str("mcp_server_delete"),
+            Self::TeamCreate => f.write_str("team_create"),
+            Self::TeamRename => f.write_str("team_rename"),
+            Self::TeamDelete => f.write_str("team_delete"),
+            Self::TeamSetManager => f.write_str("team_set_manager"),
+            Self::TeamMemberCreate => f.write_str("team_member_create"),
+            Self::TeamMemberUpdate => f.write_str("team_member_update"),
+            Self::TeamMemberDelete => f.write_str("team_member_delete"),
+            Self::TeamMemberActivate => f.write_str("team_member_activate"),
             Self::ProjectReadDiff => f.write_str("project_read_diff"),
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
@@ -404,6 +445,9 @@ impl fmt::Display for FrameKind {
             Self::SteeringNotify => f.write_str("steering_notify"),
             Self::SkillNotify => f.write_str("skill_notify"),
             Self::McpServerNotify => f.write_str("mcp_server_notify"),
+            Self::TeamNotify => f.write_str("team_notify"),
+            Self::TeamMemberNotify => f.write_str("team_member_notify"),
+            Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
             Self::ProjectFileList => f.write_str("project_file_list"),
             Self::ProjectGitStatus => f.write_str("project_git_status"),
             Self::ProjectFileContents => f.write_str("project_file_contents"),
@@ -844,6 +888,10 @@ pub struct AgentStartPayload {
     pub workspace_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<CustomAgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<TeamId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_member_id: Option<TeamMemberId>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
     pub created_at_ms: u64,
@@ -869,6 +917,10 @@ pub struct NewAgentPayload {
     pub workspace_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<CustomAgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<TeamId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_member_id: Option<TeamMemberId>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
     pub created_at_ms: u64,
@@ -1007,6 +1059,143 @@ pub enum SkillNotifyPayload {
 pub enum McpServerNotifyPayload {
     Upsert { mcp_server: McpServerConfig },
     Delete { id: McpServerId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMemberRole {
+    Manager,
+    Report,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamMemberState {
+    Active,
+    Paused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Team {
+    pub id: TeamId,
+    pub name: String,
+    pub manager_member_id: TeamMemberId,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMember {
+    pub id: TeamMemberId,
+    pub team_id: TeamId,
+    pub role: TeamMemberRole,
+    pub state: TeamMemberState,
+    pub name: String,
+    pub description: String,
+    pub custom_agent_id: CustomAgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    pub project_ids: Vec<ProjectId>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberBindingPayload {
+    pub member_id: TeamMemberId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_agent_id: Option<AgentId>,
+    pub status: AgentControlStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberCreateSpec {
+    pub name: String,
+    pub description: String,
+    pub custom_agent_id: CustomAgentId,
+    pub project_ids: Vec<ProjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamCreatePayload {
+    pub name: String,
+    pub manager: TeamMemberCreateSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRenamePayload {
+    pub id: TeamId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDeletePayload {
+    pub id: TeamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamSetManagerPayload {
+    pub team_id: TeamId,
+    pub new_manager_member_id: TeamMemberId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberCreatePayload {
+    pub team_id: TeamId,
+    pub member: TeamMemberCreateSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberUpdatePayload {
+    pub id: TeamMemberId,
+    pub name: String,
+    pub description: String,
+    pub project_ids: Vec<ProjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMemberDeletePayload {
+    pub id: TeamMemberId,
+}
+
+/// User-initiated team-member activation, sent from the frontend on the host
+/// stream. Mirrors the manager-initiated `tyde_team_message_member` flow but
+/// has no caller agent (the user is the caller). `prompt: None` is the
+/// "just open the chat" case: if the member has no live binding and no
+/// session, the server does nothing — activation defers until the user types
+/// a first message and re-sends with `prompt: Some`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TeamMemberActivatePayload {
+    pub member_id: TeamMemberId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TeamNotifyPayload {
+    Upsert { team: Team },
+    Delete { team: Team },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TeamMemberNotifyPayload {
+    Upsert { member: TeamMember },
+    Delete { member: TeamMember },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TeamMemberBindingNotifyPayload {
+    Upsert { binding: TeamMemberBindingPayload },
+    Delete { binding: TeamMemberBindingPayload },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

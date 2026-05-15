@@ -8,20 +8,24 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use protocol::types::AgentClosedPayload;
 use protocol::{
-    AgentId, AgentOrigin, AgentStartPayload, BackendSetupPayload, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBrowseListPayload,
-    HostBrowseStartPayload, HostSettingsPayload, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
-    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
-    ReviewId, RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload,
-    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload,
-    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    FrameKind, HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData,
+    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
+    McpServerUpsertPayload, McpTransportConfig, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId,
+    RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
+    TeamDeletePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberRole,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
     TerminalSendPayload,
 };
@@ -60,6 +64,7 @@ use crate::review::{
     ReviewRegistry, ReviewRegistryHandle, build_create_request, review_stream_path,
 };
 use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
+use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
 use crate::store::project::ProjectStore;
@@ -72,6 +77,10 @@ use crate::stream::{Stream, StreamClosed};
 use crate::sub_agent::{
     HostSubAgentSpawnRequest, HostSubAgentSpawnRx, HostSubAgentSpawnTx, SubAgentEmitter,
     SubAgentHandle,
+};
+use crate::team_registry::{
+    TeamDescribeData, TeamMemberActivation, TeamMessagePlan, TeamRegistryEvents,
+    TeamRegistryHandle, TeamRegistrySnapshot,
 };
 use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal};
 
@@ -88,6 +97,19 @@ pub struct HostRuntimeConfig {
 }
 
 #[derive(Clone, Debug)]
+struct TeamSpawnContext {
+    team_id: TeamId,
+    team_member_id: TeamMemberId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TeamMemberMessageOutcome {
+    pub member_id: TeamMemberId,
+    pub agent_id: AgentId,
+    pub queued: bool,
+}
+
+#[derive(Clone, Debug)]
 enum KiroSessionSchemaState {
     Pending,
     Ready(SessionSettingsSchema),
@@ -97,6 +119,7 @@ enum KiroSessionSchemaState {
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
+    pub team_registry: TeamRegistryHandle,
     pub project_store: Arc<Mutex<ProjectStore>>,
     pub settings_store: Arc<Mutex<HostSettingsStore>>,
     pub session_store: Arc<Mutex<SessionStore>>,
@@ -123,6 +146,92 @@ pub struct HostHandle {
     state: Arc<Mutex<HostState>>,
 }
 
+#[cfg(test)]
+struct InstalledTeamMutationAfterRefsHook {
+    inner: Arc<TeamMutationAfterRefsHook>,
+}
+
+#[cfg(test)]
+struct TeamMutationAfterRefsHook {
+    host_state_ptr: usize,
+    operation: &'static str,
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type TeamMutationAfterRefsHookCell = std::sync::Mutex<Option<Arc<TeamMutationAfterRefsHook>>>;
+
+#[cfg(test)]
+impl InstalledTeamMutationAfterRefsHook {
+    async fn wait_until_reached(&self) {
+        self.inner.reached.notified().await;
+    }
+
+    fn resume(&self) {
+        self.inner.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for InstalledTeamMutationAfterRefsHook {
+    fn drop(&mut self) {
+        let mut hook = team_mutation_after_refs_hook_cell()
+            .lock()
+            .expect("team mutation hook mutex poisoned");
+        if hook
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner))
+        {
+            *hook = None;
+        }
+        self.inner.resume.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn install_team_mutation_after_refs_test_hook(
+    host: &HostHandle,
+    operation: &'static str,
+) -> InstalledTeamMutationAfterRefsHook {
+    let inner = Arc::new(TeamMutationAfterRefsHook {
+        host_state_ptr: Arc::as_ptr(&host.state) as usize,
+        operation,
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let mut hook = team_mutation_after_refs_hook_cell()
+        .lock()
+        .expect("team mutation hook mutex poisoned");
+    assert!(hook.is_none(), "team mutation test hook already installed");
+    *hook = Some(Arc::clone(&inner));
+    InstalledTeamMutationAfterRefsHook { inner }
+}
+
+#[cfg(test)]
+async fn wait_for_team_mutation_after_refs_test_hook(host: &HostHandle, operation: &'static str) {
+    let hook = {
+        team_mutation_after_refs_hook_cell()
+            .lock()
+            .expect("team mutation hook mutex poisoned")
+            .clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.host_state_ptr != Arc::as_ptr(&host.state) as usize || hook.operation != operation {
+        return;
+    }
+    hook.reached.notify_one();
+    hook.resume.notified().await;
+}
+
+#[cfg(test)]
+fn team_mutation_after_refs_hook_cell() -> &'static TeamMutationAfterRefsHookCell {
+    static HOOK: std::sync::OnceLock<TeamMutationAfterRefsHookCell> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 pub(crate) struct HostSubAgentEmitter {
     spawn_tx: HostSubAgentSpawnTx,
     parent_agent_id: AgentId,
@@ -146,6 +255,7 @@ impl HostSubAgentEmitter {
 struct HostStorePaths {
     session: PathBuf,
     project: PathBuf,
+    agent_team: PathBuf,
     review: PathBuf,
     settings: PathBuf,
     custom_agent: PathBuf,
@@ -419,6 +529,52 @@ impl HostHandle {
             }
         }
 
+        let team_snapshot = match state.team_registry.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::error!(
+                    host_stream = %host_path,
+                    error = %err,
+                    "failed to snapshot teams for host registration"
+                );
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+        };
+        for team in team_snapshot.teams {
+            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+                panic!(
+                    "host stream {} disappeared during team registration replay",
+                    host_path
+                );
+            };
+            if emit_team_notify_for_subscriber(&TeamNotifyPayload::Upsert { team }, subscriber)
+                .await
+                .is_err()
+            {
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+        }
+        for member in team_snapshot.members {
+            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+                panic!(
+                    "host stream {} disappeared during team member registration replay",
+                    host_path
+                );
+            };
+            if emit_team_member_notify_for_subscriber(
+                &TeamMemberNotifyPayload::Upsert { member },
+                subscriber,
+            )
+            .await
+            .is_err()
+            {
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+        }
+
         let agent_ids = state.registry.agent_ids();
         let mut deferred_attachments = Vec::new();
         for agent_id in agent_ids {
@@ -443,6 +599,8 @@ impl HostHandle {
                 backend_kind: start.backend_kind,
                 workspace_roots: start.workspace_roots.clone(),
                 custom_agent_id: start.custom_agent_id.clone(),
+                team_id: start.team_id.clone(),
+                team_member_id: start.team_member_id.clone(),
                 project_id: start.project_id.clone(),
                 parent_agent_id: start.parent_agent_id.clone(),
                 created_at_ms: start.created_at_ms,
@@ -460,6 +618,37 @@ impl HostHandle {
             }
             let agent_stream = subscriber.stream.with_path(instance_stream);
             deferred_attachments.push((agent_handle, agent_stream));
+        }
+
+        let team_snapshot = match state.team_registry.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::error!(
+                    host_stream = %host_path,
+                    error = %err,
+                    "failed to snapshot team bindings for host registration"
+                );
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+        };
+        for binding in team_snapshot.bindings {
+            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+                panic!(
+                    "host stream {} disappeared during team binding registration replay",
+                    host_path
+                );
+            };
+            if emit_team_member_binding_notify_for_subscriber(
+                &TeamMemberBindingNotifyPayload::Upsert { binding },
+                subscriber,
+            )
+            .await
+            .is_err()
+            {
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
         }
 
         drop(state);
@@ -536,6 +725,22 @@ impl HostHandle {
         payload: SpawnAgentPayload,
         origin: AgentOrigin,
         resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
+    ) -> AgentId {
+        self.spawn_agent_with_origin_config_and_team(
+            payload,
+            origin,
+            resolved_spawn_config_override,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_agent_with_origin_config_and_team(
+        &self,
+        payload: SpawnAgentPayload,
+        origin: AgentOrigin,
+        resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
+        team_context: Option<TeamSpawnContext>,
     ) -> AgentId {
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
@@ -705,6 +910,10 @@ impl HostHandle {
                     name: resolved_name,
                     origin,
                     custom_agent_id: effective_custom_agent_id,
+                    team_id: team_context.as_ref().map(|context| context.team_id.clone()),
+                    team_member_id: team_context
+                        .as_ref()
+                        .map(|context| context.team_member_id.clone()),
                     parent_agent_id: payload.parent_agent_id,
                     parent_session_id,
                     project_id: payload.project_id,
@@ -912,6 +1121,10 @@ impl HostHandle {
                     name: resolved_name,
                     origin,
                     custom_agent_id: effective_custom_agent_id,
+                    team_id: team_context.as_ref().map(|context| context.team_id.clone()),
+                    team_member_id: team_context
+                        .as_ref()
+                        .map(|context| context.team_member_id.clone()),
                     parent_agent_id: payload.parent_agent_id,
                     parent_session_id,
                     project_id,
@@ -1181,6 +1394,35 @@ impl HostHandle {
                 ),
             ));
         }
+        let snapshot = state
+            .team_registry
+            .snapshot()
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let referenced_team_members = snapshot
+            .members
+            .iter()
+            .filter(|member| member.project_ids.contains(&payload.id))
+            .map(|member| member.id.clone())
+            .collect::<Vec<_>>();
+        if !referenced_team_members.is_empty() {
+            let project_name = state
+                .project_store
+                .lock()
+                .await
+                .get(&payload.id)
+                .map(|project| project.name);
+            return Err(AppError::conflict(
+                OPERATION,
+                referenced_team_member_delete_message(
+                    "project",
+                    &payload.id,
+                    project_name.as_deref(),
+                    &snapshot,
+                    &referenced_team_members,
+                ),
+            ));
+        }
         let project = state
             .project_store
             .lock()
@@ -1265,6 +1507,35 @@ impl HostHandle {
     ) -> AppResult<()> {
         const OPERATION: &str = "custom_agent_delete";
         let mut state = self.state.lock().await;
+        let snapshot = state
+            .team_registry
+            .snapshot()
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let referenced_team_members = snapshot
+            .members
+            .iter()
+            .filter(|member| member.custom_agent_id == payload.id)
+            .map(|member| member.id.clone())
+            .collect::<Vec<_>>();
+        if !referenced_team_members.is_empty() {
+            let custom_agent_name = state
+                .custom_agent_store
+                .lock()
+                .await
+                .get(&payload.id)
+                .map(|custom_agent| custom_agent.name);
+            return Err(AppError::conflict(
+                OPERATION,
+                referenced_team_member_delete_message(
+                    "custom agent",
+                    &payload.id,
+                    custom_agent_name.as_deref(),
+                    &snapshot,
+                    &referenced_team_members,
+                ),
+            ));
+        }
         let id = state
             .custom_agent_store
             .lock()
@@ -1371,6 +1642,581 @@ impl HostHandle {
             .map_err(|error| mcp_server_store_error(OPERATION, error))?;
         fan_out_mcp_server_notify(&mut state, McpServerNotifyPayload::Delete { id }).await;
         Ok(())
+    }
+
+    pub(crate) async fn describe_team_for_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<TeamDescribeData, String> {
+        let registry = { self.state.lock().await.team_registry.clone() };
+        registry.describe_for_agent(agent_id).await
+    }
+
+    pub(crate) async fn custom_agent_by_id(
+        &self,
+        id: &protocol::CustomAgentId,
+    ) -> Result<Option<CustomAgent>, String> {
+        let store = { Arc::clone(&self.state.lock().await.custom_agent_store) };
+        Ok(store.lock().await.get(id))
+    }
+
+    /// User-initiated team-member activation (host stream). Mirrors the
+    /// Reuse/Resume/New branches of `message_team_member` but skips the
+    /// caller-is-manager auth. With `prompt: None`, the no-binding + no-session
+    /// case is a no-op (just opens the chat tab; first user message will
+    /// re-send with `prompt: Some`).
+    pub(crate) async fn activate_team_member(
+        &self,
+        member_id: TeamMemberId,
+        prompt: Option<String>,
+        images: Option<Vec<ImageData>>,
+    ) -> AppResult<TeamMemberMessageOutcome> {
+        const OPERATION: &str = "team_member_activate";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let has_prompt = prompt.is_some();
+        let plan = registry
+            .plan_user_activation(member_id.clone(), has_prompt)
+            .await
+            .map_err(|error| team_member_activation_error(OPERATION, error))?;
+        match plan.activation.clone() {
+            TeamMemberActivation::Reuse { agent_id } => {
+                if let Some(prompt) = prompt {
+                    self.message_bound_team_member(&registry, &plan, agent_id, prompt, images)
+                        .await
+                        .map_err(|error| team_member_activation_error(OPERATION, error))
+                } else {
+                    Ok(TeamMemberMessageOutcome {
+                        member_id: plan.member.id.clone(),
+                        agent_id,
+                        queued: false,
+                    })
+                }
+            }
+            TeamMemberActivation::Resume { session_id } => {
+                if !has_prompt {
+                    // Defer until a real message arrives.
+                    return Ok(TeamMemberMessageOutcome {
+                        member_id: plan.member.id.clone(),
+                        agent_id: AgentId(String::new()),
+                        queued: false,
+                    });
+                }
+                if let Err(err) = self.ensure_team_resume_session(&session_id).await {
+                    self.record_team_member_resume_failure(&registry, plan.member.id.clone())
+                        .await
+                        .map_err(|error| team_member_activation_error(OPERATION, error))?;
+                    return Err(team_member_activation_error(OPERATION, err));
+                }
+                self.spawn_unbound_team_member(
+                    &registry,
+                    &plan,
+                    SpawnAgentParams::Resume { session_id, prompt },
+                    None,
+                )
+                .await
+                .map_err(|error| team_member_activation_error(OPERATION, error))
+            }
+            TeamMemberActivation::New => {
+                let Some(message) = prompt else {
+                    // Fresh member + no prompt: nothing to do server-side.
+                    return Ok(TeamMemberMessageOutcome {
+                        member_id: plan.member.id.clone(),
+                        agent_id: AgentId(String::new()),
+                        queued: false,
+                    });
+                };
+                let prompt = if plan.member.role == TeamMemberRole::Manager
+                    && plan.member.session_id.is_none()
+                {
+                    match self.manager_prompt_with_roster(&plan, message).await {
+                        Ok(prompt) => prompt,
+                        Err(err) => {
+                            let events = registry
+                                .record_binding_failure(plan.member.id.clone())
+                                .await
+                                .map_err(|error| team_member_activation_error(OPERATION, error))?;
+                            self.fan_out_team_registry_events(events).await;
+                            return Err(team_member_activation_error(OPERATION, err));
+                        }
+                    }
+                } else {
+                    message
+                };
+                let backend_kind = match self.team_member_backend_kind().await {
+                    Ok(backend_kind) => backend_kind,
+                    Err(err) => {
+                        let events = registry
+                            .record_binding_failure(plan.member.id.clone())
+                            .await
+                            .map_err(|error| team_member_activation_error(OPERATION, error))?;
+                        self.fan_out_team_registry_events(events).await;
+                        return Err(team_member_activation_error(OPERATION, err));
+                    }
+                };
+                let workspace_roots = match self.team_member_workspace_roots(&plan.member).await {
+                    Ok(workspace_roots) => workspace_roots,
+                    Err(err) => {
+                        let events = registry
+                            .record_binding_failure(plan.member.id.clone())
+                            .await
+                            .map_err(|error| team_member_activation_error(OPERATION, error))?;
+                        self.fan_out_team_registry_events(events).await;
+                        return Err(team_member_activation_error(OPERATION, err));
+                    }
+                };
+                self.spawn_unbound_team_member(
+                    &registry,
+                    &plan,
+                    SpawnAgentParams::New {
+                        workspace_roots,
+                        prompt,
+                        images,
+                        backend_kind,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                    Some(backend_kind),
+                )
+                .await
+                .map_err(|error| team_member_activation_error(OPERATION, error))
+            }
+        }
+    }
+
+    pub(crate) async fn message_team_member(
+        &self,
+        caller_agent_id: AgentId,
+        member_id: TeamMemberId,
+        message: String,
+        images: Option<Vec<ImageData>>,
+    ) -> Result<TeamMemberMessageOutcome, String> {
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let plan = registry
+            .plan_message_member(caller_agent_id, member_id.clone())
+            .await?;
+        match plan.activation.clone() {
+            TeamMemberActivation::Reuse { agent_id } => {
+                self.message_bound_team_member(&registry, &plan, agent_id, message, images)
+                    .await
+            }
+            TeamMemberActivation::Resume { session_id } => {
+                if let Err(err) = self.ensure_team_resume_session(&session_id).await {
+                    self.record_team_member_resume_failure(&registry, plan.member.id.clone())
+                        .await?;
+                    return Err(err);
+                }
+                self.spawn_unbound_team_member(
+                    &registry,
+                    &plan,
+                    SpawnAgentParams::Resume {
+                        session_id,
+                        prompt: Some(message),
+                    },
+                    None,
+                )
+                .await
+            }
+            TeamMemberActivation::New => {
+                let prompt = if plan.member.role == TeamMemberRole::Manager
+                    && plan.member.session_id.is_none()
+                {
+                    match self.manager_prompt_with_roster(&plan, message).await {
+                        Ok(prompt) => prompt,
+                        Err(err) => {
+                            let events = registry
+                                .record_binding_failure(plan.member.id.clone())
+                                .await?;
+                            self.fan_out_team_registry_events(events).await;
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    message
+                };
+                let backend_kind = match self.team_member_backend_kind().await {
+                    Ok(backend_kind) => backend_kind,
+                    Err(err) => {
+                        let events = registry
+                            .record_binding_failure(plan.member.id.clone())
+                            .await?;
+                        self.fan_out_team_registry_events(events).await;
+                        return Err(err);
+                    }
+                };
+                let workspace_roots = match self.team_member_workspace_roots(&plan.member).await {
+                    Ok(workspace_roots) => workspace_roots,
+                    Err(err) => {
+                        let events = registry
+                            .record_binding_failure(plan.member.id.clone())
+                            .await?;
+                        self.fan_out_team_registry_events(events).await;
+                        return Err(err);
+                    }
+                };
+                self.spawn_unbound_team_member(
+                    &registry,
+                    &plan,
+                    SpawnAgentParams::New {
+                        workspace_roots,
+                        prompt,
+                        images,
+                        backend_kind,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                    Some(backend_kind),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn message_bound_team_member(
+        &self,
+        registry: &TeamRegistryHandle,
+        plan: &TeamMessagePlan,
+        agent_id: AgentId,
+        message: String,
+        images: Option<Vec<ImageData>>,
+    ) -> Result<TeamMemberMessageOutcome, String> {
+        let handle = self.agent_handle(&agent_id).await.ok_or_else(|| {
+            format!(
+                "team member {} is bound to missing agent {agent_id}",
+                plan.member.id
+            )
+        })?;
+        let queued = self
+            .agent_status_snapshot(&agent_id)
+            .await
+            .map(|status| status.is_active())
+            .unwrap_or(false);
+        let events = registry
+            .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        let sent = handle
+            .send_input(AgentInput::SendMessage(SendMessagePayload {
+                message,
+                images,
+                origin: None,
+            }))
+            .await;
+        if !sent {
+            let events = registry
+                .record_binding_failure(plan.member.id.clone())
+                .await?;
+            self.fan_out_team_registry_events(events).await;
+            return Err(format!(
+                "team member {} agent backend is closed",
+                plan.member.id
+            ));
+        }
+        Ok(TeamMemberMessageOutcome {
+            member_id: plan.member.id.clone(),
+            agent_id,
+            queued,
+        })
+    }
+
+    async fn spawn_unbound_team_member(
+        &self,
+        registry: &TeamRegistryHandle,
+        plan: &TeamMessagePlan,
+        params: SpawnAgentParams,
+        _backend_kind: Option<protocol::BackendKind>,
+    ) -> Result<TeamMemberMessageOutcome, String> {
+        let clear_session_on_failure = matches!(&params, SpawnAgentParams::Resume { .. });
+        let payload = SpawnAgentPayload {
+            name: Some(plan.member.name.clone()),
+            custom_agent_id: Some(plan.member.custom_agent_id.clone()),
+            parent_agent_id: None,
+            project_id: Some(team_member_primary_project_id(&plan.member)?),
+            params,
+        };
+        let agent_id = self
+            .spawn_agent_with_origin_config_and_team(
+                payload,
+                AgentOrigin::TeamMember,
+                None,
+                Some(TeamSpawnContext {
+                    team_id: plan.team.id.clone(),
+                    team_member_id: plan.member.id.clone(),
+                }),
+            )
+            .await;
+        match self.wait_for_agent_session_id_result(&agent_id).await {
+            Ok(session_id) => {
+                let refs = {
+                    let state = self.state.lock().await;
+                    agent_team_validation_refs(&state, "team_member_bind")
+                        .await
+                        .map_err(|err| err.to_string())?
+                };
+                let events = registry
+                    .bind_member_agent(
+                        plan.member.id.clone(),
+                        agent_id.clone(),
+                        Some(session_id),
+                        refs,
+                    )
+                    .await?;
+                self.fan_out_team_registry_events(events).await;
+                if let Some(status) = self.agent_status_snapshot(&agent_id).await {
+                    let events = if status.terminated {
+                        registry.clear_binding_by_agent(agent_id.clone()).await?
+                    } else {
+                        registry
+                            .record_agent_activity(agent_id.clone(), status.status())
+                            .await?
+                    };
+                    self.fan_out_team_registry_events(events).await;
+                }
+                Ok(TeamMemberMessageOutcome {
+                    member_id: plan.member.id.clone(),
+                    agent_id,
+                    queued: false,
+                })
+            }
+            Err(err) => {
+                if clear_session_on_failure {
+                    self.record_team_member_resume_failure(registry, plan.member.id.clone())
+                        .await?;
+                } else {
+                    let events = registry
+                        .record_binding_failure(plan.member.id.clone())
+                        .await?;
+                    self.fan_out_team_registry_events(events).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn record_team_member_resume_failure(
+        &self,
+        registry: &TeamRegistryHandle,
+        member_id: TeamMemberId,
+    ) -> Result<(), String> {
+        let refs = {
+            let state = self.state.lock().await;
+            agent_team_validation_refs(&state, "team_member_resume_failure")
+                .await
+                .map_err(|err| err.to_string())?
+        };
+        let events = registry.record_resume_failure(member_id, refs).await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    async fn wait_for_agent_session_id_result(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<SessionId, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let (session_id, status_handle) = {
+                let state = self.state.lock().await;
+                (
+                    state.agent_sessions.get(agent_id).cloned(),
+                    state.registry.agent_status_handle(agent_id),
+                )
+            };
+            if let Some(session_id) = session_id {
+                return Ok(session_id);
+            }
+            if let Some(status_handle) = status_handle {
+                let status = status_handle.snapshot().await;
+                if status.terminated {
+                    return Err(status.last_error.unwrap_or_else(|| {
+                        format!("agent {agent_id} terminated before session binding")
+                    }));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for team member agent {agent_id} session binding"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn ensure_team_resume_session(&self, session_id: &SessionId) -> Result<(), String> {
+        let session_store = { Arc::clone(&self.state.lock().await.session_store) };
+        let record = session_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| format!("failed to load sessions before team resume: {error}"))?
+            .into_iter()
+            .find(|record| record.id == *session_id)
+            .ok_or_else(|| format!("cannot resume missing session {session_id}"))?;
+        if !record.resumable {
+            return Err(format!("cannot resume non-resumable session {session_id}"));
+        }
+        Ok(())
+    }
+
+    async fn team_member_backend_kind(&self) -> Result<protocol::BackendKind, String> {
+        let settings = self.read_settings().await?;
+        settings.default_backend.ok_or_else(|| {
+            "cannot activate fresh team member because host has no default_backend".to_string()
+        })
+    }
+
+    async fn team_member_workspace_roots(
+        &self,
+        member: &TeamMember,
+    ) -> Result<Vec<String>, String> {
+        let project_store = { Arc::clone(&self.state.lock().await.project_store) };
+        let project_store = project_store.lock().await;
+        let mut roots = Vec::new();
+        let mut seen = HashSet::new();
+        for project_id in &member.project_ids {
+            let project = project_store.get(project_id).ok_or_else(|| {
+                format!(
+                    "team member {} references missing project {}",
+                    member.id, project_id
+                )
+            })?;
+            for root in project.roots {
+                if seen.insert(root.clone()) {
+                    roots.push(root);
+                }
+            }
+        }
+        Ok(roots)
+    }
+
+    async fn manager_prompt_with_roster(
+        &self,
+        plan: &TeamMessagePlan,
+        prompt: String,
+    ) -> Result<String, String> {
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let snapshot = registry.snapshot().await?;
+        let members = snapshot
+            .members
+            .into_iter()
+            .filter(|member| member.team_id == plan.team.id)
+            .collect::<Vec<_>>();
+        Ok(prepend_manager_roster(&plan.team, &members, prompt))
+    }
+
+    pub(crate) async fn create_team(&self, payload: TeamCreatePayload) -> AppResult<()> {
+        const OPERATION: &str = "team_create";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.create_team(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn rename_team(&self, payload: TeamRenamePayload) -> AppResult<()> {
+        const OPERATION: &str = "team_rename";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.rename_team(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_team(&self, payload: TeamDeletePayload) -> AppResult<()> {
+        const OPERATION: &str = "team_delete";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.delete_team(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn set_team_manager(&self, payload: TeamSetManagerPayload) -> AppResult<()> {
+        const OPERATION: &str = "team_set_manager";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.set_manager(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn create_team_member(
+        &self,
+        payload: TeamMemberCreatePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_member_create";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.create_member(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn update_team_member(
+        &self,
+        payload: TeamMemberUpdatePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_member_update";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.update_member(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_team_member(
+        &self,
+        payload: TeamMemberDeletePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "team_member_delete";
+        let events = self
+            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
+                registry.delete_member(payload, refs).await
+            })
+            .await?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    async fn serialized_team_registry_mutation<F, Fut>(
+        &self,
+        operation: &'static str,
+        mutate: F,
+    ) -> AppResult<TeamRegistryEvents>
+    where
+        F: FnOnce(TeamRegistryHandle, AgentTeamValidationRefs) -> Fut,
+        Fut: Future<Output = Result<TeamRegistryEvents, String>>,
+    {
+        let state = self.state.lock().await;
+        let registry = state.team_registry.clone();
+        let refs = agent_team_validation_refs(&state, operation).await?;
+        #[cfg(test)]
+        wait_for_team_mutation_after_refs_test_hook(self, operation).await;
+        // Hold host_state through the registry mutation so the validation-ref
+        // snapshot and persisted team change serialize with project/custom-agent deletes.
+        let events = mutate(registry, refs)
+            .await
+            .map_err(|error| team_registry_error(operation, error))?;
+        drop(state);
+        Ok(events)
+    }
+
+    async fn fan_out_team_registry_events(&self, events: TeamRegistryEvents) {
+        let mut state = self.state.lock().await;
+        fan_out_team_registry_events(&mut state, events).await;
     }
 
     pub(crate) async fn list_sessions(&self, host_output_stream: &Stream) -> AppResult<()> {
@@ -1753,6 +2599,20 @@ impl HostHandle {
             agent_id
         );
         state.agent_sessions.remove(agent_id);
+        match state
+            .team_registry
+            .clear_binding_by_agent(agent_id.clone())
+            .await
+        {
+            Ok(events) => fan_out_team_registry_events(&mut state, events).await,
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %error,
+                    "failed to clear team binding while closing agent"
+                );
+            }
+        }
 
         true
     }
@@ -2881,6 +3741,84 @@ fn mcp_server_store_error(operation: &'static str, error: String) -> AppError {
     }
 }
 
+fn referenced_team_member_delete_message(
+    resource_kind: &str,
+    resource_id: &impl std::fmt::Display,
+    resource_name: Option<&str>,
+    snapshot: &TeamRegistrySnapshot,
+    referenced_member_ids: &[TeamMemberId],
+) -> String {
+    let resource = match resource_name {
+        Some(name) => format!(r#"{resource_kind} "{name}""#),
+        None => format!("{resource_kind} {resource_id}"),
+    };
+    let Some(first_member_id) = referenced_member_ids.first() else {
+        return format!("cannot delete {resource} while referenced by a team member");
+    };
+    let message = if let Some(member) = snapshot
+        .members
+        .iter()
+        .find(|member| member.id == *first_member_id)
+    {
+        if let Some(team) = snapshot.teams.iter().find(|team| team.id == member.team_id) {
+            format!(
+                r#"cannot delete {resource} while referenced by team member "{}" in team "{}""#,
+                member.name, team.name
+            )
+        } else {
+            format!(
+                r#"cannot delete {resource} while referenced by team member "{}" in team {}"#,
+                member.name, member.team_id
+            )
+        }
+    } else {
+        format!("cannot delete {resource} while referenced by team member {first_member_id}")
+    };
+    let remaining = referenced_member_ids.len().saturating_sub(1);
+    if remaining > 0 {
+        format!("{message} (and {remaining} more)")
+    } else {
+        message
+    }
+}
+
+fn team_member_activation_error(operation: &'static str, error: String) -> AppError {
+    if error.starts_with("conflict:") || error.contains("activation is already in progress") {
+        AppError::conflict(operation, error)
+    } else if error.starts_with("failed to load sessions")
+        || error.starts_with("Failed ")
+        || error.starts_with("Invalid agent teams store")
+        || error.contains("references missing team")
+        || error.contains("bound to missing agent")
+    {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else if error.starts_with("cannot resume") || error.contains("agent backend is closed") {
+        AppError::conflict(operation, error)
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
+fn team_registry_error(operation: &'static str, error: String) -> AppError {
+    if error.contains("references missing custom agent")
+        || error.contains("references missing project")
+    {
+        AppError::conflict(operation, error)
+    } else if error.contains("missing") {
+        AppError::not_found(operation, error)
+    } else if error.contains("already")
+        || error.contains("active manager")
+        || error.contains("live-bound")
+        || error.starts_with("conflict:")
+    {
+        AppError::conflict(operation, error)
+    } else if error.starts_with("Failed ") || error.starts_with("Invalid agent teams store") {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
 fn session_store_error(operation: &'static str, error: String) -> AppError {
     if error.starts_with("Failed ") {
         AppError::internal_message(operation, error.clone(), anyhow!(error))
@@ -2913,6 +3851,8 @@ pub fn spawn_host() -> HostHandle {
         .unwrap_or_else(|err| panic!("failed to resolve default session store path: {err}"));
     let project_path = ProjectStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default project store path: {err}"));
+    let agent_team_path = AgentTeamsStore::default_path()
+        .unwrap_or_else(|err| panic!("failed to resolve default agent teams store path: {err}"));
     let review_path = ReviewStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default review store path: {err}"));
     let settings_path = HostSettingsStore::default_path()
@@ -2931,6 +3871,7 @@ pub fn spawn_host() -> HostHandle {
         HostStorePaths {
             session: session_path,
             project: project_path,
+            agent_team: agent_team_path,
             review: review_path,
             settings: settings_path,
             custom_agent: custom_agent_path,
@@ -2991,6 +3932,7 @@ pub fn spawn_host_with_store_paths_and_runtime_config(
         HostStorePaths {
             session: session_path,
             project: project_path,
+            agent_team: parent.join("agent_teams.json"),
             review: parent.join("reviews.json"),
             settings: settings_path,
             custom_agent: parent.join("custom_agents.json"),
@@ -3037,6 +3979,7 @@ pub fn spawn_host_with_mock_backend_and_runtime_config(
         HostStorePaths {
             session: session_path,
             project: project_path,
+            agent_team: parent.join("agent_teams.json"),
             review: parent.join("reviews.json"),
             settings: settings_path,
             custom_agent: parent.join("custom_agents.json"),
@@ -3056,10 +3999,24 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     let session_store = SessionStore::load(paths.session)?;
-    let project_store = Arc::new(Mutex::new(ProjectStore::load(paths.project)?));
+    let project_store = ProjectStore::load(paths.project)?;
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
+    let team_refs = AgentTeamValidationRefs {
+        custom_agent_ids: custom_agent_store
+            .list()?
+            .into_iter()
+            .map(|custom_agent| custom_agent.id)
+            .collect(),
+        project_ids: project_store
+            .list()?
+            .into_iter()
+            .map(|project| project.id)
+            .collect(),
+    };
+    let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs)?;
+    let project_store = Arc::new(Mutex::new(project_store));
     let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
     let steering_store = SteeringStore::load(paths.steering)?;
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
@@ -3097,6 +4054,7 @@ fn spawn_host_inner(
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
             review_registry,
+            team_registry: TeamRegistryHandle::spawn(team_store),
             project_store,
             settings_store: Arc::new(Mutex::new(settings_store)),
             session_store: Arc::new(Mutex::new(session_store)),
@@ -3164,8 +4122,96 @@ fn spawn_host_inner(
     spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
     spawn_host_review_ai_task(host.clone(), review_ai_spawn_rx);
     spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
+    spawn_host_team_status_task(host.clone());
 
     Ok(host)
+}
+
+fn spawn_host_team_status_task(host: HostHandle) {
+    let worker = async move {
+        let mut status_rx = host.subscribe_agent_status_changes().await;
+        let mut last_seen = HashMap::<AgentId, u64>::new();
+        loop {
+            if status_rx.changed().await.is_err() {
+                break;
+            }
+            let entries = {
+                let state = host.state.lock().await;
+                state
+                    .registry
+                    .agent_ids()
+                    .into_iter()
+                    .filter_map(|agent_id| {
+                        state
+                            .registry
+                            .agent_status_handle(&agent_id)
+                            .map(|status_handle| (agent_id, status_handle))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let live_agent_ids = entries
+                .iter()
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect::<HashSet<_>>();
+            last_seen.retain(|agent_id, _| live_agent_ids.contains(agent_id));
+
+            for (agent_id, status_handle) in entries {
+                let status = status_handle.snapshot().await;
+                if last_seen.get(&agent_id).copied() == Some(status.activity_counter) {
+                    continue;
+                }
+                last_seen.insert(agent_id.clone(), status.activity_counter);
+                let registry = { host.state.lock().await.team_registry.clone() };
+                let result = if status.terminated {
+                    registry.clear_binding_by_agent(agent_id.clone()).await
+                } else {
+                    registry
+                        .record_agent_activity(agent_id.clone(), status.status())
+                        .await
+                };
+                match result {
+                    Ok(events) => host.fan_out_team_registry_events(events).await,
+                    Err(error) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %error,
+                            "failed to update team member binding from agent status"
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name("tyde-host-team-status".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "failed to build host team-status runtime"
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(worker);
+        })
+    {
+        tracing::error!(
+            error = %err,
+            "failed to spawn host team-status worker thread"
+        );
+    }
 }
 
 fn spawn_host_sub_agent_task(host: HostHandle, mut rx: HostSubAgentSpawnRx) {
@@ -3329,6 +4375,69 @@ pub(crate) fn startup_mcp_servers_for_settings(
     servers
 }
 
+fn prepend_manager_roster(team: &protocol::Team, members: &[TeamMember], prompt: String) -> String {
+    let mut block = String::new();
+    block.push_str(
+        "You are the manager for this Tyde agent team. Current roster:
+",
+    );
+    block.push_str(&format!(
+        "Team: {} ({})
+",
+        team.name, team.id
+    ));
+    for member in members {
+        if member.role != TeamMemberRole::Report {
+            continue;
+        }
+        block.push_str(
+            "
+Report:
+",
+        );
+        block.push_str(&format!(
+            "- member_id: {}
+",
+            member.id
+        ));
+        block.push_str(&format!(
+            "- name: {}
+",
+            member.name
+        ));
+        block.push_str(&format!(
+            "- description: {}
+",
+            member.description
+        ));
+        let project_ids = member
+            .project_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        block.push_str(&format!(
+            "- project_ids: {:?}
+",
+            project_ids
+        ));
+    }
+    block.push_str("
+Use tyde_team_describe when you need the current roster and tyde_team_message_member to delegate to reports.
+
+User request:
+");
+    block.push_str(&prompt);
+    block
+}
+
+fn team_member_primary_project_id(member: &TeamMember) -> Result<ProjectId, String> {
+    member
+        .project_ids
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("team member {} has no project_ids", member.id))
+}
+
 fn debug_mcp_url_for_repo_root(base_url: &str, repo_root: &str) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
     format!(
@@ -3377,6 +4486,8 @@ async fn emit_new_agent_for_stream(
         backend_kind: start.backend_kind,
         workspace_roots: start.workspace_roots.clone(),
         custom_agent_id: start.custom_agent_id.clone(),
+        team_id: start.team_id.clone(),
+        team_member_id: start.team_member_id.clone(),
         project_id: start.project_id.clone(),
         parent_agent_id: start.parent_agent_id.clone(),
         created_at_ms: start.created_at_ms,
@@ -3534,6 +4645,112 @@ async fn fan_out_mcp_server_notify(state: &mut HostState, payload: McpServerNoti
     }
 }
 
+async fn fan_out_team_registry_events(state: &mut HostState, events: TeamRegistryEvents) {
+    for payload in events.team_notifies {
+        fan_out_team_notify(state, payload).await;
+    }
+    for payload in events.member_notifies {
+        fan_out_team_member_notify(state, payload).await;
+    }
+    for payload in events.binding_notifies {
+        fan_out_team_member_binding_notify(state, payload).await;
+    }
+}
+
+async fn fan_out_team_notify(state: &mut HostState, payload: TeamNotifyPayload) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_team_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn fan_out_team_member_notify(state: &mut HostState, payload: TeamMemberNotifyPayload) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_team_member_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn fan_out_team_member_binding_notify(
+    state: &mut HostState,
+    payload: TeamMemberBindingNotifyPayload,
+) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_team_member_binding_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn agent_team_validation_refs(
+    state: &HostState,
+    operation: &'static str,
+) -> AppResult<AgentTeamValidationRefs> {
+    let custom_agent_ids = state
+        .custom_agent_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| AppError::internal(operation, anyhow!(error)))?
+        .into_iter()
+        .map(|custom_agent| custom_agent.id)
+        .collect::<HashSet<_>>();
+    let project_ids = state
+        .project_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| AppError::internal(operation, anyhow!(error)))?
+        .into_iter()
+        .map(|project| project.id)
+        .collect::<HashSet<_>>();
+    Ok(AgentTeamValidationRefs {
+        custom_agent_ids,
+        project_ids,
+    })
+}
+
 fn project_stream_path(project_id: &ProjectId) -> StreamPath {
     StreamPath(format!("/project/{}", project_id.0))
 }
@@ -3659,6 +4876,37 @@ async fn fan_out_backend_setup(state: &mut HostState, payload: BackendSetupPaylo
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+async fn emit_team_notify_for_subscriber(
+    payload: &TeamNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TeamNotify payload for host stream fanout");
+    subscriber.stream.send_value(FrameKind::TeamNotify, payload)
+}
+
+async fn emit_team_member_notify_for_subscriber(
+    payload: &TeamMemberNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TeamMemberNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::TeamMemberNotify, payload)
+}
+
+async fn emit_team_member_binding_notify_for_subscriber(
+    payload: &TeamMemberBindingNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TeamMemberBindingNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::TeamMemberBindingNotify, payload)
 }
 
 async fn emit_project_notify_for_subscriber(
@@ -3979,10 +5227,13 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::mock::MOCK_DIE_AFTER_BUSY_SENTINEL;
     use crate::review::ReviewHandle;
+    use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
-        BackendKind, DiffContextMode, ProjectDiffScope, ProjectGitDiffPayload, Review,
-        ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus,
+        BackendKind, CustomAgentId, DiffContextMode, HostSettingValue, ProjectDiffScope,
+        ProjectGitDiffPayload, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus,
+        TeamMemberCreateSpec, ToolPolicy,
     };
 
     #[test]
@@ -4000,6 +5251,883 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TeamFixture {
+        _dir: tempfile::TempDir,
+        host: HostHandle,
+        team: protocol::Team,
+        manager: TeamMember,
+        report: TeamMember,
+        custom_agent_id: CustomAgentId,
+        project_id: ProjectId,
+        project_root: String,
+        agent_team_store_path: PathBuf,
+    }
+
+    struct TeamRaceFixture {
+        temp_dir: tempfile::TempDir,
+        host: HostHandle,
+        team: protocol::Team,
+        custom_agent_id: CustomAgentId,
+        project_id: ProjectId,
+        agent_team_store_path: PathBuf,
+    }
+
+    async fn team_fixture() -> TeamFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_root = dir.path().join("project-root");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        let session_path = dir.path().join("sessions.json");
+        let project_path = dir.path().join("projects.json");
+        let settings_path = dir.path().join("settings.json");
+        let agent_team_store_path = dir.path().join("agent_teams.json");
+        let host = spawn_host_with_mock_backend(session_path, project_path, settings_path)
+            .expect("spawn mock host");
+
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable backend");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(BackendKind::Claude),
+            },
+        })
+        .await
+        .expect("set default backend");
+
+        let custom_agent_id = CustomAgentId(format!("custom-{}", Uuid::new_v4()));
+        host.upsert_custom_agent(CustomAgentUpsertPayload {
+            custom_agent: CustomAgent {
+                id: custom_agent_id.clone(),
+                name: "Team Custom Agent".to_owned(),
+                description: "Handles team work".to_owned(),
+                instructions: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: ToolPolicy::Unrestricted,
+            },
+        })
+        .await
+        .expect("upsert custom agent");
+
+        host.create_project(ProjectCreatePayload {
+            name: "Team Project".to_owned(),
+            roots: vec![project_root.to_string_lossy().to_string()],
+        })
+        .await
+        .expect("create project");
+        let project_id = {
+            let state = host.state.lock().await;
+            state
+                .project_store
+                .lock()
+                .await
+                .list()
+                .expect("list projects")
+                .into_iter()
+                .find(|project| project.name == "Team Project")
+                .expect("created project")
+                .id
+        };
+
+        host.create_team(TeamCreatePayload {
+            name: "Product Team".to_owned(),
+            manager: TeamMemberCreateSpec {
+                name: "Manager".to_owned(),
+                description: "Coordinates reports".to_owned(),
+                custom_agent_id: custom_agent_id.clone(),
+                project_ids: vec![project_id.clone()],
+            },
+        })
+        .await
+        .expect("create team");
+        let (team, manager) = {
+            let snapshot = team_snapshot(&host).await;
+            let team = snapshot
+                .teams
+                .into_iter()
+                .find(|team| team.name == "Product Team")
+                .expect("created team");
+            let manager = snapshot
+                .members
+                .into_iter()
+                .find(|member| member.id == team.manager_member_id)
+                .expect("created manager");
+            (team, manager)
+        };
+
+        host.create_team_member(TeamMemberCreatePayload {
+            team_id: team.id.clone(),
+            member: TeamMemberCreateSpec {
+                name: "Report".to_owned(),
+                description: "Implements delegated work".to_owned(),
+                custom_agent_id: custom_agent_id.clone(),
+                project_ids: vec![project_id.clone()],
+            },
+            session_id: None,
+        })
+        .await
+        .expect("create report");
+        let report = team_snapshot(&host)
+            .await
+            .members
+            .into_iter()
+            .find(|member| member.team_id == team.id && member.role == TeamMemberRole::Report)
+            .expect("created report");
+
+        TeamFixture {
+            _dir: dir,
+            host,
+            team,
+            manager,
+            report,
+            custom_agent_id,
+            project_id,
+            project_root: project_root.to_string_lossy().to_string(),
+            agent_team_store_path,
+        }
+    }
+
+    async fn team_race_fixture() -> TeamRaceFixture {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let project_root = temp_dir.path().join("race-project-root");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        let project_root = project_root.to_string_lossy().to_string();
+        let manager_project_root = temp_dir.path().join("race-manager-project-root");
+        std::fs::create_dir_all(&manager_project_root).expect("create manager project root");
+        let manager_project_root = manager_project_root.to_string_lossy().to_string();
+        let session_path = temp_dir.path().join("sessions.json");
+        let project_path = temp_dir.path().join("projects.json");
+        let settings_path = temp_dir.path().join("settings.json");
+        let agent_team_store_path = temp_dir.path().join("agent_teams.json");
+        let host = spawn_host_with_mock_backend(session_path, project_path, settings_path)
+            .expect("spawn mock host");
+
+        let manager_custom_agent_id = CustomAgentId(format!("manager-{}", Uuid::new_v4()));
+        host.upsert_custom_agent(CustomAgentUpsertPayload {
+            custom_agent: CustomAgent {
+                id: manager_custom_agent_id.clone(),
+                name: "Race Manager Custom Agent".to_owned(),
+                description: "Owns the team manager".to_owned(),
+                instructions: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: ToolPolicy::Unrestricted,
+            },
+        })
+        .await
+        .expect("upsert manager custom agent");
+
+        let custom_agent_id = CustomAgentId(format!("race-{}", Uuid::new_v4()));
+        host.upsert_custom_agent(CustomAgentUpsertPayload {
+            custom_agent: CustomAgent {
+                id: custom_agent_id.clone(),
+                name: "Race Custom Agent".to_owned(),
+                description: "The custom agent raced with member creation".to_owned(),
+                instructions: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: ToolPolicy::Unrestricted,
+            },
+        })
+        .await
+        .expect("upsert raced custom agent");
+
+        host.create_project(ProjectCreatePayload {
+            name: "Race Manager Project".to_owned(),
+            roots: vec![manager_project_root],
+        })
+        .await
+        .expect("create manager project");
+        let manager_project_id = {
+            let state = host.state.lock().await;
+            state
+                .project_store
+                .lock()
+                .await
+                .list()
+                .expect("list projects")
+                .into_iter()
+                .find(|project| project.name == "Race Manager Project")
+                .expect("created manager project")
+                .id
+        };
+
+        host.create_project(ProjectCreatePayload {
+            name: "Race Project".to_owned(),
+            roots: vec![project_root.clone()],
+        })
+        .await
+        .expect("create project");
+        let project_id = {
+            let state = host.state.lock().await;
+            state
+                .project_store
+                .lock()
+                .await
+                .list()
+                .expect("list projects")
+                .into_iter()
+                .find(|project| project.name == "Race Project")
+                .expect("created project")
+                .id
+        };
+
+        host.create_team(TeamCreatePayload {
+            name: "Race Team".to_owned(),
+            manager: TeamMemberCreateSpec {
+                name: "Race Manager".to_owned(),
+                description: "Coordinates the race test".to_owned(),
+                custom_agent_id: manager_custom_agent_id,
+                project_ids: vec![manager_project_id],
+            },
+        })
+        .await
+        .expect("create team");
+        let team = team_snapshot(&host)
+            .await
+            .teams
+            .into_iter()
+            .find(|team| team.name == "Race Team")
+            .expect("created team");
+
+        TeamRaceFixture {
+            temp_dir,
+            host,
+            team,
+            custom_agent_id,
+            project_id,
+            agent_team_store_path,
+        }
+    }
+
+    async fn team_snapshot(host: &HostHandle) -> crate::team_registry::TeamRegistrySnapshot {
+        let registry = { host.state.lock().await.team_registry.clone() };
+        registry.snapshot().await.expect("team snapshot")
+    }
+
+    async fn bind_team_member(host: &HostHandle, member: &TeamMember) -> AgentId {
+        let agent_id = AgentId(Uuid::new_v4().to_string());
+        let session_id = SessionId(format!("session-{}", Uuid::new_v4()));
+        let (registry, refs) = {
+            let state = host.state.lock().await;
+            (
+                state.team_registry.clone(),
+                agent_team_validation_refs(&state, "test_bind_team_member")
+                    .await
+                    .expect("team refs"),
+            )
+        };
+        let events = registry
+            .bind_member_agent(member.id.clone(), agent_id.clone(), Some(session_id), refs)
+            .await
+            .expect("bind member");
+        host.fan_out_team_registry_events(events).await;
+        agent_id
+    }
+
+    fn member_from_snapshot(
+        host_snapshot: crate::team_registry::TeamRegistrySnapshot,
+        id: &TeamMemberId,
+    ) -> TeamMember {
+        host_snapshot
+            .members
+            .into_iter()
+            .find(|member| member.id == *id)
+            .expect("member in snapshot")
+    }
+
+    fn persisted_team_store(path: &Path) -> AgentTeamsStoreFile {
+        let json = std::fs::read_to_string(path).expect("read agent teams store");
+        serde_json::from_str(&json).expect("parse agent teams store")
+    }
+
+    async fn assert_agent_team_store_loads_with_current_refs(host: &HostHandle, path: &Path) {
+        let refs = {
+            let state = host.state.lock().await;
+            agent_team_validation_refs(&state, "test_validate_agent_team_store")
+                .await
+                .expect("team refs")
+        };
+        AgentTeamsStore::load(path.to_path_buf(), &refs).expect("agent teams store validates");
+    }
+
+    fn team_member_create_payload(
+        fixture: &TeamRaceFixture,
+        custom_agent_id: CustomAgentId,
+        project_ids: Vec<ProjectId>,
+    ) -> TeamMemberCreatePayload {
+        TeamMemberCreatePayload {
+            team_id: fixture.team.id.clone(),
+            member: TeamMemberCreateSpec {
+                name: "Race Report".to_owned(),
+                description: "Created while a referenced record is deleting".to_owned(),
+                custom_agent_id,
+                project_ids,
+            },
+            session_id: None,
+        }
+    }
+
+    fn team_mutation_race_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn wait_for_team_member_unbound(host: &HostHandle, member_id: &TeamMemberId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = team_snapshot(host).await;
+            let binding = snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.member_id == *member_id)
+                .expect("member binding");
+            if binding.current_agent_id.is_none() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for team member {member_id} to unbind"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn team_first_message_records_report_session_id() {
+        let fixture = team_fixture().await;
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+
+        let outcome = fixture
+            .host
+            .message_team_member(
+                manager_agent_id,
+                fixture.report.id.clone(),
+                "Please investigate the bug".to_owned(),
+                None,
+            )
+            .await
+            .expect("message report");
+
+        assert_eq!(outcome.member_id, fixture.report.id);
+        assert!(!outcome.queued);
+
+        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
+        let session_id = report
+            .session_id
+            .clone()
+            .expect("first spawn records session id");
+        let persisted = persisted_team_store(&fixture.agent_team_store_path);
+        let persisted_report = persisted
+            .members
+            .get(&fixture.report.id)
+            .expect("persisted report");
+        assert_eq!(persisted_report.session_id.as_ref(), Some(&session_id));
+
+        let start = fixture
+            .host
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|start| start.agent_id == outcome.agent_id)
+            .expect("spawned report agent");
+        assert_eq!(start.origin, AgentOrigin::TeamMember);
+        assert_eq!(start.team_id.as_ref(), Some(&fixture.team.id));
+        assert_eq!(start.team_member_id.as_ref(), Some(&fixture.report.id));
+    }
+
+    #[tokio::test]
+    async fn team_member_spawn_uses_union_of_project_roots() {
+        let fixture = team_fixture().await;
+        let second_root = fixture._dir.path().join("second-project-root");
+        std::fs::create_dir_all(&second_root).expect("create second root");
+        let second_root = second_root.to_string_lossy().to_string();
+        fixture
+            .host
+            .create_project(ProjectCreatePayload {
+                name: "Second Team Project".to_owned(),
+                roots: vec![fixture.project_root.clone(), second_root.clone()],
+            })
+            .await
+            .expect("create second project");
+        let second_project_id = {
+            let state = fixture.host.state.lock().await;
+            state
+                .project_store
+                .lock()
+                .await
+                .list()
+                .expect("list projects")
+                .into_iter()
+                .find(|project| project.name == "Second Team Project")
+                .expect("created second project")
+                .id
+        };
+        fixture
+            .host
+            .update_team_member(TeamMemberUpdatePayload {
+                id: fixture.report.id.clone(),
+                name: fixture.report.name.clone(),
+                description: fixture.report.description.clone(),
+                project_ids: vec![fixture.project_id.clone(), second_project_id],
+            })
+            .await
+            .expect("update report projects");
+        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+
+        let outcome = fixture
+            .host
+            .message_team_member(
+                manager_agent_id,
+                report.id.clone(),
+                "Use both projects".to_owned(),
+                None,
+            )
+            .await
+            .expect("message report");
+
+        let start = fixture
+            .host
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|start| start.agent_id == outcome.agent_id)
+            .expect("spawned report agent");
+        assert_eq!(
+            start.workspace_roots,
+            vec![fixture.project_root.clone(), second_root]
+        );
+        assert_eq!(start.project_id.as_ref(), Some(&fixture.project_id));
+    }
+
+    #[tokio::test]
+    async fn team_terminal_agent_unbinds_and_resumes_next_message() {
+        let fixture = team_fixture().await;
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+
+        let first = fixture
+            .host
+            .message_team_member(
+                manager_agent_id.clone(),
+                fixture.report.id.clone(),
+                format!("First task {MOCK_DIE_AFTER_BUSY_SENTINEL}"),
+                None,
+            )
+            .await
+            .expect("first message spawns report");
+        let first_session_id =
+            member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id)
+                .session_id
+                .expect("first session id");
+
+        wait_for_team_member_unbound(&fixture.host, &fixture.report.id).await;
+
+        let second = fixture
+            .host
+            .message_team_member(
+                manager_agent_id,
+                fixture.report.id.clone(),
+                "Follow-up after crash".to_owned(),
+                None,
+            )
+            .await
+            .expect("second message resumes after terminal unbind");
+        assert_ne!(first.agent_id, second.agent_id);
+
+        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
+        assert_eq!(report.session_id.as_ref(), Some(&first_session_id));
+    }
+
+    #[tokio::test]
+    async fn team_subsequent_unbound_message_resumes_session() {
+        let fixture = team_fixture().await;
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+        let first = fixture
+            .host
+            .message_team_member(
+                manager_agent_id.clone(),
+                fixture.report.id.clone(),
+                "First task".to_owned(),
+                None,
+            )
+            .await
+            .expect("first message");
+        let first_session_id =
+            member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id)
+                .session_id
+                .expect("first session id");
+
+        assert!(fixture.host.close_agent(&first.agent_id).await);
+
+        let second = fixture
+            .host
+            .message_team_member(
+                manager_agent_id,
+                fixture.report.id.clone(),
+                "Follow-up task".to_owned(),
+                None,
+            )
+            .await
+            .expect("second message resumes");
+        assert_ne!(first.agent_id, second.agent_id);
+
+        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
+        assert_eq!(report.session_id.as_ref(), Some(&first_session_id));
+    }
+
+    #[tokio::test]
+    async fn team_message_member_rejects_report_caller() {
+        let fixture = team_fixture().await;
+        let report_agent_id = bind_team_member(&fixture.host, &fixture.report).await;
+
+        let err = fixture
+            .host
+            .message_team_member(
+                report_agent_id,
+                fixture.report.id.clone(),
+                "Try to delegate".to_owned(),
+                None,
+            )
+            .await
+            .expect_err("report caller should be rejected");
+        assert!(err.starts_with("authorization:"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn team_resume_failure_marks_binding_failed() {
+        let fixture = team_fixture().await;
+        let report_agent_id = bind_team_member(&fixture.host, &fixture.report).await;
+        let report = member_from_snapshot(team_snapshot(&fixture.host).await, &fixture.report.id);
+        let bad_session_id = report.session_id.clone().expect("bound report session");
+        {
+            let state = fixture.host.state.lock().await;
+            state
+                .session_store
+                .lock()
+                .await
+                .upsert_backend_session(
+                    &BackendSession {
+                        id: bad_session_id.clone(),
+                        backend_kind: BackendKind::Claude,
+                        workspace_roots: vec![fixture.project_root.clone()],
+                        title: Some("Missing mock backend session".to_owned()),
+                        token_count: None,
+                        created_at_ms: Some(1),
+                        updated_at_ms: Some(1),
+                        resumable: true,
+                    },
+                    None,
+                    Some(report.project_ids[0].clone()),
+                    Some(report.custom_agent_id.clone()),
+                )
+                .expect("persist fake session");
+        }
+        {
+            let registry = { fixture.host.state.lock().await.team_registry.clone() };
+            let events = registry
+                .clear_binding_by_agent(report_agent_id)
+                .await
+                .expect("clear report binding");
+            fixture.host.fan_out_team_registry_events(events).await;
+        }
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+
+        let err = fixture
+            .host
+            .message_team_member(
+                manager_agent_id,
+                fixture.report.id.clone(),
+                "Try resume".to_owned(),
+                None,
+            )
+            .await
+            .expect_err("unknown backend session should fail");
+        assert!(
+            err.contains("unknown mock session"),
+            "unexpected error: {err}"
+        );
+
+        let snapshot = team_snapshot(&fixture.host).await;
+        let binding = snapshot
+            .bindings
+            .iter()
+            .find(|binding| binding.member_id == fixture.report.id)
+            .expect("report binding");
+        assert!(binding.current_agent_id.is_none());
+        assert_eq!(binding.status, AgentControlStatus::Failed);
+        let report = member_from_snapshot(snapshot, &fixture.report.id);
+        assert!(report.session_id.is_none());
+        let persisted = persisted_team_store(&fixture.agent_team_store_path);
+        let persisted_report = persisted
+            .members
+            .get(&fixture.report.id)
+            .expect("persisted report");
+        assert!(persisted_report.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn team_delete_hard_removes_team_and_members() {
+        let fixture = team_fixture().await;
+
+        fixture
+            .host
+            .delete_team(TeamDeletePayload {
+                id: fixture.team.id.clone(),
+            })
+            .await
+            .expect("delete team");
+        let snapshot = team_snapshot(&fixture.host).await;
+        assert!(snapshot.teams.iter().all(|team| team.id != fixture.team.id));
+        assert!(
+            snapshot
+                .members
+                .iter()
+                .all(|member| member.team_id != fixture.team.id)
+        );
+        assert!(snapshot.bindings.iter().all(|binding| {
+            binding.member_id != fixture.manager.id && binding.member_id != fixture.report.id
+        }));
+        let persisted = persisted_team_store(&fixture.agent_team_store_path);
+        assert!(!persisted.teams.contains_key(&fixture.team.id));
+        assert!(!persisted.members.contains_key(&fixture.manager.id));
+        assert!(!persisted.members.contains_key(&fixture.report.id));
+
+        let err = fixture
+            .host
+            .rename_team(TeamRenamePayload {
+                id: fixture.team.id.clone(),
+                name: "Renamed Team".to_owned(),
+            })
+            .await
+            .expect_err("deleted team rename should fail");
+        assert_eq!(err.kind, crate::error::AppErrorKind::NotFound);
+        assert!(err.message.contains("missing team"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_team_messages_spawn_at_most_one_agent() {
+        let fixture = team_fixture().await;
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let host = fixture.host.clone();
+            let caller = manager_agent_id.clone();
+            let member_id = fixture.report.id.clone();
+            tasks.push(tokio::spawn(async move {
+                host.message_team_member(
+                    caller,
+                    member_id,
+                    format!("Concurrent task {index}"),
+                    None,
+                )
+                .await
+            }));
+        }
+
+        let mut success_count = 0;
+        for task in tasks {
+            match task.await.expect("message task should not panic") {
+                Ok(_) => success_count += 1,
+                Err(err) => assert!(
+                    err.starts_with("conflict:"),
+                    "unexpected concurrent message error: {err}"
+                ),
+            }
+        }
+        assert!(success_count >= 1);
+
+        let report_agents = fixture
+            .host
+            .list_agents()
+            .await
+            .into_iter()
+            .filter(|agent| agent.team_member_id.as_ref() == Some(&fixture.report.id))
+            .collect::<Vec<_>>();
+        assert_eq!(report_agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn team_delete_rejects_live_bound_member() {
+        let fixture = team_fixture().await;
+        bind_team_member(&fixture.host, &fixture.report).await;
+
+        let err = fixture
+            .host
+            .delete_team_member(TeamMemberDeletePayload {
+                id: fixture.report.id.clone(),
+            })
+            .await
+            .expect_err("live-bound report should not delete");
+        assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
+        assert!(err.message.contains("live-bound"));
+    }
+
+    #[tokio::test]
+    async fn team_references_block_custom_agent_and_project_delete() {
+        let fixture = team_fixture().await;
+
+        let custom_agent_err = fixture
+            .host
+            .delete_custom_agent(CustomAgentDeletePayload {
+                id: fixture.custom_agent_id.clone(),
+            })
+            .await
+            .expect_err("custom agent reference should block delete");
+        assert_eq!(custom_agent_err.kind, crate::error::AppErrorKind::Conflict);
+        assert!(
+            custom_agent_err
+                .message
+                .contains(r#"custom agent "Team Custom Agent""#)
+        );
+        assert!(custom_agent_err.message.contains(r#"team "Product Team""#));
+        assert!(
+            custom_agent_err
+                .message
+                .contains(r#"team member "Manager""#)
+                || custom_agent_err.message.contains(r#"team member "Report""#)
+        );
+        assert!(!custom_agent_err.message.contains(&fixture.manager.id.0));
+        assert!(!custom_agent_err.message.contains(&fixture.report.id.0));
+
+        let project_err = fixture
+            .host
+            .delete_project(ProjectDeletePayload {
+                id: fixture.project_id.clone(),
+            })
+            .await
+            .expect_err("project reference should block delete");
+        assert_eq!(project_err.kind, crate::error::AppErrorKind::Conflict);
+        assert!(project_err.message.contains(r#"project "Team Project""#));
+        assert!(project_err.message.contains(r#"team "Product Team""#));
+        assert!(
+            project_err.message.contains(r#"team member "Manager""#)
+                || project_err.message.contains(r#"team member "Report""#)
+        );
+        assert!(!project_err.message.contains(&fixture.manager.id.0));
+        assert!(!project_err.message.contains(&fixture.report.id.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_member_and_delete_custom_agent_serialize() {
+        let race_test_guard = team_mutation_race_test_lock().lock().await;
+        let fixture = team_race_fixture().await;
+        assert!(fixture.temp_dir.path().exists());
+        let hook = install_team_mutation_after_refs_test_hook(&fixture.host, "team_member_create");
+        let create_host = fixture.host.clone();
+        let create_payload = team_member_create_payload(
+            &fixture,
+            fixture.custom_agent_id.clone(),
+            vec![fixture.project_id.clone()],
+        );
+        let create_task =
+            tokio::spawn(async move { create_host.create_team_member(create_payload).await });
+
+        hook.wait_until_reached().await;
+        let delete_host = fixture.host.clone();
+        let custom_agent_id = fixture.custom_agent_id.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_host
+                .delete_custom_agent(CustomAgentDeletePayload {
+                    id: custom_agent_id,
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        hook.resume();
+
+        let create_result = create_task.await.expect("create task should not panic");
+        let delete_result = delete_task.await.expect("delete task should not panic");
+        match (&create_result, &delete_result) {
+            (Ok(()), Err(err)) => {
+                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
+                assert!(err.message.contains(r#"custom agent "Race Custom Agent""#));
+                assert!(err.message.contains(r#"team member "Race Report""#));
+            }
+            (Err(err), Ok(())) => {
+                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
+                assert!(
+                    err.message.contains("references missing custom agent"),
+                    "unexpected create error: {}",
+                    err.message
+                );
+            }
+            (Ok(()), Ok(())) => panic!("create and delete both succeeded"),
+            (Err(create_err), Err(delete_err)) => panic!(
+                "create and delete both failed: create={}, delete={}",
+                create_err, delete_err
+            ),
+        }
+        assert_agent_team_store_loads_with_current_refs(
+            &fixture.host,
+            &fixture.agent_team_store_path,
+        )
+        .await;
+        drop(hook);
+        drop(race_test_guard);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_member_and_delete_project_serialize() {
+        let race_test_guard = team_mutation_race_test_lock().lock().await;
+        let fixture = team_race_fixture().await;
+        assert!(fixture.temp_dir.path().exists());
+        let hook = install_team_mutation_after_refs_test_hook(&fixture.host, "team_member_create");
+        let create_host = fixture.host.clone();
+        let create_payload = team_member_create_payload(
+            &fixture,
+            fixture.custom_agent_id.clone(),
+            vec![fixture.project_id.clone()],
+        );
+        let create_task =
+            tokio::spawn(async move { create_host.create_team_member(create_payload).await });
+
+        hook.wait_until_reached().await;
+        let delete_host = fixture.host.clone();
+        let project_id = fixture.project_id.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_host
+                .delete_project(ProjectDeletePayload { id: project_id })
+                .await
+        });
+        tokio::task::yield_now().await;
+        hook.resume();
+
+        let create_result = create_task.await.expect("create task should not panic");
+        let delete_result = delete_task.await.expect("delete task should not panic");
+        match (&create_result, &delete_result) {
+            (Ok(()), Err(err)) => {
+                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
+                assert!(err.message.contains(r#"project "Race Project""#));
+                assert!(err.message.contains(r#"team member "Race Report""#));
+            }
+            (Err(err), Ok(())) => {
+                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
+                assert!(
+                    err.message.contains("references missing project"),
+                    "unexpected create error: {}",
+                    err.message
+                );
+            }
+            (Ok(()), Ok(())) => panic!("create and delete both succeeded"),
+            (Err(create_err), Err(delete_err)) => panic!(
+                "create and delete both failed: create={}, delete={}",
+                create_err, delete_err
+            ),
+        }
+        assert_agent_team_store_loads_with_current_refs(
+            &fixture.host,
+            &fixture.agent_team_store_path,
+        )
+        .await;
+        drop(hook);
+        drop(race_test_guard);
     }
 
     #[tokio::test]

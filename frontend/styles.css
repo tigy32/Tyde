@@ -1516,6 +1516,333 @@ kbd {
     position: relative;
 }
 
+/* Horizontal split: main chat column on the left, optional team-roster
+ * sidebar on the right. The sidebar mounts only when the active chat's
+ * agent is the live binding for a team's manager (see `chat_view.rs`
+ * `manager_team` Memo + `dev-docs/19-agent-teams.md` §9.2). */
+.chat-view-body {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+    min-width: 0;
+}
+
+.chat-view-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+/* Teams panel: list of teams shown in the dock. Each .team-card is a
+ * bordered block containing a header (title button + actions) and a
+ * roster of member rows. Without these rules everything collapses into
+ * a wall of unspaced text. */
+.team-card-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.team-card {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-primary);
+    border-radius: 0.4rem;
+    background: var(--surface-1);
+    overflow: hidden;
+}
+
+.team-card-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-primary);
+    background: var(--surface-2);
+}
+
+.team-card-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.team-card-title:hover .team-card-name {
+    color: var(--text-bright);
+}
+
+.team-card-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.team-card-count {
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
+}
+
+.team-card-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    flex-shrink: 0;
+}
+
+.team-card-roster {
+    display: flex;
+    flex-direction: column;
+}
+
+.team-member-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-primary);
+    cursor: pointer;
+    transition: background 0.12s;
+}
+
+.team-member-row:last-child {
+    border-bottom: none;
+}
+
+.team-member-row:hover {
+    background: var(--surface-2);
+}
+
+.team-member-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.team-member-name-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.team-member-name {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.team-member-role-badge {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+}
+
+.team-member-state,
+.team-member-status {
+    font-size: 0.78rem;
+    color: var(--text-tertiary);
+}
+
+.team-member-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.team-member-custom-agent,
+.team-member-projects-summary {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 28ch;
+}
+
+/* Multi-select project picker inside the member form. Each project is a
+ * checkbox row; the list scrolls when many projects exist so the modal
+ * stays a sensible height. */
+.team-member-projects {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.team-member-project-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-height: 12rem;
+    overflow-y: auto;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--surface-1, var(--surface-2));
+}
+
+.team-member-project-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.team-member-project-empty {
+    font-size: 0.8rem;
+    color: var(--text-tertiary);
+    font-style: italic;
+}
+
+.team-member-actions {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    align-items: center;
+    flex-shrink: 0;
+}
+
+/* New-team wizard, step 3 (reports). The pending form and the chip list
+ * share a vertical stack with comfortable spacing so the Remove button
+ * never crowds the report name. */
+.team-wizard-reports {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin: 0.5rem 0 1rem;
+}
+
+.team-wizard-report-chip {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.4rem 0.6rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 0.4rem;
+}
+
+.team-wizard-report-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+}
+
+.team-wizard-pending-report {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 0.4rem;
+}
+
+.team-wizard-pending-report .settings-form-row {
+    margin-top: 0.5rem;
+}
+
+.team-roster-sidebar {
+    display: flex;
+    flex-direction: column;
+    width: 260px;
+    flex-shrink: 0;
+    border-left: 1px solid var(--border-primary);
+    background: var(--surface-1);
+    overflow-y: auto;
+    min-height: 0;
+}
+
+.team-roster-header {
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.team-roster-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+}
+
+.team-roster-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.team-roster-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+    cursor: pointer;
+}
+
+.team-roster-row:hover {
+    background: var(--surface-2);
+}
+
+.team-roster-row-line {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.team-roster-row-name {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.team-roster-row-role,
+.team-roster-row-status,
+.team-roster-row-custom-agent,
+.team-roster-row-project,
+.team-roster-row-roots,
+.team-roster-row-active {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.team-roster-row-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.team-roster-empty {
+    padding: var(--space-3) var(--space-4);
+    color: var(--text-tertiary);
+    font-style: italic;
+}
+
 .chat-agent-header {
     display: flex;
     align-items: center;

@@ -246,6 +246,36 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
     pending_images.set(Vec::new());
 
     if state.active_agent.get_untracked().is_none() {
+        // Active tab has no live agent. If it's a draft team-member tab,
+        // route through `TeamMemberActivate` so the server spawns the agent
+        // under the right `AgentOrigin::TeamMember` (see
+        // `dev-docs/19-agent-teams.md` §5 and the backend
+        // `activate_team_member` flow). The server's `NewAgent` echo will
+        // upgrade this tab's `agent_ref` in dispatch.rs. Otherwise it's an
+        // ordinary "New Chat" draft and we fall through to `spawn_new_chat`.
+        if let Some(pending) = state.active_pending_team_member_untracked() {
+            let Some(stream) = state.host_stream_untracked(&pending.host_id) else {
+                log::error!(
+                    "submit_chat_input: host stream missing for {host}",
+                    host = pending.host_id
+                );
+                return;
+            };
+            spawn_local(async move {
+                if let Err(error) = crate::send::team_member_activate(
+                    &pending.host_id,
+                    stream,
+                    pending.member_id,
+                    Some(text),
+                    payload_images,
+                )
+                .await
+                {
+                    log::error!("team_member_activate (with prompt) failed: {error}");
+                }
+            });
+            return;
+        }
         spawn_new_chat(state, text, payload_images);
         return;
     }

@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
-    AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendAccessMode, BackendKind, Envelope,
-    ProjectId, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
+    AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendAccessMode, BackendKind,
+    CustomAgentId, Envelope, ImageData, ProjectId, SendMessagePayload, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -144,6 +145,21 @@ struct SendAgentMessageToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct TeamMessageMemberToolInput {
+    member_id: String,
+    message: String,
+    images: Option<Vec<TeamMessageImageInput>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TeamMessageImageInput {
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EmptyToolInput {}
 
 #[derive(Debug, Serialize)]
@@ -185,6 +201,46 @@ struct AgentOverview {
     created_at_ms: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct TeamDescribeResult {
+    team: Team,
+    members: Vec<TeamDescribeMember>,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamDescribeMember {
+    member: TeamMember,
+    custom_agent: TeamCustomAgentSummary,
+    binding: TeamMemberBindingPayload,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamCustomAgentSummary {
+    id: CustomAgentId,
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamMessageMemberResult {
+    member_id: String,
+    agent_id: String,
+    queued: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamToolError {
+    code: TeamToolErrorCode,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TeamToolErrorCode {
+    Authorization,
+    Conflict,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -196,6 +252,10 @@ fn ok_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
 
 fn err_text(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
+}
+
+fn err_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
+    Ok(CallToolResult::error(vec![Content::json(value)?]))
 }
 
 fn request_agent_id_from_parts(
@@ -294,6 +354,69 @@ impl TydeAgentControlMcpServer {
         }
     }
 
+    #[tool(
+        description = "Describe the calling team member's team, roster, custom-agent summaries, and live bindings."
+    )]
+    async fn tyde_team_describe(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let request_agent_id = match request_agent_id_from_parts(&parts) {
+            Ok(Some(agent_id)) => agent_id,
+            Ok(None) => {
+                return Ok(err_text(
+                    "tyde_team_describe requires an injected caller agent_id",
+                ));
+            }
+            Err(err) => return Ok(err_text(err)),
+        };
+        match do_team_describe(&self.host, request_agent_id).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Manager-only: send a message to an active report. Returns the report member_id and live agent_id."
+    )]
+    async fn tyde_team_message_member(
+        &self,
+        Parameters(input): Parameters<TeamMessageMemberToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let request_agent_id = match request_agent_id_from_parts(&parts) {
+            Ok(Some(agent_id)) => agent_id,
+            Ok(None) => {
+                return Ok(err_text(
+                    "tyde_team_message_member requires an injected caller agent_id",
+                ));
+            }
+            Err(err) => return Ok(err_text(err)),
+        };
+        if let Err(err) = reject_mutating_tool_for_read_only_caller(
+            &self.host,
+            Some(&request_agent_id),
+            "tyde_team_message_member",
+        )
+        .await
+        {
+            return Ok(err_text(err));
+        }
+        match do_team_message_member(&self.host, request_agent_id, input).await {
+            Ok(result) => ok_json(result),
+            Err(err) if err.starts_with("authorization:") => err_json(TeamToolError {
+                code: TeamToolErrorCode::Authorization,
+                message: err,
+            }),
+            Err(err) if err.starts_with("conflict:") => err_json(TeamToolError {
+                code: TeamToolErrorCode::Conflict,
+                message: err,
+            }),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
     #[tool(description = "List all agents currently known to this Tyde host.")]
     async fn tyde_list_agents(
         &self,
@@ -311,7 +434,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for orchestrating Tyde2 coding agents. Spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, and read output only with tyde_read_agent."
+                "Tools for orchestrating Tyde2 coding agents. Spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read output only with tyde_read_agent, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -519,6 +642,87 @@ async fn reject_mutating_tool_for_read_only_caller(
     Ok(())
 }
 
+async fn do_team_describe(
+    host: &HostHandle,
+    caller_agent_id: AgentId,
+) -> Result<TeamDescribeResult, String> {
+    let data = host.describe_team_for_agent(caller_agent_id).await?;
+    let mut members = Vec::with_capacity(data.members.len());
+    for member in data.members {
+        let custom_agent = host
+            .custom_agent_by_id(&member.custom_agent_id)
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "team member {} references missing custom agent {}",
+                    member.id, member.custom_agent_id
+                )
+            })?;
+        let binding = data
+            .bindings
+            .iter()
+            .find(|binding| binding.member_id == member.id)
+            .cloned()
+            .unwrap_or_else(|| TeamMemberBindingPayload {
+                member_id: member.id.clone(),
+                current_agent_id: None,
+                status: AgentControlStatus::Idle,
+                last_active_at_ms: None,
+            });
+        members.push(TeamDescribeMember {
+            member,
+            custom_agent: TeamCustomAgentSummary {
+                id: custom_agent.id,
+                name: custom_agent.name,
+                description: custom_agent.description,
+            },
+            binding,
+        });
+    }
+    Ok(TeamDescribeResult {
+        team: data.team,
+        members,
+    })
+}
+
+async fn do_team_message_member(
+    host: &HostHandle,
+    caller_agent_id: AgentId,
+    input: TeamMessageMemberToolInput,
+) -> Result<TeamMessageMemberResult, String> {
+    let member_id = parse_team_member_id(&input.member_id)?;
+    if input.message.trim().is_empty() {
+        return Err("message must not be empty".to_string());
+    }
+    let images = input.images.map(|images| {
+        images
+            .into_iter()
+            .map(|image| ImageData {
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect::<Vec<_>>()
+    });
+    if let Some(images) = images.as_ref() {
+        for image in images {
+            if image.media_type.trim().is_empty() {
+                return Err("images media_type must not be empty".to_string());
+            }
+            if image.data.trim().is_empty() {
+                return Err("images data must not be empty".to_string());
+            }
+        }
+    }
+    let outcome = host
+        .message_team_member(caller_agent_id, member_id, input.message, images)
+        .await?;
+    Ok(TeamMessageMemberResult {
+        member_id: outcome.member_id.0,
+        agent_id: outcome.agent_id.0,
+        queued: outcome.queued,
+    })
+}
+
 async fn do_list_agents(host: &HostHandle) -> Result<Vec<AgentOverview>, String> {
     let agents = host.list_agents().await;
     let mut overviews = Vec::with_capacity(agents.len());
@@ -686,6 +890,14 @@ fn parse_agent_ids(inputs: Vec<String>) -> Result<Vec<AgentId>, String> {
 fn parse_project_id(input: &str) -> Result<ProjectId, String> {
     Uuid::parse_str(input).map_err(|err| format!("invalid project_id '{input}': {err}"))?;
     Ok(ProjectId(input.to_string()))
+}
+
+fn parse_team_member_id(input: &str) -> Result<TeamMemberId, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("member_id must not be empty".to_string());
+    }
+    Ok(TeamMemberId(trimmed.to_string()))
 }
 
 fn split_request_target(target: &str) -> Result<(&str, Option<AgentId>), String> {

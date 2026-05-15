@@ -3,9 +3,12 @@ use std::collections::HashMap;
 
 use protocol::{
     CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerUpsertPayload, SkillRefreshPayload, Steering, SteeringDeletePayload,
-    SteeringId, SteeringUpsertPayload, StreamPath,
+    CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, SkillRefreshPayload, Steering,
+    SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
+    TeamDeletePayload, TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload,
+    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberUpdatePayload,
+    TeamSetManagerPayload,
 };
 use serde::Serialize;
 
@@ -159,6 +162,114 @@ pub async fn skill_refresh(host_id: &str, host_stream: StreamPath) -> Result<(),
         host_stream,
         FrameKind::SkillRefresh,
         &SkillRefreshPayload {},
+    )
+    .await
+}
+
+pub async fn team_create(
+    host_id: &str,
+    host_stream: StreamPath,
+    name: String,
+    manager: TeamMemberCreateSpec,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamCreate,
+        &TeamCreatePayload { name, manager },
+    )
+    .await
+}
+
+pub async fn team_delete(
+    host_id: &str,
+    host_stream: StreamPath,
+    id: TeamId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamDelete,
+        &TeamDeletePayload { id },
+    )
+    .await
+}
+
+pub async fn team_set_manager(
+    host_id: &str,
+    host_stream: StreamPath,
+    team_id: TeamId,
+    new_manager_member_id: TeamMemberId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamSetManager,
+        &TeamSetManagerPayload {
+            team_id,
+            new_manager_member_id,
+        },
+    )
+    .await
+}
+
+pub async fn team_member_create(
+    host_id: &str,
+    host_stream: StreamPath,
+    team_id: TeamId,
+    member: TeamMemberCreateSpec,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamMemberCreate,
+        &TeamMemberCreatePayload {
+            team_id,
+            member,
+            session_id: None,
+        },
+    )
+    .await
+}
+
+pub async fn team_member_update(
+    host_id: &str,
+    host_stream: StreamPath,
+    payload: TeamMemberUpdatePayload,
+) -> Result<(), String> {
+    send_frame(host_id, host_stream, FrameKind::TeamMemberUpdate, &payload).await
+}
+
+pub async fn team_member_delete(
+    host_id: &str,
+    host_stream: StreamPath,
+    id: TeamMemberId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamMemberDelete,
+        &TeamMemberDeletePayload { id },
+    )
+    .await
+}
+
+pub async fn team_member_activate(
+    host_id: &str,
+    host_stream: StreamPath,
+    member_id: TeamMemberId,
+    prompt: Option<String>,
+    images: Option<Vec<ImageData>>,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamMemberActivate,
+        &TeamMemberActivatePayload {
+            member_id,
+            prompt,
+            images,
+        },
     )
     .await
 }

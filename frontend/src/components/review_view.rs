@@ -2608,12 +2608,10 @@ fn ReviewSidebar(
                     .unwrap_or_else(|| "AI Review".to_owned())
             });
             state.open_tab(
-                TabContent::Chat {
-                    agent_ref: Some(ActiveAgentRef {
-                        host_id: host.clone(),
-                        agent_id,
-                    }),
-                },
+                TabContent::chat_with_agent(ActiveAgentRef {
+                    host_id: host.clone(),
+                    agent_id,
+                }),
                 label,
                 true,
             );

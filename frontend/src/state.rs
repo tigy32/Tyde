@@ -10,8 +10,8 @@ use protocol::{
     ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
     ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId,
     ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
-    Steering, SteeringId, StreamPath, TaskList, TerminalId, ToolExecutionCompletedData,
-    ToolRequest,
+    Steering, SteeringId, StreamPath, TaskList, Team, TeamId, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, TerminalId, ToolExecutionCompletedData, ToolRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,11 +93,27 @@ pub fn next_tab_id() -> TabId {
     })
 }
 
+/// A chat tab whose `agent_ref` has not yet been resolved because the user
+/// opened a team member whose live binding does not exist yet. The first user
+/// message sent in this tab is routed through `TeamMemberActivate` instead of
+/// `SpawnAgent`, and the resulting `NewAgent` echo upgrades the tab's
+/// `agent_ref` in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTeamMember {
+    pub host_id: String,
+    pub member_id: TeamMemberId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabContent {
     Home,
     Chat {
         agent_ref: Option<ActiveAgentRef>,
+        /// `Some` only while the user has opened a team member whose live
+        /// agent hasn't been spawned yet. `None` for ordinary draft and live
+        /// chat tabs — the discriminator that tells `submit_chat_input` to
+        /// send `TeamMemberActivate` instead of `SpawnAgent::New`.
+        pending_team_member: Option<PendingTeamMember>,
     },
     File {
         path: ProjectPath,
@@ -111,6 +127,29 @@ pub enum TabContent {
         host_id: String,
         review_id: ReviewId,
     },
+}
+
+impl TabContent {
+    pub fn empty_chat() -> Self {
+        Self::Chat {
+            agent_ref: None,
+            pending_team_member: None,
+        }
+    }
+
+    pub fn chat_with_agent(agent_ref: ActiveAgentRef) -> Self {
+        Self::Chat {
+            agent_ref: Some(agent_ref),
+            pending_team_member: None,
+        }
+    }
+
+    pub fn team_member_draft(host_id: String, member_id: TeamMemberId) -> Self {
+        Self::Chat {
+            agent_ref: None,
+            pending_team_member: Some(PendingTeamMember { host_id, member_id }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -644,6 +683,18 @@ pub struct AppState {
     pub mcp_servers: RwSignal<HashMap<String, HashMap<McpServerId, McpServerConfig>>>,
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
     pub skills: RwSignal<HashMap<String, HashMap<SkillId, Skill>>>,
+    /// Host-scoped team records, keyed by host_id then TeamId. Populated from
+    /// `TeamNotify::Upsert` and pruned by `TeamNotify::Delete`.
+    pub teams: RwSignal<HashMap<String, HashMap<TeamId, Team>>>,
+    /// Host-scoped team member records. Members are looked up by id when
+    /// rendering rosters and detail views; teams are joined via member.team_id.
+    pub team_members: RwSignal<HashMap<String, HashMap<TeamMemberId, TeamMember>>>,
+    /// Runtime team-member bindings: `current_agent_id`, status, last-active.
+    /// Server emits these as `TeamMemberBindingNotify`. After a restart every
+    /// binding starts with `current_agent_id: None` until the member is
+    /// reactivated.
+    pub team_member_bindings:
+        RwSignal<HashMap<String, HashMap<TeamMemberId, TeamMemberBindingPayload>>>,
     pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
     /// Per-review full state. Server is the source of truth: a `ReviewView`
     /// subscribes to `/review/<id>` and dispatch applies `ReviewEvent`
@@ -726,7 +777,7 @@ impl AppState {
         let active_agent: Memo<Option<ActiveAgentRef>> = Memo::new(move |_| {
             center_zone.with(|cz| {
                 cz.active_tab().and_then(|tab| match &tab.content {
-                    TabContent::Chat { agent_ref } => agent_ref.clone(),
+                    TabContent::Chat { agent_ref, .. } => agent_ref.clone(),
                     _ => None,
                 })
             })
@@ -791,6 +842,9 @@ impl AppState {
             mcp_servers: RwSignal::new(HashMap::new()),
             steering: RwSignal::new(HashMap::new()),
             skills: RwSignal::new(HashMap::new()),
+            teams: RwSignal::new(HashMap::new()),
+            team_members: RwSignal::new(HashMap::new()),
+            team_member_bindings: RwSignal::new(HashMap::new()),
             agents_panel_filters: RwSignal::new(HashMap::new()),
             reviews: RwSignal::new(HashMap::new()),
             review_summaries: RwSignal::new(HashMap::new()),
@@ -1031,11 +1085,7 @@ impl AppState {
             }
             (true, None) => {
                 let mut cz = CenterZoneState::default();
-                cz.open(
-                    TabContent::Chat { agent_ref: None },
-                    "New Chat".to_string(),
-                    true,
-                );
+                cz.open(TabContent::empty_chat(), "New Chat".to_string(), true);
                 self.tab_lru.set(cz.active_tab_id.into_iter().collect());
                 self.center_zone.set(cz);
                 self.active_terminal.set(None);
@@ -1156,6 +1206,15 @@ impl AppState {
             map.remove(host_id);
         });
         self.skills.update(|map| {
+            map.remove(host_id);
+        });
+        self.teams.update(|map| {
+            map.remove(host_id);
+        });
+        self.team_members.update(|map| {
+            map.remove(host_id);
+        });
+        self.team_member_bindings.update(|map| {
             map.remove(host_id);
         });
         self.projects
@@ -1404,6 +1463,23 @@ impl AppState {
         self.center_zone
             .update(|cz| cz.rename_tab_label(id, new_label));
     }
+
+    /// If the currently active tab is a draft team-member chat tab (the user
+    /// clicked a team member whose live agent hasn't been spawned yet),
+    /// return the `(host_id, member_id)` pair. Used by the chat input send
+    /// path to send `TeamMemberActivate { prompt: Some(_) }` instead of the
+    /// normal `SpawnAgent::New`.
+    pub fn active_pending_team_member_untracked(&self) -> Option<PendingTeamMember> {
+        self.center_zone.with_untracked(|cz| {
+            cz.active_tab().and_then(|tab| match &tab.content {
+                TabContent::Chat {
+                    agent_ref: None,
+                    pending_team_member: Some(pending),
+                } => Some(pending.clone()),
+                _ => None,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1422,8 +1498,8 @@ mod tests {
     #[test]
     fn close_others_keeps_target_and_non_closeable() {
         let home = make_tab(TabContent::Home, "Home", false);
-        let chat1 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 1", true);
-        let chat2 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 2", true);
+        let chat1 = make_tab(TabContent::empty_chat(), "Chat 1", true);
+        let chat2 = make_tab(TabContent::empty_chat(), "Chat 2", true);
         let target_id = chat1.id;
         let mut cz = CenterZoneState {
             tabs: vec![home, chat1, chat2],
@@ -1439,9 +1515,9 @@ mod tests {
     #[test]
     fn close_to_right_removes_closeable_tabs_after_target() {
         let home = make_tab(TabContent::Home, "Home", false);
-        let chat1 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 1", true);
-        let chat2 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 2", true);
-        let chat3 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 3", true);
+        let chat1 = make_tab(TabContent::empty_chat(), "Chat 1", true);
+        let chat2 = make_tab(TabContent::empty_chat(), "Chat 2", true);
+        let chat3 = make_tab(TabContent::empty_chat(), "Chat 3", true);
         let target_id = chat1.id;
         let mut cz = CenterZoneState {
             tabs: vec![home, chat1, chat2, chat3],
@@ -1458,8 +1534,8 @@ mod tests {
     fn close_all_keeps_only_non_closeable() {
         let home = make_tab(TabContent::Home, "Home", false);
         let home_id = home.id;
-        let chat1 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 1", true);
-        let chat2 = make_tab(TabContent::Chat { agent_ref: None }, "Chat 2", true);
+        let chat1 = make_tab(TabContent::empty_chat(), "Chat 1", true);
+        let chat2 = make_tab(TabContent::empty_chat(), "Chat 2", true);
         let mut cz = CenterZoneState {
             tabs: vec![home, chat1, chat2],
             active_tab_id: None,
@@ -1521,7 +1597,7 @@ mod tests {
     #[test]
     fn rename_tab_label_only_changes_target() {
         let home = make_tab(TabContent::Home, "Home", false);
-        let chat = make_tab(TabContent::Chat { agent_ref: None }, "Old Name", true);
+        let chat = make_tab(TabContent::empty_chat(), "Old Name", true);
         let target_id = chat.id;
         let mut cz = CenterZoneState {
             tabs: vec![home, chat],
@@ -1677,11 +1753,7 @@ mod tests {
                 );
             });
             state.center_zone.update(|cz| {
-                cz.open(
-                    TabContent::Chat { agent_ref: None },
-                    "Chat".to_string(),
-                    true,
-                );
+                cz.open(TabContent::empty_chat(), "Chat".to_string(), true);
             });
             let target_id = state
                 .center_zone
@@ -1816,11 +1888,7 @@ mod tests {
             let state = AppState::new();
 
             state.center_zone.update(|cz| {
-                cz.open(
-                    TabContent::Chat { agent_ref: None },
-                    "Chat".to_string(),
-                    true,
-                );
+                cz.open(TabContent::empty_chat(), "Chat".to_string(), true);
             });
             let target_id = state
                 .center_zone
@@ -1922,9 +1990,7 @@ mod tests {
             assert_eq!(state.active_agent.get_untracked(), None);
 
             state.open_tab(
-                TabContent::Chat {
-                    agent_ref: Some(agent_a.clone()),
-                },
+                TabContent::chat_with_agent(agent_a.clone()),
                 "A".to_owned(),
                 true,
             );
@@ -1935,9 +2001,7 @@ mod tests {
                 .with_untracked(|cz| cz.active_tab_id.expect("A tab active"));
 
             state.open_tab(
-                TabContent::Chat {
-                    agent_ref: Some(agent_b.clone()),
-                },
+                TabContent::chat_with_agent(agent_b.clone()),
                 "B".to_owned(),
                 true,
             );
@@ -2028,9 +2092,7 @@ mod tests {
                 agent_id: AgentId("agent-c".to_owned()),
             };
             state.open_tab(
-                TabContent::Chat {
-                    agent_ref: Some(agent_ref),
-                },
+                TabContent::chat_with_agent(agent_ref),
                 "Agent C".to_owned(),
                 true,
             );

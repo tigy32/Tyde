@@ -14,12 +14,13 @@ use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
+use crate::components::team_roster_sidebar::TeamRosterSidebar;
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ChatRowId, TabId, TabScrollState,
-    ToolOutputMode, TransientEvent,
+    ActiveAgentRef, AgentInfo, AppState, ChatRowHandle, ChatRowId, PendingTeamMember, TabId,
+    TabScrollState, ToolOutputMode, TransientEvent,
 };
 
-use protocol::BackendKind;
+use protocol::{BackendKind, TeamId, TeamMemberState};
 
 /// Default per-row height assumed for rows we haven't measured yet.
 /// Affects initial scrollbar size and pre-measurement window math; once
@@ -85,6 +86,12 @@ pub fn ChatView(
     /// `state.chat_input` — every keystroke would wake each hidden
     /// instance, doubling-or-worse the per-keystroke main-thread cost.
     is_active: Signal<bool>,
+    /// Carries `(host_id, member_id)` for a draft team-member tab that has
+    /// not yet been assigned a live `agent_ref`. Used by the `manager_team`
+    /// Memo so the roster sidebar appears immediately when a fresh manager
+    /// tab is opened, before the user's first message spawns an agent.
+    #[prop(into, optional)]
+    pending_team_member: Option<Signal<Option<PendingTeamMember>>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
@@ -656,8 +663,84 @@ pub fn ChatView(
 
     // (ToolOutputModeToggle is defined below.)
 
+    // Manager-team Memo: resolves to `(host_id, team_id)` whenever the
+    // active chat belongs to a team's manager, so the roster sidebar mounts.
+    //
+    // Two paths are handled:
+    //   Path 1 — live-bound tab: `agent_ref` is set and the binding map
+    //             maps the manager's member to this agent_id.
+    //   Path 2 — draft tab: `agent_ref` is None but `pending_team_member`
+    //             names the member; we look that member up and confirm it
+    //             is the team's manager in Active state.
+    //
+    // Reactive on `agent_ref`, `pending_team_member`, `teams`,
+    // `team_members`, and `team_member_bindings`.
+    let manager_team_state = state.clone();
+    let manager_team: Memo<Option<(String, TeamId)>> = Memo::new(move |_| {
+        // Path 1: live-bound tab.
+        if let Some(active) = agent_ref.get() {
+            let host_id = active.host_id.clone();
+            let agent_id = active.agent_id.clone();
+            let result = manager_team_state.teams.with(|teams_map| {
+                let host_teams = teams_map.get(&host_id)?;
+                for team in host_teams.values() {
+                    let manager_id = team.manager_member_id.clone();
+                    let active_manager = manager_team_state.team_members.with(|members_map| {
+                        members_map
+                            .get(&host_id)
+                            .and_then(|m| m.get(&manager_id))
+                            .map(|m| m.state == TeamMemberState::Active)
+                            .unwrap_or(false)
+                    });
+                    if !active_manager {
+                        continue;
+                    }
+                    let bound = manager_team_state
+                        .team_member_bindings
+                        .with(|bindings_map| {
+                            bindings_map
+                                .get(&host_id)
+                                .and_then(|m| m.get(&manager_id))
+                                .and_then(|b| b.current_agent_id.clone())
+                        });
+                    if bound.as_ref() == Some(&agent_id) {
+                        return Some((host_id.clone(), team.id.clone()));
+                    }
+                }
+                None
+            });
+            if result.is_some() {
+                return result;
+            }
+        }
+
+        // Path 2: draft team-member tab — no agent yet, but we know the
+        // member. Show the sidebar immediately so the user can see the
+        // roster before sending their first message.
+        let pending = pending_team_member.and_then(|sig| sig.get())?;
+        let host_id = pending.host_id.clone();
+        let member_id = pending.member_id.clone();
+        manager_team_state.team_members.with(|members_map| {
+            let member = members_map.get(&host_id).and_then(|m| m.get(&member_id))?;
+            if member.state != TeamMemberState::Active {
+                return None;
+            }
+            let team_id = member.team_id.clone();
+            manager_team_state.teams.with(|teams_map| {
+                let team = teams_map.get(&host_id).and_then(|m| m.get(&team_id))?;
+                if team.manager_member_id == member_id {
+                    Some((host_id.clone(), team_id.clone()))
+                } else {
+                    None
+                }
+            })
+        })
+    });
+
     view! {
         <div class="chat-view">
+          <div class="chat-view-body">
+            <div class="chat-view-main">
             <Show
                 when=has_agent
                 fallback=move || {
@@ -822,6 +905,13 @@ pub fn ChatView(
             >
                 <ChatInput />
             </Show>
+            </div>
+            {move || manager_team.get().map(|(host_id, team_id)| {
+                view! {
+                    <TeamRosterSidebar host_id=host_id team_id=team_id />
+                }
+            })}
+          </div>
         </div>
     }
 }
@@ -1362,5 +1452,300 @@ mod wasm_tests {
             distance_from_bottom > 500,
             "restored user-scrolled tab should not auto-scroll back to bottom"
         );
+    }
+
+    /// Blocker 2 — Roster sidebar renders for a manager chat. When the
+    /// active chat's `agent_ref` matches a team's manager binding,
+    /// `manager_team` resolves and `TeamRosterSidebar` mounts, listing
+    /// each active report's name and CustomAgent label, and filtering
+    /// out non-Active members.
+    #[wasm_bindgen_test]
+    async fn roster_sidebar_renders_for_manager_chat_excluding_paused() {
+        use crate::state::AgentInfo;
+        use protocol::{
+            AgentControlStatus, AgentOrigin, BackendKind, CustomAgent, CustomAgentId, ProjectId,
+            StreamPath, Team, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+            TeamMemberRole, TeamMemberState,
+        };
+
+        let host_id = "host-a".to_owned();
+        let agent_id = AgentId("agent-mgr".to_owned());
+        let manager_id = TeamMemberId("m-1".to_owned());
+        let report_alive_id = TeamMemberId("m-2".to_owned());
+        let report_paused_id = TeamMemberId("m-3".to_owned());
+
+        let team = Team {
+            id: TeamId("t-1".to_owned()),
+            name: "Alpha".to_owned(),
+            manager_member_id: manager_id.clone(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let make_member = |id: &TeamMemberId,
+                           name: &str,
+                           role: TeamMemberRole,
+                           state: TeamMemberState|
+         -> TeamMember {
+            TeamMember {
+                id: id.clone(),
+                team_id: TeamId("t-1".to_owned()),
+                role,
+                state,
+                name: name.to_owned(),
+                description: String::new(),
+                custom_agent_id: CustomAgentId("ca-1".to_owned()),
+                session_id: None,
+                project_ids: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            }
+        };
+
+        let manager_member = make_member(
+            &manager_id,
+            "Manager A",
+            TeamMemberRole::Manager,
+            TeamMemberState::Active,
+        );
+        let report_alive = make_member(
+            &report_alive_id,
+            "Alive Report",
+            TeamMemberRole::Report,
+            TeamMemberState::Active,
+        );
+        let report_paused = make_member(
+            &report_paused_id,
+            "Paused Report",
+            TeamMemberRole::Report,
+            TeamMemberState::Paused,
+        );
+
+        let container = make_container();
+        let host_for_mount = host_id.clone();
+        let agent_id_for_mount = agent_id.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Wire the AgentInfo so the chat header renders.
+            state.agents.update(|agents| {
+                agents.push(AgentInfo {
+                    host_id: host_for_mount.clone(),
+                    agent_id: agent_id_for_mount.clone(),
+                    name: "Manager A".to_owned(),
+                    origin: AgentOrigin::TeamMember,
+                    backend_kind: BackendKind::Claude,
+                    workspace_roots: vec!["/repo".to_owned()],
+                    project_id: None,
+                    parent_agent_id: None,
+                    custom_agent_id: Some(CustomAgentId("ca-1".to_owned())),
+                    created_at_ms: 0,
+                    instance_stream: StreamPath("/agent/agent-mgr".to_owned()),
+                    started: true,
+                    fatal_error: None,
+                });
+            });
+            // Wire the CustomAgent so the sidebar can show the label.
+            state.custom_agents.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(
+                    CustomAgentId("ca-1".to_owned()),
+                    CustomAgent {
+                        id: CustomAgentId("ca-1".to_owned()),
+                        name: "Researcher".to_owned(),
+                        description: "Custom agent".to_owned(),
+                        instructions: None,
+                        skill_ids: Vec::new(),
+                        mcp_server_ids: Vec::new(),
+                        tool_policy: protocol::ToolPolicy::Unrestricted,
+                    },
+                );
+            });
+            // Wire the team + members.
+            state.teams.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(team.id.clone(), team.clone());
+            });
+            state.team_members.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(manager_member.id.clone(), manager_member.clone());
+                host_map.insert(report_alive.id.clone(), report_alive.clone());
+                host_map.insert(report_paused.id.clone(), report_paused.clone());
+            });
+            // Wire the manager's binding so `manager_team` Memo finds the team.
+            state.team_member_bindings.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(
+                    manager_id.clone(),
+                    TeamMemberBindingPayload {
+                        member_id: manager_id.clone(),
+                        current_agent_id: Some(agent_id_for_mount.clone()),
+                        status: AgentControlStatus::Idle,
+                        last_active_at_ms: None,
+                    },
+                );
+            });
+
+            provide_context(state.clone());
+            let bound = ActiveAgentRef {
+                host_id: host_for_mount.clone(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(20_001) agent_ref=agent_ref_signal is_active=is_active_signal /> }
+        });
+
+        next_tick().await;
+        next_tick().await;
+
+        let sidebar = container
+            .query_selector(".team-roster-sidebar")
+            .unwrap()
+            .expect("roster sidebar should mount for manager chat");
+        let sidebar_html: HtmlElement = sidebar.dyn_into().unwrap();
+        let text = sidebar_html.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Alive Report"),
+            "expected active report visible in sidebar: {text:?}"
+        );
+        assert!(
+            text.contains("Researcher"),
+            "expected CustomAgent label visible in sidebar: {text:?}"
+        );
+        assert!(
+            !text.contains("Paused Report"),
+            "paused report must not appear in sidebar: {text:?}"
+        );
+        let _ = ProjectId("noop".to_owned()); // referenced to silence unused-import warnings
+    }
+
+    /// Roster sidebar renders for a **draft** (pre-first-message) manager tab.
+    /// When the user opens a fresh team whose manager has no live agent yet,
+    /// the tab carries `pending_team_member` instead of an `agent_ref`. The
+    /// sidebar must appear immediately so the user can see reports before
+    /// typing their first message.
+    #[wasm_bindgen_test]
+    async fn roster_sidebar_renders_for_draft_manager_tab() {
+        use crate::state::PendingTeamMember;
+        use protocol::{
+            CustomAgent, CustomAgentId, ProjectId, Team, TeamId, TeamMember, TeamMemberId,
+            TeamMemberRole, TeamMemberState,
+        };
+
+        let host_id = "host-draft".to_owned();
+        let manager_id = TeamMemberId("m-draft-mgr".to_owned());
+        let report_id = TeamMemberId("m-draft-report".to_owned());
+
+        let team = Team {
+            id: TeamId("t-draft".to_owned()),
+            name: "DraftTeam".to_owned(),
+            manager_member_id: manager_id.clone(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let make_member = |id: &TeamMemberId,
+                           name: &str,
+                           role: TeamMemberRole,
+                           state: TeamMemberState|
+         -> TeamMember {
+            TeamMember {
+                id: id.clone(),
+                team_id: TeamId("t-draft".to_owned()),
+                role,
+                state,
+                name: name.to_owned(),
+                description: String::new(),
+                custom_agent_id: CustomAgentId("ca-draft".to_owned()),
+                session_id: None,
+                project_ids: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            }
+        };
+
+        let manager_member = make_member(
+            &manager_id,
+            "Draft Manager",
+            TeamMemberRole::Manager,
+            TeamMemberState::Active,
+        );
+        let report_member = make_member(
+            &report_id,
+            "Draft Report",
+            TeamMemberRole::Report,
+            TeamMemberState::Active,
+        );
+
+        let container = make_container();
+        let host_for_mount = host_id.clone();
+        let manager_id_for_mount = manager_id.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Wire CustomAgent label.
+            state.custom_agents.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(
+                    CustomAgentId("ca-draft".to_owned()),
+                    CustomAgent {
+                        id: CustomAgentId("ca-draft".to_owned()),
+                        name: "Planner".to_owned(),
+                        description: "Custom agent".to_owned(),
+                        instructions: None,
+                        skill_ids: Vec::new(),
+                        mcp_server_ids: Vec::new(),
+                        tool_policy: protocol::ToolPolicy::Unrestricted,
+                    },
+                );
+            });
+            // Wire team + members. No binding — this is a fresh team.
+            state.teams.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(team.id.clone(), team.clone());
+            });
+            state.team_members.update(|m| {
+                let host_map = m.entry(host_for_mount.clone()).or_default();
+                host_map.insert(manager_member.id.clone(), manager_member.clone());
+                host_map.insert(report_member.id.clone(), report_member.clone());
+            });
+
+            provide_context(state.clone());
+            // Draft tab: no agent_ref, but pending_team_member points at the manager.
+            let agent_ref_signal: Signal<Option<ActiveAgentRef>> = Signal::derive(|| None);
+            let pending = PendingTeamMember {
+                host_id: host_for_mount.clone(),
+                member_id: manager_id_for_mount.clone(),
+            };
+            let pending_signal: Signal<Option<PendingTeamMember>> =
+                Signal::derive(move || Some(pending.clone()));
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! {
+                <ChatView
+                    tab_id=TabId(20_002)
+                    agent_ref=agent_ref_signal
+                    is_active=is_active_signal
+                    pending_team_member=pending_signal
+                />
+            }
+        });
+
+        next_tick().await;
+        next_tick().await;
+
+        let sidebar = container
+            .query_selector(".team-roster-sidebar")
+            .unwrap()
+            .expect("roster sidebar should mount for draft manager tab");
+        let sidebar_html: HtmlElement = sidebar.dyn_into().unwrap();
+        let text = sidebar_html.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Draft Report"),
+            "expected report visible in sidebar for draft manager tab: {text:?}"
+        );
+        assert!(
+            text.contains("Planner"),
+            "expected CustomAgent label visible in sidebar for draft manager tab: {text:?}"
+        );
+        let _ = ProjectId("noop".to_owned()); // silence unused-import warnings
     }
 }

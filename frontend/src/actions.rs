@@ -2,14 +2,56 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{AppState, TabContent, sort_project_infos};
+use crate::state::{ActiveProjectRef, AppState, TabContent, sort_project_infos};
 
 use protocol::{
     BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath,
+    ProjectReorderPayload, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
+
+/// Resume a session on the given host. Synchronously switches the active
+/// project context (so the resulting `NewAgent` event lands in the user's
+/// current view, upgrading the fresh "New Chat" tab into the resumed chat)
+/// and then sends the `SpawnAgent::Resume` frame. Sessions without a
+/// `project_id` drop the user to the global/home view.
+///
+/// Shared by `SessionsPanel` and by team manager/report opens so the
+/// project-switch step never gets skipped.
+pub fn resume_session(
+    state: &AppState,
+    host_id: String,
+    session_id: SessionId,
+    project_id: Option<ProjectId>,
+) {
+    let target_project = project_id.map(|pid| ActiveProjectRef {
+        host_id: host_id.clone(),
+        project_id: pid,
+    });
+    state.switch_active_project(target_project);
+    let state = state.clone();
+    spawn_local(async move {
+        let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+            log::error!("resume_session: host stream missing for {host_id}");
+            return;
+        };
+        let payload = SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        };
+        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
+        {
+            log::error!("failed to send SpawnAgent (resume): {error}");
+        }
+    });
+}
 
 pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
     begin_new_chat_with(state, backend_override, None);
@@ -27,11 +69,7 @@ pub fn begin_new_chat_with(
         .set(SessionSettingsValues::default());
     // Opening (and activating) the new chat tab drives `active_agent` to None
     // via the Memo derived from `center_zone`.
-    state.open_tab(
-        TabContent::Chat { agent_ref: None },
-        "New Chat".to_string(),
-        true,
-    );
+    state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
 }
 
 pub fn resolve_backend(state: &AppState, host_id: &str) -> Option<BackendKind> {

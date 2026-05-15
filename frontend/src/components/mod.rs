@@ -21,6 +21,8 @@ pub mod session_settings;
 pub mod sessions_panel;
 pub mod settings_panel;
 pub mod task_list;
+pub mod team_roster_sidebar;
+pub mod teams_panel;
 pub mod terminal_view;
 pub mod tool_card;
 pub mod workbench;

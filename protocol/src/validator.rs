@@ -12,7 +12,10 @@ use crate::{
     ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload, RunBackendSetupPayload,
     SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TerminalCreatePayload, ToolExecutionCompletedData,
+    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, ToolExecutionCompletedData,
     ToolRequest,
 };
 
@@ -81,9 +84,13 @@ impl ProtocolValidator {
                     ));
                 }
 
-                validate_agent_origin(payload.origin, payload.parent_agent_id.as_ref()).map_err(
-                    |message| self.violation(envelope, Some(payload.backend_kind), message),
-                )?;
+                validate_agent_origin(
+                    payload.origin,
+                    payload.parent_agent_id.as_ref(),
+                    payload.team_id.as_ref(),
+                    payload.team_member_id.as_ref(),
+                )
+                .map_err(|message| self.violation(envelope, Some(payload.backend_kind), message))?;
 
                 self.agent_streams.insert(
                     payload.instance_stream,
@@ -161,6 +168,17 @@ impl ProtocolValidator {
             FrameKind::McpServerNotify => {
                 parse_host_payload::<McpServerNotifyPayload>(self, envelope, "McpServerNotify")
             }
+            FrameKind::TeamNotify => {
+                parse_host_payload::<TeamNotifyPayload>(self, envelope, "TeamNotify")
+            }
+            FrameKind::TeamMemberNotify => {
+                parse_host_payload::<TeamMemberNotifyPayload>(self, envelope, "TeamMemberNotify")
+            }
+            FrameKind::TeamMemberBindingNotify => parse_host_payload::<
+                TeamMemberBindingNotifyPayload,
+            >(
+                self, envelope, "TeamMemberBindingNotify"
+            ),
             FrameKind::SetSetting => {
                 parse_host_payload::<SetSettingPayload>(self, envelope, "SetSetting")
             }
@@ -212,6 +230,32 @@ impl ProtocolValidator {
             FrameKind::McpServerDelete => {
                 parse_host_payload::<McpServerDeletePayload>(self, envelope, "McpServerDelete")
             }
+            FrameKind::TeamCreate => {
+                parse_host_payload::<TeamCreatePayload>(self, envelope, "TeamCreate")
+            }
+            FrameKind::TeamRename => {
+                parse_host_payload::<TeamRenamePayload>(self, envelope, "TeamRename")
+            }
+            FrameKind::TeamDelete => {
+                parse_host_payload::<TeamDeletePayload>(self, envelope, "TeamDelete")
+            }
+            FrameKind::TeamSetManager => {
+                parse_host_payload::<TeamSetManagerPayload>(self, envelope, "TeamSetManager")
+            }
+            FrameKind::TeamMemberCreate => {
+                parse_host_payload::<TeamMemberCreatePayload>(self, envelope, "TeamMemberCreate")
+            }
+            FrameKind::TeamMemberUpdate => {
+                parse_host_payload::<TeamMemberUpdatePayload>(self, envelope, "TeamMemberUpdate")
+            }
+            FrameKind::TeamMemberDelete => {
+                parse_host_payload::<TeamMemberDeletePayload>(self, envelope, "TeamMemberDelete")
+            }
+            FrameKind::TeamMemberActivate => parse_host_payload::<TeamMemberActivatePayload>(
+                self,
+                envelope,
+                "TeamMemberActivate",
+            ),
             FrameKind::HostBrowseStart => {
                 parse_host_payload::<HostBrowseStartPayload>(self, envelope, "HostBrowseStart")
             }
@@ -266,9 +310,12 @@ impl ProtocolValidator {
                         format!("failed to parse AgentStart payload: {error}"),
                     )
                 })?;
-                if let Err(message) =
-                    validate_agent_origin(payload.origin, payload.parent_agent_id.as_ref())
-                {
+                if let Err(message) = validate_agent_origin(
+                    payload.origin,
+                    payload.parent_agent_id.as_ref(),
+                    payload.team_id.as_ref(),
+                    payload.team_member_id.as_ref(),
+                ) {
                     return Err(build_violation(
                         &recent_frames,
                         envelope,
@@ -366,12 +413,25 @@ impl ProtocolValidator {
 fn validate_agent_origin(
     origin: AgentOrigin,
     parent_agent_id: Option<&crate::AgentId>,
+    team_id: Option<&crate::TeamId>,
+    team_member_id: Option<&crate::TeamMemberId>,
 ) -> Result<(), String> {
     match origin {
         AgentOrigin::BackendNative if parent_agent_id.is_none() => {
             Err("backend_native agents must include parent_agent_id".to_owned())
         }
-        AgentOrigin::User | AgentOrigin::AgentControl | AgentOrigin::BackendNative => Ok(()),
+        AgentOrigin::TeamMember if team_id.is_none() || team_member_id.is_none() => {
+            Err("team_member agents must include team_id and team_member_id".to_owned())
+        }
+        AgentOrigin::User | AgentOrigin::AgentControl | AgentOrigin::BackendNative
+            if team_id.is_some() || team_member_id.is_some() =>
+        {
+            Err("non-team_member agents must not include team_id or team_member_id".to_owned())
+        }
+        AgentOrigin::User
+        | AgentOrigin::AgentControl
+        | AgentOrigin::BackendNative
+        | AgentOrigin::TeamMember => Ok(()),
     }
 }
 
@@ -742,6 +802,8 @@ mod tests {
                 backend_kind: BackendKind::Claude,
                 workspace_roots: vec![],
                 custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
                 project_id: None,
                 parent_agent_id: None,
                 created_at_ms: 0,
@@ -763,6 +825,8 @@ mod tests {
                 backend_kind: BackendKind::Claude,
                 workspace_roots: vec![],
                 custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
                 project_id: None,
                 parent_agent_id: None,
                 created_at_ms: 0,
@@ -774,6 +838,33 @@ mod tests {
     fn chat_envelope(seq: u64, event: &ChatEvent) -> Envelope {
         Envelope::from_payload(agent_stream(), FrameKind::ChatEvent, seq, event)
             .expect("serialize ChatEvent")
+    }
+
+    fn new_agent_with_team_fields(
+        origin: AgentOrigin,
+        team_id: Option<crate::TeamId>,
+        team_member_id: Option<crate::TeamMemberId>,
+    ) -> Envelope {
+        Envelope::from_payload(
+            host_stream(),
+            FrameKind::NewAgent,
+            0,
+            &NewAgentPayload {
+                agent_id: crate::AgentId("test-agent".to_owned()),
+                name: "test".to_owned(),
+                origin,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: vec![],
+                custom_agent_id: None,
+                team_id,
+                team_member_id,
+                project_id: None,
+                parent_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: agent_stream(),
+            },
+        )
+        .expect("serialize NewAgent")
     }
 
     fn assistant_message(content: &str) -> ChatMessage {
@@ -830,6 +921,46 @@ mod tests {
             success: true,
             error: None,
         })
+    }
+
+    #[test]
+    fn accepts_team_member_origin_with_team_fields() {
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&new_agent_with_team_fields(
+                AgentOrigin::TeamMember,
+                Some(crate::TeamId("team-1".to_owned())),
+                Some(crate::TeamMemberId("member-1".to_owned())),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_team_member_origin_without_team_fields() {
+        let mut validator = ProtocolValidator::new();
+        let violation = validator
+            .validate_envelope(&new_agent_with_team_fields(
+                AgentOrigin::TeamMember,
+                Some(crate::TeamId("team-1".to_owned())),
+                None,
+            ))
+            .expect_err("team member origin should require both team ids");
+
+        assert!(violation.to_string().contains("team_id and team_member_id"));
+    }
+
+    #[test]
+    fn rejects_non_team_origin_with_team_fields() {
+        let mut validator = ProtocolValidator::new();
+        let violation = validator
+            .validate_envelope(&new_agent_with_team_fields(
+                AgentOrigin::User,
+                Some(crate::TeamId("team-1".to_owned())),
+                Some(crate::TeamMemberId("member-1".to_owned())),
+            ))
+            .expect_err("user origin should not include team ids");
+
+        assert!(violation.to_string().contains("non-team_member"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod agent_teams;
 pub mod custom_agents;
 pub mod mcp_servers;
 pub mod project;

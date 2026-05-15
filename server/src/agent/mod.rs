@@ -2424,6 +2424,8 @@ mod tests {
             backend_kind: protocol::BackendKind::Tycode,
             workspace_roots: vec!["/tmp/test".to_string()],
             custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
             project_id: None,
             parent_agent_id: None,
             created_at_ms: 1,

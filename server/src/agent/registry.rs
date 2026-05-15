@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use protocol::{
     AgentControlStatus, AgentId, AgentOrigin, AgentStartPayload, BackendAccessMode, BackendKind,
     ChatEvent, CustomAgentId, ProjectId, SendMessagePayload, SessionId, SessionSettingsSchema,
-    SessionSettingsValues, SpawnCostHint,
+    SessionSettingsValues, SpawnCostHint, TeamId, TeamMemberId,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -114,6 +114,8 @@ pub(crate) struct ResolvedSpawnRequest {
     pub name: String,
     pub origin: AgentOrigin,
     pub custom_agent_id: Option<CustomAgentId>,
+    pub team_id: Option<TeamId>,
+    pub team_member_id: Option<TeamMemberId>,
     pub parent_agent_id: Option<AgentId>,
     pub parent_session_id: Option<SessionId>,
     pub project_id: Option<ProjectId>,
@@ -197,6 +199,8 @@ impl AgentRegistry {
             backend_kind: request.backend_kind,
             workspace_roots: request.workspace_roots.clone(),
             custom_agent_id: request.custom_agent_id.clone(),
+            team_id: request.team_id.clone(),
+            team_member_id: request.team_member_id.clone(),
             project_id: request.project_id.clone(),
             parent_agent_id: request.parent_agent_id.clone(),
             created_at_ms: now_ms(),
@@ -249,6 +253,8 @@ impl AgentRegistry {
             backend_kind: request.backend_kind,
             workspace_roots: request.workspace_roots.clone(),
             custom_agent_id: request.custom_agent_id.clone(),
+            team_id: None,
+            team_member_id: None,
             project_id: request.project_id.clone(),
             parent_agent_id: Some(request.parent_agent_id.clone()),
             created_at_ms: now_ms(),

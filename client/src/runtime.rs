@@ -13,9 +13,10 @@ use protocol::{
     ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload,
     SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
     SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
-    StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
-    TerminalStartPayload, read_envelope, write_envelope,
+    StreamPath, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload, TeamNotifyPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
+    TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
+    read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -125,6 +126,9 @@ pub enum HostEvent {
     SteeringNotify(SteeringNotifyPayload),
     SkillNotify(SkillNotifyPayload),
     McpServerNotify(McpServerNotifyPayload),
+    TeamNotify(TeamNotifyPayload),
+    TeamMemberNotify(TeamMemberNotifyPayload),
+    TeamMemberBindingNotify(TeamMemberBindingNotifyPayload),
     AgentClosed(AgentClosedPayload),
     NewAgent(AgentEndpoint),
     NewTerminal(TerminalEndpoint),
@@ -684,6 +688,32 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::McpServerNotify(payload)).await;
+            true
+        }
+        FrameKind::TeamNotify => {
+            let payload: TeamNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::TeamNotify(payload)).await;
+            true
+        }
+        FrameKind::TeamMemberNotify => {
+            let payload: TeamMemberNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::TeamMemberNotify(payload)).await;
+            true
+        }
+        FrameKind::TeamMemberBindingNotify => {
+            let payload: TeamMemberBindingNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::TeamMemberBindingNotify(payload))
+                .await;
             true
         }
         FrameKind::SessionSchemas => {

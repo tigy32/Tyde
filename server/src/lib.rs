@@ -17,6 +17,7 @@ pub mod steering;
 pub mod store;
 pub(crate) mod stream;
 pub(crate) mod sub_agent;
+pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
 
 pub use backend::{acp, claude, codex, gemini, kiro, subprocess};

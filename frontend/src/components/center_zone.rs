@@ -56,6 +56,7 @@ fn do_rename(state: AppState, tab_id: TabId, new_label: String) {
     match content {
         Some(TabContent::Chat {
             agent_ref: Some(agent_ref),
+            ..
         }) => {
             let agent_info = state.agents.with_untracked(|agents| {
                 agents
@@ -448,7 +449,25 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                         .find(|t| t.id == tab_id)
                                         .map(|t| &t.content)
                                     {
-                                        Some(TabContent::Chat { agent_ref }) => agent_ref.clone(),
+                                        Some(TabContent::Chat { agent_ref, .. }) => agent_ref.clone(),
+                                        _ => None,
+                                    }
+                                })
+                            });
+                        // Reactive pending_team_member for draft manager tabs.
+                        let pending_state = state.clone();
+                        let pending_signal: Signal<Option<crate::state::PendingTeamMember>> =
+                            Signal::derive(move || {
+                                pending_state.center_zone.with(|cz| {
+                                    match cz
+                                        .tabs
+                                        .iter()
+                                        .find(|t| t.id == tab_id)
+                                        .map(|t| &t.content)
+                                    {
+                                        Some(TabContent::Chat { pending_team_member, .. }) => {
+                                            pending_team_member.clone()
+                                        }
                                         _ => None,
                                     }
                                 })
@@ -471,6 +490,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                 tab_id=tab_id
                                 agent_ref=agent_ref_signal
                                 is_active=is_active_signal
+                                pending_team_member=pending_signal
                             />
                         }.into_any()
                     }

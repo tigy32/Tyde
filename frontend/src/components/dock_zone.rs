@@ -4,6 +4,7 @@ use crate::components::agents_panel::AgentsPanel;
 use crate::components::file_explorer::FileExplorer;
 use crate::components::git_panel::GitPanel;
 use crate::components::sessions_panel::SessionsPanel;
+use crate::components::teams_panel::TeamsPanel;
 use crate::components::terminal_view::TerminalView;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -26,6 +27,7 @@ pub fn DockZone(position: DockPosition) -> impl IntoView {
 enum RightTab {
     Agents,
     Sessions,
+    Teams,
 }
 
 #[component]
@@ -60,6 +62,13 @@ fn RightDock() -> impl IntoView {
             "display: none;"
         }
     };
+    let teams_style = move || {
+        if active_tab.get() == RightTab::Teams {
+            ""
+        } else {
+            "display: none;"
+        }
+    };
 
     view! {
         <div class="dock-inner">
@@ -70,6 +79,9 @@ fn RightDock() -> impl IntoView {
                 <button class={tab_class(RightTab::Sessions)} on:click=move |_| active_tab.set(RightTab::Sessions)>
                     "Sessions"
                 </button>
+                <button class={tab_class(RightTab::Teams)} on:click=move |_| active_tab.set(RightTab::Teams)>
+                    "Teams"
+                </button>
             </div>
             <div class="dock-tab-content">
                 <div class="dock-tab-mount" style=agents_style>
@@ -77,6 +89,9 @@ fn RightDock() -> impl IntoView {
                 </div>
                 <div class="dock-tab-mount" style=sessions_style>
                     <SessionsPanel />
+                </div>
+                <div class="dock-tab-mount" style=teams_style>
+                    <TeamsPanel />
                 </div>
             </div>
         </div>

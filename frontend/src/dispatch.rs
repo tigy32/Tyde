@@ -15,7 +15,8 @@ use protocol::{
     ProtocolValidator, QueuedMessagesPayload, RejectPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
-    StreamPath, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    StreamPath, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamNotifyPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalStartPayload,
 };
 
@@ -317,6 +318,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 );
                 let agent_id = payload.agent_id.clone();
                 let origin = payload.origin;
+                let team_member_id = payload.team_member_id.clone();
                 let info = AgentInfo {
                     host_id: host_id.to_string(),
                     agent_id: payload.agent_id,
@@ -333,6 +335,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     fatal_error: None,
                 };
                 let project_id = info.project_id.clone();
+                let agent_name_for_upgrade = info.name.clone();
                 // Only User-origin agents auto-open a chat tab and steal focus.
                 // AgentControl and BackendNative agents appear in the sidebar
                 // but must not disrupt the user's current view.
@@ -342,6 +345,30 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
                     agents.push(info);
                 });
+
+                // Team-member upgrade: a `pending_team_member` chat tab was
+                // opened when the user clicked the team or a report row and
+                // is waiting for this spawn echo. Match against
+                // `team_member_id` rather than the host/origin so the
+                // upgrade works for both User-initiated (via
+                // `TeamMemberActivate`) and manager-initiated (via
+                // `tyde_team_message_member`) team-member spawns that
+                // happen to coincide with a draft tab.
+                if let Some(team_member_id) = team_member_id.clone() {
+                    let upgraded = upgrade_pending_team_member_tab(
+                        state,
+                        host_id,
+                        &team_member_id,
+                        &ActiveAgentRef {
+                            host_id: host_id.to_string(),
+                            agent_id: agent_id.clone(),
+                        },
+                        &agent_name_for_upgrade,
+                    );
+                    if upgraded {
+                        return;
+                    }
+                }
 
                 if is_programmatic {
                     return;
@@ -376,18 +403,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // active_agent is now a Memo over center_zone — the update
                     // below drives it.
                     state.center_zone.update(|cz| {
-                        let new_chat = TabContent::Chat { agent_ref: None };
+                        let new_chat = TabContent::empty_chat();
                         if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
-                            tab.content = TabContent::Chat {
-                                agent_ref: Some(new_active_agent.clone()),
-                            };
+                            tab.content = TabContent::chat_with_agent(new_active_agent.clone());
                             tab.label = agent_name.clone();
                             cz.active_tab_id = Some(tab.id);
                         } else {
                             cz.open(
-                                TabContent::Chat {
-                                    agent_ref: Some(new_active_agent.clone()),
-                                },
+                                TabContent::chat_with_agent(new_active_agent.clone()),
                                 agent_name.clone(),
                                 true,
                             );
@@ -399,18 +422,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     state.project_view_memory.update(|map| {
                         let slot = map.entry(target).or_default();
                         let cz = slot.center_zone.get_or_insert_with(Default::default);
-                        let new_chat = TabContent::Chat { agent_ref: None };
+                        let new_chat = TabContent::empty_chat();
                         if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
-                            tab.content = TabContent::Chat {
-                                agent_ref: Some(new_active_agent),
-                            };
+                            tab.content = TabContent::chat_with_agent(new_active_agent);
                             tab.label = agent_name;
                             cz.active_tab_id = Some(tab.id);
                         } else {
                             cz.open(
-                                TabContent::Chat {
-                                    agent_ref: Some(new_active_agent),
-                                },
+                                TabContent::chat_with_agent(new_active_agent),
                                 agent_name,
                                 true,
                             );
@@ -421,18 +440,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     // active_agent is a Memo over center_zone; the update below
                     // drives it.
                     state.center_zone.update(|cz| {
-                        let new_chat = TabContent::Chat { agent_ref: None };
+                        let new_chat = TabContent::empty_chat();
                         if let Some(tab) = cz.tabs.iter_mut().find(|t| t.content == new_chat) {
-                            tab.content = TabContent::Chat {
-                                agent_ref: Some(new_active_agent.clone()),
-                            };
+                            tab.content = TabContent::chat_with_agent(new_active_agent.clone());
                             tab.label = agent_name.clone();
                             cz.active_tab_id = Some(tab.id);
                         } else {
                             cz.open(
-                                TabContent::Chat {
-                                    agent_ref: Some(new_active_agent),
-                                },
+                                TabContent::chat_with_agent(new_active_agent),
                                 agent_name,
                                 true,
                             );
@@ -1163,6 +1178,104 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::TeamNotify => match envelope.parse_payload::<TeamNotifyPayload>() {
+            Ok(TeamNotifyPayload::Upsert { team }) => {
+                state.teams.update(|map| {
+                    let host_map = map.entry(host_id.to_string()).or_default();
+                    host_map.insert(team.id.clone(), team);
+                });
+            }
+            Ok(TeamNotifyPayload::Delete { team }) => {
+                state.teams.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&team.id);
+                    }
+                });
+                // Drop any members and their bindings that belonged to this
+                // team. Snapshot dropped ids before the retain so the binding
+                // prune knows which to remove.
+                let dropped_member_ids = state.team_members.with_untracked(|map| {
+                    map.get(host_id)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|(_, member)| member.team_id == team.id)
+                                .map(|(id, _)| id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                });
+                if !dropped_member_ids.is_empty() {
+                    state.team_members.update(|map| {
+                        if let Some(host_map) = map.get_mut(host_id) {
+                            host_map.retain(|_, member| member.team_id != team.id);
+                        }
+                    });
+                    state.team_member_bindings.update(|map| {
+                        if let Some(host_map) = map.get_mut(host_id) {
+                            host_map.retain(|member_id, _| !dropped_member_ids.contains(member_id));
+                        }
+                    });
+                }
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse team_notify payload: {error}"),
+            ),
+        },
+        FrameKind::TeamMemberNotify => match envelope.parse_payload::<TeamMemberNotifyPayload>() {
+            Ok(TeamMemberNotifyPayload::Upsert { member }) => {
+                state.team_members.update(|map| {
+                    let host_map = map.entry(host_id.to_string()).or_default();
+                    host_map.insert(member.id.clone(), member);
+                });
+            }
+            Ok(TeamMemberNotifyPayload::Delete { member }) => {
+                state.team_members.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&member.id);
+                    }
+                });
+                state.team_member_bindings.update(|map| {
+                    if let Some(host_map) = map.get_mut(host_id) {
+                        host_map.remove(&member.id);
+                    }
+                });
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse team_member_notify payload: {error}"),
+            ),
+        },
+        FrameKind::TeamMemberBindingNotify => {
+            match envelope.parse_payload::<TeamMemberBindingNotifyPayload>() {
+                Ok(TeamMemberBindingNotifyPayload::Upsert { binding }) => {
+                    state.team_member_bindings.update(|map| {
+                        let host_map = map.entry(host_id.to_string()).or_default();
+                        host_map.insert(binding.member_id.clone(), binding);
+                    });
+                }
+                Ok(TeamMemberBindingNotifyPayload::Delete { binding }) => {
+                    state.team_member_bindings.update(|map| {
+                        if let Some(host_map) = map.get_mut(host_id) {
+                            host_map.remove(&binding.member_id);
+                        }
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse team_member_binding_notify payload: {error}"),
+                ),
+            }
+        }
         _ => {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
         }
@@ -1657,6 +1770,57 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.prune_tab_lru();
 }
 
+/// Find a draft chat tab opened against `(host_id, member_id)` and replace its
+/// content with a live `agent_ref`. Searches the current center zone first,
+/// then each stored `project_view_memory` snapshot — a team click that
+/// happened in another project's view still upgrades when the agent finally
+/// spawns. Returns `true` if a tab was upgraded.
+fn upgrade_pending_team_member_tab(
+    state: &AppState,
+    host_id: &str,
+    member_id: &TeamMemberId,
+    agent_ref: &ActiveAgentRef,
+    agent_name: &str,
+) -> bool {
+    let matches_pending = |content: &TabContent| -> bool {
+        matches!(
+            content,
+            TabContent::Chat {
+                agent_ref: None,
+                pending_team_member: Some(pending),
+            } if pending.host_id == host_id && pending.member_id == *member_id
+        )
+    };
+
+    let mut upgraded = false;
+    state.center_zone.update(|cz| {
+        if let Some(tab) = cz.tabs.iter_mut().find(|t| matches_pending(&t.content)) {
+            tab.content = TabContent::chat_with_agent(agent_ref.clone());
+            tab.label = agent_name.to_string();
+            cz.active_tab_id = Some(tab.id);
+            upgraded = true;
+        }
+    });
+    if upgraded {
+        return true;
+    }
+    state.project_view_memory.update(|map| {
+        for memory in map.values_mut() {
+            let Some(cz) = memory.center_zone.as_mut() else {
+                continue;
+            };
+            if let Some(tab) = cz.tabs.iter_mut().find(|t| matches_pending(&t.content)) {
+                tab.content = TabContent::chat_with_agent(agent_ref.clone());
+                tab.label = agent_name.to_string();
+                cz.active_tab_id = Some(tab.id);
+                upgraded = true;
+                break;
+            }
+        }
+    });
+    upgraded
+}
+
 fn close_agent_tabs(
     center_zone: &mut crate::state::CenterZoneState,
     host_id: &str,
@@ -1668,7 +1832,7 @@ fn close_agent_tabs(
         .filter(|tab| {
             matches!(
                 &tab.content,
-                TabContent::Chat { agent_ref: Some(ar) }
+                TabContent::Chat { agent_ref: Some(ar), .. }
                     if ar.host_id == host_id && ar.agent_id == *agent_id
             )
         })
@@ -1698,7 +1862,8 @@ fn rename_agent_tabs(
         let matches_agent = matches!(
             &tab.content,
             TabContent::Chat {
-                agent_ref: Some(agent_ref)
+                agent_ref: Some(agent_ref),
+                ..
             } if agent_ref.host_id == host_id && agent_ref.agent_id == *agent_id
         );
         if matches_agent {

@@ -15,8 +15,10 @@ use protocol::{
     ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringUpsertPayload, StreamPath, TerminalClosePayload, TerminalCreatePayload, TerminalId,
-    TerminalResizePayload, TerminalSendPayload,
+    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -121,6 +123,76 @@ pub(crate) async fn route_client_envelope(
                 let payload: McpServerDeletePayload =
                     parse_payload(&envelope, "mcp_server_delete")?;
                 host.delete_mcp_server(payload).await?;
+            }
+            FrameKind::TeamCreate => {
+                let payload: TeamCreatePayload = parse_payload(&envelope, "team_create")?;
+                ensure_non_empty("team_create", "name", payload.name.as_str())?;
+                validate_team_member_create_spec("team_create", &payload.manager)?;
+                host.create_team(payload).await?;
+            }
+            FrameKind::TeamRename => {
+                let payload: TeamRenamePayload = parse_payload(&envelope, "team_rename")?;
+                ensure_non_empty("team_rename", "id", payload.id.0.as_str())?;
+                ensure_non_empty("team_rename", "name", payload.name.as_str())?;
+                host.rename_team(payload).await?;
+            }
+            FrameKind::TeamDelete => {
+                let payload: TeamDeletePayload = parse_payload(&envelope, "team_delete")?;
+                ensure_non_empty("team_delete", "id", payload.id.0.as_str())?;
+                host.delete_team(payload).await?;
+            }
+            FrameKind::TeamSetManager => {
+                let payload: TeamSetManagerPayload = parse_payload(&envelope, "team_set_manager")?;
+                ensure_non_empty("team_set_manager", "team_id", payload.team_id.0.as_str())?;
+                ensure_non_empty(
+                    "team_set_manager",
+                    "new_manager_member_id",
+                    payload.new_manager_member_id.0.as_str(),
+                )?;
+                host.set_team_manager(payload).await?;
+            }
+            FrameKind::TeamMemberCreate => {
+                let payload: TeamMemberCreatePayload =
+                    parse_payload(&envelope, "team_member_create")?;
+                ensure_non_empty("team_member_create", "team_id", payload.team_id.0.as_str())?;
+                if payload.session_id.is_some() {
+                    return Err(AppError::invalid(
+                        "team_member_create",
+                        "session_id must be absent",
+                    ));
+                }
+                validate_team_member_create_spec("team_member_create", &payload.member)?;
+                host.create_team_member(payload).await?;
+            }
+            FrameKind::TeamMemberUpdate => {
+                let payload: TeamMemberUpdatePayload =
+                    parse_payload(&envelope, "team_member_update")?;
+                ensure_non_empty("team_member_update", "id", payload.id.0.as_str())?;
+                ensure_non_empty("team_member_update", "name", payload.name.as_str())?;
+                ensure_non_empty(
+                    "team_member_update",
+                    "description",
+                    payload.description.as_str(),
+                )?;
+                validate_team_project_ids("team_member_update", &payload.project_ids)?;
+                host.update_team_member(payload).await?;
+            }
+            FrameKind::TeamMemberDelete => {
+                let payload: TeamMemberDeletePayload =
+                    parse_payload(&envelope, "team_member_delete")?;
+                ensure_non_empty("team_member_delete", "id", payload.id.0.as_str())?;
+                host.delete_team_member(payload).await?;
+            }
+            FrameKind::TeamMemberActivate => {
+                let payload: TeamMemberActivatePayload =
+                    parse_payload(&envelope, "team_member_activate")?;
+                ensure_non_empty(
+                    "team_member_activate",
+                    "member_id",
+                    payload.member_id.0.as_str(),
+                )?;
+                host.activate_team_member(payload.member_id, payload.prompt, payload.images)
+                    .await?;
             }
             FrameKind::HostBrowseStart => {
                 let payload: HostBrowseStartPayload =
@@ -610,6 +682,40 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_team_member_create_spec(
+    operation: &'static str,
+    spec: &protocol::TeamMemberCreateSpec,
+) -> AppResult<()> {
+    ensure_non_empty(operation, "name", spec.name.as_str())?;
+    ensure_non_empty(operation, "description", spec.description.as_str())?;
+    ensure_non_empty(
+        operation,
+        "custom_agent_id",
+        spec.custom_agent_id.0.as_str(),
+    )?;
+    validate_team_project_ids(operation, &spec.project_ids)
+}
+
+fn validate_team_project_ids(operation: &'static str, project_ids: &[ProjectId]) -> AppResult<()> {
+    if project_ids.is_empty() {
+        return Err(AppError::invalid(
+            operation,
+            "project_ids must not be empty",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for project_id in project_ids {
+        ensure_non_empty(operation, "project_id", project_id.0.as_str())?;
+        if !seen.insert(project_id.0.as_str()) {
+            return Err(AppError::invalid(
+                operation,
+                format!("project_ids contains duplicate id {}", project_id),
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -375,9 +375,7 @@ fn agent_card(
         // Opening (and activating) the chat tab drives `active_agent` to this
         // agent via the Memo derived from `center_zone`.
         state_for_click.open_tab(
-            TabContent::Chat {
-                agent_ref: Some(agent_ref),
-            },
+            TabContent::chat_with_agent(agent_ref),
             click_name.clone(),
             true,
         );
@@ -397,9 +395,7 @@ fn agent_card(
             // active_agent is a Memo over center_zone; opening the tab drives
             // it.
             kd_state.open_tab(
-                TabContent::Chat {
-                    agent_ref: Some(agent_ref),
-                },
+                TabContent::chat_with_agent(agent_ref),
                 kd_name.clone(),
                 true,
             );

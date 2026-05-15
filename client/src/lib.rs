@@ -23,7 +23,10 @@ use protocol::{
     SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
     SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TYDE_VERSION, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload, TeamMemberActivatePayload,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
     TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
     write_envelope,
@@ -234,6 +237,61 @@ impl Connection {
         payload: ProjectDeletePayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::ProjectDelete, &payload)
+            .await
+    }
+
+    pub async fn team_create(&mut self, payload: TeamCreatePayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamCreate, &payload)
+            .await
+    }
+
+    pub async fn team_rename(&mut self, payload: TeamRenamePayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamRename, &payload)
+            .await
+    }
+
+    pub async fn team_delete(&mut self, payload: TeamDeletePayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamDelete, &payload)
+            .await
+    }
+
+    pub async fn team_set_manager(
+        &mut self,
+        payload: TeamSetManagerPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamSetManager, &payload)
+            .await
+    }
+
+    pub async fn team_member_create(
+        &mut self,
+        payload: TeamMemberCreatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamMemberCreate, &payload)
+            .await
+    }
+
+    pub async fn team_member_update(
+        &mut self,
+        payload: TeamMemberUpdatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamMemberUpdate, &payload)
+            .await
+    }
+
+    pub async fn team_member_delete(
+        &mut self,
+        payload: TeamMemberDeletePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamMemberDelete, &payload)
+            .await
+    }
+
+    pub async fn team_member_activate(
+        &mut self,
+        payload: TeamMemberActivatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamMemberActivate, &payload)
             .await
     }
 
@@ -613,6 +671,18 @@ impl Connection {
                 }
                 FrameKind::McpServerNotify => {
                     let _: McpServerNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamNotify => {
+                    let _: TeamNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamMemberNotify => {
+                    let _: TeamMemberNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamMemberBindingNotify => {
+                    let _: TeamMemberBindingNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::HostSettings => {

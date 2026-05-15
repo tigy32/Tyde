@@ -1,40 +1,53 @@
 # Agent Teams
 
-Spec for **Agent Teams**: persistent, server-owned teams of agents organized
-by a manager/report relationship, fed by a kanban board, with long-lived
-memory maintained by Tyde-managed compaction so agents "vaguely remember"
-prior work over time.
+Spec for **Agent Teams**: persistent, server-owned teams of agents
+organized as one manager and N direct reports. The user opens a chat
+with the manager (just like any agent chat) and assigns work
+conversationally. The manager delegates to its reports using MCP
+tools. Each member binds a `CustomAgent` (its role, tools, prompts)
+to a `SessionId` (its rolling memory). There is no kanban board, no
+autonomous wake loop, and no Tyde-owned memory layer.
 
 Audience: implementation agents and future maintainers.
 
-This doc represents consensus between Claude and Codex design proposals
-(see `dev-docs/proposals/agent-teams-claude.md`,
-`dev-docs/proposals/agent-teams-codex.md`, and the two cross-review files
-in the same directory). It is the spec to implement from. Where the
-two proposals disagreed, the choices made here are explained in §16.
+This doc represents consensus between Claude and Codex design
+proposals (see `dev-docs/proposals/agent-teams-claude.md`,
+`dev-docs/proposals/agent-teams-codex.md`, and the two cross-review
+files), simplified per Mike's direction to drop the board entirely
+and lean on existing primitives.
 
 It builds on:
 
 - `01-philosophy.md` — non-negotiable architecture rules.
 - `03-agents.md` — agent lifecycle and event model.
-- `06-projects.md` — host-owned domain pattern (replayed events,
-  on-disk store).
-- `11-agent-control-mcp.md` — embedded loopback MCP surface.
+- `05-session-resume.md` — `SessionId`, `SpawnAgent::Resume`, the
+  session store. **The v1 memory mechanism for team members.**
+- `06-projects.md` — host-owned domain pattern.
+- `11-agent-control-mcp.md` — embedded loopback MCP surface. **The
+  v1 manager-to-report delegation surface.**
 - `15-sub-agents.md` — `AgentOrigin`, parent/child plumbing.
 - `16-queued-messages.md` — actor-owned per-agent queue.
-- `17-custom-agents.md` — `CustomAgent`, `Steering`, `Skill`, `McpServer`.
+- `17-custom-agents.md` — `CustomAgent` (the agent definition each
+  team member is an instance of).
 
-The whole spec can be reduced to one structural claim:
+The whole spec reduces to:
 
-> A **team member** is a durable, server-owned identity (`TeamMemberId`)
-> with persistent memory and an org-chart role. The current live
-> `AgentId` is a runtime binding, not the identity. Members are reanimated
-> across backend session restarts, server restarts, and compactions by
-> spawning a fresh agent and injecting the saved memory. The kanban
-> **board** is the work intake; the **manager** is woken by a server-owned
-> coordinator when the board needs human-style judgment.
+> A **team** is a host-scoped record of `(name, manager_member_id,
+> members[])`. A **team member** binds a `CustomAgent` (role / tools
+> / prompts / backend) to a `SessionId` (rolling memory) and declares
+> one or more `project_ids`. The server derives `workspace_roots`
+> from those projects at spawn time. The user
+> interacts with the team by opening the manager's chat — a normal
+> agent chat, resumed via `SpawnAgent::Resume`. The manager delegates
+> by calling `tyde_team_message_member`, which resolves the target
+> member to a live `AgentId` (resuming or first-spawning as needed)
+> and queues the message. The manager then uses the existing
+> `tyde_read_agent` / `tyde_await_agents` to follow up. No board,
+> no autonomous wake.
 
-Everything else (columns, tools, frontend) is mechanism.
+Teams span projects. The manager can have a frontend specialist on
+project Foo, a backend specialist on projects Bar and Baz, and route
+work across them.
 
 ---
 
@@ -42,264 +55,195 @@ Everything else (columns, tools, frontend) is mechanism.
 
 ### Goals
 
-- **Durable team membership** that survives backend session restarts,
-  server restarts, compaction, and live-agent replacement.
-- **Flat org chart**: each team has exactly one manager and N direct
-  reports.
-- **Server-owned kanban board**: humans drop work into `Backlog`; the
-  manager pulls and delegates; reports work; the manager reviews.
-- **Long-lived per-member memory**: a rolling summary plus a bounded
-  verbatim recent-turn tail, persisted on the server, replayed into a
-  fresh backend session whenever Tyde rebinds.
-- **Backend-agnostic compaction**: Tyde-managed memory is the canonical
-  durable record. We do not rely on backend-native `/compact` in v1.
-- **Single source of truth in Rust**: every concept (team, member, card,
-  event, memory) is a typed `protocol/src/types.rs` record. The server
-  emits replay+live events. The frontend renders.
+- **Durable team membership.** Members survive backend session
+  restarts, server restarts, and live-agent replacement.
+- **Flat org chart**: one manager + N direct reports. Host-scoped.
+- **Per-member projects.** A team can span codebases. Each member
+  declares one or more `project_ids`; `workspace_roots` is derived
+  as the union of those projects' roots at spawn time.
+- **Members are `CustomAgent` instances.** Creating a member picks
+  which `CustomAgent` it embodies — that defines its backend, system
+  prompt, steering, skills, MCP servers. Two members can share the
+  same `CustomAgent`; their `SessionId`s diverge from first spawn.
+- **Session resume is the memory mechanism.** A member owns one
+  `SessionId`. Idle members are historical sessions; the team
+  registry resumes them on demand. Whatever the backend does for
+  context handling (Claude's `/compact`, etc.) maintains the session.
+  Tyde does not interpret, mirror, or summarize the session.
+- **Interaction is conversational.** The user opens the manager's
+  chat and talks. The manager picks reports and delegates via MCP.
+  No new dispatch UI; no scheduling layer.
+- **Single source of truth in Rust**: every concept is a typed
+  `protocol/src/types.rs` record. The server emits replay+live
+  events; the frontend renders.
 - **Local and remote hosts are identical** from the frontend's
-  perspective. Teams are a host-owned domain like projects.
+  perspective.
 
 ### Non-Goals (v1)
 
-- Nested teams. A team has members, not sub-teams.
-- Multiple managers per team, or matrix delegation.
-- Cross-team agent membership. A `TeamMemberId` belongs to exactly one
-  team.
-- Reports promoting peers, hiring helpers, or otherwise mutating the
-  org. Org changes are human-only.
-- Agent-created teams. Humans create teams.
-- Free-form delegation. Managers delegate only to direct reports.
-- Custom kanban columns. Columns are a fixed enum.
-- Backend-native `/compact` integration. Tyde-managed memory only.
-- Cost / budget tracking and concurrency caps. (Real concern; deferred —
-  see §16 open questions.)
-- Project-scoped team templates. Teams may carry an optional
-  `project_id`, but there are no template/inheritance semantics.
-- Migrating an existing live agent into a team. Members are created
-  with the team; new members are spawned as members from day one.
-- User-editable memory through the UI. Memory is read-only in v1; users
-  can request a manual compaction.
+- **No kanban board.** No cards, columns, transitions, claim leases,
+  optimistic concurrency, or board-stream subscriptions. Work flows
+  through chat.
+- **No autonomous manager loop.** The manager acts only when the
+  user (or another agent's tool call) sends it a message. No server-
+  driven wake on idle reports, no coalesced wake prompts.
+- **No peer-to-peer delegation.** Only the manager can call
+  `tyde_team_message_member`. Reports do their work and idle.
+- **No team-level workspace_roots or project_id.** Teams are
+  host-scoped; project bindings live on each member, and roots are
+  derived from those projects.
+- **No nested teams, multi-manager, matrix orgs.**
+- **No agent-created teams.** Org changes are human-only.
+- **No Tyde-owned memory or compaction.** The session is the memory.
+- **No cost / budget tracking.** Real concern; deferred.
+- **No migrating an existing live agent into a team.** Members are
+  created with the team.
+- **No forking a member's session** (e.g. "branch the manager's
+  history into a new member").
 
 ---
 
 ## 2. Conceptual Model
 
 ```
-┌─────────┐  has 1   ┌──────────────┐
-│  Team   │─────────▶│  TeamBoard   │
-│         │   has N  └──────┬───────┘
-│         │──────────┐      │ has N
-└────┬────┘  has 1   │      ▼
-     │ manager       │  ┌────────────┐  has N  ┌──────────────┐
-     │               │  │ TeamCard   │────────▶│TeamCardEvent │
-     ▼               │  └────┬───────┘         │ (append-only)│
-┌──────────────┐ has N│       │                └──────────────┘
-│  TeamMember  │◀─────┘       │ assignee 0..1
-│ (Manager or  │              ▼
-│  Report)     │       ┌──────────────┐
-│              │       │  TeamMember  │ (must be in same team)
-│ TeamMemberId │       └──────────────┘
-└──────┬───────┘
-       │ has 1
+┌─────────────┐
+│    Team     │  host-scoped; no project, no workspace_roots
+│ TeamId, name│
+│ manager_id  │
+└──────┬──────┘
+       │ has N (≥1, including the manager)
        ▼
-┌──────────────┐    1:1    ┌────────────────────┐
-│TeamMemberId  │──────────▶│  TeamMemberMemory  │
-│ (durable)    │           │ summary_markdown,  │
-│              │           │ recent_turns_text, │
-└──────┬───────┘           │ active_card_ids,   │
-       │ may be bound to   │ generation         │
-       ▼                   └────────────────────┘
-┌──────────────────┐    typed binding event:
-│ live AgentId     │    TeamMemberBindingNotify
-│ (runtime only,   │    { member_id, current_agent_id, status }
-│  may be absent)  │
-└──────────────────┘
+┌─────────────────────┐
+│     TeamMember      │
+│  TeamMemberId       │
+│  role: Manager|Report
+│  state: Active|Paused │
+│  project_ids: Vec │← 1+; teams span projects
+│  roots: derived   │
+└────┬──┬─────────────┘
+     │  │
+     │  │ binds (required) ┌────────────────────────┐
+     │  └─────────────────▶│   CustomAgent          │
+     │                     │   (17-custom-agents)   │
+     │                     │   backend, prompts,    │
+     │                     │   steering, tools, MCP │
+     │                     └────────────────────────┘
+     │
+     │ owns 0..1            ┌────────────────────────┐
+     └─────────────────────▶│   SessionId            │
+                            │   (05-session-resume)  │
+                            │   rolling memory       │
+                            └───────────┬────────────┘
+                                        │ resumed into
+                                        ▼
+                            ┌────────────────────────┐
+                            │  live AgentId          │
+                            │  (runtime; may be None) │
+                            └────────────────────────┘
+                                        ▲
+                              surfaced via
+                              TeamMemberBindingNotify
 ```
 
 ### Definitions
 
 - **Team** — a host-owned organization unit. Has `TeamId`, `name`,
-  optional `project_id`, `workspace_roots`, exactly one active manager,
-  and exactly one `TeamBoard`.
+  exactly one active manager (`manager_member_id`), and a list of
+  members. Teams have *no* `project_id` and *no* `workspace_roots`
+  at the team level.
 - **TeamMember** — a durable persistent member identity
-  (`TeamMemberId`). Has a role, backend kind, optional
-  `custom_agent_id`, `state` (Active/Paused/Archived), and a
-  `TeamMemberMemory`. *Does not* have a stable `AgentId`.
-- **Manager** — `TeamMemberRole::Manager`. Exactly one per team. Wakes
-  on board events; pulls work; delegates; reviews.
-- **Report** — `TeamMemberRole::Report`. Receives delegated cards;
-  cannot assign work to others.
-- **Memory** — server-owned rolling memory record per `TeamMemberId`.
-  Independent of any current live `AgentId`. Updated by compaction;
-  injected into future spawns.
-- **Live AgentId binding** — runtime-only mapping between
-  `TeamMemberId` and the currently-running `AgentId`. Surfaced via
-  `TeamMemberBindingNotify`. Never persisted as durable identity. After
-  any restart, all bindings are `None` until the coordinator rebinds
-  them.
-- **TeamBoard** — one kanban board per team.
-- **TeamCardColumnKind** — fixed enum: `Backlog`, `Triage`,
-  `Assigned`, `InProgress`, `Blocked`, `Review`, `Done`, `Canceled`.
-- **TeamCard** — durable work item. Has `column`, optional
-  `manager_member_id` and `report_member_id`, `version: u64` (for
-  optimistic concurrency), title, body, position.
-- **TeamCardEvent** — append-only typed activity log entry. Carried on
-  a separate notify frame from card snapshots.
+  (`TeamMemberId`). Binds a `CustomAgent` and optionally a
+  `SessionId`. Has an org role (`Manager` or `Report`), a `state`
+  (`Active`/`Paused`), and `project_ids` (one or more required).
+  At spawn time the server derives `workspace_roots` as the
+  deduped union of those projects' roots. Two members can share the
+  same `CustomAgent`; their sessions are independent.
+- **CustomAgent** — defined in `17-custom-agents.md`. Owns backend
+  kind, system prompt, steering, skills, MCP server list.
+- **SessionId** — defined in `05-session-resume.md`. The
+  backend-native resumable session identifier. The member's
+  *memory* is this session's history. Tyde stores nothing
+  additional about the member's recall.
+- **Manager** — the unique member with `TeamMemberRole::Manager`.
+  Receives user messages and delegates to reports via the team MCP
+  tools.
+- **Report** — `TeamMemberRole::Report`. Receives delegated messages
+  from the manager. Cannot delegate further in v1.
+- **Live `AgentId` binding** — runtime-only mapping between
+  `TeamMemberId` and the currently-running `AgentId`. Emitted as
+  `TeamMemberBindingNotify`. Never persisted as durable identity.
 
-The existing `Agent` from `03-agents.md` is unchanged. A live team-member
-agent is a normal `Agent` with `AgentOrigin::TeamMember` and
-`team_id`/`team_member_id` populated on its birth-certificate payload.
+The existing `Agent` model from `03-agents.md` is unchanged. A live
+team-member agent is a normal `Agent` with
+`AgentOrigin::TeamMember` and `team_id`/`team_member_id` populated
+on its birth-certificate payload.
 
 ---
 
 ## 3. Persistence Model
 
-### Choice: SQLite at `~/.tyde/teams.db`
+### Choice: one JSON file at `~/.tyde/agent_teams.json`
 
-This is a **new persistence pattern** for Tyde2. Existing host-owned
-domains (`projects.json`, `custom_agents.json`, `steering.json`) are JSON
-blobs on disk. Teams are different in two ways that justify the cost of
-a new dependency:
+Same on-disk pattern as every other host-owned domain in Tyde2
+(`projects.json`, `custom_agents.json`, `steering.json`,
+`mcp_servers.json`, `sessions.json`): a single JSON file under
+`~/.tyde/`, loaded once at startup, atomically rewritten on each
+mutation (write-temp, `fsync`, `rename`). Mirror the existing
+pattern in `server/src/store/session.rs` and
+`server/src/store/project.rs`.
 
-1. **Cards mutate frequently** (drag, claim, assign, status, comment).
-   A populated team's board does many writes per minute when active.
-   Full-file JSON rewrites scale poorly with hundreds of cards and
-   thousands of activity events.
-2. **Activity history is append-only and large.** A
-   `team_card_events` table with an index is a natural fit. Storing it
-   inside the same JSON file as the live state forces a rewrite of
-   every event for every event.
+### Store file shape
 
-We use **rusqlite** in WAL mode. The protocol shape is unchanged
-behind the persistence choice — if the dependency proves problematic
-later, the store can be swapped without churning the wire.
+```rust
+#[derive(Serialize, Deserialize)]
+struct AgentTeamsStoreFile {
+    version: u32,
+    teams: HashMap<TeamId, Team>,
+    members: HashMap<TeamMemberId, TeamMember>,
+}
+```
+
+The map keys mirror the typed-ID newtypes. Each field stores the
+protocol struct directly — no parallel persistence mirror types.
+Live `AgentId` bindings are runtime state, never persisted.
+
+`version` starts at 1; bump and add a migration step if shape
+changes.
 
 ### Single-writer actor
 
-A `TeamStoreActor` owns the `rusqlite::Connection`. All mutations
-serialize through it via mpsc. No `Arc<Mutex<Connection>>`. Reads go
-through the actor too in v1; if reads become a bottleneck we'll add a
-benchmarked read path then.
-
-The store actor deserializes SQL rows into protocol enums/structs.
-**SQL strings are not load-bearing.** The store fails loudly on
-unrecognized values rather than fallback-defaulting.
-
-### Schemas
-
-```sql
-CREATE TABLE teams (
-    team_id           TEXT PRIMARY KEY,         -- TeamId
-    name              TEXT NOT NULL,
-    project_id        TEXT,                     -- ProjectId, optional
-    workspace_roots   TEXT NOT NULL,            -- JSON array<String>
-    manager_member_id TEXT NOT NULL,            -- TeamMemberId
-    created_at_ms     INTEGER NOT NULL,
-    updated_at_ms     INTEGER NOT NULL,
-    archived_at_ms    INTEGER                   -- soft delete; NULL while live
-);
-
-CREATE TABLE team_members (
-    member_id         TEXT PRIMARY KEY,         -- TeamMemberId
-    team_id           TEXT NOT NULL REFERENCES teams(team_id),
-    role              TEXT NOT NULL,            -- TeamMemberRole, snake_case
-    state             TEXT NOT NULL,            -- TeamMemberState
-    name              TEXT NOT NULL,
-    description       TEXT NOT NULL,            -- free-form prose for manager prompts
-    backend_kind      TEXT NOT NULL,            -- BackendKind
-    custom_agent_id   TEXT,                     -- CustomAgentId, optional
-    project_id        TEXT,
-    workspace_roots   TEXT NOT NULL,            -- JSON array
-    last_session_id   TEXT,                     -- audit only; not used for resume
-    created_at_ms     INTEGER NOT NULL,
-    updated_at_ms     INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX team_one_active_manager
-    ON team_members(team_id) WHERE role = 'manager' AND state = 'active';
-
-CREATE TABLE team_boards (
-    board_id          TEXT PRIMARY KEY,
-    team_id           TEXT NOT NULL REFERENCES teams(team_id),
-    name              TEXT NOT NULL,
-    created_at_ms     INTEGER NOT NULL,
-    updated_at_ms     INTEGER NOT NULL,
-    archived_at_ms    INTEGER
-);
-
-CREATE TABLE team_cards (
-    card_id           TEXT PRIMARY KEY,
-    board_id          TEXT NOT NULL REFERENCES team_boards(board_id),
-    title             TEXT NOT NULL,
-    body              TEXT NOT NULL,
-    column_kind       TEXT NOT NULL,            -- TeamCardColumnKind
-    position          REAL NOT NULL,            -- fractional rank within column
-    manager_member_id TEXT,                     -- TeamMemberId, optional
-    report_member_id  TEXT,                     -- TeamMemberId, optional
-    version           INTEGER NOT NULL,         -- bumped on every mutation
-    created_at_ms     INTEGER NOT NULL,
-    updated_at_ms     INTEGER NOT NULL
-);
-CREATE INDEX cards_by_board_column ON team_cards(board_id, column_kind, position);
-
-CREATE TABLE team_card_events (
-    event_id          TEXT PRIMARY KEY,         -- TeamCardEventId
-    card_id           TEXT NOT NULL REFERENCES team_cards(card_id),
-    actor_json        TEXT NOT NULL,            -- TeamCardActor (JSON)
-    event_json        TEXT NOT NULL,            -- TeamCardEventKind (JSON)
-    created_at_ms     INTEGER NOT NULL
-);
-CREATE INDEX events_by_card ON team_card_events(card_id, created_at_ms);
-
-CREATE TABLE team_member_memory (
-    member_id         TEXT PRIMARY KEY REFERENCES team_members(member_id),
-    generation        INTEGER NOT NULL,
-    summary_markdown  TEXT NOT NULL,
-    recent_turns_text TEXT NOT NULL,            -- bounded; ~4 KB target
-    active_card_ids   TEXT NOT NULL,            -- JSON array<TeamCardId>
-    source_compaction_id TEXT,                  -- TeamCompactionId, optional
-    updated_at_ms     INTEGER NOT NULL
-);
-
-CREATE TABLE team_compactions (
-    compaction_id     TEXT PRIMARY KEY,
-    member_id         TEXT NOT NULL REFERENCES team_members(member_id),
-    trigger           TEXT NOT NULL,            -- TeamCompactionTrigger
-    status            TEXT NOT NULL,            -- TeamCompactionStatus
-    started_at_ms     INTEGER NOT NULL,
-    completed_at_ms   INTEGER,
-    previous_generation INTEGER NOT NULL,
-    next_generation   INTEGER,
-    error             TEXT
-);
-```
+A `TeamRegistry` actor owns the in-memory `AgentTeamsStoreFile` and
+the file path. All mutations serialize through it via mpsc. After
+every accepted mutation it writes the updated file (temp + atomic
+rename) before emitting protocol events. No `Arc<Mutex<...>>`.
 
 ### Validation
 
-The store actor validates on load and on every mutation. No silent
+The registry validates on load and on every mutation. No silent
 repair; loud failure on invariant violation:
 
 - Every member references an existing team.
-- Each team has exactly one active manager (enforced by partial unique
-  index above).
-- Reports' `manager_member_id` resolves to that team's active manager
-  (denormalized for read clarity; checked on write).
+- Every member's `custom_agent_id` references an existing
+  `CustomAgent`.
+- Every member has one or more `project_ids`, each referencing an
+  existing `Project`.
+- Each team has exactly one active manager (`role == Manager &&
+  state == Active`).
 - A `TeamMemberId` belongs to exactly one team.
-- Cards reference a board in their team. Card `manager_member_id` and
-  `report_member_id`, when set, reference members of that team.
-- Card column/assignment invariants: `Assigned` requires a
-  `report_member_id`; `Triage` requires a `manager_member_id`.
-- Memory and compaction records reference existing members.
+- A `SessionId` is owned by at most one member.
+- A team's `manager_member_id` resolves to a member of that team
+  with `role == Manager`.
+
+If the file fails to load (invalid JSON, invariant violation,
+unknown enum variant), startup fails loudly. No "best-effort drop
+the bad rows" recovery.
 
 ### Runtime live-agent binding
 
-The live `AgentId` for a member is **runtime state**, never written to
-SQLite as durable identity. It is emitted as `TeamMemberBindingNotify`.
-After a server restart, the coordinator emits `current_agent_id: None`
-for every member until it rebinds them.
-
-`team_members.last_session_id` is **audit only** — kept so a user can
-trace which session an old member last bound to. Team-member continuity
-is memory injection, not session resume (§5).
+The live `AgentId` for a member is **runtime state**, never
+written to disk. It is emitted as `TeamMemberBindingNotify`.
+After a server restart, the registry emits `current_agent_id:
+None` for every member until they're rebound.
 
 ---
 
@@ -308,381 +252,204 @@ is memory injection, not session resume (§5).
 V1 invariants — chosen to make invalid states unrepresentable:
 
 - A team has exactly one active manager.
-- A report's manager is its team's manager.
 - A `TeamMemberId` belongs to exactly one team.
 - A manager cannot also be a report in the same team.
-- Teams do not nest. No `parent_team_id`.
-- Cards cannot cross teams.
-- Archiving a member with non-terminal assigned cards is rejected. The
-  user must reassign or close those cards first.
+- Teams are host-scoped. No team-level `project_id`. Members bind
+  one or more projects individually.
+- Teams do not nest.
 
-**Manager replacement** is human-only via `TeamSetManager`. The new
-manager must already be a `Report` of the team. The transition is
-atomic in one transaction (old manager → report; chosen report →
-manager). No auto-promotion when a manager dies; the team blocks new
-delegation until a human replaces the manager.
+**Manager replacement** is human-only via `TeamSetManager`. The
+new manager must already be a `Report` of the team. The transition
+is atomic in one transaction. No auto-promotion when a manager's
+session can no longer be resumed; the team waits for human action.
 
-The restriction is deliberate. Once you allow many-to-many
-manager/report or nested teams, you have a delegation graph, and
-graphs have cycles, and the kanban mental model breaks. The protocol
-shape (`TeamMemberRole` is an enum, `Team` has a single
-`manager_member_id`) is forward-compatible with adding nesting later
-as a clean extension.
+The org graph is depth-1. Forward-compatible with nesting later
+without breaking the protocol.
 
 ---
 
-## 5. Memory & Compaction
+## 5. Member Lifecycle & Session Continuity
 
-### What "compaction" means in v1
+A team member's memory is its `SessionId`. The existing session
+store (`05-session-resume.md` / `sessions.json`) is the source of
+truth for the conversation history. Tyde maintains no parallel
+record.
 
-Compaction is **updating server-owned memory**, full stop. We do not
-invoke any backend's native `/compact`. The reason is observability:
-native `/compact` rewrites the live session's context but produces no
-artifact Tyde can persist, so it cannot be the durable cross-restart
-record. Tyde-managed memory is.
+### First activation
 
-When a member needs to act and has no live `AgentId`, Tyde:
+A member is "activated" when someone (the user, or the manager via
+`tyde_team_message_member`) first sends it a message. With
+`session_id: None`:
 
-1. Reads the member's `TeamMemberMemory` and `CustomAgent`/`Steering`
-   resolution.
-2. Spawns a fresh backend session of the member's `BackendKind`.
-3. Injects the initial prompt:
-   `role_card + summary_markdown + recent_turns_text + active_card_ids
-   summary + (incoming work prompt if any)`.
-4. Emits `TeamMemberBindingNotify` with the new `current_agent_id`.
+1. The registry issues `SpawnAgent::New` with:
+   - `custom_agent_id` = member's `CustomAgent`
+   - `workspace_roots` = union of member project roots
+   - `parent_agent_id: None`
+   - `project_id` = first `member.project_ids` entry
+   - `prompt` = the incoming message
+   - `backend_kind` = derived from the `CustomAgent`
+2. The backend produces a fresh `SessionId`. The registry records
+   it on the member in one transaction, then emits
+   `TeamMemberNotify::Upsert` (now with `session_id: Some(...)`)
+   and `TeamMemberBindingNotify { current_agent_id: Some(...) }`.
 
-If the member already has a live binding, work is queued onto its agent
-via the existing queue actor (`16-queued-messages.md`).
+### Subsequent activations (member not currently bound)
 
-### Memory schema
+With `session_id: Some(s)` and `current_agent_id: None`:
 
-```rust
-pub struct TeamMemberMemory {
-    pub member_id: TeamMemberId,
-    pub generation: u64,
-    pub summary_markdown: String,        // human-readable rolling summary
-    pub recent_turns_text: String,       // bounded verbatim tail, ~4 KB
-    pub active_card_ids: Vec<TeamCardId>,
-    pub source_compaction_id: Option<TeamCompactionId>,
-    pub updated_at_ms: u64,
-}
-```
+1. Registry issues `SpawnAgent::Resume { session_id: s, prompt:
+   Some(message) }`.
+2. Backend resumes; a new live `AgentId` is bound.
+3. Registry emits `TeamMemberBindingNotify`.
 
-We deliberately keep the schema small:
+### Subsequent activations (member currently bound)
 
-- `summary_markdown` is prose. Users will eventually want to inspect
-  this; markdown is friendlier than structured JSON.
-- `recent_turns_text` is the verbatim tail. Verbatim matters for
-  pronoun resolution and "as I said earlier" continuity. Bounded so
-  injection doesn't blow the next session's context.
-- `active_card_ids` is the only structured field — it is unambiguous
-  (derivable from card state) and lets the spawn prompt cite the
-  member's open work without parsing markdown.
+The message is delivered to the live agent via the existing queue
+actor (`16-queued-messages.md`). The session continues; no resume
+needed.
 
-We considered structured `open_commitments` (Codex's original
-proposal) and rejected it for v1. It is a fuzzy-output ask — what
-counts as a "commitment" vs. a "decision" vs. a regular note? — and
-LLMs handle that category poorly. If we need structured commitments,
-add them later.
+### When does a member become unbound?
 
-### Triggers
+Same triggers as any other agent — the live `AgentId` disappears
+when:
 
-The `TeamCoordinator` checks compaction eligibility only when a
-member's `TypingStatusChanged(false)` fires (i.e. the member is idle).
+- the agent closes normally after going idle (existing behavior;
+  the session persists in the session store)
+- the agent crashes
+- the server restarts
 
-```rust
-pub enum TeamCompactionTrigger {
-    TokenThreshold,      // ContextBreakdown.input_tokens > 0.6 * context_window
-    CardBoundary,        // assigned card moved to Done | Blocked | Canceled
-    Manual,              // human or self requested
-    RestartRecovery,     // server restart found stale memory generation
-}
-```
+Tyde does not deliberately park members. Whatever lifetime rules
+apply to regular agents apply to team members. If you want a
+report to stay warm, keep sending it messages.
 
-No wall-clock-idle trigger. Compacting an idle agent that hasn't
-moved is wasted spend; the threshold trigger fires anyway when work
-resumes.
+### Compaction / memory growth
 
-At most one compaction in flight per member. Additional triggers
-coalesce into one pending reason.
+Not Tyde's problem. The backend's own context handling keeps the
+session usable. If `Backend::resume()` fails because the session
+grew too large or the backend lost it, the registry surfaces a
+visible binding-failure event. The user can delete and recreate
+the member (`SpawnAgent::New` against the same `CustomAgent`).
+**Tyde never silently falls back to `SpawnAgent::New` on resume
+failure** — that would lose memory without the user knowing.
 
-### Compactor
+### `last_active_at_ms` for UI
 
-A **`MemoryCompactor`** is an internal one-shot agent — not a team
-member. It is not on the board, has no memory of its own, and is
-terminated as soon as it produces output.
-
-- Spawned via the existing `Backend` trait. Default
-  `BackendKind::Tycode` with `CostHint::Low`. Configurable per host
-  setting.
-- Receives a deterministic prompt template containing:
-  - the previous `summary_markdown`
-  - all turns since the last compaction (read from the member's session
-    history; Tyde already has it)
-  - a manifest of card outcomes since last compaction (titles, final
-    states, key transitions)
-  - the role card
-- Produces output via a single typed tool call:
-  `submit_compaction({ summary_markdown, recent_turns_text,
-  active_card_ids })`. The shape is enforced by the tool schema.
-- On success: the store actor commits a new memory row, bumps
-  `generation`, writes a `team_compactions` row, emits
-  `TeamMemoryNotify::Updated` and `TeamCompactionNotify::Completed`.
-- On failure (tool not called, schema violation, timeout): the prior
-  generation stays current; emits
-  `TeamCompactionNotify::Failed { error }`. Loud, no partial update.
-
-Why external compactor and not self-compaction (the member calling
-`tyde_submit_team_memory_update`)? Two reasons:
-
-1. **Deterministic prompt**: Tyde controls the input. The member's
-   own context could be anywhere — mid-card, mid-thought, partial
-   tool output. The compactor sees a clean slate and a structured
-   input.
-2. **Cost predictability**: a small, fast model on a bounded prompt.
-   The member could be on an expensive model with a large live
-   context.
-
-Self-compaction is reconsidered in §16 if the external compactor's
-output quality proves poor.
-
-### Generation drift
-
-When the coordinator goes to bind a fresh `AgentId` to a member, it
-checks the member's memory generation against the live session's
-start-time generation (recorded when the binding was made). If they
-diverge by more than 1, the live session is too stale; the coordinator
-gracefully terminates it and respawns with the latest memory before
-delivering the new work. (We never restart mid-turn.)
-
-### Memory across server restarts
-
-`teams.db` is on disk. After a server restart, all memory records are
-intact. No member has a live `AgentId`. The coordinator, on first wake
-need (a card in `Backlog`, a non-terminal `Assigned` card, etc.),
-spawns a fresh backend session per §5 and emits a new
-`TeamMemberBindingNotify`.
-
-This is also why team members do **not** use the
-`05-session-resume.md` machinery. Session resume is for transient,
-single-task agents. Team-member continuity is memory injection.
-`team_members.last_session_id` is kept for audit only.
+The registry records a non-persisted `last_active_at_ms` per
+member, updated whenever the live agent emits a turn. UI affordance
+only; lost on restart; re-derived from next activity.
 
 ---
 
-## 6. Task / Card Lifecycle
+## 6. Manager and Delegation
 
-### Columns
+There is no autonomous manager loop. The manager is a normal live
+agent; it acts only when it receives a message.
 
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamCardColumnKind {
-    Backlog,
-    Triage,
-    Assigned,
-    InProgress,
-    Blocked,
-    Review,
-    Done,
-    Canceled,
-}
-```
+### How the user works with a team
 
-Six live + two terminal columns. The split between `Backlog → Triage →
-Assigned` exists because "manager has accepted responsibility" and
-"manager has chosen an assignee" are different states — useful for
-failure handling (claim leases, §6.3) and useful for the user to see
-which cards the manager is sitting on.
+1. User opens the team in the Teams panel.
+2. That opens the **manager's** agent chat — exactly the same UI as
+   any other agent chat, resumed from `manager.session_id`.
+3. User types: *"have alice take a look at the auth bug and bob
+   refactor the dashboard."*
+4. The manager replies in chat, and along the way calls
+   `tyde_team_message_member({ member_id: alice, message: ... })`
+   and similarly for bob. The server resolves each `member_id` to
+   a live `AgentId` (resuming or first-spawning) and queues the
+   message.
+5. The tool call returns the live `AgentId`s. The manager can
+   follow up using existing `tyde_read_agent` /
+   `tyde_await_agents` from `11-agent-control-mcp.md`.
 
-### Allowed transitions
+The manager's `CustomAgent` system prompt should explain its role
+and the available team tools. The roster (who exists, what they
+specialize in, their `project_ids`) is delivered as part of the
+manager's session context — see §6.2.
 
-```text
-Backlog    → Triage      (manager only)
-Backlog    → Canceled    (human only)
-Triage     → Assigned    (manager only)
-Triage     → Backlog     (manager: release; coordinator: claim lease expired)
-Triage     → Canceled    (manager or human)
-Assigned   → InProgress  (assigned report only)
-Assigned   → Canceled    (manager or human)
-InProgress → Review      (assigned report only)
-InProgress → Blocked     (assigned report only; coordinator on report failure)
-Blocked    → InProgress  (assigned report only)
-Blocked    → Assigned    (manager re-prompts)
-Blocked    → Canceled    (manager or human)
-Review     → Done        (manager or human)
-Review     → Assigned    (manager rejects, sends back)
-Any non-terminal → Canceled (human override always allowed)
-```
+### 6.2 How the manager knows who its reports are
 
-Anything not in this table is rejected by the server with a
-`CommandError` (`InvalidInput`, `Forbidden`, or `Conflict` — see §11).
+Two paths, both supported:
 
-**Reports cannot mark cards `Done`.** This keeps the manager role
-meaningful.
+- **Spawn-time context.** The first message the manager ever sees
+  (via `SpawnAgent::New.prompt`, when the manager is first
+  activated) includes a server-authored roster block listing each
+  report's `member_id`, `name`, `description`, and `project_ids`.
+  The manager remembers it for the rest of the session.
+- **MCP query.** `tyde_team_describe` is always available and
+  returns the current roster with live bindings. The manager calls
+  it when in doubt, especially after a long gap or if it suspects
+  membership changed.
 
-### Manager claim lease
+The roster block is *not* re-injected on every message — that
+would burn tokens. The manager has tools to refresh on demand.
 
-When the manager moves a card `Backlog → Triage`, a server-owned
-**claim lease** starts (default 5 minutes; configurable in
-`HostSettings`). If the manager has not moved the card to `Assigned`
-or `Canceled` by lease expiry:
+### 6.3 Delegation flow
 
-- The coordinator moves the card back to `Backlog`.
-- It appends a `ManagerClaimExpired { manager_member_id }` activity
-  event.
-- The manager is woken with a coalesced "your claim expired on N
-  cards" prompt the next time it idles.
+Manager calls
+`tyde_team_message_member({ member_id, message, images? })`:
 
-This handles "manager crashes mid-triage" without leaving cards
-invisibly stuck.
+1. Server validates: caller is the team's active manager;
+   `member_id` is a `Report` of the same team in `Active` state.
+2. Server resolves the member to a live `AgentId`:
+   - If currently bound → reuse.
+   - Else if `session_id: Some(s)` → `SpawnAgent::Resume { s,
+     prompt: Some(message) }`. Record any state changes
+     (e.g. binding) and emit notifies.
+   - Else → `SpawnAgent::New { custom_agent_id, workspace_roots,
+     project_id, prompt: message, ... }`, where `workspace_roots`
+     is the union of all bound project roots and `project_id` is
+     the first bound project. Record the new `SessionId` on the
+     member and emit notifies.
+3. If the member was already bound, the message is queued via the
+   queue actor.
+4. Tool returns `{ member_id, agent_id, queued: bool }` so the
+   manager can call `tyde_read_agent` / `tyde_await_agents` next.
 
-### Optimistic concurrency
+The manager and reports otherwise communicate through normal agent
+streams. There is no special "team channel."
 
-Every card mutation payload carries `expected_version: u64`. The store
-actor compares against the current row's `version`. On mismatch, the
-mutation is rejected with `CommandErrorCode::Conflict` and the server
-re-emits a fresh `TeamCardNotify::Upsert` so all clients reconcile.
+### 6.4 What stops a report from delegating?
 
-This catches the human-vs-manager race ("user drags a card while the
-manager is assigning it") cleanly and without silent fallbacks.
-Actor serialization gives ordering, not preconditions; we need both.
+Authorization in `tyde_team_message_member` checks
+`caller_agent_id` against the team's active manager. A report
+calling it gets a typed authorization error. Reports cannot grow
+the team or hire helpers.
 
-### Events emitted
-
-For every accepted card mutation, the server emits **two** frames on
-the team's stream:
-
-1. `TeamCardNotify::Upsert { card }` — the new full snapshot.
-2. `TeamCardActivityNotify { event }` — one append-only typed event.
-
-This keeps card snapshots small (no embedded history) and the activity
-log queryable as a separate stream.
-
-For deletes / archives, `TeamCardNotify::Delete { card }` carries the
-**full** prior record (not just the ID), matching the project precedent
-in `06-projects.md`.
+(Reports can still call `tyde_spawn_agent` from the existing
+agent-control MCP to spawn transient helpers — same as any other
+agent. Those helpers are not team members. See §13 open
+questions.)
 
 ---
 
-## 7. Manager Loop
+## 7. Protocol Changes
 
-### The manager does not poll
+All in `protocol/src/types.rs`. Frontend types are generated.
 
-A `TeamCoordinator` actor (one per live team) subscribes to its team's
-events and the typing-status streams of its members. It wakes the
-manager only when something needs human-style judgment. Wake delivery
-goes through the existing queued-message mechanism
-(`16-queued-messages.md`) — the work is the card; the queued
-`SendMessage` is just a notification.
-
-### Wake triggers
-
-1. A new card lands in `Backlog`.
-2. A card has been stuck in `Triage` past its claim lease.
-3. A report moved a card to `Review`.
-4. A report moved a card to `Blocked`.
-5. A report's live agent failed or closed while assigned.
-6. Server restart with non-terminal cards (replay-driven wake).
-7. Compaction completed and the member's `active_card_ids` changed.
-8. Human explicitly requests manager attention on a card.
-
-### Coalescing
-
-At most one outstanding wake message exists for a manager at any time.
-If the manager is busy and five new triggers fire, they coalesce into
-one prompt summarising what changed: "since you last looked, 3 new
-backlog cards, 1 review waiting, 2 reports blocked." The coalesced
-prompt is delivered once the manager idles.
-
-### Wake prompt content
-
-Server-authored. Bounded. Deterministic. Contains:
-
-- Team and member IDs.
-- Manager role instructions (from `CustomAgent`/`Steering`).
-- Cards needing manager action: typed snapshots with title, body
-  excerpt, current column, assignee.
-- Roster of reports: `member_id`, name, free-form `description`,
-  current open card count, last live status (idle/thinking/failed),
-  last-failure summary if any.
-- Memory hint (`summary_markdown` excerpt + `active_card_ids`).
-- Explicit instruction to use the team MCP tools (§9).
-
-Raw card history is not included in the wake prompt. The manager pulls
-it explicitly via `tyde_team_read_card`.
-
-### Assignment flow
-
-1. Manager calls
-   `tyde_team_assign_card({ card_id, report_member_id, expected_version })`.
-2. Server validates: caller is the team's manager; report is a `Report`
-   of the same team in `Active` state; card version matches; card's
-   current column allows transitioning to `Assigned`.
-3. Server moves card → `Assigned`, bumps `version`, appends a
-   `ReportAssigned { manager_member_id, report_member_id }` activity
-   event.
-4. Server delivers a `SendMessage` to the **report** with the card
-   body. If the report has no live binding, the coordinator first
-   spawns a fresh agent per §5; then queues the prompt.
-5. Subscribers receive `TeamCardNotify::Upsert` and
-   `TeamCardActivityNotify`.
-
-The manager does not message the report directly. The team is the
-mediator. This is what makes the kanban the source of truth: a queued
-`SendMessage` to a non-running report can disappear (queue is runtime-
-only, per `16-queued-messages.md`); a persisted card assignment
-survives and is redelivered on the next spawn.
-
----
-
-## 8. Protocol Changes
-
-All in `protocol/src/types.rs`. Frontend types are generated from these
-definitions per the codegen rule.
-
-### 8.1 Typed IDs
+### 7.1 Typed IDs
 
 ```rust
-#[derive(..., Serialize, Deserialize)] #[serde(transparent)]
+#[serde(transparent)]
 pub struct TeamId(pub String);
+
+#[serde(transparent)]
 pub struct TeamMemberId(pub String);
-pub struct TeamBoardId(pub String);
-pub struct TeamCardId(pub String);
-pub struct TeamCardEventId(pub String);
-pub struct TeamCompactionId(pub String);
 ```
 
-### 8.2 Enums
+(`SessionId`, `CustomAgentId`, `AgentId`, `ProjectId`, `BackendKind`
+all reused from existing protocol.)
+
+### 7.2 Enums
 
 ```rust
 #[derive(..., Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamMemberRole { Manager, Report }
 
-pub enum TeamMemberState { Active, Paused, Archived }
-
-pub enum TeamCardColumnKind {
-    Backlog, Triage, Assigned, InProgress, Blocked, Review, Done, Canceled,
-}
-
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TeamCardActor {
-    Human,
-    Member { member_id: TeamMemberId },
-    Server,
-}
-
-pub enum TeamCompactionTrigger {
-    TokenThreshold, CardBoundary, Manual, RestartRecovery,
-}
-
-pub enum TeamCompactionStatus { Started, Completed, Failed }
+pub enum TeamMemberState { Active, Paused }
 ```
 
-### 8.3 `AgentOrigin` extension
-
-Add a new variant:
+### 7.3 `AgentOrigin` extension
 
 ```rust
 pub enum AgentOrigin {
@@ -693,29 +460,26 @@ pub enum AgentOrigin {
 }
 ```
 
-Extend `AgentStartPayload` and `NewAgentPayload`:
+Extend `AgentStartPayload` / `NewAgentPayload`:
 
 ```rust
 pub team_id: Option<TeamId>,
 pub team_member_id: Option<TeamMemberId>,
 ```
 
-Validation: `AgentOrigin::TeamMember` requires both fields to be
-`Some`; all other origins require both to be `None`. This is a
-protocol-level invariant — no inference from `parent_agent_id` etc.
+Validation: `AgentOrigin::TeamMember` requires both fields `Some`;
+all other origins require both `None`. Frontend never infers from
+parentage.
 
-### 8.4 Records
+### 7.4 Records
 
 ```rust
 pub struct Team {
     pub id: TeamId,
     pub name: String,
-    pub project_id: Option<ProjectId>,
-    pub workspace_roots: Vec<String>,
     pub manager_member_id: TeamMemberId,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub archived_at_ms: Option<u64>,
 }
 
 pub struct TeamMember {
@@ -724,522 +488,355 @@ pub struct TeamMember {
     pub role: TeamMemberRole,
     pub state: TeamMemberState,
     pub name: String,
-    pub description: String,
-    pub backend_kind: BackendKind,
-    pub custom_agent_id: Option<CustomAgentId>,
-    pub project_id: Option<ProjectId>,
-    pub workspace_roots: Vec<String>,
-    pub last_session_id: Option<SessionId>,
+    pub description: String,                   // free-form; surfaced to manager
+    pub custom_agent_id: CustomAgentId,        // required
+    pub session_id: Option<SessionId>,         // None until first spawn
+    pub project_ids: Vec<ProjectId>,           // one or more required
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-}
-
-pub struct TeamBoard {
-    pub id: TeamBoardId,
-    pub team_id: TeamId,
-    pub name: String,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub archived_at_ms: Option<u64>,
-}
-
-pub struct TeamCard {
-    pub id: TeamCardId,
-    pub board_id: TeamBoardId,
-    pub title: String,
-    pub body: String,
-    pub column: TeamCardColumnKind,
-    pub position: f64,
-    pub manager_member_id: Option<TeamMemberId>,
-    pub report_member_id: Option<TeamMemberId>,
-    pub version: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TeamCardEventKind {
-    Created,
-    Moved          { from: TeamCardColumnKind, to: TeamCardColumnKind },
-    ManagerClaimed { manager_member_id: TeamMemberId },
-    ManagerClaimExpired { manager_member_id: TeamMemberId },
-    ReportAssigned { manager_member_id: TeamMemberId, report_member_id: TeamMemberId },
-    NoteAdded      { body: String },
-    Blocked        { reason: String },
-    ReviewRequested{ summary: String },
-    Completed,
-    Canceled       { reason: String },
-}
-
-pub struct TeamCardEvent {
-    pub id: TeamCardEventId,
-    pub card_id: TeamCardId,
-    pub actor: TeamCardActor,
-    pub event: TeamCardEventKind,
-    pub created_at_ms: u64,
-}
-
-pub struct TeamMemberMemory {
-    pub member_id: TeamMemberId,
-    pub generation: u64,
-    pub summary_markdown: String,
-    pub recent_turns_text: String,
-    pub active_card_ids: Vec<TeamCardId>,
-    pub source_compaction_id: Option<TeamCompactionId>,
-    pub updated_at_ms: u64,
-}
-
-pub struct TeamCompactionRecord {
-    pub id: TeamCompactionId,
-    pub member_id: TeamMemberId,
-    pub trigger: TeamCompactionTrigger,
-    pub status: TeamCompactionStatus,
-    pub started_at_ms: u64,
-    pub completed_at_ms: Option<u64>,
-    pub previous_generation: u64,
-    pub next_generation: Option<u64>,
-    pub error: Option<String>,
 }
 
 pub struct TeamMemberBindingPayload {
     pub member_id: TeamMemberId,
     pub current_agent_id: Option<AgentId>,
     pub status: AgentControlStatus,
+    pub last_active_at_ms: Option<u64>,
 }
 ```
 
-### 8.5 Streams
+### 7.5 Streams
 
-Two stream patterns:
+Teams ride on the existing **`/host/<uuid>`** stream. There is no
+per-team detail stream — the team and its members are small enough
+to live in host replay, and a chat with the manager is just a
+normal `/agent/<id>` stream on top of session resume.
 
-- **`/host/<uuid>`** — host stream gains team summaries + team CRUD.
-  Carries the *list* of teams so a frontend can render the team
-  selector. Mirrors `ProjectNotify`.
-- **`/team/<team_id>/<instance_id>`** — per-subscriber team detail
-  stream. Carries members, boards, card snapshots, card activity,
-  memory, compactions, and bindings for one team. Subscribers attach
-  via a typed `TeamSubscribe` input on the host stream and detach via
-  `TeamClose`. Same pattern as project streams in `07-project-stream.md`.
-
-This split keeps host replay light (a frontend that lists teams
-doesn't need every card of every team) and follows the existing
-`Project` precedent.
-
-### 8.6 Input frame kinds (host stream)
+### 7.6 Input frame kinds (host stream)
 
 ```rust
 TeamCreate
 TeamRename
-TeamArchive
-TeamSetManager
-TeamMemberCreate
-TeamMemberUpdate
-TeamMemberArchive
-TeamSubscribe          // open a /team/<id>/<instance> stream
-TeamClose              // close a /team/<id>/<instance> stream
-TeamBoardRename
-TeamCardCreate
-TeamCardUpdate
-TeamCardMove           // typed transition with expected_version
-TeamCardClaim          // Backlog → Triage; manager only
-TeamCardAssignReport   // Triage → Assigned; manager only
-TeamCardAddNote
-TeamCardArchive
-TeamMemberCompactNow
+TeamDelete               // hard delete; cascades to all members
+TeamSetManager           // new manager must already be a Report of this team
+TeamMemberCreate         // requires custom_agent_id and project_ids
+TeamMemberUpdate         // mutable: name, description, project_ids
+TeamMemberDelete         // hard delete; rejects active manager / only member / live-bound
 ```
 
-Every card mutation payload includes
-`expected_version: u64`.
+No `TeamMember*Message`, no `TeamCard*` anything.
 
-### 8.7 Output frame kinds
-
-On `/host/<uuid>` (after existing replay):
+### 7.7 Output frame kinds (host stream)
 
 ```rust
-TeamNotify  // Upsert { team } | Delete { team }
-```
-
-On `/team/<team_id>/<instance_id>`:
-
-```rust
-TeamStart                  // seq 0; carries Team and TeamBoard
-TeamMemberNotify           // Upsert { member } | Delete { member }
-TeamMemberBindingNotify    // payload defined above
-TeamCardNotify             // Upsert { card } | Delete { card }
-TeamCardActivityNotify     // { event: TeamCardEvent }
-TeamMemoryNotify           // Updated { memory: TeamMemberMemory }
-TeamCompactionNotify       // { record: TeamCompactionRecord }
+TeamNotify              // Upsert { team } | Delete { team }
+TeamMemberNotify        // Upsert { member } | Delete { member }
+TeamMemberBindingNotify // payload defined above
 ```
 
 `Notify` payloads use the tagged `Upsert | Delete` pattern from
-existing host domains. Delete payloads carry the **full** prior record
-(matching `06-projects.md`), so subscribers can render archive views
-without re-reading.
+existing host domains; delete carries the full prior record.
 
-### 8.8 Replay ordering
+### 7.8 Replay ordering
 
 On host attach:
 
 1. `HostSettings`
 2. existing host prelude
-3. `ProjectNotify`
+3. `ProjectNotify` *(members may reference projects)*
 4. `McpServerNotify`
 5. `SkillNotify`
 6. `SteeringNotify`
-7. `CustomAgentNotify`
-8. **`TeamNotify`** — list of teams (summaries only)
-9. existing live `NewAgent` events
+7. `CustomAgentNotify` *(members reference CustomAgents)*
+8. `SessionNotify` *(members reference sessions)*
+9. **`TeamNotify`** — team summaries
+10. **`TeamMemberNotify`** — for each member
+11. existing live `NewAgent` events (some may have
+    `AgentOrigin::TeamMember`)
+12. **`TeamMemberBindingNotify`** — for each member (current
+    bindings, mostly `None` immediately after restart)
 
-On team attach (`TeamSubscribe`):
+### 7.9 Validation in `protocol/src/validator.rs`
 
-1. `TeamStart` (seq 0; carries team + board)
-2. `TeamMemberNotify::Upsert` for each member
-3. `TeamCardNotify::Upsert` for each non-archived card
-4. `TeamCardActivityNotify` for each persisted card event, in order
-5. `TeamMemoryNotify::Updated` for each member's current memory
-6. `TeamCompactionNotify` for the most recent N compactions per member
-   (default N=5) — older compactions paginated on demand
-7. `TeamMemberBindingNotify` for each member (with
-   `current_agent_id: None` for any not currently bound)
-
-### 8.9 Validation in `protocol/src/validator.rs`
-
-- `TeamCreate.manager_member_id` must reference a member created in the
-  same payload (atomic team-with-manager creation), or an existing
-  member already in `Active` state with no current team.
-- `TeamCardClaim` rejected if caller is not the team's active manager.
-- `TeamCardAssignReport.report_member_id` must be a `Report` of the
-  same team in `Active` state.
-- `TeamCardMove.to` must be reachable from the card's current column
-  per the §6 transition table, with the actor permitted for that
-  transition.
-- Stale `expected_version` → `Conflict`.
+- `TeamMemberCreate.custom_agent_id` references an existing
+  `CustomAgent`.
+- `TeamMemberCreate.project_ids` is non-empty, and every id
+  references an existing `Project`.
+- `TeamMemberCreate.session_id` must be absent — fresh members
+  start with no session.
+- A `SessionId` cannot be claimed by more than one member.
+- `TeamCreate` accepts an inline manager `TeamMemberCreate` as
+  part of the same payload (atomic team-with-manager creation) and
+  validates both together.
+- `TeamSetManager.new_manager_member_id` references an existing
+  member with `role == Report` and `state == Active`.
+- `TeamMemberDelete` rejected if the member is the team's active
+  manager, the team's only member, or has a live binding. Use
+  `TeamDelete` to remove an entire team; it cascades to all members.
 - `AgentOrigin::TeamMember` requires both `team_id` and
-  `team_member_id`; other origins require both to be `None`.
-
-These shape the wire so the worst classes of invalid input are
-unrepresentable.
+  `team_member_id`; other origins require both `None`.
 
 ---
 
-## 9. MCP Surface
+## 8. MCP Surface
 
-### Decision: tools, mapped 1:1 to typed protocol commands
-
-Managers and reports drive the team via the existing **agent-control
-MCP** (`11-agent-control-mcp.md`). The MCP server is already injected
-into every spawned agent. New team tools are **thin shims** over the
-same `TeamCoordinator` mutation path used by the human UI. There is no
-parallel command model — the MCP layer is a callable wrapper.
+Add team tools to the existing embedded agent-control MCP server
+(`11-agent-control-mcp.md`). Each tool is a thin shim over a typed
+protocol command handled by the `TeamRegistry`; the MCP layer is
+not a parallel control plane.
 
 Caller identity is derived from the loopback URL injection (existing
-pattern). A member cannot impersonate another member by passing a
-different ID. A report calling `tyde_team_assign_card` is rejected
-because the server knows the caller's role.
+pattern). The server knows the calling `AgentId` and from it the
+calling `TeamMemberId` (if any).
 
-### New tools
+### Tools
 
-| Tool                         | Maps to                          | Caller                    |
-|------------------------------|----------------------------------|---------------------------|
-| `tyde_team_list`             | (read)                           | any team member           |
-| `tyde_team_describe`         | (read: team + members + memory)  | any team member           |
-| `tyde_team_read_board`       | (read: cards by column)          | team member               |
-| `tyde_team_read_card`        | (read: full card + activity)     | team member               |
-| `tyde_team_claim_card`       | `TeamCardClaim`                  | manager only              |
-| `tyde_team_assign_card`      | `TeamCardAssignReport`           | manager only              |
-| `tyde_team_move_card`        | `TeamCardMove`                   | per §6 transition matrix  |
-| `tyde_team_add_card_note`    | `TeamCardAddNote`                | team member               |
-| `tyde_team_compact_member`   | `TeamMemberCompactNow`           | manager (any) or self     |
+| Tool                              | Visibility   | Behavior                                                                 |
+|-----------------------------------|--------------|--------------------------------------------------------------------------|
+| `tyde_team_describe`              | Any team member | Returns team metadata + roster with each member's `CustomAgent` summary, `project_ids`, current binding, last-active. |
+| `tyde_team_message_member`        | Manager only | Sends a message to a teammate. Resolves member → live `AgentId`, resuming or first-spawning as needed. Returns `{ member_id, agent_id, queued: bool }`. |
 
-Tools deliberately **omitted** in v1:
+Deliberately omitted in v1:
 
 - `tyde_team_create` / `tyde_team_add_member` — org changes are
   human-only.
-- `tyde_team_send_to_report` — reports receive work *only* via card
-  assignment. This is what makes the kanban the source of truth.
+- `tyde_team_message_team` (broadcast) — out of scope.
+- Any tool reading another member's chat output. Managers use the
+  existing `tyde_read_agent` / `tyde_await_agents` against the
+  `AgentId` returned by `tyde_team_message_member`.
 
 If `HostSettings.tyde_agent_control_mcp_enabled` is `false`, team
-loops pause visibly. Humans can still operate the board manually.
+delegation is unavailable. The user can still chat with the
+manager directly; the manager just can't delegate.
 
 ---
 
-## 10. Frontend Surface
+## 9. Frontend Surface
 
-Brief — Mike will iterate on UI later. v1 just needs to render
-protocol events; no client-side caches, no client-side board logic.
+Brief; Mike will iterate later.
 
-### 10.1 Teams panel
+### 9.1 Teams panel
 
-Sibling to the existing Projects/Sessions/Agents panels:
+Sibling to existing Projects/Sessions/Agents panels:
 
-- List of teams: name, member count, open card count, manager indicator,
-  archived badge.
-- "New team" wizard: name, optional project, create manager
-  (pick `BackendKind` + `CustomAgent`), create reports the same way.
-  Org changes go through typed protocol commands.
+- List of teams: name and member count.
+- "New team" wizard: name, create the manager (pick `CustomAgent`,
+  one or more projects via a multi-project picker, name,
+  description), then add reports the same way.
+- "Add report" / "Edit member" affordances inside a team.
 
-### 10.2 Board view
+### 9.2 Opening a team
 
-- Fixed columns: `Backlog | Triage | Assigned | InProgress | Blocked
-  | Review`. `Done` and `Canceled` collapsed into a footer drawer.
-- Cards keyed by `TeamCardId` (philosophy reactivity rule).
-- Drag/drop emits `TeamCardMove` with `expected_version`.
-- Click → side panel: title, body, current assignments, activity log
-  (from `TeamCardActivityNotify` stream), "open agent chat" button
-  jumping to the assignee's `/agent/...` stream.
+Clicking a team **opens the manager's agent chat** (same UI as any
+session resume from the Sessions tab). The chat stream is the
+manager's `/agent/<id>` stream; the chat history is the manager's
+session history.
 
-### 10.3 Member cards
+A sidebar in this view shows the team roster:
 
-In the team header / sidebar:
+- Each report: name, role, `CustomAgent` label, selected projects
+  from the multi-project picker, live status (from
+  `TeamMemberBindingNotify`), last-active time.
+- Click a report → open *that report's* chat in another tab.
+  Identical agent-chat view, different `AgentId`. No new UI.
 
-- Each member: name, role, backend/custom-agent labels, live status
-  (from `TeamMemberBindingNotify` + agent typing status).
-- Memory generation, last compaction time, `summary_markdown` preview,
-  list of `active_card_ids`.
-- Click → expands to full memory (lazy-loaded; rolling summaries can
-  be ~2K tokens).
-- "Compact now" button.
-
-### 10.4 No new dispatch primitives
+### 9.3 No new dispatch primitives
 
 Everything renders from `TeamNotify`, `TeamMemberNotify`,
-`TeamCardNotify`, `TeamCardActivityNotify`, `TeamMemoryNotify`,
-`TeamCompactionNotify`, `TeamMemberBindingNotify`.
-
-No refresh button; views update from server events only.
+`TeamMemberBindingNotify` + the existing agent stream. No refresh
+button.
 
 ---
 
-## 11. Failure Modes
+## 10. Failure Modes
 
-### Manager crashes mid-triage
+### Member's session can't be resumed
 
-Card sits in `Triage`. Claim lease (default 5 min) expires → coordinator
-moves the card back to `Backlog`, appends `ManagerClaimExpired` activity
-event, and surfaces in UI. On manager respawn, the card is in `Backlog`
-and will appear as a fresh wake trigger. No invisible stuck state.
+`Backend::resume(member.session_id)` fails (session deleted,
+backend lost it, version mismatch). The registry:
 
-### Manager dies and won't come back
+- Emits a `TeamMemberBindingNotify` with status indicating the
+  failure (reuse `AgentControlStatus` failure variants).
+- Does **not** silently `SpawnAgent::New`. Losing memory is a
+  user-visible event, not a recovery path.
+- User deletes the member and creates a new one (deliberate fresh
+  start), or escalates.
 
-Team blocks new claims/assignments. UI shows the team in a degraded
-state. Human must `TeamSetManager` to a current report. No
-auto-promotion.
+### Manager session can't be resumed
 
-### Report can't complete a card
+Same as above. The team becomes unusable for new delegation
+because the user can't reach the manager. UI shows team as
+degraded. Human runs `TeamSetManager` against a `Report` (which
+is then promoted), then may delete the old member.
 
-Report moves card → `Blocked` with a reason. Manager wakes (trigger 4),
-decides: send back to `InProgress` with guidance, reassign to a
-different report (`Blocked → Assigned`), or cancel.
+### Member deleted while live agent is running
 
-### Report dies while assigned
+`TeamMemberDelete` is rejected if the member has a live binding,
+to keep things simple. The user must close the live chat first (or
+the agent must idle out), then delete. The session record itself
+is not deleted by member delete; the member is removed from the
+roster and the team store.
 
-Coordinator detects (typing status `Failed` or session closed) and,
-after a configurable grace period, moves the card →
-`Blocked { reason: "assignee unavailable" }` with `actor: Server`.
-Manager wakes. This is an explicit typed transition, not silent
-recovery.
+### `CustomAgent` deleted while in use
 
-### Compaction fails
+`CustomAgentDelete` is rejected by `17-custom-agents.md` validation
+while any team member references it. (This rule needs to be added
+when teams ship.)
 
-Tool not called, schema invalid, timeout: the prior memory generation
-stays current. `TeamCompactionNotify::Failed { error }` is emitted. If
-the failure was due to hard context pressure on the live binding, the
-coordinator terminates the live agent and respawns from the
-last-good memory before the next work delivery.
+### Project deleted while a member references it
 
-### Compaction loses important context
+`ProjectDelete` is rejected by `06-projects.md` validation while
+any team member's `project_ids` contains it.
 
-Compaction is destructive — that's the trade. Mitigations:
+### Server restart
 
-- `recent_turns_text` is verbatim, so the immediate "what we were
-  doing" tail is intact.
-- Card activity history is durable and queryable (separate stream).
-- Compaction generation is included in `TeamMemoryNotify`. The user
-  can see when memory shifted and inspect the prior generation via
-  `team_compactions`.
-- We do **not** try to detect "important" context heuristically; that
-  would violate "no inference."
+`TeamRegistry` loads `agent_teams.json` into memory. All bindings
+are `None`. The registry emits replay in §7.8 order. Members are
+not auto-spawned; they come back to life when next messaged.
 
-### Race on a card
+### MCP disabled
 
-Two writers (e.g. human drag + manager assign) hit the actor in some
-order. The second's `expected_version` is stale → server emits
-`CommandError::Conflict`, re-emits `TeamCardNotify::Upsert` so all
-clients reconcile, and the second writer must retry on the new
-version.
+`tyde_team_message_member` returns an unavailable error. The user
+can still chat with the manager directly. Without the team MCP,
+the manager is just an agent with a description of its team in
+its session history.
 
-### Server restart with active cards
+### Race on team mutation
 
-`TeamStoreActor` loads everything from `teams.db`. All bindings are
-`None`. The coordinator emits replay events in the §8.8 order. On
-encountering a non-terminal card, it wakes the relevant manager or
-report (which triggers a fresh spawn per §5).
-
-### MCP disabled mid-session
-
-Team autonomous loops pause. UI shows team as paused. Humans can still
-operate the board manually. The server does not inject a partial tool
-surface.
-
-### Cycles in delegation
-
-Schema-prevented. One manager per team, reports cannot delegate, no
-nested teams, no cross-team cards. The org graph is depth-1.
-
-### Member archived while assigned
-
-`TeamMemberArchive` is rejected if the member appears on any
-non-terminal card. The user must reassign or close those cards first.
+The `TeamRegistry` actor serializes mutations. The only racy case
+is two clients mutating the same team simultaneously (e.g. one
+renames it, another adds a member). Mutations are independent
+fields; last-write wins per field. No optimistic concurrency
+needed because there is no shared mutable card state to race on.
 
 ---
 
-## 12. Implementation Order (rough)
+## 11. Implementation Order (rough)
 
-1. Protocol types and frame kinds (§8). Generated frontend types fall
-   out automatically.
-2. `TeamStoreActor` with the schemas in §3, single-writer pattern.
-3. `TeamCoordinator` per-team actor + `TeamRegistry`. Mirrors the
-   existing agent registry pattern.
-4. Host stream replay extension: `TeamNotify` summaries.
-5. Per-team detail stream `/team/<id>/<instance>` plumbing.
-6. Member spawn-with-memory path: a fresh agent of `BackendKind` with
-   role + memory + active-card injection.
-7. Card lifecycle: transitions, claim leases, optimistic concurrency,
-   activity events.
-8. Manager wake triggers + coalescing on top of the queue actor.
-9. `MemoryCompactor` internal agent + token-threshold and card-boundary
-   triggers.
-10. Agent-control MCP team tools (§9).
-11. Frontend teams panel + board view + member memory cards.
-12. Tests (§13).
+1. Protocol types and frame kinds (§7). Generated frontend types
+   fall out automatically.
+2. `TeamRegistry` actor owning `~/.tyde/agent_teams.json` per §3,
+   single-writer pattern, mirroring `server/src/store/session.rs`.
+3. Extend `CustomAgentDelete` and `ProjectDelete` validation to
+   reject if any team member references them.
+4. Member activation path: `SpawnAgent::New` on first wake,
+   `SpawnAgent::Resume` on subsequent wakes. Record `session_id`
+   atomically with the member upsert.
+5. Host stream replay extension (`TeamNotify`, `TeamMemberNotify`,
+   `TeamMemberBindingNotify`).
+6. Agent-control MCP team tools (§8) with manager-only auth on
+   `tyde_team_message_member`.
+7. Roster injection into the manager's first `SpawnAgent::New`
+   prompt.
+8. Frontend teams panel + member roster sidebar.
+9. Tests (§12).
 
 ---
 
-## 13. Testing
+## 12. Testing
 
 Unit / integration:
 
-- Card transition matrix exhaustively (every `from × to × actor`).
-- Optimistic concurrency: stale `expected_version` always rejected.
-- Permission table: each tool × caller-role × card-state combination.
-- Memory generation drift: spawn → compact → respawn → memory injected.
-- Compactor failure paths: tool not called, schema violation, timeout.
-- Coalesced wake messages: N triggers → 1 prompt with summary.
-- Replay ordering: `TeamSubscribe` → exact frame order, all references
-  resolvable.
-- Multi-subscriber races: two clients both move the same card.
-- Server restart: non-terminal cards resume their wake triggers.
+- Member create persists; reload from disk round-trips.
+- First message to a fresh member triggers `SpawnAgent::New` and
+  records the resulting `session_id` atomically with the member
+  upsert.
+- Subsequent message to an unbound member triggers
+  `SpawnAgent::Resume` against the recorded `session_id` (never
+  `New`).
+- `Backend::resume` failure surfaces as visible binding failure;
+  no fallback to `New`.
+- `tyde_team_message_member` from a `Report` is rejected.
+- `tyde_team_message_member` from the manager to a member of
+  another team is rejected.
+- `TeamDelete` hard-removes the team and cascades to all members.
+- `TeamMemberDelete` of the active manager is rejected;
+  `TeamMemberDelete` of the only member is rejected;
+  `TeamMemberDelete` of a live-bound member is rejected.
+- `CustomAgentDelete` and `ProjectDelete` rejected while
+  referenced.
+- Replay ordering: `CustomAgent`/`Project`/`Session` events
+  precede teams.
+- Server restart: members load with `current_agent_id: None`;
+  next message activates them correctly.
 
 Frontend (wasm-bindgen-test, per `CLAUDE.md`):
 
-- Board renders one card per `TeamCardId`; updates on
-  `TeamCardNotify::Upsert`.
-- Activity log scrolls in `created_at_ms` order.
-- Member card shows memory generation that updates on
-  `TeamMemoryNotify::Updated`.
-- No frontend caches; clearing the signals re-renders identical DOM.
+- Teams panel renders one row per `TeamId`.
+- Opening a team navigates to the manager's `/agent/<id>` stream.
+- Member sidebar shows live binding state and updates on
+  `TeamMemberBindingNotify`.
+- No frontend caches; clearing signals re-renders identical DOM.
+
+---
+
+## 13. Open Questions for Mike
+
+These are deliberate unresolved points. Each is reversible.
+
+1. **Roster injection.** Spec says the team roster is injected into
+   the manager's first-spawn prompt and refreshed via
+   `tyde_team_describe` on demand. Alternative: a small system-prompt
+   prepend on *every* manager turn that lists the roster. That
+   guarantees freshness but burns tokens. Confirm OK to do
+   inject-once + on-demand refresh.
+
+2. **Reports spawning transient helpers.** Reports can still call
+   the existing `tyde_spawn_agent` to spawn one-off helpers (per
+   `11-agent-control-mcp.md`). Those helpers aren't team members
+   and don't show up in the roster. Confirm OK.
+
+3. **Manager project selection.** A manager has its own
+   `project_ids` like any member. For a coordination-only manager,
+   the user still picks at least one project. Confirm we don't need
+   "manager has the union of all reports' projects" auto-magic.
+
+4. **Concurrency / cost cap per team.** Not in v1. Without the
+   board and without autonomous wake, the manager spawns reports
+   only as the user drives the conversation, so runaway loops are
+   less of a concern — but a `HostSettings.team_max_concurrent_members`
+   cap would still be sensible later.
+
+5. **Manager auto-promotion.** When a manager's session can no
+   longer be resumed, the team is degraded until the user runs
+   `TeamSetManager`. We could auto-promote the longest-tenured
+   report. v1 says no — humans should make this call.
+
+6. **Resume failure handling.** Spec says do **not** silently
+   `SpawnAgent::New` when `Resume` fails. The user must delete
+   and recreate. Confirm.
 
 ---
 
 ## 14. Glossary cross-reference
 
-| Term in this doc        | Where it's defined                       |
-|-------------------------|------------------------------------------|
-| `AgentId`               | `03-agents.md` (live agent identity)     |
-| `SessionId`             | `05-session-resume.md`                   |
-| `AgentOrigin`           | `15-sub-agents.md` + §8.3 here           |
-| `CustomAgent` / `Steering` | `17-custom-agents.md`                  |
-| `ProjectId`             | `06-projects.md`                         |
-| Queued message / actor  | `16-queued-messages.md`                  |
-| Loopback MCP server     | `11-agent-control-mcp.md`                |
+| Term                    | Where defined                             |
+|-------------------------|-------------------------------------------|
+| `AgentId`               | `03-agents.md`                            |
+| `SessionId`, resume     | `05-session-resume.md`                    |
+| `AgentOrigin`           | `15-sub-agents.md` + §7.3 here            |
+| `CustomAgent`, `CustomAgentId` | `17-custom-agents.md`              |
+| `ProjectId`             | `06-projects.md`                          |
+| Queued message / actor  | `16-queued-messages.md`                   |
+| Loopback MCP server     | `11-agent-control-mcp.md`                 |
 
 ---
 
-## 15. Forward compatibility
+## 15. Summary
 
-The protocol shape preserves these extension points without breaking
-changes:
+A team is a host-scoped record `(Team, TeamMembers)`. Each member
+binds a `CustomAgent` (role / tools / instructions) to a
+`SessionId` (rolling memory), binds one or more projects, and is
+reanimated on demand via `SpawnAgent::Resume`. Workspace roots are
+derived as the union of the member's project roots at spawn time.
+The user works with the team by opening the
+manager's chat — a normal agent chat resumed from
+`manager.session_id`. The manager delegates by calling
+`tyde_team_message_member`, which resolves the target member to a
+live `AgentId` and queues the message. There is no board, no
+autonomous loop, no Tyde-owned memory layer, no per-team detail
+stream. Persistence is one JSON file. The frontend is a pure
+projection.
 
-- `TeamMemberRole` is an enum → can add `SubManager` etc. for nested
-  orgs.
-- `Team` has no `parent_team_id`; can be added without rewriting
-  existing fields.
-- `TeamCardColumnKind` is an enum → can add lanes; clients must handle
-  unknown variants per the existing protocol convention.
-- `TeamCompactionTrigger` can grow new variants (e.g. `WallClockIdle`)
-  without invalidating prior records.
-- A `TeamCompactionMode` enum (NativeCompact / RestartFromMemory /
-  MemoryOnly) was considered for v1 and dropped — every backend is
-  effectively `RestartFromMemory` today. Adding the enum later is a
-  pure addition: existing records imply `RestartFromMemory`.
-
----
-
-## 16. Open Questions for Mike
-
-These are deliberate unresolved points; the doc above picked an answer
-for each so an implementer is unblocked, but they are the spots where
-Mike (or future use) might pick differently. Each is reversible.
-
-1. **Storage = SQLite.** New dependency for Tyde2 (sessions are JSON
-   today; there is no existing `session.db` to lean on). The data
-   shape — append-heavy activity log, frequent card mutations — makes
-   SQLite a real win, but it's a new pattern. Confirm OK to introduce
-   `rusqlite` here. If not: fall back to JSON with full-file rewrites,
-   accept the rewrite cost, swap later if it bites.
-
-2. **Manager `Done` authority.** Spec lets the manager mark `Review →
-   Done` directly; humans can override by reopening or canceling. The
-   activity log makes it auditable. If you'd rather every `Done`
-   require human acceptance, change the §6 transition table —
-   protocol-only change.
-
-3. **Reports spawning transient helpers.** The agent-control MCP's
-   `tyde_spawn_agent` lets any agent spawn another. A working report
-   may fan out helpers; spec leaves this allowed and invisible to the
-   board. If you want helpers tracked as nested cards or disallowed
-   for team members, that's a §9 decision — say so before we
-   implement.
-
-4. **Concurrency / cost cap per team.** Not in v1. Autonomous loops
-   are a money-fire hazard. A `HostSettings.team_max_concurrent_turns`
-   cap and per-team spend cap are obvious; deferred only because the
-   coordinator-as-event-driven design throttles natural pacing
-   already. Confirm OK to defer.
-
-5. **Manager auto-promotion.** When a manager dies fatally, the team
-   blocks until a human runs `TeamSetManager`. We could auto-promote
-   the longest-tenured report. v1 says no — picking the right
-   replacement is a judgment call; humans should make it. If you want
-   auto-promotion, easy addition to the coordinator.
-
-6. **Member memory user-editing.** Spec marks memory read-only in v1;
-   users can request a manual compaction. A "edit memory" affordance
-   (with the agent re-spawned to pick up the edit) is reasonable
-   later — confirm OK to defer.
-
-7. **Compactor: external one-shot vs self-compaction.** Spec uses an
-   external `MemoryCompactor` (deterministic prompt, cheap model). The
-   alternative is self-compaction via an MCP tool the member calls.
-   External is more controllable; self-compaction has the member's
-   live context for free. If the external compactor's output quality
-   is poor in practice, switch to self-compaction — protocol-compatible.
-
----
-
-## 17. Summary
-
-A team is a server-owned record of `(Team, TeamBoard, TeamMembers,
-TeamCards, TeamCardEvents, TeamMemberMemory, TeamCompactions)`.
-`TeamMemberId` is durable; `AgentId` is a runtime binding emitted as
-`TeamMemberBindingNotify`. The kanban board is the work intake;
-managers are LLM agents woken by a `TeamCoordinator` only when
-something needs human-style judgment. Compaction is Tyde-managed via
-an internal one-shot `MemoryCompactor`, triggered by token threshold
-or card boundary. Persistence is SQLite at `~/.tyde/teams.db`,
-single-writer through a `TeamStoreActor`. The MCP surface is a thin
-shim over typed protocol commands handled by the same coordinator the
-UI uses. The frontend is a pure projection.
-
-The biggest design risk is compaction quality. The biggest scope risk
-is letting teams nest in v1.
+The biggest scope risk is putting any of this back in v1 because
+"surely we need it for X." We don't. Ship the manager-chat
+delegation flow first; reassess after real use.

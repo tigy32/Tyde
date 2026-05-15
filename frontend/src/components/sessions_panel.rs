@@ -1,13 +1,11 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{
-    BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload, SpawnAgentParams,
-    SpawnAgentPayload,
-};
+use protocol::{BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload};
 
+use crate::actions::resume_session;
 use crate::send::send_frame;
-use crate::state::{ActiveProjectRef, AppState, ConnectionStatus};
+use crate::state::{AppState, ConnectionStatus};
 
 fn backend_class(kind: BackendKind) -> &'static str {
     match kind {
@@ -217,37 +215,12 @@ fn session_card(state: AppState, session: crate::state::SessionInfo) -> impl Int
     let resume_host = session_host_id.clone();
     let resume_project_id = session.summary.project_id.clone();
     let do_resume = std::rc::Rc::new(move || {
-        let state = resume_state.clone();
-        let sid = resume_sid.clone();
-        let host_id = resume_host.clone();
-        // Switch to the session's project synchronously so the NewAgent event
-        // lands in the user's current view (upgrading the fresh "New Chat" tab
-        // into the resumed chat). Sessions without a project_id drop the user
-        // to the global/home view.
-        let target = resume_project_id.clone().map(|pid| ActiveProjectRef {
-            host_id: host_id.clone(),
-            project_id: pid,
-        });
-        state.switch_active_project(target);
-        spawn_local(async move {
-            if let Some(host_stream) = state.host_stream_untracked(&host_id) {
-                let payload = SpawnAgentPayload {
-                    name: None,
-                    custom_agent_id: None,
-                    parent_agent_id: None,
-                    project_id: None,
-                    params: SpawnAgentParams::Resume {
-                        session_id: sid,
-                        prompt: None,
-                    },
-                };
-                if let Err(e) =
-                    send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
-                {
-                    log::error!("failed to send SpawnAgent (resume): {e}");
-                }
-            }
-        });
+        resume_session(
+            &resume_state,
+            resume_host.clone(),
+            resume_sid.clone(),
+            resume_project_id.clone(),
+        );
     });
 
     let do_resume2 = do_resume.clone();
