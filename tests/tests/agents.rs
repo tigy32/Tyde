@@ -2306,8 +2306,9 @@ async fn invalid_project_input_surfaces_command_error_and_keeps_connection_alive
 }
 
 #[tokio::test]
-async fn spawn_with_missing_project_id_closes_the_connection() {
+async fn spawn_with_missing_project_id_emits_terminal_agent_error() {
     let mut fixture = Fixture::new().await;
+    let missing_project_id = ProjectId("11111111-1111-1111-1111-111111111111".to_owned());
 
     fixture
         .client
@@ -2315,7 +2316,7 @@ async fn spawn_with_missing_project_id_closes_the_connection() {
             name: Some("missing-project-agent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
-            project_id: Some(ProjectId("11111111-1111-1111-1111-111111111111".to_owned())),
+            project_id: Some(missing_project_id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/missing-project".to_owned()],
                 prompt: "hello".to_owned(),
@@ -2329,35 +2330,39 @@ async fn spawn_with_missing_project_id_closes_the_connection() {
         .await
         .expect("spawn_agent write failed");
 
-    loop {
-        match fixture
-            .client
-            .next_event()
-            .await
-            .expect("next_event after missing project spawn failed")
-        {
-            None => break,
-            Some(env)
-                if fixture::is_builtin_team_custom_agent_notify(&env)
-                    || matches!(
-                        env.kind,
-                        FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionSchemas
-                            | FrameKind::BackendSetup
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionList
-                            | FrameKind::HostSettings
-                    ) =>
-            {
-                continue;
-            }
-            Some(env) => panic!(
-                "spawning with a missing project should terminate the connection, got: {} on {}",
-                env.kind, env.stream
-            ),
-        }
-    }
+    let env = expect_next_event(&mut fixture.client, "missing project NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
+    assert_eq!(new_agent.name, "missing-project-agent");
+    assert_eq!(new_agent.project_id, None);
+    let agent_stream = new_agent.instance_stream.clone();
+
+    let env = expect_next_event(&mut fixture.client, "missing project AgentStart").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, agent_stream);
+    let start: AgentStartPayload = env.parse_payload().expect("parse AgentStartPayload");
+    assert_eq!(start.project_id, None);
+
+    let env = expect_next_event(&mut fixture.client, "missing project AgentError").await;
+    assert_eq!(env.kind, FrameKind::AgentError);
+    assert_eq!(env.stream, agent_stream);
+    let err: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
+    assert!(err.fatal, "missing project should terminate the agent");
+    assert_eq!(err.code, protocol::AgentErrorCode::BackendFailed);
+    assert!(
+        err.message.contains(&format!(
+            "cannot spawn agent in missing project {missing_project_id}"
+        )),
+        "unexpected missing project error: {}",
+        err.message
+    );
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(150),
+        "connection should stay open after missing-project spawn rejection",
+    )
+    .await;
 
     let mut fresh_client = fixture.connect_fresh_host().await;
     expect_no_event(

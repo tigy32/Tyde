@@ -15,6 +15,7 @@ const BUILTIN_TEAM_CUSTOM_AGENT_IDS: &[&str] = &[
     "tyde-frontend-engineer",
     "tyde-backend-engineer",
     "tyde-test-qa-engineer",
+    "tyde-debugger",
 ];
 
 #[allow(dead_code)]

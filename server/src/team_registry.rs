@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::agent::now_ms;
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
 use crate::store::custom_agents::{
-    BACKEND_ENGINEER_CUSTOM_AGENT_ID, CODE_REVIEWER_CUSTOM_AGENT_ID,
+    BACKEND_ENGINEER_CUSTOM_AGENT_ID, CODE_REVIEWER_CUSTOM_AGENT_ID, DEBUGGER_CUSTOM_AGENT_ID,
     FRONTEND_ENGINEER_CUSTOM_AGENT_ID, TEAM_LEAD_CUSTOM_AGENT_ID, TEST_QA_ENGINEER_CUSTOM_AGENT_ID,
 };
 
@@ -1500,7 +1500,7 @@ fn role_presets() -> Vec<TeamRolePreset> {
             default_description:
                 "Reproduces failures, gathers evidence, identifies root causes, and fixes the bug."
                     .to_owned(),
-            default_custom_agent_id: Some(CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned())),
+            default_custom_agent_id: Some(CustomAgentId(DEBUGGER_CUSTOM_AGENT_ID.to_owned())),
         },
     ]
 }

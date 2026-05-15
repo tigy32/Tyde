@@ -1684,6 +1684,30 @@ kbd {
     color: var(--text-tertiary);
 }
 
+/* Color-coded dot mirroring the AgentsPanel agent-card-status indicator.
+ * Text-status content is intentionally replaced by this dot; the human
+ * label lives in title / aria-label so it stays accessible. */
+.team-member-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: inline-block;
+}
+
+.team-member-status-dot.running {
+    background: var(--accent-primary);
+    animation: pulse 1.5s infinite;
+}
+
+.team-member-status-dot.completed {
+    background: var(--success);
+}
+
+.team-member-status-dot.error {
+    background: var(--error);
+}
+
 .team-member-meta {
     display: flex;
     flex-wrap: wrap;
@@ -1744,6 +1768,40 @@ kbd {
     gap: var(--space-1);
     align-items: center;
     flex-shrink: 0;
+}
+
+/* Flat icon button for per-member row actions (set manager / edit /
+ * delete). Borderless, sized to fit on the same row as identity badges
+ * so each member card stays ~2 rows tall. Tooltip + aria-label carry
+ * the action name. */
+.team-member-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.9rem;
+    line-height: 1;
+}
+
+.team-member-icon-btn:hover {
+    background: var(--surface-2);
+    color: var(--text-primary);
+}
+
+.team-member-icon-btn:focus-visible {
+    outline: 1px solid var(--accent-primary);
+    outline-offset: 1px;
+}
+
+.team-member-icon-btn-danger:hover {
+    color: var(--error);
 }
 
 .team-draft-start,
@@ -4833,6 +4891,15 @@ kbd {
     border-right: 1px solid var(--border-primary);
 }
 
+/* Render the line number via a pseudo-element so it isn't part of the
+ * document text. WebKit (Tauri's WKWebView) copies the text content of
+ * elements that span a selection even when `user-select: none` is set,
+ * which would leak gutter numbers into copied code. Pseudo-element
+ * generated content is never part of the document and never copied. */
+.diff-gutter::before {
+    content: attr(data-line-num);
+}
+
 .diff-gutter-old {
     border-right: none;
 }
@@ -5096,6 +5163,13 @@ kbd {
     user-select: none;
     border-right: 1px solid var(--border-primary);
     flex-shrink: 0;
+}
+
+/* See .diff-gutter::before — pseudo-element generated content stays out
+ * of the document text so copying a code row never includes the line
+ * number, even under WKWebView's permissive user-select copy semantics. */
+.file-line-num::before {
+    content: attr(data-line-num);
 }
 
 .file-line code {

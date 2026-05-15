@@ -1220,6 +1220,7 @@ fn render_unified_item(
                     >
                         <span
                             class=old_class
+                            data-line-num=old_str
                             title=if old_clickable { "Click or drag to comment" } else { "" }
                             on:pointerdown=move |ev: web_sys::PointerEvent| {
                                 if !old_clickable { return; }
@@ -1228,9 +1229,10 @@ fn render_unified_item(
                                 ev.prevent_default();
                                 cb(pdown_root_old.clone(), pdown_path_old.clone(), ReviewDiffSide::Old, n);
                             }
-                        >{old_str}</span>
+                        ></span>
                         <span
                             class=new_class
+                            data-line-num=new_str
                             title=if new_clickable { "Click or drag to comment" } else { "" }
                             on:pointerdown=move |ev: web_sys::PointerEvent| {
                                 if !new_clickable { return; }
@@ -1239,7 +1241,7 @@ fn render_unified_item(
                                 ev.prevent_default();
                                 cb(pdown_root_new.clone(), pdown_path_new.clone(), ReviewDiffSide::New, n);
                             }
-                        >{new_str}</span>
+                        ></span>
                         <span class="diff-prefix">{prefix}</span>
                         {move || {
                             // Reactive read so the row re-renders as
@@ -2224,6 +2226,7 @@ fn UnifiedHunk(
                     >
                         <span
                             class=old_class
+                            data-line-num=old_str
                             on:pointerdown=move |ev: web_sys::PointerEvent| {
                                 if !old_clickable { return; }
                                 let Some(cb) = cb_for_old.as_ref() else { return };
@@ -2231,9 +2234,10 @@ fn UnifiedHunk(
                                 ev.prevent_default();
                                 cb(pdown_root_old.clone(), pdown_path_old.clone(), ReviewDiffSide::Old, n);
                             }
-                        >{old_str}</span>
+                        ></span>
                         <span
                             class=new_class
+                            data-line-num=new_str
                             on:pointerdown=move |ev: web_sys::PointerEvent| {
                                 if !new_clickable { return; }
                                 let Some(cb) = cb_for_new.as_ref() else { return };
@@ -2241,7 +2245,7 @@ fn UnifiedHunk(
                                 ev.prevent_default();
                                 cb(pdown_root_new.clone(), pdown_path_new.clone(), ReviewDiffSide::New, n);
                             }
-                        >{new_str}</span>
+                        ></span>
                         <span class="diff-prefix">{prefix}</span>
                         {move || {
                             let result: AnyView = render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text);
@@ -2876,9 +2880,10 @@ fn render_sbs_paired_row(
             >
                 <span
                     class=gutter_class
+                    data-line-num=num
                     title=if pointer_active { "Click or drag to comment" } else { "" }
                     on:pointerdown=on_pointer_down
-                >{num}</span>
+                ></span>
                 <span class="diff-prefix">{prefix}</span>
                 {move || {
                     // Reactive read: if the cell carries a token signal

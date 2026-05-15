@@ -442,7 +442,10 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
                                                 class=move || file_line_class(i, &find)
                                                 data-find-idx=i
                                             >
-                                                <span class="file-line-num">{i + 1}</span>
+                                                <span
+                                                    class="file-line-num"
+                                                    data-line-num={(i + 1).to_string()}
+                                                ></span>
                                                 {move || {
                                                     // Reactive read: when a
                                                     // chunk lands and updates
@@ -761,14 +764,18 @@ mod wasm_tests {
             "row spacing is not uniform: total={total:.2}px, expected≈{expected_total:.2}px"
         );
 
-        // Text guard: each row's rendered text should equal the line number
-        // followed by the source line, with no extra characters. Catches the
-        // class of bug where stray characters (e.g. a trailing "\n") leak into
-        // the rendered output — which is the original double-spacing
-        // regression we hit. Text-equality is the right assertion shape here:
-        // the user perceives "what text appears in the row," and any character
-        // we didn't intend to add is a defect regardless of whether the
-        // headless renderer expands the row's pixel height for it.
+        // Text guard: each row's rendered text content must equal the
+        // source line exactly — no leading line number, no stray
+        // characters. Two concerns ride on this assertion:
+        //
+        // 1. The original double-spacing regression: stray characters
+        //    (e.g. trailing "\n") leaking into the rendered output.
+        // 2. Gutter line numbers must NOT be part of the row's text
+        //    content. `text_content()` is the same surface the browser
+        //    uses for copy operations, so any line number appearing here
+        //    would also appear in the user's clipboard when they drag
+        //    over a row — the bug this design avoids by rendering line
+        //    numbers via a CSS pseudo-element with `content: attr(...)`.
         let expected = [
             "line one",
             "line two",
@@ -778,10 +785,17 @@ mod wasm_tests {
         ];
         for (i, row) in rows.iter().enumerate() {
             let text = row.text_content().unwrap_or_default();
-            let want = format!("{}{}", i + 1, expected[i]);
             assert_eq!(
-                text, want,
-                "row {i} rendered text does not match source line exactly"
+                text, expected[i],
+                "row {i} rendered text must equal source line exactly \
+                 (no line number, no stray characters)"
+            );
+            let line_num = (i + 1).to_string();
+            assert!(
+                !text.contains(&line_num),
+                "row {i} text must not contain the gutter line number {line_num:?}; \
+                 the line number lives in a CSS pseudo-element so it stays out of \
+                 selection / copy: text was {text:?}"
             );
         }
     }

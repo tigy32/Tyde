@@ -63,6 +63,7 @@ fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
         "tyde-frontend-engineer",
         "tyde-backend-engineer",
         "tyde-test-qa-engineer",
+        "tyde-debugger",
     ]
     .into_iter()
     .collect()
@@ -298,8 +299,8 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
             .await;
     assert_eq!(
         builtins.len(),
-        5,
-        "expected five built-in team custom agents: {builtins:?}"
+        6,
+        "expected six built-in team custom agents: {builtins:?}"
     );
     let reviewer_id = CustomAgentId("tyde-code-reviewer".to_owned());
     let reviewer = builtins
@@ -310,8 +311,19 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         reviewer
             .instructions
             .as_deref()
-            .is_some_and(|instructions| instructions.contains("correctness bugs")),
+            .is_some_and(|instructions| instructions.contains("Review workflow")),
         "Code Reviewer should start with review defaults: {reviewer:?}"
+    );
+    let debugger = builtins
+        .get(&CustomAgentId("tyde-debugger".to_owned()))
+        .expect("built-in Debugger should be seeded");
+    assert_eq!(debugger.name, "Debugger");
+    assert!(
+        debugger
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains("Form theories")),
+        "Debugger should start with debugging defaults: {debugger:?}"
     );
 
     let mut edited = reviewer.clone();

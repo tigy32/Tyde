@@ -293,7 +293,7 @@ fn TabButton(
             }
             title=move || tab_data().map(|t| t.label).unwrap_or_default()
             aria-label=move || tab_data().map(|t| t.label).unwrap_or_default()
-            attr:data-tab-id=tab_id.0.to_string()
+            data-tab-id=tab_id.0.to_string()
             on:click=on_click
             on:contextmenu=on_contextmenu
         >
@@ -706,9 +706,13 @@ pub fn CenterZone() -> impl IntoView {
                 </div>
 
                 <div class="tab-strip-scroll" node_ref=tab_scroll_ref>
-                    {move || scroll_tab_ids().into_iter().map(|id| {
-                        view! { <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id /> }
-                    }).collect_view()}
+                    <For
+                        each=move || scroll_tab_ids()
+                        key=|id| *id
+                        let:id
+                    >
+                        <TabButton tab_id=id context_menu=context_menu editing_tab_id=editing_tab_id />
+                    </For>
                 </div>
 
                 <div class="pinned-tab-actions">
@@ -816,5 +820,125 @@ pub fn CenterZone() -> impl IntoView {
                 }
             })}
         </div>
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use wasm_bindgen_test::*;
+    use web_sys::{HtmlElement, HtmlInputElement};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn click_context_menu_item(container: &HtmlElement, text: &str) {
+        let buttons = container
+            .query_selector_all(".context-menu button")
+            .unwrap();
+        for i in 0..buttons.length() {
+            let button = buttons.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+            if button.text_content().as_deref().map(str::trim) == Some(text) {
+                button.click();
+                return;
+            }
+        }
+        panic!("context menu item {text:?} not found");
+    }
+
+    #[wasm_bindgen_test]
+    async fn chat_tab_rename_survives_external_label_update() {
+        let container = make_container();
+        let state = AppState::new();
+        state.open_tab(TabContent::empty_chat(), "Original Chat".to_owned(), true);
+        let chat_tab_id = state
+            .center_zone
+            .with_untracked(|cz| cz.active_tab_id.expect("chat tab active"));
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <CenterZone /> }
+        });
+        next_tick().await;
+
+        let tab_button: HtmlElement = container
+            .query_selector(".tab-strip-scroll button.tab")
+            .unwrap()
+            .expect("chat tab button")
+            .dyn_into()
+            .unwrap();
+        let contextmenu = web_sys::MouseEvent::new("contextmenu").unwrap();
+        tab_button.dispatch_event(&contextmenu).unwrap();
+        next_tick().await;
+        click_context_menu_item(&container, "Rename");
+        next_tick().await;
+
+        let document = web_sys::window().unwrap().document().unwrap();
+        let input: HtmlInputElement = container
+            .query_selector("input.tab-rename-input")
+            .unwrap()
+            .expect("rename input should be visible")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            input.value(),
+            "Original Chat",
+            "rename input should seed from the tab label when editing starts"
+        );
+        let input_node: web_sys::Element = input.clone().dyn_into().unwrap();
+        let active = document.active_element().expect("focused element");
+        assert!(
+            active.is_same_node(Some(&input_node)),
+            "rename input should be focused when editing starts"
+        );
+
+        input.set_value("User Typed Title");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        state.rename_tab_label(chat_tab_id, "External Session Label".to_owned());
+        next_tick().await;
+
+        let current_input: HtmlInputElement = container
+            .query_selector("input.tab-rename-input")
+            .unwrap()
+            .expect("external label update must not exit rename mode")
+            .dyn_into()
+            .unwrap();
+        let current_node: web_sys::Element = current_input.clone().dyn_into().unwrap();
+        assert!(
+            input_node.is_same_node(Some(&current_node)),
+            "external label update remounted the rename input"
+        );
+        assert_eq!(
+            current_input.value(),
+            "User Typed Title",
+            "external label update must not clobber the in-progress rename"
+        );
+        let active = document.active_element().expect("focused element");
+        assert!(
+            active.is_same_node(Some(&input_node)),
+            "external label update blurred the rename input"
+        );
     }
 }

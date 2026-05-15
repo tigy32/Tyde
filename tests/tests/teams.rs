@@ -767,7 +767,7 @@ async fn team_draft_template_shuffle_and_commit_is_atomic() {
             .members
             .iter()
             .any(|member| member.custom_agent_id
-                == Some(CustomAgentId("tyde-code-reviewer".to_owned()))),
+                == Some(CustomAgentId("tyde-debugger".to_owned()))),
         "template application should choose built-in custom agents: {draft:?}"
     );
 
@@ -816,7 +816,7 @@ async fn team_draft_template_shuffle_and_commit_is_atomic() {
         members
             .iter()
             .any(|member| member.custom_agent_id
-                == Some(CustomAgentId("tyde-code-reviewer".to_owned()))),
+                == Some(CustomAgentId("tyde-debugger".to_owned()))),
         "commit should persist built-in custom agent selections: {members:?}"
     );
     for member in &members {

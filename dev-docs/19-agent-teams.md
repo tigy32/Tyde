@@ -631,8 +631,8 @@ presses shuffle.
 
 The v1 catalog contains:
 
-- Built-in team custom agents: Team Lead, Code Reviewer, Frontend
-  Engineer, Backend Engineer, and Test / QA Engineer. These are
+- Built-in team custom agents: Orchestrator, Code Reviewer, Frontend
+  Engineer, Backend Engineer, Test / QA Engineer, and Debugger. These are
   created in `custom_agents.json` if missing and replay as ordinary
   `CustomAgentNotify::Upsert` events. Users can edit them in the
   custom-agent UI to add local rules; seeding does not overwrite those

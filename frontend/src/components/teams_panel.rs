@@ -563,6 +563,20 @@ fn MemberRow(
         >
             <div class="team-member-main">
                 <div class="team-member-name-row">
+                    {move || binding_status().map(|status| {
+                        let label = agent_control_status_label(status);
+                        view! {
+                            <span
+                                class=format!(
+                                    "team-member-status-dot {}",
+                                    agent_control_status_dot_class(status)
+                                )
+                                role="img"
+                                title=label
+                                aria-label=label
+                            />
+                        }
+                    })}
                     <span class="team-member-name">
                         {move || member.get().map(|m| m.name).unwrap_or_default()}
                     </span>
@@ -585,12 +599,6 @@ fn MemberRow(
                             <span class="team-member-state">{state_str.to_string()}</span>
                         })
                     }}
-                    {move || binding_status().map(|status| view! {
-                        <span class="team-member-status">{agent_control_status_label(status)}</span>
-                    })}
-                    {move || last_active_label().map(|label| view! {
-                        <span class="team-member-last-active">{label}</span>
-                    })}
                 </div>
                 <div class="team-member-meta">
                     {move || agent_profile_label().map(|s| view! {
@@ -602,16 +610,35 @@ fn MemberRow(
                             <span class="team-member-projects-summary">{s}</span>
                         })
                     }}
+                    {move || last_active_label().map(|label| view! {
+                        <span class="team-member-last-active">{label}</span>
+                    })}
                 </div>
             </div>
             <div class="team-member-actions">
                 {move || can_promote().then(|| view! {
-                    <button class="filter-toggle" type="button" on:click=on_promote_click.clone()>
-                        "Set manager"
-                    </button>
+                    <button
+                        class="team-member-icon-btn"
+                        type="button"
+                        title="Set as manager"
+                        aria-label="Set as manager"
+                        on:click=on_promote_click.clone()
+                    >"\u{2605}"</button>
                 })}
-                <button class="filter-toggle" type="button" on:click=on_edit_click>"Edit"</button>
-                <button class="filter-toggle" type="button" on:click=on_delete_click>"Delete"</button>
+                <button
+                    class="team-member-icon-btn"
+                    type="button"
+                    title="Edit member"
+                    aria-label="Edit member"
+                    on:click=on_edit_click
+                >"\u{270E}"</button>
+                <button
+                    class="team-member-icon-btn team-member-icon-btn-danger"
+                    type="button"
+                    title="Delete member"
+                    aria-label="Delete member"
+                    on:click=on_delete_click
+                >"\u{1F5D1}"</button>
             </div>
         </div>
     }
@@ -639,6 +666,13 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
                 .map(|draft| (host_id.clone(), draft))
         })
     });
+    let current_draft_key: Memo<Option<(String, TeamDraftId)>> = Memo::new(move |_| {
+        current_draft.with(|draft| {
+            draft
+                .as_ref()
+                .map(|(host_id, draft)| (host_id.clone(), draft.id.clone()))
+        })
+    });
 
     let catalog_state = state.clone();
     let catalog = Memo::new(move |_| {
@@ -662,7 +696,7 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
         if !submitting.get() {
             return;
         }
-        if current_draft.get().is_none() {
+        if current_draft_key.get().is_none() {
             // Successful commit: the host's draft was deleted, so the
             // dialog can close.
             submitting.set(false);
@@ -852,7 +886,7 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
     view! {
         <ModalOverlay on_close=on_close wide=true>
             <h3 class="settings-confirm-title">"New team"</h3>
-            {move || match current_draft.get() {
+            {move || match current_draft_key.get() {
                 None => view! {
                     <div class="team-draft-start">
                         <p class="settings-form-hint">
@@ -897,15 +931,15 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
                         </div>
                     </div>
                 }.into_any(),
-                Some((host_id, draft)) => {
-                    let draft_id_for_name = draft.id.clone();
-                    let draft_id_for_apply = draft.id.clone();
-                    let draft_id_for_add = draft.id.clone();
-                    let draft_id_for_shuffle = draft.id.clone();
-                    let draft_id_for_commit = draft.id.clone();
-                    let draft_id_for_discard = draft.id.clone();
-                    let draft_id_for_rows = draft.id.clone();
-                    let draft_id_attr = draft.id.0.clone();
+                Some((host_id, draft_id)) => {
+                    let draft_id_for_name = draft_id.clone();
+                    let draft_id_for_apply = draft_id.clone();
+                    let draft_id_for_add = draft_id.clone();
+                    let draft_id_for_shuffle = draft_id.clone();
+                    let draft_id_for_commit = draft_id.clone();
+                    let draft_id_for_discard = draft_id.clone();
+                    let draft_id_for_rows = draft_id.clone();
+                    let draft_id_attr = draft_id.0.clone();
                     view! {
                         <div class="team-draft-editor" data-draft-id=draft_id_attr>
                             <label class="settings-form-label">
@@ -913,7 +947,9 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
                                 <input
                                     class="settings-text-input team-draft-name"
                                     type="text"
-                                    prop:value=draft.name.clone()
+                                    prop:value=move || current_draft.with(|c| {
+                                        c.as_ref().map(|(_, d)| d.name.clone()).unwrap_or_default()
+                                    })
                                     on:input=move |ev| {
                                         send_name.run((draft_id_for_name.clone(), event_target_value(&ev)));
                                     }
@@ -1854,6 +1890,14 @@ fn agent_control_status_label(status: AgentControlStatus) -> &'static str {
     }
 }
 
+fn agent_control_status_dot_class(status: AgentControlStatus) -> &'static str {
+    match status {
+        AgentControlStatus::Thinking => "running",
+        AgentControlStatus::Idle => "completed",
+        AgentControlStatus::Failed => "error",
+    }
+}
+
 fn cost_hint_label(cost_hint: SpawnCostHint) -> &'static str {
     match cost_hint {
         SpawnCostHint::Low => "Low",
@@ -2290,7 +2334,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn member_row_shows_live_binding_status_text() {
+    async fn member_row_exposes_binding_status_via_dot_not_text() {
         let container = make_container();
         let host_id = "host-a";
         let manager_id = TeamMemberId("m-1".to_owned());
@@ -2313,10 +2357,26 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // No 'thinking' text until a binding arrives.
+        // No status indicator until a binding arrives.
         assert!(
-            !visible_text(&container).to_lowercase().contains("thinking"),
-            "no 'thinking' text before binding arrives"
+            container
+                .query_selector(".team-member-status-dot")
+                .unwrap()
+                .is_none(),
+            "no status indicator before binding arrives"
+        );
+        let row_before: HtmlElement = container
+            .query_selector(".team-member-row")
+            .unwrap()
+            .expect("member row should render even before a binding")
+            .dyn_into()
+            .unwrap();
+        let pre_text = row_before.text_content().unwrap_or_default();
+        assert!(
+            !pre_text.to_lowercase().contains("thinking")
+                && !pre_text.to_lowercase().contains("idle")
+                && !pre_text.to_lowercase().contains("failed"),
+            "row text should not contain literal status words before binding: {pre_text:?}"
         );
 
         state.team_member_bindings.update(|m| {
@@ -2333,14 +2393,54 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let text = visible_text(&container);
-        assert!(
-            text.to_lowercase().contains("thinking"),
-            "expected 'thinking' text after binding update: {text:?}"
+        // After the binding arrives, the row exposes status as a dot
+        // indicator with role=img and an accessible label / tooltip
+        // naming the state. The literal status word must NOT appear in
+        // the row's visible text — the compact-row redesign deliberately
+        // moved that surface to title / aria-label.
+        let dot: HtmlElement = container
+            .query_selector(".team-member-status-dot")
+            .unwrap()
+            .expect("status indicator should appear after binding arrives")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            dot.get_attribute("role").as_deref(),
+            Some("img"),
+            "status indicator should advertise role=img so AT treats it as a labelled graphic"
         );
+        assert_eq!(
+            dot.get_attribute("aria-label").as_deref(),
+            Some("thinking"),
+            "status indicator should label itself with the binding status"
+        );
+        assert_eq!(
+            dot.get_attribute("title").as_deref(),
+            Some("thinking"),
+            "status indicator should tooltip with the binding status"
+        );
+
+        let row_after: HtmlElement = container
+            .query_selector(".team-member-row")
+            .unwrap()
+            .expect("member row should still render after binding")
+            .dyn_into()
+            .unwrap();
+        let row_text = row_after.text_content().unwrap_or_default();
+        let row_text_lc = row_text.to_lowercase();
+        for word in ["thinking", "idle", "failed"] {
+            assert!(
+                !row_text_lc.contains(word),
+                "row visible text should not contain literal status word {word:?} \
+                 after binding arrives (status surface is the dot's aria-label / title); \
+                 row text was: {row_text:?}"
+            );
+        }
+        // The last-active marker still belongs in visible text — that's
+        // human-readable context, not a status word.
         assert!(
-            text.contains("last active recorded"),
-            "expected last-active text after binding update: {text:?}"
+            row_text.contains("last active recorded"),
+            "expected last-active text after binding update: {row_text:?}"
         );
     }
 
@@ -3098,6 +3198,43 @@ mod wasm_tests {
         el.dispatch_event(&event).unwrap();
     }
 
+    fn find_draft_member_text_input(
+        container: &HtmlElement,
+        member_id: &str,
+        label_text: &str,
+    ) -> web_sys::HtmlInputElement {
+        let selector = format!(".team-draft-member-card[data-draft-member-id='{member_id}']");
+        let member_card: HtmlElement = container
+            .query_selector(&selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no draft member card for {member_id}"))
+            .dyn_into()
+            .unwrap();
+        let labels = member_card
+            .query_selector_all("label.settings-form-label")
+            .unwrap();
+        for i in 0..labels.length() {
+            let label = labels.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+            let Some(text) = label
+                .query_selector("span")
+                .unwrap()
+                .and_then(|span| span.text_content())
+            else {
+                continue;
+            };
+            if text.trim() != label_text {
+                continue;
+            }
+            return label
+                .query_selector("input[type='text']")
+                .unwrap()
+                .unwrap_or_else(|| panic!("label {label_text:?} has no text input"))
+                .dyn_into()
+                .unwrap();
+        }
+        panic!("text input label {label_text:?} not found for member {member_id}");
+    }
+
     #[wasm_bindgen_test]
     async fn new_team_dialog_renders_catalog_and_sends_template_create() {
         let calls = install_send_stub();
@@ -3238,6 +3375,109 @@ mod wasm_tests {
                         == Some("frontend-specialist")
             }),
             "expected SetMemberProfile frame: {frames:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn team_draft_member_name_input_keeps_focus_across_server_echoes() {
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-draft-member-name-focus";
+        let draft_id = TeamDraftId("active-team-draft".to_owned());
+        let member_id = TeamDraftMemberId("draft-manager".to_owned());
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        install_draft(
+            &state,
+            host_id,
+            make_draft(
+                "Generated Team",
+                vec![make_draft_member(
+                    &member_id.0,
+                    TeamMemberRole::Manager,
+                    "Feature Lead",
+                    "Coordinates the feature",
+                )],
+            ),
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+
+        let document = web_sys::window().unwrap().document().unwrap();
+        let name_input = find_draft_member_text_input(&container, &member_id.0, "Name");
+        assert_eq!(
+            name_input.value(),
+            "Feature Lead",
+            "member Name input should render the server-provided draft member name"
+        );
+        let name_input_node: web_sys::Element = name_input.clone().dyn_into().unwrap();
+        let name_input_element: HtmlElement = name_input.clone().dyn_into().unwrap();
+        name_input_element.focus().unwrap();
+
+        let active = document.active_element().expect("focused element");
+        assert!(
+            active.is_same_node(Some(&name_input_node)),
+            "member Name input should receive focus before typing"
+        );
+
+        for typed in ["Feature Lead X", "Feature Lead XY"] {
+            name_input.set_value(typed);
+            let event = web_sys::Event::new("input").unwrap();
+            name_input.dispatch_event(&event).unwrap();
+            next_tick().await;
+
+            state.team_drafts.update(|drafts| {
+                drafts
+                    .get_mut(host_id)
+                    .expect("host drafts")
+                    .get_mut(&draft_id)
+                    .expect("active draft")
+                    .members
+                    .iter_mut()
+                    .find(|member| member.id == member_id)
+                    .expect("draft manager")
+                    .name = typed.to_owned();
+            });
+            next_tick().await;
+
+            let current_input = find_draft_member_text_input(&container, &member_id.0, "Name");
+            let current_node: web_sys::Element = current_input.clone().dyn_into().unwrap();
+            assert!(
+                name_input_node.is_same_node(Some(&current_node)),
+                "member Name input was remounted after typing {typed:?}"
+            );
+            assert_eq!(
+                current_input.value(),
+                typed,
+                "member Name input should keep the typed text"
+            );
+            let active = document.active_element().expect("focused element");
+            assert!(
+                active.is_same_node(Some(&name_input_node)),
+                "member Name input lost focus after typing {typed:?}"
+            );
+        }
+
+        let frames = recorded_frames(&calls);
+        assert!(
+            frames.iter().any(
+                |(kind, payload)| kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+                    && payload
+                        .get("member")
+                        .and_then(|member| member.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some("Feature Lead XY")
+            ),
+            "expected final multi-character draft member name update: {frames:?}"
         );
     }
 
@@ -3573,7 +3813,13 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        click_button_with_text(&container, "Edit");
+        let edit_btn: HtmlElement = container
+            .query_selector("button[aria-label='Edit member']")
+            .unwrap()
+            .expect("edit member icon button should be present")
+            .dyn_into()
+            .unwrap();
+        edit_btn.click();
         next_tick().await;
 
         assert!(

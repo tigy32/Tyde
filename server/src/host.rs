@@ -836,15 +836,22 @@ impl HostHandle {
                 access_mode,
                 session_settings,
             } => {
-                if let Some(project_id) = &payload.project_id {
-                    project_store
-                        .lock()
-                        .await
-                        .get(project_id)
-                        .unwrap_or_else(|| {
-                            panic!("cannot spawn agent in missing project {}", project_id)
-                        });
-                }
+                let (project_id, missing_project_failure) = match payload.project_id.clone() {
+                    Some(project_id) => {
+                        if project_store.lock().await.get(&project_id).is_some() {
+                            (Some(project_id), None)
+                        } else {
+                            (
+                                None,
+                                Some(format!(
+                                    "cannot spawn agent in missing project {}",
+                                    project_id
+                                )),
+                            )
+                        }
+                    }
+                    None => (None, None),
+                };
                 let startup_mcp_servers = startup_mcp_servers_for_settings(
                     &host_settings,
                     &workspace_roots,
@@ -857,7 +864,14 @@ impl HostHandle {
                     mut resolved_spawn_config,
                     startup_warning,
                     startup_failure,
-                ) = if let Some(resolved) = resolved_spawn_config_override.clone() {
+                ) = if let Some(err) = missing_project_failure {
+                    (
+                        requested_custom_agent_id,
+                        ResolvedSpawnConfig::default(),
+                        None,
+                        Some(err),
+                    )
+                } else if let Some(resolved) = resolved_spawn_config_override.clone() {
                     (None, resolved, None, None)
                 } else {
                     let custom_agents = custom_agent_store.lock().await;
@@ -866,7 +880,7 @@ impl HostHandle {
                     let skills = skill_store.lock().await;
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind,
-                        project_id: payload.project_id.as_ref(),
+                        project_id: project_id.as_ref(),
                         custom_agent_id: requested_custom_agent_id.as_ref(),
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
@@ -956,7 +970,7 @@ impl HostHandle {
                         .map(|context| context.team_member_id.clone()),
                     parent_agent_id: payload.parent_agent_id,
                     parent_session_id,
-                    project_id: payload.project_id,
+                    project_id,
                     backend_kind,
                     workspace_roots,
                     initial_input: Some(protocol::SendMessagePayload {
