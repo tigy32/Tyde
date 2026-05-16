@@ -91,12 +91,14 @@
             term.textarea.setAttribute('autocapitalize', 'none');
             term.textarea.setAttribute('autocomplete', 'off');
         }
-        if (fit) {
-            try {
-                fit.fit();
-            } catch (_) {}
-        }
 
+        // Attach listeners BEFORE the initial fit so the resize event that
+        // fit fires when it moves xterm from its 80x24 default to the actual
+        // container size is delivered to the PTY. If we attached after fit
+        // (the previous order), the very first resize was dropped and the
+        // backing PTY stayed at 80x24 — that's what made the shell wrap at
+        // ~80 columns and what made tall menus like `git rebase -i` lose
+        // their top rows even when the terminal pane was visibly larger.
         if (typeof onData === "function") {
             term.onData((data) => {
                 try {
@@ -117,6 +119,25 @@
             });
         }
 
+        if (fit) {
+            try {
+                fit.fit();
+            } catch (_) {}
+            // Re-fit on the next animation frame: when the terminal mounts
+            // while its dock is still settling its flex layout the container
+            // can read as 0x0 at this point, in which case xterm-addon-fit
+            // silently no-ops. By the next frame the container has its real
+            // dimensions and this fit propagates a resize through the now-
+            // attached onResize listener.
+            requestAnimationFrame(() => {
+                const entry = terminals.get(id);
+                if (!entry || !entry.fit) return;
+                try {
+                    entry.fit.fit();
+                } catch (_) {}
+            });
+        }
+
         let observer = null;
         if (typeof window.ResizeObserver === "function" && fit) {
             observer = new window.ResizeObserver(() => {
@@ -127,7 +148,36 @@
             observer.observe(container);
         }
 
-        terminals.set(id, { term, fit, container, observer });
+        // Visibility transitions need their own signal: when a terminal is
+        // created in an inactive tab its `.terminal-content` ancestor is
+        // `display: none`, so xterm-addon-fit's proposeDimensions() reads
+        // `parseInt("auto")` -> NaN for the parent and silently bails. When
+        // the user later activates that tab the ancestor flips to
+        // `display: flex`, but ResizeObserver is not reliable across
+        // display-none/visible transitions in Chromium and the Leptos
+        // activation effect can call fit() before the class change has
+        // committed to the DOM, so the fit there also bails. An
+        // IntersectionObserver fires reliably exactly when the element
+        // becomes rendered/visible in the viewport, at which point fit can
+        // read real parent dimensions and propagate a resize through the
+        // attached onResize listener. Idempotent: when the element is
+        // already visible at create-time the observer fires once with the
+        // same dimensions and term.resize is a no-op.
+        let intersectionObserver = null;
+        if (typeof window.IntersectionObserver === "function" && fit) {
+            intersectionObserver = new window.IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    if (entry.isIntersecting) {
+                        try {
+                            fit.fit();
+                        } catch (_) {}
+                    }
+                }
+            });
+            intersectionObserver.observe(container);
+        }
+
+        terminals.set(id, { term, fit, container, observer, intersectionObserver });
         return { cols: term.cols, rows: term.rows };
     }
 
@@ -143,6 +193,11 @@
         if (entry.observer) {
             try {
                 entry.observer.disconnect();
+            } catch (_) {}
+        }
+        if (entry.intersectionObserver) {
+            try {
+                entry.intersectionObserver.disconnect();
             } catch (_) {}
         }
         try {
