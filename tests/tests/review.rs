@@ -9,11 +9,11 @@ use fixture::Fixture;
 use protocol::{
     AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode, CommandErrorPayload,
     DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
-    ProjectCreatePayload, ProjectDiffScope, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review, ReviewActionPayload,
-    ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor, ReviewCommentId,
-    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
-    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
+    ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review,
+    ReviewActionPayload, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor,
+    ReviewCommentId, ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide,
+    ReviewErrorCode, ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
     ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, SessionId,
     SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
@@ -91,6 +91,33 @@ async fn expect_review_error(
     }
 }
 
+async fn expect_review_list_changed(
+    client: &mut client::Connection,
+    project: &Project,
+    review: &Review,
+) {
+    loop {
+        let env = next_env(client, "review list changed").await;
+        if env.kind != FrameKind::ProjectEvent {
+            continue;
+        }
+        if env.stream.0 != format!("/project/{}", project.id.0) {
+            continue;
+        }
+        match env
+            .parse_payload::<ProjectEventPayload>()
+            .expect("project event payload")
+        {
+            ProjectEventPayload::ReviewListChanged { reviews }
+                if reviews.iter().any(|summary| summary.id == review.id) =>
+            {
+                return;
+            }
+            ProjectEventPayload::ReviewListChanged { .. } => {}
+        }
+    }
+}
+
 async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId) -> Review {
     client
         .review_subscribe(review_id, ReviewSubscribePayload::default())
@@ -103,10 +130,14 @@ async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId)
 }
 
 async fn create_project(client: &mut client::Connection, root: &Path) -> Project {
+    create_project_with_roots(client, vec![root.to_string_lossy().to_string()]).await
+}
+
+async fn create_project_with_roots(client: &mut client::Connection, roots: Vec<String>) -> Project {
     client
         .project_create(ProjectCreatePayload {
             name: "Review Project".to_owned(),
-            roots: vec![root.to_string_lossy().to_string()],
+            roots,
         })
         .await
         .expect("project_create");
@@ -476,6 +507,82 @@ async fn create_review_add_update_delete_and_submit_live() {
             other => panic!("unexpected review event while waiting for consumed: {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn create_review_skips_non_git_roots_in_multi_root_project() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let mut git_roots = Vec::new();
+    for index in 0..4 {
+        let repo = root.path().join(format!("git-root-{index}"));
+        fs::create_dir_all(&repo).expect("create repo");
+        seed_repo(&repo);
+        git_roots.push(repo);
+    }
+    let plain_root = root.path().join("plain-root");
+    fs::create_dir_all(&plain_root).expect("create plain root");
+    fs::write(plain_root.join("notes.txt"), "not a git checkout\n").expect("write plain file");
+    let plain_root = plain_root.to_string_lossy().to_string();
+
+    let project_roots = vec![
+        git_roots[0].to_string_lossy().to_string(),
+        git_roots[1].to_string_lossy().to_string(),
+        plain_root.clone(),
+        git_roots[2].to_string_lossy().to_string(),
+        git_roots[3].to_string_lossy().to_string(),
+    ];
+
+    let project = create_project_with_roots(&mut client, project_roots).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+
+    assert_eq!(review.diffs.len(), 4);
+    assert!(review.diffs.iter().all(|diff| diff.root.0 != plain_root));
+    for git_root in &git_roots {
+        let git_root = git_root.to_string_lossy();
+        let diff = review
+            .diffs
+            .iter()
+            .find(|diff| diff.root.0 == git_root)
+            .unwrap_or_else(|| panic!("missing review diff for {git_root}"));
+        assert_eq!(diff.scope, ProjectDiffScope::Uncommitted);
+        assert_eq!(diff.context_mode, DiffContextMode::FullFile);
+        assert!(
+            diff.files
+                .iter()
+                .any(|file| file.relative_path == "src/lib.rs"),
+            "missing src/lib.rs diff for {git_root}"
+        );
+    }
+    expect_review_list_changed(&mut client, &project, &review).await;
+}
+
+#[tokio::test]
+async fn create_review_with_only_non_git_roots_succeeds_empty() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let plain_a = root.path().join("plain-a");
+    let plain_b = root.path().join("plain-b");
+    fs::create_dir_all(&plain_a).expect("create plain root a");
+    fs::create_dir_all(&plain_b).expect("create plain root b");
+    fs::write(plain_a.join("notes.txt"), "not a git checkout\n").expect("write plain file");
+
+    let project = create_project_with_roots(
+        &mut client,
+        vec![
+            plain_a.to_string_lossy().to_string(),
+            plain_b.to_string_lossy().to_string(),
+        ],
+    )
+    .await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+
+    assert!(review.diffs.is_empty());
+    expect_review_list_changed(&mut client, &project, &review).await;
 }
 
 #[tokio::test]

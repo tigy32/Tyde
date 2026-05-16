@@ -56,8 +56,8 @@ use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, build_dir_listing,
-    commit, discard_file, read_diff, read_file, spawn_project_subscription, stage_file, stage_hunk,
-    unstage_file,
+    commit, discard_file, is_not_git_repository_error, read_diff, read_file,
+    spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::reviewer::{
@@ -3790,29 +3790,35 @@ fn read_review_diffs(
     project: &Project,
     selection: &ReviewDiffSelection,
 ) -> Result<Vec<protocol::ProjectGitDiffPayload>, String> {
-    let payloads = match selection {
-        ReviewDiffSelection::AllUncommitted => project
-            .roots
-            .iter()
-            .map(|root| ProjectReadDiffPayload {
-                root: ProjectRootPath(root.clone()),
-                scope: protocol::ProjectDiffScope::Uncommitted,
-                path: None,
+    match selection {
+        ReviewDiffSelection::AllUncommitted => {
+            let mut diffs = Vec::new();
+            for root in &project.roots {
+                let payload = ProjectReadDiffPayload {
+                    root: ProjectRootPath(root.clone()),
+                    scope: protocol::ProjectDiffScope::Uncommitted,
+                    path: None,
+                    context_mode: protocol::DiffContextMode::FullFile,
+                };
+                match read_diff(project, payload) {
+                    Ok(diff) => diffs.push(diff),
+                    Err(error) if is_not_git_repository_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(diffs)
+        }
+        ReviewDiffSelection::Root { root, scope, path } => read_diff(
+            project,
+            ProjectReadDiffPayload {
+                root: root.clone(),
+                scope: *scope,
+                path: path.clone(),
                 context_mode: protocol::DiffContextMode::FullFile,
-            })
-            .collect::<Vec<_>>(),
-        ReviewDiffSelection::Root { root, scope, path } => vec![ProjectReadDiffPayload {
-            root: root.clone(),
-            scope: *scope,
-            path: path.clone(),
-            context_mode: protocol::DiffContextMode::FullFile,
-        }],
-    };
-
-    payloads
-        .into_iter()
-        .map(|payload| read_diff(project, payload))
-        .collect()
+            },
+        )
+        .map(|diff| vec![diff]),
+    }
 }
 
 async fn project_exists(

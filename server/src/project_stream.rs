@@ -798,6 +798,10 @@ pub(crate) fn build_git_status(project: &Project) -> Result<ProjectGitStatusPayl
     build_git_status_with_runner(project, run_git_mode)
 }
 
+pub(crate) fn is_not_git_repository_error(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("not a git repository")
+}
+
 fn build_git_status_with_runner<F>(
     project: &Project,
     mut run_git: F,
@@ -814,7 +818,7 @@ where
             GitAccessMode::ReadOnly,
         ) {
             Ok(output) => output,
-            Err(err) if err.contains("not a git repository") => {
+            Err(err) if is_not_git_repository_error(&err) => {
                 roots.push(ProjectRootGitStatus {
                     root: ProjectRootPath(root.clone()),
                     branch: None,
