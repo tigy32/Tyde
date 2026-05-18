@@ -63,16 +63,24 @@ After approval:
 1. Confirm the working tree is clean and you are on `main`:
    `git status --short` and `git branch --show-current`. Stop if the tree is
    dirty or the branch is not `main`.
-2. Confirm the commit to release: `git log -1 --oneline`.
-3. Verify the tag does not already exist locally or on `origin`:
+2. Confirm the release commit contains the target version before tagging.
+   Bump the tracked release-version files to `X.Y.Z` (including lockfiles
+   and consistency files) before creating any tag, then run
+   `python3 tools/check_release_version.py vX.Y.Z`. Stop if it fails. Run
+   the full pre-commit sequence and commit the bump locally before
+   continuing.
+3. Confirm the commit to release: `git log -1 --oneline`.
+4. Verify the tag does not already exist locally or on `origin`:
    `git tag --list vX.Y.Z` and `git ls-remote --tags origin vX.Y.Z`. Stop if
    it exists unless the user gives explicit further instructions.
-4. Run the full pre-commit sequence above. Stop if any check fails.
-5. Create the annotated tag:
+5. Run the full pre-commit sequence above. Stop if any check fails.
+6. Re-run the release-version check immediately before tagging:
+   `python3 tools/check_release_version.py vX.Y.Z`. Stop if it fails.
+7. Create the annotated tag:
    `git tag -a vX.Y.Z -m "Release vX.Y.Z"`.
-6. Push `main`, then push the tag:
+8. Push `main`, then push the tag:
    `git push origin main` and `git push origin vX.Y.Z`.
-7. Verify the remote tag exists:
+9. Verify the remote tag exists:
    `git ls-remote --tags origin vX.Y.Z`.
 
 ### 6. Commits don't need to be strictly standalone

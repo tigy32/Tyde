@@ -11,7 +11,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
-    patch: 11,
+    patch: 14,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
