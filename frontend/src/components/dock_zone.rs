@@ -77,7 +77,7 @@ fn RightDock() -> impl IntoView {
                     "Agents"
                 </button>
                 <button class={tab_class(RightTab::Sessions)} on:click=move |_| active_tab.set(RightTab::Sessions)>
-                    "Sessions"
+                    "History"
                 </button>
                 <button class={tab_class(RightTab::Teams)} on:click=move |_| active_tab.set(RightTab::Teams)>
                     "Teams"

@@ -624,6 +624,25 @@ impl AgentsPanelFilters {
     }
 }
 
+/// Per-project filter state for the Sessions/History panel. Stored per
+/// active project (keyed by `Option<ActiveProjectRef>`, where `None`
+/// represents the Home project) so user toggles persist across project
+/// switches for the life of the app.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionsPanelFilters {
+    pub show_child_sessions: bool,
+    pub show_other_projects: bool,
+}
+
+impl SessionsPanelFilters {
+    pub fn defaults_for(project: Option<&ActiveProjectRef>) -> Self {
+        Self {
+            show_child_sessions: false,
+            show_other_projects: project.is_none(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveAgentRef {
     pub host_id: String,
@@ -741,6 +760,7 @@ pub struct AppState {
     pub team_member_shuffle_suggestions:
         RwSignal<HashMap<String, HashMap<TeamId, TeamMemberShuffleSuggestionEntry>>>,
     pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
+    pub sessions_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, SessionsPanelFilters>>,
     /// Per-review full state. Server is the source of truth: a `ReviewView`
     /// subscribes to `/review/<id>` and dispatch applies `ReviewEvent`
     /// deltas to the entry. The first event on subscribe is always
@@ -941,6 +961,7 @@ impl AppState {
             team_drafts: RwSignal::new(HashMap::new()),
             team_member_shuffle_suggestions: RwSignal::new(HashMap::new()),
             agents_panel_filters: RwSignal::new(HashMap::new()),
+            sessions_panel_filters: RwSignal::new(HashMap::new()),
             reviews: RwSignal::new(HashMap::new()),
             review_summaries: RwSignal::new(HashMap::new()),
             review_create_pending: RwSignal::new(HashMap::new()),
