@@ -535,6 +535,82 @@ fn MemberRow(
         on_promote.run(mid_for_promote.clone());
     };
 
+    // Compact/Rotate action on a team member operates on the live bound
+    // agent. Gated on: there *is* a live binding for this member, that
+    // binding is `Idle`, the binding's agent isn't already mid-
+    // compaction, and the host is connected. Hidden otherwise so the
+    // user never sees an enabled button they can't usefully press.
+    let host_for_compact = host_id.clone();
+    let binding_for_compact = binding;
+    let state_for_compact_gate = state.clone();
+    let can_compact = move || {
+        let Some(binding) = binding_for_compact.get() else {
+            return false;
+        };
+        if binding.current_agent_id.is_none() {
+            return false;
+        }
+        if !matches!(binding.status, protocol::AgentControlStatus::Idle) {
+            return false;
+        }
+        let Some(agent_id) = binding.current_agent_id else {
+            return false;
+        };
+        if state_for_compact_gate
+            .compaction_in_progress
+            .with(|map| map.contains_key(&agent_id))
+        {
+            return false;
+        }
+        matches!(
+            state_for_compact_gate.connection_status_for_host(&host_for_compact),
+            crate::state::ConnectionStatus::Connected
+        )
+    };
+    let host_for_compact_click = host_id.clone();
+    let binding_for_compact_click = binding;
+    let state_for_compact_click = state.clone();
+    let on_compact_click = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        let Some(binding) = binding_for_compact_click.get_untracked() else {
+            return;
+        };
+        let Some(agent_id) = binding.current_agent_id else {
+            return;
+        };
+        let host_id = host_for_compact_click.clone();
+        let state = state_for_compact_click.clone();
+        let agent_stream = state.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|a| a.host_id == host_id && a.agent_id == agent_id)
+                .map(|a| a.instance_stream.clone())
+        });
+        let Some(agent_stream) = agent_stream else {
+            log::error!(
+                "team-member compact: bound agent {} not found on host {host_id}",
+                agent_id.0
+            );
+            return;
+        };
+        // The server marks the predecessor session non-resumable as
+        // part of the compaction protocol, so don't promise the user
+        // they can pick it back up. The summary stays in Sessions as
+        // a read-only record of what was kept.
+        let message =
+            "Compact agent for this team member?\n\nThe agent will write a summary of context worth keeping and a fresh replacement will start from that summary. The original session is closed and kept in Sessions as a read-only record — you can view it, but it can't be resumed.".to_string();
+        spawn_local(async move {
+            if !crate::bridge::confirm_dialog("Compact agent", &message).await {
+                return;
+            }
+            state.mark_compaction_started(&host_id, agent_id.clone());
+            if let Err(e) = crate::send::compact_agent(&host_id, agent_stream).await {
+                log::error!("team-member compact: failed to send AgentCompact: {e}");
+                state.finish_compaction_failure(agent_id, e);
+            }
+        });
+    };
+
     let can_promote = move || matches!(member.get().map(|m| m.role), Some(TeamMemberRole::Report));
     let host_for_active = host_id.clone();
     let member_id_for_active = member_id.clone();
@@ -625,6 +701,15 @@ fn MemberRow(
                         on:click=on_promote_click.clone()
                     >"\u{2605}"</button>
                 })}
+                {move || can_compact().then(|| view! {
+                    <button
+                        class="team-member-icon-btn team-member-icon-btn-compact"
+                        type="button"
+                        title="Compact agent"
+                        aria-label="Compact agent"
+                        on:click=on_compact_click.clone()
+                    >"\u{27F2}"</button>
+                })}
                 <button
                     class="team-member-icon-btn"
                     type="button"
@@ -680,6 +765,68 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
         catalog_state
             .team_preset_catalogs
             .with(|catalogs| catalogs.get(&host_id).cloned())
+    });
+
+    // Projects available on the host that hosts the open draft. Sorted by
+    // display name so the upfront picker is stable.
+    let projects_state = state.clone();
+    let host_projects: Memo<Vec<protocol::Project>> = Memo::new(move |_| {
+        let Some(host_id) = projects_state.selected_host_id.get() else {
+            return Vec::new();
+        };
+        let mut projects: Vec<protocol::Project> = projects_state
+            .projects
+            .get()
+            .into_iter()
+            .filter(|p| p.host_id == host_id)
+            .map(|p| p.project)
+            .collect();
+        projects.sort_by(|a, b| a.name.cmp(&b.name));
+        projects
+    });
+
+    // Default backend declared in HostSettings for the draft's host. Used to
+    // auto-fill each member's backend the moment the draft appears, so the
+    // user only has to override per-member when they really want to.
+    let backend_state = state.clone();
+    let default_backend: Memo<Option<BackendKind>> = Memo::new(move |_| {
+        let host_id = backend_state.selected_host_id.get()?;
+        backend_state
+            .host_settings_by_host
+            .with(|map| map.get(&host_id).and_then(|s| s.default_backend))
+    });
+
+    // One project applies to every member of the new team. Seeded from the
+    // currently-active project when that project lives on the draft's host;
+    // otherwise from the first available project. The user can still
+    // override.
+    let wizard_project: RwSignal<Option<ProjectId>> = RwSignal::new(None);
+    let project_seed_state = state.clone();
+    Effect::new(move |_| {
+        if current_draft_key.get().is_none() {
+            return;
+        }
+        if wizard_project.get_untracked().is_some() {
+            return;
+        }
+        let Some(host_id) = project_seed_state.selected_host_id.get() else {
+            return;
+        };
+        let available = host_projects.get();
+        let active_match = project_seed_state
+            .active_project
+            .get()
+            .filter(|active| active.host_id == host_id)
+            .and_then(|active| {
+                available
+                    .iter()
+                    .find(|p| p.id == active.project_id)
+                    .map(|p| p.id.clone())
+            });
+        let seed = active_match.or_else(|| available.first().map(|p| p.id.clone()));
+        if let Some(id) = seed {
+            wizard_project.set(Some(id));
+        }
     });
 
     let command_error_state = state.clone();
@@ -883,6 +1030,68 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
         })
     };
 
+    // The upfront Project picker is authoritative for every draft
+    // member's `project_ids` in this wizard — per-member project
+    // controls are intentionally hidden, so the picker is the only way
+    // to set project membership. Every time the picker changes, sync
+    // each member to `[selected]`; if the picker is cleared, clear each
+    // member so server-side validation surfaces the missing project
+    // rather than letting a stale project linger.
+    //
+    // Backend is filled from `HostSettings.default_backend` only when
+    // the member's `backend_kind` is missing — never overwrites a
+    // per-member override the user picked from the backend select.
+    //
+    // The replace echoes back through `team_drafts` so each predicate
+    // flips false on the next run and there is no loop.
+    let autofill_state = state.clone();
+    Effect::new(move |_| {
+        let Some((host_id, draft)) = current_draft.get() else {
+            return;
+        };
+        let backend = default_backend.get();
+        let project = wizard_project.get();
+        let project_target: Vec<ProjectId> = project
+            .as_ref()
+            .cloned()
+            .map(|id| vec![id])
+            .unwrap_or_default();
+        let Some(stream) = autofill_state.host_stream_untracked(&host_id) else {
+            return;
+        };
+        let draft_id = draft.id.clone();
+        for member in draft.members.iter() {
+            let needs_backend = member.backend_kind.is_none() && backend.is_some();
+            let needs_project_sync = member.project_ids != project_target;
+            if !needs_backend && !needs_project_sync {
+                continue;
+            }
+            let mut edit = TeamDraftMemberEdit {
+                id: member.id.clone(),
+                name: member.name.clone(),
+                description: member.description.clone(),
+                custom_agent_id: member.custom_agent_id.clone(),
+                backend_kind: member.backend_kind,
+                cost_hint: member.cost_hint,
+                project_ids: member.project_ids.clone(),
+            };
+            if needs_backend {
+                edit.backend_kind = backend;
+            }
+            if needs_project_sync {
+                edit.project_ids = project_target.clone();
+            }
+            let host = host_id.clone();
+            let stream = stream.clone();
+            let draft = draft_id.clone();
+            spawn_local(async move {
+                if let Err(error) = team_draft_replace_member(&host, stream, draft, edit).await {
+                    log::error!("team_draft_replace_member autofill failed: {error}");
+                }
+            });
+        }
+    });
+
     view! {
         <ModalOverlay on_close=on_close wide=true>
             <h3 class="settings-confirm-title">"New team"</h3>
@@ -957,6 +1166,37 @@ fn NewTeamDialog(on_close: Callback<()>) -> impl IntoView {
                                     autocapitalize="none"
                                     autocomplete="off"
                                 />
+                            </label>
+                            <label class="settings-form-label">
+                                <span>"Project"<span class="settings-form-hint">" (applies to every team member)"</span></span>
+                                <select
+                                    class="settings-text-input team-draft-project-select"
+                                    on:change=move |ev| {
+                                        let value = event_target_value(&ev);
+                                        wizard_project.set(
+                                            (!value.is_empty()).then_some(ProjectId(value)),
+                                        );
+                                    }
+                                >
+                                    <option
+                                        value=""
+                                        prop:selected=move || wizard_project.get().is_none()
+                                    >"— select project —"</option>
+                                    {move || host_projects.get().into_iter().map(|project| {
+                                        let id_val = project.id.clone();
+                                        let value = project.id.0.clone();
+                                        let label = project.name.clone();
+                                        view! {
+                                            <option
+                                                value=value
+                                                prop:selected=move || wizard_project.get().as_ref() == Some(&id_val)
+                                            >{label}</option>
+                                        }
+                                    }).collect_view()}
+                                </select>
+                                {move || host_projects.get().is_empty().then(|| view! {
+                                    <span class="settings-form-hint">"No projects on this host. Create one before adding team members."</span>
+                                })}
                             </label>
                             <div class="team-draft-template-actions">
                                 {move || catalog.get().and_then(|catalog| {
@@ -1069,20 +1309,6 @@ fn DraftMemberRow(
             .unwrap_or_default();
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         agents
-    });
-
-    let state_for_projects = state.clone();
-    let host_for_projects = host_id.clone();
-    let available_projects: Memo<Vec<protocol::Project>> = Memo::new(move |_| {
-        let mut projects: Vec<protocol::Project> = state_for_projects
-            .projects
-            .get()
-            .into_iter()
-            .filter(|p| p.host_id == host_for_projects)
-            .map(|p| p.project)
-            .collect();
-        projects.sort_by(|a, b| a.name.cmp(&b.name));
-        projects
     });
 
     let state_for_backends = state.clone();
@@ -1204,8 +1430,29 @@ fn DraftMemberRow(
         })
     };
 
+    // Surface the member's current `project_ids` as a comma-separated
+    // attribute so the upfront Project picker's effect on each member is
+    // observable from the DOM (E2E + wasm test verification, and a
+    // future visual badge if we want one). Read-only — the upfront
+    // picker is still the only edit surface in this wizard.
+    let project_ids_attr = move || {
+        member
+            .get()
+            .map(|m| {
+                m.project_ids
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default()
+    };
     view! {
-        <div class="team-draft-member-card" data-draft-member-id=member_id.0.clone()>
+        <div
+            class="team-draft-member-card"
+            data-draft-member-id=member_id.0.clone()
+            data-project-ids=project_ids_attr
+        >
             <div class="team-draft-member-header">
                 <strong>{move || member.get().map(|member| member.name).filter(|name| !name.is_empty()).unwrap_or_else(|| "Unnamed member".to_owned())}</strong>
                 <span class="team-member-role-badge">
@@ -1390,46 +1637,6 @@ fn DraftMemberRow(
                             .collect_view()}
                     </select>
                 </label>
-                <div class="settings-form-label team-member-projects">
-                    <span>"Projects"<span class="settings-form-hint">" (pick one or more)"</span></span>
-                    <div class="team-member-project-list">
-                        <For
-                            each=move || available_projects.get()
-                            key=|project| project.id.clone()
-                            let:project
-                        >
-                            {
-                                let id_for_checked = project.id.clone();
-                                let id_for_change = project.id.clone();
-                                let input_id = project.id.0.clone();
-                                view! {
-                                    <label class="team-member-project-row">
-                                        <input
-                                            id=input_id
-                                            type="checkbox"
-                                            prop:checked=move || member.get().map(|member| member.project_ids.iter().any(|id| id == &id_for_checked)).unwrap_or(false)
-                                            on:change=move |ev| {
-                                                let checked = event_target_checked(&ev);
-                                                let project_id = id_for_change.clone();
-                                                if let Some(mut current) = member.get_untracked() {
-                                                    if checked {
-                                                        if !current.project_ids.iter().any(|id| id == &project_id) {
-                                                            current.project_ids.push(project_id);
-                                                        }
-                                                    } else {
-                                                        current.project_ids.retain(|id| id != &project_id);
-                                                    }
-                                                    send_replace.run(current);
-                                                }
-                                            }
-                                        />
-                                        <span class="team-member-project-name">{project.name}</span>
-                                    </label>
-                                }
-                            }
-                        </For>
-                    </div>
-                </div>
             </div>
         </div>
     }
@@ -2441,6 +2648,234 @@ mod wasm_tests {
         assert!(
             row_text.contains("last active recorded"),
             "expected last-active text after binding update: {row_text:?}"
+        );
+    }
+
+    /// Compact icon on a `MemberRow` only shows up when the team member
+    /// has a live binding (`current_agent_id` is `Some`) AND that binding
+    /// is `Idle` AND the bound agent is in `state.agents` (so we can
+    /// route to its instance stream) AND the host is connected.
+    /// Clicking it (through the OK-stubbed confirm dialog) sends a real
+    /// `AgentCompact` frame targeting the *bound agent's* instance
+    /// stream — not the host stream — and flips the in-progress flag.
+    #[wasm_bindgen_test]
+    async fn member_row_compact_gated_on_bound_idle_and_routes_to_agent() {
+        let calls = install_send_stub();
+        let _ = js_sys::eval(
+            r#"
+            window.__TAURI__.core.invoke = function(cmd, args) {
+                window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                if (cmd === 'plugin:dialog|message') {
+                    return Promise.resolve('Ok');
+                }
+                return Promise.resolve();
+            };
+            "#,
+        );
+
+        let host_id = "host-compact";
+        let manager_id = TeamMemberId("m-mgr".to_owned());
+        let bound_agent_id = AgentId("a-mgr".to_owned());
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-mgr")],
+            vec![make_member(
+                "m-mgr",
+                "t-1",
+                "Manager",
+                TeamMemberRole::Manager,
+            )],
+        );
+        install_host_stream(&state, host_id);
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.to_owned(), ConnectionStatus::Connected);
+        });
+        // The compact handler reaches for the bound agent's
+        // instance_stream from state.agents — install one.
+        state.agents.update(|agents| {
+            agents.push(crate::state::AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: bound_agent_id.clone(),
+                name: "Manager Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                // Mirror the real backend format `/agent/<id>/<uuid>`.
+                // Using a stable suffix keeps tests deterministic.
+                instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            });
+        });
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        // No binding yet → no Compact icon. The other action icons
+        // (Edit, Delete) should still be present per the existing UX so
+        // this assertion is *narrow*: only the compact icon is gated.
+        assert!(
+            container
+                .query_selector(".team-member-icon-btn-compact")
+                .unwrap()
+                .is_none(),
+            "compact icon must be hidden when the member has no live binding"
+        );
+
+        // Bind, but mark as Thinking. Still hidden.
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            entry.insert(
+                manager_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: manager_id.clone(),
+                    current_agent_id: Some(bound_agent_id.clone()),
+                    status: AgentControlStatus::Thinking,
+                    last_active_at_ms: Some(123),
+                },
+            );
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".team-member-icon-btn-compact")
+                .unwrap()
+                .is_none(),
+            "compact icon must be hidden while the binding is Thinking"
+        );
+
+        // Flip to Idle. Compact icon should now render.
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            entry.insert(
+                manager_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: manager_id.clone(),
+                    current_agent_id: Some(bound_agent_id.clone()),
+                    status: AgentControlStatus::Idle,
+                    last_active_at_ms: Some(456),
+                },
+            );
+        });
+        next_tick().await;
+
+        let btn: HtmlElement = container
+            .query_selector(".team-member-icon-btn-compact")
+            .unwrap()
+            .expect("compact icon should render for Idle bound member")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            btn.get_attribute("aria-label").as_deref(),
+            Some("Compact agent")
+        );
+
+        // Click → confirm dialog (Ok) → spawn_local → real
+        // `AgentCompact` frame on the agent's instance stream.
+        btn.click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        // The compact button must surface accurate wording in the
+        // confirmation dialog: backend marks the predecessor session
+        // non-resumable, so the dialog must not promise the user they
+        // can pick it back up. Walk the recorded invoke calls,
+        // find the `plugin:dialog|message` invocation, and assert on
+        // the `message` arg.
+        let mut dialog_message: Option<String> = None;
+        for entry in calls.iter() {
+            let arr = entry.dyn_into::<js_sys::Array>().expect("array");
+            if arr.get(0).as_string().as_deref() != Some("plugin:dialog|message") {
+                continue;
+            }
+            let args_json = arr.get(1).as_string().expect("args");
+            let args: JsonValue = serde_json::from_str(&args_json).expect("args parse");
+            if let Some(msg) = args.get("message").and_then(|v| v.as_str()) {
+                dialog_message = Some(msg.to_owned());
+                break;
+            }
+        }
+        let dialog_message = dialog_message
+            .expect("team-member compact must open a confirm dialog before sending the frame");
+        assert!(
+            !dialog_message.to_lowercase().contains("can be resumed"),
+            "team-member compact dialog must not promise the original session can be resumed; got: {dialog_message:?}"
+        );
+        assert!(
+            dialog_message.contains("can't be resumed"),
+            "team-member compact dialog must state the original session can't be resumed; got: {dialog_message:?}"
+        );
+        assert!(
+            dialog_message.to_lowercase().contains("read-only")
+                || dialog_message.to_lowercase().contains("read only"),
+            "team-member compact dialog must mention the session remains as a read-only record; got: {dialog_message:?}"
+        );
+
+        let frames = recorded_frames(&calls);
+        let compact_frames: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _)| kind == &FrameKind::AgentCompact.to_string())
+            .collect();
+        assert_eq!(
+            compact_frames.len(),
+            1,
+            "team-member compact should fire exactly one AgentCompact frame, all frames: {frames:?}"
+        );
+        let envelope_for_stream = compact_frames[0].1.clone();
+        // The frames vector loses the stream path; re-decode it from
+        // the raw recorded send_host_line calls to assert it routes via
+        // the bound agent's instance stream (not the host stream).
+        let mut routed_to_agent_stream = false;
+        for entry in calls.iter() {
+            let arr = entry.dyn_into::<js_sys::Array>().expect("array");
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let args_json = arr.get(1).as_string().expect("args");
+            let args: JsonValue = serde_json::from_str(&args_json).expect("args parse");
+            let line = args.get("line").and_then(|v| v.as_str()).expect("line");
+            let env: JsonValue = serde_json::from_str(line).expect("envelope parse");
+            if env.get("kind").and_then(|v| v.as_str()) == Some("agent_compact") {
+                routed_to_agent_stream =
+                    env.get("stream").and_then(|v| v.as_str()) == Some("/agent/a-mgr/inst");
+                break;
+            }
+        }
+        assert!(
+            routed_to_agent_stream,
+            "AgentCompact must target the bound agent's instance stream /agent/a-mgr/inst"
+        );
+        assert_eq!(
+            envelope_for_stream,
+            serde_json::json!({}),
+            "default AgentCompactPayload omits optional fields"
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&bound_agent_id)),
+            "bound agent should be marked in-flight while the server processes"
+        );
+
+        // While in-flight, the compact icon is hidden again so the user
+        // can't double-fire.
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".team-member-icon-btn-compact")
+                .unwrap()
+                .is_none(),
+            "compact icon must be hidden while a compaction is already in flight for the bound agent"
         );
     }
 
@@ -3529,8 +3964,10 @@ mod wasm_tests {
         next_tick().await;
         set_select_by_label(&container, "Cost effort", "low");
         next_tick().await;
-        check_project_checkbox(&container, project_id);
-        next_tick().await;
+        // The wizard's upfront Project picker self-seeds from the installed
+        // project list and propagates to each member via the autofill
+        // effect; no per-member project checkbox to click.
+        let _ = project_id;
         click_button_with_text(&container, "Create team");
         next_tick().await;
 
@@ -3568,6 +4005,369 @@ mod wasm_tests {
                     && kind != &FrameKind::TeamMemberCreate.to_string()),
             "new team flow must not use create-then-member loop: {frames:?}"
         );
+    }
+
+    /// The wizard auto-fills every draft member's backend from the host's
+    /// `HostSettings.default_backend` and the upfront Project picker's
+    /// selection (seeded from the user's currently-open project). Users
+    /// only have to touch those fields when they want to override.
+    #[wasm_bindgen_test]
+    async fn new_team_wizard_autofills_backend_and_project_from_defaults() {
+        use crate::state::ActiveProjectRef;
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-autofill";
+        let active_project_id = "p-active";
+        let other_project_id = "p-other";
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        // Two projects on the host; the autofill should pick the active
+        // one, not just the first by name.
+        install_project(&state, host_id, other_project_id, "Aardvark");
+        install_project(&state, host_id, active_project_id, "Zebra");
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: host_id.to_owned(),
+            project_id: ProjectId(active_project_id.to_owned()),
+        }));
+        install_draft(
+            &state,
+            host_id,
+            make_draft(
+                "",
+                vec![make_draft_member(
+                    "draft-manager",
+                    TeamMemberRole::Manager,
+                    "",
+                    "",
+                )],
+            ),
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+        // Two ticks: the project-seed effect runs on draft visibility,
+        // then the autofill effect picks up the seeded project.
+        next_tick().await;
+
+        let frames = recorded_frames(&calls);
+        let replaces: Vec<_> = frames
+            .iter()
+            .filter(|(kind, payload)| {
+                kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+            })
+            .collect();
+        assert!(
+            !replaces.is_empty(),
+            "expected at least one autofill replace_member frame: {frames:?}"
+        );
+        let last = replaces
+            .last()
+            .expect("replace_member frames non-empty above");
+        let member = last
+            .1
+            .get("member")
+            .expect("replace_member carries member payload");
+        assert_eq!(
+            member.get("backend_kind").and_then(|v| v.as_str()),
+            Some("claude"),
+            "autofill should use the host's default_backend: {member:?}"
+        );
+        let project_ids = member
+            .get("project_ids")
+            .and_then(|v| v.as_array())
+            .expect("project_ids should be an array");
+        assert_eq!(project_ids.len(), 1, "exactly one project: {project_ids:?}");
+        assert_eq!(
+            project_ids[0].as_str(),
+            Some(active_project_id),
+            "autofill should seed the active project, not the first by name"
+        );
+    }
+
+    /// Helper: drive the upfront wizard Project picker. Targets the class
+    /// directly because the picker label includes an inline hint span
+    /// that confuses the generic `set_select_by_label` text matcher.
+    fn pick_wizard_project(container: &HtmlElement, value: &str) {
+        let select: web_sys::HtmlSelectElement = container
+            .query_selector("select.team-draft-project-select")
+            .unwrap()
+            .expect("upfront project picker should be visible in the wizard")
+            .dyn_into()
+            .unwrap();
+        select.set_value(value);
+        let event = web_sys::Event::new("change").unwrap();
+        select.dispatch_event(&event).unwrap();
+    }
+
+    /// Treat the upfront Project picker as the single source of truth for
+    /// every draft member: changing the selection must propagate to *all*
+    /// existing members, not just the ones whose `project_ids` are empty.
+    /// Without this, hiding per-member project controls leaves users
+    /// unable to correct the stale selection.
+    #[wasm_bindgen_test]
+    async fn upfront_project_change_overrides_existing_member_project_ids() {
+        use crate::state::ActiveProjectRef;
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-upfront-change";
+        let project_a = "p-a";
+        let project_b = "p-b";
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        install_project(&state, host_id, project_a, "Project A");
+        install_project(&state, host_id, project_b, "Project B");
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: host_id.to_owned(),
+            project_id: ProjectId(project_a.to_owned()),
+        }));
+        install_draft(
+            &state,
+            host_id,
+            make_draft(
+                "",
+                vec![make_draft_member(
+                    "draft-manager",
+                    TeamMemberRole::Manager,
+                    "",
+                    "",
+                )],
+            ),
+        );
+        // Stand in for the server: when the frontend sends a replace_member
+        // the real host echoes a TeamDraftNotify with the new field values.
+        // Without an echo the autofill effect's `member.project_ids !=
+        // project_target` predicate never flips false, so simulate it here
+        // by mirroring the latest replace_member into `team_drafts`.
+        let echo_state = state.clone();
+        let echo_host = host_id.to_owned();
+        let echo_calls = calls.clone();
+        let echo = move || {
+            let frames = recorded_frames(&echo_calls);
+            let latest = frames.into_iter().rev().find(|(kind, payload)| {
+                kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+            });
+            let Some((_, payload)) = latest else { return };
+            let Some(member) = payload.get("member") else {
+                return;
+            };
+            let member_id = member
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let project_ids: Vec<ProjectId> = member
+                .get("project_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| ProjectId(s.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let backend = member
+                .get("backend_kind")
+                .and_then(|v| v.as_str())
+                .and_then(parse_backend_kind);
+            echo_state.team_drafts.update(|map| {
+                if let Some(drafts) = map.get_mut(&echo_host)
+                    && let Some(draft) = drafts.values_mut().next()
+                    && let Some(m) = draft.members.iter_mut().find(|m| m.id.0 == member_id)
+                {
+                    m.project_ids = project_ids;
+                    if backend.is_some() {
+                        m.backend_kind = backend;
+                    }
+                }
+            });
+        };
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+        next_tick().await; // seed → autofill cascade
+        echo(); // mirror the autofill A onto state
+        next_tick().await;
+
+        let frames_after_seed = recorded_frames(&calls);
+        let last_replace_a = frames_after_seed
+            .iter()
+            .rev()
+            .find(|(kind, payload)| {
+                kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+            })
+            .expect("seed autofill should send a replace_member");
+        let seeded_projects = last_replace_a
+            .1
+            .get("member")
+            .and_then(|m| m.get("project_ids"))
+            .and_then(|v| v.as_array())
+            .expect("seed replace_member carries project_ids");
+        assert_eq!(seeded_projects.len(), 1);
+        assert_eq!(seeded_projects[0].as_str(), Some(project_a));
+
+        // No per-member project section in the wizard — this is the
+        // contract that makes the upfront picker the only way to set
+        // project membership. If this shape were ever silently restored
+        // the user could be left with inconsistent state on picker
+        // changes.
+        let per_member_projects = container
+            .query_selector_all(".team-draft-member-card .team-member-projects")
+            .unwrap();
+        assert_eq!(
+            per_member_projects.length(),
+            0,
+            "wizard should not render per-member project pickers"
+        );
+
+        // The card's data-project-ids attribute reflects the live member
+        // state and is the DOM surface E2E and visual debug can read.
+        let card_before: HtmlElement = container
+            .query_selector(".team-draft-member-card[data-draft-member-id='draft-manager']")
+            .unwrap()
+            .expect("draft manager card present")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            card_before.get_attribute("data-project-ids").as_deref(),
+            Some(project_a),
+            "card data-project-ids should reflect the seeded project A"
+        );
+
+        // Now change the upfront picker to project B and confirm the
+        // member's project_ids is replaced with [project_b], not just
+        // additive or ignored.
+        pick_wizard_project(&container, project_b);
+        next_tick().await;
+        next_tick().await;
+        echo();
+        next_tick().await;
+
+        let frames_after_change = recorded_frames(&calls);
+        let last_replace_b = frames_after_change
+            .iter()
+            .rev()
+            .find(|(kind, payload)| {
+                kind == &FrameKind::TeamDraftUpdate.to_string()
+                    && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+            })
+            .expect("picker change should send a replace_member");
+        let new_projects = last_replace_b
+            .1
+            .get("member")
+            .and_then(|m| m.get("project_ids"))
+            .and_then(|v| v.as_array())
+            .expect("post-change replace_member carries project_ids");
+        assert_eq!(
+            new_projects.len(),
+            1,
+            "exactly one project after picker change: {new_projects:?}"
+        );
+        assert_eq!(
+            new_projects[0].as_str(),
+            Some(project_b),
+            "picker change must rewrite member project_ids to the new selection"
+        );
+        let card_after: HtmlElement = container
+            .query_selector(".team-draft-member-card[data-draft-member-id='draft-manager']")
+            .unwrap()
+            .expect("draft manager card present after picker change")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            card_after.get_attribute("data-project-ids").as_deref(),
+            Some(project_b),
+            "card data-project-ids should re-render to project B after picker change"
+        );
+    }
+
+    /// Multi-member drafts (template-instantiated or generated) must all
+    /// receive the upfront-picked project on autofill, not just the first.
+    #[wasm_bindgen_test]
+    async fn upfront_project_propagates_to_all_template_members() {
+        use crate::state::ActiveProjectRef;
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-multi-member";
+        let project_id = "p-1";
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        install_project(&state, host_id, project_id, "Test Project");
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: host_id.to_owned(),
+            project_id: ProjectId(project_id.to_owned()),
+        }));
+        install_draft(
+            &state,
+            host_id,
+            make_draft(
+                "",
+                vec![
+                    make_draft_member("draft-manager", TeamMemberRole::Manager, "", ""),
+                    make_draft_member("draft-report-1", TeamMemberRole::Report, "", ""),
+                    make_draft_member("draft-report-2", TeamMemberRole::Report, "", ""),
+                ],
+            ),
+        );
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+        next_tick().await;
+
+        let frames = recorded_frames(&calls);
+        // Group replace_member frames by member id and assert each member
+        // saw at least one autofill that targets [project_id].
+        use std::collections::HashSet;
+        let mut covered: HashSet<String> = HashSet::new();
+        for (kind, payload) in &frames {
+            if kind != &FrameKind::TeamDraftUpdate.to_string() {
+                continue;
+            }
+            if payload.get("kind").and_then(|v| v.as_str()) != Some("replace_member") {
+                continue;
+            }
+            let Some(member) = payload.get("member") else {
+                continue;
+            };
+            let project_ids = member
+                .get("project_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if project_ids == vec![project_id] {
+                if let Some(id) = member.get("id").and_then(|v| v.as_str()) {
+                    covered.insert(id.to_owned());
+                }
+            }
+        }
+        for expected in ["draft-manager", "draft-report-1", "draft-report-2"] {
+            assert!(
+                covered.contains(expected),
+                "expected autofill replace_member for {expected} with [{project_id}], saw {frames:?}"
+            );
+        }
     }
 
     #[wasm_bindgen_test]

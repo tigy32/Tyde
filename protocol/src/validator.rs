@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::types::{CloseAgentPayload, NewTerminalPayload};
+use crate::types::{
+    AgentCompactNotifyPayload, AgentCompactPayload, CloseAgentPayload, NewTerminalPayload,
+};
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
     ChatEvent, CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
@@ -392,9 +394,29 @@ impl ProtocolValidator {
                     ));
                 }
             }
+            FrameKind::AgentCompactNotify => {
+                let _: AgentCompactNotifyPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse AgentCompactNotify payload: {error}"),
+                    )
+                })?;
+            }
             FrameKind::AgentError => {}
             FrameKind::SessionSettings => {}
             FrameKind::SetSessionSettings => {}
+            FrameKind::AgentCompact => {
+                let _: AgentCompactPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse AgentCompact payload: {error}"),
+                    )
+                })?;
+            }
             FrameKind::QueuedMessages => {}
             FrameKind::EditQueuedMessage => {}
             FrameKind::CancelQueuedMessage => {}

@@ -523,6 +523,28 @@ pub fn sort_project_infos(projects: &mut [ProjectInfo]) {
     });
 }
 
+/// Close every Chat tab in `center_zone` whose `agent_ref` points at
+/// `(host_id, agent_id)`. Mirror of `dispatch::close_agent_tabs`, kept
+/// in `state` so `finalize_compaction_close` can reuse it without
+/// pulling state internals into the dispatcher.
+fn close_agent_tabs_in_cz(center_zone: &mut CenterZoneState, host_id: &str, agent_id: &AgentId) {
+    let remove_ids: Vec<_> = center_zone
+        .tabs
+        .iter()
+        .filter(|tab| {
+            matches!(
+                &tab.content,
+                TabContent::Chat { agent_ref: Some(ar), .. }
+                    if ar.host_id == host_id && ar.agent_id == *agent_id
+            )
+        })
+        .map(|tab| tab.id)
+        .collect();
+    for id in remove_ids {
+        center_zone.close(id);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionInfo {
     pub host_id: String,
@@ -752,6 +774,53 @@ pub struct AppState {
     /// the matching `ReviewEvent` echoes back, or on
     /// `ReviewEvent::Error` whose context matches.
     pub review_action_target_pending: RwSignal<HashSet<(ReviewId, ReviewActionTarget)>>,
+    /// Agents whose compaction request is in flight, keyed by the old
+    /// agent id, with a snapshot of identifying fields captured at
+    /// compaction-start time. The fingerprint lets the `NewAgent`
+    /// dispatcher tell which incoming user-origin agent is the
+    /// replacement (and so should NOT auto-open a competing tab) versus
+    /// an unrelated spawn. The Agents panel renders these agents with a
+    /// running-blue "Compacting…" pill and hides the Compact button so
+    /// the user can't double-fire. Cleared by
+    /// `finish_compaction_success` / `finish_compaction_failure`.
+    pub compaction_in_progress: RwSignal<HashMap<AgentId, CompactionOldInfo>>,
+    /// Last non-fatal compaction error per agent, keyed by the agent the
+    /// user asked to compact. Rendered as an inline message on the agent
+    /// card; cleared on the next successful start.
+    pub compaction_errors: RwSignal<HashMap<AgentId, String>>,
+    /// `Completed` notify can arrive before the replacement's `NewAgent`
+    /// echo is dispatched. When that happens we stash `new → old` here
+    /// keyed by `(host_id, new_agent_id)`, and the `NewAgent` arm flushes
+    /// the entry by calling `finish_compaction_success`.
+    pub compaction_pending_completion: RwSignal<HashMap<(String, AgentId), AgentId>>,
+    /// Defensive belt for ordering inversions. Under the current
+    /// server contract the event order is `NewAgent (replacement) →
+    /// Completed (on old, still-valid stream) → AgentClosed (old)`,
+    /// so by the time `AgentClosed` lands `compaction_in_progress`
+    /// has already been cleared by `Completed` and the deferred-close
+    /// set stays empty. We keep the set so that if the server ever
+    /// inverts ordering for any reason — `AgentClosed` before
+    /// `Completed` — we still preserve the user's chat tab until
+    /// `Completed` retargets it. Drained at
+    /// `finish_compaction_success` time.
+    pub compaction_pending_close: RwSignal<HashSet<(String, AgentId)>>,
+}
+
+/// Snapshot of identifying fields captured for an agent at the moment
+/// its compaction was kicked off. Used by `dispatch::apply_new_agent` to
+/// recognize the server-spawned replacement (which shares these fields)
+/// without needing a protocol-level lineage flag on `NewAgentPayload`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionOldInfo {
+    pub host_id: String,
+    pub project_id: Option<ProjectId>,
+    pub custom_agent_id: Option<CustomAgentId>,
+    pub backend_kind: BackendKind,
+    /// Team-member id is read from `team_member_bindings` at start
+    /// time: if the old agent is the live binding for a team member,
+    /// the replacement's `NewAgent` payload will carry the same
+    /// member id, giving a deterministic match.
+    pub team_member_id: Option<TeamMemberId>,
 }
 
 /// Identifier for a per-row review action awaiting server echo. Used as
@@ -877,7 +946,270 @@ impl AppState {
             review_create_pending: RwSignal::new(HashMap::new()),
             review_action_pending: RwSignal::new(HashMap::new()),
             review_action_target_pending: RwSignal::new(HashSet::new()),
+            compaction_in_progress: RwSignal::new(HashMap::new()),
+            compaction_errors: RwSignal::new(HashMap::new()),
+            compaction_pending_completion: RwSignal::new(HashMap::new()),
+            compaction_pending_close: RwSignal::new(HashSet::new()),
         }
+    }
+
+    /// Record that the user has fired a compaction for `(host_id,
+    /// agent_id)`. Looks up the agent's `AgentInfo` + team-member
+    /// binding so the dispatcher can later correlate the replacement
+    /// agent's `NewAgent` echo to this compaction without protocol-
+    /// level lineage info. Clears any prior error so a fresh attempt
+    /// has a clean error surface.
+    pub fn mark_compaction_started(&self, host_id: &str, agent_id: AgentId) {
+        self.compaction_errors.update(|m| {
+            m.remove(&agent_id);
+        });
+        let info = self.compaction_info_for(host_id, &agent_id);
+        self.compaction_in_progress.update(|map| {
+            map.insert(agent_id, info);
+        });
+    }
+
+    /// Build the fingerprint by reading the agent's own `AgentInfo` and
+    /// scanning `team_member_bindings` for any member whose live
+    /// `current_agent_id` matches. The team-member id (when present) is
+    /// the strongest correlation field because the replacement's
+    /// `NewAgent` payload always carries the same value.
+    fn compaction_info_for(&self, host_id: &str, agent_id: &AgentId) -> CompactionOldInfo {
+        let (project_id, custom_agent_id, backend_kind) = self.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|a| a.host_id == host_id && &a.agent_id == agent_id)
+                .map(|a| {
+                    (
+                        a.project_id.clone(),
+                        a.custom_agent_id.clone(),
+                        a.backend_kind,
+                    )
+                })
+                .unwrap_or((None, None, BackendKind::Claude))
+        });
+        let team_member_id = self.team_member_bindings.with_untracked(|map| {
+            map.get(host_id).and_then(|members| {
+                members.iter().find_map(|(member_id, binding)| {
+                    if binding.current_agent_id.as_ref() == Some(agent_id) {
+                        Some(member_id.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+        });
+        CompactionOldInfo {
+            host_id: host_id.to_owned(),
+            project_id,
+            custom_agent_id,
+            backend_kind,
+            team_member_id,
+        }
+    }
+
+    /// Find an in-flight compaction whose old-agent fingerprint matches
+    /// the new agent identified by `(host_id, fields)`. The dispatcher
+    /// uses this in `apply_new_agent` to recognize the replacement and
+    /// skip the auto-tab-open path that would otherwise steal focus
+    /// from the user's existing chat tab.
+    pub fn find_compaction_replacement(
+        &self,
+        host_id: &str,
+        team_member_id: Option<&TeamMemberId>,
+        project_id: Option<&ProjectId>,
+        custom_agent_id: Option<&CustomAgentId>,
+        backend_kind: BackendKind,
+    ) -> Option<AgentId> {
+        self.compaction_in_progress.with_untracked(|map| {
+            for (old_id, info) in map.iter() {
+                if info.host_id != host_id {
+                    continue;
+                }
+                // Team-member match is decisive when both sides have a
+                // member id: the replacement's NewAgent payload always
+                // carries the same one.
+                let team_match = match (info.team_member_id.as_ref(), team_member_id) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !team_match {
+                    continue;
+                }
+                if info.project_id.as_ref() != project_id {
+                    continue;
+                }
+                if info.custom_agent_id.as_ref() != custom_agent_id {
+                    continue;
+                }
+                if info.backend_kind != backend_kind {
+                    continue;
+                }
+                return Some(old_id.clone());
+            }
+            None
+        })
+    }
+
+    /// Add `(host_id, agent_id)` to the deferred-close set. Used by
+    /// `dispatch::apply_agent_closed` when an `AgentClosed` arrives for
+    /// an agent that is mid-compaction: we keep the agent's state
+    /// alive so `finish_compaction_success` has something to retarget,
+    /// and finalize the close from there.
+    pub fn defer_compaction_close(&self, host_id: &str, agent_id: AgentId) {
+        self.compaction_pending_close.update(|set| {
+            set.insert((host_id.to_owned(), agent_id));
+        });
+    }
+
+    /// Server-confirmed completion: the compaction finished, the
+    /// predecessor is being closed, and `new_agent` is the live
+    /// replacement. Retargets every chat tab pointing at `prev_agent_id`
+    /// to `new_agent` so the user keeps working in the same tab without
+    /// remount/focus churn — mirrors `upgrade_pending_team_member_tab`.
+    pub fn finish_compaction_success(&self, prev_agent_id: &AgentId, new_agent: &AgentInfo) {
+        self.compaction_in_progress.update(|map| {
+            map.remove(prev_agent_id);
+        });
+        self.compaction_errors.update(|m| {
+            m.remove(prev_agent_id);
+        });
+        let new_ref = ActiveAgentRef {
+            host_id: new_agent.host_id.clone(),
+            agent_id: new_agent.agent_id.clone(),
+        };
+        let label = new_agent.name.clone();
+        let new_ref_for_memory = new_ref.clone();
+        let label_for_memory = label.clone();
+        let prev_for_cz = prev_agent_id.clone();
+        self.center_zone.update(|cz| {
+            for tab in cz.tabs.iter_mut() {
+                if let TabContent::Chat {
+                    agent_ref: Some(ar),
+                    ..
+                } = &tab.content
+                    && ar.host_id == new_ref.host_id
+                    && ar.agent_id == prev_for_cz
+                {
+                    tab.content = TabContent::chat_with_agent(new_ref.clone());
+                    tab.label = label.clone();
+                }
+            }
+        });
+        let prev_for_memory = prev_agent_id.clone();
+        self.project_view_memory.update(|map| {
+            for memory in map.values_mut() {
+                let Some(cz) = memory.center_zone.as_mut() else {
+                    continue;
+                };
+                for tab in cz.tabs.iter_mut() {
+                    if let TabContent::Chat {
+                        agent_ref: Some(ar),
+                        ..
+                    } = &tab.content
+                        && ar.host_id == new_ref_for_memory.host_id
+                        && ar.agent_id == prev_for_memory
+                    {
+                        tab.content = TabContent::chat_with_agent(new_ref_for_memory.clone());
+                        tab.label = label_for_memory.clone();
+                    }
+                }
+            }
+        });
+        // Under the current server contract `AgentClosed` arrives
+        // AFTER `Completed`, so the deferred-close set is normally
+        // empty here and the cleanup below is a no-op — the normal
+        // `apply_agent_closed` path will handle teardown. If the
+        // server ever inverts ordering (AgentClosed before Completed),
+        // the dispatcher's defer path will have queued the teardown
+        // in `compaction_pending_close` and we drain it now, after
+        // the retarget, so the old agent's transient state is gone.
+        let prev_for_close = prev_agent_id.clone();
+        let new_host = new_ref.host_id.clone();
+        let had_pending_close = self
+            .compaction_pending_close
+            .with_untracked(|set| set.contains(&(new_host.clone(), prev_for_close.clone())));
+        if had_pending_close {
+            self.compaction_pending_close.update(|set| {
+                set.remove(&(new_host.clone(), prev_for_close.clone()));
+            });
+            self.finalize_compaction_close(&new_host, &prev_for_close);
+        }
+    }
+
+    /// Drop every transient state map entry tied to the closed old
+    /// agent. Mirrors `dispatch::apply_agent_closed`'s cleanup set so
+    /// the deferred-close path doesn't leave stale entries behind that
+    /// the normal close path would have dropped. The tab-related steps
+    /// (close any tab still pointing at the old agent + prune LRU) are
+    /// belt-and-suspenders here: `finish_compaction_success` retargets
+    /// every Chat tab from `old -> new` first, so by the time we reach
+    /// this point the close-tabs sweep is typically a no-op. We keep
+    /// it because nothing guarantees every surface was retargeted
+    /// (e.g. a future tab type that `finish_compaction_success`
+    /// doesn't know about), and leaving a stray tab pointing at a
+    /// dead agent is worse than a redundant scan.
+    fn finalize_compaction_close(&self, host_id: &str, agent_id: &AgentId) {
+        self.agents.update(|agents| {
+            agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == *agent_id));
+        });
+        self.chat_rows.update(|map| {
+            map.remove(agent_id);
+        });
+        self.chat_tool_rows.update(|map| {
+            map.remove(agent_id);
+        });
+        self.streaming_text.update(|map| {
+            map.remove(agent_id);
+        });
+        self.agent_turn_active.update(|map| {
+            map.remove(agent_id);
+        });
+        self.transient_events.update(|map| {
+            map.remove(agent_id);
+        });
+        self.task_lists.update(|map| {
+            map.remove(agent_id);
+        });
+        self.agent_message_queue.update(|map| {
+            map.remove(agent_id);
+        });
+        self.agent_session_settings.update(|map| {
+            map.remove(agent_id);
+        });
+        let host_for_cz = host_id.to_owned();
+        let agent_for_cz = agent_id.clone();
+        self.center_zone
+            .update(|cz| close_agent_tabs_in_cz(cz, &host_for_cz, &agent_for_cz));
+        let host_for_memory = host_id.to_owned();
+        let agent_for_memory = agent_id.clone();
+        self.project_view_memory.update(|memories| {
+            for memory in memories.values_mut() {
+                if let Some(center_zone) = memory.center_zone.as_mut() {
+                    close_agent_tabs_in_cz(center_zone, &host_for_memory, &agent_for_memory);
+                }
+            }
+        });
+        self.prune_tab_lru();
+    }
+
+    /// Server-confirmed failure: the compaction did not produce a
+    /// replacement. The predecessor is still alive, so we just clear the
+    /// in-flight flag and surface the message on its card. We also
+    /// belt-and-suspenders drain the pending-close set in case it ever
+    /// gets populated on a failure path.
+    pub fn finish_compaction_failure(&self, agent_id: AgentId, message: String) {
+        self.compaction_in_progress.update(|map| {
+            map.remove(&agent_id);
+        });
+        let agent_id_for_close = agent_id.clone();
+        self.compaction_pending_close.update(|set| {
+            set.retain(|(_, a)| a != &agent_id_for_close);
+        });
+        self.compaction_errors.update(|m| {
+            m.insert(agent_id, message);
+        });
     }
 
     pub fn selected_host(&self) -> Option<ConfiguredHost> {

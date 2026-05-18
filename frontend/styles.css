@@ -1804,6 +1804,10 @@ kbd {
     color: var(--error);
 }
 
+.team-member-icon-btn-compact:hover {
+    color: var(--accent-primary);
+}
+
 .team-draft-start,
 .team-draft-editor {
     display: flex;
@@ -4046,6 +4050,13 @@ kbd {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* Non-fatal compaction failure — the predecessor agent is still alive,
+ * so the surface uses a softer tone than the fatal-error variant
+ * above. */
+.agent-card-error-compaction {
+    color: var(--warning, var(--error));
 }
 
 .agent-card-child-hidden {

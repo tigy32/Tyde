@@ -95,6 +95,15 @@ enum TeamRegistryCommand {
         refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
+    RotateMemberAgent {
+        member_id: TeamMemberId,
+        old_agent_id: AgentId,
+        new_agent_id: AgentId,
+        old_session_id: SessionId,
+        new_session_id: SessionId,
+        refs: AgentTeamValidationRefs,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
     RecordBindingFailure {
         member_id: TeamMemberId,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
@@ -292,6 +301,27 @@ impl TeamRegistryHandle {
             member_id,
             agent_id,
             session_id,
+            refs,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn rotate_member_agent(
+        &self,
+        member_id: TeamMemberId,
+        old_agent_id: AgentId,
+        new_agent_id: AgentId,
+        old_session_id: SessionId,
+        new_session_id: SessionId,
+        refs: AgentTeamValidationRefs,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::RotateMemberAgent {
+            member_id,
+            old_agent_id,
+            new_agent_id,
+            old_session_id,
+            new_session_id,
             refs,
             reply,
         })
@@ -554,6 +584,25 @@ impl TeamRegistryActor {
                     reply,
                 } => {
                     let result = self.bind_member_agent(member_id, agent_id, session_id, &refs);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::RotateMemberAgent {
+                    member_id,
+                    old_agent_id,
+                    new_agent_id,
+                    old_session_id,
+                    new_session_id,
+                    refs,
+                    reply,
+                } => {
+                    let result = self.rotate_member_agent(
+                        member_id,
+                        old_agent_id,
+                        new_agent_id,
+                        old_session_id,
+                        new_session_id,
+                        &refs,
+                    );
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::RecordBindingFailure { member_id, reply } => {
@@ -885,6 +934,42 @@ impl TeamRegistryActor {
             .binding_notifies
             .push(TeamMemberBindingNotifyPayload::Upsert { binding });
         Ok(events)
+    }
+
+    fn rotate_member_agent(
+        &mut self,
+        member_id: TeamMemberId,
+        old_agent_id: AgentId,
+        new_agent_id: AgentId,
+        old_session_id: SessionId,
+        new_session_id: SessionId,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.pending_activations.remove(&member_id);
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.member_id == member_id)
+            .ok_or_else(|| format!("team member {member_id} has no binding"))?;
+        if binding.current_agent_id.as_ref() != Some(&old_agent_id) {
+            return Err(format!(
+                "team member {member_id} is not bound to agent {old_agent_id}"
+            ));
+        }
+
+        let member = self.store.replace_member_session_id(
+            &member_id,
+            &old_session_id,
+            new_session_id,
+            refs,
+        )?;
+        let binding =
+            self.upsert_binding(member_id, Some(new_agent_id), AgentControlStatus::Thinking)?;
+        Ok(TeamRegistryEvents {
+            member_notifies: vec![TeamMemberNotifyPayload::Upsert { member }],
+            binding_notifies: vec![TeamMemberBindingNotifyPayload::Upsert { binding }],
+            ..TeamRegistryEvents::default()
+        })
     }
 
     fn record_binding_failure(

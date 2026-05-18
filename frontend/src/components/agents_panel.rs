@@ -5,10 +5,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{AgentId, FrameKind, SetAgentNamePayload};
 
-use crate::send::{close_agent, send_frame};
+use crate::send::{close_agent, compact_agent, send_frame};
 use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, StreamingState,
-    TabContent,
+    ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, ConnectionStatus,
+    StreamingState, TabContent,
 };
 
 /// Pure predicate used by the Agents panel filter memo. Extracted so the
@@ -88,6 +88,7 @@ enum DerivedAgentState {
     Initializing,
     Thinking,
     Idle,
+    Compacting,
     Terminated,
 }
 
@@ -95,6 +96,7 @@ fn status_icon(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "\u{25F7}", // ◷ clock (CSS animates)
         DerivedAgentState::Thinking => "\u{25F7}",     // ◷ clock (CSS animates)
+        DerivedAgentState::Compacting => "\u{27F2}",   // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Idle => "\u{2713}",         // ✓
         DerivedAgentState::Terminated => "\u{2022}",   // •
     }
@@ -104,6 +106,7 @@ fn status_class(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "agent-card-status running",
         DerivedAgentState::Thinking => "agent-card-status running",
+        DerivedAgentState::Compacting => "agent-card-status running",
         DerivedAgentState::Idle => "agent-card-status completed",
         DerivedAgentState::Terminated => "agent-card-status error",
     }
@@ -464,12 +467,16 @@ fn agent_card(
         let agent_id = agent_id.clone();
         let streaming = state.streaming_text;
         let turn_active = state.agent_turn_active;
+        let compaction = state.compaction_in_progress;
         move || {
             if has_fatal {
                 return DerivedAgentState::Terminated;
             }
             if !started {
                 return DerivedAgentState::Initializing;
+            }
+            if compaction.with(|map| map.contains_key(&agent_id)) {
+                return DerivedAgentState::Compacting;
             }
             let typing = turn_active.with(|map| map.get(&agent_id).copied().unwrap_or(false));
             let streaming_open = streaming.with(|map| map.contains_key(&agent_id));
@@ -485,7 +492,73 @@ fn agent_card(
         let derived = derived.clone();
         move || status_class(&derived())
     };
-    let status_icon_sig = move || status_icon(&derived());
+    let status_icon_sig = {
+        let derived = derived.clone();
+        move || status_icon(&derived())
+    };
+
+    // Compact (Compact/Rotate) action — gated on the agent being idle on a
+    // connected host with at least one chat row, and not already mid-
+    // compaction. Hidden when gating fails so the button surface mirrors
+    // the existing hover-revealed Close (`agent-card-action`) UX.
+    let can_compact = {
+        let host_id = agent.host_id.clone();
+        let agent_id = agent_id.clone();
+        let derived = derived.clone();
+        let state = state.clone();
+        move || {
+            if !matches!(
+                state.connection_status_for_host(&host_id),
+                ConnectionStatus::Connected
+            ) {
+                return false;
+            }
+            if state
+                .chat_rows
+                .with(|map| map.get(&agent_id).is_none_or(|rows| rows.is_empty()))
+            {
+                return false;
+            }
+            matches!(derived(), DerivedAgentState::Idle)
+        }
+    };
+    let compact_host_id = agent.host_id.clone();
+    let compact_agent_id = agent_id.clone();
+    let compact_agent_stream = agent.instance_stream.clone();
+    let compact_name = name.clone();
+    let compact_state = state.clone();
+    let on_compact = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        let host_id = compact_host_id.clone();
+        let aid = compact_agent_id.clone();
+        let agent_stream = compact_agent_stream.clone();
+        // The server marks the predecessor session non-resumable as
+        // part of the compaction protocol, so don't promise the user
+        // they can pick it back up. The summary remains visible in
+        // Sessions as a read-only record of what was kept.
+        let message = format!(
+            "Compact agent \"{}\"?\n\nThe agent will write a summary of context worth keeping and a fresh replacement will start from that summary. The original session is closed and kept in Sessions as a read-only record — you can view it, but it can't be resumed.",
+            compact_name
+        );
+        let state = compact_state.clone();
+        spawn_local(async move {
+            if !crate::bridge::confirm_dialog("Compact agent", &message).await {
+                return;
+            }
+            state.mark_compaction_started(&host_id, aid.clone());
+            if let Err(e) = compact_agent(&host_id, agent_stream).await {
+                log::error!("failed to send AgentCompact: {e}");
+                state.finish_compaction_failure(aid, e);
+            }
+        });
+    };
+
+    let compaction_error_msg = {
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move || state.compaction_errors.with(|m| m.get(&agent_id).cloned())
+    };
+
     let agent_id_for_editing_block = agent_id.clone();
 
     view! {
@@ -626,6 +699,18 @@ fn agent_card(
                     >
                         "\u{270E}"
                     </button>
+                    {move || can_compact().then(|| view! {
+                        <button
+                            type="button"
+                            class="filter-toggle agent-card-compact agent-card-action"
+                            title="Compact agent"
+                            aria-label="Compact agent"
+                            on:click=on_compact.clone()
+                            on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                        >
+                            "\u{27F2}"
+                        </button>
+                    })}
                     <button
                         type="button"
                         class="filter-toggle agent-card-close agent-card-action"
@@ -651,6 +736,9 @@ fn agent_card(
             </div>
             {error_msg.map(|msg| view! {
                 <div class="agent-card-error">{msg}</div>
+            })}
+            {move || compaction_error_msg().map(|msg| view! {
+                <div class="agent-card-error agent-card-error-compaction">{msg}</div>
             })}
         </div>
     }
@@ -918,5 +1006,1001 @@ mod tests {
     fn defaults_for_specific_project_shows_other_projects_false() {
         let ap = active("h", "p");
         assert!(!AgentsPanelFilters::defaults_for(Some(&ap)).show_other_projects);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::dispatch::dispatch_envelope;
+    use crate::state::{ChatMessageEntry, ChatRowHandle};
+    use leptos::mount::mount_to;
+    use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
+    use protocol::{
+        AgentOrigin, BackendKind, ChatMessage, Envelope, MessageSender, NewAgentPayload, StreamPath,
+    };
+    use serde_json::Value as JsonValue;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 600px; height: 800px;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Stub `window.__TAURI__.core.invoke` so every call is recorded into
+    /// `window.__test_send_calls`, `plugin:dialog|message` resolves to
+    /// `"Ok"` (the user clicked OK on the native confirm), and everything
+    /// else resolves to undefined. The recorded JS array is returned so
+    /// tests can read it after triggering UI actions.
+    fn install_send_stub_with_dialog_ok() -> js_sys::Array {
+        let calls = js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    if (cmd === 'plugin:dialog|message') {
+                        return Promise.resolve('Ok');
+                    }
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+                return window.__test_send_calls;
+            })();
+            "#,
+        )
+        .expect("install tauri stub");
+        calls.dyn_into::<js_sys::Array>().expect("array")
+    }
+
+    /// Walk `window.__test_send_calls` and return `(frame_kind, payload)`
+    /// tuples for every `send_host_line` invoke. Mirrors the
+    /// `recorded_frames` helper in teams_panel's tests so the assertion
+    /// shape stays consistent across the crate.
+    fn recorded_frames(calls: &js_sys::Array) -> Vec<(String, JsonValue, String)> {
+        let mut out = Vec::new();
+        for entry in calls.iter() {
+            let arr = entry.dyn_into::<js_sys::Array>().expect("entry array");
+            let cmd = arr.get(0).as_string().expect("cmd is string");
+            if cmd != "send_host_line" {
+                continue;
+            }
+            let args_json = arr.get(1).as_string().expect("args json string");
+            let args: JsonValue = serde_json::from_str(&args_json).expect("args parse");
+            let line = args
+                .get("line")
+                .and_then(|v| v.as_str())
+                .expect("line present");
+            let envelope: JsonValue = serde_json::from_str(line).expect("envelope parse");
+            let kind = envelope
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .expect("kind present")
+                .to_string();
+            let stream = envelope
+                .get("stream")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let payload = envelope.get("payload").cloned().unwrap_or(JsonValue::Null);
+            out.push((kind, payload, stream));
+        }
+        out
+    }
+
+    /// Synthesize an `Envelope` and feed it through `dispatch_envelope`
+    /// for the tests that drive the AgentCompactNotify state machine.
+    /// Sequence is advanced per (host, stream) so the seq validator
+    /// doesn't reject subsequent frames in the same test.
+    fn dispatch_frame<T: serde::Serialize>(
+        state: &AppState,
+        host_id: &str,
+        stream: StreamPath,
+        kind: FrameKind,
+        seq: u64,
+        payload: &T,
+    ) {
+        let envelope =
+            Envelope::from_payload(stream, kind, seq, payload).expect("envelope serialize");
+        dispatch_envelope(state, host_id, envelope);
+    }
+
+    fn make_app_state(host_id: &str) -> AppState {
+        let state = AppState::new();
+        state.selected_host_id.set(Some(host_id.to_owned()));
+        state.host_streams.update(|map| {
+            map.insert(host_id.to_owned(), StreamPath(format!("/host/{host_id}")));
+        });
+        state.connection_statuses.update(|map| {
+            map.insert(
+                host_id.to_owned(),
+                crate::state::ConnectionStatus::Connected,
+            );
+        });
+        state
+    }
+
+    fn push_agent(state: &AppState, host_id: &str, agent_id: &str, name: &str, started: bool) {
+        state.agents.update(|agents| {
+            agents.push(AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: AgentId(agent_id.to_owned()),
+                name: name.to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                // Mirror the real backend format `/agent/<id>/<uuid>`.
+                // Using a stable suffix keeps tests deterministic; the
+                // protocol validator only cares about the registered
+                // path equality, not the uuid value.
+                instance_stream: StreamPath(format!("/agent/{agent_id}/inst")),
+                started,
+                fatal_error: None,
+            });
+        });
+    }
+
+    fn seed_chat_row(state: &AppState, agent_id: &str) {
+        state.chat_rows.update(|m| {
+            m.insert(
+                AgentId(agent_id.to_owned()),
+                vec![ChatRowHandle::new(ChatMessageEntry {
+                    message: ChatMessage {
+                        timestamp: 0,
+                        sender: MessageSender::User,
+                        content: "hi".to_owned(),
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                    tool_requests: Vec::new(),
+                })],
+            );
+        });
+    }
+
+    fn compact_btn(container: &HtmlElement) -> Option<HtmlElement> {
+        container
+            .query_selector(".agent-card-compact")
+            .unwrap()
+            .map(|e| e.dyn_into::<HtmlElement>().unwrap())
+    }
+
+    /// Mount `AgentsPanel` and return the handle. Caller MUST bind the
+    /// handle to a local (e.g. `_handle`) — dropping it tears down the
+    /// Leptos root, which empties the container and makes any DOM probe
+    /// trivially fail.
+    fn mount_panel(container: &HtmlElement, state: AppState) -> impl Sized {
+        let state_for_mount = state;
+        mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <AgentsPanel /> }
+        })
+    }
+
+    /// Idle agent on a connected host with at least one chat row should
+    /// expose the Compact action.
+    #[wasm_bindgen_test]
+    async fn compact_button_visible_when_idle_with_history_and_connected() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-idle", "Agent", true);
+        seed_chat_row(&state, "a-idle");
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let btn = compact_btn(&container).expect("compact button should render for idle agent");
+        assert_eq!(
+            btn.get_attribute("aria-label").as_deref(),
+            Some("Compact agent"),
+            "compact button must keep a labelled affordance"
+        );
+    }
+
+    /// Initializing (server hasn't echoed AgentStart) — Compact must be
+    /// hidden so the user can't fire a rotation before the agent is even
+    /// ready.
+    #[wasm_bindgen_test]
+    async fn compact_button_hidden_when_initializing() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-init", "Agent", false);
+        seed_chat_row(&state, "a-init");
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container.query_selector(".agent-card").unwrap().is_some(),
+            "agent card itself should render for the initializing agent"
+        );
+        assert!(
+            compact_btn(&container).is_none(),
+            "compact button must be hidden while the agent is still initializing"
+        );
+    }
+
+    /// Thinking (turn active or streaming open) — Compact must be hidden.
+    #[wasm_bindgen_test]
+    async fn compact_button_hidden_when_thinking() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-thinking", "Agent", true);
+        seed_chat_row(&state, "a-thinking");
+        state.agent_turn_active.update(|m| {
+            m.insert(AgentId("a-thinking".to_owned()), true);
+        });
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container.query_selector(".agent-card").unwrap().is_some(),
+            "agent card itself should render for the thinking agent"
+        );
+        assert!(
+            compact_btn(&container).is_none(),
+            "compact button must be hidden while the agent is taking a turn"
+        );
+    }
+
+    /// No chat rows yet — compaction is wasted spend on an unused agent.
+    #[wasm_bindgen_test]
+    async fn compact_button_hidden_when_no_chat_history() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-blank", "Agent", true);
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container.query_selector(".agent-card").unwrap().is_some(),
+            "agent card itself should render even with no chat rows"
+        );
+        assert!(
+            compact_btn(&container).is_none(),
+            "compact button must be hidden for agents that have no chat rows yet"
+        );
+    }
+
+    /// Disconnected host — Compact must be hidden because the request
+    /// can't reach the server.
+    #[wasm_bindgen_test]
+    async fn compact_button_hidden_when_host_disconnected() {
+        let container = make_container();
+        let state = make_app_state("h");
+        state.connection_statuses.update(|m| {
+            m.insert("h".to_owned(), crate::state::ConnectionStatus::Disconnected);
+        });
+        push_agent(&state, "h", "a-disc", "Agent", true);
+        seed_chat_row(&state, "a-disc");
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container.query_selector(".agent-card").unwrap().is_some(),
+            "agent card itself should render even when host is disconnected"
+        );
+        assert!(
+            compact_btn(&container).is_none(),
+            "compact button must be hidden when the host is disconnected"
+        );
+    }
+
+    /// Already compacting — Compact button must be hidden so the user
+    /// can't double-fire, and the status pill must render the running-
+    /// blue style we use elsewhere for in-flight work.
+    #[wasm_bindgen_test]
+    async fn compacting_state_hides_button_and_shows_running_pill() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-busy", "Agent", true);
+        seed_chat_row(&state, "a-busy");
+        state.mark_compaction_started("h", AgentId("a-busy".to_owned()));
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            compact_btn(&container).is_none(),
+            "compact button must be hidden once a compaction is in flight"
+        );
+        let status_pill: HtmlElement = container
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .expect("status pill present")
+            .dyn_into()
+            .unwrap();
+        let class = status_pill.get_attribute("class").unwrap_or_default();
+        assert!(
+            class.contains("running"),
+            "compacting status pill should use the running class for the blue pulse, got: {class}"
+        );
+    }
+
+    /// Compaction failure surfaces a non-fatal inline error and the
+    /// predecessor agent is back to idle (Compact button is offered
+    /// again).
+    #[wasm_bindgen_test]
+    async fn compaction_failure_shows_inline_error_and_reenables_button() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-fail", "Agent", true);
+        seed_chat_row(&state, "a-fail");
+        state.finish_compaction_failure(
+            AgentId("a-fail".to_owned()),
+            "summary backend returned an error".to_owned(),
+        );
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let error_row: HtmlElement = container
+            .query_selector(".agent-card-error-compaction")
+            .unwrap()
+            .expect("compaction error footer present")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            error_row
+                .text_content()
+                .unwrap_or_default()
+                .contains("summary backend"),
+            "error row should display the server-reported reason"
+        );
+        assert!(
+            compact_btn(&container).is_some(),
+            "compact button should be offered again after a non-fatal failure"
+        );
+    }
+
+    /// Clicking Compact through the OK-stubbed confirm dialog actually
+    /// sends an `AgentCompact` frame on the *agent's* instance stream
+    /// (not the host stream), with a `Default::default()` payload as
+    /// per the Backend contract. The local state also flips to
+    /// in-flight so the next render shows the running pill.
+    #[wasm_bindgen_test]
+    async fn clicking_compact_sends_agent_compact_frame_on_agent_stream() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-click", "Agent", true);
+        seed_chat_row(&state, "a-click");
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let btn = compact_btn(&container).expect("compact button should render");
+        btn.click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let frames = recorded_frames(&calls);
+        let compact_frames: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _, _)| kind == &FrameKind::AgentCompact.to_string())
+            .collect();
+        assert_eq!(
+            compact_frames.len(),
+            1,
+            "exactly one AgentCompact frame should be sent, all frames: {frames:?}"
+        );
+        let (_, payload, stream) = compact_frames[0];
+        assert_eq!(
+            stream, "/agent/a-click/inst",
+            "AgentCompact must target the agent's instance stream, not the host stream"
+        );
+        assert_eq!(
+            payload,
+            &serde_json::json!({}),
+            "default AgentCompactPayload omits the optional tuning fields"
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-click".to_owned()))),
+            "agent should be flagged as in-flight while the server processes"
+        );
+    }
+
+    /// The dispatcher's INBOUND_SEQ and INBOUND_PROTOCOL validators are
+    /// process-wide thread-locals that persist across wasm tests. Each
+    /// compaction test dispatches a fresh `(host_id, stream)` pair, so we
+    /// reset that host's seq state AND wipe the protocol validator's
+    /// stream registry at the top of every test. Without the protocol
+    /// reset, a NewAgent for `/agent/a-new/inst` in one test would trip
+    /// the duplicate-stream check in the next test that uses the same
+    /// path.
+    fn reset_inbound_seqs(host_id: &str) {
+        crate::dispatch::clear_host_seqs(host_id);
+        crate::dispatch::reset_inbound_protocol();
+    }
+
+    /// Real backend stream format for an agent instance. The protocol
+    /// validator rejects agent-stream traffic on streams that were
+    /// never registered via NewAgent, so tests that send AgentCompact*
+    /// or AgentClosed frames must use stream paths that match the
+    /// `/agent/<agent_id>/<uuid>` pattern the server actually emits.
+    fn agent_stream(agent_id: &str) -> StreamPath {
+        StreamPath(format!("/agent/{agent_id}/inst"))
+    }
+
+    /// Dispatch a NewAgent frame so the protocol validator registers
+    /// the agent's `/agent/<id>/inst` instance stream. Without this,
+    /// subsequent AgentCompactNotify / AgentClosed frames on the agent
+    /// stream are rejected as "unknown agent_id". The seq returned is
+    /// the next free seq on the `/host/<host_id>` stream so callers
+    /// can chain further host-stream frames.
+    fn register_agent_via_new_agent(
+        state: &AppState,
+        host_id: &str,
+        agent_id: &str,
+        name: &str,
+        host_seq: u64,
+        created_at_ms: u64,
+    ) {
+        dispatch_frame(
+            state,
+            host_id,
+            StreamPath(format!("/host/{host_id}")),
+            FrameKind::NewAgent,
+            host_seq,
+            &NewAgentPayload {
+                agent_id: AgentId(agent_id.to_owned()),
+                name: name.to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
+                project_id: None,
+                parent_agent_id: None,
+                created_at_ms,
+                instance_stream: agent_stream(agent_id),
+            },
+        );
+    }
+
+    /// `AgentCompactNotify` with status `Started` flips the agent into
+    /// `compaction_in_progress` even if the user never clicked Compact
+    /// (e.g. compaction was kicked off by a server-side rule). Uses a
+    /// real `/agent/<id>/<uuid>` stream so the protocol validator
+    /// path is exercised, not bypassed.
+    #[wasm_bindgen_test]
+    async fn dispatch_compact_notify_started_marks_in_progress() {
+        reset_inbound_seqs("h-started");
+        let state = make_app_state("h-started");
+        register_agent_via_new_agent(&state, "h-started", "a-old", "Agent", 0, 0);
+        seed_chat_row(&state, "a-old");
+        dispatch_frame(
+            &state,
+            "h-started",
+            agent_stream("a-old"),
+            FrameKind::AgentCompactNotify,
+            0,
+            &AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Started,
+                old_agent_id: AgentId("a-old".to_owned()),
+                old_session_id: None,
+                new_agent_id: None,
+                new_session_id: None,
+                summary_preview: None,
+                message: None,
+            },
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-old".to_owned()))),
+            "Started notify must mark the old agent in-flight"
+        );
+    }
+
+    /// `Failed` notify clears the in-flight flag and stores the
+    /// server-reported reason as a non-fatal error so the card surfaces
+    /// it inline without flipping the agent to Terminated.
+    #[wasm_bindgen_test]
+    async fn dispatch_compact_notify_failed_clears_in_progress_and_stores_error() {
+        reset_inbound_seqs("h-failed");
+        let state = make_app_state("h-failed");
+        register_agent_via_new_agent(&state, "h-failed", "a-old", "Agent", 0, 0);
+        seed_chat_row(&state, "a-old");
+        state.mark_compaction_started("h-failed", AgentId("a-old".to_owned()));
+        dispatch_frame(
+            &state,
+            "h-failed",
+            agent_stream("a-old"),
+            FrameKind::AgentCompactNotify,
+            0,
+            &AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Failed,
+                old_agent_id: AgentId("a-old".to_owned()),
+                old_session_id: None,
+                new_agent_id: None,
+                new_session_id: None,
+                summary_preview: None,
+                message: Some("summary backend returned an error".to_owned()),
+            },
+        );
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-old".to_owned()))),
+            "Failed notify must clear the in-flight flag"
+        );
+        let err = state
+            .compaction_errors
+            .with(|m| m.get(&AgentId("a-old".to_owned())).cloned())
+            .expect("error message stored");
+        assert!(err.contains("summary backend"), "got error {err:?}");
+    }
+
+    /// `Completed` notify when the replacement's `NewAgent` echo is
+    /// already in state retargets every chat tab pointing at the old
+    /// agent over to the new one — same TabId / scroll / focus, just a
+    /// new agent_ref. Mirrors the `upgrade_pending_team_member_tab`
+    /// contract. Uses real `/agent/<id>/<uuid>` streams.
+    #[wasm_bindgen_test]
+    async fn dispatch_compact_notify_completed_after_new_agent_retargets_tab() {
+        reset_inbound_seqs("h-after");
+        let state = make_app_state("h-after");
+        // Register `a-old` via a real NewAgent frame. For User-origin
+        // agents this also auto-opens a chat tab — that's the very
+        // user-perceived tab the retarget needs to preserve.
+        register_agent_via_new_agent(&state, "h-after", "a-old", "Old Agent", 0, 0);
+        seed_chat_row(&state, "a-old");
+        let tab_id_before = state
+            .center_zone
+            .with_untracked(|cz| cz.active_tab_id)
+            .expect("NewAgent should have auto-opened a chat tab for a-old");
+        let tabs_before = state.center_zone.with_untracked(|cz| cz.tabs.len());
+        // User clicks Compact: the fingerprint is captured now. When
+        // NewAgent for the replacement arrives next, the fingerprint
+        // suppression keeps it from stealing focus / opening a duplicate.
+        state.mark_compaction_started("h-after", AgentId("a-old".to_owned()));
+        register_agent_via_new_agent(&state, "h-after", "a-new", "Compacted Agent", 1, 1);
+        assert_eq!(
+            state.center_zone.with_untracked(|cz| cz.tabs.len()),
+            tabs_before,
+            "replacement NewAgent must not open a duplicate tab while compaction is in flight"
+        );
+
+        dispatch_frame(
+            &state,
+            "h-after",
+            agent_stream("a-old"),
+            FrameKind::AgentCompactNotify,
+            0,
+            &AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Completed,
+                old_agent_id: AgentId("a-old".to_owned()),
+                old_session_id: None,
+                new_agent_id: Some(AgentId("a-new".to_owned())),
+                new_session_id: None,
+                summary_preview: Some("Worked on the wizard.".to_owned()),
+                message: None,
+            },
+        );
+
+        let (label, ar, tab_id_after) = state.center_zone.with_untracked(|cz| {
+            let tab = cz.active_tab().expect("active tab still present");
+            let agent_ref = match &tab.content {
+                TabContent::Chat {
+                    agent_ref: Some(ar),
+                    ..
+                } => ar.clone(),
+                _ => panic!("active tab should still be a Chat after retarget"),
+            };
+            (tab.label.clone(), agent_ref, tab.id)
+        });
+        assert_eq!(
+            tab_id_after, tab_id_before,
+            "retarget must preserve the TabId so the tab does not remount"
+        );
+        assert_eq!(ar.agent_id, AgentId("a-new".to_owned()));
+        assert_eq!(label, "Compacted Agent");
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-old".to_owned()))),
+            "in-flight flag cleared on Completed"
+        );
+        assert!(
+            state.compaction_pending_completion.with(|m| m.is_empty()),
+            "no pending mapping should linger when NewAgent is already in state"
+        );
+    }
+
+    /// `Completed` notify can race ahead of the replacement's
+    /// `NewAgent` echo. When that happens the dispatcher stashes the
+    /// (host, new) → old mapping in `compaction_pending_completion`,
+    /// and the `NewAgent` arm later flushes it to do the retarget.
+    /// This test exercises that ordering using real `/agent/<id>/<uuid>`
+    /// streams so the protocol validator path is exercised.
+    #[wasm_bindgen_test]
+    async fn dispatch_compact_notify_completed_before_new_agent_defers_then_flushes() {
+        reset_inbound_seqs("h-defer");
+        let state = make_app_state("h-defer");
+        register_agent_via_new_agent(&state, "h-defer", "a-old", "Old Agent", 0, 0);
+        seed_chat_row(&state, "a-old");
+        let tab_id_before = state
+            .center_zone
+            .with_untracked(|cz| cz.active_tab_id)
+            .expect("NewAgent should have auto-opened a chat tab for a-old");
+        state.mark_compaction_started("h-defer", AgentId("a-old".to_owned()));
+
+        // Completed arrives FIRST, while the replacement isn't in
+        // state.agents yet. Note we send on a-old's REAL agent stream
+        // — the backend's new contract is that Completed lands while
+        // the old stream is still valid (i.e. before AgentClosed
+        // invalidates it).
+        dispatch_frame(
+            &state,
+            "h-defer",
+            agent_stream("a-old"),
+            FrameKind::AgentCompactNotify,
+            0,
+            &AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Completed,
+                old_agent_id: AgentId("a-old".to_owned()),
+                old_session_id: None,
+                new_agent_id: Some(AgentId("a-new".to_owned())),
+                new_session_id: None,
+                summary_preview: None,
+                message: None,
+            },
+        );
+        // The retarget is deferred; the tab still points at the old
+        // agent, but the pending mapping is recorded.
+        let still_old = state.center_zone.with_untracked(|cz| {
+            cz.active_tab().and_then(|tab| match &tab.content {
+                TabContent::Chat {
+                    agent_ref: Some(ar),
+                    ..
+                } => Some(ar.agent_id.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(still_old, Some(AgentId("a-old".to_owned())));
+        assert!(
+            state
+                .compaction_pending_completion
+                .with(|m| m.contains_key(&("h-defer".to_owned(), AgentId("a-new".to_owned())))),
+            "pending mapping should be recorded until NewAgent arrives"
+        );
+
+        // Now the replacement's NewAgent echo lands on the host stream
+        // (seq=1 since a-old's NewAgent occupied seq=0). The NewAgent
+        // dispatch arm should flush the pending mapping and call
+        // finish_compaction_success.
+        register_agent_via_new_agent(&state, "h-defer", "a-new", "Compacted Agent", 1, 1);
+
+        let (label, ar, tab_id_after) = state.center_zone.with_untracked(|cz| {
+            let tab = cz.active_tab().expect("active tab still present");
+            let agent_ref = match &tab.content {
+                TabContent::Chat {
+                    agent_ref: Some(ar),
+                    ..
+                } => ar.clone(),
+                _ => panic!("active tab should still be a Chat after retarget"),
+            };
+            (tab.label.clone(), agent_ref, tab.id)
+        });
+        assert_eq!(tab_id_after, tab_id_before, "TabId preserved across flush");
+        assert_eq!(ar.agent_id, AgentId("a-new".to_owned()));
+        assert_eq!(label, "Compacted Agent");
+        assert!(
+            state.compaction_pending_completion.with(|m| m.is_empty()),
+            "pending mapping must be drained after the NewAgent flush"
+        );
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-old".to_owned()))),
+            "in-flight flag cleared once retarget finalizes"
+        );
+    }
+
+    /// Fixed backend contract regression: `NewAgent` (replacement) →
+    /// `AgentCompactNotify::Completed` on the old agent's still-valid
+    /// stream → `AgentClosed` (old). All frames use real
+    /// `/agent/<id>/<uuid>` stream paths so the protocol validator
+    /// path is exercised (the validator rejects agent-stream traffic
+    /// after `AgentClosed` removes the stream, which is exactly why
+    /// the backend must deliver `Completed` BEFORE `AgentClosed`).
+    ///
+    /// Asserts the user-visible contract:
+    ///   1. Replacement `NewAgent` does NOT open a duplicate chat tab.
+    ///   2. `Completed` retargets the existing tab to the replacement
+    ///      in place — same `TabId`, new `agent_ref`, new label.
+    ///   3. The subsequent `AgentClosed` for old does NOT close the
+    ///      retargeted tab.
+    ///   4. Once `AgentClosed` runs the old agent's transient state
+    ///      (agents row, chat_rows, etc.) is gone.
+    #[wasm_bindgen_test]
+    async fn qa_ordering_new_then_completed_then_close_preserves_tab() {
+        reset_inbound_seqs("h-qa");
+        let state = make_app_state("h-qa");
+        // Register a-old via a real NewAgent. For User-origin agents
+        // this also auto-opens the user's chat tab.
+        register_agent_via_new_agent(&state, "h-qa", "a-old", "Old Agent", 0, 0);
+        seed_chat_row(&state, "a-old");
+        let tab_id_before = state
+            .center_zone
+            .with_untracked(|cz| cz.active_tab_id)
+            .expect("NewAgent should have auto-opened a chat tab for a-old");
+        let tabs_before = state.center_zone.with_untracked(|cz| cz.tabs.len());
+
+        // User clicks Compact — fingerprint captured. Replacement
+        // NewAgent arrives next; without the dispatcher's fingerprint
+        // suppression it would steal focus into a duplicate tab.
+        state.mark_compaction_started("h-qa", AgentId("a-old".to_owned()));
+
+        // 1. Replacement NewAgent arrives on /host/h-qa (seq=1 because
+        //    a-old's NewAgent occupied seq=0).
+        register_agent_via_new_agent(&state, "h-qa", "a-new", "Compacted Agent", 1, 1);
+        let after_new_agent_tab_count = state.center_zone.with_untracked(|cz| cz.tabs.len());
+        let after_new_agent_active = state.center_zone.with_untracked(|cz| {
+            cz.active_tab().and_then(|tab| match &tab.content {
+                TabContent::Chat {
+                    agent_ref: Some(ar),
+                    ..
+                } => Some(ar.agent_id.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            after_new_agent_tab_count, tabs_before,
+            "replacement NewAgent must not open a duplicate chat tab"
+        );
+        assert_eq!(
+            after_new_agent_active,
+            Some(AgentId("a-old".to_owned())),
+            "active tab must still point at the old agent until Completed retargets it"
+        );
+
+        // 2. Completed arrives on the OLD agent's instance stream,
+        //    while that stream is still valid (the protocol validator
+        //    would reject this frame if it arrived after AgentClosed).
+        dispatch_frame(
+            &state,
+            "h-qa",
+            agent_stream("a-old"),
+            FrameKind::AgentCompactNotify,
+            0,
+            &AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Completed,
+                old_agent_id: AgentId("a-old".to_owned()),
+                old_session_id: None,
+                new_agent_id: Some(AgentId("a-new".to_owned())),
+                new_session_id: None,
+                summary_preview: Some("Worked on the wizard.".to_owned()),
+                message: None,
+            },
+        );
+        let (label, ar, tab_id_after, tabs_after) = state.center_zone.with_untracked(|cz| {
+            let tab = cz.active_tab().expect("active tab still present");
+            let agent_ref = match &tab.content {
+                TabContent::Chat {
+                    agent_ref: Some(ar),
+                    ..
+                } => ar.clone(),
+                _ => panic!("active tab should be a Chat after retarget"),
+            };
+            (tab.label.clone(), agent_ref, tab.id, cz.tabs.len())
+        });
+        assert_eq!(
+            tab_id_after, tab_id_before,
+            "Completed retarget must preserve the TabId so the tab does not remount"
+        );
+        assert_eq!(
+            ar.agent_id,
+            AgentId("a-new".to_owned()),
+            "tab agent_ref should now point at the replacement"
+        );
+        assert_eq!(label, "Compacted Agent");
+        assert_eq!(
+            tabs_after, tabs_before,
+            "no duplicate tab introduced through retarget"
+        );
+        assert!(
+            !state
+                .compaction_in_progress
+                .with_untracked(|map| map.contains_key(&AgentId("a-old".to_owned()))),
+            "in-flight flag cleared on Completed"
+        );
+
+        // 3. AgentClosed for old arrives last. This is the "normal"
+        //    close path (compaction_in_progress no longer has a-old),
+        //    so we expect transient state for a-old to be cleaned up.
+        //    The retargeted tab now points at a-new, so the close
+        //    sweep finds no matching Chat tab and must leave it alone.
+        // seq=2 on /host/h-qa: a-old=0, a-new=1, AgentClosed=2.
+        dispatch_frame(
+            &state,
+            "h-qa",
+            StreamPath("/host/h-qa".to_owned()),
+            FrameKind::AgentClosed,
+            2,
+            &protocol::AgentClosedPayload {
+                agent_id: AgentId("a-old".to_owned()),
+            },
+        );
+
+        // The retargeted tab is still here, still pointing at a-new.
+        let (final_label, final_ar, final_tab_id, final_tab_count) =
+            state.center_zone.with_untracked(|cz| {
+                let tab = cz.active_tab().expect("active tab still present");
+                let agent_ref = match &tab.content {
+                    TabContent::Chat {
+                        agent_ref: Some(ar),
+                        ..
+                    } => ar.clone(),
+                    _ => panic!("active tab should still be a Chat after AgentClosed"),
+                };
+                (tab.label.clone(), agent_ref, tab.id, cz.tabs.len())
+            });
+        assert_eq!(
+            final_tab_id, tab_id_before,
+            "AgentClosed must not remount or replace the retargeted tab"
+        );
+        assert_eq!(
+            final_ar.agent_id,
+            AgentId("a-new".to_owned()),
+            "AgentClosed for the old agent must not flip agent_ref back"
+        );
+        assert_eq!(final_label, "Compacted Agent");
+        assert_eq!(
+            final_tab_count, tabs_before,
+            "AgentClosed for the old agent must not close the retargeted tab"
+        );
+
+        // 4. Old agent transient state cleaned up by the normal
+        //    apply_agent_closed path (compaction_in_progress was
+        //    empty so no defer; teardown ran immediately).
+        assert!(
+            state.agents.with_untracked(|agents| agents
+                .iter()
+                .all(|a| a.agent_id != AgentId("a-old".to_owned()))),
+            "old AgentInfo must be cleaned up after AgentClosed"
+        );
+        assert!(
+            !state
+                .chat_rows
+                .with_untracked(|m| m.contains_key(&AgentId("a-old".to_owned()))),
+            "old chat_rows must be cleaned up after AgentClosed"
+        );
+        assert!(
+            !state
+                .agent_session_settings
+                .with_untracked(|m| m.contains_key(&AgentId("a-old".to_owned()))),
+            "old agent_session_settings must be cleaned up after AgentClosed"
+        );
+        assert!(
+            state.compaction_pending_close.with(|set| set.is_empty()),
+            "pending-close set must remain empty under the new contract"
+        );
+    }
+
+    /// Defensive belt: `finalize_compaction_close` cleans up the same
+    /// transient maps `apply_agent_closed` does. The new backend
+    /// contract delivers `Completed` before `AgentClosed`, so the
+    /// deferred-close path normally isn't exercised — but we still
+    /// want the cleanup parity intact in case ordering ever inverts.
+    /// This drives `finalize_compaction_close` directly via the
+    /// state API to keep the assertion narrow and protocol-free.
+    #[wasm_bindgen_test]
+    async fn finalize_compaction_close_clears_agent_session_settings() {
+        let state = make_app_state("h-clean");
+        push_agent(&state, "h-clean", "a-old", "Old Agent", true);
+        seed_chat_row(&state, "a-old");
+        state.agent_session_settings.update(|map| {
+            map.insert(
+                AgentId("a-old".to_owned()),
+                protocol::SessionSettingsValues::default(),
+            );
+        });
+        // Drive the same code path finish_compaction_success calls
+        // after retargeting: drop the deferred-close entry's transient
+        // state for the old agent.
+        state.finish_compaction_success(
+            &AgentId("a-old".to_owned()),
+            &AgentInfo {
+                host_id: "h-clean".to_owned(),
+                agent_id: AgentId("a-new".to_owned()),
+                name: "New".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 1,
+                instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            },
+        );
+        // Without an entry in compaction_pending_close,
+        // finish_compaction_success does NOT call finalize — that's
+        // intentional. Add one and re-trigger by calling
+        // defer_compaction_close + a synthetic
+        // finish_compaction_success.
+        state.defer_compaction_close("h-clean", AgentId("a-old".to_owned()));
+        state.finish_compaction_success(
+            &AgentId("a-old".to_owned()),
+            &AgentInfo {
+                host_id: "h-clean".to_owned(),
+                agent_id: AgentId("a-new".to_owned()),
+                name: "New".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 1,
+                instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            },
+        );
+        assert!(
+            !state
+                .agent_session_settings
+                .with_untracked(|m| m.contains_key(&AgentId("a-old".to_owned()))),
+            "finalize_compaction_close must drop agent_session_settings for the old agent"
+        );
+        assert!(
+            !state
+                .chat_rows
+                .with_untracked(|m| m.contains_key(&AgentId("a-old".to_owned()))),
+            "finalize_compaction_close must drop chat_rows for the old agent"
+        );
+        assert!(
+            state.agents.with_untracked(|agents| agents
+                .iter()
+                .all(|a| a.agent_id != AgentId("a-old".to_owned()))),
+            "finalize_compaction_close must drop the old AgentInfo"
+        );
     }
 }

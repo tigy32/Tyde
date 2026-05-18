@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use protocol::types::AgentClosedPayload;
+use protocol::types::{
+    AgentClosedPayload, AgentCompactNotifyPayload, AgentCompactPayload, AgentCompactStatus,
+};
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
     CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
@@ -44,7 +46,10 @@ use crate::agent::registry::{
     AgentRegistry, InitialAgentAlias, InitialAgentAliasPersistence, RelaySpawnRequest,
     ResolvedSpawnRequest,
 };
-use crate::agent::{AgentHandle, GenerateAgentNameRequest, derive_agent_name, generate_agent_name};
+use crate::agent::{
+    AgentHandle, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentNameRequest,
+    MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name, generate_agent_name,
+};
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
 use crate::backend::{
@@ -105,6 +110,8 @@ struct TeamSpawnContext {
     team_id: TeamId,
     team_member_id: TeamMemberId,
 }
+
+const COMPACTION_SUMMARY_PREVIEW_CHARS: usize = 512;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TeamMemberMessageOutcome {
@@ -749,6 +756,435 @@ impl HostHandle {
     pub(crate) async fn spawn_agent(&self, payload: SpawnAgentPayload) -> AgentId {
         self.spawn_agent_with_origin(payload, AgentOrigin::User)
             .await
+    }
+
+    pub(crate) async fn compact_agent(
+        &self,
+        agent_id: AgentId,
+        payload: AgentCompactPayload,
+        stream: Stream,
+    ) -> AppResult<()> {
+        let summary_prompt = payload
+            .summary_prompt
+            .unwrap_or_else(default_compaction_summary_prompt);
+        let max_summary_bytes = payload
+            .max_summary_bytes
+            .map(|bytes| bytes as usize)
+            .unwrap_or(DEFAULT_COMPACTION_SUMMARY_MAX_BYTES)
+            .clamp(1, MAX_COMPACTION_SUMMARY_BYTES);
+
+        let Some((agent_handle, start, old_session_id, access_mode, session_store, team_registry)) =
+            ({
+                let state = self.state.lock().await;
+                state.registry.agent_handle(&agent_id).map(|agent_handle| {
+                    let start = agent_handle.snapshot();
+                    (
+                        agent_handle,
+                        start,
+                        state.agent_sessions.get(&agent_id).cloned(),
+                        state.registry.agent_access_mode(&agent_id),
+                        Arc::clone(&state.session_store),
+                        state.team_registry.clone(),
+                    )
+                })
+            })
+        else {
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: None,
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some("agent is not running".to_owned()),
+                },
+            );
+            return Ok(());
+        };
+
+        let Some(old_session_id) = old_session_id else {
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: None,
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some("agent has no session to compact".to_owned()),
+                },
+            );
+            return Ok(());
+        };
+        let Some(access_mode) = access_mode else {
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: Some(old_session_id),
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some("agent access mode is unavailable".to_owned()),
+                },
+            );
+            return Ok(());
+        };
+        if start.origin == AgentOrigin::BackendNative {
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: Some(old_session_id),
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some("backend-native agents cannot be compacted".to_owned()),
+                },
+            );
+            return Ok(());
+        }
+        let old_record = match session_store.lock().await.get(&old_session_id) {
+            Some(record) => record,
+            None => {
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: Some("agent session metadata is missing".to_owned()),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        if old_record.compacted_to_session_id.is_some() {
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: Some(old_session_id),
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some("agent session is already compacted".to_owned()),
+                },
+            );
+            return Ok(());
+        }
+
+        send_agent_compact_notify(
+            &stream,
+            AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Started,
+                old_agent_id: agent_id.clone(),
+                old_session_id: Some(old_session_id.clone()),
+                new_agent_id: None,
+                new_session_id: None,
+                summary_preview: None,
+                message: None,
+            },
+        );
+
+        let summary = match agent_handle
+            .compact(summary_prompt, max_summary_bytes)
+            .await
+        {
+            Some(Ok(summary)) => summary,
+            Some(Err(error)) => {
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: Some(error),
+                    },
+                );
+                return Ok(());
+            }
+            None => {
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: Some("agent stopped before compaction completed".to_owned()),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        if summary.session_id != old_session_id {
+            let _ = agent_handle.release_compaction().await;
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: Some(old_session_id),
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some(format!(
+                        "compaction summary came from unexpected session {}",
+                        summary.session_id
+                    )),
+                },
+            );
+            return Ok(());
+        }
+
+        let summary_preview = compaction_summary_preview(&summary.summary);
+        let replacement_prompt = build_compaction_replacement_prompt(&summary.summary);
+        let team_context = match (
+            start.origin,
+            start.team_id.clone(),
+            start.team_member_id.clone(),
+        ) {
+            (AgentOrigin::TeamMember, Some(team_id), Some(team_member_id)) => {
+                Some(TeamSpawnContext {
+                    team_id,
+                    team_member_id,
+                })
+            }
+            (AgentOrigin::TeamMember, _, _) => {
+                let _ = agent_handle.release_compaction().await;
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: Some(summary_preview),
+                        message: Some("team agent metadata is incomplete".to_owned()),
+                    },
+                );
+                return Ok(());
+            }
+            (_, None, None) => None,
+            _ => {
+                let _ = agent_handle.release_compaction().await;
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: Some(summary_preview),
+                        message: Some("team agent metadata is incomplete".to_owned()),
+                    },
+                );
+                return Ok(());
+            }
+        };
+        let replacement_payload = SpawnAgentPayload {
+            name: Some(start.name.clone()),
+            custom_agent_id: start.custom_agent_id.clone(),
+            parent_agent_id: start.parent_agent_id.clone(),
+            project_id: start.project_id.clone(),
+            params: SpawnAgentParams::New {
+                workspace_roots: start.workspace_roots.clone(),
+                prompt: replacement_prompt,
+                images: None,
+                backend_kind: start.backend_kind,
+                cost_hint: None,
+                access_mode,
+                session_settings: old_record.session_settings.clone(),
+            },
+        };
+        let new_agent_id = self
+            .spawn_agent_with_origin_config_and_team(
+                replacement_payload,
+                start.origin,
+                None,
+                team_context.clone(),
+            )
+            .await;
+        let new_session_id = match self.wait_for_agent_session_id_result(&new_agent_id).await {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.close_agent(&new_agent_id).await;
+                let _ = agent_handle.release_compaction().await;
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: Some(new_agent_id),
+                        new_session_id: None,
+                        summary_preview: Some(summary_preview),
+                        message: Some(format!("replacement agent failed to start: {error}")),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+        if let Some(context) = team_context.as_ref() {
+            let refs_result = {
+                let state = self.state.lock().await;
+                agent_team_validation_refs(&state, "agent_compact").await
+            };
+            let refs = match refs_result {
+                Ok(refs) => refs,
+                Err(error) => {
+                    self.close_agent(&new_agent_id).await;
+                    let _ = agent_handle.release_compaction().await;
+                    send_agent_compact_notify(
+                        &stream,
+                        AgentCompactNotifyPayload {
+                            status: AgentCompactStatus::Failed,
+                            old_agent_id: agent_id,
+                            old_session_id: Some(old_session_id),
+                            new_agent_id: Some(new_agent_id),
+                            new_session_id: Some(new_session_id),
+                            summary_preview: Some(summary_preview),
+                            message: Some(format!("team validation failed: {error}")),
+                        },
+                    );
+                    return Ok(());
+                }
+            };
+            match team_registry
+                .rotate_member_agent(
+                    context.team_member_id.clone(),
+                    agent_id.clone(),
+                    new_agent_id.clone(),
+                    old_session_id.clone(),
+                    new_session_id.clone(),
+                    refs,
+                )
+                .await
+            {
+                Ok(events) => {
+                    let mut state = self.state.lock().await;
+                    fan_out_team_registry_events(&mut state, events).await;
+                }
+                Err(error) => {
+                    self.close_agent(&new_agent_id).await;
+                    let _ = agent_handle.release_compaction().await;
+                    send_agent_compact_notify(
+                        &stream,
+                        AgentCompactNotifyPayload {
+                            status: AgentCompactStatus::Failed,
+                            old_agent_id: agent_id,
+                            old_session_id: Some(old_session_id),
+                            new_agent_id: Some(new_agent_id),
+                            new_session_id: Some(new_session_id),
+                            summary_preview: Some(summary_preview),
+                            message: Some(format!("team binding rotation failed: {error}")),
+                        },
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        if let Err(error) = session_store.lock().await.mark_compacted(
+            &old_session_id,
+            &new_session_id,
+            summary_preview.clone(),
+        ) {
+            if let Some(context) = team_context.as_ref() {
+                let rollback_refs_result = {
+                    let state = self.state.lock().await;
+                    agent_team_validation_refs(&state, "agent_compact_rollback").await
+                };
+                match rollback_refs_result {
+                    Ok(rollback_refs) => {
+                        match team_registry
+                            .rotate_member_agent(
+                                context.team_member_id.clone(),
+                                new_agent_id.clone(),
+                                agent_id.clone(),
+                                new_session_id.clone(),
+                                old_session_id.clone(),
+                                rollback_refs,
+                            )
+                            .await
+                        {
+                            Ok(events) => {
+                                let mut state = self.state.lock().await;
+                                fan_out_team_registry_events(&mut state, events).await;
+                            }
+                            Err(rollback_error) => {
+                                tracing::error!(
+                                    member_id = %context.team_member_id,
+                                    error = %rollback_error,
+                                    "failed to roll back team binding after session compaction metadata failure"
+                                );
+                            }
+                        }
+                    }
+                    Err(rollback_error) => {
+                        tracing::error!(
+                            member_id = %context.team_member_id,
+                            error = %rollback_error,
+                            "failed to validate team binding rollback after session compaction metadata failure"
+                        );
+                    }
+                }
+            }
+            self.close_agent(&new_agent_id).await;
+            let _ = agent_handle.release_compaction().await;
+            send_agent_compact_notify(
+                &stream,
+                AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: agent_id,
+                    old_session_id: Some(old_session_id),
+                    new_agent_id: Some(new_agent_id),
+                    new_session_id: Some(new_session_id),
+                    summary_preview: Some(summary_preview),
+                    message: Some(format!("session compaction metadata failed: {error}")),
+                },
+            );
+            return Ok(());
+        }
+
+        self.fan_out_session_lists().await;
+        send_agent_compact_notify(
+            &stream,
+            AgentCompactNotifyPayload {
+                status: AgentCompactStatus::Completed,
+                old_agent_id: agent_id.clone(),
+                old_session_id: Some(old_session_id),
+                new_agent_id: Some(new_agent_id),
+                new_session_id: Some(new_session_id),
+                summary_preview: Some(summary_preview),
+                message: None,
+            },
+        );
+        if !self.close_agent(&agent_id).await {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "old agent was already closed after successful compaction"
+            );
+        }
+        Ok(())
     }
 
     async fn spawn_agent_with_origin(
@@ -3560,17 +3996,40 @@ impl HostHandle {
             ));
         }
 
-        let (target_agent_id, target_agent) = {
+        let target_session_ids = {
+            let session_store = {
+                let state = self.state.lock().await;
+                Arc::clone(&state.session_store)
+            };
+            let mut ids = vec![target_session_id.clone()];
+            match session_store
+                .lock()
+                .await
+                .compacted_successor_chain(&target_session_id)
+            {
+                Ok(successors) => ids.extend(successors),
+                Err(error) => {
+                    tracing::warn!(
+                        target_session_id = %target_session_id,
+                        error = %error,
+                        "failed to resolve compacted review delivery target"
+                    );
+                }
+            }
+            ids
+        };
+
+        let (target_agent_id, target_agent, delivered_session_id) = {
             let state = self.state.lock().await;
             let matches = state
                 .agent_sessions
                 .iter()
-                .filter(|(_, session_id)| *session_id == &target_session_id)
-                .filter_map(|(agent_id, _)| {
+                .filter(|(_, session_id)| target_session_ids.contains(session_id))
+                .filter_map(|(agent_id, session_id)| {
                     state
                         .registry
                         .agent_handle(agent_id)
-                        .map(|handle| (agent_id.clone(), handle))
+                        .map(|handle| (agent_id.clone(), handle, session_id.clone()))
                 })
                 .collect::<Vec<_>>();
             match matches.len() {
@@ -3587,7 +4046,7 @@ impl HostHandle {
             tracing::info!(
                 review_id = %review_id,
                 target_agent_id = %target_agent_id,
-                target_session_id = %target_session_id,
+                target_session_id = %delivered_session_id,
                 "delivered review feedback bundle to live agent"
             );
             ReviewDeliveryOutcome::Delivered
@@ -3601,40 +4060,64 @@ impl HostHandle {
             let state = self.state.lock().await;
             state.review_registry.clone()
         };
-        let bundles = match registry
-            .submitted_bundles_for_session(session_id.clone())
-            .await
-        {
-            Ok(bundles) => bundles,
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %error,
-                    "failed to query submitted reviews for resumed session"
-                );
-                return;
-            }
-        };
-        for (review_id, payload) in bundles {
-            match self
-                .deliver_review_payload(review_id.clone(), session_id.clone(), payload)
+        let session_ids = {
+            let session_store = {
+                let state = self.state.lock().await;
+                Arc::clone(&state.session_store)
+            };
+            let mut ids = vec![session_id.clone()];
+            match session_store
+                .lock()
                 .await
+                .compacted_ancestor_chain(&session_id)
             {
-                ReviewDeliveryOutcome::Delivered | ReviewDeliveryOutcome::Offline => {}
-                ReviewDeliveryOutcome::Ambiguous => {
+                Ok(ancestors) => ids.extend(ancestors),
+                Err(error) => {
                     tracing::warn!(
-                        review_id = %review_id,
                         session_id = %session_id,
-                        "submitted review delivery is ambiguous after session resume"
+                        error = %error,
+                        "failed to resolve compacted review delivery ancestors"
                     );
                 }
-                ReviewDeliveryOutcome::Failed(message) => {
+            }
+            ids
+        };
+        for origin_session_id in session_ids {
+            let bundles = match registry
+                .submitted_bundles_for_session(origin_session_id.clone())
+                .await
+            {
+                Ok(bundles) => bundles,
+                Err(error) => {
                     tracing::warn!(
-                        review_id = %review_id,
-                        session_id = %session_id,
-                        error = %message,
-                        "submitted review delivery failed after session resume"
+                        session_id = %origin_session_id,
+                        error = %error,
+                        "failed to query submitted reviews for resumed session"
                     );
+                    continue;
+                }
+            };
+            for (review_id, payload) in bundles {
+                match self
+                    .deliver_review_payload(review_id.clone(), origin_session_id.clone(), payload)
+                    .await
+                {
+                    ReviewDeliveryOutcome::Delivered | ReviewDeliveryOutcome::Offline => {}
+                    ReviewDeliveryOutcome::Ambiguous => {
+                        tracing::warn!(
+                            review_id = %review_id,
+                            session_id = %origin_session_id,
+                            "submitted review delivery is ambiguous after session resume"
+                        );
+                    }
+                    ReviewDeliveryOutcome::Failed(message) => {
+                        tracing::warn!(
+                            review_id = %review_id,
+                            session_id = %origin_session_id,
+                            error = %message,
+                            "submitted review delivery failed after session resume"
+                        );
+                    }
                 }
             }
         }
@@ -5324,6 +5807,36 @@ fn new_instance_stream(agent_id: &AgentId) -> StreamPath {
     StreamPath(format!("/agent/{}/{}", agent_id, instance_id))
 }
 
+fn default_compaction_summary_prompt() -> String {
+    "Summarize the durable context a future replacement Tyde agent should remember. \
+Focus on user preferences, project facts, decisions, constraints, open threads, and \
+useful debugging or implementation learnings. Omit transient chatter and output only \
+the summary."
+        .to_owned()
+}
+
+fn build_compaction_replacement_prompt(summary: &str) -> String {
+    format!(
+        "You are replacing a previous persistent Tyde agent after session compaction. \
+Use this memory summary as your durable context, but do not claim you can access the \
+old session transcript unless the user provides it.\n\nMemory summary:\n{summary}\n\n\
+Acknowledge briefly and continue from this memory."
+    )
+}
+
+fn compaction_summary_preview(summary: &str) -> String {
+    summary
+        .chars()
+        .take(COMPACTION_SUMMARY_PREVIEW_CHARS)
+        .collect()
+}
+
+fn send_agent_compact_notify(stream: &Stream, payload: AgentCompactNotifyPayload) {
+    let value = serde_json::to_value(payload)
+        .expect("failed to serialize AgentCompactNotify payload for agent stream");
+    let _ = stream.send_value(FrameKind::AgentCompactNotify, value);
+}
+
 impl HostHandle {
     async fn refresh_after_project_mutation(
         &self,
@@ -5486,13 +5999,13 @@ fn validate_terminal_relative_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mock::MOCK_DIE_AFTER_BUSY_SENTINEL;
+    use crate::backend::mock::{MOCK_DIE_AFTER_BUSY_SENTINEL, MOCK_SLOW_TURN_SENTINEL};
     use crate::review::ReviewHandle;
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
         BackendKind, CustomAgentId, DiffContextMode, HostSettingValue, ProjectDiffScope,
-        ProjectGitDiffPayload, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus,
-        TeamMemberCreateSpec, ToolPolicy,
+        ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
+        ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec, ToolPolicy,
     };
 
     #[test]
@@ -5531,6 +6044,11 @@ mod tests {
         custom_agent_id: CustomAgentId,
         project_id: ProjectId,
         agent_team_store_path: PathBuf,
+    }
+
+    struct CompactFixture {
+        _dir: tempfile::TempDir,
+        host: HostHandle,
     }
 
     async fn team_fixture() -> TeamFixture {
@@ -5883,6 +6401,519 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    async fn compact_fixture() -> CompactFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("spawn mock host");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable backend");
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(BackendKind::Claude),
+            },
+        })
+        .await
+        .expect("set default backend");
+        CompactFixture { _dir: dir, host }
+    }
+
+    async fn spawn_idle_user_agent(host: &HostHandle, prompt: &str) -> (AgentId, SessionId) {
+        let agent_id = host
+            .spawn_agent(SpawnAgentPayload {
+                name: Some("Compact Me".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: Vec::new(),
+                    prompt: prompt.to_owned(),
+                    images: None,
+                    backend_kind: BackendKind::Claude,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await;
+        let session_id = host
+            .wait_for_agent_session_id_result(&agent_id)
+            .await
+            .expect("agent session id");
+        wait_for_agent_idle(host, &agent_id).await;
+        (agent_id, session_id)
+    }
+
+    async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = host.agent_status_snapshot(agent_id).await
+                && status.started
+                && !status.terminated
+                && !status.is_active()
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for agent {agent_id} to become idle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_agent_active(host: &HostHandle, agent_id: &AgentId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = host.agent_status_snapshot(agent_id).await
+                && status.started
+                && !status.terminated
+                && status.is_active()
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for agent {agent_id} to become active"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn compact_stream(agent_id: &AgentId) -> (Stream, mpsc::UnboundedReceiver<protocol::Envelope>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Stream::new(StreamPath(format!("/agent/{}", agent_id)), tx),
+            rx,
+        )
+    }
+
+    fn drain_validated_events(
+        validator: &mut ProtocolValidator,
+        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+        context: &str,
+    ) -> Vec<protocol::Envelope> {
+        let mut envelopes = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            validator
+                .validate_envelope(&envelope)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{context}: protocol violation after {} on {}: {err}",
+                        envelope.kind, envelope.stream
+                    )
+                });
+            envelopes.push(envelope);
+        }
+        envelopes
+    }
+
+    fn drain_compact_notifies(
+        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+    ) -> Vec<AgentCompactNotifyPayload> {
+        let mut notifies = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if envelope.kind == FrameKind::AgentCompactNotify {
+                notifies.push(
+                    envelope
+                        .parse_payload::<AgentCompactNotifyPayload>()
+                        .expect("compact notify payload"),
+                );
+            }
+        }
+        notifies
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_rotates_user_agent() {
+        let fixture = compact_fixture().await;
+        let (old_agent_id, old_session_id) =
+            spawn_idle_user_agent(&fixture.host, "remember this user preference").await;
+        let (stream, mut rx) = compact_stream(&old_agent_id);
+
+        fixture
+            .host
+            .compact_agent(old_agent_id.clone(), AgentCompactPayload::default(), stream)
+            .await
+            .expect("compact agent");
+
+        let notifies = drain_compact_notifies(&mut rx);
+        assert_eq!(
+            notifies.first().map(|notify| notify.status),
+            Some(AgentCompactStatus::Started)
+        );
+        let completed = notifies
+            .iter()
+            .find(|notify| notify.status == AgentCompactStatus::Completed)
+            .expect("completed notify");
+        let new_agent_id = completed
+            .new_agent_id
+            .clone()
+            .expect("new agent id in completed notify");
+        let new_session_id = completed
+            .new_session_id
+            .clone()
+            .expect("new session id in completed notify");
+        assert_ne!(new_agent_id, old_agent_id);
+        assert_ne!(new_session_id, old_session_id);
+        assert!(fixture.host.agent_handle(&old_agent_id).await.is_none());
+        assert!(fixture.host.agent_handle(&new_agent_id).await.is_some());
+
+        let (old_record, new_record) = {
+            let state = fixture.host.state.lock().await;
+            let store = state.session_store.lock().await;
+            (
+                store.get(&old_session_id).expect("old record"),
+                store.get(&new_session_id).expect("new record"),
+            )
+        };
+        assert!(!old_record.resumable);
+        assert_eq!(
+            old_record.compacted_to_session_id.as_ref(),
+            Some(&new_session_id)
+        );
+        assert_eq!(
+            new_record.compacted_from_session_id.as_ref(),
+            Some(&old_session_id)
+        );
+        assert!(
+            old_record
+                .compaction_summary_preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("mock backend response"))
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_completed_validates_before_old_agent_closed_on_instance_stream() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_stream = Stream::new(
+            StreamPath(format!("/host/compact-order-{}", Uuid::new_v4())),
+            tx.clone(),
+        );
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream)
+                .await
+                .is_empty()
+        );
+        let mut validator = ProtocolValidator::new();
+        drain_validated_events(&mut validator, &mut rx, "host registration");
+
+        let (old_agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "remember protocol ordering").await;
+        let spawn_events = drain_validated_events(&mut validator, &mut rx, "old agent spawn");
+        let old_instance_stream = spawn_events
+            .iter()
+            .find_map(|envelope| {
+                if envelope.kind != FrameKind::NewAgent {
+                    return None;
+                }
+                let payload: NewAgentPayload =
+                    envelope.parse_payload().expect("parse old NewAgent");
+                (payload.agent_id == old_agent_id).then_some(payload.instance_stream)
+            })
+            .expect("old agent instance stream");
+        assert!(
+            old_instance_stream
+                .0
+                .starts_with(&format!("/agent/{}/", old_agent_id))
+        );
+
+        let compact_stream = Stream::new(old_instance_stream.clone(), tx);
+        fixture
+            .host
+            .compact_agent(
+                old_agent_id.clone(),
+                AgentCompactPayload::default(),
+                compact_stream,
+            )
+            .await
+            .expect("compact agent");
+
+        let compact_events = drain_validated_events(&mut validator, &mut rx, "agent compaction");
+        let mut completed_index = None;
+        let mut closed_index = None;
+        for (index, envelope) in compact_events.iter().enumerate() {
+            match envelope.kind {
+                FrameKind::AgentCompactNotify if envelope.stream == old_instance_stream => {
+                    let payload: AgentCompactNotifyPayload =
+                        envelope.parse_payload().expect("compact notify");
+                    if payload.status == AgentCompactStatus::Completed {
+                        completed_index = Some(index);
+                    }
+                }
+                FrameKind::AgentClosed => {
+                    let payload: AgentClosedPayload =
+                        envelope.parse_payload().expect("agent closed");
+                    if payload.agent_id == old_agent_id {
+                        closed_index = Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let completed_index = completed_index.expect("completed compact notify");
+        let closed_index = closed_index.expect("old AgentClosed");
+        assert!(
+            completed_index < closed_index,
+            "Completed notify must arrive before AgentClosed invalidates the old stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_rejects_busy_agent() {
+        let fixture = compact_fixture().await;
+        let resolved = ResolvedSpawnConfig {
+            instructions: Some(MOCK_SLOW_TURN_SENTINEL.to_owned()),
+            ..Default::default()
+        };
+        let agent_id = fixture
+            .host
+            .spawn_agent_with_origin_config_and_team(
+                SpawnAgentPayload {
+                    name: Some("Busy Agent".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: Vec::new(),
+                        prompt: "slow start".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Claude,
+                        cost_hint: None,
+                        access_mode: Default::default(),
+                        session_settings: None,
+                    },
+                },
+                AgentOrigin::User,
+                Some(resolved),
+                None,
+            )
+            .await;
+        let old_session_id = fixture
+            .host
+            .wait_for_agent_session_id_result(&agent_id)
+            .await
+            .expect("agent session id");
+        wait_for_agent_active(&fixture.host, &agent_id).await;
+        let (stream, mut rx) = compact_stream(&agent_id);
+
+        fixture
+            .host
+            .compact_agent(agent_id.clone(), AgentCompactPayload::default(), stream)
+            .await
+            .expect("compact busy agent");
+
+        let notifies = drain_compact_notifies(&mut rx);
+        let failed = notifies
+            .iter()
+            .find(|notify| notify.status == AgentCompactStatus::Failed)
+            .expect("failed notify");
+        assert!(
+            failed
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("busy"))
+        );
+        assert!(fixture.host.agent_handle(&agent_id).await.is_some());
+        let old_record = {
+            let state = fixture.host.state.lock().await;
+            state
+                .session_store
+                .lock()
+                .await
+                .get(&old_session_id)
+                .expect("old record")
+        };
+        assert!(old_record.resumable);
+        assert!(old_record.compacted_to_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_summary_failure_leaves_old_agent() {
+        let fixture = compact_fixture().await;
+        let (old_agent_id, old_session_id) =
+            spawn_idle_user_agent(&fixture.host, "initial prompt").await;
+        let (stream, mut rx) = compact_stream(&old_agent_id);
+
+        fixture
+            .host
+            .compact_agent(
+                old_agent_id.clone(),
+                AgentCompactPayload {
+                    summary_prompt: Some("/compact".to_owned()),
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+            .expect("compact agent");
+
+        let notifies = drain_compact_notifies(&mut rx);
+        let failed = notifies
+            .iter()
+            .find(|notify| notify.status == AgentCompactStatus::Failed)
+            .expect("failed notify");
+        assert!(
+            failed
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("summary was empty"))
+        );
+        assert!(fixture.host.agent_handle(&old_agent_id).await.is_some());
+        let old_record = {
+            let state = fixture.host.state.lock().await;
+            state
+                .session_store
+                .lock()
+                .await
+                .get(&old_session_id)
+                .expect("old record")
+        };
+        assert!(old_record.resumable);
+        assert!(old_record.compacted_to_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_replacement_failure_leaves_old_agent() {
+        let fixture = compact_fixture().await;
+        let (old_agent_id, old_session_id) =
+            spawn_idle_user_agent(&fixture.host, "initial prompt").await;
+        let (stream, mut rx) = compact_stream(&old_agent_id);
+
+        fixture
+            .host
+            .compact_agent(
+                old_agent_id.clone(),
+                AgentCompactPayload {
+                    summary_prompt: Some("__mock_fail_spawn__".to_owned()),
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+            .expect("compact agent");
+
+        let notifies = drain_compact_notifies(&mut rx);
+        let failed = notifies
+            .iter()
+            .find(|notify| notify.status == AgentCompactStatus::Failed)
+            .expect("failed notify");
+        assert!(
+            failed
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("replacement agent failed"))
+        );
+        assert!(fixture.host.agent_handle(&old_agent_id).await.is_some());
+        if let Some(new_agent_id) = failed.new_agent_id.as_ref() {
+            assert!(fixture.host.agent_handle(new_agent_id).await.is_none());
+        }
+        let old_record = {
+            let state = fixture.host.state.lock().await;
+            state
+                .session_store
+                .lock()
+                .await
+                .get(&old_session_id)
+                .expect("old record")
+        };
+        assert!(old_record.resumable);
+        assert!(old_record.compacted_to_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_rotates_team_member_session() {
+        let fixture = team_fixture().await;
+        let manager_agent_id = bind_team_member(&fixture.host, &fixture.manager).await;
+        let outcome = fixture
+            .host
+            .message_team_member(
+                manager_agent_id.clone(),
+                fixture.report.id.clone(),
+                "Please investigate the bug".to_owned(),
+                None,
+            )
+            .await
+            .expect("message report");
+        let old_report_agent_id = outcome.agent_id;
+        let old_report_session_id = fixture
+            .host
+            .wait_for_agent_session_id_result(&old_report_agent_id)
+            .await
+            .expect("report session");
+        wait_for_agent_idle(&fixture.host, &old_report_agent_id).await;
+        let (stream, mut rx) = compact_stream(&old_report_agent_id);
+
+        fixture
+            .host
+            .compact_agent(
+                old_report_agent_id.clone(),
+                AgentCompactPayload::default(),
+                stream,
+            )
+            .await
+            .expect("compact report");
+
+        let notifies = drain_compact_notifies(&mut rx);
+        let completed = notifies
+            .iter()
+            .find(|notify| notify.status == AgentCompactStatus::Completed)
+            .expect("completed notify");
+        let replacement_agent_id = completed
+            .new_agent_id
+            .clone()
+            .expect("replacement agent id");
+        let replacement_session_id = completed
+            .new_session_id
+            .clone()
+            .expect("replacement session id");
+        assert_ne!(replacement_session_id, old_report_session_id);
+
+        let snapshot = team_snapshot(&fixture.host).await;
+        let report = member_from_snapshot(snapshot.clone(), &fixture.report.id);
+        assert_eq!(report.session_id.as_ref(), Some(&replacement_session_id));
+        let binding = snapshot
+            .bindings
+            .iter()
+            .find(|binding| binding.member_id == fixture.report.id)
+            .expect("report binding");
+        assert_eq!(
+            binding.current_agent_id.as_ref(),
+            Some(&replacement_agent_id)
+        );
+
+        assert!(fixture.host.close_agent(&replacement_agent_id).await);
+        wait_for_team_member_unbound(&fixture.host, &fixture.report.id).await;
+        let resumed = fixture
+            .host
+            .message_team_member(
+                manager_agent_id,
+                fixture.report.id.clone(),
+                "Follow up after compaction".to_owned(),
+                None,
+            )
+            .await
+            .expect("message compacted report");
+        let resumed_session_id = fixture
+            .host
+            .wait_for_agent_session_id_result(&resumed.agent_id)
+            .await
+            .expect("resumed report session");
+        assert_eq!(resumed_session_id, replacement_session_id);
     }
 
     #[tokio::test]

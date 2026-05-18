@@ -39,6 +39,14 @@ pub struct SessionRecord {
     pub session_settings: Option<SessionSettingsValues>,
     #[serde(default = "default_resumable")]
     pub resumable: bool,
+    #[serde(default)]
+    pub compacted_from_session_id: Option<SessionId>,
+    #[serde(default)]
+    pub compacted_to_session_id: Option<SessionId>,
+    #[serde(default)]
+    pub compacted_at_ms: Option<u64>,
+    #[serde(default)]
+    pub compaction_summary_preview: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +116,10 @@ impl SessionStore {
                     token_count: session.token_count,
                     session_settings: None,
                     resumable: session.resumable,
+                    compacted_from_session_id: None,
+                    compacted_to_session_id: None,
+                    compacted_at_ms: None,
+                    compaction_summary_preview: None,
                 });
 
             entry.backend_kind = session.backend_kind;
@@ -207,6 +219,103 @@ impl SessionStore {
         })
     }
 
+    pub fn mark_compacted(
+        &self,
+        old_session_id: &SessionId,
+        new_session_id: &SessionId,
+        summary_preview: String,
+    ) -> Result<(), String> {
+        if old_session_id == new_session_id {
+            return Err(format!(
+                "cannot compact session {old_session_id} into itself"
+            ));
+        }
+        self.read_modify_write(|records| {
+            if !records.contains_key(&old_session_id.0) {
+                return Err(format!(
+                    "cannot compact missing old session {old_session_id}"
+                ));
+            }
+            if !records.contains_key(&new_session_id.0) {
+                return Err(format!(
+                    "cannot compact into missing new session {new_session_id}"
+                ));
+            }
+
+            let now = now_ms();
+            let old_record = records
+                .get_mut(&old_session_id.0)
+                .expect("old session existence checked before compaction mark");
+            old_record.resumable = false;
+            old_record.compacted_to_session_id = Some(new_session_id.clone());
+            old_record.compacted_at_ms = Some(now);
+            old_record.compaction_summary_preview = Some(summary_preview.clone());
+            old_record.updated_at_ms = now;
+
+            let new_record = records
+                .get_mut(&new_session_id.0)
+                .expect("new session existence checked before compaction mark");
+            new_record.compacted_from_session_id = Some(old_session_id.clone());
+            new_record.compacted_at_ms = Some(now);
+            new_record.compaction_summary_preview = Some(summary_preview);
+            new_record.updated_at_ms = now;
+            Ok(())
+        })?
+    }
+
+    pub fn compacted_successor_chain(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionId>, String> {
+        let records = Self::read_from_disk(&self.path)?;
+        let mut out = Vec::new();
+        let mut current = session_id.clone();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(current.clone());
+        for _ in 0..16 {
+            let Some(record) = records.get(&current.0) else {
+                break;
+            };
+            let Some(next) = record.compacted_to_session_id.clone() else {
+                break;
+            };
+            if !seen.insert(next.clone()) {
+                return Err(format!("compacted session lineage loop includes {next}"));
+            }
+            out.push(next.clone());
+            current = next;
+        }
+        Ok(out)
+    }
+
+    pub fn compacted_ancestor_chain(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionId>, String> {
+        let records = Self::read_from_disk(&self.path)?;
+        let mut out = Vec::new();
+        let mut current = session_id.clone();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(current.clone());
+        for _ in 0..16 {
+            let Some(previous) = records
+                .values()
+                .find(|record| record.compacted_to_session_id.as_ref() == Some(&current))
+                .map(|record| record.id.clone())
+            else {
+                break;
+            };
+            if !seen.insert(previous.clone()) {
+                return Err(format!(
+                    "compacted session lineage loop includes {previous}"
+                ));
+            }
+            out.push(previous.clone());
+            current = previous;
+        }
+        Ok(out)
+    }
+
     pub fn effective_name(&self, session_id: &SessionId) -> Option<String> {
         self.get(session_id)
             .and_then(|record| record.user_alias.or(record.alias))
@@ -229,6 +338,10 @@ impl SessionStore {
                 message_count: record.message_count,
                 token_count: record.token_count,
                 resumable: record.resumable,
+                compacted_from_session_id: record.compacted_from_session_id,
+                compacted_to_session_id: record.compacted_to_session_id,
+                compacted_at_ms: record.compacted_at_ms,
+                compaction_summary_preview: record.compaction_summary_preview,
             })
             .collect())
     }
@@ -296,4 +409,42 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_store_loads_legacy_records_without_compaction_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "records": {
+    "session-1": {
+      "id": "session-1",
+      "backend_kind": "claude",
+      "workspace_roots": [],
+      "created_at_ms": 1,
+      "updated_at_ms": 2,
+      "message_count": 3,
+      "resumable": true
+    }
+  }
+}"#,
+        )
+        .expect("write legacy session store");
+
+        let store = SessionStore::load(path).expect("load legacy session store");
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert!(summary.resumable);
+        assert!(summary.compacted_from_session_id.is_none());
+        assert!(summary.compacted_to_session_id.is_none());
+        assert!(summary.compacted_at_ms.is_none());
+        assert!(summary.compaction_summary_preview.is_none());
+    }
 }

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::anyhow;
-use protocol::types::CloseAgentPayload;
+use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
     CustomAgentDeletePayload, CustomAgentUpsertPayload, DeleteSessionPayload,
@@ -397,6 +397,16 @@ pub(crate) async fn route_client_envelope(
                         send_agent_not_running_error(stream, agent_id).await;
                     }
                 }
+            }
+            FrameKind::AgentCompact => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: AgentCompactPayload = parse_payload(&envelope, "agent_compact")?;
+                if let Some(summary_prompt) = payload.summary_prompt.as_ref() {
+                    ensure_non_empty("agent_compact", "summary_prompt", summary_prompt.as_str())?;
+                }
+                let stream = host_output_stream.with_path(stream_path);
+                host.compact_agent(agent_id, payload, stream).await?;
             }
             FrameKind::Interrupt => {
                 let stream_path = envelope.stream.clone();

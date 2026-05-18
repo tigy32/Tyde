@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use protocol::types::AgentCompactPayload;
 use protocol::{
     CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
@@ -71,6 +72,20 @@ pub async fn close_agent(host_id: &str, agent_stream: StreamPath) -> Result<(), 
         agent_stream,
         FrameKind::CloseAgent,
         &CloseAgentPayload {},
+    )
+    .await
+}
+
+/// Fire a compaction request for the agent reached via `agent_stream`.
+/// The server parses the agent id from the stream path; the payload only
+/// carries optional tuning fields. Mirrors `close_agent`'s targeting
+/// pattern.
+pub async fn compact_agent(host_id: &str, agent_stream: StreamPath) -> Result<(), String> {
+    send_frame(
+        host_id,
+        agent_stream,
+        FrameKind::AgentCompact,
+        &AgentCompactPayload::default(),
     )
     .await
 }

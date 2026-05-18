@@ -510,6 +510,39 @@ impl AgentTeamsStore {
         Ok(updated)
     }
 
+    pub fn replace_member_session_id(
+        &mut self,
+        member_id: &TeamMemberId,
+        old_session_id: &SessionId,
+        new_session_id: SessionId,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<TeamMember, String> {
+        if let Some(existing_owner) = self.file.members.values().find(|member| {
+            member.id != *member_id && member.session_id.as_ref() == Some(&new_session_id)
+        }) {
+            return Err(format!(
+                "session {} is already owned by team member {}",
+                new_session_id, existing_owner.id
+            ));
+        }
+
+        let member =
+            self.file.members.get_mut(member_id).ok_or_else(|| {
+                format!("cannot replace session for missing team member {member_id}")
+            })?;
+        if member.session_id.as_ref() != Some(old_session_id) {
+            return Err(format!(
+                "team member {member_id} session_id {:?} does not match expected {old_session_id}",
+                member.session_id
+            ));
+        }
+        member.session_id = Some(new_session_id);
+        member.updated_at_ms = now_ms()?;
+        let updated = member.clone();
+        self.validate_and_save(refs)?;
+        Ok(updated)
+    }
+
     pub fn clear_member_session_id(
         &mut self,
         member_id: &TeamMemberId,

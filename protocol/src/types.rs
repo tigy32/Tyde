@@ -342,6 +342,7 @@ pub enum FrameKind {
     CancelQueuedMessage,
     SendQueuedMessageNow,
     SetAgentName,
+    AgentCompact,
     Interrupt,
     CloseAgent,
     RunBackendSetup,
@@ -397,6 +398,7 @@ pub enum FrameKind {
     NewAgent,
     AgentStart,
     AgentRenamed,
+    AgentCompactNotify,
     AgentClosed,
     ChatEvent,
     AgentError,
@@ -451,6 +453,7 @@ impl fmt::Display for FrameKind {
             Self::CancelQueuedMessage => f.write_str("cancel_queued_message"),
             Self::SendQueuedMessageNow => f.write_str("send_queued_message_now"),
             Self::SetAgentName => f.write_str("set_agent_name"),
+            Self::AgentCompact => f.write_str("agent_compact"),
             Self::Interrupt => f.write_str("interrupt"),
             Self::CloseAgent => f.write_str("close_agent"),
             Self::RunBackendSetup => f.write_str("run_backend_setup"),
@@ -502,6 +505,7 @@ impl fmt::Display for FrameKind {
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
+            Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
             Self::AgentClosed => f.write_str("agent_closed"),
             Self::ChatEvent => f.write_str("chat_event"),
             Self::AgentError => f.write_str("agent_error"),
@@ -781,6 +785,38 @@ pub struct SetAgentNamePayload {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCompactPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_summary_bytes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCompactStatus {
+    Started,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCompactNotifyPayload {
+    pub status: AgentCompactStatus,
+    pub old_agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InterruptPayload {}
 
@@ -809,6 +845,14 @@ pub struct SessionSummary {
     pub message_count: u32,
     pub token_count: Option<u64>,
     pub resumable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_from_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_to_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_summary_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

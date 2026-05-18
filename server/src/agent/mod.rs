@@ -37,6 +37,8 @@ use self::registry::{InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSp
 
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const DEFAULT_COMPACTION_SUMMARY_MAX_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 
 type BackendHandle = Box<dyn BackendSender>;
 type BackendSpawnResult = Result<(BackendHandle, EventStream, SessionId), String>;
@@ -64,6 +66,14 @@ struct AgentNameChangeContext<'a> {
 
 enum AgentCommand {
     SendInput(AgentInput),
+    Compact {
+        summary_prompt: String,
+        max_summary_bytes: usize,
+        reply: oneshot::Sender<Result<CompactionSummary, String>>,
+    },
+    ReleaseCompaction {
+        reply: oneshot::Sender<()>,
+    },
     SetName {
         name: String,
         persistence: AgentNamePersistence,
@@ -79,6 +89,19 @@ enum AgentCommand {
         reply: oneshot::Sender<()>,
     },
     Attach(Stream),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionSummary {
+    pub session_id: SessionId,
+    pub summary: String,
+}
+
+struct ActiveCompaction {
+    reply: oneshot::Sender<Result<CompactionSummary, String>>,
+    summary: String,
+    max_summary_bytes: usize,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +128,41 @@ impl AgentHandle {
             return false;
         }
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
+    }
+
+    pub async fn compact(
+        &self,
+        summary_prompt: String,
+        max_summary_bytes: usize,
+    ) -> Option<Result<CompactionSummary, String>> {
+        if !self.accepting_input.load(Ordering::SeqCst) {
+            return Some(Err("agent is not accepting input".to_owned()));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::Compact {
+                summary_prompt,
+                max_summary_bytes,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub async fn release_compaction(&self) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReleaseCompaction { reply: reply_tx })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.is_ok()
     }
 
     pub async fn set_name(&self, name: String) -> Option<bool> {
@@ -664,6 +722,8 @@ pub(crate) fn spawn_agent_actor(
         let mut in_turn = is_new_spawn;
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
+        let mut active_compaction: Option<ActiveCompaction> = None;
+        let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
         if let Err(err) = persist_agent_session(
             &session_store,
@@ -783,6 +843,11 @@ pub(crate) fn spawn_agent_actor(
             tokio::select! {
                 maybe_event = events.recv() => {
                     let Some(event) = maybe_event else {
+                        if let Some(compaction) = active_compaction.take() {
+                            let _ = compaction
+                                .reply
+                                .send(Err("agent backend closed during compaction".to_owned()));
+                        }
                         if matches!(lifecycle, ActorLifecycle::Closing) {
                             let reply = close_reply
                                 .take()
@@ -826,6 +891,21 @@ pub(crate) fn spawn_agent_actor(
                     };
                     match &event {
                         ChatEvent::MessageAdded(message) => {
+                            if let Some(compaction) = active_compaction.as_mut() {
+                                match &message.sender {
+                                    MessageSender::Error => {
+                                        compaction.error = Some(message.content.clone());
+                                    }
+                                    MessageSender::Assistant { .. } if compaction.summary.is_empty() => {
+                                        push_summary_capped(
+                                            &mut compaction.summary,
+                                            &message.content,
+                                            compaction.max_summary_bytes,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if matches!(message.sender, MessageSender::Error) {
                                 let msg = message.content.clone();
                                 status_handle.update(|s| {
@@ -846,8 +926,26 @@ pub(crate) fn spawn_agent_actor(
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
-                        ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
-                        ChatEvent::StreamEnd(_) => {
+                        ChatEvent::StreamDelta(delta) => {
+                            if let Some(compaction) = active_compaction.as_mut() {
+                                push_summary_capped(
+                                    &mut compaction.summary,
+                                    &delta.text,
+                                    compaction.max_summary_bytes,
+                                );
+                            }
+                            active_stream_text.push_str(&delta.text);
+                        }
+                        ChatEvent::StreamEnd(data) => {
+                            if let Some(compaction) = active_compaction.as_mut()
+                                && compaction.summary.is_empty()
+                            {
+                                push_summary_capped(
+                                    &mut compaction.summary,
+                                    &data.message.content,
+                                    compaction.max_summary_bytes,
+                                );
+                            }
                             active_stream_text.clear();
                             status_handle.update(|s| {
                                 s.turn_completed = true;
@@ -866,6 +964,9 @@ pub(crate) fn spawn_agent_actor(
                             }).await;
                         }
                         ChatEvent::OperationCancelled(_) => {
+                            if let Some(compaction) = active_compaction.as_mut() {
+                                compaction.error = Some("compaction summary turn was cancelled".to_owned());
+                            }
                             status_handle.update(|s| {
                                 s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
@@ -894,6 +995,30 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await;
 
+                    if matches!(event, ChatEvent::TypingStatusChanged(false))
+                        && let Some(compaction) = active_compaction.take()
+                    {
+                        let session_id = current_session_id
+                            .as_ref()
+                            .expect("live agent must have session_id");
+                        let (reply, result) = complete_compaction(compaction, session_id);
+                        if result.is_err() {
+                            compaction_blocked = false;
+                        }
+                        if let Err(error) = &result {
+                            status_handle
+                                .update(|s| {
+                                    s.last_error = Some(error.clone());
+                                    s.activity_counter = s.activity_counter.saturating_add(1);
+                                })
+                                .await;
+                        }
+                        // Keep normal input blocked after success until the host
+                        // either rotates successfully and closes this actor or
+                        // explicitly releases it.
+                        let _ = reply.send(result);
+                    }
+
 
                     if matches!(event, ChatEvent::TypingStatusChanged(false))
                         && matches!(lifecycle, ActorLifecycle::Closing)
@@ -911,6 +1036,7 @@ pub(crate) fn spawn_agent_actor(
 
                     if matches!(event, ChatEvent::TypingStatusChanged(false))
                         && matches!(lifecycle, ActorLifecycle::Running)
+                        && !compaction_blocked
                         && !queue.is_empty()
                     {
                         let queued = queue
@@ -980,6 +1106,19 @@ pub(crate) fn spawn_agent_actor(
                     match command {
                         AgentCommand::SendInput(input) => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
+                                continue;
+                            }
+                            if active_compaction.is_some() || compaction_blocked {
+                                let payload =
+                                    compaction_input_rejected_payload(&current_start.agent_id);
+                                append_event(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    FrameKind::AgentError,
+                                    &payload,
+                                )
+                                .await;
                                 continue;
                             }
                             match input {
@@ -1291,6 +1430,85 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                         }
+                        AgentCommand::Compact {
+                            summary_prompt,
+                            max_summary_bytes,
+                            reply,
+                        } => {
+                            let reject = if matches!(lifecycle, ActorLifecycle::Closing) {
+                                Some("agent is closing".to_owned())
+                            } else if current_start.origin == AgentOrigin::BackendNative {
+                                Some("backend-native agents cannot be compacted".to_owned())
+                            } else if active_compaction.is_some() || compaction_blocked {
+                                Some("agent compaction is already in progress".to_owned())
+                            } else if current_session_id.is_none() {
+                                Some("agent has no session to compact".to_owned())
+                            } else if in_turn {
+                                Some("agent is busy".to_owned())
+                            } else if !queue.is_empty() {
+                                Some("agent has queued work".to_owned())
+                            } else {
+                                None
+                            };
+                            if let Some(error) = reject {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+
+                            compaction_blocked = true;
+                            in_turn = true;
+                            active_compaction = Some(ActiveCompaction {
+                                reply,
+                                summary: String::new(),
+                                max_summary_bytes: max_summary_bytes
+                                    .clamp(1, MAX_COMPACTION_SUMMARY_BYTES),
+                                error: None,
+                            });
+                            status_handle
+                                .update(|s| {
+                                    s.is_thinking = true;
+                                    s.turn_completed = false;
+                                    s.last_error = None;
+                                    s.activity_counter = s.activity_counter.saturating_add(1);
+                                })
+                                .await;
+                            if !backend
+                                .as_ref()
+                                .expect("backend must exist while actor is running")
+                                .send(AgentInput::SendMessage(SendMessagePayload {
+                                    message: summary_prompt,
+                                    images: None,
+                                    origin: None,
+                                }))
+                                .await
+                            {
+                                let compaction = active_compaction
+                                    .take()
+                                    .expect("active compaction disappeared after backend send failed");
+                                compaction_blocked = false;
+                                in_turn = false;
+                                status_handle
+                                    .update(|s| {
+                                        s.is_thinking = false;
+                                        s.turn_completed = true;
+                                        s.last_error = Some("agent backend closed".to_owned());
+                                        s.activity_counter = s.activity_counter.saturating_add(1);
+                                    })
+                                    .await;
+                                let _ = compaction
+                                    .reply
+                                    .send(Err("agent backend closed".to_owned()));
+                            }
+                        }
+                        AgentCommand::ReleaseCompaction { reply } => {
+                            if active_compaction.is_none() {
+                                compaction_blocked = false;
+                                if matches!(lifecycle, ActorLifecycle::Running) {
+                                    accepting_input_task.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            let _ = reply.send(());
+                        }
                         AgentCommand::SetName {
                             name,
                             persistence,
@@ -1321,6 +1539,19 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::Interrupt => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
+                                continue;
+                            }
+                            if active_compaction.is_some() || compaction_blocked {
+                                let payload =
+                                    compaction_input_rejected_payload(&current_start.agent_id);
+                                append_event(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    FrameKind::AgentError,
+                                    &payload,
+                                )
+                                .await;
                                 continue;
                             }
                             if !backend
@@ -1552,6 +1783,12 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
                     match command {
+                        AgentCommand::Compact { reply, .. } => {
+                            let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
+                        }
+                        AgentCommand::ReleaseCompaction { reply } => {
+                            let _ = reply.send(());
+                        }
                         AgentCommand::SendInput(_) | AgentCommand::Interrupt => {
                             let payload = relay_input_rejected_payload(&current_start.agent_id);
                             append_event(
@@ -1669,6 +1906,61 @@ fn relay_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
     }
 }
 
+fn compaction_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
+    AgentErrorPayload {
+        agent_id: agent_id.clone(),
+        code: AgentErrorCode::Internal,
+        message: "agent compaction is in progress".to_owned(),
+        fatal: false,
+    }
+}
+
+fn push_summary_capped(summary: &mut String, text: &str, max_summary_bytes: usize) {
+    let remaining = max_summary_bytes.saturating_sub(summary.len());
+    if remaining == 0 {
+        return;
+    }
+    if text.len() <= remaining {
+        summary.push_str(text);
+        return;
+    }
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > remaining {
+            break;
+        }
+        end = next;
+    }
+    if end > 0 {
+        summary.push_str(&text[..end]);
+    }
+}
+
+fn complete_compaction(
+    compaction: ActiveCompaction,
+    session_id: &SessionId,
+) -> (
+    oneshot::Sender<Result<CompactionSummary, String>>,
+    Result<CompactionSummary, String>,
+) {
+    let reply = compaction.reply;
+    if let Some(error) = compaction.error {
+        return (reply, Err(error));
+    }
+    let summary = compaction.summary.trim().to_owned();
+    if summary.is_empty() {
+        return (reply, Err("compaction summary was empty".to_owned()));
+    }
+    (
+        reply,
+        Ok(CompactionSummary {
+            session_id: session_id.clone(),
+            summary,
+        }),
+    )
+}
+
 async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &AgentErrorPayload) {
     context.accepting_input.store(false, Ordering::SeqCst);
     context.queue.clear();
@@ -1750,6 +2042,12 @@ async fn park_terminal_agent(
                 let _ = reply.send(());
                 break;
             }
+            AgentCommand::Compact { reply, .. } => {
+                let _ = reply.send(Err("agent is not running".to_owned()));
+            }
+            AgentCommand::ReleaseCompaction { reply } => {
+                let _ = reply.send(());
+            }
             AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
         }
     }
@@ -1808,6 +2106,12 @@ async fn park_relay_terminal_agent(
             AgentCommand::Close { reply } => {
                 finish_actor_close(accepting_input, status_handle, reply).await;
                 break;
+            }
+            AgentCommand::Compact { reply, .. } => {
+                let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
+            }
+            AgentCommand::ReleaseCompaction { reply } => {
+                let _ = reply.send(());
             }
             AgentCommand::SendInput(_) | AgentCommand::Interrupt => {
                 let payload = relay_input_rejected_payload(&current_start.agent_id);
@@ -2373,6 +2677,12 @@ mod tests {
                     AgentCommand::Close { reply } => {
                         let _ = reply.send(());
                         break;
+                    }
+                    AgentCommand::Compact { reply, .. } => {
+                        let _ = reply.send(Err("agent is not running".to_owned()));
+                    }
+                    AgentCommand::ReleaseCompaction { reply } => {
+                        let _ = reply.send(());
                     }
                     AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
                 }

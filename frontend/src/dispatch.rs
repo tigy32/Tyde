@@ -69,6 +69,16 @@ pub fn clear_host_seqs(host_id: &str) {
     INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
 }
 
+/// Reset the inbound `ProtocolValidator`. The validator carries per-stream
+/// state (registered agent streams, recent-frame history) which persists for
+/// the lifetime of the wasm thread. Production code never calls this; it
+/// exists so wasm tests, which reuse stream paths (`/agents/a-new`, etc.)
+/// across independent test cases, can start each test with a clean validator.
+#[allow(dead_code)]
+pub fn reset_inbound_protocol() {
+    INBOUND_PROTOCOL.with(|validator| *validator.borrow_mut() = ProtocolValidator::new());
+}
+
 thread_local! {
     static INBOUND_SEQ: RefCell<FrontendSeqValidator> = RefCell::new(FrontendSeqValidator::new());
     static INBOUND_PROTOCOL: RefCell<ProtocolValidator> = RefCell::new(ProtocolValidator::new());
@@ -320,6 +330,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 let agent_id = payload.agent_id.clone();
                 let origin = payload.origin;
                 let team_member_id = payload.team_member_id.clone();
+                // Snapshot the fingerprint inputs before moving payload
+                // into AgentInfo. The compaction replacement-detection
+                // path below reads these to correlate against in-flight
+                // old agents' fingerprints captured at start time.
+                let fp_project_id = payload.project_id.clone();
+                let fp_custom_agent_id = payload.custom_agent_id.clone();
+                let fp_backend_kind = payload.backend_kind;
                 let info = AgentInfo {
                     host_id: host_id.to_string(),
                     agent_id: payload.agent_id,
@@ -346,6 +363,60 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
                     agents.push(info);
                 });
+
+                // If a compaction `Completed` notify arrived before this
+                // `NewAgent` echo, the dispatch handler for the notify
+                // stashed `(host, new) -> old` so we could flush the
+                // retarget here, once the replacement is in `state.agents`.
+                let pending_old = state.compaction_pending_completion.with_untracked(|map| {
+                    map.get(&(host_id.to_string(), agent_id.clone())).cloned()
+                });
+                if let Some(old_agent_id) = pending_old {
+                    let new_info = state.agents.with_untracked(|agents| {
+                        agents
+                            .iter()
+                            .find(|a| a.host_id == host_id && a.agent_id == agent_id)
+                            .cloned()
+                    });
+                    if let Some(new_info) = new_info {
+                        state.finish_compaction_success(&old_agent_id, &new_info);
+                    }
+                    state.compaction_pending_completion.update(|map| {
+                        map.remove(&(host_id.to_string(), agent_id.clone()));
+                    });
+                    // Completed-early ordering: the retarget already
+                    // happened. Skip the auto-tab-open below — the
+                    // user's existing chat tab is already retargeted to
+                    // this agent.
+                    return;
+                }
+
+                // Current server contract: `NewAgent` for the
+                // replacement arrives BEFORE `Completed` (which in
+                // turn arrives before `AgentClosed` for the old).
+                // Correlate via the fingerprint we captured at
+                // compaction-start time. If this is the replacement,
+                // the user's existing chat tab is still pointing at
+                // the (alive) old agent — `Completed` will retarget
+                // it when it lands. Skip the auto-tab-open path here
+                // so the replacement does not steal focus into a
+                // duplicate tab.
+                let likely_replacement = state.find_compaction_replacement(
+                    host_id,
+                    team_member_id.as_ref(),
+                    fp_project_id.as_ref(),
+                    fp_custom_agent_id.as_ref(),
+                    fp_backend_kind,
+                );
+                if let Some(old_agent_id) = likely_replacement {
+                    log::info!(
+                        "dispatch new_agent host={} agent_id={} recognized as compaction replacement for old={}; deferring tab retarget to Completed",
+                        host_id,
+                        agent_id,
+                        old_agent_id.0,
+                    );
+                    return;
+                }
 
                 // Team-member upgrade: a `pending_team_member` chat tab was
                 // opened when the user clicked the team or a report row and
@@ -503,6 +574,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse agent_closed payload: {error}"),
             ),
         },
+        FrameKind::AgentCompactNotify => {
+            match envelope.parse_payload::<protocol::types::AgentCompactNotifyPayload>() {
+                Ok(payload) => apply_agent_compact_notify(state, host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_compact_notify payload: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentError => match envelope.parse_payload::<AgentErrorPayload>() {
             Ok(payload) => {
                 log::error!(
@@ -1778,7 +1861,81 @@ fn apply_agent_rename(state: &AppState, host_id: &str, payload: AgentRenamedPayl
     });
 }
 
+fn apply_agent_compact_notify(
+    state: &AppState,
+    host_id: &str,
+    payload: protocol::types::AgentCompactNotifyPayload,
+) {
+    use protocol::types::AgentCompactStatus;
+    log::info!(
+        "dispatch agent_compact_notify host={} status={:?} old={} new={:?}",
+        host_id,
+        payload.status,
+        payload.old_agent_id.0,
+        payload.new_agent_id.as_ref().map(|a| a.0.as_str()),
+    );
+    match payload.status {
+        AgentCompactStatus::Started => {
+            state.mark_compaction_started(host_id, payload.old_agent_id);
+        }
+        AgentCompactStatus::Failed => {
+            let message = payload
+                .message
+                .unwrap_or_else(|| "Compaction failed.".to_owned());
+            state.finish_compaction_failure(payload.old_agent_id, message);
+        }
+        AgentCompactStatus::Completed => {
+            let Some(new_agent_id) = payload.new_agent_id else {
+                log::warn!(
+                    "agent_compact_notify Completed without new_agent_id; clearing in-progress for {}",
+                    payload.old_agent_id.0
+                );
+                state.compaction_in_progress.update(|map| {
+                    map.remove(&payload.old_agent_id);
+                });
+                return;
+            };
+            // The replacement's `NewAgent` echo may have already landed
+            // (typical) or it may still be in flight. If it's already in
+            // `state.agents`, finalize the retarget immediately;
+            // otherwise stash so the `NewAgent` arm flushes it.
+            let new_info = state.agents.with_untracked(|agents| {
+                agents
+                    .iter()
+                    .find(|a| a.host_id == host_id && a.agent_id == new_agent_id)
+                    .cloned()
+            });
+            if let Some(new_info) = new_info {
+                state.finish_compaction_success(&payload.old_agent_id, &new_info);
+            } else {
+                state.compaction_pending_completion.update(|map| {
+                    map.insert((host_id.to_owned(), new_agent_id), payload.old_agent_id);
+                });
+            }
+        }
+    }
+}
+
 fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
+    // Defensive belt for ordering inversion. The current server
+    // contract delivers compaction events in the order
+    // `NewAgent (replacement) → Completed (on old, still-valid
+    // stream) → AgentClosed (old)`, which means by the time we
+    // reach here for a compaction old-agent close, `Completed`
+    // has already cleared `compaction_in_progress` and the
+    // branch below is skipped — we hit the normal teardown. If
+    // the server ever inverts that ordering, defer teardown so
+    // `state.agents`, `chat_rows`, and the user's chat tab stay
+    // alive until `Completed` retargets the tab and
+    // `finish_compaction_success` finalizes the close from the
+    // `compaction_pending_close` set.
+    let is_compacting = state
+        .compaction_in_progress
+        .with_untracked(|map| map.contains_key(&agent_id));
+    if is_compacting {
+        state.defer_compaction_close(host_id, agent_id);
+        return;
+    }
     state.agents.update(|agents| {
         agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
     });
