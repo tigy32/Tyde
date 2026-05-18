@@ -15,7 +15,7 @@ use protocol::{
     ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
     TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
@@ -196,6 +196,15 @@ pub(crate) async fn route_client_envelope(
                     payload.member_id.0.as_str(),
                 )?;
                 host.activate_team_member(payload.member_id, payload.prompt, payload.images)
+                    .await?;
+            }
+            FrameKind::TeamCompact => {
+                let payload: TeamCompactPayload = parse_payload(&envelope, "team_compact")?;
+                ensure_non_empty("team_compact", "team_id", payload.team_id.0.as_str())?;
+                if let Some(summary_prompt) = payload.summary_prompt.as_ref() {
+                    ensure_non_empty("team_compact", "summary_prompt", summary_prompt.as_str())?;
+                }
+                host.compact_team(payload, host_output_stream.clone())
                     .await?;
             }
             FrameKind::TeamDraftCreate => {
@@ -406,7 +415,8 @@ pub(crate) async fn route_client_envelope(
                     ensure_non_empty("agent_compact", "summary_prompt", summary_prompt.as_str())?;
                 }
                 let stream = host_output_stream.with_path(stream_path);
-                host.compact_agent(agent_id, payload, stream).await?;
+                host.compact_agent_in_background(agent_id, payload, stream)
+                    .await?;
             }
             FrameKind::Interrupt => {
                 let stream_path = envelope.stream.clone();

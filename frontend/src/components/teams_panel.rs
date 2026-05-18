@@ -2,10 +2,10 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    AgentControlStatus, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint, Team,
-    TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
-    TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberCreateSpec,
-    TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
+    AgentControlStatus, AgentId, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint,
+    StreamPath, Team, TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit,
+    TeamDraftMemberId, TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload,
+    TeamMemberCreateSpec, TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
     TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId,
     TeamTemplateId,
 };
@@ -355,6 +355,120 @@ fn TeamCard(
             })
     });
 
+    // Team-level Compact targets: mirror the server's accept/reject
+    // rules so the button only enables when the server would accept the
+    // `TeamCompact` frame. Returns `None` (button disabled) when:
+    //   * any Active member is missing a binding entry (server treats
+    //     this as an internal error),
+    //   * any Active member's binding is not Idle (server rejects with
+    //     conflict), regardless of whether it's bound to a live agent,
+    //   * any Active+Idle+bound member is already mid-compaction,
+    //   * any Active+Idle+bound member is missing from `state.agents`.
+    // Active+Idle members with no `current_agent_id` are skipped — the
+    // server accepts them too (nothing to compact). Members in any
+    // non-Active state are skipped. Returns `None` if the resulting
+    // target list is empty (nothing to compact).
+    let host_for_team_targets = host_id.clone();
+    let state_for_team_targets = state.clone();
+    let members_for_team_targets = members;
+    let team_compact_targets = move || -> Option<Vec<(AgentId, StreamPath)>> {
+        let bindings = state_for_team_targets
+            .team_member_bindings
+            .with(|m| m.get(&host_for_team_targets).cloned())?;
+        let compacting = state_for_team_targets
+            .compaction_in_progress
+            .with(|m| m.keys().cloned().collect::<std::collections::HashSet<_>>());
+        let agents_snapshot = state_for_team_targets.agents.get();
+        let mut targets: Vec<(AgentId, StreamPath)> = Vec::new();
+        for member in members_for_team_targets.get() {
+            if !matches!(member.state, TeamMemberState::Active) {
+                continue;
+            }
+            let binding = bindings.get(&member.id)?;
+            if !matches!(binding.status, protocol::AgentControlStatus::Idle) {
+                return None;
+            }
+            let Some(agent_id) = binding.current_agent_id.clone() else {
+                continue;
+            };
+            if compacting.contains(&agent_id) {
+                return None;
+            }
+            let stream = agents_snapshot
+                .iter()
+                .find(|a| a.host_id == host_for_team_targets && a.agent_id == agent_id)
+                .map(|a| a.instance_stream.clone())?;
+            targets.push((agent_id, stream));
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        Some(targets)
+    };
+
+    let host_for_team_compact_gate = host_id.clone();
+    let state_for_team_compact_gate = state.clone();
+    let team_compact_targets_for_gate = team_compact_targets.clone();
+    let can_compact_team = move || {
+        if !matches!(
+            state_for_team_compact_gate.connection_status_for_host(&host_for_team_compact_gate),
+            crate::state::ConnectionStatus::Connected
+        ) {
+            return false;
+        }
+        team_compact_targets_for_gate().is_some()
+    };
+
+    let host_for_team_compact_click = host_id.clone();
+    let state_for_team_compact_click = state.clone();
+    let team_name_for_compact = team_record;
+    let team_id_for_compact_click = team_id.clone();
+    let team_compact_targets_for_click = team_compact_targets;
+    let on_team_compact_click = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        let Some(targets) = team_compact_targets_for_click() else {
+            return;
+        };
+        let host_id = host_for_team_compact_click.clone();
+        let state = state_for_team_compact_click.clone();
+        let team_id = team_id_for_compact_click.clone();
+        let team_label = team_name_for_compact
+            .get_untracked()
+            .map(|t| t.name)
+            .unwrap_or_default();
+        let count = targets.len();
+        let plural = if count == 1 { "agent" } else { "agents" };
+        let message = format!(
+            "Compact context for every member of \"{team_label}\"?\n\nEach of the {count} bound {plural} will write a summary of context worth keeping and a fresh replacement will start from that summary. The original sessions are closed and kept in Sessions as read-only records — you can view them, but they can't be resumed."
+        );
+        spawn_local(async move {
+            if !crate::bridge::confirm_dialog("Compact context", &message).await {
+                return;
+            }
+            // Optimistically flag every targeted agent in-flight so the
+            // per-member Compact icons and the team button itself
+            // re-gate to disabled until per-agent AgentCompactNotify
+            // events settle. Mirrors the per-member compact path's
+            // double-fire defense.
+            for (agent_id, _) in &targets {
+                state.mark_compaction_started(&host_id, agent_id.clone());
+            }
+            let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+                log::error!("team compact: no host stream for {host_id}");
+                for (agent_id, _) in targets {
+                    state.finish_compaction_failure(agent_id, "no host stream".to_string());
+                }
+                return;
+            };
+            if let Err(e) = crate::send::team_compact(&host_id, host_stream, team_id).await {
+                log::error!("team compact: failed to send TeamCompact: {e}");
+                for (agent_id, _) in targets {
+                    state.finish_compaction_failure(agent_id, e.clone());
+                }
+            }
+        });
+    };
+
     let host_for_rows = host_id.clone();
     view! {
         <div
@@ -389,6 +503,25 @@ fn TeamCard(
                     >
                         "+ Report"
                     </button>
+                    {move || {
+                        let enabled = can_compact_team();
+                        view! {
+                            <button
+                                class="filter-toggle team-card-compact"
+                                type="button"
+                                title=if enabled {
+                                    "Compact context for every bound team member"
+                                } else {
+                                    "Compact context (available when every bound member is idle)"
+                                }
+                                aria-label="Compact context"
+                                disabled=!enabled
+                                on:click=on_team_compact_click.clone()
+                            >
+                                "Compact context"
+                            </button>
+                        }
+                    }}
                     <button
                         class="filter-toggle"
                         type="button"
@@ -694,7 +827,7 @@ fn MemberRow(
             <div class="team-member-actions">
                 {move || can_promote().then(|| view! {
                     <button
-                        class="team-member-icon-btn"
+                        class="team-member-icon-btn team-member-icon-btn-promote"
                         type="button"
                         title="Set as manager"
                         aria-label="Set as manager"
@@ -4787,6 +4920,430 @@ mod wasm_tests {
         assert!(
             recorded_frames(&calls).is_empty(),
             "validation should stop sends before any frames are written"
+        );
+    }
+
+    /// Promote/set-manager affordance is the only per-member action that
+    /// must stay out of the way until the user is engaging with a row.
+    /// Hover/focus-within reveals it. We assert on the *rendered* opacity
+    /// from the production stylesheet (not on a class name) so this test
+    /// won't accept a future refactor that drops the visibility rule.
+    #[wasm_bindgen_test]
+    async fn promote_button_hidden_until_row_hovered_or_focused() {
+        ensure_styles_loaded();
+        let host_id = "host-promote";
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-mgr")],
+            vec![
+                make_member("m-mgr", "t-1", "Manager", TeamMemberRole::Manager),
+                make_member("m-rep", "t-1", "Reporter", TeamMemberRole::Report),
+            ],
+        );
+        install_host_stream(&state, host_id);
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        let promote_btn: HtmlElement = container
+            .query_selector(".team-member-icon-btn-promote")
+            .unwrap()
+            .expect("promote button must render in the DOM (visibility-only hidden)")
+            .dyn_into()
+            .unwrap();
+
+        let row_for_promote = promote_btn
+            .closest(".team-member-row")
+            .unwrap()
+            .expect("promote button must live inside a team-member-row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+
+        let window = web_sys::window().unwrap();
+        // Baseline (no hover, no focus): the promote button is rendered
+        // but visually hidden via opacity:0 + pointer-events:none. The
+        // hidden state is what keeps it out of the way until the user
+        // engages with the row.
+        let baseline_style = window
+            .get_computed_style(&promote_btn)
+            .unwrap()
+            .expect("computed style for promote button");
+        assert_eq!(
+            baseline_style.get_property_value("opacity").unwrap(),
+            "0",
+            "promote button must default to opacity 0 (hidden until hover/focus)"
+        );
+        assert_eq!(
+            baseline_style.get_property_value("pointer-events").unwrap(),
+            "none",
+            "promote button must default to pointer-events:none so it can't be misclicked while hidden"
+        );
+
+        // Keyboard reveal: focusing the row's first reachable button
+        // brings the promote button into view via :focus-within. This is
+        // the accessibility guarantee — keyboard users must still be able
+        // to reach the promote action.
+        let edit_btn: HtmlElement = row_for_promote
+            .query_selector(".team-member-icon-btn[aria-label='Edit member']")
+            .unwrap()
+            .expect("edit-member button should exist in the row")
+            .dyn_into()
+            .unwrap();
+        edit_btn.focus().unwrap();
+        next_tick().await;
+        let focused_style = window
+            .get_computed_style(&promote_btn)
+            .unwrap()
+            .expect("computed style after focus");
+        assert_eq!(
+            focused_style.get_property_value("opacity").unwrap(),
+            "1",
+            "promote button must become visible when keyboard focus enters the row (accessibility)"
+        );
+        assert_eq!(
+            focused_style.get_property_value("pointer-events").unwrap(),
+            "auto",
+            "promote button must become clickable when keyboard focus enters the row"
+        );
+    }
+
+    /// Team-level Compact button is enabled only when every Active member
+    /// with a live binding is Idle and not already mid-compaction, and at
+    /// least one member is bound. Clicking it (through the OK-stubbed
+    /// confirm dialog) sends a single `TeamCompact` frame on the host
+    /// stream — server fans out per-member compactions internally.
+    /// While any member is Thinking the button is disabled; while
+    /// compactions are in flight the button stays disabled to prevent
+    /// double-fire.
+    #[wasm_bindgen_test]
+    async fn team_compact_button_gated_on_every_member_idle_and_sends_team_compact_frame() {
+        let calls = install_send_stub();
+        let _ = js_sys::eval(
+            r#"
+            window.__TAURI__.core.invoke = function(cmd, args) {
+                window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                if (cmd === 'plugin:dialog|message') {
+                    return Promise.resolve('Ok');
+                }
+                return Promise.resolve();
+            };
+            "#,
+        );
+
+        let host_id = "host-team-compact";
+        let manager_id = TeamMemberId("m-mgr".to_owned());
+        let report_id = TeamMemberId("m-rep".to_owned());
+        let mgr_agent_id = AgentId("a-mgr".to_owned());
+        let rep_agent_id = AgentId("a-rep".to_owned());
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-mgr")],
+            vec![
+                make_member("m-mgr", "t-1", "Manager", TeamMemberRole::Manager),
+                make_member("m-rep", "t-1", "Reporter", TeamMemberRole::Report),
+            ],
+        );
+        install_host_stream(&state, host_id);
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.to_owned(), ConnectionStatus::Connected);
+        });
+        state.agents.update(|agents| {
+            agents.push(crate::state::AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: mgr_agent_id.clone(),
+                name: "Manager Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            });
+            agents.push(crate::state::AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: rep_agent_id.clone(),
+                name: "Reporter Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/a-rep/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            });
+        });
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        // No bindings yet → the team has nothing to compact, so the
+        // button is disabled. (We never hide the button to avoid CLS
+        // and to keep the affordance discoverable.)
+        let team_compact_btn = || -> Option<HtmlElement> {
+            container
+                .query_selector(".team-card-compact")
+                .unwrap()
+                .map(|el| el.dyn_into::<HtmlElement>().unwrap())
+        };
+        let btn = team_compact_btn().expect("team-card-compact button must render");
+        assert!(
+            btn.has_attribute("disabled"),
+            "team Compact button must be disabled when no member is bound"
+        );
+
+        // Bind manager Idle, reporter Thinking. Mixed state must keep
+        // the button disabled — must not imply the action is safe.
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            entry.insert(
+                manager_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: manager_id.clone(),
+                    current_agent_id: Some(mgr_agent_id.clone()),
+                    status: AgentControlStatus::Idle,
+                    last_active_at_ms: Some(1),
+                },
+            );
+            entry.insert(
+                report_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: report_id.clone(),
+                    current_agent_id: Some(rep_agent_id.clone()),
+                    status: AgentControlStatus::Thinking,
+                    last_active_at_ms: Some(2),
+                },
+            );
+        });
+        next_tick().await;
+        let btn = team_compact_btn().expect("team Compact button must still render");
+        assert!(
+            btn.has_attribute("disabled"),
+            "team Compact button must be disabled while any member is Thinking"
+        );
+
+        // Flip reporter to Idle. Now every bound member is Idle → enabled.
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            entry.insert(
+                report_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: report_id.clone(),
+                    current_agent_id: Some(rep_agent_id.clone()),
+                    status: AgentControlStatus::Idle,
+                    last_active_at_ms: Some(3),
+                },
+            );
+        });
+        next_tick().await;
+        let btn = team_compact_btn().expect("team Compact button must still render");
+        assert!(
+            !btn.has_attribute("disabled"),
+            "team Compact button must be enabled when every bound member is Idle"
+        );
+
+        // Click → confirm → send a single TeamCompact frame on the
+        // host stream. Server fans out internally.
+        btn.click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        let team_compact_frames: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _)| kind == &FrameKind::TeamCompact.to_string())
+            .collect();
+        assert_eq!(
+            team_compact_frames.len(),
+            1,
+            "team Compact must send exactly one TeamCompact frame, got frames: {frames:?}"
+        );
+        // Confirm the team_id in the payload + that we routed on the
+        // host stream (not any agent stream).
+        let team_compact_payload = team_compact_frames[0].1.clone();
+        assert_eq!(
+            team_compact_payload.get("team_id").and_then(|v| v.as_str()),
+            Some("t-1"),
+            "TeamCompact payload must carry the team_id, got: {team_compact_payload:?}"
+        );
+        let mut routed_to_host_stream = false;
+        for entry in calls.iter() {
+            let arr = entry.dyn_into::<js_sys::Array>().expect("array");
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let args_json = arr.get(1).as_string().expect("args");
+            let args: JsonValue = serde_json::from_str(&args_json).expect("args parse");
+            let line = args.get("line").and_then(|v| v.as_str()).expect("line");
+            let env: JsonValue = serde_json::from_str(line).expect("envelope parse");
+            if env.get("kind").and_then(|v| v.as_str()) == Some("team_compact") {
+                routed_to_host_stream =
+                    env.get("stream").and_then(|v| v.as_str()) == Some("/host/host-team-compact");
+                break;
+            }
+        }
+        assert!(
+            routed_to_host_stream,
+            "TeamCompact must target the host stream, not an agent instance stream"
+        );
+
+        // Both members are flipped to in-progress so the per-member
+        // compact buttons hide and a second click on the team button
+        // becomes a no-op (state guards).
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&mgr_agent_id)),
+            "manager agent should be marked in-flight after team compact"
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&rep_agent_id)),
+            "reporter agent should be marked in-flight after team compact"
+        );
+        // With both agents now in compaction_in_progress, gating must
+        // re-disable the team Compact button — same defense the per-
+        // member button has against double-fire.
+        next_tick().await;
+        let btn = team_compact_btn().expect("team Compact button must still render after click");
+        assert!(
+            btn.has_attribute("disabled"),
+            "team Compact button must re-disable while any member is mid-compaction"
+        );
+    }
+
+    /// Server rule: an Active member whose binding is not Idle blocks
+    /// the entire team from compacting, *even if that member has no
+    /// `current_agent_id`*. The frontend gating must match — otherwise
+    /// the user would see an enabled button that the server then
+    /// rejects with a 409. Also asserts that no `TeamCompact` frame is
+    /// sent if the user somehow forces a click in this state.
+    #[wasm_bindgen_test]
+    async fn team_compact_disabled_when_active_member_unbound_but_not_idle() {
+        let calls = install_send_stub();
+        let _ = js_sys::eval(
+            r#"
+            window.__TAURI__.core.invoke = function(cmd, args) {
+                window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                if (cmd === 'plugin:dialog|message') {
+                    return Promise.resolve('Ok');
+                }
+                return Promise.resolve();
+            };
+            "#,
+        );
+
+        let host_id = "host-team-compact-unbound";
+        let manager_id = TeamMemberId("m-mgr".to_owned());
+        let report_id = TeamMemberId("m-rep".to_owned());
+        let mgr_agent_id = AgentId("a-mgr".to_owned());
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-mgr")],
+            vec![
+                make_member("m-mgr", "t-1", "Manager", TeamMemberRole::Manager),
+                make_member("m-rep", "t-1", "Reporter", TeamMemberRole::Report),
+            ],
+        );
+        install_host_stream(&state, host_id);
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.to_owned(), ConnectionStatus::Connected);
+        });
+        state.agents.update(|agents| {
+            agents.push(crate::state::AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: mgr_agent_id.clone(),
+                name: "Manager Agent".to_owned(),
+                origin: protocol::AgentOrigin::User,
+                backend_kind: protocol::BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            });
+        });
+        // Manager: bound, Idle (a valid target on its own).
+        // Reporter: bound but UNBOUND-from-agent (current_agent_id =
+        // None) and status Thinking. This is the case the server
+        // explicitly rejects: not-Idle gates the whole team, even
+        // without a live agent.
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            entry.insert(
+                manager_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: manager_id.clone(),
+                    current_agent_id: Some(mgr_agent_id.clone()),
+                    status: AgentControlStatus::Idle,
+                    last_active_at_ms: Some(1),
+                },
+            );
+            entry.insert(
+                report_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: report_id.clone(),
+                    current_agent_id: None,
+                    status: AgentControlStatus::Thinking,
+                    last_active_at_ms: Some(2),
+                },
+            );
+        });
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        let team_compact_btn = || -> Option<HtmlElement> {
+            container
+                .query_selector(".team-card-compact")
+                .unwrap()
+                .map(|el| el.dyn_into::<HtmlElement>().unwrap())
+        };
+        let btn = team_compact_btn().expect("team-card-compact button must render");
+        assert!(
+            btn.has_attribute("disabled"),
+            "team Compact must be disabled when any Active member binding is non-Idle, \
+             even if unbound — matches server reject"
+        );
+
+        // Defense in depth: even forcing a click does not send a frame
+        // (the click handler short-circuits when `team_compact_targets`
+        // returns None).
+        btn.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        let team_compact_frames: Vec<_> = frames
+            .iter()
+            .filter(|(kind, _)| kind == &FrameKind::TeamCompact.to_string())
+            .collect();
+        assert!(
+            team_compact_frames.is_empty(),
+            "no TeamCompact frame may leave the client while gating disallows the action, got: {frames:?}"
         );
     }
 }

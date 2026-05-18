@@ -1808,6 +1808,25 @@ kbd {
     color: var(--accent-primary);
 }
 
+/* Promote/set-manager is a destructive-ish reorganization action: hide it
+ * by default so it does not compete with the primary edit/compact/delete
+ * affordances, and reveal it only when the user is engaging with the row
+ * (hover or keyboard focus anywhere inside the row). `:focus-within`
+ * keeps the button reachable for keyboard users — tabbing into the row's
+ * other buttons brings the promote button into view so it can be tabbed
+ * to next, instead of being skipped over invisibly. */
+.team-member-icon-btn-promote {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.team-member-row:hover .team-member-icon-btn-promote,
+.team-member-row:focus-within .team-member-icon-btn-promote,
+.team-member-icon-btn-promote:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
 .team-draft-start,
 .team-draft-editor {
     display: flex;

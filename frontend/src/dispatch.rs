@@ -586,6 +586,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::TeamCompactNotify => {
+            match envelope.parse_payload::<protocol::types::TeamCompactNotifyPayload>() {
+                Ok(payload) => apply_team_compact_notify(state, host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse team_compact_notify payload: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentError => match envelope.parse_payload::<AgentErrorPayload>() {
             Ok(payload) => {
                 log::error!(
@@ -1911,6 +1923,67 @@ fn apply_agent_compact_notify(
                 state.compaction_pending_completion.update(|map| {
                     map.insert((host_id.to_owned(), new_agent_id), payload.old_agent_id);
                 });
+            }
+        }
+    }
+}
+
+/// Per-agent compaction events for a team compact run reach the server
+/// on internal team-compact streams, so the client never sees them as
+/// `AgentCompactNotify` frames. Instead the server aggregates them into
+/// `TeamCompactNotify.results`. Fan each per-agent result through the
+/// same `apply_agent_compact_notify` path so retarget/finalize/error
+/// state machines stay in one place. `Started` flags every targeted
+/// agent as in-flight (idempotent if the local click handler already
+/// marked them), so a team compact initiated by another client still
+/// disables per-member affordances here.
+fn apply_team_compact_notify(
+    state: &AppState,
+    host_id: &str,
+    payload: protocol::types::TeamCompactNotifyPayload,
+) {
+    use protocol::types::TeamCompactStatus;
+    log::info!(
+        "dispatch team_compact_notify host={} team={} status={:?} agents={} results={}",
+        host_id,
+        payload.team_id,
+        payload.status,
+        payload.agent_ids.len(),
+        payload.results.len(),
+    );
+    match payload.status {
+        TeamCompactStatus::Started => {
+            for agent_id in payload.agent_ids {
+                state.mark_compaction_started(host_id, agent_id);
+            }
+        }
+        TeamCompactStatus::Completed | TeamCompactStatus::Failed => {
+            // Per-agent results: drive each through the same handler as
+            // a solo agent compaction. Agents that succeeded retarget
+            // their chat tab; agents that failed surface the inline
+            // error and re-enable the compact button.
+            let mut seen: std::collections::HashSet<AgentId> =
+                std::collections::HashSet::with_capacity(payload.results.len());
+            for result in payload.results {
+                seen.insert(result.old_agent_id.clone());
+                apply_agent_compact_notify(state, host_id, result);
+            }
+            // Defensive: any agent_id present in the Started fan-out but
+            // missing from results would otherwise stay stuck in
+            // `compaction_in_progress`. Treat as failure with the
+            // team-level message so the UI re-enables.
+            let team_message = payload.message.clone().unwrap_or_else(|| {
+                "Team compaction did not report a result for this agent.".to_owned()
+            });
+            for agent_id in payload.agent_ids {
+                if !seen.contains(&agent_id) {
+                    let still_in_flight = state
+                        .compaction_in_progress
+                        .with_untracked(|map| map.contains_key(&agent_id));
+                    if still_in_flight {
+                        state.finish_compaction_failure(agent_id, team_message.clone());
+                    }
+                }
             }
         }
     }

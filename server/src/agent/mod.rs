@@ -97,6 +97,12 @@ pub(crate) struct CompactionSummary {
     pub summary: String,
 }
 
+pub(crate) enum CompactionStart {
+    Started(oneshot::Receiver<Result<CompactionSummary, String>>),
+    Rejected(String),
+    Closed,
+}
+
 struct ActiveCompaction {
     reply: oneshot::Sender<Result<CompactionSummary, String>>,
     summary: String,
@@ -130,13 +136,13 @@ impl AgentHandle {
         self.tx.send(AgentCommand::SendInput(input)).is_ok()
     }
 
-    pub async fn compact(
+    pub fn begin_compact(
         &self,
         summary_prompt: String,
         max_summary_bytes: usize,
-    ) -> Option<Result<CompactionSummary, String>> {
+    ) -> CompactionStart {
         if !self.accepting_input.load(Ordering::SeqCst) {
-            return Some(Err("agent is not accepting input".to_owned()));
+            return CompactionStart::Rejected("agent is not accepting input".to_owned());
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -148,9 +154,9 @@ impl AgentHandle {
             })
             .is_err()
         {
-            return None;
+            return CompactionStart::Closed;
         }
-        reply_rx.await.ok()
+        CompactionStart::Started(reply_rx)
     }
 
     pub async fn release_compaction(&self) -> bool {

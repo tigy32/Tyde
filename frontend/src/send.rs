@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use protocol::types::AgentCompactPayload;
+use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
     CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
@@ -86,6 +86,28 @@ pub async fn compact_agent(host_id: &str, agent_stream: StreamPath) -> Result<()
         agent_stream,
         FrameKind::AgentCompact,
         &AgentCompactPayload::default(),
+    )
+    .await
+}
+
+/// Fire a team-wide compaction request. The server fans out per-member
+/// compactions and emits `TeamCompactNotify` + per-agent
+/// `AgentCompactNotify` events. Routed on the host stream because the
+/// team itself is host-scoped (no per-team instance stream).
+pub async fn team_compact(
+    host_id: &str,
+    host_stream: StreamPath,
+    team_id: TeamId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamCompact,
+        &TeamCompactPayload {
+            team_id,
+            summary_prompt: None,
+            max_summary_bytes: None,
+        },
     )
     .await
 }

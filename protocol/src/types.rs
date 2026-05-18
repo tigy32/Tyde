@@ -367,6 +367,7 @@ pub enum FrameKind {
     TeamMemberUpdate,
     TeamMemberDelete,
     TeamMemberActivate,
+    TeamCompact,
     TeamMemberShuffle,
     TeamDraftCreate,
     TeamDraftUpdate,
@@ -412,6 +413,7 @@ pub enum FrameKind {
     TeamNotify,
     TeamMemberNotify,
     TeamMemberBindingNotify,
+    TeamCompactNotify,
     TeamPresetCatalogNotify,
     TeamDraftNotify,
     TeamMemberShuffleSuggestionNotify,
@@ -478,6 +480,7 @@ impl fmt::Display for FrameKind {
             Self::TeamMemberUpdate => f.write_str("team_member_update"),
             Self::TeamMemberDelete => f.write_str("team_member_delete"),
             Self::TeamMemberActivate => f.write_str("team_member_activate"),
+            Self::TeamCompact => f.write_str("team_compact"),
             Self::TeamMemberShuffle => f.write_str("team_member_shuffle"),
             Self::TeamDraftCreate => f.write_str("team_draft_create"),
             Self::TeamDraftUpdate => f.write_str("team_draft_update"),
@@ -519,6 +522,7 @@ impl fmt::Display for FrameKind {
             Self::TeamNotify => f.write_str("team_notify"),
             Self::TeamMemberNotify => f.write_str("team_member_notify"),
             Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
+            Self::TeamCompactNotify => f.write_str("team_compact_notify"),
             Self::TeamPresetCatalogNotify => f.write_str("team_preset_catalog_notify"),
             Self::TeamDraftNotify => f.write_str("team_draft_notify"),
             Self::TeamMemberShuffleSuggestionNotify => {
@@ -1420,6 +1424,37 @@ pub struct TeamMemberActivatePayload {
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<ImageData>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamCompactPayload {
+    pub team_id: TeamId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_summary_bytes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamCompactStatus {
+    Started,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamCompactNotifyPayload {
+    pub status: TeamCompactStatus,
+    pub team_id: TeamId,
+    #[serde(default)]
+    pub member_ids: Vec<TeamMemberId>,
+    #[serde(default)]
+    pub agent_ids: Vec<AgentId>,
+    #[serde(default)]
+    pub results: Vec<AgentCompactNotifyPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

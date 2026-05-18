@@ -3,6 +3,7 @@ use std::fmt;
 
 use crate::types::{
     AgentCompactNotifyPayload, AgentCompactPayload, CloseAgentPayload, NewTerminalPayload,
+    TeamCompactNotifyPayload, TeamCompactPayload,
 };
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
@@ -276,6 +277,12 @@ impl ProtocolValidator {
                 envelope,
                 "TeamMemberActivate",
             ),
+            FrameKind::TeamCompact => {
+                parse_host_payload::<TeamCompactPayload>(self, envelope, "TeamCompact")
+            }
+            FrameKind::TeamCompactNotify => {
+                parse_host_payload::<TeamCompactNotifyPayload>(self, envelope, "TeamCompactNotify")
+            }
             FrameKind::TeamDraftCreate => {
                 parse_host_payload::<TeamDraftCreatePayload>(self, envelope, "TeamDraftCreate")
             }

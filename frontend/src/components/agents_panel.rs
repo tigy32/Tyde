@@ -1015,9 +1015,12 @@ mod wasm_tests {
     use crate::dispatch::dispatch_envelope;
     use crate::state::{ChatMessageEntry, ChatRowHandle};
     use leptos::mount::mount_to;
-    use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
+    use protocol::types::{
+        AgentCompactNotifyPayload, AgentCompactStatus, TeamCompactNotifyPayload, TeamCompactStatus,
+    };
     use protocol::{
-        AgentOrigin, BackendKind, ChatMessage, Envelope, MessageSender, NewAgentPayload, StreamPath,
+        AgentOrigin, BackendKind, ChatMessage, Envelope, MessageSender, NewAgentPayload,
+        StreamPath, TeamId, TeamMemberId,
     };
     use serde_json::Value as JsonValue;
     use wasm_bindgen::JsCast;
@@ -2001,6 +2004,281 @@ mod wasm_tests {
                 .iter()
                 .all(|a| a.agent_id != AgentId("a-old".to_owned()))),
             "finalize_compaction_close must drop the old AgentInfo"
+        );
+    }
+
+    /// `TeamCompactNotify::Started` flips every targeted agent into
+    /// `compaction_in_progress` even when the user never clicked Compact
+    /// in this client (a team compact may have been initiated from
+    /// another client / server-side rule). Idempotent if the local
+    /// click handler had already marked them.
+    #[wasm_bindgen_test]
+    async fn dispatch_team_compact_notify_started_marks_all_targets_in_progress() {
+        reset_inbound_seqs("h-team-started");
+        let state = make_app_state("h-team-started");
+        register_agent_via_new_agent(&state, "h-team-started", "a-mgr", "Manager", 0, 0);
+        register_agent_via_new_agent(&state, "h-team-started", "a-rep", "Reporter", 1, 1);
+        seed_chat_row(&state, "a-mgr");
+        seed_chat_row(&state, "a-rep");
+        dispatch_frame(
+            &state,
+            "h-team-started",
+            StreamPath("/host/h-team-started".to_owned()),
+            FrameKind::TeamCompactNotify,
+            2,
+            &TeamCompactNotifyPayload {
+                status: TeamCompactStatus::Started,
+                team_id: TeamId("t-1".to_owned()),
+                member_ids: vec![
+                    TeamMemberId("m-mgr".to_owned()),
+                    TeamMemberId("m-rep".to_owned()),
+                ],
+                agent_ids: vec![AgentId("a-mgr".to_owned()), AgentId("a-rep".to_owned())],
+                results: Vec::new(),
+                message: None,
+            },
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-mgr".to_owned()))),
+            "Started team notify must mark every targeted agent in-flight (a-mgr)"
+        );
+        assert!(
+            state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-rep".to_owned()))),
+            "Started team notify must mark every targeted agent in-flight (a-rep)"
+        );
+    }
+
+    /// `TeamCompactNotify::Completed` carries one
+    /// `AgentCompactNotifyPayload` per target. The dispatcher must
+    /// drive each through the same per-agent state machine: chat tabs
+    /// retarget to the new agent, `compaction_in_progress` clears.
+    /// Per-agent `AgentCompactNotify` frames are NOT emitted to the
+    /// client during a team compact, so this aggregated path is the
+    /// only place the UI learns of completion.
+    #[wasm_bindgen_test]
+    async fn dispatch_team_compact_notify_completed_retargets_each_member_tab() {
+        reset_inbound_seqs("h-team-completed");
+        let state = make_app_state("h-team-completed");
+        register_agent_via_new_agent(&state, "h-team-completed", "a-mgr-old", "Manager", 0, 0);
+        register_agent_via_new_agent(&state, "h-team-completed", "a-rep-old", "Reporter", 1, 1);
+        seed_chat_row(&state, "a-mgr-old");
+        seed_chat_row(&state, "a-rep-old");
+        state.mark_compaction_started("h-team-completed", AgentId("a-mgr-old".to_owned()));
+        state.mark_compaction_started("h-team-completed", AgentId("a-rep-old".to_owned()));
+        // Replacement agents land first (server emits them on the host
+        // stream, then sends TeamCompactNotify on the host stream).
+        register_agent_via_new_agent(
+            &state,
+            "h-team-completed",
+            "a-mgr-new",
+            "Manager (compacted)",
+            2,
+            2,
+        );
+        register_agent_via_new_agent(
+            &state,
+            "h-team-completed",
+            "a-rep-new",
+            "Reporter (compacted)",
+            3,
+            3,
+        );
+
+        dispatch_frame(
+            &state,
+            "h-team-completed",
+            StreamPath("/host/h-team-completed".to_owned()),
+            FrameKind::TeamCompactNotify,
+            4,
+            &TeamCompactNotifyPayload {
+                status: TeamCompactStatus::Completed,
+                team_id: TeamId("t-1".to_owned()),
+                member_ids: vec![
+                    TeamMemberId("m-mgr".to_owned()),
+                    TeamMemberId("m-rep".to_owned()),
+                ],
+                agent_ids: vec![
+                    AgentId("a-mgr-old".to_owned()),
+                    AgentId("a-rep-old".to_owned()),
+                ],
+                results: vec![
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Completed,
+                        old_agent_id: AgentId("a-mgr-old".to_owned()),
+                        old_session_id: None,
+                        new_agent_id: Some(AgentId("a-mgr-new".to_owned())),
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: None,
+                    },
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Completed,
+                        old_agent_id: AgentId("a-rep-old".to_owned()),
+                        old_session_id: None,
+                        new_agent_id: Some(AgentId("a-rep-new".to_owned())),
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: None,
+                    },
+                ],
+                message: None,
+            },
+        );
+
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-mgr-old".to_owned()))),
+            "team Completed must clear in-flight for a-mgr-old"
+        );
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-rep-old".to_owned()))),
+            "team Completed must clear in-flight for a-rep-old"
+        );
+        // Each per-agent result drives the same retarget path as a
+        // solo compaction. Both old→new mappings must finalize without
+        // anything left behind in `compaction_pending_completion`.
+        assert!(
+            state.compaction_pending_completion.with(|m| m.is_empty()),
+            "all per-agent retargets must finalize since both replacements are in state"
+        );
+    }
+
+    /// Partial `TeamCompactNotify::Failed` — one agent succeeded, one
+    /// failed. Each per-agent result must drive its own state path:
+    /// the successful one retargets and clears in-flight, the failed
+    /// one clears in-flight and surfaces the error message inline so
+    /// the per-agent Compact button re-enables.
+    #[wasm_bindgen_test]
+    async fn dispatch_team_compact_notify_failed_applies_per_agent_results() {
+        reset_inbound_seqs("h-team-mixed");
+        let state = make_app_state("h-team-mixed");
+        register_agent_via_new_agent(&state, "h-team-mixed", "a-ok-old", "OK", 0, 0);
+        register_agent_via_new_agent(&state, "h-team-mixed", "a-bad-old", "Bad", 1, 1);
+        seed_chat_row(&state, "a-ok-old");
+        seed_chat_row(&state, "a-bad-old");
+        state.mark_compaction_started("h-team-mixed", AgentId("a-ok-old".to_owned()));
+        state.mark_compaction_started("h-team-mixed", AgentId("a-bad-old".to_owned()));
+        register_agent_via_new_agent(&state, "h-team-mixed", "a-ok-new", "OK (compacted)", 2, 2);
+
+        dispatch_frame(
+            &state,
+            "h-team-mixed",
+            StreamPath("/host/h-team-mixed".to_owned()),
+            FrameKind::TeamCompactNotify,
+            3,
+            &TeamCompactNotifyPayload {
+                status: TeamCompactStatus::Failed,
+                team_id: TeamId("t-1".to_owned()),
+                member_ids: vec![
+                    TeamMemberId("m-ok".to_owned()),
+                    TeamMemberId("m-bad".to_owned()),
+                ],
+                agent_ids: vec![
+                    AgentId("a-ok-old".to_owned()),
+                    AgentId("a-bad-old".to_owned()),
+                ],
+                results: vec![
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Completed,
+                        old_agent_id: AgentId("a-ok-old".to_owned()),
+                        old_session_id: None,
+                        new_agent_id: Some(AgentId("a-ok-new".to_owned())),
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: None,
+                    },
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: AgentId("a-bad-old".to_owned()),
+                        old_session_id: None,
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: Some("summary backend exploded".to_owned()),
+                    },
+                ],
+                message: Some("1 of 2 team agents failed to compact".to_owned()),
+            },
+        );
+
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-ok-old".to_owned()))),
+            "successful per-agent result must clear in-flight"
+        );
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-bad-old".to_owned()))),
+            "failed per-agent result must also clear in-flight (re-enable Compact button)"
+        );
+        let err = state
+            .compaction_errors
+            .with(|m| m.get(&AgentId("a-bad-old".to_owned())).cloned())
+            .expect("per-agent failure must surface an error for the failed agent");
+        assert!(
+            err.contains("summary backend"),
+            "per-agent error message must come from the result's message, got {err:?}"
+        );
+        assert!(
+            state
+                .compaction_errors
+                .with(|m| !m.contains_key(&AgentId("a-ok-old".to_owned()))),
+            "successful per-agent result must NOT record an error"
+        );
+    }
+
+    /// Defensive: if the server's `Failed` notify lists an agent in
+    /// `agent_ids` but provides no matching `results` entry (e.g. the
+    /// per-agent task aborted before producing a payload), the
+    /// dispatcher must still clear that agent's in-flight flag using
+    /// the team-level message — otherwise the per-agent Compact button
+    /// would remain disabled forever.
+    #[wasm_bindgen_test]
+    async fn dispatch_team_compact_notify_missing_result_falls_back_to_team_message() {
+        reset_inbound_seqs("h-team-missing");
+        let state = make_app_state("h-team-missing");
+        register_agent_via_new_agent(&state, "h-team-missing", "a-orphan", "Orphan", 0, 0);
+        seed_chat_row(&state, "a-orphan");
+        state.mark_compaction_started("h-team-missing", AgentId("a-orphan".to_owned()));
+
+        dispatch_frame(
+            &state,
+            "h-team-missing",
+            StreamPath("/host/h-team-missing".to_owned()),
+            FrameKind::TeamCompactNotify,
+            1,
+            &TeamCompactNotifyPayload {
+                status: TeamCompactStatus::Failed,
+                team_id: TeamId("t-1".to_owned()),
+                member_ids: vec![TeamMemberId("m-orphan".to_owned())],
+                agent_ids: vec![AgentId("a-orphan".to_owned())],
+                results: Vec::new(),
+                message: Some("team compaction aborted".to_owned()),
+            },
+        );
+
+        assert!(
+            !state
+                .compaction_in_progress
+                .with(|map| map.contains_key(&AgentId("a-orphan".to_owned()))),
+            "missing per-agent result must still clear in-flight via team-level fallback"
+        );
+        let err = state
+            .compaction_errors
+            .with(|m| m.get(&AgentId("a-orphan".to_owned())).cloned())
+            .expect("team-level message must be surfaced when no per-agent result was emitted");
+        assert!(
+            err.contains("team compaction aborted"),
+            "fallback must use the team-level message, got {err:?}"
         );
     }
 }

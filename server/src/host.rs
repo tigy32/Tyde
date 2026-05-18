@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use protocol::types::{
     AgentClosedPayload, AgentCompactNotifyPayload, AgentCompactPayload, AgentCompactStatus,
+    TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
 };
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
@@ -30,8 +31,8 @@ use protocol::{
     TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
     TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
     TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
     TerminalSendPayload,
 };
@@ -47,8 +48,8 @@ use crate::agent::registry::{
     ResolvedSpawnRequest,
 };
 use crate::agent::{
-    AgentHandle, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentNameRequest,
-    MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name, generate_agent_name,
+    AgentHandle, CompactionStart, CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES,
+    GenerateAgentNameRequest, MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name, generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
@@ -78,7 +79,7 @@ use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
 use crate::store::project::ProjectStore;
 use crate::store::review::ReviewStore;
-use crate::store::session::SessionStore;
+use crate::store::session::{SessionRecord, SessionStore};
 use crate::store::settings::HostSettingsStore;
 use crate::store::skills::SkillStore;
 use crate::store::steering::SteeringStore;
@@ -118,6 +119,31 @@ pub(crate) struct TeamMemberMessageOutcome {
     pub member_id: TeamMemberId,
     pub agent_id: AgentId,
     pub queued: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TeamCompactTarget {
+    member_id: TeamMemberId,
+    agent_id: AgentId,
+}
+
+struct TeamAgentCompaction {
+    target: TeamCompactTarget,
+    compaction: AgentCompaction,
+    rx: mpsc::UnboundedReceiver<protocol::Envelope>,
+}
+
+struct AgentCompaction {
+    agent_id: AgentId,
+    agent_handle: AgentHandle,
+    start: AgentStartPayload,
+    old_session_id: SessionId,
+    access_mode: protocol::BackendAccessMode,
+    old_record: SessionRecord,
+    session_store: Arc<Mutex<SessionStore>>,
+    team_registry: TeamRegistryHandle,
+    stream: Stream,
+    summary_rx: oneshot::Receiver<Result<CompactionSummary, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -758,12 +784,273 @@ impl HostHandle {
             .await
     }
 
+    pub(crate) async fn compact_agent_in_background(
+        &self,
+        agent_id: AgentId,
+        payload: AgentCompactPayload,
+        stream: Stream,
+    ) -> AppResult<()> {
+        let Some(compaction) = self
+            .begin_agent_compaction(agent_id, payload, stream)
+            .await?
+        else {
+            return Ok(());
+        };
+        let host = self.clone();
+        tokio::spawn(async move {
+            host.finish_agent_compaction(compaction).await;
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn compact_team(
+        &self,
+        payload: TeamCompactPayload,
+        stream: Stream,
+    ) -> AppResult<()> {
+        let targets = self.team_compact_targets(&payload.team_id).await?;
+        let member_ids = targets
+            .iter()
+            .map(|target| target.member_id.clone())
+            .collect::<Vec<_>>();
+        let agent_ids = targets
+            .iter()
+            .map(|target| target.agent_id.clone())
+            .collect::<Vec<_>>();
+        let mut compactions = Vec::with_capacity(targets.len());
+        let mut results = Vec::new();
+        for target in targets {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let target_agent_id = target.agent_id.clone();
+            let agent_stream = Stream::new(
+                StreamPath(format!("/agent/{}/team-compact", target_agent_id)),
+                tx,
+            );
+            let agent_payload = AgentCompactPayload {
+                summary_prompt: payload.summary_prompt.clone(),
+                max_summary_bytes: payload.max_summary_bytes,
+            };
+            match self
+                .begin_agent_compaction(target_agent_id.clone(), agent_payload, agent_stream)
+                .await?
+            {
+                Some(compaction) => {
+                    compactions.push(TeamAgentCompaction {
+                        target,
+                        compaction,
+                        rx,
+                    });
+                }
+                None => {
+                    results.push(drain_final_agent_compact_notify(&target_agent_id, &mut rx));
+                }
+            }
+        }
+
+        send_team_compact_notify(
+            &stream,
+            TeamCompactNotifyPayload {
+                status: TeamCompactStatus::Started,
+                team_id: payload.team_id.clone(),
+                member_ids: member_ids.clone(),
+                agent_ids: agent_ids.clone(),
+                results: Vec::new(),
+                message: None,
+            },
+        );
+
+        let host = self.clone();
+        tokio::spawn(async move {
+            host.finish_team_compactions(
+                payload,
+                member_ids,
+                agent_ids,
+                compactions,
+                results,
+                stream,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    async fn team_compact_targets(&self, team_id: &TeamId) -> AppResult<Vec<TeamCompactTarget>> {
+        const OPERATION: &str = "team_compact";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let snapshot = registry
+            .snapshot()
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        if !snapshot.teams.iter().any(|team| team.id == *team_id) {
+            return Err(AppError::not_found(
+                OPERATION,
+                format!("team {team_id} does not exist"),
+            ));
+        }
+
+        let members = snapshot
+            .members
+            .into_iter()
+            .filter(|member| member.team_id == *team_id && member.state == TeamMemberState::Active)
+            .collect::<Vec<_>>();
+        let bindings = snapshot
+            .bindings
+            .into_iter()
+            .map(|binding| (binding.member_id.clone(), binding))
+            .collect::<HashMap<_, _>>();
+        let mut targets = Vec::new();
+        for member in members {
+            let Some(binding) = bindings.get(&member.id) else {
+                return Err(AppError::internal_message(
+                    OPERATION,
+                    format!("team member {} has no binding", member.id),
+                    anyhow!("team member {} has no binding", member.id),
+                ));
+            };
+            if binding.status != AgentControlStatus::Idle {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "team member {} is not idle ({:?})",
+                        member.id, binding.status
+                    ),
+                ));
+            }
+            let Some(agent_id) = binding.current_agent_id.clone() else {
+                continue;
+            };
+            let status = self.agent_status_snapshot(&agent_id).await.ok_or_else(|| {
+                AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "team member {} is bound to missing agent {agent_id}",
+                        member.id
+                    ),
+                )
+            })?;
+            if status.terminated {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!("team member {} agent {agent_id} is terminated", member.id),
+                ));
+            }
+            if status.is_active() {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!("team member {} agent {agent_id} is not idle", member.id),
+                ));
+            }
+            targets.push(TeamCompactTarget {
+                member_id: member.id,
+                agent_id,
+            });
+        }
+
+        if targets.is_empty() {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!("team {team_id} has no live idle agents to compact"),
+            ));
+        }
+        Ok(targets)
+    }
+
+    async fn finish_team_compactions(
+        &self,
+        payload: TeamCompactPayload,
+        member_ids: Vec<TeamMemberId>,
+        agent_ids: Vec<AgentId>,
+        compactions: Vec<TeamAgentCompaction>,
+        mut results: Vec<AgentCompactNotifyPayload>,
+        stream: Stream,
+    ) {
+        let mut handles = Vec::with_capacity(compactions.len());
+        for compaction in compactions {
+            let host = self.clone();
+            let target = compaction.target.clone();
+            handles.push((
+                target,
+                tokio::spawn(async move { host.finish_team_compaction_target(compaction).await }),
+            ));
+        }
+
+        for (target, handle) in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(error) => results.push(AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: target.agent_id,
+                    old_session_id: None,
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some(format!("team compaction task failed: {error}")),
+                }),
+            }
+        }
+
+        let failures = results
+            .iter()
+            .filter(|result| result.status != AgentCompactStatus::Completed)
+            .count();
+        let (status, message) = if failures == 0 {
+            (TeamCompactStatus::Completed, None)
+        } else {
+            (
+                TeamCompactStatus::Failed,
+                Some(format!(
+                    "{failures} of {} team agents failed to compact",
+                    results.len()
+                )),
+            )
+        };
+        send_team_compact_notify(
+            &stream,
+            TeamCompactNotifyPayload {
+                status,
+                team_id: payload.team_id,
+                member_ids,
+                agent_ids,
+                results,
+                message,
+            },
+        );
+    }
+
+    async fn finish_team_compaction_target(
+        &self,
+        team_compaction: TeamAgentCompaction,
+    ) -> AgentCompactNotifyPayload {
+        let old_agent_id = team_compaction.target.agent_id.clone();
+        self.finish_agent_compaction(team_compaction.compaction)
+            .await;
+        let mut rx = team_compaction.rx;
+        drain_final_agent_compact_notify(&old_agent_id, &mut rx)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn compact_agent(
         &self,
         agent_id: AgentId,
         payload: AgentCompactPayload,
         stream: Stream,
     ) -> AppResult<()> {
+        let Some(compaction) = self
+            .begin_agent_compaction(agent_id, payload, stream)
+            .await?
+        else {
+            return Ok(());
+        };
+        self.finish_agent_compaction(compaction).await;
+        Ok(())
+    }
+
+    async fn begin_agent_compaction(
+        &self,
+        agent_id: AgentId,
+        payload: AgentCompactPayload,
+        stream: Stream,
+    ) -> AppResult<Option<AgentCompaction>> {
         let summary_prompt = payload
             .summary_prompt
             .unwrap_or_else(default_compaction_summary_prompt);
@@ -801,7 +1088,7 @@ impl HostHandle {
                     message: Some("agent is not running".to_owned()),
                 },
             );
-            return Ok(());
+            return Ok(None);
         };
 
         let Some(old_session_id) = old_session_id else {
@@ -817,7 +1104,7 @@ impl HostHandle {
                     message: Some("agent has no session to compact".to_owned()),
                 },
             );
-            return Ok(());
+            return Ok(None);
         };
         let Some(access_mode) = access_mode else {
             send_agent_compact_notify(
@@ -832,7 +1119,7 @@ impl HostHandle {
                     message: Some("agent access mode is unavailable".to_owned()),
                 },
             );
-            return Ok(());
+            return Ok(None);
         };
         if start.origin == AgentOrigin::BackendNative {
             send_agent_compact_notify(
@@ -847,7 +1134,7 @@ impl HostHandle {
                     message: Some("backend-native agents cannot be compacted".to_owned()),
                 },
             );
-            return Ok(());
+            return Ok(None);
         }
         let old_record = match session_store.lock().await.get(&old_session_id) {
             Some(record) => record,
@@ -864,7 +1151,7 @@ impl HostHandle {
                         message: Some("agent session metadata is missing".to_owned()),
                     },
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
         if old_record.compacted_to_session_id.is_some() {
@@ -880,7 +1167,7 @@ impl HostHandle {
                     message: Some("agent session is already compacted".to_owned()),
                 },
             );
-            return Ok(());
+            return Ok(None);
         }
 
         send_agent_compact_notify(
@@ -896,12 +1183,9 @@ impl HostHandle {
             },
         );
 
-        let summary = match agent_handle
-            .compact(summary_prompt, max_summary_bytes)
-            .await
-        {
-            Some(Ok(summary)) => summary,
-            Some(Err(error)) => {
+        let summary_rx = match agent_handle.begin_compact(summary_prompt, max_summary_bytes) {
+            CompactionStart::Started(summary_rx) => summary_rx,
+            CompactionStart::Rejected(error) => {
                 send_agent_compact_notify(
                     &stream,
                     AgentCompactNotifyPayload {
@@ -914,9 +1198,9 @@ impl HostHandle {
                         message: Some(error),
                     },
                 );
-                return Ok(());
+                return Ok(None);
             }
-            None => {
+            CompactionStart::Closed => {
                 send_agent_compact_notify(
                     &stream,
                     AgentCompactNotifyPayload {
@@ -929,7 +1213,67 @@ impl HostHandle {
                         message: Some("agent stopped before compaction completed".to_owned()),
                     },
                 );
-                return Ok(());
+                return Ok(None);
+            }
+        };
+        Ok(Some(AgentCompaction {
+            agent_id,
+            agent_handle,
+            start,
+            old_session_id,
+            access_mode,
+            old_record,
+            session_store,
+            team_registry,
+            stream,
+            summary_rx,
+        }))
+    }
+
+    async fn finish_agent_compaction(&self, compaction: AgentCompaction) {
+        let AgentCompaction {
+            agent_id,
+            agent_handle,
+            start,
+            old_session_id,
+            access_mode,
+            old_record,
+            session_store,
+            team_registry,
+            stream,
+            summary_rx,
+        } = compaction;
+        let summary = match summary_rx.await {
+            Ok(Ok(summary)) => summary,
+            Ok(Err(error)) => {
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: Some(error),
+                    },
+                );
+                return;
+            }
+            Err(_) => {
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: None,
+                        message: Some("agent stopped before compaction completed".to_owned()),
+                    },
+                );
+                return;
             }
         };
         if summary.session_id != old_session_id {
@@ -949,7 +1293,7 @@ impl HostHandle {
                     )),
                 },
             );
-            return Ok(());
+            return;
         }
 
         let summary_preview = compaction_summary_preview(&summary.summary);
@@ -979,7 +1323,7 @@ impl HostHandle {
                         message: Some("team agent metadata is incomplete".to_owned()),
                     },
                 );
-                return Ok(());
+                return;
             }
             (_, None, None) => None,
             _ => {
@@ -996,7 +1340,7 @@ impl HostHandle {
                         message: Some("team agent metadata is incomplete".to_owned()),
                     },
                 );
-                return Ok(());
+                return;
             }
         };
         let replacement_payload = SpawnAgentPayload {
@@ -1039,7 +1383,7 @@ impl HostHandle {
                         message: Some(format!("replacement agent failed to start: {error}")),
                     },
                 );
-                return Ok(());
+                return;
             }
         };
 
@@ -1065,7 +1409,7 @@ impl HostHandle {
                             message: Some(format!("team validation failed: {error}")),
                         },
                     );
-                    return Ok(());
+                    return;
                 }
             };
             match team_registry
@@ -1098,7 +1442,7 @@ impl HostHandle {
                             message: Some(format!("team binding rotation failed: {error}")),
                         },
                     );
-                    return Ok(());
+                    return;
                 }
             }
         }
@@ -1162,7 +1506,7 @@ impl HostHandle {
                     message: Some(format!("session compaction metadata failed: {error}")),
                 },
             );
-            return Ok(());
+            return;
         }
 
         self.fan_out_session_lists().await;
@@ -1184,7 +1528,6 @@ impl HostHandle {
                 "old agent was already closed after successful compaction"
             );
         }
-        Ok(())
     }
 
     async fn spawn_agent_with_origin(
@@ -5837,6 +6180,56 @@ fn send_agent_compact_notify(stream: &Stream, payload: AgentCompactNotifyPayload
     let _ = stream.send_value(FrameKind::AgentCompactNotify, value);
 }
 
+fn drain_final_agent_compact_notify(
+    old_agent_id: &AgentId,
+    rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+) -> AgentCompactNotifyPayload {
+    let mut final_notify = None;
+    while let Ok(envelope) = rx.try_recv() {
+        if envelope.kind != FrameKind::AgentCompactNotify {
+            continue;
+        }
+        match envelope.parse_payload::<AgentCompactNotifyPayload>() {
+            Ok(payload)
+                if matches!(
+                    payload.status,
+                    AgentCompactStatus::Completed | AgentCompactStatus::Failed
+                ) =>
+            {
+                final_notify = Some(payload);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return AgentCompactNotifyPayload {
+                    status: AgentCompactStatus::Failed,
+                    old_agent_id: old_agent_id.clone(),
+                    old_session_id: None,
+                    new_agent_id: None,
+                    new_session_id: None,
+                    summary_preview: None,
+                    message: Some(format!("failed to parse compaction result: {error}")),
+                };
+            }
+        }
+    }
+
+    final_notify.unwrap_or(AgentCompactNotifyPayload {
+        status: AgentCompactStatus::Failed,
+        old_agent_id: old_agent_id.clone(),
+        old_session_id: None,
+        new_agent_id: None,
+        new_session_id: None,
+        summary_preview: None,
+        message: Some("agent compaction finished without a terminal notify".to_owned()),
+    })
+}
+
+fn send_team_compact_notify(stream: &Stream, payload: TeamCompactNotifyPayload) {
+    let value = serde_json::to_value(payload)
+        .expect("failed to serialize TeamCompactNotify payload for host stream");
+    let _ = stream.send_value(FrameKind::TeamCompactNotify, value);
+}
+
 impl HostHandle {
     async fn refresh_after_project_mutation(
         &self,
@@ -6003,8 +6396,8 @@ mod tests {
     use crate::review::ReviewHandle;
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
-        BackendKind, CustomAgentId, DiffContextMode, HostSettingValue, ProjectDiffScope,
-        ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
+        AgentErrorPayload, BackendKind, CustomAgentId, DiffContextMode, HostSettingValue,
+        ProjectDiffScope, ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
         ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec, ToolPolicy,
     };
 
@@ -6403,6 +6796,26 @@ mod tests {
         }
     }
 
+    async fn wait_for_team_member_binding_idle(host: &HostHandle, member_id: &TeamMemberId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = team_snapshot(host).await;
+            let binding = snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.member_id == *member_id)
+                .expect("member binding");
+            if binding.current_agent_id.is_some() && binding.status == AgentControlStatus::Idle {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for team member {member_id} binding to become idle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn compact_fixture() -> CompactFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = spawn_host_with_mock_backend(
@@ -6532,6 +6945,188 @@ mod tests {
             }
         }
         notifies
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_route_does_not_block_host_commands() {
+        let fixture = compact_fixture().await;
+        let (old_agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "remember routing responsiveness").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/compact-route-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path.clone(), tx);
+        let agent_path = StreamPath(format!("/agent/{}/{}", old_agent_id, Uuid::new_v4()));
+        let compact = protocol::Envelope::from_payload(
+            agent_path,
+            FrameKind::AgentCompact,
+            0,
+            &AgentCompactPayload {
+                summary_prompt: Some(format!("{MOCK_SLOW_TURN_SENTINEL} summarize")),
+                max_summary_bytes: None,
+            },
+        )
+        .expect("compact envelope");
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, compact),
+        )
+        .await
+        .expect("agent_compact route should return without waiting for compaction")
+        .expect("route compact");
+
+        let list_sessions = protocol::Envelope::from_payload(
+            host_path.clone(),
+            FrameKind::ListSessions,
+            0,
+            &protocol::ListSessionsPayload::default(),
+        )
+        .expect("list sessions envelope");
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            crate::router::route_client_envelope(
+                &fixture.host,
+                &host_path,
+                &host_stream,
+                list_sessions,
+            ),
+        )
+        .await
+        .expect("list_sessions route should not wait behind compaction")
+        .expect("route list sessions");
+
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("session list should be emitted while compaction is still running")
+                .expect("output envelope");
+            if envelope.kind == FrameKind::SessionList {
+                break;
+            }
+            if envelope.kind == FrameKind::AgentCompactNotify {
+                let payload: AgentCompactNotifyPayload =
+                    envelope.parse_payload().expect("compact notify");
+                assert_ne!(
+                    payload.status,
+                    AgentCompactStatus::Completed,
+                    "slow compaction completed before ListSessions was processed"
+                );
+            }
+        }
+
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("background compaction should finish")
+                .expect("output envelope");
+            if envelope.kind != FrameKind::AgentCompactNotify {
+                continue;
+            }
+            let payload: AgentCompactNotifyPayload =
+                envelope.parse_payload().expect("compact notify");
+            if matches!(
+                payload.status,
+                AgentCompactStatus::Completed | AgentCompactStatus::Failed
+            ) {
+                assert_eq!(payload.status, AgentCompactStatus::Completed);
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_compaction_route_orders_later_agent_input_after_compact() {
+        let fixture = compact_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/compact-ordering-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path.clone(), tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream.clone())
+                .await
+                .is_empty()
+        );
+
+        let (old_agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "remember input ordering").await;
+        let old_instance_stream = loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("new agent should be emitted")
+                .expect("output envelope");
+            if envelope.kind != FrameKind::NewAgent {
+                continue;
+            }
+            let payload: NewAgentPayload = envelope.parse_payload().expect("new agent payload");
+            if payload.agent_id == old_agent_id {
+                break payload.instance_stream;
+            }
+        };
+
+        let compact = protocol::Envelope::from_payload(
+            old_instance_stream.clone(),
+            FrameKind::AgentCompact,
+            0,
+            &AgentCompactPayload {
+                summary_prompt: Some(format!("{MOCK_SLOW_TURN_SENTINEL} summarize")),
+                max_summary_bytes: None,
+            },
+        )
+        .expect("compact envelope");
+        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, compact)
+            .await
+            .expect("route compact");
+
+        let send = protocol::Envelope::from_payload(
+            old_instance_stream,
+            FrameKind::SendMessage,
+            1,
+            &SendMessagePayload {
+                message: "This input must wait behind compaction".to_owned(),
+                images: None,
+                origin: None,
+            },
+        )
+        .expect("send envelope");
+        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, send)
+            .await
+            .expect("route send");
+
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("compacting agent should reject later input")
+                .expect("output envelope");
+            if envelope.kind != FrameKind::AgentError {
+                continue;
+            }
+            let payload: AgentErrorPayload = envelope.parse_payload().expect("agent error payload");
+            if payload.agent_id == old_agent_id
+                && payload.message.contains("compaction is in progress")
+            {
+                break;
+            }
+        }
+
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("background compaction should finish")
+                .expect("output envelope");
+            if envelope.kind != FrameKind::AgentCompactNotify {
+                continue;
+            }
+            let payload: AgentCompactNotifyPayload =
+                envelope.parse_payload().expect("compact notify");
+            if matches!(
+                payload.status,
+                AgentCompactStatus::Completed | AgentCompactStatus::Failed
+            ) {
+                assert_eq!(payload.status, AgentCompactStatus::Completed);
+                break;
+            }
+        }
     }
 
     #[tokio::test]
@@ -6914,6 +7509,153 @@ mod tests {
             .await
             .expect("resumed report session");
         assert_eq!(resumed_session_id, replacement_session_id);
+    }
+
+    #[tokio::test]
+    async fn team_compaction_rejects_busy_team() {
+        let fixture = team_fixture().await;
+        let manager = fixture
+            .host
+            .activate_team_member(
+                fixture.manager.id.clone(),
+                Some(format!("{MOCK_SLOW_TURN_SENTINEL} start manager")),
+                None,
+            )
+            .await
+            .expect("activate busy manager");
+        wait_for_agent_active(&fixture.host, &manager.agent_id).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let stream = Stream::new(
+            StreamPath(format!("/host/team-compact-busy-{}", Uuid::new_v4())),
+            tx,
+        );
+
+        let error = fixture
+            .host
+            .compact_team(
+                TeamCompactPayload {
+                    team_id: fixture.team.id.clone(),
+                    summary_prompt: None,
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+            .expect_err("busy team should reject compaction");
+        assert!(
+            error.message.contains("not idle"),
+            "unexpected error: {error}"
+        );
+        wait_for_agent_idle(&fixture.host, &manager.agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn team_compaction_rotates_live_idle_members() {
+        let fixture = team_fixture().await;
+        let manager = fixture
+            .host
+            .activate_team_member(
+                fixture.manager.id.clone(),
+                Some("Start the manager".to_owned()),
+                None,
+            )
+            .await
+            .expect("activate manager");
+        wait_for_agent_idle(&fixture.host, &manager.agent_id).await;
+        wait_for_team_member_binding_idle(&fixture.host, &fixture.manager.id).await;
+
+        let report = fixture
+            .host
+            .message_team_member(
+                manager.agent_id.clone(),
+                fixture.report.id.clone(),
+                "Please investigate the bug".to_owned(),
+                None,
+            )
+            .await
+            .expect("message report");
+        wait_for_agent_idle(&fixture.host, &report.agent_id).await;
+        wait_for_team_member_binding_idle(&fixture.host, &fixture.report.id).await;
+        let old_agent_ids = HashSet::from([manager.agent_id.clone(), report.agent_id.clone()]);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let stream = Stream::new(
+            StreamPath(format!("/host/team-compact-{}", Uuid::new_v4())),
+            tx,
+        );
+        fixture
+            .host
+            .compact_team(
+                TeamCompactPayload {
+                    team_id: fixture.team.id.clone(),
+                    summary_prompt: None,
+                    max_summary_bytes: None,
+                },
+                stream,
+            )
+            .await
+            .expect("compact team");
+
+        let started = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("team compaction started notify")
+            .expect("team compaction started envelope");
+        assert_eq!(started.kind, FrameKind::TeamCompactNotify);
+        let started: TeamCompactNotifyPayload =
+            started.parse_payload().expect("team compact started");
+        assert_eq!(started.status, TeamCompactStatus::Started);
+        assert_eq!(started.agent_ids.len(), 2);
+
+        let completed = loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("team compaction should finish")
+                .expect("team compact envelope");
+            if envelope.kind != FrameKind::TeamCompactNotify {
+                continue;
+            }
+            let payload: TeamCompactNotifyPayload =
+                envelope.parse_payload().expect("team compact notify");
+            if payload.status != TeamCompactStatus::Started {
+                break payload;
+            }
+        };
+        assert_eq!(completed.status, TeamCompactStatus::Completed);
+        assert_eq!(completed.results.len(), 2);
+        assert!(
+            completed
+                .results
+                .iter()
+                .all(|result| result.status == AgentCompactStatus::Completed)
+        );
+        assert!(
+            completed
+                .results
+                .iter()
+                .all(|result| old_agent_ids.contains(&result.old_agent_id))
+        );
+
+        let snapshot = team_snapshot(&fixture.host).await;
+        for member_id in [&fixture.manager.id, &fixture.report.id] {
+            let member = member_from_snapshot(snapshot.clone(), member_id);
+            let session_id = member.session_id.expect("member session after compaction");
+            let binding = snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.member_id == *member_id)
+                .expect("member binding");
+            let new_agent_id = binding
+                .current_agent_id
+                .as_ref()
+                .expect("member remains live-bound");
+            assert!(!old_agent_ids.contains(new_agent_id));
+            let result = completed
+                .results
+                .iter()
+                .find(|result| result.new_agent_id.as_ref() == Some(new_agent_id))
+                .expect("completed result for new agent");
+            assert_eq!(result.new_session_id.as_ref(), Some(&session_id));
+        }
     }
 
     #[tokio::test]
