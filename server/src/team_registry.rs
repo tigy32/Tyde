@@ -998,19 +998,19 @@ impl TeamRegistryActor {
         member_id: &TeamMemberId,
         status: AgentControlStatus,
     ) -> Result<TeamRegistryEvents, String> {
-        let Some(current_agent_id) = self
+        let previous = self
             .bindings
             .iter()
             .find(|binding| binding.member_id == *member_id)
+            .cloned();
+        let Some(current_agent_id) = previous
+            .as_ref()
             .and_then(|binding| binding.current_agent_id.clone())
         else {
             return Err(format!("team member {member_id} has no live binding"));
         };
         let binding = self.upsert_binding(member_id.clone(), Some(current_agent_id), status)?;
-        Ok(TeamRegistryEvents {
-            binding_notifies: vec![TeamMemberBindingNotifyPayload::Upsert { binding }],
-            ..TeamRegistryEvents::default()
-        })
+        Ok(binding_activity_events(previous.as_ref(), binding))
     }
 
     fn record_agent_activity(
@@ -1018,19 +1018,16 @@ impl TeamRegistryActor {
         agent_id: &AgentId,
         status: AgentControlStatus,
     ) -> Result<TeamRegistryEvents, String> {
-        let Some(member_id) = self
+        let previous = self
             .bindings
             .iter()
             .find(|binding| binding.current_agent_id.as_ref() == Some(agent_id))
-            .map(|binding| binding.member_id.clone())
-        else {
+            .cloned();
+        let Some(member_id) = previous.as_ref().map(|binding| binding.member_id.clone()) else {
             return Ok(TeamRegistryEvents::default());
         };
         let binding = self.upsert_binding(member_id, Some(agent_id.clone()), status)?;
-        Ok(TeamRegistryEvents {
-            binding_notifies: vec![TeamMemberBindingNotifyPayload::Upsert { binding }],
-            ..TeamRegistryEvents::default()
-        })
+        Ok(binding_activity_events(previous.as_ref(), binding))
     }
 
     fn clear_binding_by_agent(&mut self, agent_id: &AgentId) -> Result<TeamRegistryEvents, String> {
@@ -1489,6 +1486,23 @@ impl TeamRegistryActor {
         let cutoff = now_ms().saturating_sub(ACTIVATION_RESERVATION_TIMEOUT_MS);
         self.pending_activations
             .retain(|_, started_at_ms| *started_at_ms >= cutoff);
+    }
+}
+
+fn binding_activity_events(
+    previous: Option<&TeamMemberBindingPayload>,
+    binding: TeamMemberBindingPayload,
+) -> TeamRegistryEvents {
+    let should_notify = previous.is_none_or(|previous| {
+        previous.current_agent_id != binding.current_agent_id || previous.status != binding.status
+    });
+    if should_notify {
+        TeamRegistryEvents {
+            binding_notifies: vec![TeamMemberBindingNotifyPayload::Upsert { binding }],
+            ..TeamRegistryEvents::default()
+        }
+    } else {
+        TeamRegistryEvents::default()
     }
 }
 

@@ -1277,6 +1277,19 @@ mod wasm_tests {
         // ResizeObservers fire so the visible-window Memo recomputes
         // against measured heights rather than the 200px estimate.
         next_tick().await;
+        let scroller: HtmlElement = container
+            .query_selector(".chat-messages")
+            .unwrap()
+            .expect("chat scroller present")
+            .dyn_into()
+            .unwrap();
+        // Production chat views sticky-scroll to the bottom on mount when
+        // the user has not explicitly scrolled up. This test is about the
+        // top-window geometry, so force that scroll position before
+        // asserting that the unmounted suffix is represented by the
+        // bottom spacer.
+        scroller.set_scroll_top(0);
+        next_tick().await;
 
         let mounted = message_rows(&container);
         assert!(

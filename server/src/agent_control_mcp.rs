@@ -30,8 +30,10 @@ use crate::team_registry::team_preset_catalog;
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
 const DEFAULT_AWAIT_TIMEOUT_MS: u64 = 60_000;
-const DEFAULT_READ_LIMIT: usize = 100;
-const MAX_READ_LIMIT: usize = 1_000;
+const DEFAULT_READ_LIMIT: usize = 50;
+const MAX_READ_LIMIT: usize = 200;
+const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+const MAX_READ_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AgentControlMcpHandle {
@@ -135,6 +137,7 @@ struct ReadAgentToolInput {
     agent_id: String,
     after_seq: Option<u64>,
     limit: Option<u32>,
+    max_bytes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -187,6 +190,9 @@ struct ReadAgentResult {
     agent_id: String,
     events: Vec<Envelope>,
     next_after_seq: Option<u64>,
+    max_bytes: usize,
+    omitted_events: usize,
+    omitted_event_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,7 +330,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read output events from a Tyde agent. This is the only agent-control tool that returns agent output."
+        description = "Read output events from a Tyde agent. Results are capped by limit and max_bytes; use next_after_seq for incremental reads."
     )]
     async fn tyde_read_agent(
         &self,
@@ -334,7 +340,15 @@ impl TydeAgentControlMcpServer {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
-        match do_read_agent(&self.host, &agent_id, input.after_seq, input.limit).await {
+        match do_read_agent(
+            &self.host,
+            &agent_id,
+            input.after_seq,
+            input.limit,
+            input.max_bytes,
+        )
+        .await
+        {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -886,6 +900,7 @@ async fn do_read_agent(
     agent_id: &AgentId,
     after_seq: Option<u64>,
     limit: Option<u32>,
+    max_bytes: Option<u32>,
 ) -> Result<ReadAgentResult, String> {
     let limit = limit
         .map(|value| value as usize)
@@ -896,6 +911,15 @@ async fn do_read_agent(
     if limit > MAX_READ_LIMIT {
         return Err(format!("limit must be <= {MAX_READ_LIMIT}"));
     }
+    let max_bytes = max_bytes
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_READ_MAX_BYTES);
+    if max_bytes == 0 {
+        return Err("max_bytes must be greater than zero".to_string());
+    }
+    if max_bytes > MAX_READ_MAX_BYTES {
+        return Err(format!("max_bytes must be <= {MAX_READ_MAX_BYTES}"));
+    }
 
     let handle = host
         .agent_handle(agent_id)
@@ -905,13 +929,56 @@ async fn do_read_agent(
         .read_output(after_seq, limit)
         .await
         .ok_or_else(|| format!("agent {} is not available", agent_id.0))?;
-    let next_after_seq = events.last().map(|event| event.seq).or(after_seq);
+    let capped = cap_read_events(events, max_bytes, after_seq);
 
     Ok(ReadAgentResult {
         agent_id: agent_id.0.clone(),
-        events,
-        next_after_seq,
+        events: capped.events,
+        next_after_seq: capped.next_after_seq,
+        max_bytes,
+        omitted_events: capped.omitted_events,
+        omitted_event_bytes: capped.omitted_event_bytes,
     })
+}
+
+struct CappedReadEvents {
+    events: Vec<Envelope>,
+    next_after_seq: Option<u64>,
+    omitted_events: usize,
+    omitted_event_bytes: usize,
+}
+
+fn cap_read_events(
+    events: Vec<Envelope>,
+    max_bytes: usize,
+    after_seq: Option<u64>,
+) -> CappedReadEvents {
+    let mut kept = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut omitted_events = 0usize;
+    let mut omitted_event_bytes = 0usize;
+    let mut next_after_seq = after_seq;
+
+    for event in events {
+        let event_bytes = serde_json::to_vec(&event)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        next_after_seq = Some(event.seq);
+        if used_bytes.saturating_add(event_bytes) <= max_bytes {
+            used_bytes = used_bytes.saturating_add(event_bytes);
+            kept.push(event);
+        } else {
+            omitted_events = omitted_events.saturating_add(1);
+            omitted_event_bytes = omitted_event_bytes.saturating_add(event_bytes);
+        }
+    }
+
+    CappedReadEvents {
+        events: kept,
+        next_after_seq,
+        omitted_events,
+        omitted_event_bytes,
+    }
 }
 
 #[derive(Debug)]
@@ -1025,6 +1092,7 @@ async fn healthz_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::StreamPath;
 
     #[test]
     fn rejects_non_loopback_bind_addr() {
@@ -1072,6 +1140,34 @@ mod tests {
         let err = split_request_target("/mcp?agent_id=not-a-uuid")
             .expect_err("invalid agent_id should fail");
         assert!(err.contains("invalid agent_id"));
+    }
+
+    #[test]
+    fn cap_read_events_advances_past_omitted_events() {
+        let events = vec![
+            Envelope::from_payload(
+                StreamPath("/agent/a".to_owned()),
+                protocol::FrameKind::ChatEvent,
+                1,
+                &serde_json::json!({"text": "small"}),
+            )
+            .expect("small event"),
+            Envelope::from_payload(
+                StreamPath("/agent/a".to_owned()),
+                protocol::FrameKind::ChatEvent,
+                2,
+                &serde_json::json!({"text": "x".repeat(4096)}),
+            )
+            .expect("large event"),
+        ];
+
+        let capped = cap_read_events(events, 512, None);
+
+        assert_eq!(capped.events.len(), 1);
+        assert_eq!(capped.events[0].seq, 1);
+        assert_eq!(capped.next_after_seq, Some(2));
+        assert_eq!(capped.omitted_events, 1);
+        assert!(capped.omitted_event_bytes > 512);
     }
 
     #[test]

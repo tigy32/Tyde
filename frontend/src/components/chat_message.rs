@@ -1,7 +1,8 @@
 use leptos::prelude::*;
 use protocol::MessageSender;
+use wasm_bindgen::JsCast;
 
-use crate::components::tool_card::ToolCardView;
+use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
 use crate::state::ChatRowHandle;
 
@@ -126,11 +127,13 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
     };
 
     let body_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let reasoning_open = RwSignal::new(false);
 
     let entry_for_reasoning = entry.clone();
     let entry_for_images = entry.clone();
     let entry_for_tools = entry.clone();
     let entry_for_footer = entry.clone();
+    let entry_for_reasoning_slot = StoredValue::new_local(entry_for_reasoning.clone());
 
     view! {
         <div class=move || card_meta.with(|(c, _, _, _)| c.clone())>
@@ -144,11 +147,18 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
 
             // Reasoning (collapsible)
             {move || {
-                entry_for_reasoning.get().message.reasoning.map(|r| {
-                    let text = r.text;
-                    let token_count = r.tokens;
+                entry_for_reasoning.with(|entry| entry.message.reasoning.as_ref().map(|r| r.tokens)).map(|token_count| {
                     view! {
-                        <details class="chat-card-reasoning">
+                        <details
+                            class="chat-card-reasoning"
+                            on:toggle=move |ev: leptos::ev::Event| {
+                                if let Some(target) = ev.target()
+                                    && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
+                                {
+                                    reasoning_open.set(el.open());
+                                }
+                            }
+                        >
                             <summary>
                                 <span class="reasoning-icon">"💭"</span>
                                 " Thinking"
@@ -156,7 +166,17 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
                                     <span class="reasoning-tokens">{format!(" ({} tokens)", format_compact(t))}</span>
                                 })}
                             </summary>
-                            <pre class="reasoning-content">{text}</pre>
+                            <Show when=move || reasoning_open.get()>
+                                {move || {
+                                    entry_for_reasoning_slot.with_value(|entry_for_reasoning_body| entry_for_reasoning_body.with(|entry| {
+                                        entry.message.reasoning.as_ref().map(|reasoning| {
+                                            view! {
+                                                <pre class="reasoning-content">{reasoning.text.clone()}</pre>
+                                            }
+                                        })
+                                    }))
+                                }}
+                            </Show>
                         </details>
                     }
                 })
@@ -205,11 +225,7 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
                     return None;
                 }
                 Some(view! {
-                    <div class="chat-card-tools">
-                        {tools.into_iter().map(|tr| {
-                            view! { <ToolCardView entry=tr /> }
-                        }).collect::<Vec<_>>()}
-                    </div>
+                    <ToolCardListView entries=tools />
                 })
             }}
 

@@ -2088,7 +2088,6 @@ kbd {
     display: flex;
     flex-direction: column;
     gap: 0;
-    scroll-behavior: smooth;
 }
 
 /* ===== Scroll-to-Bottom Button ===== */
@@ -2519,6 +2518,41 @@ kbd {
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     overflow: hidden;
+}
+
+.tool-list-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 32px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-muted);
+    font-size: 0.78rem;
+}
+
+.tool-list-hidden-count {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-list-expand {
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: var(--accent-primary);
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+
+.tool-list-expand:hover {
+    color: var(--text-primary);
 }
 
 .tool-card-header {

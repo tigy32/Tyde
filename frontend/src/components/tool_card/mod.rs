@@ -12,10 +12,13 @@
 //! `ToolExecutionResult::Error` routes through `error_result::render`, no
 //! matter the request kind.
 
+use std::sync::Arc;
+
 use leptos::prelude::*;
 use protocol::{ToolExecutionResult, ToolRequestType};
+use wasm_bindgen::JsCast;
 
-use crate::state::{AppState, ToolOutputMode, ToolRequestEntry};
+use crate::state::{AppState, StreamingToolRequest, ToolOutputMode, ToolRequestEntry};
 
 mod error_result;
 mod get_type_docs;
@@ -25,8 +28,183 @@ mod read_files;
 mod run_command;
 mod search_types;
 
+const TOOL_LIST_INLINE_LIMIT: usize = 80;
+const TOOL_LIST_HEAD_COUNT: usize = 8;
+const TOOL_LIST_TAIL_COUNT: usize = 32;
+
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod test_utils;
+
+#[component]
+pub fn ToolCardListView(entries: Vec<ToolRequestEntry>) -> impl IntoView {
+    let entries = Arc::new(entries);
+    let expanded = RwSignal::new(false);
+    let total = entries.len();
+
+    view! {
+        <div class="chat-card-tools">
+            <For
+                each={
+                    let entries = entries.clone();
+                    move || {
+                        let expanded = expanded.get();
+                        visible_tool_indexes(entries.len(), expanded, |idx| {
+                            is_operational_tool(&entries[idx])
+                        })
+                        .into_iter()
+                        .map(|idx| entries[idx].clone())
+                        .collect::<Vec<_>>()
+                    }
+                }
+                key=|entry| entry.request.tool_call_id.clone()
+                let:entry
+            >
+                <ToolCardView entry=entry />
+            </For>
+            <ToolListSummary
+                total=move || total
+                hidden_count={
+                    let entries = entries.clone();
+                    move || {
+                        let visible = visible_tool_indexes(entries.len(), expanded.get(), |idx| {
+                            is_operational_tool(&entries[idx])
+                        })
+                        .len();
+                        entries.len().saturating_sub(visible)
+                    }
+                }
+                expanded=expanded
+            />
+        </div>
+    }
+}
+
+#[component]
+pub fn StreamingToolCardListView(entries: ArcRwSignal<Vec<StreamingToolRequest>>) -> impl IntoView {
+    let expanded = RwSignal::new(false);
+
+    view! {
+        <div class="chat-card-tools">
+            <For
+                each={
+                    let entries = entries.clone();
+                    move || {
+                        let expanded = expanded.get();
+                        entries.with(|tools| {
+                            visible_tool_indexes(tools.len(), expanded, |idx| {
+                                tools[idx].entry.with_untracked(is_operational_tool)
+                            })
+                            .into_iter()
+                            .map(|idx| tools[idx].clone())
+                            .collect::<Vec<_>>()
+                        })
+                    }
+                }
+                key=|tool| tool.tool_call_id.clone()
+                let:tool
+            >
+                <StreamingToolCardView entry=tool.entry />
+            </For>
+            <ToolListSummary
+                total={
+                    let entries = entries.clone();
+                    move || entries.with(|tools| tools.len())
+                }
+                hidden_count={
+                    let entries = entries.clone();
+                    move || {
+                        entries.with(|tools| {
+                            let visible = visible_tool_indexes(tools.len(), expanded.get(), |idx| {
+                                tools[idx].entry.with_untracked(is_operational_tool)
+                            })
+                            .len();
+                            tools.len().saturating_sub(visible)
+                        })
+                    }
+                }
+                expanded=expanded
+            />
+        </div>
+    }
+}
+
+#[component]
+fn StreamingToolCardView(entry: ArcRwSignal<ToolRequestEntry>) -> impl IntoView {
+    view! {
+        {move || view! { <ToolCardView entry=entry.get() /> }}
+    }
+}
+
+#[component]
+fn ToolListSummary(
+    total: impl Fn() -> usize + Send + Sync + 'static,
+    hidden_count: impl Fn() -> usize + Send + Sync + 'static,
+    expanded: RwSignal<bool>,
+) -> impl IntoView {
+    view! {
+        {move || {
+            let total = total();
+            if total <= TOOL_LIST_INLINE_LIMIT {
+                None
+            } else {
+                let is_expanded = expanded.get();
+                let label = if is_expanded {
+                    format!("{total} tools")
+                } else {
+                    format!("{} tools hidden", hidden_count())
+                };
+                let button_label = if is_expanded { "Show fewer" } else { "Show all" };
+                Some(view! {
+                    <div class="tool-list-summary">
+                        <span class="tool-list-hidden-count">{label}</span>
+                        <button
+                            type="button"
+                            class="tool-list-expand"
+                            on:click=move |_| expanded.update(|value| *value = !*value)
+                        >
+                            {button_label}
+                        </button>
+                    </div>
+                })
+            }
+        }}
+    }
+}
+
+fn visible_tool_indexes<F>(len: usize, expanded: bool, mut is_important: F) -> Vec<usize>
+where
+    F: FnMut(usize) -> bool,
+{
+    if expanded || len <= TOOL_LIST_INLINE_LIMIT {
+        return (0..len).collect();
+    }
+
+    let mut visible = vec![false; len];
+    for keep in visible.iter_mut().take(TOOL_LIST_HEAD_COUNT) {
+        *keep = true;
+    }
+    for keep in visible
+        .iter_mut()
+        .skip(len.saturating_sub(TOOL_LIST_TAIL_COUNT))
+    {
+        *keep = true;
+    }
+    for (idx, keep) in visible.iter_mut().enumerate() {
+        if is_important(idx) {
+            *keep = true;
+        }
+    }
+
+    visible
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, keep)| keep.then_some(idx))
+        .collect()
+}
+
+fn is_operational_tool(entry: &ToolRequestEntry) -> bool {
+    entry.result.as_ref().is_none_or(|result| !result.success)
+}
 
 #[component]
 pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
@@ -66,17 +244,27 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
     // toggle and every card re-lays out without remounting.
     let body_tool_type = tool_type.clone();
     let body_result = result.as_ref().map(|r| r.tool_result.clone());
-    let body = move || {
-        let mode = tool_output_mode.get();
-        render_body(&body_tool_type, body_result.as_ref(), mode)
-    };
+    let body_tool_type_slot = StoredValue::new_local(body_tool_type);
+    let body_result_slot = StoredValue::new_local(body_result);
+    let details_open = RwSignal::new(!has_result || !result_success);
+    let default_open_for_body =
+        move || !has_result || !result_success || tool_output_mode.get() != ToolOutputMode::Summary;
+    let default_open_for_prop =
+        move || !has_result || !result_success || tool_output_mode.get() != ToolOutputMode::Summary;
+    let render_body_when = move || default_open_for_body() || details_open.get();
 
     view! {
-        <details class="tool-card" open=move || {
-            // Failed tools always open. In-flight always open. Otherwise:
-            // open in Compact/Full, collapsed in Summary.
-            !has_result || !result_success || tool_output_mode.get() != ToolOutputMode::Summary
-        }>
+        <details
+            class="tool-card"
+            prop:open=default_open_for_prop
+            on:toggle=move |ev: leptos::ev::Event| {
+                if let Some(target) = ev.target()
+                    && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
+                {
+                    details_open.set(el.open());
+                }
+            }
+        >
             <summary class="tool-card-header">
                 <span class="tool-card-icon">{icon}</span>
                 <span class="tool-card-name">{tool_name}</span>
@@ -89,9 +277,18 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
                 <span class=status_class>{status_label}</span>
                 <span class="tool-chevron">"\u{25b6}"</span>
             </summary>
-            <div class="tool-card-body">
-                {body}
-            </div>
+            <Show when=render_body_when>
+                <div class="tool-card-body">
+                    {move || {
+                        let mode = tool_output_mode.get();
+                        body_tool_type_slot.with_value(|body_tool_type| {
+                            body_result_slot.with_value(|body_result| {
+                                render_body(body_tool_type, body_result.as_ref(), mode)
+                            })
+                        })
+                    }}
+                </div>
+            </Show>
         </details>
     }
 }

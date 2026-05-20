@@ -24,9 +24,9 @@ use protocol::{
 use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
-    OpenFile, ProjectInfo, ReviewActionTarget, SessionInfo, StreamingState, TabContent,
-    TerminalInfo, ToolRequestEntry, TransientEvent, reduce_diff_response, root_display_name,
-    sort_project_infos,
+    OpenFile, ProjectInfo, ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest,
+    TabContent, TerminalInfo, ToolRequestEntry, TransientEvent, reduce_diff_response,
+    root_display_name, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -2279,7 +2279,16 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             // and `model` strings we don't need here).
             let tool_requests = state
                 .streaming_text
-                .with_untracked(|map| map.get(&agent_id).map(|s| s.tool_requests.get_untracked()))
+                .with_untracked(|map| {
+                    map.get(&agent_id).map(|s| {
+                        s.tool_requests.with_untracked(|tools| {
+                            tools
+                                .iter()
+                                .map(|tool| tool.entry.get_untracked())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                })
                 .unwrap_or_default();
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
@@ -2324,9 +2333,12 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
             if let Some(streaming) = streaming {
-                streaming
-                    .tool_requests
-                    .update(|tools| tools.push(tool_entry));
+                streaming.tool_requests.update(|tools| {
+                    tools.push(StreamingToolRequest {
+                        tool_call_id: tool_call_id.clone(),
+                        entry: leptos::prelude::ArcRwSignal::new(tool_entry),
+                    });
+                });
                 return;
             }
             if let Some(row) = state.last_chat_row_untracked(&agent_id) {
@@ -2359,17 +2371,16 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
             if let Some(streaming) = streaming {
-                let mut matched = false;
-                streaming.tool_requests.update(|tools| {
-                    if let Some(tool) = tools
-                        .iter_mut()
-                        .find(|tool| tool.request.tool_call_id == call_id)
-                    {
-                        tool.result = Some(data.clone());
-                        matched = true;
-                    }
+                let tool_entry = streaming.tool_requests.with_untracked(|tools| {
+                    tools
+                        .iter()
+                        .find(|tool| tool.tool_call_id == call_id)
+                        .map(|tool| tool.entry.clone())
                 });
-                if matched {
+                if let Some(tool_entry) = tool_entry {
+                    tool_entry.update(|tool| {
+                        tool.result = Some(data.clone());
+                    });
                     return;
                 }
             }

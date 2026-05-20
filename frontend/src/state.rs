@@ -335,6 +335,12 @@ pub struct ToolRequestEntry {
     pub result: Option<ToolExecutionCompletedData>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StreamingToolRequest {
+    pub tool_call_id: String,
+    pub entry: ArcRwSignal<ToolRequestEntry>,
+}
+
 // ── Chat transcript rows ────────────────────────────────────────────────
 
 thread_local! {
@@ -454,7 +460,7 @@ pub struct StreamingState {
     pub model: Option<String>,
     pub text: ArcRwSignal<String>,
     pub reasoning: ArcRwSignal<String>,
-    pub tool_requests: ArcRwSignal<Vec<ToolRequestEntry>>,
+    pub tool_requests: ArcRwSignal<Vec<StreamingToolRequest>>,
 }
 
 #[derive(Clone, Debug)]
