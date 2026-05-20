@@ -5,7 +5,8 @@ use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
     CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, SkillRefreshPayload, Steering,
+    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobilePairingCancelPayload,
+    MobilePairingOfferId, MobilePairingStartPayload, SkillRefreshPayload, Steering,
     SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
@@ -108,6 +109,37 @@ pub async fn team_compact(
             summary_prompt: None,
             max_summary_bytes: None,
         },
+    )
+    .await
+}
+
+/// Ask the server to mint a fresh mobile pairing offer. The server
+/// replies on the host stream with `MobilePairingOffer` (carrying the
+/// `qr_uri`) and an updated `MobileAccessState` snapshot whose
+/// pairing phase transitions to `Active`.
+pub async fn mobile_pairing_start(host_id: &str, host_stream: StreamPath) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::MobilePairingStart,
+        &MobilePairingStartPayload {},
+    )
+    .await
+}
+
+/// Cancel an in-flight pairing offer. The server confirms by pushing
+/// a fresh `MobileAccessState` with `pairing.kind == Cancelled` and
+/// drops the active offer so the QR stops being honoured.
+pub async fn mobile_pairing_cancel(
+    host_id: &str,
+    host_stream: StreamPath,
+    offer_id: MobilePairingOfferId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::MobilePairingCancel,
+        &MobilePairingCancelPayload { offer_id },
     )
     .await
 }

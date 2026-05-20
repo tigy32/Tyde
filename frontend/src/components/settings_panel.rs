@@ -8,20 +8,159 @@ use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
-    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, CustomAgent,
-    CustomAgentId, DiffContextMode, FrameKind, HostSettingValue, McpServerConfig, McpServerId,
-    McpTransportConfig, ProjectId, RunBackendSetupPayload, SetSettingPayload, Skill, SkillId,
-    Steering, SteeringId, SteeringScope, ToolPolicy,
+    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BrokerUrl, CustomAgent,
+    CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode, FrameKind, HostSettingValue,
+    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
+    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
+    ProjectId, RunBackendSetupPayload, SetSettingPayload, Skill, SkillId, Steering, SteeringId,
+    SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
 
 use crate::send::{
-    custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert, skill_refresh,
-    steering_delete, steering_upsert,
+    custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert,
+    mobile_pairing_cancel, mobile_pairing_start, skill_refresh, steering_delete, steering_upsert,
 };
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
+
+/// Frontend-side mirror of `mqtt-transport::validate_broker_url`'s
+/// scheme acceptance rules. We intentionally check ONLY the scheme
+/// here (a coarse, low-risk filter) — the server is still the
+/// authoritative validator and will reject finer-grained problems
+/// like fragments or embedded credentials. Keeping this filter narrow
+/// means the user gets immediate visible feedback on the most common
+/// mistake ("mqtt://" vs "mqtts://") without the UI duplicating the
+/// full URL grammar the server checks.
+fn validate_broker_url_input(raw: &str) -> Result<(), &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("mqtts://") || lower.starts_with("wss://") {
+        let after_scheme = trimmed
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        if after_scheme.is_empty() {
+            return Err("Broker URL is missing a host after the scheme.");
+        }
+        if after_scheme.contains('@') {
+            return Err(
+                "Broker credentials must be supplied out-of-band, not embedded in the URL.",
+            );
+        }
+        if after_scheme.contains('#') {
+            return Err("Broker URL fragments (#…) are not supported.");
+        }
+        Ok(())
+    } else if lower.starts_with("mqtt://")
+        || lower.starts_with("ws://")
+        || lower.starts_with("tcp://")
+    {
+        Err("Insecure scheme — use mqtts:// or wss:// instead.")
+    } else if lower.contains("://") {
+        Err("Unsupported scheme — only mqtts:// and wss:// are accepted.")
+    } else {
+        Err("Broker URL must start with mqtts:// or wss://.")
+    }
+}
+
+/// Render the pairing `qr_uri` as an inline SVG QR code. Returns an
+/// SVG string that callers splat into the DOM via `inner_html`.
+/// Uses `qrcodegen` (pure Rust, no transitive deps) with Medium ECC —
+/// the QR fits comfortably on the user's monitor and the pairing
+/// session has a short TTL so degraded scan ergonomics matter less
+/// than keeping the QR small. Returns `None` if the input exceeds
+/// QR-version-40 capacity (~2953 bytes), which would indicate a
+/// malformed `qr_uri` from the server rather than a legitimate
+/// pairing payload.
+fn render_pairing_qr_svg(qr_uri: &str) -> Option<String> {
+    let qr = qrcodegen::QrCode::encode_text(qr_uri, qrcodegen::QrCodeEcc::Medium).ok()?;
+    // `qrcodegen` ships the module bitmap but no SVG writer (their
+    // demo crate provides one). Implement a tiny SVG emitter inline.
+    // border=2 keeps the quiet zone the spec requires. Fill/stroke
+    // are CSS-overridable via `.settings-mobile-pairing-qr rect`.
+    let border: i32 = 2;
+    let size = qr.size();
+    let dim = size + border * 2;
+    use std::fmt::Write;
+    let mut out = String::with_capacity((size * size) as usize * 32);
+    let _ = write!(
+        out,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {dim} {dim}" stroke="none" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#ffffff"/>"##,
+    );
+    for y in 0..size {
+        for x in 0..size {
+            if qr.get_module(x, y) {
+                let _ = write!(
+                    out,
+                    r##"<rect x="{}" y="{}" width="1" height="1" fill="#000000"/>"##,
+                    x + border,
+                    y + border,
+                );
+            }
+        }
+    }
+    out.push_str("</svg>");
+    Some(out)
+}
+
+/// Compute how many seconds remain until `expires_at_ms` (millis since
+/// epoch). Returns `None` if the host clock can't be read. Saturating
+/// arithmetic so a stale offer reports 0 instead of overflowing.
+fn expires_in_seconds(expires_at_ms: u64) -> Option<u64> {
+    let now = js_sys::Date::now();
+    if !now.is_finite() {
+        return None;
+    }
+    let now_ms = now.max(0.0) as u64;
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms);
+    Some(remaining_ms / 1000)
+}
+
+/// Short, user-facing label for the broker connection state.
+/// Doesn't include the broker URL itself — that's already visible
+/// below in the Broker URL field. Errors include the server message
+/// verbatim because it's the most actionable info we have.
+fn broker_status_line(status: &MobileBrokerStatus) -> String {
+    match status {
+        MobileBrokerStatus::Disabled => "Mobile connections disabled".to_owned(),
+        MobileBrokerStatus::Connecting { .. } => "Connecting to broker…".to_owned(),
+        MobileBrokerStatus::Online { .. } => "Broker online".to_owned(),
+        MobileBrokerStatus::Error { message, .. } => format!("Broker error: {message}"),
+    }
+}
+
+/// Slug used by CSS to pick a per-state color for the broker pill.
+fn broker_status_slug(status: &MobileBrokerStatus) -> &'static str {
+    match status {
+        MobileBrokerStatus::Disabled => "disabled",
+        MobileBrokerStatus::Connecting { .. } => "connecting",
+        MobileBrokerStatus::Online { .. } => "online",
+        MobileBrokerStatus::Error { .. } => "error",
+    }
+}
+
+/// Status line for the pairing lifecycle. Returns `None` for `Idle`
+/// (no useful message to show — the absence of a status line is
+/// itself the signal that pairing is idle).
+fn pairing_status_line(phase: &MobilePairingState) -> Option<String> {
+    match phase {
+        MobilePairingState::Idle => None,
+        MobilePairingState::Active { .. } => Some("Pairing in progress — scan the QR.".to_owned()),
+        MobilePairingState::Consumed { .. } => {
+            Some("Device paired. Open Tyde on your mobile to confirm.".to_owned())
+        }
+        MobilePairingState::Expired { .. } => {
+            Some("Pairing expired. Start a new pairing session to try again.".to_owned())
+        }
+        MobilePairingState::Cancelled { .. } => Some("Pairing cancelled.".to_owned()),
+        MobilePairingState::Failed { message, .. } => Some(format!("Pairing failed: {message}")),
+    }
+}
 
 const STORAGE_THEME: &str = "tyde-theme";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
@@ -159,6 +298,76 @@ mod diff_pref_tests {
     fn tool_output_mode_unknown_is_none() {
         assert_eq!(tool_output_mode_from_str(""), None);
         assert_eq!(tool_output_mode_from_str("bogus"), None);
+    }
+
+    // ---- broker URL validator ----
+    //
+    // These tests mirror the rules the server-side `validate_broker_url`
+    // enforces in `mqtt-transport`. The frontend's filter is intentionally
+    // coarser (scheme + common shape) — the server is the authoritative
+    // validator. If the server tightens its rules and the frontend
+    // doesn't, a typed URL will still hit a server-side error and the
+    // existing inline-error path will surface it.
+
+    #[test]
+    fn broker_url_validator_accepts_empty() {
+        // Empty input = "use host default", not an error.
+        assert!(validate_broker_url_input("").is_ok());
+        assert!(validate_broker_url_input("   ").is_ok());
+    }
+
+    #[test]
+    fn broker_url_validator_accepts_mqtts_and_wss() {
+        assert!(validate_broker_url_input("mqtts://broker.example:8883").is_ok());
+        assert!(validate_broker_url_input("wss://broker.example/relay").is_ok());
+        // Case-insensitive on scheme — URLs are case-insensitive there.
+        assert!(validate_broker_url_input("MQTTS://broker.example:8883").is_ok());
+    }
+
+    #[test]
+    fn broker_url_validator_rejects_insecure_schemes() {
+        for bad in [
+            "mqtt://broker.example",
+            "ws://broker.example",
+            "tcp://x.test",
+        ] {
+            let err = validate_broker_url_input(bad)
+                .expect_err(&format!("expected {bad:?} to be rejected"));
+            assert!(
+                err.contains("Insecure") || err.contains("insecure"),
+                "error for {bad:?} should mention insecure scheme: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_url_validator_rejects_unknown_or_missing_scheme() {
+        // Wrong scheme.
+        assert!(validate_broker_url_input("http://broker.example").is_err());
+        // No scheme separator at all.
+        assert!(validate_broker_url_input("broker.example:8883").is_err());
+        // Empty after scheme.
+        assert!(validate_broker_url_input("mqtts://").is_err());
+    }
+
+    #[test]
+    fn broker_url_validator_rejects_embedded_credentials() {
+        let err = validate_broker_url_input("mqtts://user:pass@broker.example")
+            .expect_err("URL with @ must be rejected");
+        assert!(
+            err.contains("credentials"),
+            "error must mention credentials: {err}"
+        );
+    }
+
+    #[test]
+    fn broker_url_validator_rejects_fragments() {
+        let err = validate_broker_url_input("mqtts://broker.example#frag")
+            .expect_err("URL with fragment must be rejected");
+        assert!(
+            err.contains("fragment"),
+            "error must mention fragments: {err}"
+        );
     }
 }
 
@@ -325,6 +534,7 @@ enum SettingsTab {
     McpServers,
     Steering,
     Skills,
+    Mobile,
     Debug,
 }
 
@@ -339,6 +549,7 @@ impl SettingsTab {
             Self::McpServers => "MCP Servers",
             Self::Steering => "Steering",
             Self::Skills => "Skills",
+            Self::Mobile => "Mobile",
             Self::Debug => "Debug",
         }
     }
@@ -440,6 +651,19 @@ impl SettingsTab {
                 "New steering",
             ],
             Self::Skills => &["Skills", "Refresh", "SKILL.md", "Filesystem skills"],
+            Self::Mobile => &[
+                "Mobile",
+                "Mobile connections",
+                "Enable mobile connections",
+                "Broker URL",
+                "Public MQTT broker",
+                "MQTT",
+                "broker.emqx.io",
+                "Encryption",
+                "Metadata",
+                "QR",
+                "Pairing",
+            ],
             Self::Debug => &[
                 "Debug",
                 "Tyde Debug MCP",
@@ -462,7 +686,7 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 9] = [
+const ALL_TABS: [SettingsTab; 10] = [
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::General,
@@ -471,6 +695,7 @@ const ALL_TABS: [SettingsTab; 9] = [
     SettingsTab::McpServers,
     SettingsTab::Steering,
     SettingsTab::Skills,
+    SettingsTab::Mobile,
     SettingsTab::Debug,
 ];
 
@@ -551,6 +776,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                 SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
                                 SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
                                 SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
+                                SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
                                 SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
                             }}
                         </div>
@@ -1445,6 +1671,478 @@ fn DebugTab() -> impl IntoView {
                     <span class="settings-toggle-slider"></span>
                 </label>
             </div>
+        </div>
+    }
+}
+
+/// Mobile pairing / broker settings. Two host-scoped settings live here:
+///   * `enable_mobile_connections` — master kill switch.
+///   * `mobile_broker_url` — optional override for the public MQTT
+///     broker the host uses for the relay path. The default is a free
+///     public broker (`mqtts://broker.emqx.io:8883`); the user can
+///     point at their own broker by overriding here. Empty input
+///     resets to "use server default" (None on the wire).
+///
+/// The Tyde end-to-end encryption layer (paired session keys) sits on
+/// top of MQTT and is independent of the broker chosen. The warning
+/// block makes that contract explicit and reminds the user that
+/// metadata (their IP, message timing, topic names) is still visible
+/// to whoever runs the broker.
+///
+/// Frontend never claims to operate the broker — copy uses "Public
+/// MQTT broker" / "Broker URL" wording. "Tyde broker" is forbidden:
+/// Tyde is the client, not the operator of `broker.emqx.io`.
+#[component]
+fn MobileTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_enabled_checked = state.clone();
+    let state_for_enabled_disabled = state.clone();
+    let state_for_broker_value = state.clone();
+    let state_for_broker_disabled = state.clone();
+    let state_for_broker_commit = state.clone();
+    let state_for_broker_keydown = state.clone();
+    let state_for_broker_reset = state.clone();
+    let state_for_pairing_lookup = state.clone();
+    let state_for_offer_lookup = state.clone();
+    let state_for_start_pending = state.clone();
+    let state_for_start_click = state.clone();
+    let state_for_cancel_click = state.clone();
+
+    // Inline error surfaced when the user types something the server
+    // would reject. Cleared when the user types again, when the field
+    // is reset via "Use default", or when a valid URL commits.
+    let broker_error: RwSignal<Option<String>> = RwSignal::new(None);
+    // Inline error surfaced when MobilePairingStart fails locally
+    // (e.g. no host stream). Server-side failures land via
+    // `MobileAccessState::Failed` instead and render via
+    // `pairing_status_line`.
+    let pairing_error: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let enabled_checked = move || {
+        state_for_enabled_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.enable_mobile_connections)
+    };
+    let enabled_disabled = move || {
+        state_for_enabled_disabled
+            .selected_host_settings()
+            .is_none()
+    };
+    let on_enabled_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            send_host_setting(
+                &state,
+                HostSettingValue::EnableMobileConnections {
+                    enabled: input.checked(),
+                },
+            );
+        }
+    };
+
+    // The text field always reflects the current override. Empty
+    // input commits `None`, which the server resolves to its built-in
+    // default.
+    let broker_value = move || {
+        state_for_broker_value
+            .selected_host_settings()
+            .and_then(|settings| settings.mobile_broker_url)
+            .map(|url| url.as_str().to_owned())
+            .unwrap_or_default()
+    };
+    let broker_disabled = {
+        let state = state_for_broker_disabled.clone();
+        move || state.selected_host_settings().is_none()
+    };
+    let broker_disabled_for_input = broker_disabled.clone();
+    let broker_disabled_for_button = broker_disabled.clone();
+
+    // Validate + send. Used by both `change` (blur) and Enter so the
+    // two code paths can't drift. Returns the input element so the
+    // caller can still touch the DOM if needed (none currently do).
+    let commit_broker = move |state: &AppState, raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            broker_error.set(None);
+            send_host_setting(
+                state,
+                HostSettingValue::MobileBrokerUrl { broker_url: None },
+            );
+            return;
+        }
+        if let Err(message) = validate_broker_url_input(trimmed) {
+            broker_error.set(Some(message.to_owned()));
+            return;
+        }
+        match BrokerUrl::new(trimmed.to_owned()) {
+            Ok(url) => {
+                broker_error.set(None);
+                send_host_setting(
+                    state,
+                    HostSettingValue::MobileBrokerUrl {
+                        broker_url: Some(url),
+                    },
+                );
+            }
+            Err(error) => {
+                log::error!("invalid broker URL {trimmed:?}: {error}");
+                broker_error.set(Some(error.to_string()));
+            }
+        }
+    };
+
+    // `commit_broker` only captures `Copy` handles (RwSignal), so we
+    // can hand it to both event closures by value without an Rc.
+    let on_broker_commit = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        let raw = input.value();
+        commit_broker(&state_for_broker_commit, &raw);
+    };
+    let on_broker_keydown = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() != "Enter" {
+            return;
+        }
+        ev.prevent_default();
+        let Some(target) = ev.target() else {
+            return;
+        };
+        let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() else {
+            return;
+        };
+        let raw = input.value();
+        commit_broker(&state_for_broker_keydown, &raw);
+    };
+    // Typing clears any prior error so the user isn't yelled at while
+    // they're still editing.
+    let on_broker_input = move |_: web_sys::Event| {
+        broker_error.set(None);
+    };
+    let on_broker_reset = move |_: web_sys::MouseEvent| {
+        broker_error.set(None);
+        send_host_setting(
+            &state_for_broker_reset,
+            HostSettingValue::MobileBrokerUrl { broker_url: None },
+        );
+    };
+
+    // ---- Pairing section reactive lookups ----
+    // Each closure looks up the slice of state for the *currently
+    // selected* host. The host can change without remounting the tab
+    // (e.g. via the Hosts surface), so each lookup re-reads
+    // `selected_host_id` on every tracked invocation.
+
+    let mobile_state_for_host = move || -> Option<MobileAccessStatePayload> {
+        let host_id = state_for_pairing_lookup.selected_host_id.get()?;
+        state_for_pairing_lookup
+            .mobile_access_state
+            .with(|m| m.get(&host_id).cloned())
+    };
+    let mobile_offer_for_host = move || -> Option<MobilePairingOfferPayload> {
+        let host_id = state_for_offer_lookup.selected_host_id.get()?;
+        state_for_offer_lookup
+            .mobile_pairing_offer
+            .with(|m| m.get(&host_id).cloned())
+    };
+    let mobile_start_pending = move || -> bool {
+        let host_id = state_for_start_pending.selected_host_id.get();
+        let Some(host_id) = host_id else {
+            return false;
+        };
+        state_for_start_pending
+            .mobile_pairing_start_pending
+            .with(|set| set.contains(&host_id))
+    };
+    let paired_devices = move || -> Vec<protocol::MobileDeviceSummary> {
+        mobile_state_for_host()
+            .map(|state| state.paired_devices)
+            .unwrap_or_default()
+    };
+
+    let on_start_pairing_click = move |_: web_sys::MouseEvent| {
+        pairing_error.set(None);
+        let Some((host_id, host_stream)) = state_for_start_click.selected_host_stream_untracked()
+        else {
+            pairing_error.set(Some("No host selected.".to_owned()));
+            return;
+        };
+        // Optimistically gate the button so a double-click doesn't fire
+        // two Start frames. Cleared when MobileAccessState/Offer lands
+        // or on a local send error.
+        let host_id_for_gate = host_id.clone();
+        state_for_start_click
+            .mobile_pairing_start_pending
+            .update(|set| {
+                set.insert(host_id_for_gate);
+            });
+        let state_for_async = state_for_start_click.clone();
+        spawn_local(async move {
+            if let Err(err) = mobile_pairing_start(&host_id, host_stream).await {
+                log::error!("mobile_pairing_start send failed: {err}");
+                let host_id_for_clear = host_id.clone();
+                state_for_async.mobile_pairing_start_pending.update(|set| {
+                    set.remove(&host_id_for_clear);
+                });
+                pairing_error.set(Some(format!("Could not start pairing: {err}")));
+            }
+        });
+    };
+
+    let on_cancel_pairing_click = move |_: web_sys::MouseEvent| {
+        let Some(offer) = mobile_offer_for_host() else {
+            // No active offer — nothing to cancel. Could happen if the
+            // server already pushed an Expired/Cancelled state between
+            // render and click.
+            return;
+        };
+        let Some((host_id, host_stream)) = state_for_cancel_click.selected_host_stream_untracked()
+        else {
+            pairing_error.set(Some("No host selected.".to_owned()));
+            return;
+        };
+        let offer_id: MobilePairingOfferId = offer.offer_id.clone();
+        spawn_local(async move {
+            if let Err(err) = mobile_pairing_cancel(&host_id, host_stream, offer_id).await {
+                log::error!("mobile_pairing_cancel send failed: {err}");
+                pairing_error.set(Some(format!("Could not cancel pairing: {err}")));
+            }
+        });
+    };
+
+    // Hide-or-disable rules:
+    // * Start button is *visible* when the host has settings loaded
+    //   AND mobile is enabled AND broker is Online AND we're not
+    //   already mid-pairing (Active offer or a Start in flight).
+    // * Cancel button is visible when we have an Active offer.
+    let pairing_phase = move || -> Option<MobilePairingState> {
+        mobile_state_for_host().map(|state| state.pairing)
+    };
+    let broker_phase = move || -> Option<MobileBrokerStatus> {
+        mobile_state_for_host().map(|state| state.broker_status)
+    };
+    let state_for_can_start_settings = state.clone();
+    let can_start_pairing = move || -> bool {
+        let Some(host_id) = state_for_can_start_settings.selected_host_id.get() else {
+            return false;
+        };
+        let enabled = state_for_can_start_settings
+            .host_settings_by_host
+            .with(|m| {
+                m.get(&host_id)
+                    .map(|settings| settings.enable_mobile_connections)
+                    .unwrap_or(false)
+            });
+        if !enabled {
+            return false;
+        }
+        let online = matches!(broker_phase(), Some(MobileBrokerStatus::Online { .. }));
+        let in_flight = mobile_start_pending()
+            || matches!(pairing_phase(), Some(MobilePairingState::Active { .. }));
+        online && !in_flight
+    };
+
+    view! {
+        <h2 class="settings-panel-title">"Mobile"</h2>
+
+        <p class="settings-description settings-panel-intro">
+            "Pair the Tyde mobile app with this host. The pairing QR carries the broker URL the mobile app should use, so the mobile app does not need any preconfigured Tyde infrastructure."
+        </p>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Enable mobile connections"</label>
+                    <p class="settings-description">
+                        "When enabled, this host can accept pairing requests from the Tyde mobile app and route mobile traffic over the broker below."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=enabled_checked
+                        disabled=enabled_disabled
+                        on:change=on_enabled_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="settings-field settings-mobile-pairing">
+            <label class="settings-label">"Pair a mobile device"</label>
+            <p class="settings-description">
+                "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR carries the broker URL and a one-shot pre-shared key; the pairing session expires after a couple of minutes."
+            </p>
+            // Broker status pill — surfaces broker_status from the
+            // MobileAccessState snapshot. Keeps the user informed when
+            // the broker is offline / errored so a missing Start button
+            // is self-explanatory.
+            {move || broker_phase().map(|status| view! {
+                <p class=format!("settings-mobile-pairing-broker settings-mobile-pairing-broker-{}", broker_status_slug(&status))>
+                    {broker_status_line(&status)}
+                </p>
+            })}
+            {move || pairing_phase().and_then(|phase| pairing_status_line(&phase)).map(|line| view! {
+                <p class="settings-mobile-pairing-status" role="status">{line}</p>
+            })}
+            {move || mobile_offer_for_host().map(|offer| {
+                let qr_uri = offer.qr_uri.0.clone();
+                let qr_svg = render_pairing_qr_svg(&qr_uri).unwrap_or_else(|| {
+                    "<p>QR rendering failed; use the URI below.</p>".to_owned()
+                });
+                let expires_in = expires_in_seconds(offer.expires_at_ms);
+                let expires_label = match expires_in {
+                    None => "expiry unknown".to_owned(),
+                    Some(0) => "expiring now".to_owned(),
+                    Some(seconds) => format!("expires in {seconds}s"),
+                };
+                let qr_uri_for_text = qr_uri.clone();
+                view! {
+                    <div class="settings-mobile-pairing-active" role="region" aria-label="Active pairing QR">
+                        <div
+                            class="settings-mobile-pairing-qr"
+                            // SAFETY: `qr_svg` is produced by `qrcodegen`
+                            // which emits a fixed structural SVG with no
+                            // attacker-controlled attribute content; the
+                            // QR modules are rendered as <rect> elements
+                            // with the QR module bitmap, not user input.
+                            inner_html=qr_svg
+                        />
+                        <div class="settings-mobile-pairing-active-meta">
+                            <p class="settings-description settings-mobile-pairing-expires">
+                                {expires_label}
+                            </p>
+                            <details class="settings-mobile-pairing-fallback">
+                                <summary>"Show pairing URI"</summary>
+                                <p class="settings-description">
+                                    "If your mobile device can't scan the QR, paste this URI into the Tyde mobile app's pairing screen instead. Treat it like a one-shot password — anyone with the URI before it expires can pair as a device on this host."
+                                </p>
+                                <textarea
+                                    class="settings-input settings-mobile-pairing-uri"
+                                    readonly=true
+                                    spellcheck="false"
+                                    autocapitalize="none"
+                                    autocomplete="off"
+                                    aria-label="Pairing URI"
+                                    rows="3"
+                                    prop:value=qr_uri_for_text
+                                />
+                            </details>
+                            <button
+                                type="button"
+                                class="filter-toggle settings-mobile-pairing-cancel"
+                                on:click=on_cancel_pairing_click.clone()
+                            >
+                                "Cancel pairing"
+                            </button>
+                        </div>
+                    </div>
+                }
+            })}
+            {move || {
+                // The Start button stays in the DOM at all times for
+                // discoverability — disabling instead of hiding keeps
+                // the affordance visible while the user fixes the
+                // precondition (enable / fix broker / wait for an
+                // active offer to settle).
+                let can = can_start_pairing();
+                let title = if can {
+                    "Start a fresh pairing session"
+                } else if mobile_start_pending() {
+                    "Starting pairing…"
+                } else if matches!(pairing_phase(), Some(MobilePairingState::Active { .. })) {
+                    "A pairing session is already active — cancel it first"
+                } else if !matches!(broker_phase(), Some(MobileBrokerStatus::Online { .. })) {
+                    "Broker is not online yet"
+                } else {
+                    "Enable mobile connections to pair a device"
+                };
+                view! {
+                    <button
+                        type="button"
+                        class="filter-toggle settings-mobile-pairing-start"
+                        disabled=!can
+                        title=title
+                        on:click=on_start_pairing_click.clone()
+                    >
+                        "Start pairing"
+                    </button>
+                }
+            }}
+            {move || pairing_error.get().map(|message| view! {
+                <p class="settings-mobile-broker-error" role="alert">{message}</p>
+            })}
+            {move || {
+                let devices = paired_devices();
+                (!devices.is_empty()).then(|| view! {
+                    <div class="settings-mobile-pairing-devices">
+                        <p class="settings-mobile-pairing-devices-heading">"Paired devices"</p>
+                        <ul class="settings-mobile-pairing-devices-list">
+                            {devices.into_iter().map(|device| {
+                                let state_label = match device.state {
+                                    MobileDeviceState::Connected => "connected",
+                                    MobileDeviceState::Paired => "offline",
+                                    MobileDeviceState::Revoked => "revoked",
+                                };
+                                let state_class = format!("settings-mobile-pairing-device-state settings-mobile-pairing-device-state-{state_label}");
+                                view! {
+                                    <li class="settings-mobile-pairing-device">
+                                        <span class="settings-mobile-pairing-device-label">{device.label.clone()}</span>
+                                        <span class=state_class>{state_label}</span>
+                                    </li>
+                                }
+                            }).collect::<Vec<_>>()}
+                        </ul>
+                    </div>
+                })
+            }}
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label">"Broker URL"</label>
+            <p class="settings-description">
+                "Public MQTT broker used to ferry pairing offers and encrypted traffic between this host and the mobile app. Leave blank to use the host default — the pairing QR will carry whichever broker URL is active, so the mobile app does not need to be preconfigured."
+            </p>
+            <div class="settings-mobile-broker-row">
+                <input
+                    type="text"
+                    class="settings-input settings-mobile-broker-input"
+                    prop:value=broker_value
+                    placeholder=DEFAULT_MOBILE_MQTT_BROKER_URL
+                    disabled=broker_disabled_for_input
+                    autocapitalize="none"
+                    autocomplete="off"
+                    spellcheck="false"
+                    aria-label="Broker URL"
+                    aria-invalid=move || if broker_error.get().is_some() { "true" } else { "false" }
+                    on:input=on_broker_input
+                    on:change=on_broker_commit
+                    on:keydown=on_broker_keydown
+                />
+                <button
+                    type="button"
+                    class="filter-toggle settings-mobile-broker-reset"
+                    disabled=broker_disabled_for_button
+                    title="Use the host default broker"
+                    on:click=on_broker_reset
+                >
+                    "Use default"
+                </button>
+            </div>
+            {move || broker_error.get().map(|message| view! {
+                <p class="settings-mobile-broker-error" role="alert">{message}</p>
+            })}
+        </div>
+
+        <div class="settings-mobile-warning" role="note">
+            <p class="settings-mobile-warning-heading">
+                "Public broker — encrypted contents, visible metadata"
+            </p>
+            <p class="settings-description">
+                "The broker is run by a third party and is untrusted. Tyde end-to-end encrypts every message between this host and your paired mobile devices, so the broker operator cannot read your chats, files, or commands. However, metadata like your IP address, connection timing, topic names, and message sizes is visible to the broker operator. Point this at your own MQTT broker if you need to hide that metadata too."
+            </p>
         </div>
     }
 }
@@ -3367,6 +4065,1056 @@ mod wasm_tests {
             options.len() >= 20,
             "expected >=20 themes in dropdown, got {}: {options:?}",
             options.len()
+        );
+    }
+
+    // ---- Mobile tab ----
+
+    /// Install the host-settings snapshot the Mobile tab depends on,
+    /// taking ownership of the provided `AppState`. Mirrors the data
+    /// path the dispatcher uses when it receives a real
+    /// `HostSettingsPayload` from the server.
+    fn install_mobile_host_settings(state: &AppState, broker_url: Option<&str>, enabled: bool) {
+        let host_id = "host-mobile".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id,
+                protocol::HostSettings {
+                    enabled_backends: vec![protocol::BackendKind::Claude],
+                    default_backend: Some(protocol::BackendKind::Claude),
+                    enable_mobile_connections: enabled,
+                    mobile_broker_url: broker_url
+                        .map(|s| protocol::BrokerUrl::new(s.to_owned()).expect("broker url")),
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+            );
+        });
+    }
+
+    fn click_tab(container: &HtmlElement, label: &str) {
+        // Walk every button rendered anywhere inside the settings UI
+        // and pick the one whose visible text matches the tab label.
+        let nodes = container
+            .query_selector_all("button")
+            .expect("settings buttons");
+        let mut observed: Vec<String> = Vec::new();
+        for i in 0..nodes.length() {
+            let Some(node) = nodes.item(i) else { continue };
+            let Ok(el) = node.dyn_into::<HtmlElement>() else {
+                continue;
+            };
+            let text = el
+                .text_content()
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_default();
+            if text == label {
+                el.click();
+                return;
+            }
+            observed.push(text);
+        }
+        panic!("settings tab labelled {label:?} not found among {observed:?}");
+    }
+
+    fn broker_input(container: &HtmlElement) -> web_sys::HtmlInputElement {
+        container
+            .query_selector(".settings-mobile-broker-input")
+            .unwrap()
+            .expect("broker URL input must render on the Mobile tab")
+            .dyn_into()
+            .unwrap()
+    }
+
+    /// When the host has no `mobile_broker_url` override, the broker
+    /// URL input must render empty but display the
+    /// `mqtts://broker.emqx.io:8883` placeholder so the user can see
+    /// what the host default resolves to. This is the foundation of
+    /// the "QR carries the broker URL even when the user hasn't set
+    /// one" contract — the placeholder is purely informational so
+    /// the user knows what they're opting into.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_broker_default_placeholder_when_no_override() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, false);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let input = broker_input(&container);
+        assert_eq!(
+            input.value(),
+            "",
+            "broker URL input must be empty when no host override exists"
+        );
+        assert_eq!(
+            input.get_attribute("placeholder").as_deref(),
+            Some(DEFAULT_MOBILE_MQTT_BROKER_URL),
+            "broker URL placeholder must surface the public default"
+        );
+    }
+
+    /// When the host has an explicit override, the broker URL input
+    /// must display it (not the placeholder).
+    #[wasm_bindgen_test]
+    async fn mobile_tab_broker_input_reflects_host_override() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, Some("mqtts://mybroker.example/relay"), true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let input = broker_input(&container);
+        assert_eq!(
+            input.value(),
+            "mqtts://mybroker.example/relay",
+            "broker URL input must reflect the host override exactly"
+        );
+    }
+
+    /// The warning copy must call out: (1) the broker is public /
+    /// untrusted, (2) Tyde contents are encrypted, (3) metadata may
+    /// be visible. Tests on user-perceived text content, not on a
+    /// CSS class — if a future refactor moves the warning into a
+    /// different element the assertion still passes as long as the
+    /// content is reachable.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_warning_covers_public_encrypted_metadata() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, false);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default().to_lowercase();
+        assert!(
+            text.contains("public"),
+            "mobile warning must call the broker public; got: {text:?}"
+        );
+        assert!(
+            text.contains("end-to-end encrypt") || text.contains("encrypt"),
+            "mobile warning must mention encryption; got: {text:?}"
+        );
+        assert!(
+            text.contains("metadata"),
+            "mobile warning must call out metadata leakage; got: {text:?}"
+        );
+        // Inverse: must NOT imply Tyde runs the broker.
+        assert!(
+            !text.contains("tyde broker"),
+            "mobile copy must not say 'Tyde broker' (we are the client, not the operator); got: {text:?}"
+        );
+        // The "untrusted" framing should be present in some form.
+        assert!(
+            text.contains("untrusted") || text.contains("third party"),
+            "mobile warning must frame the broker as untrusted/third-party; got: {text:?}"
+        );
+    }
+
+    /// The "Use default" button must always be present alongside the
+    /// broker URL input so the user can revert to the host default
+    /// without manually clearing the field.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_has_use_default_button() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, Some("mqtts://override/relay"), true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let buttons = container.query_selector_all("button").unwrap();
+        let mut found = false;
+        for i in 0..buttons.length() {
+            let Some(node) = buttons.item(i) else {
+                continue;
+            };
+            let Ok(el) = node.dyn_into::<HtmlElement>() else {
+                continue;
+            };
+            if el.text_content().as_deref().map(str::trim) == Some("Use default") {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "Mobile tab must surface a 'Use default' button to revert the broker override"
+        );
+    }
+
+    /// The tab nav must include a "Mobile" entry; the previous tab
+    /// list omitted it entirely. This is the discoverability gate —
+    /// without the nav button the page is unreachable.
+    #[wasm_bindgen_test]
+    async fn settings_nav_includes_mobile_tab() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        let buttons = container.query_selector_all("button").unwrap();
+        let mut found = false;
+        for i in 0..buttons.length() {
+            let Some(node) = buttons.item(i) else {
+                continue;
+            };
+            let Ok(el) = node.dyn_into::<HtmlElement>() else {
+                continue;
+            };
+            if el.text_content().as_deref().map(str::trim) == Some("Mobile") {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "Settings nav must include a 'Mobile' tab so the broker URL surface is reachable"
+        );
+    }
+
+    // ---- Mobile tab: send-frame behaviour + inline validation ----
+
+    /// Stub `window.__TAURI__.core.invoke` to record every call into
+    /// `window.__test_send_calls = [[cmd, JSON.stringify(args)], …]`
+    /// and resolve immediately. Mirrors the pattern used by
+    /// `teams_panel::wasm_tests::install_send_stub`.
+    fn install_settings_send_stub() -> js_sys::Array {
+        let code = r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+                return window.__test_send_calls;
+            })();
+        "#;
+        let calls = js_sys::eval(code).expect("install tauri stub");
+        calls.dyn_into::<js_sys::Array>().expect("array")
+    }
+
+    /// Find every SetSetting frame recorded against the send-stub and
+    /// return the parsed `setting` JSON for each. Narrowed to
+    /// SetSetting so we can ignore handshake/other invokes.
+    fn recorded_set_setting_payloads(calls: &js_sys::Array) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for entry in calls.iter() {
+            let arr = match entry.dyn_into::<js_sys::Array>() {
+                Ok(arr) => arr,
+                Err(_) => continue,
+            };
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let Some(args_json) = arr.get(1).as_string() else {
+                continue;
+            };
+            let args: serde_json::Value = match serde_json::from_str(&args_json) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(line) = args.get("line").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let envelope: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if envelope.get("kind").and_then(|v| v.as_str()) != Some("set_setting") {
+                continue;
+            }
+            if let Some(setting) = envelope
+                .get("payload")
+                .and_then(|p| p.get("setting"))
+                .cloned()
+            {
+                out.push(setting);
+            }
+        }
+        out
+    }
+
+    /// Dispatch a synthetic DOM event on `input` from JS. `web_sys` in
+    /// this feature set doesn't expose `KeyboardEventInit`, and
+    /// `Event::new` does not carry the `key` property our handler
+    /// reads — building the event in JS sidesteps both limitations.
+    fn dispatch_event_from_js(input: &web_sys::HtmlInputElement, kind: &str, key: Option<&str>) {
+        let id = format!("__tyde_dispatch_target_{kind}");
+        input.set_id(&id);
+        let key_part = key.map(|k| format!(", key: {k:?}")).unwrap_or_default();
+        let code = format!(
+            r#"
+            (function() {{
+                var el = document.getElementById({id:?});
+                if (!el) {{ throw new Error('dispatch target not found'); }}
+                var ev;
+                if ({kind:?} === 'keydown') {{
+                    ev = new KeyboardEvent('keydown', {{ bubbles: true, cancelable: true{key_part} }});
+                }} else {{
+                    ev = new Event({kind:?}, {{ bubbles: true, cancelable: true }});
+                }}
+                el.dispatchEvent(ev);
+            }})();
+            "#
+        );
+        js_sys::eval(&code).expect("dispatch event from JS");
+    }
+
+    fn dispatch_change(input: &web_sys::HtmlInputElement) {
+        dispatch_event_from_js(input, "change", None);
+    }
+
+    fn dispatch_enter(input: &web_sys::HtmlInputElement) {
+        dispatch_event_from_js(input, "keydown", Some("Enter"));
+    }
+
+    /// Pressing Enter on a valid override commits a `SetSetting` frame
+    /// whose payload is `MobileBrokerUrl { broker_url: Some(...) }`.
+    /// Load-bearing assertion that the typed-URL commit path actually
+    /// reaches the wire.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_enter_commits_valid_broker_url() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let input = broker_input(&container);
+        input.set_value("mqtts://override.example:8883");
+        dispatch_enter(&input);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let mobile = settings
+            .iter()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("mobile_broker_url"))
+            .expect("Enter on a valid broker URL must emit a MobileBrokerUrl SetSetting frame");
+        let broker_url = mobile
+            .get("broker_url")
+            .and_then(|v| v.as_str())
+            .expect("MobileBrokerUrl payload must carry the URL on commit");
+        assert_eq!(broker_url, "mqtts://override.example:8883");
+    }
+
+    /// Clicking "Use default" commits `MobileBrokerUrl { broker_url:
+    /// None }`. The server resolves None to the host's built-in
+    /// default, so this is how the user reverts an override without
+    /// manually clearing the field.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_use_default_button_commits_none() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, Some("mqtts://override.example"), true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        // Find the Use default button by text and click it.
+        let buttons = container.query_selector_all("button").unwrap();
+        let mut clicked = false;
+        for i in 0..buttons.length() {
+            let Some(node) = buttons.item(i) else {
+                continue;
+            };
+            let Ok(el) = node.dyn_into::<HtmlElement>() else {
+                continue;
+            };
+            if el.text_content().as_deref().map(str::trim) == Some("Use default") {
+                el.click();
+                clicked = true;
+                break;
+            }
+        }
+        assert!(clicked, "Use default button must be present and clickable");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let mobile = settings
+            .iter()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("mobile_broker_url"))
+            .expect("Use default must emit a MobileBrokerUrl SetSetting frame");
+        // `broker_url: None` is encoded as `Option::None`, which serde
+        // serialises as absent OR explicit null depending on payload
+        // attributes. Accept either to keep the test resilient.
+        let broker_url = mobile.get("broker_url");
+        match broker_url {
+            None => {}
+            Some(value) if value.is_null() => {}
+            Some(value) => {
+                panic!("Use default must clear the override (broker_url: None); got {value:?}")
+            }
+        }
+    }
+
+    /// Toggling the "Enable mobile connections" checkbox commits a
+    /// `SetSetting` frame whose payload is
+    /// `EnableMobileConnections { enabled }`. Without this assertion
+    /// the toggle could silently become a no-op and nothing would
+    /// notice.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_enable_toggle_commits_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, false);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        // The enable toggle is the only checkbox inside the Mobile tab.
+        let toggles = container
+            .query_selector_all("input[type='checkbox']")
+            .unwrap();
+        assert!(
+            toggles.length() >= 1,
+            "Mobile tab must render at least one checkbox"
+        );
+        let toggle: web_sys::HtmlInputElement = toggles
+            .item(0)
+            .unwrap()
+            .dyn_into()
+            .expect("checkbox element");
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let enable = settings
+            .iter()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("enable_mobile_connections"))
+            .expect("Toggling Enable must emit an EnableMobileConnections SetSetting frame");
+        assert_eq!(
+            enable.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "EnableMobileConnections payload must carry enabled=true after toggle on"
+        );
+    }
+
+    /// Pressing Enter on an insecure-scheme URL must (a) NOT emit any
+    /// SetSetting frame for the broker URL and (b) render an inline
+    /// error message that mentions the scheme problem. This is the
+    /// silent-failure regression guard the prior review called out.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_invalid_url_shows_inline_error_and_suppresses_send() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let input = broker_input(&container);
+        input.set_value("mqtt://broker.example:1883");
+        dispatch_enter(&input);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        // No MobileBrokerUrl SetSetting frame should have been sent.
+        let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings
+                .iter()
+                .all(|s| s.get("kind").and_then(|k| k.as_str()) != Some("mobile_broker_url")),
+            "Invalid broker URL must not be committed; recorded settings: {settings:?}"
+        );
+
+        // The inline error must be visible AND mention scheme/insecure
+        // so the user can correct it without guessing.
+        let error_el = container
+            .query_selector(".settings-mobile-broker-error")
+            .unwrap()
+            .expect("Invalid broker URL must surface an inline error message");
+        let error_text = error_el.text_content().unwrap_or_default().to_lowercase();
+        assert!(
+            error_text.contains("insecure")
+                || error_text.contains("mqtts")
+                || error_text.contains("scheme"),
+            "Inline error must explain the scheme problem; got: {error_text:?}"
+        );
+
+        // aria-invalid must flip so screen readers announce the error.
+        let aria_invalid = input.get_attribute("aria-invalid");
+        assert_eq!(
+            aria_invalid.as_deref(),
+            Some("true"),
+            "Broker URL input must set aria-invalid=true while showing the error"
+        );
+    }
+
+    // ---- Mobile pairing section ----
+
+    /// Seed an Online broker `MobileAccessState` snapshot under the
+    /// installed host so the Start-pairing button can render enabled.
+    fn install_online_broker_state(state: &AppState) {
+        let url = BrokerUrl::new("mqtts://broker.test:8883").expect("broker url");
+        let payload = protocol::MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::Online { broker_url: url },
+            pairing: MobilePairingState::Idle,
+            paired_devices: Vec::new(),
+        };
+        state.mobile_access_state.update(|m| {
+            m.insert("host-mobile".to_owned(), payload);
+        });
+    }
+
+    /// Inject an active offer + matching MobileAccessState so the UI
+    /// renders the QR + Cancel button without going through the
+    /// server round-trip.
+    fn install_active_offer(state: &AppState, offer_id: &str, qr_uri: &str, expires_at_ms: u64) {
+        let offer = protocol::MobilePairingOfferPayload {
+            offer_id: protocol::MobilePairingOfferId(offer_id.to_owned()),
+            qr_uri: protocol::MobilePairingQrUri(qr_uri.to_owned()),
+            expires_at_ms,
+        };
+        state.mobile_pairing_offer.update(|m| {
+            m.insert("host-mobile".to_owned(), offer);
+        });
+        let url = BrokerUrl::new("mqtts://broker.test:8883").expect("broker url");
+        let payload = protocol::MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::Online { broker_url: url },
+            pairing: MobilePairingState::Active {
+                offer_id: protocol::MobilePairingOfferId(offer_id.to_owned()),
+                expires_at_ms,
+            },
+            paired_devices: Vec::new(),
+        };
+        state.mobile_access_state.update(|m| {
+            m.insert("host-mobile".to_owned(), payload);
+        });
+    }
+
+    fn find_button_by_text(container: &HtmlElement, label: &str) -> Option<HtmlElement> {
+        let buttons = container.query_selector_all("button").ok()?;
+        for i in 0..buttons.length() {
+            let node = buttons.item(i)?;
+            let el = node.dyn_into::<HtmlElement>().ok()?;
+            if el.text_content().as_deref().map(str::trim) == Some(label) {
+                return Some(el);
+            }
+        }
+        None
+    }
+
+    /// Find every Mobile* frame recorded against the send-stub and
+    /// return the parsed envelope JSON (so we can assert on `kind`
+    /// and `payload`).
+    fn recorded_mobile_envelopes(calls: &js_sys::Array) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for entry in calls.iter() {
+            let arr = match entry.dyn_into::<js_sys::Array>() {
+                Ok(arr) => arr,
+                Err(_) => continue,
+            };
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let Some(args_json) = arr.get(1).as_string() else {
+                continue;
+            };
+            let args: serde_json::Value = match serde_json::from_str(&args_json) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(line) = args.get("line").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let envelope: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let kind = envelope
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if kind.starts_with("mobile_") {
+                out.push(envelope);
+            }
+        }
+        out
+    }
+
+    /// When mobile is enabled and the broker is Online, the
+    /// `Start pairing` button is rendered enabled and clicking it
+    /// fires exactly one `MobilePairingStart` frame on the host
+    /// stream.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_start_pairing_sends_frame_when_broker_online() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            install_online_broker_state(&state);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let btn = find_button_by_text(&container, "Start pairing")
+            .expect("Start pairing button must render on the Mobile tab");
+        assert!(
+            !btn.has_attribute("disabled"),
+            "Start pairing must be enabled when mobile is on and broker is Online"
+        );
+        btn.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let envelopes = recorded_mobile_envelopes(&calls);
+        let start = envelopes
+            .iter()
+            .find(|env| env.get("kind").and_then(|k| k.as_str()) == Some("mobile_pairing_start"))
+            .expect("Click must emit a MobilePairingStart frame");
+        let stream = start.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            stream.starts_with("/host/"),
+            "MobilePairingStart must target the host stream; got: {stream:?}"
+        );
+    }
+
+    /// While mobile is *disabled*, the Start button is rendered (for
+    /// discoverability) but disabled — and clicking it must not emit
+    /// a frame. The disabled-attribute alone suppresses the click in
+    /// real browsers, but the test asserts on both surfaces to keep
+    /// the contract clear.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_start_pairing_disabled_when_mobile_disabled() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, false);
+            install_online_broker_state(&state);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let btn = find_button_by_text(&container, "Start pairing")
+            .expect("Start pairing button must still render so users can see the affordance");
+        assert!(
+            btn.has_attribute("disabled"),
+            "Start pairing must be disabled when mobile is not enabled"
+        );
+    }
+
+    /// When an active offer is in state, the Mobile tab renders a QR
+    /// (as inline SVG), the raw pairing URI in a copyable readonly
+    /// textarea fallback, and a Cancel button. Clicking Cancel emits
+    /// `MobilePairingCancel` with the matching `offer_id`.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_active_offer_renders_qr_fallback_and_cancel() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            install_active_offer(
+                &state,
+                "offer-abc",
+                "tyde-pair://v1?token-data-here",
+                u64::MAX, // arbitrarily far in future so the expires line is positive
+            );
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        // QR renders as inline SVG inside the pairing container.
+        let qr_container = container
+            .query_selector(".settings-mobile-pairing-qr")
+            .unwrap()
+            .expect("Active offer must render a QR container");
+        let qr_svg = qr_container
+            .query_selector("svg")
+            .unwrap()
+            .expect("QR container must contain an inline <svg> element");
+        // The SVG must contain real QR module rects — otherwise we
+        // could ship an empty <svg/> and still satisfy the "is the
+        // element present" check. Each dark module renders as a
+        // <rect width="1" height="1" .../> with a black fill; require
+        // a healthy count so a regression that emits the placeholder
+        // background only (or a stub) trips this.
+        let rects = qr_svg.query_selector_all("rect").unwrap();
+        assert!(
+            rects.length() > 16,
+            "QR SVG must contain many dark module rects (got {})",
+            rects.length()
+        );
+        // The raw pairing URI must never appear inside the SVG. The
+        // URI carries the pre-shared key; embedding it as SVG text or
+        // an attribute would leak it via DOM scraping / accessibility
+        // tree traversal. The QR encodes it as bitmap modules only.
+        let svg_outer = qr_svg.outer_html();
+        assert!(
+            !svg_outer.contains("tyde-pair://"),
+            "QR SVG must not embed the raw pairing URI as text/attributes"
+        );
+        assert!(
+            !svg_outer.contains("token-data-here"),
+            "QR SVG must not leak the pre-shared key portion of the URI"
+        );
+
+        // Fallback URI textarea must carry the exact qr_uri so the
+        // user can copy-paste it on devices that can't scan.
+        let textarea: web_sys::HtmlTextAreaElement = container
+            .query_selector(".settings-mobile-pairing-uri")
+            .unwrap()
+            .expect("Active offer must render the URI fallback textarea")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(textarea.value(), "tyde-pair://v1?token-data-here");
+
+        // Cancel button must be present + clicking it fires
+        // MobilePairingCancel with the offer_id.
+        let cancel = find_button_by_text(&container, "Cancel pairing")
+            .expect("Active offer must render a Cancel pairing button");
+        cancel.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let envelopes = recorded_mobile_envelopes(&calls);
+        let cancel_env = envelopes
+            .iter()
+            .find(|env| env.get("kind").and_then(|k| k.as_str()) == Some("mobile_pairing_cancel"))
+            .expect("Cancel click must emit a MobilePairingCancel frame");
+        let offer_id = cancel_env
+            .get("payload")
+            .and_then(|p| p.get("offer_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            offer_id,
+            Some("offer-abc"),
+            "MobilePairingCancel must carry the active offer's id"
+        );
+    }
+
+    /// When the broker is in Error state, the pairing card surfaces
+    /// the server error message via the broker status pill, and the
+    /// Start button is disabled even when mobile is enabled.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_broker_error_disables_start_and_shows_message() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            let payload = protocol::MobileAccessStatePayload {
+                broker_status: MobileBrokerStatus::Error {
+                    broker_url: None,
+                    code: protocol::MobileAccessErrorCode::BrokerConnectionFailed,
+                    message: "broker unreachable".to_owned(),
+                },
+                pairing: MobilePairingState::Idle,
+                paired_devices: Vec::new(),
+            };
+            state.mobile_access_state.update(|m| {
+                m.insert("host-mobile".to_owned(), payload);
+            });
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let btn = find_button_by_text(&container, "Start pairing")
+            .expect("Start pairing button must render even on broker error");
+        assert!(
+            btn.has_attribute("disabled"),
+            "Start pairing must be disabled while the broker is in error state"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("broker unreachable"),
+            "Broker error message must surface in the pairing card; got: {text:?}"
+        );
+    }
+
+    /// QA blocker regression: the server can replace one Active
+    /// pairing with another by broadcasting `MobileAccessState
+    /// { Active { offer_id: NEW } }` and then sending the matching
+    /// `MobilePairingOffer { offer_id: NEW }` only to the *requester*.
+    /// A bystander UI that already had stored offer A must NOT keep
+    /// rendering A's QR after the Active.offer_id changes to B —
+    /// otherwise Cancel would target the now-stale offer A and the
+    /// user would scan an obsolete QR.
+    ///
+    /// Drives the dispatcher directly (no DOM) so the assertion is
+    /// about state-level reconciliation, where the bug lives.
+    #[wasm_bindgen_test]
+    async fn dispatch_mobile_access_state_drops_stale_offer_on_id_mismatch() {
+        use crate::dispatch::dispatch_envelope;
+        use protocol::{Envelope, MobilePairingOfferId, MobilePairingQrUri};
+
+        // Independent host id so this test's INBOUND_SEQ /
+        // INBOUND_PROTOCOL state doesn't collide with any other
+        // settings_panel test the runner happens to schedule before
+        // us. `reset_inbound_protocol` also clears stream-registration
+        // state so a fresh host stream is accepted.
+        crate::dispatch::clear_host_seqs("h-mobile-mismatch");
+        crate::dispatch::reset_inbound_protocol();
+
+        let state = AppState::new();
+        let host_id = "h-mobile-mismatch";
+        state.selected_host_id.set(Some(host_id.to_owned()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+
+        // Seed: bystander already has offer A stored from an earlier
+        // pairing the server broadcast.
+        let offer_a = protocol::MobilePairingOfferPayload {
+            offer_id: MobilePairingOfferId("offer-A".to_owned()),
+            qr_uri: MobilePairingQrUri("tyde-pair://v1?stale-A".to_owned()),
+            expires_at_ms: u64::MAX,
+        };
+        state.mobile_pairing_offer.update(|m| {
+            m.insert(host_id.to_owned(), offer_a);
+        });
+
+        // Server broadcasts a fresh Active state for a *different*
+        // offer id. The new offer payload itself is only delivered to
+        // the requester (not this bystander).
+        let new_state = protocol::MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::Online {
+                broker_url: BrokerUrl::new("mqtts://broker.test:8883").expect("broker url"),
+            },
+            pairing: MobilePairingState::Active {
+                offer_id: MobilePairingOfferId("offer-B".to_owned()),
+                expires_at_ms: u64::MAX,
+            },
+            paired_devices: Vec::new(),
+        };
+        let stream = protocol::StreamPath(format!("/host/{host_id}"));
+        let envelope = Envelope::from_payload(stream, FrameKind::MobileAccessState, 0, &new_state)
+            .expect("envelope serialize");
+        dispatch_envelope(&state, host_id, envelope);
+
+        // The stale offer A must be gone. Without the fix, this
+        // assertion fails because the bystander keeps rendering
+        // offer A while the server has already rotated to B.
+        let stored = state
+            .mobile_pairing_offer
+            .with_untracked(|m| m.get(host_id).cloned());
+        assert!(
+            stored.is_none(),
+            "Active.offer_id changed; stale stored offer must be cleared (still had: {stored:?})"
+        );
+        // The new MobileAccessState should be stored regardless.
+        let access = state
+            .mobile_access_state
+            .with_untracked(|m| m.get(host_id).cloned());
+        assert!(
+            matches!(
+                access.as_ref().map(|s| &s.pairing),
+                Some(MobilePairingState::Active { .. })
+            ),
+            "MobileAccessState snapshot must still be stored"
+        );
+    }
+
+    /// Counterpart: when `Active.offer_id` matches the stored
+    /// offer's id, the stored offer must NOT be cleared. (Without
+    /// this we'd churn the QR on every state replay.)
+    #[wasm_bindgen_test]
+    async fn dispatch_mobile_access_state_keeps_offer_when_id_matches() {
+        use crate::dispatch::dispatch_envelope;
+        use protocol::{Envelope, MobilePairingOfferId, MobilePairingQrUri};
+
+        crate::dispatch::clear_host_seqs("h-mobile-match");
+        crate::dispatch::reset_inbound_protocol();
+
+        let state = AppState::new();
+        let host_id = "h-mobile-match";
+        state.selected_host_id.set(Some(host_id.to_owned()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+
+        let offer_id_str = "offer-X";
+        let offer = protocol::MobilePairingOfferPayload {
+            offer_id: MobilePairingOfferId(offer_id_str.to_owned()),
+            qr_uri: MobilePairingQrUri("tyde-pair://v1?valid".to_owned()),
+            expires_at_ms: u64::MAX,
+        };
+        state.mobile_pairing_offer.update(|m| {
+            m.insert(host_id.to_owned(), offer);
+        });
+
+        let access_state = protocol::MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::Online {
+                broker_url: BrokerUrl::new("mqtts://broker.test:8883").expect("broker url"),
+            },
+            pairing: MobilePairingState::Active {
+                offer_id: MobilePairingOfferId(offer_id_str.to_owned()),
+                expires_at_ms: u64::MAX,
+            },
+            paired_devices: Vec::new(),
+        };
+        let stream = protocol::StreamPath(format!("/host/{host_id}"));
+        let envelope =
+            Envelope::from_payload(stream, FrameKind::MobileAccessState, 0, &access_state)
+                .expect("envelope serialize");
+        dispatch_envelope(&state, host_id, envelope);
+
+        let stored = state
+            .mobile_pairing_offer
+            .with_untracked(|m| m.get(host_id).cloned());
+        assert_eq!(
+            stored.as_ref().map(|o| o.offer_id.0.as_str()),
+            Some(offer_id_str),
+            "Matching Active.offer_id must NOT clear the stored offer"
+        );
+    }
+
+    /// Non-Active phases (Consumed / Expired / Cancelled / Failed)
+    /// must always clear the stored offer regardless of id. Cancelled
+    /// covers the Cancel-roundtrip case the bystander would otherwise
+    /// see after the server confirms a stale-id Cancel.
+    #[wasm_bindgen_test]
+    async fn dispatch_mobile_access_state_drops_offer_on_non_active_phase() {
+        use crate::dispatch::dispatch_envelope;
+        use protocol::{Envelope, MobilePairingOfferId, MobilePairingQrUri};
+
+        crate::dispatch::clear_host_seqs("h-mobile-cancelled");
+        crate::dispatch::reset_inbound_protocol();
+
+        let state = AppState::new();
+        let host_id = "h-mobile-cancelled";
+        state.selected_host_id.set(Some(host_id.to_owned()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.to_owned(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+
+        let offer = protocol::MobilePairingOfferPayload {
+            offer_id: MobilePairingOfferId("offer-Z".to_owned()),
+            qr_uri: MobilePairingQrUri("tyde-pair://v1?cancelled".to_owned()),
+            expires_at_ms: u64::MAX,
+        };
+        state.mobile_pairing_offer.update(|m| {
+            m.insert(host_id.to_owned(), offer);
+        });
+
+        let access_state = protocol::MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::Online {
+                broker_url: BrokerUrl::new("mqtts://broker.test:8883").expect("broker url"),
+            },
+            // Cancelled: offer_id is still in the state but the
+            // pairing lifecycle is no longer Active — UI should
+            // stop rendering the QR.
+            pairing: MobilePairingState::Cancelled {
+                offer_id: MobilePairingOfferId("offer-Z".to_owned()),
+            },
+            paired_devices: Vec::new(),
+        };
+        let stream = protocol::StreamPath(format!("/host/{host_id}"));
+        let envelope =
+            Envelope::from_payload(stream, FrameKind::MobileAccessState, 0, &access_state)
+                .expect("envelope serialize");
+        dispatch_envelope(&state, host_id, envelope);
+
+        let stored = state
+            .mobile_pairing_offer
+            .with_untracked(|m| m.get(host_id).cloned());
+        assert!(
+            stored.is_none(),
+            "Non-Active phase must clear the stored offer (still had: {stored:?})"
         );
     }
 }

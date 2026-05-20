@@ -1,0 +1,25 @@
+[package]
+name = "mqtt-transport"
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+ciborium = "0.2"
+chacha20poly1305 = "0.10.1"
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hkdf = "0.13.0"
+rand = "0.8"
+rumqttc = { version = "0.25.1", features = ["websocket"] }
+protocol = { path = "../protocol" }
+serde.workspace = true
+sha2 = "0.11.0"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url = "2"
+
+[dev-dependencies]
+rcgen = "0.14.7"
+rumqttd = "0.20.0"
+tempfile = "3"

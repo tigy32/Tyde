@@ -9,7 +9,8 @@ use protocol::{
     AgentStartPayload, BackendSetupPayload, ChatEvent, CommandErrorPayload,
     CustomAgentNotifyPayload, Envelope, FrameKind, HostBrowseEntriesPayload,
     HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerNotifyPayload, NewAgentPayload, NewTerminalPayload, ProjectEventPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
+    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitCommitResultPayload,
     ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
     ProtocolValidator, QueuedMessagesPayload, RejectPayload, ReviewCommentSource,
@@ -231,6 +232,101 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_settings payload: {error}"),
             ),
         },
+        FrameKind::MobileAccessState => {
+            match envelope.parse_payload::<MobileAccessStatePayload>() {
+                Ok(payload) => {
+                    // Don't log the QR uri here — pairing payloads are
+                    // log-sensitive even though the QR itself only
+                    // contains the embedded broker/secret room. The
+                    // Display impl on `MobilePairingState` is structural
+                    // so this is safe.
+                    log::info!(
+                        "dispatch mobile_access_state host={} pairing={:?} paired_devices={}",
+                        host_id,
+                        std::mem::discriminant(&payload.pairing),
+                        payload.paired_devices.len()
+                    );
+                    // Clear the start-pending gate once the server has
+                    // moved out of Idle: any non-Idle state means the
+                    // server received our Start (or someone else's).
+                    if !matches!(payload.pairing, MobilePairingState::Idle) {
+                        state.mobile_pairing_start_pending.update(|set| {
+                            set.remove(host_id);
+                        });
+                    }
+                    // Drop any stored offer that doesn't match the
+                    // server's current pairing phase. Two cases:
+                    //   1. Phase is not Active → no offer should be
+                    //      rendered at all (Consumed / Expired /
+                    //      Cancelled / Failed / Idle).
+                    //   2. Phase is Active { offer_id: NEW } but our
+                    //      stored offer's id is something else (or
+                    //      we have no stored offer yet). The server
+                    //      may roll one Active session into a
+                    //      different one — pushing `Active { offer_id:
+                    //      B }` to a broadcast while only sending the
+                    //      matching `MobilePairingOffer { offer_id:
+                    //      B }` to the *requesting* connection. A
+                    //      bystander UI that previously rendered
+                    //      offer A would otherwise keep showing A's
+                    //      QR (and Cancel would target stale A).
+                    let drop_offer = match &payload.pairing {
+                        MobilePairingState::Active { offer_id, .. } => {
+                            state.mobile_pairing_offer.with_untracked(|m| {
+                                m.get(host_id)
+                                    .map(|stored| &stored.offer_id != offer_id)
+                                    .unwrap_or(false)
+                            })
+                        }
+                        _ => true,
+                    };
+                    if drop_offer {
+                        state.mobile_pairing_offer.update(|m| {
+                            m.remove(host_id);
+                        });
+                    }
+                    state.mobile_access_state.update(|m| {
+                        m.insert(host_id.to_string(), payload);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse mobile_access_state payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::MobilePairingOffer => {
+            match envelope.parse_payload::<MobilePairingOfferPayload>() {
+                Ok(payload) => {
+                    // Avoid logging the qr_uri itself — it embeds a
+                    // pre-shared key the mobile app uses to derive the
+                    // session keys. The offer_id and expiry are enough
+                    // for forensic logs.
+                    log::info!(
+                        "dispatch mobile_pairing_offer host={} offer_id={} expires_at_ms={}",
+                        host_id,
+                        payload.offer_id,
+                        payload.expires_at_ms
+                    );
+                    state.mobile_pairing_start_pending.update(|set| {
+                        set.remove(host_id);
+                    });
+                    state.mobile_pairing_offer.update(|m| {
+                        m.insert(host_id.to_string(), payload);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse mobile_pairing_offer payload: {error}"),
+                ),
+            }
+        }
         FrameKind::BackendSetup => match envelope.parse_payload::<BackendSetupPayload>() {
             Ok(payload) => {
                 log::info!(

@@ -41,6 +41,10 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         HostEvent::HostSettings(_) => {}
         _ => panic!("expected initial HostSettings"),
     }
+    match next_host_event(&mut events, "initial mobile access state").await {
+        HostEvent::MobileAccessState(_) => {}
+        _ => panic!("expected initial MobileAccessState"),
+    }
     match next_host_event(&mut events, "initial session schemas").await {
         HostEvent::SessionSchemas(_) => {}
         _ => panic!("expected initial SessionSchemas"),
@@ -76,6 +80,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::SteeringNotify(_)
                 | HostEvent::SkillNotify(_)
                 | HostEvent::McpServerNotify(_)
+                | HostEvent::MobileAccessState(_)
+                | HostEvent::MobilePairingOffer(_)
                 | HostEvent::TeamNotify(_)
                 | HostEvent::TeamMemberNotify(_)
                 | HostEvent::TeamMemberBindingNotify(_)

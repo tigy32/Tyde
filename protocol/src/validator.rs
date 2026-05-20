@@ -10,12 +10,14 @@ use crate::{
     ChatEvent, CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBrowseClosePayload,
     HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload, RunBackendSetupPayload,
-    SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
+    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
+    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetSettingPayload,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
     TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
@@ -147,6 +149,14 @@ impl ProtocolValidator {
             FrameKind::HostSettings => {
                 parse_host_payload::<HostSettingsPayload>(self, envelope, "HostSettings")
             }
+            FrameKind::MobileAccessState => {
+                parse_host_payload::<MobileAccessStatePayload>(self, envelope, "MobileAccessState")
+            }
+            FrameKind::MobilePairingOffer => parse_host_payload::<MobilePairingOfferPayload>(
+                self,
+                envelope,
+                "MobilePairingOffer",
+            ),
             FrameKind::BackendSetup => {
                 parse_host_payload::<BackendSetupPayload>(self, envelope, "BackendSetup")
             }
@@ -203,6 +213,26 @@ impl ProtocolValidator {
             FrameKind::SetSetting => {
                 parse_host_payload::<SetSettingPayload>(self, envelope, "SetSetting")
             }
+            FrameKind::MobilePairingStart => parse_host_payload::<MobilePairingStartPayload>(
+                self,
+                envelope,
+                "MobilePairingStart",
+            ),
+            FrameKind::MobilePairingCancel => parse_host_payload::<MobilePairingCancelPayload>(
+                self,
+                envelope,
+                "MobilePairingCancel",
+            ),
+            FrameKind::MobileDeviceRevoke => parse_host_payload::<MobileDeviceRevokePayload>(
+                self,
+                envelope,
+                "MobileDeviceRevoke",
+            ),
+            FrameKind::MobileDeviceRename => parse_host_payload::<MobileDeviceRenamePayload>(
+                self,
+                envelope,
+                "MobileDeviceRename",
+            ),
             FrameKind::SpawnAgent => {
                 parse_host_payload::<SpawnAgentPayload>(self, envelope, "SpawnAgent")
             }

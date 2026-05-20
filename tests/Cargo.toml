@@ -5,12 +5,16 @@ edition.workspace = true
 [dependencies]
 client = { path = "../client" }
 protocol = { path = "../protocol" }
+mqtt-transport = { path = "../mqtt-transport" }
 server = { path = "../server" }
 tyde-dev-driver = { path = "../dev-driver" }
+futures-util = "0.3"
 paste = "1"
 rmcp = { version = "0.15.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 

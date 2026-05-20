@@ -1222,12 +1222,11 @@ mod wasm_tests {
             "row 2 was remounted on append — keyed <For> failed"
         );
         // Row 3 is the freshly mounted tail.
-        assert_eq!(
+        assert!(
             rows_after[3]
                 .text_content()
                 .unwrap_or_default()
                 .contains("fourth"),
-            true,
             "newly appended row should display the appended content"
         );
     }

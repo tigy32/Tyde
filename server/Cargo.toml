@@ -8,9 +8,12 @@ full-backends = []
 
 [dependencies]
 anyhow = "1"
+blake2 = "0.10"
+futures-util = "0.3"
 client = { path = "../client" }
 devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
+mqtt-transport = { path = "../mqtt-transport" }
 axum = "0.8"
 base64 = "0.22"
 command-group = { version = "5", features = ["with-tokio"] }

@@ -5688,6 +5688,228 @@ kbd {
     cursor: not-allowed;
 }
 
+/* --- Mobile tab --- */
+
+.settings-input {
+    padding: var(--space-2) var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 0.923rem;
+    color: var(--text-primary);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    outline: none;
+    transition: border-color 0.15s;
+}
+
+.settings-input:focus {
+    border-color: var(--accent-primary);
+}
+
+.settings-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.settings-mobile-broker-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+}
+
+.settings-mobile-broker-input {
+    flex: 1 1 320px;
+    min-width: 0;
+}
+
+.settings-mobile-warning {
+    margin-top: var(--space-3);
+    padding: var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--warning, var(--accent-primary));
+    border-radius: 6px;
+}
+
+.settings-mobile-warning-heading {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 var(--space-2) 0;
+}
+
+.settings-mobile-broker-error {
+    margin-top: var(--space-2);
+    font-size: 0.923rem;
+    color: var(--error, var(--accent-primary));
+    line-height: 1.4;
+}
+
+.settings-mobile-broker-input[aria-invalid="true"] {
+    border-color: var(--error, var(--accent-primary));
+}
+
+/* --- Mobile pairing section --- */
+
+.settings-mobile-pairing {
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    padding: var(--space-3);
+    background: var(--surface-2);
+}
+
+.settings-mobile-pairing-broker {
+    display: inline-block;
+    margin: var(--space-2) 0;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid var(--border-primary);
+}
+
+.settings-mobile-pairing-broker-online {
+    color: var(--success, var(--accent-primary));
+    border-color: var(--success, var(--accent-primary));
+}
+
+.settings-mobile-pairing-broker-connecting {
+    color: var(--text-secondary);
+}
+
+.settings-mobile-pairing-broker-disabled {
+    color: var(--text-tertiary);
+    font-style: italic;
+}
+
+.settings-mobile-pairing-broker-error {
+    color: var(--error, var(--accent-primary));
+    border-color: var(--error, var(--accent-primary));
+}
+
+.settings-mobile-pairing-status {
+    margin-top: var(--space-2);
+    font-size: 0.95rem;
+    color: var(--text-secondary);
+}
+
+.settings-mobile-pairing-active {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    align-items: flex-start;
+    margin-top: var(--space-3);
+    padding: var(--space-3);
+    background: var(--surface-1, var(--surface-base));
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+}
+
+.settings-mobile-pairing-qr {
+    flex: 0 0 256px;
+    width: 256px;
+    height: 256px;
+    background: #ffffff;
+    padding: var(--space-2);
+    border-radius: 6px;
+    border: 1px solid var(--border-primary);
+}
+
+.settings-mobile-pairing-qr svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.settings-mobile-pairing-active-meta {
+    flex: 1 1 220px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.settings-mobile-pairing-expires {
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+}
+
+.settings-mobile-pairing-fallback {
+    margin: 0;
+}
+
+.settings-mobile-pairing-fallback summary {
+    cursor: pointer;
+    font-size: 0.95rem;
+    color: var(--text-secondary);
+    margin-bottom: var(--space-1);
+}
+
+.settings-mobile-pairing-uri {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    width: 100%;
+    word-break: break-all;
+    white-space: pre-wrap;
+}
+
+.settings-mobile-pairing-cancel {
+    align-self: flex-start;
+}
+
+.settings-mobile-pairing-start {
+    margin-top: var(--space-3);
+}
+
+.settings-mobile-pairing-devices {
+    margin-top: var(--space-3);
+}
+
+.settings-mobile-pairing-devices-heading {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 var(--space-2) 0;
+}
+
+.settings-mobile-pairing-devices-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.settings-mobile-pairing-device {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border-radius: 4px;
+    background: var(--surface-1, var(--surface-base));
+}
+
+.settings-mobile-pairing-device-label {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.settings-mobile-pairing-device-state {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+}
+
+.settings-mobile-pairing-device-state-connected {
+    color: var(--success, var(--accent-primary));
+}
+
+.settings-mobile-pairing-device-state-revoked {
+    color: var(--error, var(--accent-primary));
+}
+
 /* --- Backend Cards --- */
 
 .settings-backend-list {

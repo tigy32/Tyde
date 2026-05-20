@@ -90,6 +90,8 @@ fn expected_empty_settings() -> HostSettings {
     HostSettings {
         enabled_backends: Vec::new(),
         default_backend: None,
+        enable_mobile_connections: false,
+        mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
     }
@@ -180,6 +182,8 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
         HostSettings {
             enabled_backends: vec![BackendKind::Kiro, BackendKind::Claude, BackendKind::Gemini,],
             default_backend: Some(BackendKind::Claude),
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
         }

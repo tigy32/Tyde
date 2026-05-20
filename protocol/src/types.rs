@@ -13,6 +13,7 @@ pub const TYDE_VERSION: Version = Version {
     minor: 8,
     patch: 14,
 };
+pub const DEFAULT_MOBILE_MQTT_BROKER_URL: &str = "mqtts://broker.emqx.io:8883";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Version {
@@ -62,6 +63,95 @@ fn parse_version_component(component: Option<&str>, name: &str) -> Result<u32, S
 pub struct StreamPath(pub String);
 
 impl fmt::Display for StreamPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolTypeError {
+    EmptyIdentifier { type_name: &'static str },
+}
+
+impl fmt::Display for ProtocolTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyIdentifier { type_name } => {
+                write!(f, "{type_name} must not be empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProtocolTypeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrokerUrl(String);
+
+impl BrokerUrl {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "BrokerUrl",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BrokerUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MobilePairingOfferId(pub String);
+
+impl MobilePairingOfferId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "MobilePairingOfferId",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MobilePairingOfferId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MobileDeviceId(pub String);
+
+impl fmt::Display for MobileDeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MobilePairingQrUri(pub String);
+
+impl fmt::Display for MobilePairingQrUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -390,6 +480,10 @@ pub enum FrameKind {
     TerminalSend,
     TerminalResize,
     TerminalClose,
+    MobilePairingStart,
+    MobilePairingCancel,
+    MobileDeviceRevoke,
+    MobileDeviceRename,
 
     SetSessionSettings,
 
@@ -433,6 +527,8 @@ pub enum FrameKind {
     CommandError,
     SessionSchemas,
     SessionSettings,
+    MobileAccessState,
+    MobilePairingOffer,
     ReviewCreate,
     ReviewAction,
     ReviewEvent,
@@ -503,6 +599,10 @@ impl fmt::Display for FrameKind {
             Self::TerminalSend => f.write_str("terminal_send"),
             Self::TerminalResize => f.write_str("terminal_resize"),
             Self::TerminalClose => f.write_str("terminal_close"),
+            Self::MobilePairingStart => f.write_str("mobile_pairing_start"),
+            Self::MobilePairingCancel => f.write_str("mobile_pairing_cancel"),
+            Self::MobileDeviceRevoke => f.write_str("mobile_device_revoke"),
+            Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
             Self::HostSettings => f.write_str("host_settings"),
             Self::BackendSetup => f.write_str("backend_setup"),
             Self::NewAgent => f.write_str("new_agent"),
@@ -545,6 +645,8 @@ impl fmt::Display for FrameKind {
             Self::SetSessionSettings => f.write_str("set_session_settings"),
             Self::SessionSchemas => f.write_str("session_schemas"),
             Self::SessionSettings => f.write_str("session_settings"),
+            Self::MobileAccessState => f.write_str("mobile_access_state"),
+            Self::MobilePairingOffer => f.write_str("mobile_pairing_offer"),
             Self::ReviewCreate => f.write_str("review_create"),
             Self::ReviewAction => f.write_str("review_action"),
             Self::ReviewEvent => f.write_str("review_event"),
@@ -607,6 +709,10 @@ pub struct HostSettings {
     #[serde(default)]
     pub default_backend: Option<BackendKind>,
     #[serde(default)]
+    pub enable_mobile_connections: bool,
+    #[serde(default)]
+    pub mobile_broker_url: Option<BrokerUrl>,
+    #[serde(default)]
     pub tyde_debug_mcp_enabled: bool,
     #[serde(default = "default_agent_control_mcp_enabled")]
     pub tyde_agent_control_mcp_enabled: bool,
@@ -630,6 +736,12 @@ pub enum HostSettingValue {
     DefaultBackend {
         default_backend: Option<BackendKind>,
     },
+    EnableMobileConnections {
+        enabled: bool,
+    },
+    MobileBrokerUrl {
+        broker_url: Option<BrokerUrl>,
+    },
     TydeDebugMcpEnabled {
         enabled: bool,
     },
@@ -641,6 +753,120 @@ pub enum HostSettingValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSettingsPayload {
     pub settings: HostSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePairingStartPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePairingCancelPayload {
+    pub offer_id: MobilePairingOfferId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDeviceRevokePayload {
+    pub device_id: MobileDeviceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDeviceRenamePayload {
+    pub device_id: MobileDeviceId,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileAccessStatePayload {
+    pub broker_status: MobileBrokerStatus,
+    pub pairing: MobilePairingState,
+    pub paired_devices: Vec<MobileDeviceSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobilePairingOfferPayload {
+    pub offer_id: MobilePairingOfferId,
+    pub qr_uri: MobilePairingQrUri,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MobileBrokerStatus {
+    Disabled,
+    Connecting {
+        broker_url: BrokerUrl,
+    },
+    Online {
+        broker_url: BrokerUrl,
+    },
+    Error {
+        broker_url: Option<BrokerUrl>,
+        code: MobileAccessErrorCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MobilePairingState {
+    Idle,
+    Active {
+        offer_id: MobilePairingOfferId,
+        expires_at_ms: u64,
+    },
+    Consumed {
+        offer_id: MobilePairingOfferId,
+    },
+    Expired {
+        offer_id: MobilePairingOfferId,
+    },
+    Cancelled {
+        offer_id: MobilePairingOfferId,
+    },
+    Failed {
+        offer_id: MobilePairingOfferId,
+        code: MobileAccessErrorCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileDeviceState {
+    Paired,
+    Connected,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileAccessErrorCode {
+    InvalidConfig,
+    BrokerUnavailable,
+    BrokerConnectionFailed,
+    BrokerProtocol,
+    BrokerRejected,
+    PairingExpired,
+    PairingRejected,
+    CryptoFailed,
+    DuplicateDevice,
+    InvalidPairingQr,
+    KeystoreFailed,
+    StoreLoadFailed,
+    TransportFailed,
+    UnknownDevice,
+    RevokedDevice,
+    VersionMismatch,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDeviceSummary {
+    pub device_id: MobileDeviceId,
+    pub label: String,
+    pub key_fingerprint: String,
+    pub created_at_ms: u64,
+    pub last_seen_at_ms: Option<u64>,
+    pub state: MobileDeviceState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,6 +1,8 @@
 pub mod agent_teams;
 pub mod custom_agents;
 pub mod mcp_servers;
+pub mod mobile_pairings;
+pub(crate) mod permissions;
 pub mod project;
 pub mod review;
 pub mod session;

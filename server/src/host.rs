@@ -15,8 +15,9 @@ use protocol::{
     CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
     FrameKind, HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData,
     McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
@@ -60,6 +61,9 @@ use crate::backend::{
 use crate::browse_stream;
 use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
+use crate::mobile_access::{
+    MobileAccessCommand, MobileAccessHandle, MobileAccessInit, spawn_mobile_access_actor,
+};
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, build_dir_listing,
     commit, discard_file, is_not_git_repository_error, read_diff, read_file,
@@ -77,6 +81,7 @@ use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
+use crate::store::mobile_pairings::MobilePairingsStore;
 use crate::store::project::ProjectStore;
 use crate::store::review::ReviewStore;
 use crate::store::session::{SessionRecord, SessionStore};
@@ -104,6 +109,7 @@ pub struct HostRuntimeConfig {
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub kiro_probe_program: Option<String>,
+    pub mobile_pairing_ttl: Option<std::time::Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,12 +176,19 @@ pub(crate) struct HostState {
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
     pub review_mcp: ReviewMcpHandle,
+    pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
     kiro_probe_program: Option<String>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
+}
+
+impl Drop for HostState {
+    fn drop(&mut self) {
+        self.mobile_access.shutdown();
+    }
 }
 
 #[derive(Clone)]
@@ -300,6 +313,7 @@ struct HostStorePaths {
     steering: PathBuf,
     skills_index: PathBuf,
     skills_root_dir: PathBuf,
+    mobile_pairings: PathBuf,
 }
 
 impl SubAgentEmitter for HostSubAgentEmitter {
@@ -384,10 +398,32 @@ impl HostHandle {
             state.host_streams.remove(&host_path);
             return Vec::new();
         }
+        let Some(subscriber) = state.host_streams.get(&host_path) else {
+            panic!(
+                "host stream {} disappeared during mobile access replay",
+                host_path
+            );
+        };
+        if state
+            .mobile_access
+            .register_subscriber(subscriber.stream.clone())
+            .await
+            .is_err()
+        {
+            state.host_streams.remove(&host_path);
+            return Vec::new();
+        }
+        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+            panic!(
+                "host stream {} disappeared during session schema replay",
+                host_path
+            );
+        };
         if emit_session_schemas_for_subscriber(&schemas, subscriber)
             .await
             .is_err()
         {
+            state.mobile_access.unregister_subscriber(host_path.clone());
             state.host_streams.remove(&host_path);
             return Vec::new();
         }
@@ -735,6 +771,7 @@ impl HostHandle {
         let (project_handles, terminals, review_registry) = {
             let mut state = self.state.lock().await;
             state.host_streams.remove(path);
+            state.mobile_access.unregister_subscriber(path.clone());
             let review_registry = state.review_registry.clone();
             let project_handles = state
                 .project_streams
@@ -3177,7 +3214,7 @@ impl HostHandle {
         const OPERATION: &str = "set_setting";
         let mut state = self.state.lock().await;
         let refresh_session_schemas = matches!(
-            payload.setting,
+            &payload.setting,
             protocol::HostSettingValue::EnabledBackends { .. }
         );
         let settings = state
@@ -3186,12 +3223,42 @@ impl HostHandle {
             .await
             .apply(payload.setting)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        fan_out_host_settings(&mut state, settings).await;
+        fan_out_host_settings(&mut state, settings.clone()).await;
+        state.mobile_access.settings_changed(settings);
         if refresh_session_schemas {
             drop(state);
             self.refresh_session_schemas().await;
         }
         Ok(())
+    }
+
+    pub(crate) async fn start_mobile_pairing(&self, requester: StreamPath) -> AppResult<()> {
+        let mobile_access = self.state.lock().await.mobile_access.clone();
+        mobile_access.start_pairing(requester)
+    }
+
+    pub(crate) async fn cancel_mobile_pairing(
+        &self,
+        payload: MobilePairingCancelPayload,
+    ) -> AppResult<()> {
+        let mobile_access = self.state.lock().await.mobile_access.clone();
+        mobile_access.cancel_pairing(payload)
+    }
+
+    pub(crate) async fn revoke_mobile_device(
+        &self,
+        payload: MobileDeviceRevokePayload,
+    ) -> AppResult<()> {
+        let mobile_access = self.state.lock().await.mobile_access.clone();
+        mobile_access.revoke_device(payload).await
+    }
+
+    pub(crate) async fn rename_mobile_device(
+        &self,
+        payload: MobileDeviceRenamePayload,
+    ) -> AppResult<()> {
+        let mobile_access = self.state.lock().await.mobile_access.clone();
+        mobile_access.rename_device(payload).await
     }
 
     pub(crate) async fn fan_out_backend_setup(&self) {
@@ -4830,6 +4897,9 @@ pub fn spawn_host() -> HostHandle {
         .unwrap_or_else(|err| panic!("failed to resolve default skills index path: {err}"));
     let skills_root_dir = SkillStore::default_root_dir()
         .unwrap_or_else(|err| panic!("failed to resolve default skills root dir: {err}"));
+    let mobile_pairings_path = MobilePairingsStore::default_path().unwrap_or_else(|err| {
+        panic!("failed to resolve default mobile pairings store path: {err}")
+    });
     spawn_host_inner(
         HostStorePaths {
             session: session_path,
@@ -4842,6 +4912,7 @@ pub fn spawn_host() -> HostHandle {
             steering: steering_path,
             skills_index: skills_index_path,
             skills_root_dir,
+            mobile_pairings: mobile_pairings_path,
         },
         false,
         HostRuntimeConfig::default(),
@@ -4903,6 +4974,7 @@ pub fn spawn_host_with_store_paths_and_runtime_config(
             steering: parent.join("steering.json"),
             skills_index: parent.join("skills.json"),
             skills_root_dir: parent.join("skills"),
+            mobile_pairings: parent.join("mobile_pairings.json"),
         },
         false,
         runtime_config,
@@ -4950,6 +5022,7 @@ pub fn spawn_host_with_mock_backend_and_runtime_config(
             steering: parent.join("steering.json"),
             skills_index: parent.join("skills.json"),
             skills_root_dir: parent.join("skills"),
+            mobile_pairings: parent.join("mobile_pairings.json"),
         },
         true,
         runtime_config,
@@ -4966,6 +5039,8 @@ fn spawn_host_inner(
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
     let host_settings = settings_store.get()?;
+    let initial_mobile_settings = host_settings.clone();
+    let mobile_pairings_store = MobilePairingsStore::load(paths.mobile_pairings)?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
     let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
     let team_refs = AgentTeamValidationRefs {
@@ -4991,6 +5066,8 @@ fn spawn_host_inner(
     let skill_store = SkillStore::load(paths.skills_index, paths.skills_root_dir)?;
     let (sub_agent_spawn_tx, sub_agent_spawn_rx) =
         mpsc::unbounded_channel::<HostSubAgentSpawnRequest>();
+    let (mobile_access_tx, mobile_access_rx) = mpsc::unbounded_channel::<MobileAccessCommand>();
+    let mobile_access = MobileAccessHandle::new(mobile_access_tx.clone());
     let (review_delivery_tx, review_delivery_rx) = mpsc::channel::<ReviewDeliveryRequest>(64);
     let (review_ai_spawn_tx, review_ai_spawn_rx) = mpsc::channel::<ReviewAiSpawnRequest>(16);
     let (review_project_update_tx, review_project_update_rx) =
@@ -5037,6 +5114,7 @@ fn spawn_host_inner(
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
             review_mcp: review_mcp_placeholder,
+            mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             host_streams: HashMap::new(),
@@ -5045,6 +5123,19 @@ fn spawn_host_inner(
             browse_streams: HashMap::new(),
         })),
     };
+
+    spawn_mobile_access_actor(
+        host.clone(),
+        mobile_access_tx,
+        mobile_access_rx,
+        MobileAccessInit {
+            pairings_store: mobile_pairings_store,
+            initial_settings: initial_mobile_settings,
+            pairing_ttl: runtime_config
+                .mobile_pairing_ttl
+                .unwrap_or(crate::mobile_access::DEFAULT_PAIRING_TTL),
+        },
+    )?;
 
     let agent_control_mcp = match crate::agent_control_mcp::start_server(
         runtime_config.agent_control_mcp_bind_addr,

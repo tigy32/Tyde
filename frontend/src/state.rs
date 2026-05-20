@@ -6,7 +6,8 @@ use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
     DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform,
-    HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope, ProjectGitDiffFile,
+    HostSettings, McpServerConfig, McpServerId, MobileAccessStatePayload,
+    MobilePairingOfferPayload, Project, ProjectDiffScope, ProjectGitDiffFile,
     ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
     ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId,
     ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
@@ -830,6 +831,23 @@ pub struct AppState {
     /// `Completed` retargets it. Drained at
     /// `finish_compaction_success` time.
     pub compaction_pending_close: RwSignal<HashSet<(String, AgentId)>>,
+    /// Latest server-pushed `MobileAccessState` snapshot per host. The
+    /// payload carries broker status, the pairing-lifecycle phase
+    /// (`Idle | Active | Consumed | Expired | Cancelled | Failed`), and
+    /// the paired-device list. The Mobile settings tab reads from this
+    /// to render pairing status / device list. Server is the source of
+    /// truth; the frontend never synthesises entries.
+    pub mobile_access_state: RwSignal<HashMap<String, MobileAccessStatePayload>>,
+    /// Latest server-pushed `MobilePairingOffer` per host. Contains the
+    /// `qr_uri` we render as a QR code. Cleared when the pairing
+    /// lifecycle transitions out of Active (Consumed / Expired /
+    /// Cancelled / Failed) so a stale QR isn't left lying around.
+    pub mobile_pairing_offer: RwSignal<HashMap<String, MobilePairingOfferPayload>>,
+    /// Per-host bit: true while a `MobilePairingStart` is in flight and
+    /// we haven't yet seen the server-confirmed offer back. Used to
+    /// disable the Start button so the user can't double-fire while
+    /// the server is preparing the offer.
+    pub mobile_pairing_start_pending: RwSignal<HashSet<String>>,
 }
 
 /// Snapshot of identifying fields captured for an agent at the moment
@@ -977,6 +995,9 @@ impl AppState {
             compaction_errors: RwSignal::new(HashMap::new()),
             compaction_pending_completion: RwSignal::new(HashMap::new()),
             compaction_pending_close: RwSignal::new(HashSet::new()),
+            mobile_access_state: RwSignal::new(HashMap::new()),
+            mobile_pairing_offer: RwSignal::new(HashMap::new()),
+            mobile_pairing_start_pending: RwSignal::new(HashSet::new()),
         }
     }
 
@@ -2461,6 +2482,8 @@ mod tests {
                     HostSettings {
                         enabled_backends: vec![BackendKind::Claude],
                         default_backend: Some(BackendKind::Claude),
+                        enable_mobile_connections: false,
+                        mobile_broker_url: None,
                         tyde_debug_mcp_enabled: false,
                         tyde_agent_control_mcp_enabled: true,
                     },
@@ -2470,6 +2493,8 @@ mod tests {
                     HostSettings {
                         enabled_backends: vec![BackendKind::Gemini],
                         default_backend: Some(BackendKind::Gemini),
+                        enable_mobile_connections: false,
+                        mobile_broker_url: None,
                         tyde_debug_mcp_enabled: false,
                         tyde_agent_control_mcp_enabled: true,
                     },

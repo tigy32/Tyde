@@ -7,21 +7,22 @@ use protocol::{
     CustomAgentDeletePayload, CustomAgentUpsertPayload, DeleteSessionPayload,
     EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerUpsertPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
-    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
-    TerminalSendPayload,
+    McpServerUpsertPayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, MobilePairingStartPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
+    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
+    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -41,6 +42,42 @@ pub(crate) async fn route_client_envelope(
             FrameKind::SetSetting => {
                 let payload: SetSettingPayload = parse_payload(&envelope, "set_setting")?;
                 host.set_setting(payload).await?;
+            }
+            FrameKind::MobilePairingStart => {
+                let _: MobilePairingStartPayload =
+                    parse_payload(&envelope, "mobile_pairing_start")?;
+                host.start_mobile_pairing(envelope.stream.clone()).await?;
+            }
+            FrameKind::MobilePairingCancel => {
+                let payload: MobilePairingCancelPayload =
+                    parse_payload(&envelope, "mobile_pairing_cancel")?;
+                ensure_non_empty(
+                    "mobile_pairing_cancel",
+                    "offer_id",
+                    payload.offer_id.0.as_str(),
+                )?;
+                host.cancel_mobile_pairing(payload).await?;
+            }
+            FrameKind::MobileDeviceRevoke => {
+                let payload: MobileDeviceRevokePayload =
+                    parse_payload(&envelope, "mobile_device_revoke")?;
+                ensure_non_empty(
+                    "mobile_device_revoke",
+                    "device_id",
+                    payload.device_id.0.as_str(),
+                )?;
+                host.revoke_mobile_device(payload).await?;
+            }
+            FrameKind::MobileDeviceRename => {
+                let payload: MobileDeviceRenamePayload =
+                    parse_payload(&envelope, "mobile_device_rename")?;
+                ensure_non_empty(
+                    "mobile_device_rename",
+                    "device_id",
+                    payload.device_id.0.as_str(),
+                )?;
+                ensure_non_empty("mobile_device_rename", "label", payload.label.as_str())?;
+                host.rename_mobile_device(payload).await?;
             }
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;

@@ -12,27 +12,27 @@ use protocol::{
     CancelQueuedMessagePayload, CommandErrorPayload, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError,
     FrameKind, HelloPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload, NewAgentPayload,
-    NewTerminalPayload, PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
-    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    RejectPayload, ReviewActionPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
-    ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
-    TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
-    write_envelope,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, RejectPayload,
+    ReviewActionPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId, ReviewSubscribePayload,
+    SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION,
+    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalId,
+    TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
+    Version, WelcomePayload, read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
@@ -758,6 +758,14 @@ impl Connection {
                 }
                 FrameKind::HostSettings => {
                     let _: HostSettingsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::MobileAccessState => {
+                    let _: MobileAccessStatePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::MobilePairingOffer => {
+                    let _: MobilePairingOfferPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::BackendSetup => {

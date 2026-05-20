@@ -117,6 +117,18 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
             }
             settings.default_backend = default_backend;
         }
+        HostSettingValue::EnableMobileConnections { enabled } => {
+            settings.enable_mobile_connections = enabled;
+        }
+        HostSettingValue::MobileBrokerUrl { broker_url } => {
+            if broker_url
+                .as_ref()
+                .is_some_and(|url| url.as_str().trim().is_empty())
+            {
+                return Err("mobile_broker_url must not be empty".to_owned());
+            }
+            settings.mobile_broker_url = broker_url;
+        }
         HostSettingValue::TydeDebugMcpEnabled { enabled } => {
             settings.tyde_debug_mcp_enabled = enabled;
         }
@@ -132,6 +144,8 @@ fn empty_settings() -> HostSettings {
     HostSettings {
         enabled_backends: Vec::new(),
         default_backend: None,
+        enable_mobile_connections: false,
+        mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
     }
@@ -149,9 +163,19 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         ));
     }
 
+    if settings
+        .mobile_broker_url
+        .as_ref()
+        .is_some_and(|url| url.as_str().trim().is_empty())
+    {
+        return Err("mobile_broker_url must not be empty".to_owned());
+    }
+
     Ok(HostSettings {
         enabled_backends,
         default_backend: settings.default_backend,
+        enable_mobile_connections: settings.enable_mobile_connections,
+        mobile_broker_url: settings.mobile_broker_url,
         tyde_debug_mcp_enabled: settings.tyde_debug_mcp_enabled,
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
     })

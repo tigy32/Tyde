@@ -6,14 +6,15 @@ use protocol::{
     AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload, ChatEvent,
     CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameError, FrameKind,
     HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerNotifyPayload,
-    NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
-    StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
+    SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload, StreamPath,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
     TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
@@ -127,6 +128,8 @@ pub enum HostEvent {
     SteeringNotify(SteeringNotifyPayload),
     SkillNotify(SkillNotifyPayload),
     McpServerNotify(McpServerNotifyPayload),
+    MobileAccessState(MobileAccessStatePayload),
+    MobilePairingOffer(MobilePairingOfferPayload),
     TeamNotify(TeamNotifyPayload),
     TeamMemberNotify(TeamMemberNotifyPayload),
     TeamMemberBindingNotify(TeamMemberBindingNotifyPayload),
@@ -651,6 +654,22 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::BackendSetup(payload)).await;
+            true
+        }
+        FrameKind::MobileAccessState => {
+            let payload: MobileAccessStatePayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::MobileAccessState(payload)).await;
+            true
+        }
+        FrameKind::MobilePairingOffer => {
+            let payload: MobilePairingOfferPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::MobilePairingOffer(payload)).await;
             true
         }
         FrameKind::SessionList => {

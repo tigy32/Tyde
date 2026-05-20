@@ -2550,6 +2550,8 @@ mod wasm_tests {
                 protocol::HostSettings {
                     enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
                     default_backend: Some(BackendKind::Claude),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                 },
@@ -4489,10 +4491,10 @@ mod wasm_tests {
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_default();
-            if project_ids == vec![project_id] {
-                if let Some(id) = member.get("id").and_then(|v| v.as_str()) {
-                    covered.insert(id.to_owned());
-                }
+            if project_ids == vec![project_id]
+                && let Some(id) = member.get("id").and_then(|v| v.as_str())
+            {
+                covered.insert(id.to_owned());
             }
         }
         for expected in ["draft-manager", "draft-report-1", "draft-report-2"] {

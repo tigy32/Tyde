@@ -153,12 +153,23 @@ async fn connect_client(host: server::HostHandle) -> client::Connection {
     let env = client
         .next_event()
         .await
+        .expect("initial mobile access state read failed")
+        .expect("connection closed before initial mobile access state");
+    assert_eq!(
+        env.kind,
+        FrameKind::MobileAccessState,
+        "second host event on connect must be MobileAccessState"
+    );
+
+    let env = client
+        .next_event()
+        .await
         .expect("initial session schemas read failed")
         .expect("connection closed before initial session schemas");
     assert_eq!(
         env.kind,
         FrameKind::SessionSchemas,
-        "second host event on connect must be SessionSchemas"
+        "third host event on connect must be SessionSchemas"
     );
 
     client
