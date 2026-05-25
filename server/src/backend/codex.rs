@@ -186,7 +186,10 @@ impl CodexSession {
             .map(|s| s.to_string());
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let emitter = Arc::new(TurnEmitter::new(event_tx));
+        let emitter = Arc::new(TurnEmitter::new_for_agent(
+            event_tx,
+            AgentName(CODEX_AGENT_NAME),
+        ));
 
         let inner = Arc::new(CodexInner {
             rpc,
@@ -1512,6 +1515,23 @@ impl CodexInner {
     }
 
     async fn emit_reasoning_delta(&self, params: &Value, delta: String) {
+        if delta.is_empty() {
+            return;
+        }
+        let message_id = {
+            let state = self.state.lock().await;
+            codex_reasoning_delta_message_id(&state, params)
+        };
+        if let Some((stream_message_id, model)) =
+            self.ensure_active_stream_for_message(&message_id).await
+        {
+            self.emitter.typing_status_changed(true);
+            self.emitter.stream_start(
+                &stream_message_id,
+                AgentName(CODEX_AGENT_NAME),
+                Some(&model),
+            );
+        }
         let emission = {
             let mut state = self.state.lock().await;
             apply_reasoning_delta_to_state(&mut state, params, &delta)
@@ -2276,7 +2296,10 @@ impl CodexInner {
             .await;
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
         spawn_codex_subagent_event_bridge(raw_event_rx, handle.event_tx.clone());
-        let emitter = Arc::new(TurnEmitter::new(raw_event_tx));
+        let emitter = Arc::new(TurnEmitter::new_for_agent(
+            raw_event_tx,
+            AgentName(CODEX_AGENT_NAME),
+        ));
 
         let mut state = self.state.lock().await;
         tracing::info!(
@@ -3201,6 +3224,30 @@ fn extract_reasoning_delta_from_legacy_codex_event(method: &str, params: &Value)
     extract_codex_reasoning_delta_text(params)
 }
 
+fn codex_reasoning_delta_message_id(state: &CodexState, params: &Value) -> String {
+    params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("item_id").and_then(Value::as_str))
+        .or_else(|| params.get("id").and_then(Value::as_str))
+        .map(|id| id.to_string())
+        .or_else(|| {
+            state
+                .active_stream
+                .as_ref()
+                .map(|stream| stream.message_id.clone())
+                .filter(|id| !id.is_empty())
+        })
+        .or_else(|| {
+            state
+                .active_turn_id
+                .as_ref()
+                .filter(|id| !id.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| "assistant".to_string())
+}
+
 fn apply_reasoning_delta_to_state(
     state: &mut CodexState,
     params: &Value,
@@ -3219,20 +3266,7 @@ fn apply_reasoning_delta_to_state(
         return None;
     }
 
-    let message_id = params
-        .get("itemId")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("item_id").and_then(Value::as_str))
-        .or_else(|| params.get("id").and_then(Value::as_str))
-        .map(|id| id.to_string())
-        .or_else(|| {
-            state
-                .active_stream
-                .as_ref()
-                .map(|stream| stream.message_id.clone())
-                .filter(|id| !id.is_empty())
-        })
-        .unwrap_or_else(|| "assistant".to_string());
+    let message_id = codex_reasoning_delta_message_id(state, params);
 
     if let Some(stream) = state.active_stream.as_mut() {
         stream.message_id = message_id.clone();
@@ -4398,10 +4432,9 @@ impl CodexRpc {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, ModelInfo, SelectOption, SessionId,
+    AgentInput, ChatEvent, ChatMessage, MessageSender, SelectOption, SessionId,
     SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
-    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData, ToolExecutionCompletedData,
-    ToolExecutionResult, ToolRequest, ToolRequestType,
+    SpawnCostHint,
 };
 
 use super::{
@@ -4458,18 +4491,12 @@ pub(crate) fn resolve_session_settings(
     )
 }
 
-fn backend_user_message(content: String, images: Option<Vec<protocol::ImageData>>) -> ChatEvent {
-    ChatEvent::MessageAdded(ChatMessage {
-        timestamp: unix_now_ms(),
-        sender: MessageSender::User,
-        content,
-        reasoning: None,
-        tool_calls: Vec::new(),
-        model_info: None,
-        token_usage: None,
-        context_breakdown: None,
-        images,
-    })
+fn backend_user_image_values(images: Option<Vec<protocol::ImageData>>) -> Vec<Value> {
+    images
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|image| serde_json::to_value(image).ok())
+        .collect()
 }
 
 fn backend_error_message(content: String) -> ChatEvent {
@@ -4618,6 +4645,12 @@ impl Backend for CodexBackend {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
+        spawn_codex_subagent_event_bridge(raw_event_rx, events_tx);
+        let emitter = Arc::new(TurnEmitter::new_for_agent(
+            raw_event_tx,
+            AgentName(CODEX_AGENT_NAME),
+        ));
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (subagent_emitter_tx, _subagent_emitter_rx) =
@@ -4870,18 +4903,10 @@ impl Backend for CodexBackend {
             let effort_for_input = effort_override.clone();
             let access_mode_for_input = access_mode;
 
-            if events_tx
-                .send(backend_user_message(
-                    initial_message.clone(),
-                    initial_images.clone(),
-                ))
-                .is_err()
-            {
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err("codex event stream closed".to_string()));
-                }
-                return;
-            }
+            emitter.user_message(
+                &initial_message,
+                backend_user_image_values(initial_images.clone()),
+            );
             let mut initial_input_items = vec![json!({
                 "type": "text",
                 "text": initial_message,
@@ -4990,16 +5015,14 @@ impl Backend for CodexBackend {
                                 started_item_types.clear();
                                 completed_item_types.clear();
                                 if !typing_status_active {
-                                    let _ = events_tx
-                                        .send(ChatEvent::TypingStatusChanged(true));
+                                    emitter.typing_status_changed(true);
                                     typing_status_active = true;
                                 }
-                                let _ = events_tx
-                                    .send(ChatEvent::StreamStart(StreamStartData {
-                                        message_id: Some(turn_id),
-                                        agent: CODEX_AGENT_NAME.to_owned(),
-                                        model: Some(model_name.clone()),
-                                    }));
+                                emitter.stream_start(
+                                    &turn_id,
+                                    AgentName(CODEX_AGENT_NAME),
+                                    Some(&model_name),
+                                );
                             }
                             "item/agentMessage/delta" => {
                                 let delta = params
@@ -5023,23 +5046,19 @@ impl Backend for CodexBackend {
                                     stream_closed_by_turn_completion = false;
                                     accumulated_text.clear();
                                     if !typing_status_active {
-                                        let _ = events_tx
-                                            .send(ChatEvent::TypingStatusChanged(true));
+                                        emitter.typing_status_changed(true);
                                         typing_status_active = true;
                                     }
-                                    let _ = events_tx
-                                        .send(ChatEvent::StreamStart(StreamStartData {
-                                            message_id: Some(start_message_id),
-                                            agent: CODEX_AGENT_NAME.to_owned(),
-                                            model: Some(model_name.clone()),
-                                        }));
+                                    emitter.stream_start(
+                                        &start_message_id,
+                                        AgentName(CODEX_AGENT_NAME),
+                                        Some(&model_name),
+                                    );
                                 }
                                 accumulated_text.push_str(&delta);
-                                let _ = events_tx
-                                    .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                                        message_id: msg_id,
-                                        text: delta,
-                                    }));
+                                let delta_message_id =
+                                    msg_id.as_deref().unwrap_or("assistant").to_string();
+                                emitter.stream_delta(&delta_message_id, &delta);
                             }
                             "item/completed" => {
                                 let item_type = params
@@ -5092,12 +5111,11 @@ impl Backend for CodexBackend {
                                             }
                                             CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
                                                 let start_message_id = item_id.clone();
-                                                let _ = events_tx
-                                                    .send(ChatEvent::StreamStart(StreamStartData {
-                                                        message_id: Some(start_message_id),
-                                                        agent: CODEX_AGENT_NAME.to_owned(),
-                                                        model: Some(model_name.clone()),
-                                                    }));
+                                                emitter.stream_start(
+                                                    &start_message_id,
+                                                    AgentName(CODEX_AGENT_NAME),
+                                                    Some(&model_name),
+                                                );
                                             }
                                             CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
                                         }
@@ -5108,23 +5126,15 @@ impl Backend for CodexBackend {
                                             accumulated_text.clear();
                                             text
                                         };
-                                        let message = ChatMessage {
-                                            timestamp: unix_now_ms(),
-                                            sender: MessageSender::Assistant {
-                                                agent: CODEX_AGENT_NAME.to_owned(),
-                                            },
+                                        emitter.stream_end(StreamEndPayload {
                                             content: final_text,
+                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                            model: Some(model_name.clone()),
+                                            usage: None,
                                             reasoning: None,
                                             tool_calls: Vec::new(),
-                                            model_info: Some(ModelInfo {
-                                                model: model_name.clone(),
-                                            }),
-                                            token_usage: None,
                                             context_breakdown: None,
-                                            images: None,
-                                        };
-                                        let _ = events_tx
-                                            .send(ChatEvent::StreamEnd(StreamEndData { message }));
+                                        });
                                         current_message_id = None;
                                         stream_closed_by_turn_completion = false;
                                     }
@@ -5138,26 +5148,23 @@ impl Backend for CodexBackend {
                                             .unwrap_or("")
                                             .to_string();
                                         let success = exit_code == 0;
-                                        let _ = events_tx
-                                            .send(ChatEvent::ToolExecutionCompleted(
-                                                ToolExecutionCompletedData {
-                                                    tool_call_id: item_id,
-                                                    tool_name: "run_command".to_string(),
-                                                    tool_result: ToolExecutionResult::RunCommand {
-                                                        exit_code,
-                                                        stdout: output,
-                                                        stderr: String::new(),
-                                                    },
-                                                    success,
-                                                    error: if success {
-                                                        None
-                                                    } else {
-                                                        Some(format!(
-                                                            "Command failed with exit code {exit_code}"
-                                                        ))
-                                                    },
-                                                },
-                                            ));
+                                        let error_message = if success {
+                                            None
+                                        } else {
+                                            Some(format!("Command failed with exit code {exit_code}"))
+                                        };
+                                        emitter.tool_completed(ToolCompletedPayload {
+                                            tool_call_id: &item_id,
+                                            tool_name: "run_command",
+                                            tool_result: json!({
+                                                "kind": "RunCommand",
+                                                "exit_code": exit_code,
+                                                "stdout": output,
+                                                "stderr": "",
+                                            }),
+                                            success,
+                                            error: error_message.as_deref(),
+                                        });
                                     }
                                     "fileChange" => {
                                         let file_changes = parse_codex_file_changes(&item);
@@ -5174,27 +5181,18 @@ impl Backend for CodexBackend {
                                                     .unwrap_or_else(|| {
                                                         codex_file_change_call_id(&item_id, idx, total)
                                                     });
-                                                let _ = events_tx
-                                                    .send(ChatEvent::ToolExecutionCompleted(
-                                                        ToolExecutionCompletedData {
-                                                            tool_call_id: call_id,
-                                                            tool_name: "modify_file".to_string(),
-                                                            tool_result:
-                                                                ToolExecutionResult::ModifyFile {
-                                                                    lines_added: change.lines_added,
-                                                                    lines_removed: change.lines_removed,
-                                                                },
-                                                            success,
-                                                            error: if success {
-                                                                None
-                                                            } else {
-                                                                Some(
-                                                                    "File changes were not applied"
-                                                                        .to_string(),
-                                                                )
-                                                            },
-                                                        },
-                                                    ));
+                                                emitter.tool_completed(ToolCompletedPayload {
+                                                    tool_call_id: &call_id,
+                                                    tool_name: "modify_file",
+                                                    tool_result: json!({
+                                                        "kind": "ModifyFile",
+                                                        "lines_added": change.lines_added,
+                                                        "lines_removed": change.lines_removed,
+                                                    }),
+                                                    success,
+                                                    error: (!success)
+                                                        .then_some("File changes were not applied"),
+                                                });
                                             }
                                         }
                                     }
@@ -5209,22 +5207,18 @@ impl Backend for CodexBackend {
                                             item.get("status").and_then(Value::as_str) == Some("completed")
                                                 || item.get("success").and_then(Value::as_bool)
                                                     == Some(true);
-                                        let _ = events_tx
-                                            .send(ChatEvent::ToolExecutionCompleted(
-                                                ToolExecutionCompletedData {
-                                                    tool_call_id: item_id,
-                                                    tool_name: tool_name.clone(),
-                                                    tool_result: ToolExecutionResult::Other {
-                                                        result: item,
-                                                    },
-                                                    success,
-                                                    error: if success {
-                                                        None
-                                                    } else {
-                                                        Some(format!("{tool_name} failed"))
-                                                    },
-                                                },
-                                            ));
+                                        let error_message =
+                                            (!success).then(|| format!("{tool_name} failed"));
+                                        emitter.tool_completed(ToolCompletedPayload {
+                                            tool_call_id: &item_id,
+                                            tool_name: &tool_name,
+                                            tool_result: json!({
+                                                "kind": "Other",
+                                                "result": item,
+                                            }),
+                                            success,
+                                            error: error_message.as_deref(),
+                                        });
                                     }
                                     _ => {}
                                 }
@@ -5255,15 +5249,15 @@ impl Backend for CodexBackend {
                                             .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
-                                        let _ = events_tx
-                                            .send(ChatEvent::ToolRequest(ToolRequest {
-                                                tool_call_id: item_id,
-                                                tool_name: "run_command".to_string(),
-                                                tool_type: ToolRequestType::RunCommand {
-                                                    command,
-                                                    working_directory: cwd,
-                                                },
-                                            }));
+                                        emitter.tool_request(
+                                            &item_id,
+                                            "run_command",
+                                            json!({
+                                                "kind": "RunCommand",
+                                                "command": command,
+                                                "working_directory": cwd,
+                                            }),
+                                        );
                                     }
                                     "fileChange" => {
                                         let file_changes = parse_codex_file_changes(&item);
@@ -5283,16 +5277,13 @@ impl Backend for CodexBackend {
                                         for (change, call_id) in
                                             file_changes.into_iter().zip(call_ids.into_iter())
                                         {
-                                            let _ = events_tx
-                                                .send(ChatEvent::ToolRequest(ToolRequest {
-                                                    tool_call_id: call_id,
-                                                    tool_name: "modify_file".to_string(),
-                                                    tool_type: ToolRequestType::ModifyFile {
-                                                        file_path: change.path,
-                                                        before: change.before,
-                                                        after: change.after,
-                                                    },
-                                                }));
+                                            emit_modify_file_request_to(
+                                                &emitter,
+                                                &call_id,
+                                                &change.path,
+                                                &change.before,
+                                                &change.after,
+                                            );
                                         }
                                     }
                                     "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
@@ -5302,12 +5293,14 @@ impl Backend for CodexBackend {
                                             .and_then(Value::as_str)
                                             .unwrap_or(item_type)
                                             .to_string();
-                                        let _ = events_tx
-                                            .send(ChatEvent::ToolRequest(ToolRequest {
-                                                tool_call_id: item_id,
-                                                tool_name,
-                                                tool_type: ToolRequestType::Other { args: item },
-                                            }));
+                                        emitter.tool_request(
+                                            &item_id,
+                                            &tool_name,
+                                            json!({
+                                                "kind": "Other",
+                                                "args": item,
+                                            }),
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -5353,41 +5346,28 @@ impl Backend for CodexBackend {
                                         );
                                     }
                                     if had_assistant_content || should_emit_empty_stream_end {
-                                        let message = ChatMessage {
-                                            timestamp: unix_now_ms(),
-                                            sender: MessageSender::Assistant {
-                                                agent: CODEX_AGENT_NAME.to_owned(),
-                                            },
+                                        emitter.stream_end(StreamEndPayload {
                                             content: final_text,
+                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                            model: Some(model_name.clone()),
+                                            usage: None,
                                             reasoning: None,
                                             tool_calls: Vec::new(),
-                                            model_info: Some(ModelInfo {
-                                                model: model_name.clone(),
-                                            }),
-                                            token_usage: None,
                                             context_breakdown: None,
-                                            images: None,
-                                        };
-                                        let _ = events_tx
-                                            .send(ChatEvent::StreamEnd(StreamEndData { message }));
+                                        });
                                         stream_closed_by_turn_completion = true;
                                     }
                                     current_message_id = None;
                                 }
                                 if turn_status == "interrupted" {
-                                    let _ = events_tx
-                                        .send(ChatEvent::OperationCancelled(
-                                            protocol::OperationCancelledData {
-                                                message: "Operation cancelled".to_string(),
-                                            },
-                                        ));
+                                    emitter.operation_cancelled("Operation cancelled");
+                                    typing_status_active = false;
                                 }
                                 if let Some(message) = turn_error_message {
-                                    let _ = events_tx.send(backend_error_message(message));
+                                    emitter.error_message(&message);
                                 }
                                 if typing_status_active {
-                                    let _ = events_tx
-                                        .send(ChatEvent::TypingStatusChanged(false));
+                                    emitter.typing_status_changed(false);
                                     typing_status_active = false;
                                 }
                             }
@@ -5402,12 +5382,10 @@ impl Backend for CodexBackend {
                                 let visible_message = backend_message.clone();
                                 let visible_images = payload.images.clone();
                                 let images = protocol_images_to_attachments(payload.images);
-                                if events_tx
-                                    .send(backend_user_message(visible_message, visible_images))
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                                emitter.user_message(
+                                    &visible_message,
+                                    backend_user_image_values(visible_images),
+                                );
                                 let mut input_items = vec![json!({
                                     "type": "text",
                                     "text": backend_message,
@@ -5960,7 +5938,10 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(CodexInner {
             rpc,
-            emitter: Arc::new(TurnEmitter::new(event_tx)),
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                event_tx,
+                AgentName(CODEX_AGENT_NAME),
+            )),
             state: Mutex::new(test_codex_state()),
             steering_tempfile: None,
         });
@@ -6862,7 +6843,10 @@ Do not describe the tool, and do not skip the tool call."#;
                 state.subagent_streams.insert(
                     "spawn-1".to_string(),
                     CodexSubAgentStream {
-                        emitter: Arc::new(TurnEmitter::new(subagent_tx)),
+                        emitter: Arc::new(TurnEmitter::new_for_agent(
+                            subagent_tx,
+                            AgentName(CODEX_AGENT_NAME),
+                        )),
                         receiver_thread_id: Some("thread-sub-1".to_string()),
                         external_agent_id: Some("thread-sub-1".to_string()),
                     },
@@ -7013,6 +6997,101 @@ Do not describe the tool, and do not skip the tool call."#;
                 .expect("reasoning event");
 
         assert_eq!(message_id, "assistant");
+    }
+
+    #[test]
+    fn emit_reasoning_delta_reopens_stream_before_reasoning() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            {
+                let mut state = inner.state.lock().await;
+                state.active_stream = None;
+            }
+
+            inner
+                .emit_reasoning_delta(
+                    &json!({ "itemId": "reason-item-1" }),
+                    "Inspecting constraints.".to_string(),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["TypingStatusChanged", "StreamStart", "StreamReasoningDelta"],
+                "reasoning deltas must be ordered after a synthetic StreamStart: {events:?}"
+            );
+            assert_eq!(
+                events[1]
+                    .get("data")
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(Value::as_str),
+                Some("reason-item-1")
+            );
+            assert_eq!(
+                events[2]
+                    .get("data")
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(Value::as_str),
+                Some("reason-item-1")
+            );
+
+            inner
+                .handle_notification(
+                    "item/agentMessage/delta",
+                    &json!({ "itemId": "assistant-message-1", "delta": "Found" }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["StreamDelta"],
+                "later assistant deltas should reuse the synthetic stream: {events:?}"
+            );
+            assert_eq!(
+                events[0]
+                    .get("data")
+                    .and_then(|data| data.get("message_id"))
+                    .and_then(Value::as_str),
+                Some("assistant-message-1")
+            );
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "assistant-message-1",
+                            "text": "Found"
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(kinds, vec!["StreamEnd"]);
+
+            inner.rpc.shutdown().await;
+        });
     }
 
     #[test]

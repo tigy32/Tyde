@@ -144,7 +144,10 @@ impl ClaudeSession {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(ClaudeInner {
-            emitter: Arc::new(TurnEmitter::new(event_tx)),
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                event_tx,
+                AgentName(CLAUDE_AGENT_NAME),
+            )),
             state: Mutex::new(ClaudeState {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
@@ -1746,7 +1749,10 @@ async fn ensure_subagent_stream(
 
     // Create a ClaudeInner that routes events to the sub-agent's channel.
     let sa_inner = Arc::new(ClaudeInner {
-        emitter: Arc::new(TurnEmitter::new(raw_event_tx)),
+        emitter: Arc::new(TurnEmitter::new_for_agent(
+            raw_event_tx,
+            AgentName(CLAUDE_AGENT_NAME),
+        )),
         state: Mutex::new(ClaudeState::default()),
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
@@ -5806,7 +5812,10 @@ mod tests {
     fn make_test_inner() -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = ClaudeInner {
-            emitter: Arc::new(TurnEmitter::new(event_tx)),
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                event_tx,
+                AgentName(CLAUDE_AGENT_NAME),
+            )),
             state: Mutex::new(ClaudeState {
                 workspace_root: "/tmp/test-workspace".to_string(),
                 ssh_host: None,
@@ -7104,6 +7113,11 @@ mod tests {
             summary.best_reasoning(),
             Some("Checking workspace constraints.".to_string())
         );
+        let event = rx.recv().await.expect("synthetic stream start");
+        assert_eq!(
+            event.get("kind").and_then(Value::as_str),
+            Some("StreamStart")
+        );
         let event = rx.recv().await.expect("reasoning stream event");
         assert_eq!(
             event.get("kind").and_then(Value::as_str),
@@ -7490,6 +7504,8 @@ mod tests {
             Some("Conversation compacted.")
         );
 
+        let stream_start = rx.recv().await.expect("synthetic stream start");
+        assert_eq!(event_kind(&stream_start), Some("StreamStart"));
         let stream_end = rx.recv().await.expect("stream end");
         assert_eq!(event_kind(&stream_end), Some("StreamEnd"));
     }
@@ -7500,7 +7516,10 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         (
             Arc::new(ClaudeInner {
-                emitter: Arc::new(TurnEmitter::new(event_tx)),
+                emitter: Arc::new(TurnEmitter::new_for_agent(
+                    event_tx,
+                    AgentName(CLAUDE_AGENT_NAME),
+                )),
                 state: Mutex::new(ClaudeState {
                     workspace_root,
                     ssh_host: None,
@@ -8482,7 +8501,10 @@ mod tests {
                 message_id: "subagent-toolu_spawn".to_string(),
                 has_explicit_task_prompt: false,
                 inner: Arc::new(ClaudeInner {
-                    emitter: Arc::new(TurnEmitter::new(raw_event_tx)),
+                    emitter: Arc::new(TurnEmitter::new_for_agent(
+                        raw_event_tx,
+                        AgentName(CLAUDE_AGENT_NAME),
+                    )),
                     state: Mutex::new(ClaudeState::default()),
                 }),
             },

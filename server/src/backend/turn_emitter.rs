@@ -3,9 +3,9 @@
 //! (`tycode-core/src/chat/protocol.rs`) and adapted to Tyde's
 //! `mpsc::UnboundedSender<Value>` wire format.
 //!
-//! Every backend (Claude, Codex, Gemini, Kiro, Mock) owns exactly one
-//! `Arc<TurnEmitter>` for the lifetime of the backend and routes every
-//! wire event through its typed methods. There is no `send_raw` escape
+//! Each TurnEmitter-backed backend owns exactly one `Arc<TurnEmitter>`
+//! for the lifetime of the backend and routes every wire event through
+//! its typed methods. There is no `send_raw` escape
 //! hatch: the only way to emit is via a method defined here, so the
 //! cancellation ordering spec documented on `ChatEvent` is
 //! structurally enforceable — if the code compiles, each backend's
@@ -13,15 +13,10 @@
 //! `OperationCancelled` → `TypingStatusChanged(false)` in that order.
 //!
 //! Invariants:
-//!   - `stream_start` sets `stream_open=true`. `stream_end` clears it
-//!     and is always forwarded to the wire — Claude (and others) use
-//!     StreamEnd as a turn-end sentinel even when no StreamStart was
-//!     ever emitted (e.g., placeholder StreamEnd on `/compact`). The
-//!     `stream_open` flag is observational: `is_stream_open()` lets
-//!     backends decide whether a synthetic placeholder is needed, and
-//!     `abort()` uses it to decide whether cancellation must synthesize
-//!     a StreamEnd (so cancellations without an open stream don't emit
-//!     a spurious StreamEnd).
+//!   - `stream_start` opens a stream. If a previous stream is still
+//!     open, the emitter closes it first. If a delta or StreamEnd arrives
+//!     without an open stream, the emitter synthesizes a StreamStart
+//!     first so the frontend never sees unpaired stream events.
 //!   - `tool_request` records the id; `tool_completed` clears it. Any
 //!     still-pending id at cancel time is completed as a cancellation
 //!     inside `operation_cancelled`.
@@ -50,7 +45,11 @@ pub struct TurnEmitter {
 
 struct TurnEmitterState {
     tx: mpsc::UnboundedSender<Value>,
+    default_agent: String,
+    default_model: Option<String>,
     stream_open: bool,
+    assistant_turn_open: bool,
+    current_stream_message_id: Option<String>,
     emitted_tool_requests: IndexMap<String, String>,
     completed_tool_requests: HashSet<String>,
 }
@@ -110,10 +109,18 @@ pub struct RetryAttemptPayload<'a> {
 
 impl TurnEmitter {
     pub fn new(tx: mpsc::UnboundedSender<Value>) -> Self {
+        Self::new_for_agent(tx, AgentName("assistant"))
+    }
+
+    pub fn new_for_agent(tx: mpsc::UnboundedSender<Value>, agent: AgentName<'_>) -> Self {
         Self {
             inner: std::sync::Mutex::new(TurnEmitterState {
                 tx,
+                default_agent: agent.0.to_string(),
+                default_model: None,
                 stream_open: false,
+                assistant_turn_open: false,
+                current_stream_message_id: None,
                 emitted_tool_requests: IndexMap::new(),
                 completed_tool_requests: HashSet::new(),
             }),
@@ -130,20 +137,14 @@ impl TurnEmitter {
         if text.is_empty() {
             return;
         }
-        self.lock().send(json!({
-            "kind": "StreamDelta",
-            "data": { "message_id": message_id, "text": text },
-        }));
+        self.lock().stream_delta(message_id, text);
     }
 
     pub fn stream_reasoning_delta(&self, message_id: &str, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.lock().send(json!({
-            "kind": "StreamReasoningDelta",
-            "data": { "message_id": message_id, "text": text },
-        }));
+        self.lock().stream_reasoning_delta(message_id, text);
     }
 
     pub fn stream_end(&self, payload: StreamEndPayload<'_>) {
@@ -172,7 +173,9 @@ impl TurnEmitter {
     // ---------- Messages (user / assistant / system / error / warning) ----------
 
     pub fn user_message(&self, content: &str, images: Vec<Value>) {
-        self.lock().send(json!({
+        let mut state = self.lock();
+        state.assistant_turn_open = false;
+        state.send(json!({
             "kind": "MessageAdded",
             "data": {
                 "timestamp": now_ms(),
@@ -189,7 +192,9 @@ impl TurnEmitter {
     }
 
     pub fn system_message(&self, content: &str) {
-        self.lock().send(json!({
+        let mut state = self.lock();
+        state.assistant_turn_open = false;
+        state.send(json!({
             "kind": "MessageAdded",
             "data": {
                 "timestamp": now_ms(),
@@ -206,7 +211,9 @@ impl TurnEmitter {
     }
 
     pub fn warning_message(&self, content: &str) {
-        self.lock().send(json!({
+        let mut state = self.lock();
+        state.assistant_turn_open = false;
+        state.send(json!({
             "kind": "MessageAdded",
             "data": {
                 "timestamp": now_ms(),
@@ -223,7 +230,9 @@ impl TurnEmitter {
     }
 
     pub fn error_message(&self, content: &str) {
-        self.lock().send(json!({
+        let mut state = self.lock();
+        state.assistant_turn_open = false;
+        state.send(json!({
             "kind": "MessageAdded",
             "data": {
                 "timestamp": now_ms(),
@@ -295,7 +304,9 @@ impl TurnEmitter {
     }
 
     pub fn conversation_cleared(&self) {
-        self.lock().send(json!({ "kind": "ConversationCleared" }));
+        let mut state = self.lock();
+        state.reset_turn_state();
+        state.send(json!({ "kind": "ConversationCleared" }));
     }
 
     pub fn settings(&self, data: Value) {
@@ -368,7 +379,17 @@ impl TurnEmitterState {
     }
 
     fn stream_start(&mut self, message_id: &str, agent: AgentName<'_>, model: Option<&str>) {
+        if self.stream_open {
+            self.stream_end(StreamEndPayload::default());
+        }
+        self.complete_pending_tools_as_cancelled("Tool execution was cancelled before new stream");
+
+        let message_id = normalized_id(message_id, "assistant");
         self.stream_open = true;
+        self.assistant_turn_open = true;
+        self.current_stream_message_id = Some(message_id.to_string());
+        self.default_agent = agent.0.to_string();
+        self.default_model = model.map(str::to_owned);
         let model_value = model
             .map(|m| Value::String(m.to_owned()))
             .unwrap_or(Value::Null);
@@ -382,19 +403,62 @@ impl TurnEmitterState {
         }));
     }
 
-    fn stream_end(&mut self, payload: StreamEndPayload<'_>) {
-        // Always forward: Claude uses a placeholder StreamEnd as a
-        // turn-end sentinel even when no StreamStart was emitted (e.g.,
-        // /compact, or a turn that completes before any content).
-        self.stream_open = false;
-        self.send(build_stream_end_value(&payload));
+    fn stream_delta(&mut self, message_id: &str, text: &str) {
+        self.ensure_stream_open(message_id);
+        let message_id = normalized_id(message_id, "assistant");
+        self.current_stream_message_id = Some(message_id.to_string());
+        self.send(json!({
+            "kind": "StreamDelta",
+            "data": { "message_id": message_id, "text": text },
+        }));
     }
 
-    fn assistant_message(&self, payload: AssistantMessagePayload<'_>) {
+    fn stream_reasoning_delta(&mut self, message_id: &str, text: &str) {
+        self.ensure_stream_open(message_id);
+        let message_id = normalized_id(message_id, "assistant");
+        self.current_stream_message_id = Some(message_id.to_string());
+        self.send(json!({
+            "kind": "StreamReasoningDelta",
+            "data": { "message_id": message_id, "text": text },
+        }));
+    }
+
+    fn stream_end(&mut self, payload: StreamEndPayload<'_>) {
+        if !self.stream_open {
+            self.open_synthetic_stream("assistant");
+        }
+        self.stream_open = false;
+        self.current_stream_message_id = None;
+        self.send(build_stream_end_value(&payload, &self.default_agent));
+    }
+
+    fn assistant_message(&mut self, payload: AssistantMessagePayload<'_>) {
+        self.complete_pending_tools_as_cancelled(
+            "Tool execution was cancelled before assistant message",
+        );
+        self.assistant_turn_open = true;
         self.send(build_assistant_message_value(&payload));
     }
 
     fn tool_request(&mut self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
+        if !self.assistant_turn_open {
+            self.ensure_assistant_turn_open(tool_call_id);
+        }
+        if self.is_tool_pending(tool_call_id) {
+            let existing_name = self
+                .emitted_tool_requests
+                .get(tool_call_id)
+                .cloned()
+                .unwrap_or_else(|| tool_name.to_string());
+            self.send_tool_completed(
+                tool_call_id,
+                &existing_name,
+                cancelled_tool_result("Duplicate tool request was superseded"),
+                false,
+                Some("Duplicate tool request was superseded"),
+            );
+        }
+        self.completed_tool_requests.remove(tool_call_id);
         self.emitted_tool_requests
             .insert(tool_call_id.to_string(), tool_name.to_string());
         self.send(json!({
@@ -408,19 +472,71 @@ impl TurnEmitterState {
     }
 
     fn tool_completed(&mut self, data: ToolCompletedPayload<'_>) {
+        match self.pending_tool_name(data.tool_call_id).cloned() {
+            Some(expected_name) if expected_name != data.tool_name => {
+                self.send_tool_completed(
+                    data.tool_call_id,
+                    &expected_name,
+                    cancelled_tool_result("Tool completion name mismatch was superseded"),
+                    false,
+                    Some("Tool completion name mismatch was superseded"),
+                );
+                self.tool_request(
+                    data.tool_call_id,
+                    data.tool_name,
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "synthetic": true,
+                            "reason": "tool completion arrived without a matching request",
+                        },
+                    }),
+                );
+            }
+            Some(_) => {}
+            None => {
+                self.tool_request(
+                    data.tool_call_id,
+                    data.tool_name,
+                    json!({
+                        "kind": "Other",
+                        "args": {
+                            "synthetic": true,
+                            "reason": "tool completion arrived without a pending request",
+                        },
+                    }),
+                );
+            }
+        }
+        self.send_tool_completed(
+            data.tool_call_id,
+            data.tool_name,
+            data.tool_result,
+            data.success,
+            data.error,
+        );
+    }
+
+    fn send_tool_completed(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_result: Value,
+        success: bool,
+        error: Option<&str>,
+    ) {
         self.completed_tool_requests
-            .insert(data.tool_call_id.to_string());
-        let error_value = data
-            .error
+            .insert(tool_call_id.to_string());
+        let error_value = error
             .map(|s| Value::String(s.to_owned()))
             .unwrap_or(Value::Null);
         self.send(json!({
             "kind": "ToolExecutionCompleted",
             "data": {
-                "tool_call_id": data.tool_call_id,
-                "tool_name": data.tool_name,
-                "tool_result": data.tool_result,
-                "success": data.success,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_result": tool_result,
+                "success": success,
                 "error": error_value,
             },
         }));
@@ -431,27 +547,7 @@ impl TurnEmitterState {
             self.stream_end(StreamEndPayload::default());
         }
 
-        let pending: Vec<(String, String)> = self
-            .emitted_tool_requests
-            .iter()
-            .filter(|(id, _)| !self.completed_tool_requests.contains(*id))
-            .map(|(id, name)| (id.clone(), name.clone()))
-            .collect();
-
-        for (tool_call_id, tool_name) in pending {
-            self.tool_completed(ToolCompletedPayload {
-                tool_call_id: &tool_call_id,
-                tool_name: &tool_name,
-                tool_result: json!({
-                    "Error": {
-                        "short_message": "Cancelled",
-                        "detailed_message": "Tool execution was cancelled by user",
-                    }
-                }),
-                success: false,
-                error: Some("Cancelled by user"),
-            });
-        }
+        self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user");
 
         self.send(json!({
             "kind": "OperationCancelled",
@@ -461,14 +557,67 @@ impl TurnEmitterState {
             "kind": "TypingStatusChanged",
             "data": false,
         }));
-        // Reset per-turn state so the next turn starts clean.
+        self.reset_turn_state();
+    }
+
+    fn ensure_stream_open(&mut self, message_id: &str) {
+        if !self.stream_open {
+            self.open_synthetic_stream(message_id);
+        }
+    }
+
+    fn ensure_assistant_turn_open(&mut self, message_id: &str) {
+        if !self.assistant_turn_open {
+            self.open_synthetic_stream(message_id);
+        }
+    }
+
+    fn open_synthetic_stream(&mut self, message_id: &str) {
+        let agent = self.default_agent.clone();
+        let model = self.default_model.clone();
+        self.stream_start(message_id, AgentName(&agent), model.as_deref());
+    }
+
+    fn complete_pending_tools_as_cancelled(&mut self, detailed_message: &str) {
+        let pending: Vec<(String, String)> = self
+            .emitted_tool_requests
+            .iter()
+            .filter(|(id, _)| !self.completed_tool_requests.contains(*id))
+            .map(|(id, name)| (id.clone(), name.clone()))
+            .collect();
+
+        for (tool_call_id, tool_name) in pending {
+            self.send_tool_completed(
+                &tool_call_id,
+                &tool_name,
+                cancelled_tool_result(detailed_message),
+                false,
+                Some("Cancelled"),
+            );
+        }
+    }
+
+    fn pending_tool_name(&self, tool_call_id: &str) -> Option<&String> {
+        self.emitted_tool_requests
+            .get(tool_call_id)
+            .filter(|_| !self.completed_tool_requests.contains(tool_call_id))
+    }
+
+    fn is_tool_pending(&self, tool_call_id: &str) -> bool {
+        self.pending_tool_name(tool_call_id).is_some()
+    }
+
+    fn reset_turn_state(&mut self) {
+        self.stream_open = false;
+        self.assistant_turn_open = false;
+        self.current_stream_message_id = None;
         self.emitted_tool_requests.clear();
         self.completed_tool_requests.clear();
     }
 }
 
-fn build_stream_end_value(payload: &StreamEndPayload<'_>) -> Value {
-    let agent_name = payload.agent.map(|a| a.0).unwrap_or("claude");
+fn build_stream_end_value(payload: &StreamEndPayload<'_>, default_agent: &str) -> Value {
+    let agent_name = payload.agent.map(|a| a.0).unwrap_or(default_agent);
     let model_info = payload
         .model
         .as_deref()
@@ -502,6 +651,18 @@ fn build_stream_end_value(payload: &StreamEndPayload<'_>) -> Value {
     })
 }
 
+fn normalized_id<'a>(id: &'a str, fallback: &'a str) -> &'a str {
+    if id.trim().is_empty() { fallback } else { id }
+}
+
+fn cancelled_tool_result(detailed_message: &str) -> Value {
+    json!({
+        "kind": "Error",
+        "short_message": "Cancelled",
+        "detailed_message": detailed_message,
+    })
+}
+
 fn build_assistant_message_value(payload: &AssistantMessagePayload<'_>) -> Value {
     json!({
         "kind": "MessageAdded",
@@ -530,15 +691,87 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{
+        AgentId, AgentOrigin, BackendKind, ChatEvent, Envelope, FrameKind, NewAgentPayload,
+        ProtocolValidator, StreamPath,
+    };
+
+    fn recv_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
 
     fn recv_kinds(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
-        let mut kinds = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Some(kind) = event.get("kind").and_then(Value::as_str) {
-                kinds.push(kind.to_owned());
-            }
+        event_kinds(&recv_events(rx))
+    }
+
+    fn event_kinds(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event.get("kind").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn assert_protocol_valid(events: &[Value]) {
+        let mut validator = ProtocolValidator::new();
+        let agent_stream = StreamPath("/agent/agent-1/instance-1".to_string());
+        let new_agent = Envelope::from_payload(
+            StreamPath("/host/local".to_string()),
+            FrameKind::NewAgent,
+            1,
+            &NewAgentPayload {
+                agent_id: AgentId("agent-1".to_string()),
+                name: "Test Agent".to_string(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Codex,
+                workspace_roots: vec!["/tmp".to_string()],
+                custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
+                project_id: None,
+                parent_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: agent_stream.clone(),
+            },
+        )
+        .expect("serialize NewAgent");
+        validator
+            .validate_envelope(&new_agent)
+            .expect("NewAgent validates");
+
+        for (index, event) in events.iter().enumerate() {
+            let chat_event: ChatEvent =
+                serde_json::from_value(event.clone()).expect("emitter produced ChatEvent JSON");
+            let envelope = Envelope::from_payload(
+                agent_stream.clone(),
+                FrameKind::ChatEvent,
+                index as u64 + 2,
+                &chat_event,
+            )
+            .expect("serialize ChatEvent");
+            validator
+                .validate_envelope(&envelope)
+                .unwrap_or_else(|err| panic!("event {index} violates protocol: {err}"));
         }
-        kinds
+    }
+
+    fn run_command_request() -> Value {
+        json!({
+            "kind": "RunCommand",
+            "command": "echo ok",
+            "working_directory": "/tmp",
+        })
+    }
+
+    fn read_files_request() -> Value {
+        json!({
+            "kind": "ReadFiles",
+            "file_paths": ["/tmp/file.txt"],
+        })
     }
 
     #[test]
@@ -565,8 +798,8 @@ mod tests {
         let emitter = TurnEmitter::new(tx);
         emitter.stream_start("msg-1", AgentName("claude"), None);
         emitter.stream_end(StreamEndPayload::default());
-        emitter.tool_request("tool-a", "Bash", json!({ "kind": "RunCommand" }));
-        emitter.tool_request("tool-b", "Read", json!({ "kind": "ReadFiles" }));
+        emitter.tool_request("tool-a", "Bash", run_command_request());
+        emitter.tool_request("tool-b", "Read", read_files_request());
         emitter.operation_cancelled("bye");
         drop(emitter);
         let kinds = recv_kinds(&mut rx);
@@ -589,22 +822,29 @@ mod tests {
     fn already_completed_tools_are_not_re_completed_on_cancel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new(tx);
-        emitter.tool_request("tool-a", "Bash", json!({ "kind": "RunCommand" }));
+        emitter.tool_request("tool-a", "Bash", run_command_request());
         emitter.tool_completed(ToolCompletedPayload {
             tool_call_id: "tool-a",
             tool_name: "Bash",
-            tool_result: json!({}),
+            tool_result: json!({
+                "kind": "Other",
+                "result": {},
+            }),
             success: true,
             error: None,
         });
         emitter.operation_cancelled("bye");
         drop(emitter);
-        let kinds = recv_kinds(&mut rx);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        let kinds = event_kinds(&events);
         assert_eq!(
             kinds,
             vec![
+                "StreamStart",
                 "ToolRequest",
                 "ToolExecutionCompleted",
+                "StreamEnd",
                 "OperationCancelled",
                 "TypingStatusChanged",
             ]
@@ -612,16 +852,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_end_without_open_stream_still_emits() {
-        // Claude uses a placeholder StreamEnd as a turn-end sentinel
-        // when no StreamStart was issued (e.g., /compact, or a turn
-        // that ends before any content streams). The emitter must
-        // forward it.
+    fn stream_end_without_open_stream_synthesizes_stream_start() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let emitter = TurnEmitter::new(tx);
         emitter.stream_end(StreamEndPayload::default());
         drop(emitter);
-        assert_eq!(recv_kinds(&mut rx), vec!["StreamEnd"]);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(event_kinds(&events), vec!["StreamStart", "StreamEnd"]);
     }
 
     #[test]
@@ -655,14 +893,14 @@ mod tests {
 
         // Turn 1: open a tool request, cancel.
         emitter.stream_start("msg-1", AgentName("claude"), None);
-        emitter.tool_request("tool-a", "Bash", json!({ "kind": "RunCommand" }));
+        emitter.tool_request("tool-a", "Bash", run_command_request());
         emitter.operation_cancelled("stop");
         // Drain.
         let _ = recv_kinds(&mut rx);
 
         // Turn 2: a new stream, a new tool, then a second cancel.
         emitter.stream_start("msg-2", AgentName("claude"), None);
-        emitter.tool_request("tool-b", "Read", json!({ "kind": "ReadFiles" }));
+        emitter.tool_request("tool-b", "Read", read_files_request());
         emitter.operation_cancelled("stop again");
 
         let kinds = recv_kinds(&mut rx);
@@ -686,7 +924,80 @@ mod tests {
         emitter.stream_delta("msg-1", "");
         emitter.stream_delta("msg-1", "hi");
         drop(emitter);
-        let kinds = recv_kinds(&mut rx);
-        assert_eq!(kinds, vec!["StreamDelta"]);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(event_kinds(&events), vec!["StreamStart", "StreamDelta"]);
+    }
+
+    #[test]
+    fn reasoning_delta_without_open_stream_synthesizes_stream_start() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        emitter.stream_reasoning_delta("reason-1", "thinking");
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec!["StreamStart", "StreamReasoningDelta"]
+        );
+        assert_eq!(
+            events[0]
+                .get("data")
+                .and_then(|data| data.get("agent"))
+                .and_then(Value::as_str),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn second_stream_start_closes_previous_stream_first() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        emitter.stream_start("msg-1", AgentName("codex"), Some("model-a"));
+        emitter.stream_start("msg-2", AgentName("codex"), Some("model-a"));
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec!["StreamStart", "StreamEnd", "StreamStart"]
+        );
+    }
+
+    #[test]
+    fn tool_request_without_assistant_turn_synthesizes_stream_start() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        emitter.tool_request("tool-a", "run_command", run_command_request());
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(event_kinds(&events), vec!["StreamStart", "ToolRequest"]);
+    }
+
+    #[test]
+    fn unknown_tool_completion_synthesizes_matching_request() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-a",
+            tool_name: "run_command",
+            tool_result: json!({
+                "kind": "RunCommand",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }),
+            success: true,
+            error: None,
+        });
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events),
+            vec!["StreamStart", "ToolRequest", "ToolExecutionCompleted"]
+        );
     }
 }

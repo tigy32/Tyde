@@ -122,7 +122,10 @@ impl GeminiSession {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(GeminiInner {
-            emitter: Arc::new(TurnEmitter::new(event_tx)),
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                event_tx,
+                AgentName(GEMINI_AGENT_NAME),
+            )),
             state: Mutex::new(GeminiState {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
@@ -1860,22 +1863,6 @@ impl Backend for GeminiBackend {
                             tracing::error!("Failed to interrupt Gemini turn: {err}");
                             break;
                         }
-                        if events_tx
-                            .send(ChatEvent::OperationCancelled(
-                                protocol::OperationCancelledData {
-                                    message: "Gemini turn cancelled.".to_string(),
-                                },
-                            ))
-                            .is_err()
-                        {
-                            break;
-                        }
-                        if events_tx
-                            .send(ChatEvent::TypingStatusChanged(false))
-                            .is_err()
-                        {
-                            break;
-                        }
                     }
                 }
             }
@@ -2030,22 +2017,6 @@ impl Backend for GeminiBackend {
                         };
                         if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
                             tracing::error!("Failed to interrupt resumed Gemini turn: {err}");
-                            break;
-                        }
-                        if events_tx
-                            .send(ChatEvent::OperationCancelled(
-                                protocol::OperationCancelledData {
-                                    message: "Gemini turn cancelled.".to_string(),
-                                },
-                            ))
-                            .is_err()
-                        {
-                            break;
-                        }
-                        if events_tx
-                            .send(ChatEvent::TypingStatusChanged(false))
-                            .is_err()
-                        {
                             break;
                         }
                     }

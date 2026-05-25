@@ -234,7 +234,10 @@ impl KiroSession {
 
         let inner = Arc::new(KiroInner {
             bridge,
-            emitter: Arc::new(TurnEmitter::new(event_tx)),
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                event_tx,
+                AgentName(KIRO_AGENT_NAME),
+            )),
             shutting_down: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             state: Mutex::new(KiroState {
