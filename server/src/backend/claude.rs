@@ -3418,10 +3418,13 @@ fn estimate_turn_input_bytes(prompt: &str, images: &[ImageAttachment]) -> u64 {
 }
 
 fn build_stream_json_user_message(prompt: &str, images: &[ImageAttachment]) -> Value {
-    let mut content_blocks = vec![json!({
-        "type": "text",
-        "text": prompt,
-    })];
+    let mut content_blocks = Vec::new();
+    if !prompt.trim().is_empty() {
+        content_blocks.push(json!({
+            "type": "text",
+            "text": prompt,
+        }));
+    }
 
     for image in images {
         let media_type =
@@ -6164,6 +6167,37 @@ mod tests {
         );
         assert_eq!(
             content[1]
+                .get("source")
+                .and_then(|source| source.get("data"))
+                .and_then(Value::as_str),
+            Some("base64-image")
+        );
+    }
+
+    #[test]
+    fn build_stream_json_user_message_allows_image_only_input() {
+        let images = vec![make_image("base64-image", "image/png")];
+        let payload = build_stream_json_user_message("", &images);
+        let content = payload
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .expect("content blocks");
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            content[0]
+                .get("source")
+                .and_then(|source| source.get("media_type"))
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            content[0]
                 .get("source")
                 .and_then(|source| source.get("data"))
                 .and_then(Value::as_str),

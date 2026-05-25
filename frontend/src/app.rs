@@ -62,6 +62,7 @@ thread_local! {
     static DEVTOOLS_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
     static KEYDOWN_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static CLICK_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static FILE_DROP_LISTENER_HANDLES: RefCell<Vec<EventListenerHandle>> = const { RefCell::new(Vec::new()) };
 }
 
 fn set_app_listeners_active(active: bool) {
@@ -104,6 +105,11 @@ fn clear_app_listeners() {
     });
     CLICK_LISTENER_HANDLE.with(|handle| {
         if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    FILE_DROP_LISTENER_HANDLES.with(|handles| {
+        for handle in handles.borrow_mut().drain(..) {
             handle.remove();
         }
     });
@@ -239,6 +245,61 @@ fn install_click_listener(state: AppState) {
     });
 }
 
+fn drag_type_is_files(value: &str) -> bool {
+    value == "Files"
+}
+
+fn data_transfer_types_include_files(types: &js_sys::Array) -> bool {
+    types
+        .iter()
+        .any(|value| value.as_string().as_deref().is_some_and(drag_type_is_files))
+}
+
+fn event_has_dragged_files(ev: &web_sys::Event) -> bool {
+    let Some(drag_event) = ev.dyn_ref::<web_sys::DragEvent>() else {
+        return false;
+    };
+    let Some(data_transfer) = drag_event.data_transfer() else {
+        return false;
+    };
+
+    if data_transfer_types_include_files(&data_transfer.types()) {
+        return true;
+    }
+
+    data_transfer
+        .files()
+        .is_some_and(|files| files.length() > 0)
+}
+
+fn install_file_drop_navigation_guard() {
+    FILE_DROP_LISTENER_HANDLES.with(|handles| {
+        for handle in handles.borrow_mut().drain(..) {
+            handle.remove();
+        }
+    });
+
+    let window = web_sys::window().unwrap();
+    let mut handles = Vec::new();
+    for event in ["dragover", "drop"] {
+        let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+            if event_has_dragged_files(&ev) {
+                ev.prevent_default();
+            }
+        });
+        let _ = window.add_event_listener_with_callback(event, callback.as_ref().unchecked_ref());
+        handles.push(EventListenerHandle {
+            window: window.clone(),
+            event,
+            callback,
+        });
+    }
+
+    FILE_DROP_LISTENER_HANDLES.with(|slot| {
+        slot.borrow_mut().extend(handles);
+    });
+}
+
 fn resolve_chat_file_href(href: &str, project_roots: &[String]) -> Option<ProjectPath> {
     let decoded = percent_decode_path(href).unwrap_or_else(|| href.to_owned());
     let normalized = normalize_file_reference(&decoded)?;
@@ -361,8 +422,14 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_chat_file_href;
+    use super::{drag_type_is_files, resolve_chat_file_href};
     use protocol::{ProjectPath, ProjectRootPath};
+
+    #[test]
+    fn recognizes_browser_file_drag_type() {
+        assert!(drag_type_is_files("Files"));
+        assert!(!drag_type_is_files("text/plain"));
+    }
 
     #[test]
     fn resolves_absolute_file_links_with_line_numbers() {
@@ -503,6 +570,9 @@ pub fn App() -> impl IntoView {
     });
     Effect::new(move |_| {
         install_click_listener(state_for_clicks.clone());
+    });
+    Effect::new(move |_| {
+        install_file_drop_navigation_guard();
     });
 
     let state_for_feedback = state.clone();
