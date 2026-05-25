@@ -343,6 +343,34 @@ async fn expect_turn_on_stream(
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
 }
 
+async fn expect_replayed_turn_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true)").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
+    let env = expect_chat_event_on_stream(client, stream, "MessageAdded").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    match &event {
+        ChatEvent::MessageAdded(message) => {
+            assert!(
+                message.content.contains(expected_text),
+                "unexpected replayed message text on {}: {}",
+                stream,
+                message.content,
+            );
+        }
+        other => panic!("expected replayed MessageAdded on {stream}, got {other:?}"),
+    }
+
+    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+}
+
 async fn expect_chat_event_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
@@ -1136,7 +1164,7 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
         Some(&parent_new.agent_id)
     );
 
-    expect_turn_on_stream(
+    expect_replayed_turn_on_stream(
         &mut late_client,
         &replayed_child_new.instance_stream,
         "mock native child response to: parent prompt",
@@ -1814,9 +1842,7 @@ async fn late_joining_client_gets_replay() {
         .expect("failed to parse AgentStartPayload for client 1");
     assert_eq!(client1_start.agent_id, agent_id);
 
-    // Client 1: TypingStatusChanged(true) -> StreamStart -> StreamDelta -> StreamEnd -> TypingStatusChanged(false).
-    let mut client1_chat_payloads = Vec::new();
-
+    // Client 1: live stream remains granular.
     let env = expect_chat_event(
         &mut fixture.client,
         "TypingStatusChanged(true) for client 1",
@@ -1827,8 +1853,6 @@ async fn late_joining_client_gets_replay() {
         .parse_payload()
         .expect("failed to parse TypingStatusChanged(true) for client 1");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
-    client1_chat_payloads.push(env.payload.clone());
-
     let env = expect_chat_event(&mut fixture.client, "StreamStart for client 1").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     assert_eq!(env.stream, client1_instance_stream);
@@ -1836,8 +1860,6 @@ async fn late_joining_client_gets_replay() {
         .parse_payload()
         .expect("failed to parse StreamStart for client 1");
     assert!(matches!(event, ChatEvent::StreamStart(..)));
-    client1_chat_payloads.push(env.payload.clone());
-
     let env = expect_chat_event(&mut fixture.client, "StreamDelta for client 1").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     assert_eq!(env.stream, client1_instance_stream);
@@ -1856,8 +1878,6 @@ async fn late_joining_client_gets_replay() {
         }
         other => panic!("expected StreamDelta for client 1, got {other:?}"),
     }
-    client1_chat_payloads.push(env.payload.clone());
-
     let env = expect_chat_event(&mut fixture.client, "StreamEnd for client 1").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     assert_eq!(env.stream, client1_instance_stream);
@@ -1865,8 +1885,6 @@ async fn late_joining_client_gets_replay() {
         .parse_payload()
         .expect("failed to parse StreamEnd for client 1");
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
-    client1_chat_payloads.push(env.payload.clone());
-
     let env = expect_chat_event(
         &mut fixture.client,
         "TypingStatusChanged(false) for client 1",
@@ -1877,8 +1895,6 @@ async fn late_joining_client_gets_replay() {
         .parse_payload()
         .expect("failed to parse TypingStatusChanged(false) for client 1");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
-    client1_chat_payloads.push(env.payload.clone());
-
     // Client 2 connects late and should receive NewAgent + full replay on its own instance stream.
     let mut client2 = fixture.connect().await;
 
@@ -1911,71 +1927,12 @@ async fn late_joining_client_gets_replay() {
     assert_eq!(client2_start.parent_agent_id, client1_start.parent_agent_id);
     assert_eq!(client2_start.created_at_ms, client1_start.created_at_ms);
 
-    let mut client2_chat_payloads = Vec::new();
-
-    let env = expect_next_event(&mut client2, "TypingStatusChanged(true) for client 2").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env
-        .parse_payload()
-        .expect("failed to parse TypingStatusChanged(true) for client 2");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
-    client2_chat_payloads.push(env.payload.clone());
-
-    let env = expect_next_event(&mut client2, "StreamStart for client 2").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    assert_eq!(env.stream, client2_instance_stream);
-    let event: ChatEvent = env
-        .parse_payload()
-        .expect("failed to parse StreamStart for client 2");
-    assert!(matches!(event, ChatEvent::StreamStart(..)));
-    client2_chat_payloads.push(env.payload.clone());
-
-    let env = expect_next_event(&mut client2, "StreamDelta for client 2").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    assert_eq!(env.stream, client2_instance_stream);
-    let event: ChatEvent = env
-        .parse_payload()
-        .expect("failed to parse StreamDelta for client 2");
-    match &event {
-        ChatEvent::StreamDelta(delta) => {
-            assert!(
-                delta
-                    .text
-                    .contains("mock backend response to: late join replay"),
-                "unexpected StreamDelta text for client 2: {}",
-                delta.text,
-            );
-        }
-        other => panic!("expected StreamDelta for client 2, got {other:?}"),
-    }
-    client2_chat_payloads.push(env.payload.clone());
-
-    let env = expect_next_event(&mut client2, "StreamEnd for client 2").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    assert_eq!(env.stream, client2_instance_stream);
-    let event: ChatEvent = env
-        .parse_payload()
-        .expect("failed to parse StreamEnd for client 2");
-    assert!(matches!(event, ChatEvent::StreamEnd(..)));
-    client2_chat_payloads.push(env.payload.clone());
-
-    let env = expect_next_event(&mut client2, "TypingStatusChanged(false) for client 2").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env
-        .parse_payload()
-        .expect("failed to parse TypingStatusChanged(false) for client 2");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
-    client2_chat_payloads.push(env.payload.clone());
-
-    assert_eq!(
-        client2_chat_payloads.len(),
-        client1_chat_payloads.len(),
-        "late-joining client should replay same number of ChatEvents",
-    );
-    assert_eq!(
-        client2_chat_payloads, client1_chat_payloads,
-        "replayed ChatEvent payloads must match original client payloads",
-    );
+    expect_replayed_turn_on_stream(
+        &mut client2,
+        &client2_instance_stream,
+        "mock backend response to: late join replay",
+    )
+    .await;
 }
 
 #[tokio::test]

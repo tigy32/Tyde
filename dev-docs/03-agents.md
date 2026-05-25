@@ -79,26 +79,30 @@ Example: `/agent/a1b2c3d4-e5f6-7890-abcd-ef1234567890/f9e8d7c6-b5a4-3210-fedc-ba
 ### Multi-frontend and replay
 
 Multiple frontends can connect to the same server. Each gets their own
-`instance_id` for the same `agent_id`, but both receive **identical event
-streams**.
+`instance_id` for the same `agent_id`, and both converge on the same agent
+state.
 
-When a new frontend subscribes to an existing agent, the server replays all
-events from the beginning of that agent's history on the new instance stream,
-then continues streaming live events. The replayed events have fresh sequence
-numbers (starting at 0) on the new instance — they are not copies of sequence
-numbers from other instances.
+When a new frontend subscribes to an existing agent, the server replays a
+semantic history on the new instance stream, then continues streaming live
+events. Live subscribers receive granular streaming events as they happen, but
+completed streams are stored for replay as `MessageAdded` plus any tool
+events. If a subscriber joins while a stream is active, the replay includes the
+completed semantic history, then one `StreamStart` plus aggregated text and
+reasoning deltas for the in-progress stream. The replayed events have fresh
+sequence numbers (starting at 0) on the new instance — they are not copies of
+sequence numbers from other instances.
 
 This means:
 - Frontend A spawns an agent. It gets `/agent/<id>/<instance_A>`.
 - Frontend B connects later and subscribes. It gets `/agent/<id>/<instance_B>`
-  with a full replay of all events that have occurred so far, followed by live
-  events going forward.
-- Both frontends see the same logical event stream. The server stores the
-  canonical event log per agent, not per subscriber.
+  with a compact replay of all completed work, followed by live events going
+  forward.
+- Both frontends see the same logical agent state. The server stores the
+  canonical replay log per agent, not per subscriber.
 
 When a new client completes the handshake, the server automatically subscribes
 it to all active (non-terminated) agents. For each active agent, the server
-allocates a new `instance_id`, replays the full event history, and then streams
+allocates a new `instance_id`, replays the semantic history, and then streams
 live events. There is no explicit "subscribe" input event — subscription is
 automatic on connection.
 
@@ -984,17 +988,15 @@ Frontend A                      Server                      Frontend B
   │                               │  allocates new instance_id    │
   │                               │                               │
   │                               │──── AgentStart ──────────────→│  (replay, seq 0)
-  │                               │──── ChatEvent(StreamStart) ──→│  (replay, seq 1)
-  │                               │──── ChatEvent(StreamDelta) ──→│  (replay, seq 2)
-  │                               │──── ChatEvent(StreamEnd) ────→│  (replay, seq 3)
+  │                               │──── ChatEvent(MessageAdded) ─→│  (compact replay)
   │                               │                               │
   │─── SendMessage ──────────────→│                               │
   │←── ChatEvent(StreamStart) ───│──── ChatEvent(StreamStart) ──→│  (live)
   │    ...                        │    ...                        │
 ```
 
-Both frontends see identical logical event streams. Frontend B's replay has
-fresh sequence numbers starting at 0 on its own instance stream.
+Both frontends see identical logical agent state. Frontend B's compact replay
+has fresh sequence numbers starting at 0 on its own instance stream.
 
 ---
 
@@ -1010,17 +1012,21 @@ fresh sequence numbers starting at 0 on its own instance stream.
 
 - **Agent actor.** Each agent runs as a single tokio task (actor pattern per
   philosophy). The actor owns: the backend subprocess handle, the agent's
-  state, and the canonical event log for that agent. It receives messages via
+  state, and the canonical replay log for that agent. It receives messages via
   an `mpsc` channel from the connection handler.
-- **Event log.** Each agent actor maintains an ordered log of all events
-  (`AgentStart`, `ChatEvent`, and `AgentError` frames) emitted since creation.
-  This log is used for replay when new subscribers connect.
+- **Replay log.** Each agent actor maintains an ordered semantic replay log
+  (`AgentStart`, durable `ChatEvent` state, and `AgentError` frames) emitted
+  since creation. Granular `StreamDelta` and `StreamReasoningDelta` frames are
+  broadcast live but not buffered forever after the stream completes. The same
+  actor-level rule applies to resumed sessions: if a backend re-emits
+  historical work as streaming events during resume, those events are compacted
+  into the replay log before later subscribers see them.
 - **Agent registry.** A registry mapping
   `AgentId → mpsc::Sender<AgentCommand>` so the connection handler can route
   `SendMessage` events to the right agent actor.
 - **Subscriber management.** Each agent tracks its active subscribers (one per
   connected frontend). When a new subscriber connects, the agent replays its
-  full event log on the new instance stream, then adds the subscriber to the
+  compact replay log on the new instance stream, then adds the subscriber to the
   live fanout list.
 - **Connection handler changes:**
   - After handshake, enter a message dispatch loop that reads envelopes and
@@ -1061,7 +1067,7 @@ fresh sequence numbers starting at 0 on its own instance stream.
   - Fatal error → receive `AgentError(fatal: true)`, then no more events.
   - Sequence number validation across interleaved `/host/*` and multiple
     `/agent/*` streams.
-  - Multi-frontend replay: two clients connect, second client receives full
+  - Multi-frontend replay: two clients connect, second client receives compact
     replay (starting with `AgentStart` at seq 0) with fresh sequence numbers,
     then both receive identical live events.
 
