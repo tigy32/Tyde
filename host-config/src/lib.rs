@@ -133,6 +133,8 @@ pub struct SetSelectedHostRequest {
 pub struct HostLineEvent {
     pub host_id: String,
     pub line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<u64>,
 }
 
 /// Tauri event payload: a host connection was dropped.
@@ -234,4 +236,27 @@ pub enum RemoteHostLifecycleStatus {
 pub struct HostLifecycleEvent {
     pub host_id: String,
     pub status: RemoteHostLifecycleStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_line_delivery_id_is_backward_compatible() -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = r#"{"hostId":"h1","line":"{}"}"#;
+        let decoded: HostLineEvent = serde_json::from_str(legacy)?;
+        assert_eq!(decoded.delivery_id, None);
+        let encoded = serde_json::to_string(&decoded)?;
+        assert!(!encoded.contains("deliveryId"));
+
+        let event = HostLineEvent {
+            host_id: "h1".to_owned(),
+            line: "{}".to_owned(),
+            delivery_id: Some(7),
+        };
+        let encoded = serde_json::to_string(&event)?;
+        assert!(encoded.contains(r#""deliveryId":7"#));
+        Ok(())
+    }
 }

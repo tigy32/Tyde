@@ -236,6 +236,7 @@ async fn router_actor(
                     HostLineEvent {
                         host_id: host_id.clone(),
                         line,
+                        delivery_id: None,
                     },
                 ) {
                     let _ = emit_error(

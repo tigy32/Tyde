@@ -4,6 +4,9 @@
 
 # Frontend build artifacts
 frontend/dist/
+mobile-frontend/dist/
+mobile/dist/
+mobile/dist
 
 # macOS
 .DS_Store

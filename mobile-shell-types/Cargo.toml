@@ -1,5 +1,5 @@
 [package]
-name = "host-config"
+name = "mobile-shell-types"
 edition.workspace = true
 
 [dependencies]

@@ -2478,6 +2478,7 @@ version = "0.0.0"
 dependencies = [
  "protocol",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3577,6 +3578,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobile-frontend"
+version = "0.0.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "host-config",
+ "js-sys",
+ "leptos",
+ "log",
+ "mobile-shell-types",
+ "protocol",
+ "pulldown-cmark",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+]
+
+[[package]]
+name = "mobile-shell-types"
+version = "0.0.0"
+dependencies = [
+ "protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mqtt-transport"
 version = "0.0.0"
 dependencies = [
@@ -3585,19 +3617,23 @@ dependencies = [
  "ciborium",
  "futures-channel",
  "futures-util",
+ "getrandom 0.3.4",
  "hkdf",
  "protocol",
  "rand 0.8.6",
  "rcgen",
  "rumqttc",
  "rumqttd",
+ "rustls-native-certs",
  "serde",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tracing",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -6562,6 +6598,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-barcode-scanner"
+version = "2.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "485cbcf227f04117e930be748ea71d835900466dcd1d455d5ec284d36107a305"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tauri-plugin-dialog"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6781,6 +6831,7 @@ dependencies = [
  "paste",
  "protocol",
  "rmcp",
+ "rumqttd",
  "serde",
  "serde_json",
  "server",
@@ -7317,6 +7368,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tyde-mobile-shell"
+version = "0.8.14"
+dependencies = [
+ "base64 0.22.1",
+ "devtools-protocol",
+ "host-config",
+ "mobile-shell-types",
+ "mqtt-transport",
+ "protocol",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-barcode-scanner",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "tyde-server"
 version = "0.8.14"
 dependencies = [
@@ -7457,6 +7534,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "urlpattern"
@@ -7840,6 +7923,15 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

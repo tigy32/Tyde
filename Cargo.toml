@@ -12,6 +12,9 @@ members = [
     "host-config",
     "tyde-server",
     "mqtt-transport",
+    "mobile-shell-types",
+    "mobile/src-tauri",
+    "mobile-frontend",
 ]
 
 [workspace.package]

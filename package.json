@@ -3,7 +3,12 @@
   "private": true,
   "version": "0.8.14",
   "scripts": {
-    "tauri": "cargo tauri"
+    "tauri": "cargo tauri",
+    "mobile:dev": "cd mobile/src-tauri && tauri dev",
+    "mobile:ios:init": "cd mobile/src-tauri && tauri ios init",
+    "mobile:ios:dev": "./build.sh ios",
+    "mobile:ios:tauri-dev": "cd mobile/src-tauri && tauri ios dev",
+    "mobile:ios:run": "./build.sh ios"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
