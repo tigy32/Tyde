@@ -1,5 +1,7 @@
 use std::fmt;
 use std::io::Cursor;
+#[cfg(feature = "test-support")]
+use std::net::IpAddr;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -51,8 +53,8 @@ pub enum TransportTypeError {
     },
 }
 
-pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 1;
-pub const MOBILE_QR_VERSION: u32 = 1;
+pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 2;
+pub const MOBILE_QR_VERSION: u32 = 2;
 pub const MQTT_VERSION: u8 = 5;
 pub const MQTT_QOS_AT_LEAST_ONCE: u8 = 1;
 pub const MQTT_RETAIN: bool = false;
@@ -210,6 +212,7 @@ pub fn validate_broker_url(broker_url: &BrokerUrl) -> Result<(), TransportTypeEr
             message: "mqtts:// broker URLs must not include a path".to_owned(),
         }),
         "wss" => Ok(()),
+        "mqtt" | "tcp" if loopback_plaintext_allowed(&parsed) => Ok(()),
         "mqtt" | "tcp" | "ws" => Err(TransportTypeError::InvalidBrokerUrl {
             message: format!(
                 "broker URL scheme {:?} is insecure; only mqtts:// and wss:// are allowed",
@@ -221,6 +224,24 @@ pub fn validate_broker_url(broker_url: &BrokerUrl) -> Result<(), TransportTypeEr
                 "broker URL scheme {scheme:?} is unsupported; expected mqtts:// or wss://"
             ),
         }),
+    }
+}
+
+fn loopback_plaintext_allowed(parsed: &url::Url) -> bool {
+    #[cfg(feature = "test-support")]
+    {
+        parsed.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost") || {
+                host.parse::<IpAddr>()
+                    .map(|addr| addr.is_loopback())
+                    .unwrap_or(false)
+            }
+        })
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        let _ = parsed;
+        false
     }
 }
 

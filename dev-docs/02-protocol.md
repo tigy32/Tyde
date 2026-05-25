@@ -18,6 +18,22 @@ See `01-philosophy.md` for the design decisions that shaped this spec.
 - serde_json's compact serializer already escapes `\n` inside strings to `\\n`,
   so the only bare `\n` in the output is the delimiter.
 
+### Mobile MQTT transport
+
+Tyde Mobile still exposes one bidirectional byte stream to the protocol above.
+The long-lived paired MQTT room is only a rendezvous channel:
+
+1. the phone publishes an authenticated open request on the paired room;
+2. the host replies with an authenticated accept containing a fresh data room;
+3. both sides derive a per-connection PSK from the long-term pairing PSK,
+   connection id, nonces, and data room;
+4. the normal Tyde `hello` / `welcome` / replay protocol runs over the
+   ephemeral data room.
+
+The paired room must not carry Tyde NDJSON frames. It exists only to negotiate a
+fresh data room so stale MQTT clients cannot inject old data into a new app
+connection.
+
 ---
 
 ## 2. Message Envelope
@@ -140,8 +156,8 @@ other streams.
   "seq": 0,
   "payload": {
     "code": "incompatible_protocol",
-    "message": "Server requires protocol version 2, client sent 1",
-    "server_protocol_version": 2,
+    "message": "Server requires protocol version 3, client sent 2",
+    "server_protocol_version": 3,
     "server_tyde_version": { "major": 3, "minor": 0, "patch": 0 }
   }
 }
@@ -166,7 +182,8 @@ rejection, surfaces the message, and does not retry without updating.
 ### Protocol Version (`protocol_version: u32`)
 
 - Starts at `1`
-- Bumped when the envelope format changes incompatibly
+- Bumped when the wire shape changes incompatibly, including envelope fields,
+  `FrameKind` variants, or required payload shape
 - Server supports exactly one version at a time
 - If `client.protocol_version != server.protocol_version` → `reject` with
   code `incompatible_protocol`
@@ -261,8 +278,8 @@ These types belong in the `protocol` crate.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The current protocol version. Bump when envelope format changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The current protocol version. Bump when the wire shape changes.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ── Primitives ──────────────────────────────────────────────────────
 

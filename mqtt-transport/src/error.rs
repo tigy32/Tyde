@@ -1,5 +1,6 @@
 use std::fmt;
 
+use rumqttc::v5::mqttbytes::v5::PubAckReason;
 use rumqttc::v5::{ClientError, ConnectionError};
 use thiserror::Error;
 
@@ -18,7 +19,7 @@ pub enum MqttTransportError {
     Publish { source: Box<ClientError> },
 
     #[error("MQTT publish was rejected: {reason}")]
-    PublishRejected { reason: String },
+    PublishRejected { reason: PublishRejection },
 
     #[error("transport framing error: {0}")]
     Framing(#[from] FramingError),
@@ -37,6 +38,42 @@ pub enum MqttTransportError {
 
     #[error("MQTT actor stopped before completing the requested operation")]
     ActorClosed,
+}
+
+impl MqttTransportError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::BrokerConnect { .. }
+                | Self::Subscribe { .. }
+                | Self::SubscribeRejected { .. }
+                | Self::Publish { .. }
+                | Self::PublishRejected { .. }
+                | Self::BrokerDisconnected { .. }
+                | Self::ActorClosed
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRejection {
+    pub code: PubAckReason,
+    pub reason_string: Option<String>,
+}
+
+impl PublishRejection {
+    pub fn is_quota_exceeded(&self) -> bool {
+        self.code == PubAckReason::QuotaExceeded
+    }
+}
+
+impl fmt::Display for PublishRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason_string.as_deref() {
+            Some(reason) => write!(f, "{:?}: {reason}", self.code),
+            None => write!(f, "{:?}", self.code),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -67,6 +104,12 @@ pub enum FramingError {
 
     #[error("handshake frame received after the session key was established")]
     HandshakeAfterSession,
+
+    #[error("rendezvous frame payload length {actual} is invalid; expected {expected}")]
+    InvalidRendezvousLength { expected: usize, actual: usize },
+
+    #[error("rendezvous frame authentication failed: {0}")]
+    Crypto(#[from] CryptoError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

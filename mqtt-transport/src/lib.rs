@@ -3,15 +3,22 @@ mod client;
 mod config;
 mod error;
 mod framing;
+mod reconnect;
+mod rendezvous;
 mod session;
 mod stream;
 mod topic;
 mod types;
 
-pub use client::connect;
+pub use client::{connect, connect_ephemeral};
 pub use config::{MqttConnectConfig, ParticipantRole};
-pub use error::{CounterViolation, CryptoError, FramingError, MqttTransportError};
+pub use error::{
+    CounterViolation, CryptoError, FramingError, MqttTransportError, PublishRejection,
+};
 pub use protocol::BrokerUrl;
+pub use reconnect::{
+    MqttReconnectBackoff, RECONNECT_INITIAL, RECONNECT_MAX, ReconnectBackoffError,
+};
 pub use stream::EnvelopeStream;
 pub use types::{
     BrokerAuth, BrokerEndpoint, DEFAULT_MOBILE_MQTT_BROKER_URL, MOBILE_QR_VERSION,

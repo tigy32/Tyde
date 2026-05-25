@@ -1,10 +1,18 @@
 use std::time::Duration;
 
-use mqtt_transport::{MobilePairingQrPayload, MqttTransportPolicy, host_to_client_topic};
+mod support;
+
+use mqtt_transport::{
+    MobilePairingQrPayload, MqttConnectConfig, MqttTransportPolicy, ParticipantRole,
+    host_to_client_topic,
+};
 use protocol::{
-    BrokerUrl, CommandErrorPayload, Envelope, FrameKind, HostSettingValue, HostSettingsPayload,
-    MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus, MobilePairingOfferPayload,
-    MobilePairingStartPayload, MobilePairingState, SetSettingPayload, StreamPath, write_envelope,
+    BackendKind, BrokerUrl, ChatEvent, CommandErrorPayload, Envelope, FrameKind, HostSettingValue,
+    HostSettingsPayload, ListSessionsPayload, MobileAccessErrorCode, MobileAccessStatePayload,
+    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload, MobilePairingStartPayload,
+    MobilePairingState, NewAgentPayload, ProjectCreatePayload, SendMessagePayload,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload,
+    TerminalLaunchTarget, write_envelope,
 };
 use tokio::time::timeout;
 
@@ -88,6 +96,23 @@ async fn wait_for_kind(
         }
         if env.kind == kind {
             return env;
+        }
+    }
+}
+
+async fn wait_for_chat_stream_end(client: &mut client::Connection, context: &str) -> ChatEvent {
+    loop {
+        let env = next_event(client, context).await;
+        if env.kind == FrameKind::CommandError {
+            let payload: CommandErrorPayload = env.parse_payload().expect("parse command error");
+            panic!("command error while waiting for {context}: {payload:?}");
+        }
+        if env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            return event;
         }
     }
 }
@@ -282,4 +307,436 @@ async fn pairing_qr_embeds_configured_mqtt_endpoint_and_secret_room() {
         format!("tyde/v1/{}/client-to-host", qr.room)
     );
     assert_eq!(qr.psk.as_bytes().len(), 32);
+}
+
+#[tokio::test]
+async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
+    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+    let harness = Harness::new().await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    let project_root = tempfile::tempdir().expect("create mobile project root");
+    desktop
+        .project_create(ProjectCreatePayload {
+            name: "Mobile Project".to_owned(),
+            roots: vec![project_root.path().to_string_lossy().into_owned()],
+        })
+        .await
+        .expect("create project for mobile replay");
+    wait_for_kind(
+        &mut desktop,
+        FrameKind::ProjectNotify,
+        "desktop ProjectNotify",
+    )
+    .await;
+
+    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
+    set_mobile_enabled(&mut desktop, true).await;
+    let _ = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
+        "MobileBrokerStatus::Online",
+    )
+    .await;
+    send_mobile_pairing_start(&mut desktop).await;
+
+    let offer_env = wait_for_kind(
+        &mut desktop,
+        FrameKind::MobilePairingOffer,
+        "MobilePairingOffer",
+    )
+    .await;
+    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
+    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+    assert_eq!(qr.broker.url, broker.broker_url);
+
+    let mobile_stream = timeout(
+        EVENT_TIMEOUT,
+        mqtt_transport::connect_ephemeral(MqttConnectConfig {
+            endpoint: qr.broker.clone(),
+            room: qr.room,
+            psk: qr.psk.clone(),
+            role: ParticipantRole::Client,
+        }),
+    )
+    .await
+    .expect("timed out connecting mobile MQTT transport")
+    .expect("mobile MQTT transport");
+    let mut mobile = timeout(
+        EVENT_TIMEOUT,
+        client::connect(&client::ClientConfig::current(), mobile_stream),
+    )
+    .await
+    .expect("timed out waiting for mobile Tyde Hello")
+    .expect("mobile Tyde Hello");
+
+    let state = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.pairing, MobilePairingState::Consumed { .. }),
+        "consumed mobile pairing",
+    )
+    .await;
+    assert!(matches!(
+        state.paired_devices.first().map(|device| &device.state),
+        Some(MobileDeviceState::Connected)
+    ));
+
+    let env = expect_next_kind(&mut mobile, FrameKind::HostSettings, "mobile HostSettings").await;
+    let _: HostSettingsPayload = env.parse_payload().expect("parse mobile HostSettings");
+
+    let _ = wait_for_kind(
+        &mut mobile,
+        FrameKind::ProjectNotify,
+        "mobile ProjectNotify",
+    )
+    .await;
+    let _ = wait_for_kind(
+        &mut mobile,
+        FrameKind::ProjectFileList,
+        "mobile ProjectFileList",
+    )
+    .await;
+
+    send_host_payload(
+        &mut mobile,
+        FrameKind::ListSessions,
+        &ListSessionsPayload {},
+    )
+    .await;
+    let _ = wait_for_kind(&mut mobile, FrameKind::SessionList, "mobile SessionList").await;
+
+    send_host_payload(
+        &mut mobile,
+        FrameKind::TerminalCreate,
+        &TerminalCreatePayload {
+            target: TerminalLaunchTarget::HostDefault,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await;
+    let env = expect_next_kind(
+        &mut mobile,
+        FrameKind::CommandError,
+        "mobile terminal command rejection",
+    )
+    .await;
+    let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+    assert_eq!(error.request_kind, FrameKind::TerminalCreate);
+    assert!(
+        error.message.contains("not allowed from Tyde Mobile"),
+        "unexpected terminal rejection: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
+    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+    let harness = Harness::new().await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    let mut project_roots = Vec::new();
+    for index in 0..12 {
+        let project_root = tempfile::tempdir().expect("create mobile project root");
+        std::fs::write(
+            project_root.path().join(format!("file-{index}.txt")),
+            format!("mobile project file {index}"),
+        )
+        .expect("write project file");
+        desktop
+            .project_create(ProjectCreatePayload {
+                name: format!("Mobile Project {index}"),
+                roots: vec![project_root.path().to_string_lossy().into_owned()],
+            })
+            .await
+            .expect("create project for mobile replay");
+        wait_for_kind(
+            &mut desktop,
+            FrameKind::ProjectNotify,
+            "desktop ProjectNotify",
+        )
+        .await;
+        project_roots.push(project_root);
+    }
+
+    desktop
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("mobile replay agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![project_roots[0].path().to_string_lossy().into_owned()],
+                prompt: "initial mobile replay prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn replay agent");
+    let _ = wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
+    let _ = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
+
+    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
+    set_mobile_enabled(&mut desktop, true).await;
+    let _ = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
+        "MobileBrokerStatus::Online",
+    )
+    .await;
+    send_mobile_pairing_start(&mut desktop).await;
+
+    let offer_env = wait_for_kind(
+        &mut desktop,
+        FrameKind::MobilePairingOffer,
+        "MobilePairingOffer",
+    )
+    .await;
+    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
+    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+
+    let mobile_stream = timeout(
+        EVENT_TIMEOUT,
+        mqtt_transport::connect_ephemeral(MqttConnectConfig {
+            endpoint: qr.broker.clone(),
+            room: qr.room,
+            psk: qr.psk.clone(),
+            role: ParticipantRole::Client,
+        }),
+    )
+    .await
+    .expect("timed out connecting mobile MQTT transport")
+    .expect("mobile MQTT transport");
+    let mut mobile = timeout(
+        EVENT_TIMEOUT,
+        client::connect(&client::ClientConfig::current(), mobile_stream),
+    )
+    .await
+    .expect("timed out waiting for mobile Tyde Hello")
+    .expect("mobile Tyde Hello");
+
+    let mut project_count = 0;
+    let mut replayed_agent = None;
+    while replayed_agent.is_none() || project_count < 12 {
+        let env = next_event(&mut mobile, "mobile initial replay").await;
+        match env.kind {
+            FrameKind::ProjectNotify => project_count += 1,
+            FrameKind::NewAgent => {
+                replayed_agent = Some(
+                    env.parse_payload::<NewAgentPayload>()
+                        .expect("parse replayed NewAgent"),
+                );
+            }
+            FrameKind::CommandError => {
+                let payload: CommandErrorPayload =
+                    env.parse_payload().expect("parse command error");
+                panic!("command error during mobile replay: {payload:?}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(project_count, 12);
+    let replayed_agent = replayed_agent.expect("replayed agent");
+
+    send_host_payload(
+        &mut mobile,
+        FrameKind::ListSessions,
+        &ListSessionsPayload {},
+    )
+    .await;
+    let session_env =
+        wait_for_kind(&mut mobile, FrameKind::SessionList, "mobile SessionList").await;
+    let sessions: protocol::SessionListPayload =
+        session_env.parse_payload().expect("parse SessionList");
+    assert_eq!(sessions.sessions.len(), 1);
+
+    mobile
+        .send_message_payload(
+            &replayed_agent.instance_stream,
+            SendMessagePayload {
+                message: "hello from mobile mqtt test".to_owned(),
+                images: None,
+                origin: None,
+            },
+        )
+        .await
+        .expect("send mobile message");
+    let event = wait_for_chat_stream_end(&mut mobile, "mobile follow-up StreamEnd").await;
+    let ChatEvent::StreamEnd(end) = event else {
+        panic!("expected StreamEnd");
+    };
+    assert!(
+        end.message
+            .content
+            .contains("mock backend response to: hello from mobile mqtt test"),
+        "unexpected final message: {}",
+        end.message.content
+    );
+}
+
+#[tokio::test]
+async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
+    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+    let harness = Harness::new().await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    let project_root = tempfile::tempdir().expect("create mobile project root");
+    std::fs::write(project_root.path().join("file.txt"), "mobile project file")
+        .expect("write project file");
+    desktop
+        .project_create(ProjectCreatePayload {
+            name: "Mobile Reconnect Project".to_owned(),
+            roots: vec![project_root.path().to_string_lossy().into_owned()],
+        })
+        .await
+        .expect("create project for mobile replay");
+    wait_for_kind(
+        &mut desktop,
+        FrameKind::ProjectNotify,
+        "desktop ProjectNotify",
+    )
+    .await;
+
+    desktop
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("mobile reconnect agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![project_root.path().to_string_lossy().into_owned()],
+                prompt: "initial mobile reconnect prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn replay agent");
+    let _ = wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
+    let _ = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
+
+    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
+    set_mobile_enabled(&mut desktop, true).await;
+    let _ = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
+        "MobileBrokerStatus::Online",
+    )
+    .await;
+    send_mobile_pairing_start(&mut desktop).await;
+
+    let offer_env = wait_for_kind(
+        &mut desktop,
+        FrameKind::MobilePairingOffer,
+        "MobilePairingOffer",
+    )
+    .await;
+    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
+    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+
+    let mut first = connect_mobile_client(&qr).await;
+    expect_mobile_replay(&mut first, 1, "first mobile replay").await;
+
+    let mut second = connect_mobile_client(&qr).await;
+    let replayed_agent = expect_mobile_replay(&mut second, 1, "second mobile replay").await;
+
+    send_host_payload(
+        &mut second,
+        FrameKind::ListSessions,
+        &ListSessionsPayload {},
+    )
+    .await;
+    let session_env = wait_for_kind(
+        &mut second,
+        FrameKind::SessionList,
+        "second mobile SessionList",
+    )
+    .await;
+    let sessions: protocol::SessionListPayload =
+        session_env.parse_payload().expect("parse SessionList");
+    assert_eq!(sessions.sessions.len(), 1);
+
+    second
+        .send_message_payload(
+            &replayed_agent.instance_stream,
+            SendMessagePayload {
+                message: "hello after mobile reconnect".to_owned(),
+                images: None,
+                origin: None,
+            },
+        )
+        .await
+        .expect("send mobile reconnect message");
+    let event = wait_for_chat_stream_end(&mut second, "second mobile follow-up StreamEnd").await;
+    let ChatEvent::StreamEnd(end) = event else {
+        panic!("expected StreamEnd");
+    };
+    assert!(
+        end.message
+            .content
+            .contains("mock backend response to: hello after mobile reconnect"),
+        "unexpected final message: {}",
+        end.message.content
+    );
+}
+
+async fn connect_mobile_client(qr: &MobilePairingQrPayload) -> client::Connection {
+    let mobile_stream = timeout(
+        EVENT_TIMEOUT,
+        mqtt_transport::connect_ephemeral(MqttConnectConfig {
+            endpoint: qr.broker.clone(),
+            room: qr.room,
+            psk: qr.psk.clone(),
+            role: ParticipantRole::Client,
+        }),
+    )
+    .await
+    .expect("timed out connecting mobile MQTT transport")
+    .expect("mobile MQTT transport");
+    timeout(
+        EVENT_TIMEOUT,
+        client::connect(&client::ClientConfig::current(), mobile_stream),
+    )
+    .await
+    .expect("timed out waiting for mobile Tyde Hello")
+    .expect("mobile Tyde Hello")
+}
+
+async fn expect_mobile_replay(
+    mobile: &mut client::Connection,
+    expected_projects: usize,
+    context: &str,
+) -> NewAgentPayload {
+    let mut project_count = 0;
+    let mut replayed_agent = None;
+    while replayed_agent.is_none() || project_count < expected_projects {
+        let env = next_event(mobile, context).await;
+        match env.kind {
+            FrameKind::ProjectNotify => project_count += 1,
+            FrameKind::NewAgent => {
+                replayed_agent = Some(
+                    env.parse_payload::<NewAgentPayload>()
+                        .expect("parse replayed NewAgent"),
+                );
+            }
+            FrameKind::CommandError => {
+                let payload: CommandErrorPayload =
+                    env.parse_payload().expect("parse command error");
+                panic!("command error during {context}: {payload:?}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(project_count, expected_projects);
+    replayed_agent.expect("replayed agent")
 }

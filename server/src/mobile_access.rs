@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::ServerConfig;
 use crate::accept;
-use crate::connection::run_connection;
+use crate::connection::run_mobile_connection;
 use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
 use crate::store::mobile_pairings::{
@@ -213,6 +213,7 @@ pub(crate) enum MobileAccessCommand {
     },
     DeviceDisconnected {
         device_id: MobileDeviceId,
+        connection_instance_id: u64,
     },
 }
 
@@ -279,8 +280,14 @@ pub(crate) struct MobileAccessActor {
     subscribers: HashMap<StreamPath, Stream>,
     active_requester: Option<StreamPath>,
     accept_tasks: HashMap<AcceptTaskKey, JoinHandle<()>>,
-    connected_tasks: HashMap<MobileDeviceId, JoinHandle<()>>,
+    connected_tasks: HashMap<MobileDeviceId, ConnectedMobileTask>,
     pairing_ttl_task: Option<JoinHandle<()>>,
+    next_connection_instance_id: u64,
+}
+
+struct ConnectedMobileTask {
+    instance_id: u64,
+    task: JoinHandle<()>,
 }
 
 impl MobileAccessActor {
@@ -333,6 +340,7 @@ impl MobileAccessActor {
             accept_tasks: HashMap::new(),
             connected_tasks: HashMap::new(),
             pairing_ttl_task: None,
+            next_connection_instance_id: 0,
         })
     }
 
@@ -401,8 +409,12 @@ impl MobileAccessActor {
                 MobileAccessCommand::PairingGraceElapsed { offer_id } => {
                     self.pairing_grace_elapsed(&offer_id).await;
                 }
-                MobileAccessCommand::DeviceDisconnected { device_id } => {
-                    self.device_disconnected(&device_id).await;
+                MobileAccessCommand::DeviceDisconnected {
+                    device_id,
+                    connection_instance_id,
+                } => {
+                    self.device_disconnected(&device_id, connection_instance_id)
+                        .await;
                 }
             }
         }
@@ -640,7 +652,7 @@ impl MobileAccessActor {
             task.abort();
         }
         if let Some(task) = self.connected_tasks.remove(device_id) {
-            task.abort();
+            task.task.abort();
         }
         self.pairings_store
             .save(&self.pairings)
@@ -739,7 +751,8 @@ impl MobileAccessActor {
         self.pairing = MobilePairingState::Consumed {
             offer_id: offer_id.clone(),
         };
-        self.spawn_connected_bridge(device_id, stream);
+        self.spawn_connected_bridge(device_id.clone(), stream);
+        self.spawn_device_accept(device_id);
         self.fan_out_state().await;
         self.schedule_pairing_grace(offer_id.clone());
     }
@@ -756,6 +769,7 @@ impl MobileAccessActor {
             return;
         }
         self.spawn_connected_bridge(device_id.clone(), stream);
+        self.spawn_device_accept(device_id.clone());
         self.fan_out_state().await;
     }
 
@@ -811,6 +825,15 @@ impl MobileAccessActor {
         if !self.settings.enable_mobile_connections {
             return;
         }
+        if self.connected_tasks.contains_key(device_id) {
+            tracing::warn!(
+                device_id = %device_id,
+                code = ?code,
+                message = %message,
+                "mobile reconnect listener failed while device data connection is active"
+            );
+            return;
+        }
         if self
             .pairings
             .devices
@@ -861,7 +884,19 @@ impl MobileAccessActor {
         }
     }
 
-    async fn device_disconnected(&mut self, device_id: &MobileDeviceId) {
+    async fn device_disconnected(&mut self, device_id: &MobileDeviceId, instance_id: u64) {
+        let Some(current) = self.connected_tasks.get(device_id) else {
+            return;
+        };
+        if current.instance_id != instance_id {
+            tracing::info!(
+                device_id = %device_id,
+                instance_id,
+                current_instance_id = current.instance_id,
+                "ignoring stale mobile device disconnect"
+            );
+            return;
+        }
         self.connected_tasks.remove(device_id);
         if let Some(record) = self
             .pairings
@@ -912,7 +947,7 @@ impl MobileAccessActor {
 
     fn spawn_device_accept(&mut self, device_id: MobileDeviceId) {
         let key = AcceptTaskKey::Device(device_id.clone());
-        if self.accept_tasks.contains_key(&key) || self.connected_tasks.contains_key(&device_id) {
+        if self.accept_tasks.contains_key(&key) {
             return;
         }
         let Some(record) = self
@@ -929,13 +964,31 @@ impl MobileAccessActor {
     }
 
     fn spawn_connected_bridge(&mut self, device_id: MobileDeviceId, stream: EnvelopeStream) {
+        if let Some(previous) = self.connected_tasks.remove(&device_id) {
+            previous.task.abort();
+        }
+        let instance_id = self.allocate_connection_instance_id();
         let task = tokio::spawn(bridge_authenticated_mobile(
             self.host.clone(),
             self.tx.clone(),
             device_id.clone(),
+            instance_id,
             stream,
         ));
-        self.connected_tasks.insert(device_id, task);
+        self.connected_tasks
+            .insert(device_id, ConnectedMobileTask { instance_id, task });
+    }
+
+    fn allocate_connection_instance_id(&mut self) -> u64 {
+        let instance_id = self.next_connection_instance_id;
+        self.next_connection_instance_id = self
+            .next_connection_instance_id
+            .checked_add(1)
+            .unwrap_or_else(|| {
+                tracing::warn!("mobile connection instance id overflow; wrapping to zero");
+                0
+            });
+        instance_id
     }
 
     fn schedule_pairing_ttl(&mut self, offer_id: MobilePairingOfferId, expires_at_ms: u64) {
@@ -983,7 +1036,7 @@ impl MobileAccessActor {
             task.abort();
         }
         for (_, task) in self.connected_tasks.drain() {
-            task.abort();
+            task.task.abort();
         }
         if let Some(task) = self.pairing_ttl_task.take() {
             task.abort();
@@ -1095,7 +1148,7 @@ async fn connect_mqtt_host_stream(
         psk,
         role: ParticipantRole::Host,
     };
-    mqtt_transport::connect(config)
+    mqtt_transport::connect_ephemeral(config)
         .await
         .map_err(|err| MobileTaskError::transport(format!("MQTT mobile transport failed: {err}")))
 }
@@ -1104,11 +1157,12 @@ async fn bridge_authenticated_mobile(
     host: HostHandle,
     tx: mpsc::UnboundedSender<MobileAccessCommand>,
     device_id: MobileDeviceId,
+    connection_instance_id: u64,
     stream: EnvelopeStream,
 ) {
     match accept(&ServerConfig::current(), stream).await {
         Ok(connection) => {
-            if let Err(err) = run_connection(connection, host).await {
+            if let Err(err) = run_mobile_connection(connection, host).await {
                 tracing::warn!(device_id = %device_id, error = ?err, "mobile Tyde connection ended with frame error");
             }
         }
@@ -1116,7 +1170,10 @@ async fn bridge_authenticated_mobile(
             tracing::warn!(device_id = %device_id, error = ?err, "mobile Tyde handshake failed");
         }
     }
-    let _ = tx.send(MobileAccessCommand::DeviceDisconnected { device_id });
+    let _ = tx.send(MobileAccessCommand::DeviceDisconnected {
+        device_id,
+        connection_instance_id,
+    });
 }
 
 fn effective_broker_endpoint(configured: Option<&BrokerUrl>) -> Result<BrokerEndpoint, String> {

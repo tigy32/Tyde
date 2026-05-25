@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -5,7 +7,7 @@ use std::task::{Context, Poll, ready};
 use futures_channel::mpsc::Sender;
 use futures_util::Sink;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::{mpsc::Receiver, oneshot};
 
 use crate::chunking::{InboundPlaintext, OutboundPlaintext, next_write_len};
 use crate::error::MqttTransportError;
@@ -17,37 +19,95 @@ pub(crate) enum InboundEvent {
     Eof,
 }
 
+pub(crate) struct OutboundChunk {
+    pub bytes: Vec<u8>,
+    pub ack: oneshot::Sender<Result<(), String>>,
+}
+
+struct PendingChunk {
+    bytes: Vec<u8>,
+    ack_tx: Option<oneshot::Sender<Result<(), String>>>,
+    ack_rx: Option<oneshot::Receiver<Result<(), String>>>,
+}
+
+impl PendingChunk {
+    fn new(bytes: Vec<u8>) -> Self {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        Self {
+            bytes,
+            ack_tx: Some(ack_tx),
+            ack_rx: Some(ack_rx),
+        }
+    }
+
+    fn take_outbound(&mut self) -> io::Result<OutboundChunk> {
+        let Some(ack) = self.ack_tx.take() else {
+            return Err(io::Error::other(
+                "pending outbound chunk missing ack sender",
+            ));
+        };
+        Ok(OutboundChunk {
+            bytes: std::mem::take(&mut self.bytes),
+            ack,
+        })
+    }
+
+    fn take_ack_rx(&mut self) -> io::Result<oneshot::Receiver<Result<(), String>>> {
+        self.ack_rx
+            .take()
+            .ok_or_else(|| io::Error::other("pending outbound chunk missing ack receiver"))
+    }
+}
+
 pub struct EnvelopeStream {
-    outbound_tx: Sender<Vec<u8>>,
+    outbound_tx: Sender<OutboundChunk>,
     inbound_rx: Receiver<InboundEvent>,
     inbound: InboundPlaintext,
     outbound: OutboundPlaintext,
-    pending_chunk: Option<Vec<u8>>,
+    pending_chunk: Option<PendingChunk>,
+    outstanding_acks: VecDeque<oneshot::Receiver<Result<(), String>>>,
     shutdown_started: bool,
 }
 
 impl EnvelopeStream {
-    pub(crate) fn new(outbound_tx: Sender<Vec<u8>>, inbound_rx: Receiver<InboundEvent>) -> Self {
+    pub(crate) fn new(
+        outbound_tx: Sender<OutboundChunk>,
+        inbound_rx: Receiver<InboundEvent>,
+    ) -> Self {
         Self {
             outbound_tx,
             inbound_rx,
             inbound: InboundPlaintext::new(),
             outbound: OutboundPlaintext::new(),
             pending_chunk: None,
+            outstanding_acks: VecDeque::new(),
             shutdown_started: false,
         }
     }
 
     fn poll_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(chunk) = self.pending_chunk.take() else {
+        let Some(mut chunk) = self.pending_chunk.take() else {
             return Poll::Ready(Ok(()));
         };
 
         match Pin::new(&mut self.outbound_tx).poll_ready(cx) {
-            Poll::Ready(Ok(())) => match Pin::new(&mut self.outbound_tx).start_send(chunk) {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(_) => Poll::Ready(Err(actor_closed_io_error())),
-            },
+            Poll::Ready(Ok(())) => {
+                let outbound = match chunk.take_outbound() {
+                    Ok(outbound) => outbound,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                match Pin::new(&mut self.outbound_tx).start_send(outbound) {
+                    Ok(()) => {
+                        let ack_rx = match chunk.take_ack_rx() {
+                            Ok(ack_rx) => ack_rx,
+                            Err(error) => return Poll::Ready(Err(error)),
+                        };
+                        self.outstanding_acks.push_back(ack_rx);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(_) => Poll::Ready(Err(actor_closed_io_error())),
+                }
+            }
             Poll::Ready(Err(_)) => Poll::Ready(Err(actor_closed_io_error())),
             Poll::Pending => {
                 self.pending_chunk = Some(chunk);
@@ -57,7 +117,7 @@ impl EnvelopeStream {
     }
 
     fn poll_send_chunk(&mut self, cx: &mut Context<'_>, chunk: Vec<u8>) -> Poll<io::Result<()>> {
-        self.pending_chunk = Some(chunk);
+        self.pending_chunk = Some(PendingChunk::new(chunk));
         self.poll_send_pending(cx)
     }
 
@@ -65,6 +125,26 @@ impl EnvelopeStream {
         ready!(self.poll_send_pending(cx))?;
         while let Some(chunk) = self.outbound.take_full_chunk() {
             ready!(self.poll_send_chunk(cx, chunk))?;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_outstanding_acks(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(ack) = self.outstanding_acks.front_mut() {
+            match Pin::new(ack).poll(cx) {
+                Poll::Ready(Ok(Ok(()))) => {
+                    self.outstanding_acks.pop_front();
+                }
+                Poll::Ready(Ok(Err(message))) => {
+                    self.outstanding_acks.pop_front();
+                    return Poll::Ready(Err(io::Error::other(message)));
+                }
+                Poll::Ready(Err(_)) => {
+                    self.outstanding_acks.pop_front();
+                    return Poll::Ready(Err(actor_closed_io_error()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
         Poll::Ready(Ok(()))
     }
@@ -141,7 +221,7 @@ impl AsyncWrite for EnvelopeStream {
             ready!(self.poll_send_chunk(cx, chunk))?;
         }
         match Pin::new(&mut self.outbound_tx).poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => self.poll_outstanding_acks(cx),
             Poll::Ready(Err(_)) => Poll::Ready(Err(actor_closed_io_error())),
             Poll::Pending => Poll::Pending,
         }
@@ -160,4 +240,41 @@ impl AsyncWrite for EnvelopeStream {
 
 fn actor_closed_io_error() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, MqttTransportError::ActorClosed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_channel::mpsc::channel;
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn flush_waits_for_outbound_ack() {
+        let (outbound_tx, mut outbound_rx) = channel(1);
+        let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1);
+        let mut stream = EnvelopeStream::new(outbound_tx, inbound_rx);
+
+        stream.write_all(b"hello").await.unwrap();
+        let mut flush = Box::pin(stream.flush());
+        assert!(
+            timeout(Duration::from_millis(25), &mut flush)
+                .await
+                .is_err(),
+            "flush returned before the MQTT actor acknowledged the chunk"
+        );
+
+        let chunk = outbound_rx.next().await.unwrap();
+        assert_eq!(chunk.bytes, b"hello");
+        chunk.ack.send(Ok(())).unwrap();
+
+        timeout(Duration::from_secs(1), flush)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

@@ -35,13 +35,7 @@ impl ReceiveCounter {
             None => Err(CryptoError::CounterViolation(
                 CounterViolation::FirstFrameMustBeZero { actual: counter },
             )),
-            Some(last_seen) if counter < last_seen => Err(CryptoError::CounterViolation(
-                CounterViolation::ReplayedOlderFrame {
-                    last_seen,
-                    actual: counter,
-                },
-            )),
-            Some(last_seen) if counter == last_seen => Ok(CounterDecision::DropDuplicate),
+            Some(last_seen) if counter <= last_seen => Ok(CounterDecision::DropDuplicate),
             Some(last_seen) => match last_seen.checked_add(1) {
                 Some(next) if counter == next => {
                     self.last_seen = Some(counter);
@@ -289,6 +283,10 @@ mod tests {
         assert_eq!(
             receiver.decrypt_received(third.counter, &third.ciphertext_with_tag)?,
             Some(b"c".to_vec())
+        );
+        assert_eq!(
+            receiver.decrypt_received(second.counter, &second.ciphertext_with_tag)?,
+            None
         );
 
         let gap_ciphertext = sender.encrypt_next(b"gap")?.ciphertext_with_tag;

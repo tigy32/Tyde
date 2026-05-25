@@ -5,7 +5,7 @@ edition.workspace = true
 [dependencies]
 client = { path = "../client" }
 protocol = { path = "../protocol" }
-mqtt-transport = { path = "../mqtt-transport" }
+mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
 server = { path = "../server" }
 tyde-dev-driver = { path = "../dev-driver" }
 futures-util = "0.3"
@@ -17,6 +17,7 @@ tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+rumqttd = "0.20.0"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

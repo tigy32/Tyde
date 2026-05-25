@@ -2,22 +2,30 @@
 name = "mqtt-transport"
 edition.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 base64.workspace = true
 ciborium = "0.2"
 chacha20poly1305 = "0.10.1"
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.3"
 hkdf = "0.13.0"
 rand = "0.8"
 rumqttc = { version = "0.25.1", features = ["websocket"] }
 protocol = { path = "../protocol" }
+rustls-native-certs = "0.8"
 serde.workspace = true
 sha2 = "0.11.0"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false }
 tracing.workspace = true
 url = "2"
+webpki-roots = "1"
 
 [dev-dependencies]
 rcgen = "0.14.7"
