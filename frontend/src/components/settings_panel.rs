@@ -20,7 +20,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::send::{
     custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert,
-    mobile_pairing_cancel, mobile_pairing_start, skill_refresh, steering_delete, steering_upsert,
+    mobile_device_revoke, mobile_pairing_cancel, mobile_pairing_start, skill_refresh,
+    steering_delete, steering_upsert,
 };
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
@@ -2079,6 +2080,9 @@ fn MobileTab() -> impl IntoView {
                 (!devices.is_empty()).then(|| view! {
                     <div class="settings-mobile-pairing-devices">
                         <p class="settings-mobile-pairing-devices-heading">"Paired devices"</p>
+                        <p class="settings-description settings-mobile-pairing-devices-description">
+                            "Remove stale test pairings here. Removed devices must scan a fresh QR before they can connect again."
+                        </p>
                         <ul class="settings-mobile-pairing-devices-list">
                             {devices.into_iter().map(|device| {
                                 let state_label = match device.state {
@@ -2087,10 +2091,44 @@ fn MobileTab() -> impl IntoView {
                                     MobileDeviceState::Revoked => "revoked",
                                 };
                                 let state_class = format!("settings-mobile-pairing-device-state settings-mobile-pairing-device-state-{state_label}");
+                                let device_label = device.label.clone();
+                                let device_id = device.device_id.clone();
+                                let state_for_remove = state.clone();
+                                let pairing_error_for_remove = pairing_error;
                                 view! {
                                     <li class="settings-mobile-pairing-device">
-                                        <span class="settings-mobile-pairing-device-label">{device.label.clone()}</span>
-                                        <span class=state_class>{state_label}</span>
+                                        <div class="settings-mobile-pairing-device-main">
+                                            <span class="settings-mobile-pairing-device-label">{device_label.clone()}</span>
+                                            <span class=state_class>{state_label}</span>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            class="filter-toggle settings-mobile-pairing-device-remove"
+                                            title="Remove this paired mobile device"
+                                            on:click=move |_: web_sys::MouseEvent| {
+                                                let state = state_for_remove.clone();
+                                                let device_id = device_id.clone();
+                                                let device_label = device_label.clone();
+                                                spawn_local(async move {
+                                                    let message = format!(
+                                                        "Remove mobile device \"{device_label}\"? It will need to scan a fresh pairing QR before it can connect again."
+                                                    );
+                                                    if !crate::bridge::confirm_dialog("Remove mobile pairing", &message).await {
+                                                        return;
+                                                    }
+                                                    let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
+                                                        pairing_error_for_remove.set(Some("No host selected.".to_owned()));
+                                                        return;
+                                                    };
+                                                    if let Err(err) = mobile_device_revoke(&host_id, host_stream, device_id).await {
+                                                        log::error!("mobile_device_revoke send failed: {err}");
+                                                        pairing_error_for_remove.set(Some(format!("Could not remove mobile device: {err}")));
+                                                    }
+                                                });
+                                            }
+                                        >
+                                            "Remove"
+                                        </button>
                                     </li>
                                 }
                             }).collect::<Vec<_>>()}
@@ -4324,6 +4362,9 @@ mod wasm_tests {
                 window.__TAURI__.core = window.__TAURI__.core || {};
                 window.__TAURI__.core.invoke = function(cmd, args) {
                     window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    if (cmd === "plugin:dialog|message") {
+                        return Promise.resolve("Ok");
+                    }
                     return Promise.resolve();
                 };
                 window.__TAURI__.event = window.__TAURI__.event || {};
@@ -4776,6 +4817,70 @@ mod wasm_tests {
         assert!(
             btn.has_attribute("disabled"),
             "Start pairing must be disabled when mobile is not enabled"
+        );
+    }
+
+    /// Each paired mobile device row has a Remove action. Clicking it
+    /// confirms, then sends `MobileDeviceRevoke` so stale test devices
+    /// disappear from the host-side pairing store.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_remove_paired_device_sends_revoke() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            let url = BrokerUrl::new("mqtts://broker.test:8883").expect("broker url");
+            state.mobile_access_state.update(|m| {
+                m.insert(
+                    "host-mobile".to_owned(),
+                    protocol::MobileAccessStatePayload {
+                        broker_status: MobileBrokerStatus::Online { broker_url: url },
+                        pairing: MobilePairingState::Idle,
+                        paired_devices: vec![protocol::MobileDeviceSummary {
+                            device_id: protocol::MobileDeviceId("device-1".to_owned()),
+                            label: "Old Test Phone".to_owned(),
+                            key_fingerprint: "fp".to_owned(),
+                            created_at_ms: 1,
+                            last_seen_at_ms: None,
+                            state: MobileDeviceState::Paired,
+                        }],
+                    },
+                );
+            });
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Old Test Phone"),
+            "Paired device label must render before removal: {text}"
+        );
+        let remove =
+            find_button_by_text(&container, "Remove").expect("Device row must render Remove");
+        remove.click();
+        for _ in 0..6 {
+            next_tick().await;
+        }
+
+        let envelopes = recorded_mobile_envelopes(&calls);
+        let revoke = envelopes
+            .iter()
+            .find(|env| env.get("kind").and_then(|k| k.as_str()) == Some("mobile_device_revoke"))
+            .expect("Remove click must emit a MobileDeviceRevoke frame");
+        let device_id = revoke
+            .get("payload")
+            .and_then(|p| p.get("device_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            device_id,
+            Some("device-1"),
+            "MobileDeviceRevoke must target the selected device"
         );
     }
 

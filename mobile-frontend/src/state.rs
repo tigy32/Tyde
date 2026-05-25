@@ -1,0 +1,705 @@
+use std::collections::HashMap;
+
+use leptos::prelude::*;
+pub use mobile_shell_types::{
+    LocalHostId, MobilePairingPreview, MobileShellError, PairedHostConnectionStatus,
+    PairedHostSummary,
+};
+use protocol::types::AgentCompactNotifyPayload;
+use protocol::{
+    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
+    DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope,
+    ProjectFileContentsPayload, ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus,
+    ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review, ReviewErrorPayload, ReviewId,
+    ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
+    Steering, SteeringId, StreamPath, TaskList, Team, TeamCompactNotifyPayload, TeamDraft,
+    TeamDraftId, TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamPresetCatalog, ToolExecutionCompletedData, ToolRequest,
+};
+
+// ── Tool output viewing mode ───────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    Summary,
+    Compact,
+    Full,
+}
+
+// ── Connection status ──────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error(String),
+}
+
+impl From<PairedHostConnectionStatus> for ConnectionStatus {
+    fn from(status: PairedHostConnectionStatus) -> Self {
+        match status {
+            PairedHostConnectionStatus::Connecting => ConnectionStatus::Connecting,
+            PairedHostConnectionStatus::Connected => ConnectionStatus::Connected,
+            PairedHostConnectionStatus::Disconnected { .. } => ConnectionStatus::Disconnected,
+            PairedHostConnectionStatus::Failed { message, .. } => ConnectionStatus::Error(message),
+        }
+    }
+}
+
+// ── App mode + pairing screens ─────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PairingScreen {
+    Scanner,
+    ManualPaste,
+    Confirm {
+        qr_uri: String,
+        preview: MobilePairingPreview,
+    },
+    InProgress {
+        qr_uri: String,
+        preview: MobilePairingPreview,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppMode {
+    /// User has zero paired hosts.
+    Onboarding,
+    /// User has at least one paired host but is not currently in the pairing
+    /// flow. The picker / per-host workspace renders here.
+    Workspace,
+    /// Pairing flow is on-screen.
+    Pairing(PairingScreen),
+}
+
+// ── Refs ───────────────────────────────────────────────────────────────
+
+/// Composite key for per-agent state (chat, tasks, streaming, etc).
+/// Combines `LocalHostId` with `AgentId` so two paired hosts that happen to
+/// generate colliding agent identifiers stay isolated.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AgentRef {
+    pub local_host_id: LocalHostId,
+    pub agent_id: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ActiveProjectRef {
+    pub local_host_id: LocalHostId,
+    pub project_id: ProjectId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectFileRef {
+    pub local_host_id: LocalHostId,
+    pub project_id: ProjectId,
+    pub path: ProjectPath,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectFileState {
+    pub path: ProjectPath,
+    pub contents: Option<String>,
+    pub is_binary: bool,
+}
+
+impl From<ProjectFileContentsPayload> for ProjectFileState {
+    fn from(payload: ProjectFileContentsPayload) -> Self {
+        Self {
+            path: payload.path,
+            contents: payload.contents,
+            is_binary: payload.is_binary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectDiffRef {
+    pub local_host_id: LocalHostId,
+    pub project_id: ProjectId,
+    pub root: ProjectRootPath,
+    pub scope: ProjectDiffScope,
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectDiffState {
+    pub root: ProjectRootPath,
+    pub scope: ProjectDiffScope,
+    pub path: Option<String>,
+    pub context_mode: DiffContextMode,
+    pub pending: bool,
+    pub files: Vec<ProjectGitDiffFile>,
+}
+
+impl ProjectDiffState {
+    pub fn for_request(
+        previous: Option<&ProjectDiffState>,
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: Option<String>,
+        context_mode: DiffContextMode,
+    ) -> Self {
+        let files = previous
+            .filter(|existing| existing.context_mode == context_mode)
+            .map(|existing| existing.files.clone())
+            .unwrap_or_default();
+        Self {
+            root,
+            scope,
+            path,
+            context_mode,
+            pending: true,
+            files,
+        }
+    }
+}
+
+pub fn reduce_project_diff_response(
+    current: Option<&ProjectDiffState>,
+    payload: protocol::ProjectGitDiffPayload,
+) -> Option<ProjectDiffState> {
+    if current.is_some_and(|state| state.pending && state.context_mode != payload.context_mode) {
+        return None;
+    }
+    Some(ProjectDiffState {
+        root: payload.root,
+        scope: payload.scope,
+        path: payload.path,
+        context_mode: payload.context_mode,
+        pending: false,
+        files: payload.files,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReviewRef {
+    pub local_host_id: LocalHostId,
+    pub review_id: ReviewId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveAgentRef {
+    pub local_host_id: LocalHostId,
+    pub agent_id: AgentId,
+}
+
+impl ActiveAgentRef {
+    pub fn as_agent_ref(&self) -> AgentRef {
+        AgentRef {
+            local_host_id: self.local_host_id.clone(),
+            agent_id: self.agent_id.clone(),
+        }
+    }
+}
+
+// ── Agent info ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentInfo {
+    pub local_host_id: LocalHostId,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub origin: AgentOrigin,
+    pub backend_kind: BackendKind,
+    pub workspace_roots: Vec<String>,
+    pub project_id: Option<ProjectId>,
+    pub parent_agent_id: Option<AgentId>,
+    pub custom_agent_id: Option<CustomAgentId>,
+    pub created_at_ms: u64,
+    pub instance_stream: StreamPath,
+    pub started: bool,
+    pub fatal_error: Option<String>,
+}
+
+impl AgentInfo {
+    pub fn agent_ref(&self) -> AgentRef {
+        AgentRef {
+            local_host_id: self.local_host_id.clone(),
+            agent_id: self.agent_id.clone(),
+        }
+    }
+}
+
+// ── Chat types ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct ChatMessageEntry {
+    pub message: ChatMessage,
+    pub tool_requests: Vec<ToolRequestEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolRequestEntry {
+    pub request: ToolRequest,
+    pub result: Option<ToolExecutionCompletedData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamingState {
+    pub agent_name: String,
+    pub model: Option<String>,
+    pub text: ArcRwSignal<String>,
+    pub reasoning: ArcRwSignal<String>,
+    pub tool_requests: ArcRwSignal<Vec<ToolRequestEntry>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TransientEvent {
+    OperationCancelled {
+        message: String,
+    },
+    RetryAttempt {
+        attempt: u64,
+        max_retries: u64,
+        error: String,
+        backoff_ms: u64,
+    },
+}
+
+// ── Project/session info ───────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectInfo {
+    pub local_host_id: LocalHostId,
+    pub project: Project,
+}
+
+pub fn sort_project_infos(projects: &mut [ProjectInfo]) {
+    projects.sort_by(|left, right| {
+        left.local_host_id
+            .0
+            .cmp(&right.local_host_id.0)
+            .then(left.project.sort_order.cmp(&right.project.sort_order))
+            .then(left.project.name.cmp(&right.project.name))
+            .then(left.project.id.0.cmp(&right.project.id.0))
+    });
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionInfo {
+    pub local_host_id: LocalHostId,
+    pub summary: SessionSummary,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostBrowseSession {
+    pub local_host_id: LocalHostId,
+    pub stream: StreamPath,
+    pub opened: Option<HostBrowseOpenedPayload>,
+    pub entries_by_path: HashMap<HostAbsPath, HostBrowseEntriesPayload>,
+    pub latest_error: Option<HostBrowseErrorPayload>,
+}
+
+// ── Navigation ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq, Copy)]
+pub enum MobileTab {
+    Home,
+    Agents,
+    Sessions,
+    Projects,
+    Settings,
+}
+
+// ── App state ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct AppState {
+    // Top-level routing
+    pub app_mode: RwSignal<AppMode>,
+    pub active_local_host_id: RwSignal<Option<LocalHostId>>,
+
+    // Multi-host
+    pub paired_hosts: RwSignal<Vec<PairedHostSummary>>,
+    pub connection_statuses: RwSignal<HashMap<LocalHostId, ConnectionStatus>>,
+    pub host_streams: RwSignal<HashMap<LocalHostId, StreamPath>>,
+    pub host_settings_by_host: RwSignal<HashMap<LocalHostId, HostSettings>>,
+    pub command_errors_by_host: RwSignal<HashMap<LocalHostId, String>>,
+    pub backend_setup_by_host: RwSignal<HashMap<LocalHostId, Vec<BackendSetupInfo>>>,
+    pub session_schemas_by_host:
+        RwSignal<HashMap<LocalHostId, HashMap<BackendKind, SessionSchemaEntry>>>,
+    pub custom_agents_by_host: RwSignal<HashMap<LocalHostId, HashMap<CustomAgentId, CustomAgent>>>,
+    pub mcp_servers_by_host: RwSignal<HashMap<LocalHostId, HashMap<McpServerId, McpServerConfig>>>,
+    pub steering_by_host: RwSignal<HashMap<LocalHostId, HashMap<SteeringId, Steering>>>,
+    pub skills_by_host: RwSignal<HashMap<LocalHostId, HashMap<SkillId, Skill>>>,
+
+    // Mobile shell error notification
+    pub mobile_shell_error: RwSignal<Option<MobileShellError>>,
+
+    // Tab navigation within the per-host workspace
+    pub active_tab: RwSignal<MobileTab>,
+    pub viewing_chat: RwSignal<bool>,
+
+    // Projects
+    pub projects: RwSignal<Vec<ProjectInfo>>,
+    pub active_project: RwSignal<Option<ActiveProjectRef>>,
+    pub file_tree: RwSignal<HashMap<(LocalHostId, ProjectId), Vec<ProjectRootListing>>>,
+    pub git_status: RwSignal<HashMap<(LocalHostId, ProjectId), Vec<ProjectRootGitStatus>>>,
+    pub project_file_contents: RwSignal<HashMap<ProjectFileRef, ProjectFileState>>,
+    pub project_diffs: RwSignal<HashMap<ProjectDiffRef, ProjectDiffState>>,
+    pub review_summaries: RwSignal<HashMap<(LocalHostId, ProjectId), Vec<ReviewSummary>>>,
+    pub reviews: RwSignal<HashMap<ReviewRef, Review>>,
+    pub review_errors: RwSignal<HashMap<ReviewRef, ReviewErrorPayload>>,
+    pub review_streams: RwSignal<HashMap<ReviewRef, StreamPath>>,
+
+    // Agents & Chat
+    pub agents: RwSignal<Vec<AgentInfo>>,
+    pub active_agent: RwSignal<Option<ActiveAgentRef>>,
+    pub chat_messages: RwSignal<HashMap<AgentRef, Vec<ChatMessageEntry>>>,
+    pub streaming_text: RwSignal<HashMap<AgentRef, StreamingState>>,
+    pub chat_input: RwSignal<String>,
+    pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
+    pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
+    pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
+    pub transient_events: RwSignal<HashMap<AgentRef, Vec<TransientEvent>>>,
+    pub agent_session_settings: RwSignal<HashMap<AgentRef, SessionSettingsValues>>,
+    pub agent_compactions: RwSignal<HashMap<AgentRef, AgentCompactNotifyPayload>>,
+
+    // Teams
+    pub teams_by_host: RwSignal<HashMap<LocalHostId, HashMap<protocol::TeamId, Team>>>,
+    pub team_members_by_host: RwSignal<HashMap<LocalHostId, HashMap<TeamMemberId, TeamMember>>>,
+    pub team_bindings_by_host:
+        RwSignal<HashMap<LocalHostId, HashMap<TeamMemberId, TeamMemberBindingPayload>>>,
+    pub team_compactions_by_host:
+        RwSignal<HashMap<LocalHostId, HashMap<protocol::TeamId, TeamCompactNotifyPayload>>>,
+    pub team_preset_catalog_by_host: RwSignal<HashMap<LocalHostId, TeamPresetCatalog>>,
+    pub team_drafts_by_host: RwSignal<HashMap<LocalHostId, HashMap<TeamDraftId, TeamDraft>>>,
+    pub team_shuffle_suggestions_by_host:
+        RwSignal<HashMap<LocalHostId, HashMap<protocol::TeamId, TeamMemberShuffleSuggestion>>>,
+
+    // Host filesystem browsing
+    pub host_browses: RwSignal<HashMap<(LocalHostId, StreamPath), HostBrowseSession>>,
+
+    // Sessions
+    pub sessions: RwSignal<Vec<SessionInfo>>,
+
+    // Draft state for new agent
+    pub draft_backend_override: RwSignal<Option<BackendKind>>,
+    pub draft_custom_agent_id: RwSignal<Option<CustomAgentId>>,
+    pub draft_session_settings: RwSignal<SessionSettingsValues>,
+
+    // Appearance
+    pub theme: RwSignal<String>,
+    pub tool_output_mode: RwSignal<ToolOutputMode>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            app_mode: RwSignal::new(AppMode::Onboarding),
+            active_local_host_id: RwSignal::new(None),
+
+            paired_hosts: RwSignal::new(Vec::new()),
+            connection_statuses: RwSignal::new(HashMap::new()),
+            host_streams: RwSignal::new(HashMap::new()),
+            host_settings_by_host: RwSignal::new(HashMap::new()),
+            command_errors_by_host: RwSignal::new(HashMap::new()),
+            backend_setup_by_host: RwSignal::new(HashMap::new()),
+            session_schemas_by_host: RwSignal::new(HashMap::new()),
+            custom_agents_by_host: RwSignal::new(HashMap::new()),
+            mcp_servers_by_host: RwSignal::new(HashMap::new()),
+            steering_by_host: RwSignal::new(HashMap::new()),
+            skills_by_host: RwSignal::new(HashMap::new()),
+
+            mobile_shell_error: RwSignal::new(None),
+
+            active_tab: RwSignal::new(MobileTab::Home),
+            viewing_chat: RwSignal::new(false),
+
+            projects: RwSignal::new(Vec::new()),
+            active_project: RwSignal::new(None),
+            file_tree: RwSignal::new(HashMap::new()),
+            git_status: RwSignal::new(HashMap::new()),
+            project_file_contents: RwSignal::new(HashMap::new()),
+            project_diffs: RwSignal::new(HashMap::new()),
+            review_summaries: RwSignal::new(HashMap::new()),
+            reviews: RwSignal::new(HashMap::new()),
+            review_errors: RwSignal::new(HashMap::new()),
+            review_streams: RwSignal::new(HashMap::new()),
+
+            agents: RwSignal::new(Vec::new()),
+            active_agent: RwSignal::new(None),
+            chat_messages: RwSignal::new(HashMap::new()),
+            streaming_text: RwSignal::new(HashMap::new()),
+            chat_input: RwSignal::new(String::new()),
+            task_lists: RwSignal::new(HashMap::new()),
+            agent_message_queue: RwSignal::new(HashMap::new()),
+            agent_turn_active: RwSignal::new(HashMap::new()),
+            transient_events: RwSignal::new(HashMap::new()),
+            agent_session_settings: RwSignal::new(HashMap::new()),
+            agent_compactions: RwSignal::new(HashMap::new()),
+
+            teams_by_host: RwSignal::new(HashMap::new()),
+            team_members_by_host: RwSignal::new(HashMap::new()),
+            team_bindings_by_host: RwSignal::new(HashMap::new()),
+            team_compactions_by_host: RwSignal::new(HashMap::new()),
+            team_preset_catalog_by_host: RwSignal::new(HashMap::new()),
+            team_drafts_by_host: RwSignal::new(HashMap::new()),
+            team_shuffle_suggestions_by_host: RwSignal::new(HashMap::new()),
+
+            host_browses: RwSignal::new(HashMap::new()),
+
+            sessions: RwSignal::new(Vec::new()),
+
+            draft_backend_override: RwSignal::new(None),
+            draft_custom_agent_id: RwSignal::new(None),
+            draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
+
+            theme: RwSignal::new("dark".to_owned()),
+            tool_output_mode: RwSignal::new(ToolOutputMode::Compact),
+        }
+    }
+
+    pub fn host_stream_untracked(&self, host: &LocalHostId) -> Option<StreamPath> {
+        self.host_streams.get_untracked().get(host).cloned()
+    }
+
+    pub fn active_host_settings(&self) -> Option<HostSettings> {
+        let host = self.active_local_host_id.get()?;
+        self.host_settings_by_host.get().get(&host).cloned()
+    }
+
+    pub fn active_host_settings_untracked(&self) -> Option<HostSettings> {
+        let host = self.active_local_host_id.get_untracked()?;
+        self.host_settings_by_host
+            .get_untracked()
+            .get(&host)
+            .cloned()
+    }
+
+    pub fn active_host_connection_status(&self) -> ConnectionStatus {
+        let Some(host) = self.active_local_host_id.get() else {
+            return ConnectionStatus::Disconnected;
+        };
+        self.connection_statuses
+            .get()
+            .get(&host)
+            .cloned()
+            .unwrap_or(ConnectionStatus::Disconnected)
+    }
+
+    pub fn active_host_command_error(&self) -> Option<String> {
+        let host = self.active_local_host_id.get()?;
+        self.command_errors_by_host.get().get(&host).cloned()
+    }
+
+    pub fn active_host_backend_setup(&self) -> Vec<BackendSetupInfo> {
+        let Some(host) = self.active_local_host_id.get() else {
+            return Vec::new();
+        };
+        self.backend_setup_by_host
+            .get()
+            .get(&host)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn active_host_custom_agents(&self) -> HashMap<CustomAgentId, CustomAgent> {
+        let Some(host) = self.active_local_host_id.get() else {
+            return HashMap::new();
+        };
+        self.custom_agents_by_host
+            .get()
+            .get(&host)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn active_paired_host(&self) -> Option<PairedHostSummary> {
+        let host = self.active_local_host_id.get()?;
+        self.paired_hosts
+            .get()
+            .into_iter()
+            .find(|h| h.local_host_id == host)
+    }
+
+    /// Drops every per-host signal entry for `host`. Called when a host is
+    /// forgotten (the user removed the pairing) or fully disconnects in a way
+    /// that should clear cached snapshots.
+    pub fn clear_host_runtime(&self, host: &LocalHostId) {
+        self.host_streams.update(|m| {
+            m.remove(host);
+        });
+        self.host_settings_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.command_errors_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.backend_setup_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.session_schemas_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.custom_agents_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.mcp_servers_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.steering_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.skills_by_host.update(|m| {
+            m.remove(host);
+        });
+
+        self.projects
+            .update(|projects| projects.retain(|p| p.local_host_id != *host));
+        self.agents
+            .update(|agents| agents.retain(|a| a.local_host_id != *host));
+        self.sessions
+            .update(|sessions| sessions.retain(|s| s.local_host_id != *host));
+
+        self.file_tree.update(|m| {
+            m.retain(|(h, _), _| h != host);
+        });
+        self.git_status.update(|m| {
+            m.retain(|(h, _), _| h != host);
+        });
+        self.project_file_contents.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.project_diffs.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.review_summaries.update(|m| {
+            m.retain(|(h, _), _| h != host);
+        });
+        self.reviews.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.review_errors.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.review_streams.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+
+        self.chat_messages.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.streaming_text.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.task_lists.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_message_queue.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_turn_active.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.transient_events.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_session_settings.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_compactions.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.teams_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.team_members_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.team_bindings_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.team_compactions_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.team_preset_catalog_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.team_drafts_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.team_shuffle_suggestions_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.host_browses.update(|m| {
+            m.retain(|(h, _), _| h != host);
+        });
+
+        if self
+            .active_project
+            .get_untracked()
+            .as_ref()
+            .is_some_and(|active| active.local_host_id == *host)
+        {
+            self.active_project.set(None);
+        }
+        if self
+            .active_agent
+            .get_untracked()
+            .as_ref()
+            .is_some_and(|active| active.local_host_id == *host)
+        {
+            self.active_agent.set(None);
+            self.viewing_chat.set(false);
+        }
+        if self
+            .active_local_host_id
+            .get_untracked()
+            .as_ref()
+            .is_some_and(|active| active == host)
+        {
+            self.active_local_host_id.set(None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_host_id_serializes_transparent() {
+        let id = LocalHostId("h-1".to_owned());
+        let encoded = serde_json::to_string(&id).unwrap();
+        assert_eq!(encoded, "\"h-1\"");
+    }
+
+    #[test]
+    fn paired_host_connection_status_maps_to_connection_status() {
+        assert_eq!(
+            ConnectionStatus::Connecting,
+            PairedHostConnectionStatus::Connecting.into()
+        );
+        assert_eq!(
+            ConnectionStatus::Connected,
+            PairedHostConnectionStatus::Connected.into()
+        );
+        assert!(matches!(
+            ConnectionStatus::from(PairedHostConnectionStatus::Disconnected {
+                reason: "x".to_owned(),
+            }),
+            ConnectionStatus::Disconnected
+        ));
+        assert!(matches!(
+            ConnectionStatus::from(PairedHostConnectionStatus::Failed {
+                code: protocol::MobileAccessErrorCode::TransportFailed,
+                message: "boom".to_owned(),
+            }),
+            ConnectionStatus::Error(_)
+        ));
+    }
+}

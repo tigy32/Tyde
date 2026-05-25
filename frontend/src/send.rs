@@ -5,15 +5,15 @@ use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
     CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobilePairingCancelPayload,
-    MobilePairingOfferId, MobilePairingStartPayload, SkillRefreshPayload, Steering,
-    SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
-    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
-    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
-    TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload, TeamMemberUpdatePayload,
-    TeamSetManagerPayload, TeamTemplateId,
+    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobileDeviceId,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
+    MobilePairingStartPayload, SkillRefreshPayload, Steering, SteeringDeletePayload, SteeringId,
+    SteeringUpsertPayload, StreamPath, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId,
+    TeamDraftMemberEdit, TeamDraftMemberId, TeamDraftShufflePayload, TeamDraftShuffleScope,
+    TeamDraftUpdatePayload, TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload,
+    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamSetManagerPayload, TeamTemplateId,
 };
 use serde::Serialize;
 
@@ -140,6 +140,22 @@ pub async fn mobile_pairing_cancel(
         host_stream,
         FrameKind::MobilePairingCancel,
         &MobilePairingCancelPayload { offer_id },
+    )
+    .await
+}
+
+/// Remove a previously paired mobile device from the host-side pairing store.
+/// The server replies by broadcasting a fresh `MobileAccessState`.
+pub async fn mobile_device_revoke(
+    host_id: &str,
+    host_stream: StreamPath,
+    device_id: MobileDeviceId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::MobileDeviceRevoke,
+        &MobileDeviceRevokePayload { device_id },
     )
     .await
 }

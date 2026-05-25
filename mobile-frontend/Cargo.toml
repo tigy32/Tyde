@@ -1,0 +1,36 @@
+[package]
+name = "mobile-frontend"
+edition.workspace = true
+
+[dependencies]
+protocol = { path = "../protocol", default-features = false }
+host-config = { path = "../host-config" }
+mobile-shell-types = { path = "../mobile-shell-types" }
+leptos = { version = "0.8.17", features = ["csr"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Clipboard",
+    "Document",
+    "Event",
+    "Element",
+    "EventTarget",
+    "HtmlElement",
+    "HtmlTextAreaElement",
+    "Navigator",
+    "Node",
+    "Storage",
+    "Window",
+    "console",
+] }
+log = "0.4"
+console_log = "1"
+console_error_panic_hook = "0.1"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

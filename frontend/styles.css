@@ -5871,6 +5871,10 @@ kbd {
     margin: 0 0 var(--space-2) 0;
 }
 
+.settings-mobile-pairing-devices-description {
+    margin: 0 0 var(--space-2) 0;
+}
+
 .settings-mobile-pairing-devices-list {
     list-style: none;
     margin: 0;
@@ -5890,9 +5894,19 @@ kbd {
     background: var(--surface-1, var(--surface-base));
 }
 
+.settings-mobile-pairing-device-main {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
 .settings-mobile-pairing-device-label {
     font-weight: 500;
     color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .settings-mobile-pairing-device-state {
@@ -5908,6 +5922,12 @@ kbd {
 
 .settings-mobile-pairing-device-state-revoked {
     color: var(--error, var(--accent-primary));
+}
+
+.settings-mobile-pairing-device-remove {
+    color: var(--error, var(--accent-primary));
+    border-color: var(--error, var(--accent-primary));
+    flex-shrink: 0;
 }
 
 /* --- Backend Cards --- */

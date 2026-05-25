@@ -127,6 +127,11 @@ fi
 
 # ── Run the tests ─────────────────────────────────────────────────────────
 export CHROMEDRIVER="$driver_bin"
+
 cd "$repo_root/frontend"
-log "running: cargo test --target wasm32-unknown-unknown $*"
+log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
+cargo test --target wasm32-unknown-unknown "$@"
+
+cd "$repo_root/mobile-frontend"
+log "running: cargo test --target wasm32-unknown-unknown $* (mobile-frontend)"
 exec cargo test --target wasm32-unknown-unknown "$@"

@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Tyde Mobile</title>
+    <link data-trunk rel="css" href="styles.css" />
+    <style>
+        html, body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            background: #0b0f14;
+            color: #e8edf3;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+        }
+        #app-root {
+            min-height: 100vh;
+            min-height: 100dvh;
+            background: #0b0f14;
+        }
+        .boot-screen {
+            min-height: 100vh;
+            min-height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 12px;
+            padding: 28px;
+            box-sizing: border-box;
+            background: #0b0f14;
+            color: #e8edf3;
+        }
+        .boot-logo {
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+        }
+        .boot-status {
+            color: #8b95a5;
+            font-size: 15px;
+            line-height: 1.45;
+        }
+        .boot-error {
+            margin-top: 12px;
+            padding: 12px;
+            border: 1px solid #f87171;
+            border-radius: 10px;
+            background: #2a1515;
+            color: #fca5a5;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+            line-height: 1.4;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body data-theme="dark">
+    <div id="app-root">
+        <div id="boot-screen" class="boot-screen">
+            <div class="boot-logo">Tyde Mobile</div>
+            <div id="boot-status" class="boot-status">
+                Starting frontend… If this stays here, the WASM bundle did not mount.
+            </div>
+        </div>
+    </div>
+    <script>
+    (function installBootDiagnostics() {
+        const showBootError = (message) => {
+            const root = document.getElementById("boot-screen") || document.getElementById("app-root") || document.body;
+            if (!root) return;
+            let error = document.getElementById("boot-error");
+            if (!error) {
+                error = document.createElement("div");
+                error.id = "boot-error";
+                error.className = "boot-error";
+                root.appendChild(error);
+            }
+            error.textContent = message;
+        };
+        window.addEventListener("error", (event) => {
+            showBootError("JavaScript error: " + (event.message || "unknown") + "\n" + (event.filename || "unknown") + ":" + (event.lineno || 0));
+        });
+        window.addEventListener("unhandledrejection", (event) => {
+            const reason = event.reason && event.reason.stack ? event.reason.stack : String(event.reason);
+            showBootError("Unhandled promise rejection:\n" + reason);
+        });
+    })();
+
+    (function installUiDebugHttpBridge() {
+        let debugEnabled = false;
+        try {
+            const params = new URLSearchParams(window.location.search || "");
+            debugEnabled = params.has("tyde-mobile-debug") || window.localStorage.getItem("tyde.mobile.debug") === "1";
+        } catch (_error) {
+            debugEnabled = false;
+        }
+        if (!debugEnabled) return;
+
+        const base = "http://127.0.0.1:9820";
+        const session = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+        const pollDelayMs = 75;
+        const retryDelayMs = 250;
+        let announcedFailure = false;
+
+        function logDebugFailure(prefix, error) {
+            if (announcedFailure) return;
+            announcedFailure = true;
+            console.warn(prefix, error && error.stack ? error.stack : error);
+        }
+
+        async function fetchJson(path, options) {
+            const response = await fetch(base + path, {
+                cache: "no-store",
+                ...options,
+            });
+            if (!response.ok) {
+                throw new Error(path + " failed with HTTP " + response.status);
+            }
+            return await response.json();
+        }
+
+        function toJsonValue(value) {
+            if (value === undefined) return null;
+            try {
+                const encoded = JSON.stringify(value, (_key, item) => {
+                    if (typeof item === "bigint") return item.toString();
+                    if (typeof item === "function") return "[Function " + (item.name || "anonymous") + "]";
+                    if (item instanceof Error) {
+                        return { name: item.name, message: item.message, stack: item.stack || null };
+                    }
+                    return item;
+                });
+                if (encoded === undefined) return null;
+                return JSON.parse(encoded);
+            } catch (_error) {
+                return String(value);
+            }
+        }
+
+        async function evaluateExpression(expression) {
+            const script = "(async () => {\n" + expression + "\n})()";
+            const value = await (0, eval)(script);
+            return { kind: "evaluate_result", value: toJsonValue(value) };
+        }
+
+        function collectStylesheetText() {
+            let text = "";
+            for (const sheet of Array.from(document.styleSheets)) {
+                const rules = sheet.cssRules;
+                for (const rule of Array.from(rules)) {
+                    text += rule.cssText + "\n";
+                }
+            }
+            return text;
+        }
+
+        function viewportSize() {
+            const doc = document.documentElement;
+            const body = document.body;
+            return {
+                width: Math.max(1, Math.ceil(window.innerWidth || doc.clientWidth || body.clientWidth || 390)),
+                height: Math.max(1, Math.ceil(window.innerHeight || doc.clientHeight || body.clientHeight || 844)),
+            };
+        }
+
+        async function captureScreenshot(maxDimension) {
+            const { width, height } = viewportSize();
+            const scale = maxDimension ? Math.min(1, maxDimension / Math.max(width, height)) : 1;
+            const outWidth = Math.max(1, Math.round(width * scale));
+            const outHeight = Math.max(1, Math.round(height * scale));
+
+            const container = document.createElement("div");
+            container.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+            container.style.width = width + "px";
+            container.style.height = height + "px";
+            container.style.overflow = "hidden";
+            container.style.background = getComputedStyle(document.body).backgroundColor || "#0b0f14";
+
+            const style = document.createElement("style");
+            style.textContent = collectStylesheetText();
+            container.appendChild(style);
+
+            for (const node of Array.from(document.body.childNodes)) {
+                if (node.nodeName.toLowerCase() !== "script") {
+                    container.appendChild(node.cloneNode(true));
+                }
+            }
+
+            const xhtml = new XMLSerializer().serializeToString(container);
+            const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + width + '" height="' + height + '"><foreignObject width="100%" height="100%">' + xhtml + '</foreignObject></svg>';
+            const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+            try {
+                const image = new Image();
+                const loaded = new Promise((resolve, reject) => {
+                    image.onload = resolve;
+                    image.onerror = () => reject(new Error("failed to render SVG screenshot"));
+                });
+                image.src = url;
+                await loaded;
+
+                const canvas = document.createElement("canvas");
+                canvas.width = outWidth;
+                canvas.height = outHeight;
+                const context = canvas.getContext("2d");
+                if (!context) throw new Error("2D canvas context is unavailable");
+                context.scale(scale, scale);
+                context.drawImage(image, 0, 0);
+                const dataUrl = canvas.toDataURL("image/png");
+                return {
+                    kind: "capture_screenshot_result",
+                    png_base64: dataUrl.split(",")[1] || "",
+                    width: outWidth,
+                    height: outHeight,
+                };
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        window.__tydeMobileDebug = {
+            session,
+            eval: (expression) => evaluateExpression(expression),
+            captureScreenshot,
+        };
+        window.__tydeMobileCaptureScreenshot = async (maxDimension) => {
+            const result = await captureScreenshot(maxDimension);
+            return {
+                pngBase64: result.png_base64,
+                width: result.width,
+                height: result.height,
+            };
+        };
+
+        async function handleRequest(event) {
+            const request = event && event.request;
+            if (!request || !request.kind) return;
+
+            let response;
+            try {
+                if (request.kind === "ping") {
+                    response = { kind: "pong" };
+                } else if (request.kind === "evaluate") {
+                    response = await evaluateExpression(request.expression || "");
+                } else if (request.kind === "capture_screenshot") {
+                    response = await captureScreenshot(request.max_dimension ?? request.maxDimension ?? null);
+                } else {
+                    response = { kind: "error", message: "unknown UI debug request kind: " + request.kind };
+                }
+            } catch (error) {
+                response = { kind: "error", message: error && error.stack ? error.stack : String(error) };
+            }
+
+            await fetchJson("/ui-debug/response", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ request_id: event.request_id, response }),
+            });
+        }
+
+        let pollTimer = null;
+        let pollInFlight = false;
+
+        async function pollOnce() {
+            if (pollInFlight) return;
+            pollInFlight = true;
+            const controller = new AbortController();
+            const abortTimer = setTimeout(() => controller.abort(), 2000);
+            try {
+                const event = await fetchJson("/ui-debug/poll?session=" + encodeURIComponent(session), { signal: controller.signal });
+                if (event) {
+                    await handleRequest(event);
+                }
+            } catch (error) {
+                logDebugFailure("Tyde UI debug poll failed", error);
+            } finally {
+                clearTimeout(abortTimer);
+                pollInFlight = false;
+            }
+        }
+
+        function startPollLoop() {
+            if (pollTimer !== null) return;
+            pollTimer = setInterval(pollOnce, pollDelayMs);
+            pollOnce();
+        }
+
+        function sleep(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        async function installTauriEventListener() {
+            const tauriEvent = window.__TAURI__ && window.__TAURI__.event;
+            if (!tauriEvent || typeof tauriEvent.listen !== "function") {
+                throw new Error("window.__TAURI__.event.listen is unavailable");
+            }
+            await tauriEvent.listen("tyde://ui-debug-request", async (tauriEventPayload) => {
+                try {
+                    await handleRequest(tauriEventPayload.payload);
+                } catch (error) {
+                    console.error("Tyde UI debug event request failed", error && error.stack ? error.stack : error);
+                }
+            });
+            console.info("Tyde UI debug Tauri event listener ready", session);
+        }
+
+        async function installTauriEventListenerLoop() {
+            for (;;) {
+                try {
+                    await installTauriEventListener();
+                    return;
+                } catch (error) {
+                    logDebugFailure("Tyde UI debug Tauri event listener failed", error);
+                    await sleep(retryDelayMs);
+                }
+            }
+        }
+
+        async function markReadyLoop() {
+            try {
+                await fetchJson("/ui-debug/ready?session=" + encodeURIComponent(session), { method: "POST" });
+                console.info("Tyde UI debug bridge ready", session);
+                startPollLoop();
+            } catch (error) {
+                logDebugFailure("Tyde UI debug ready failed", error);
+                setTimeout(markReadyLoop, retryDelayMs);
+            }
+        }
+
+        installTauriEventListenerLoop().then(markReadyLoop);
+    })();
+    </script>
+</body>
+</html>
