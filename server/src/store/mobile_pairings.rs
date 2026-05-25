@@ -107,8 +107,7 @@ impl MobilePairingsStore {
             return Ok(path);
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home)
+        Ok(crate::paths::home_dir()?
             .join(".tyde")
             .join("mobile_pairings.json"))
     }

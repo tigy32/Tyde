@@ -151,8 +151,7 @@ impl ReviewStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home).join(".tyde").join("reviews.json"))
+        Ok(crate::paths::home_dir()?.join(".tyde").join("reviews.json"))
     }
 
     pub fn list(&self) -> Result<Vec<Review>, String> {

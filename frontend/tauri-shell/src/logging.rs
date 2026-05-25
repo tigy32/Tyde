@@ -106,8 +106,5 @@ fn tracing_dir() -> Result<PathBuf, String> {
         }
     }
 
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| "failed to resolve HOME for tracing directory".to_string())?;
-    Ok(PathBuf::from(home).join(".tyde").join("tracing"))
+    Ok(server::paths::home_dir()?.join(".tyde").join("tracing"))
 }

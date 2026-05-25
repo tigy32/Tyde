@@ -36,8 +36,9 @@ impl HostSettingsStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home).join(".tyde").join("settings.json"))
+        Ok(crate::paths::home_dir()?
+            .join(".tyde")
+            .join("settings.json"))
     }
 
     pub fn get(&self) -> Result<HostSettings, String> {

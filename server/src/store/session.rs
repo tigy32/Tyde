@@ -73,8 +73,9 @@ impl SessionStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home).join(".tyde").join("sessions.json"))
+        Ok(crate::paths::home_dir()?
+            .join(".tyde")
+            .join("sessions.json"))
     }
 
     pub fn list(&self) -> Result<Vec<SessionRecord>, String> {

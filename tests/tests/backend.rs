@@ -1687,6 +1687,7 @@ async fn expect_tool_turn_after_user_echo(
     let mut got_user_message_echo = false;
     let mut final_text: Option<String> = None;
     let mut saw_stream_end = false;
+    let mut streamed_text = String::new();
     let mut tool_requests: HashMap<String, ToolRequest> = HashMap::new();
     let mut tool_completions: HashMap<String, ToolExecutionCompletedData> = HashMap::new();
 
@@ -1707,7 +1708,16 @@ async fn expect_tool_turn_after_user_echo(
                     continue;
                 }
                 saw_stream_end = true;
-                final_text = Some(data.message.content);
+                final_text = Some(if data.message.content.trim().is_empty() {
+                    streamed_text.clone()
+                } else {
+                    data.message.content
+                });
+            }
+            ChatEvent::StreamDelta(delta) => {
+                if got_user_message_echo {
+                    streamed_text.push_str(&delta.text);
+                }
             }
             ChatEvent::ToolRequest(request) => {
                 if got_user_message_echo {

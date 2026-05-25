@@ -26,9 +26,10 @@ pub(crate) fn host_platform() -> HostPlatform {
 }
 
 pub(crate) fn home_dir() -> HostAbsPath {
-    let path = std::env::var("HOME").unwrap_or_else(|err| {
-        panic!("cannot open browse stream: HOME is not set in this server process: {err}")
-    });
+    let path = crate::paths::home_dir()
+        .expect("cannot open browse stream: home directory is not set in this server process")
+        .to_string_lossy()
+        .into_owned();
     assert!(
         Path::new(&path).is_absolute(),
         "HOME must be an absolute path, got {path}"

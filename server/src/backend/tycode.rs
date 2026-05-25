@@ -673,8 +673,7 @@ async fn write_cancel(stdin: &mut tokio::process::ChildStdin) -> bool {
 }
 
 fn tycode_sessions_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory".to_string())?;
-    Ok(PathBuf::from(home).join(".tycode").join("sessions"))
+    Ok(crate::paths::home_dir()?.join(".tycode").join("sessions"))
 }
 
 fn build_tycode_mcp_servers_json(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {

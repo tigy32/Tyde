@@ -8,6 +8,7 @@ pub(crate) mod debug_mcp;
 pub(crate) mod error;
 pub(crate) mod host;
 pub(crate) mod mobile_access;
+pub mod paths;
 pub(crate) mod process_env;
 pub(crate) mod project_stream;
 pub mod remote;

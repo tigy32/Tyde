@@ -531,12 +531,7 @@ fsync_path "$DEST_DIR"
 }
 
 fn home_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory".to_string())?;
-    let trimmed = home.trim();
-    if trimmed.is_empty() {
-        return Err("HOME is empty".to_string());
-    }
-    Ok(PathBuf::from(trimmed))
+    crate::paths::home_dir()
 }
 
 #[allow(dead_code)]

@@ -75,8 +75,7 @@ pub fn launch() -> Result<(), String> {
         }
 
         let socket_path = resolve_socket_path()?;
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        let log_dir = PathBuf::from(home).join(".tyde").join("logs");
+        let log_dir = server::paths::home_dir()?.join(".tyde").join("logs");
         std::fs::create_dir_all(&log_dir).map_err(|err| {
             format!(
                 "failed to create Tyde log directory {}: {err}",
@@ -134,6 +133,5 @@ fn resolve_socket_path() -> Result<PathBuf, String> {
         }
     }
 
-    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-    Ok(PathBuf::from(home).join(".tyde").join("tyde.sock"))
+    Ok(server::paths::home_dir()?.join(".tyde").join("tyde.sock"))
 }

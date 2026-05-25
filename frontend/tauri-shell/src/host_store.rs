@@ -37,8 +37,7 @@ impl HostStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home)
+        Ok(server::paths::home_dir()?
             .join(".tyde")
             .join("configured_hosts.json"))
     }

@@ -6232,8 +6232,7 @@ fn session_schemas_for_enabled_backends(
 }
 
 fn kiro_probe_workspace_root() -> Result<String, String> {
-    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory".to_string())?;
-    Ok(home)
+    Ok(crate::paths::home_dir()?.to_string_lossy().into_owned())
 }
 
 fn new_instance_stream(agent_id: &AgentId) -> StreamPath {

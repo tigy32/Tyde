@@ -538,8 +538,9 @@ impl CustomAgentStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home).join(".tyde").join("custom_agents.json"))
+        Ok(crate::paths::home_dir()?
+            .join(".tyde")
+            .join("custom_agents.json"))
     }
 
     pub fn list(&self) -> Result<Vec<CustomAgent>, String> {

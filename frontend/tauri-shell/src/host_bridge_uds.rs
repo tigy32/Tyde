@@ -122,8 +122,7 @@ fn resolve_socket_path() -> Result<PathBuf, String> {
         }
     }
 
-    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-    Ok(PathBuf::from(home).join(".tyde").join("tyde.sock"))
+    Ok(server::paths::home_dir()?.join(".tyde").join("tyde.sock"))
 }
 
 #[cfg(target_os = "linux")]

@@ -315,8 +315,7 @@ fn resolve_socket_path() -> Result<PathBuf, String> {
 
 #[cfg(unix)]
 fn home_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-    Ok(PathBuf::from(home))
+    server::paths::home_dir()
 }
 
 #[cfg(unix)]

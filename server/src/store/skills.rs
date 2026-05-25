@@ -43,8 +43,7 @@ impl SkillStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home).join(".tyde").join("skills.json"))
+        Ok(crate::paths::home_dir()?.join(".tyde").join("skills.json"))
     }
 
     pub fn default_root_dir() -> Result<PathBuf, String> {
@@ -55,8 +54,7 @@ impl SkillStore {
             }
         }
 
-        let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
-        Ok(PathBuf::from(home).join(".tyde").join("skills"))
+        Ok(crate::paths::home_dir()?.join(".tyde").join("skills"))
     }
 
     pub fn list(&self) -> Result<Vec<Skill>, String> {
