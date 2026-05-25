@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
@@ -21,7 +21,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::time::timeout;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::host::HostHandle;
@@ -29,7 +29,7 @@ use crate::team_registry::team_preset_catalog;
 
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
-const DEFAULT_AWAIT_TIMEOUT_MS: u64 = 60_000;
+const AWAIT_TOOL_RESPONSE_GUARD: Duration = Duration::from_secs(90);
 const DEFAULT_READ_LIMIT: usize = 50;
 const MAX_READ_LIMIT: usize = 200;
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
@@ -128,7 +128,6 @@ struct SpawnAgentToolInput {
 #[serde(deny_unknown_fields)]
 struct AwaitAgentsToolInput {
     agent_ids: Vec<String>,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -323,7 +322,7 @@ impl TydeAgentControlMcpServer {
             Ok(ids) => ids,
             Err(err) => return Ok(err_text(err)),
         };
-        match do_await_agents(&self.host, agent_ids, input.timeout_ms).await {
+        match do_await_agents(&self.host, agent_ids).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -831,7 +830,14 @@ async fn do_list_agents(host: &HostHandle) -> Result<Vec<AgentOverview>, String>
 async fn do_await_agents(
     host: &HostHandle,
     agent_ids: Vec<AgentId>,
-    timeout_ms: Option<u64>,
+) -> Result<AwaitAgentsResult, String> {
+    do_await_agents_with_response_guard(host, agent_ids, AWAIT_TOOL_RESPONSE_GUARD).await
+}
+
+async fn do_await_agents_with_response_guard(
+    host: &HostHandle,
+    agent_ids: Vec<AgentId>,
+    response_guard: Duration,
 ) -> Result<AwaitAgentsResult, String> {
     if agent_ids.is_empty() {
         return Err("agent_ids must contain at least one agent_id".to_string());
@@ -843,9 +849,9 @@ async fn do_await_agents(
         }
     }
 
-    let timeout_at =
-        Instant::now() + Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_AWAIT_TIMEOUT_MS));
     let mut status_rx = host.subscribe_agent_status_changes().await;
+    let guard_sleep = sleep(response_guard);
+    tokio::pin!(guard_sleep);
 
     loop {
         let result = await_result_from_snapshot(host, &agent_ids).await?;
@@ -853,15 +859,15 @@ async fn do_await_agents(
             return Ok(result);
         }
 
-        let remaining = timeout_at.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(result);
-        }
-
-        match timeout(remaining, status_rx.changed()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err("agent status notification channel closed".to_string()),
-            Err(_) => return await_result_from_snapshot(host, &agent_ids).await,
+        tokio::select! {
+            changed = status_rx.changed() => {
+                if changed.is_err() {
+                    return Err("agent status notification channel closed".to_string());
+                }
+            }
+            _ = &mut guard_sleep => {
+                return await_result_from_snapshot(host, &agent_ids).await;
+            }
         }
     }
 }
@@ -1168,6 +1174,48 @@ mod tests {
         assert_eq!(capped.next_after_seq, Some(2));
         assert_eq!(capped.omitted_events, 1);
         assert!(capped.omitted_event_bytes > 512);
+    }
+
+    #[tokio::test]
+    async fn await_agents_returns_snapshot_before_tool_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(
+            &host,
+            SpawnAgentToolInput {
+                workspace_roots: vec!["/tmp/test".to_string()],
+                prompt: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_string(),
+                backend_kind: Some(BackendKindInput::Claude),
+                parent_agent_id: None,
+                project_id: None,
+                name: Some("slow-agent".to_string()),
+                cost_hint: None,
+                access_mode: None,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .expect("spawn slow agent");
+        let result = do_await_agents_with_response_guard(
+            &host,
+            vec![AgentId(spawned.agent_id)],
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("await should return a status snapshot");
+
+        assert!(result.ready.is_empty());
+        assert_eq!(result.still_thinking.len(), 1);
+        assert_eq!(
+            result.still_thinking[0].status,
+            AgentControlStatus::Thinking
+        );
     }
 
     #[test]

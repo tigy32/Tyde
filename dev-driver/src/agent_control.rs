@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
@@ -17,15 +17,14 @@ use tokio::io::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
+const AWAIT_TOOL_RESPONSE_GUARD_MS: u64 = 90_000;
 const DEFAULT_READ_LIMIT: usize = 100;
 const MAX_READ_LIMIT: usize = 1_000;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_QUIET_PERIOD: Duration = Duration::from_millis(50);
-const WALL_TIMEOUT_MULTIPLIER: u64 = 10;
 const COMMAND_BUFFER: usize = 32;
 const AGENT_CONTROL_HOST_BIND_ENV: &str = "TYDE_AGENT_CONTROL_HOST_BIND_ADDR";
 const LEGACY_DEV_HOST_BIND_ENV: &str = "TYDE_DEV_HOST_BIND_ADDR";
@@ -335,18 +334,9 @@ impl AgentControlHandle {
             return Err("agent_ids must contain at least one agent_id".to_string());
         }
 
-        let idle_timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS));
-        let wall_timeout = Duration::from_millis(
-            timeout_ms
-                .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS)
-                .saturating_mul(WALL_TIMEOUT_MULTIPLIER),
-        );
-        let wall_started = Instant::now();
         let mut snapshot_rx = self.snapshot_rx.clone();
-
-        let mut watched_activity =
-            watched_activity_map(&snapshot_rx.borrow(), requested_ids.as_deref())?;
-        let mut idle_deadline = Instant::now() + idle_timeout;
+        let timeout_sleep = timeout_ms.map(|ms| sleep(Duration::from_millis(ms)));
+        tokio::pin!(timeout_sleep);
 
         loop {
             let snapshot = snapshot_rx.borrow().clone();
@@ -361,39 +351,37 @@ impl AgentControlHandle {
                 });
             }
 
-            let wall_deadline = wall_started + wall_timeout;
-            let next_deadline = std::cmp::min(idle_deadline, wall_deadline);
-            let sleep_for = next_deadline.saturating_duration_since(Instant::now());
-
-            match timeout(sleep_for, snapshot_rx.changed()).await {
-                Ok(Ok(())) => {
-                    let snapshot = snapshot_rx.borrow().clone();
-                    let updated_activity =
-                        watched_activity_map(&snapshot, requested_ids.as_deref())?;
-                    if updated_activity != watched_activity {
-                        watched_activity = updated_activity;
-                        idle_deadline = Instant::now() + idle_timeout;
+            if let Some(timeout_sleep) = timeout_sleep.as_mut().as_pin_mut() {
+                tokio::select! {
+                    changed = snapshot_rx.changed() => {
+                        if changed.is_err() {
+                            let error = snapshot_rx
+                                .borrow()
+                                .connection_error
+                                .clone()
+                                .unwrap_or_else(|| "agent-control runtime stopped".to_string());
+                            return Err(error);
+                        }
+                    }
+                    _ = timeout_sleep => {
+                        let snapshot = snapshot_rx.borrow().clone();
+                        let watched_ids = resolve_watched_ids(&snapshot, requested_ids.as_deref())?;
+                        return Ok(AwaitAgentsResult {
+                            ready: ready_agents_from_snapshot(&snapshot, &watched_ids),
+                            still_thinking: still_thinking_agents_from_snapshot(
+                                &snapshot,
+                                &watched_ids,
+                            ),
+                        });
                     }
                 }
-                Ok(Err(_)) => {
-                    let error = snapshot_rx
-                        .borrow()
-                        .connection_error
-                        .clone()
-                        .unwrap_or_else(|| "agent-control runtime stopped".to_string());
-                    return Err(error);
-                }
-                Err(_) => {
-                    let snapshot = snapshot_rx.borrow().clone();
-                    let watched_ids = resolve_watched_ids(&snapshot, requested_ids.as_deref())?;
-                    return Ok(AwaitAgentsResult {
-                        ready: ready_agents_from_snapshot(&snapshot, &watched_ids),
-                        still_thinking: still_thinking_agents_from_snapshot(
-                            &snapshot,
-                            &watched_ids,
-                        ),
-                    });
-                }
+            } else if snapshot_rx.changed().await.is_err() {
+                let error = snapshot_rx
+                    .borrow()
+                    .connection_error
+                    .clone()
+                    .unwrap_or_else(|| "agent-control runtime stopped".to_string());
+                return Err(error);
             }
         }
     }
@@ -489,24 +477,6 @@ fn resolve_watched_ids(
             .map(|agent| agent.agent_id.clone())
             .collect()),
     }
-}
-
-fn watched_activity_map(
-    snapshot: &SnapshotState,
-    requested_ids: Option<&[AgentId]>,
-) -> Result<HashMap<AgentId, u64>, String> {
-    let watched_ids = resolve_watched_ids(snapshot, requested_ids)?;
-    Ok(watched_ids
-        .into_iter()
-        .map(|agent_id| {
-            let activity = snapshot
-                .agents
-                .get(&agent_id)
-                .map(|agent| agent.activity_counter)
-                .unwrap_or(0);
-            (agent_id, activity)
-        })
-        .collect())
 }
 
 fn ready_agents_from_snapshot(
@@ -1011,7 +981,6 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
 #[serde(deny_unknown_fields)]
 struct AwaitAgentsToolInput {
     agent_ids: Vec<String>,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1274,8 +1243,7 @@ fn await_agent_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "agent_ids": { "type": "array", "items": { "type": "string" } },
-            "timeout_ms": { "type": "integer", "minimum": 0 }
+            "agent_ids": { "type": "array", "items": { "type": "string" } }
         },
         "required": ["agent_ids"],
         "additionalProperties": false
@@ -1336,7 +1304,7 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
                 }
             }
             match control
-                .await_agents(Some(agent_ids), input.timeout_ms)
+                .await_agents(Some(agent_ids), Some(AWAIT_TOOL_RESPONSE_GUARD_MS))
                 .await
             {
                 Ok(result) => ToolCallResult::json(result),
