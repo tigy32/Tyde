@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::store::permissions::{atomic_write_owner_only, enforce_owner_only_file};
 
 pub const MOBILE_PAIRINGS_VERSION: u32 = 2;
+pub const MOBILE_PAIRINGS_STORE_PATH_ENV: &str = "TYDE_MOBILE_PAIRINGS_STORE_PATH";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobilePairings {
@@ -102,10 +103,22 @@ impl MobilePairingsStore {
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
+        if let Some(path) = mobile_pairings_path_override() {
+            return Ok(path);
+        }
+
         let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory")?;
         Ok(PathBuf::from(home)
             .join(".tyde")
             .join("mobile_pairings.json"))
+    }
+
+    pub fn path_for_store_parent(parent: &Path) -> PathBuf {
+        mobile_pairings_path_override().unwrap_or_else(|| parent.join("mobile_pairings.json"))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn get(&self) -> Result<MobilePairings, String> {
@@ -148,6 +161,16 @@ impl MobilePairingsStore {
                 path.display()
             ))),
         }
+    }
+}
+
+fn mobile_pairings_path_override() -> Option<PathBuf> {
+    let path = std::env::var(MOBILE_PAIRINGS_STORE_PATH_ENV).ok()?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
     }
 }
 

@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::Write;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
+use fs2::FileExt;
 use mqtt_transport::{
     BrokerAuth, BrokerEndpoint, EnvelopeStream, MobilePairingQrPayload, MqttConnectConfig,
     ParticipantRole, PreSharedKey, RoomId, default_mobile_broker_endpoint, validate_broker_url,
@@ -283,11 +287,95 @@ pub(crate) struct MobileAccessActor {
     connected_tasks: HashMap<MobileDeviceId, ConnectedMobileTask>,
     pairing_ttl_task: Option<JoinHandle<()>>,
     next_connection_instance_id: u64,
+    mobile_pairings_lease: Option<MobilePairingsLease>,
 }
 
 struct ConnectedMobileTask {
     instance_id: u64,
     task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct MobilePairingsLease {
+    file: File,
+}
+
+impl MobilePairingsLease {
+    fn try_acquire(pairings_path: &Path) -> Result<Self, String> {
+        let parent = pairings_path.parent().ok_or_else(|| {
+            format!(
+                "mobile pairings store path has no parent: {}",
+                pairings_path.display()
+            )
+        })?;
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create mobile pairings store directory {}: {err}",
+                parent.display()
+            )
+        })?;
+        let lock_path = pairings_path.with_extension("lock");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|err| {
+                format!(
+                    "failed to open mobile pairings lock {}: {err}",
+                    lock_path.display()
+                )
+            })?;
+        try_lock_mobile_pairings_file(&file, &lock_path)?;
+        file.set_len(0).map_err(|err| {
+            format!(
+                "failed to truncate mobile pairings lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+        writeln!(
+            file,
+            "pid={}\nstore={}",
+            std::process::id(),
+            pairings_path.display()
+        )
+        .map_err(|err| {
+            format!(
+                "failed to write mobile pairings lock {}: {err}",
+                lock_path.display()
+            )
+        })?;
+        if let Err(err) = file.sync_all() {
+            tracing::warn!(path = %lock_path.display(), error = %err, "failed to sync mobile pairings lock");
+        }
+        Ok(Self { file })
+    }
+}
+
+fn try_lock_mobile_pairings_file(file: &File, lock_path: &Path) -> Result<(), String> {
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(()),
+        Err(err) if is_lock_contended(&err) => Err(format!(
+            "mobile pairings are already in use by another Tyde host process ({})",
+            lock_path.display()
+        )),
+        Err(err) => Err(format!(
+            "failed to lock mobile pairings {}: {err}",
+            lock_path.display()
+        )),
+    }
+}
+
+fn is_lock_contended(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::WouldBlock)
+        || err.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+impl Drop for MobilePairingsLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl MobileAccessActor {
@@ -341,6 +429,7 @@ impl MobileAccessActor {
             connected_tasks: HashMap::new(),
             pairing_ttl_task: None,
             next_connection_instance_id: 0,
+            mobile_pairings_lease: None,
         })
     }
 
@@ -445,6 +534,7 @@ impl MobileAccessActor {
 
     async fn shutdown_runtime_state(&mut self) {
         self.abort_all_tasks();
+        self.mobile_pairings_lease = None;
         self.subscribers.clear();
     }
 
@@ -470,19 +560,39 @@ impl MobileAccessActor {
     }
 
     async fn enable_mobile_access(&mut self) {
-        match effective_broker_endpoint(self.settings.mobile_broker_url.as_ref()) {
+        let endpoint = match effective_broker_endpoint(self.settings.mobile_broker_url.as_ref()) {
             Ok(endpoint) => {
                 self.broker_status = MobileBrokerStatus::Online {
-                    broker_url: endpoint.url,
+                    broker_url: endpoint.url.clone(),
                 };
+                endpoint
             }
             Err(message) => {
+                self.abort_all_tasks();
+                self.mobile_pairings_lease = None;
                 self.broker_status = MobileBrokerStatus::Error {
                     broker_url: self.settings.mobile_broker_url.clone(),
                     code: MobileAccessErrorCode::InvalidConfig,
                     message,
                 };
                 return;
+            }
+        };
+
+        if self.mobile_pairings_lease.is_none() {
+            match MobilePairingsLease::try_acquire(self.pairings_store.path()) {
+                Ok(lease) => {
+                    self.mobile_pairings_lease = Some(lease);
+                }
+                Err(message) => {
+                    self.abort_all_tasks();
+                    self.broker_status = MobileBrokerStatus::Error {
+                        broker_url: Some(endpoint.url),
+                        code: MobileAccessErrorCode::BrokerUnavailable,
+                        message,
+                    };
+                    return;
+                }
             }
         }
 
@@ -492,6 +602,7 @@ impl MobileAccessActor {
 
     async fn disable_mobile_access(&mut self) {
         self.abort_all_tasks();
+        self.mobile_pairings_lease = None;
         self.broker_status = MobileBrokerStatus::Disabled;
         self.pairing = MobilePairingState::Idle;
         self.active_requester = None;
@@ -1328,6 +1439,21 @@ mod tests {
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
         }
+    }
+
+    #[test]
+    fn mobile_pairings_lease_rejects_second_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mobile_pairings.json");
+        let first = MobilePairingsLease::try_acquire(&path).expect("first lease");
+        let second_error =
+            MobilePairingsLease::try_acquire(&path).expect_err("second lease must fail");
+        assert!(
+            second_error.contains("already in use"),
+            "unexpected lock error: {second_error}"
+        );
+        drop(first);
+        MobilePairingsLease::try_acquire(&path).expect("lease after drop");
     }
 
     fn plaintext_test_settings(enabled: bool) -> HostSettings {

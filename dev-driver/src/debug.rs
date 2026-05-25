@@ -19,6 +19,7 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 const DEBUG_REPO_ROOT_ENV: &str = "TYDE_DEBUG_REPO_ROOT";
+const MOBILE_PAIRINGS_STORE_PATH_ENV: &str = "TYDE_MOBILE_PAIRINGS_STORE_PATH";
 const START_TIMEOUT: Duration = Duration::from_secs(105);
 
 #[derive(Clone, Debug)]
@@ -68,6 +69,7 @@ struct DevInstanceRecord {
     ui_debug_addr: SocketAddr,
     frontend_url: String,
     config_path: PathBuf,
+    store_dir: PathBuf,
     child: Child,
     started_at_ms: u64,
 }
@@ -341,6 +343,14 @@ async fn start_instance(
     let ui_debug_addr = loopback_addr(ui_debug_port);
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let instance_id = Uuid::new_v4().simple().to_string();
+    let store_dir = dev_instance_store_dir(&instance_id);
+    let mobile_pairings_path = store_dir.join("mobile_pairings.json");
+    std::fs::create_dir_all(&store_dir).map_err(|err| {
+        format!(
+            "failed to create dev instance store dir {}: {err}",
+            store_dir.display()
+        )
+    })?;
 
     let config_path = write_dev_config(&project_dir, frontend_port, &instance_id)?;
     let mut command = tauri_dev_command(&project_dir, &config_path)?;
@@ -349,6 +359,7 @@ async fn start_instance(
         .env("TYDE_DEV_INSTANCE", "1")
         .env("TYDE_DEV_HOST_BIND_ADDR", host_addr.to_string())
         .env("TYDE_DEV_UI_DEBUG_BIND_ADDR", ui_debug_addr.to_string())
+        .env(MOBILE_PAIRINGS_STORE_PATH_ENV, &mobile_pairings_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -365,6 +376,7 @@ async fn start_instance(
         ui_debug_addr,
         frontend_url: frontend_url.clone(),
         config_path,
+        store_dir,
         child,
         started_at_ms: now_ms(),
     };
@@ -372,6 +384,7 @@ async fn start_instance(
     if let Err(err) = wait_for_instance_ready(&mut record).await {
         let _ = record.child.kill().await;
         let _ = tokio::fs::remove_file(&record.config_path).await;
+        let _ = tokio::fs::remove_dir_all(&record.store_dir).await;
         return Err(err);
     }
 
@@ -402,6 +415,7 @@ async fn stop_instance(
         .ok_or_else(|| format!("unknown instance_id '{instance_id}'"))?;
     let _ = record.child.kill().await;
     let _ = tokio::fs::remove_file(&record.config_path).await;
+    let _ = tokio::fs::remove_dir_all(&record.store_dir).await;
     Ok(dev_instance_summary(&mut record).await)
 }
 
@@ -421,6 +435,7 @@ async fn list_instances(state: &Arc<DebugServerState>) -> Result<Vec<DevInstance
     for id in dead_ids {
         if let Some(record) = instances.remove(&id) {
             let _ = tokio::fs::remove_file(record.config_path).await;
+            let _ = tokio::fs::remove_dir_all(record.store_dir).await;
         }
     }
 
@@ -595,6 +610,10 @@ fn loopback_addr(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}")
         .parse()
         .expect("loopback socket addr must parse")
+}
+
+fn dev_instance_store_dir(instance_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("tyde-dev-instance-{instance_id}"))
 }
 
 fn write_dev_config(
