@@ -1356,6 +1356,85 @@ async fn assert_backend_emits_typing_status(
     );
 }
 
+async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
+    let prompt = "Reply exactly with USAGE_OK and nothing else.";
+    let workspace_roots = fixture.workspace_roots();
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        BackendKind::Codex,
+        "token-usage",
+        prompt,
+    )
+    .await;
+
+    let mut got_user_message_echo = false;
+    let mut saw_typing_false = false;
+    let mut saw_token_usage = None;
+    let mut saw_context_breakdown = None;
+    let mut final_text = String::new();
+
+    while !saw_typing_false {
+        let env = expect_next_event(&mut fixture.client, "Codex token usage ChatEvent").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::User) && message.content == prompt {
+                    got_user_message_echo = true;
+                } else if got_user_message_echo && matches!(message.sender, MessageSender::Error) {
+                    panic!(
+                        "Codex returned error instead of token usage response: {}",
+                        message.content
+                    );
+                }
+            }
+            ChatEvent::StreamEnd(data) if got_user_message_echo => {
+                if !data.message.content.trim().is_empty() {
+                    final_text = data.message.content;
+                }
+                if let Some(usage) = data.message.token_usage {
+                    saw_token_usage = Some(usage);
+                }
+                if let Some(breakdown) = data.message.context_breakdown {
+                    saw_context_breakdown = Some(breakdown);
+                }
+            }
+            ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
+                saw_typing_false = true;
+            }
+            _ => {}
+        }
+    }
+
+    let usage = saw_token_usage.unwrap_or_else(|| {
+        panic!("expected Codex StreamEnd to include token usage; final_text={final_text:?}")
+    });
+    assert!(
+        usage.total_tokens > 0,
+        "expected positive Codex total token usage; got {usage:?}"
+    );
+    assert!(
+        usage.input_tokens > 0
+            || usage.cached_prompt_tokens.unwrap_or_default() > 0
+            || usage.cache_creation_input_tokens.unwrap_or_default() > 0,
+        "expected positive Codex input/cache token usage; got {usage:?}"
+    );
+    let breakdown = saw_context_breakdown.unwrap_or_else(|| {
+        panic!("expected Codex StreamEnd to include context breakdown; final_text={final_text:?}")
+    });
+    assert!(
+        breakdown.input_tokens > 0,
+        "expected positive Codex context input tokens; got {breakdown:?}"
+    );
+    assert!(
+        breakdown.context_window >= breakdown.input_tokens,
+        "expected Codex context window to fit input tokens; got {breakdown:?}"
+    );
+}
+
 async fn assert_backend_emits_typing_and_streaming_on_follow_up_turns(
     fixture: &mut RealBackendFixture,
     backend_kind: BackendKind,
@@ -2262,6 +2341,34 @@ async fn real_codex_emits_tool_events_for_file_copy() {
         "real backend tool event failures:\n{}",
         failures.join("\n")
     );
+}
+
+#[tokio::test]
+async fn real_codex_emits_token_usage() {
+    let backend_kind = BackendKind::Codex;
+
+    if !backend_binary_available(backend_kind) {
+        eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+        return;
+    }
+    if !backend_runtime_available(backend_kind) {
+        eprintln!(
+            "SKIPPED: {} not runnable in current environment",
+            backend_label(backend_kind)
+        );
+        return;
+    }
+    if let Err(reason) = probe_backend_runtime(backend_kind).await {
+        eprintln!(
+            "SKIPPED: {} failed readiness probe: {}",
+            backend_label(backend_kind),
+            reason
+        );
+        return;
+    }
+
+    let mut fixture = RealBackendFixture::new().await;
+    assert_codex_emits_token_usage(&mut fixture).await;
 }
 
 #[tokio::test]

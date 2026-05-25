@@ -205,6 +205,7 @@ impl CodexSession {
                 active_stream: None,
                 pending_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
+                pending_agent_message: None,
                 token_usage_by_turn: HashMap::new(),
                 turn_context_by_turn: HashMap::new(),
                 file_change_call_ids: HashMap::new(),
@@ -501,6 +502,14 @@ struct CodexStreamSegment {
     model: String,
 }
 
+struct PendingCodexAgentMessage {
+    turn_id: String,
+    content: String,
+    reasoning: Option<String>,
+    model: String,
+    turn_context: TurnContextEstimate,
+}
+
 struct CodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
     receiver_thread_id: Option<String>,
@@ -532,6 +541,7 @@ struct CodexState {
     active_stream: Option<ActiveStreamState>,
     pending_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
+    pending_agent_message: Option<PendingCodexAgentMessage>,
     token_usage_by_turn: HashMap<String, Value>,
     turn_context_by_turn: HashMap<String, TurnContextEstimate>,
     file_change_call_ids: HashMap<String, Vec<String>>,
@@ -841,6 +851,7 @@ impl CodexInner {
             }
             state.active_turn_id = None;
             state.active_stream = None;
+            state.pending_agent_message = None;
             state.token_usage_by_turn.clear();
             state.turn_context_by_turn.clear();
             state.file_change_call_ids.clear();
@@ -1134,6 +1145,7 @@ impl CodexInner {
                     });
                     state.pending_tool_call_ids.clear();
                     state.close_active_stream_when_tools_idle = false;
+                    state.pending_agent_message = None;
                     let pending_user_input = state.pending_user_input_bytes;
                     state.pending_user_input_bytes = 0;
                     state.conversation_bytes_total = state
@@ -2039,7 +2051,7 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let (turn_id, reasoning, model, token_usage, turn_context) = {
+                let (pending, token_usage, context_breakdown) = {
                     let mut state = self.state.lock().await;
                     let stream = state
                         .active_stream
@@ -2055,7 +2067,6 @@ impl CodexInner {
                         });
                     state.close_active_stream_when_tools_idle = false;
                     let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
-                    let token = state.token_usage_by_turn.get(&stream.turn_id).cloned();
                     let turn_context = state
                         .turn_context_by_turn
                         .get(&stream.turn_id)
@@ -2064,38 +2075,40 @@ impl CodexInner {
                     state.conversation_bytes_total = state
                         .conversation_bytes_total
                         .saturating_add(text.len() as u64);
-                    (stream.turn_id, stream.reasoning, model, token, turn_context)
-                };
-                let reasoning = if reasoning.trim().is_empty() {
-                    extract_codex_item_reasoning(item).unwrap_or(reasoning)
-                } else {
-                    reasoning
-                };
-                let context_breakdown =
-                    estimate_context_breakdown(token_usage.as_ref(), &turn_context, Some(&model));
-                self.emitter.stream_end(StreamEndPayload {
-                    content: text,
-                    agent: Some(AgentName(CODEX_AGENT_NAME)),
-                    model: Some(model.clone()),
-                    usage: token_usage,
-                    reasoning: if reasoning.is_empty() {
-                        None
+                    let reasoning = if stream.reasoning.trim().is_empty() {
+                        extract_codex_item_reasoning(item).unwrap_or(stream.reasoning)
                     } else {
-                        Some(reasoning)
-                    },
+                        stream.reasoning
+                    };
+                    let pending = PendingCodexAgentMessage {
+                        turn_id: stream.turn_id,
+                        content: text,
+                        reasoning: contains_non_whitespace(&reasoning).then_some(reasoning),
+                        model,
+                        turn_context,
+                    };
+                    if state.active_turn_id.as_deref() == Some(pending.turn_id.as_str()) {
+                        state.pending_agent_message = Some(pending);
+                        return;
+                    }
+                    let token_usage = state.token_usage_by_turn.remove(&pending.turn_id);
+                    let context_breakdown = estimate_context_breakdown(
+                        token_usage.as_ref(),
+                        &pending.turn_context,
+                        Some(&pending.model),
+                    );
+                    state.turn_context_by_turn.remove(&pending.turn_id);
+                    (pending, token_usage, context_breakdown)
+                };
+                self.emitter.stream_end(StreamEndPayload {
+                    content: pending.content,
+                    agent: Some(AgentName(CODEX_AGENT_NAME)),
+                    model: Some(pending.model),
+                    usage: token_usage,
+                    reasoning: pending.reasoning,
                     tool_calls: Vec::new(),
                     context_breakdown: Some(context_breakdown),
                 });
-
-                // If turn completion arrived before this message item, clean up now.
-                // Otherwise keep usage/context until turn completion so follow-up
-                // agentMessage items in the same turn can still read them.
-                let mut state = self.state.lock().await;
-                let turn_still_active = state.active_turn_id.as_deref() == Some(turn_id.as_str());
-                if !turn_still_active {
-                    state.token_usage_by_turn.remove(&turn_id);
-                    state.turn_context_by_turn.remove(&turn_id);
-                }
             }
             "userMessage" => {
                 // User messages are emitted synchronously when sent to keep ordering stable.
@@ -2527,7 +2540,7 @@ impl CodexInner {
         };
         let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
 
-        {
+        let pending_message = {
             let mut state = self.state.lock().await;
             if let Some((turn_id, token_usage)) = turn_usage {
                 state.token_usage_by_turn.insert(turn_id, token_usage);
@@ -2536,13 +2549,29 @@ impl CodexInner {
             let completed_turn_id =
                 extract_turn_id(params).or_else(|| state.active_turn_id.clone());
             state.active_turn_id = None;
+            let mut pending_message = None;
             if let Some(turn_id) = completed_turn_id {
+                if state
+                    .pending_agent_message
+                    .as_ref()
+                    .is_some_and(|pending| pending.turn_id == turn_id)
+                    && let Some(pending) = state.pending_agent_message.take()
+                {
+                    let token_usage = state.token_usage_by_turn.remove(&turn_id);
+                    let context_breakdown = estimate_context_breakdown(
+                        token_usage.as_ref(),
+                        &pending.turn_context,
+                        Some(&pending.model),
+                    );
+                    state.turn_context_by_turn.remove(&turn_id);
+                    pending_message = Some((pending, token_usage, context_breakdown));
+                }
                 let stream_open_for_turn = state
                     .active_stream
                     .as_ref()
                     .map(|stream| stream.turn_id == turn_id)
                     .unwrap_or(false);
-                if !stream_open_for_turn {
+                if !stream_open_for_turn && pending_message.is_none() {
                     state.turn_context_by_turn.remove(&turn_id);
                     state.token_usage_by_turn.remove(&turn_id);
                 }
@@ -2552,6 +2581,19 @@ impl CodexInner {
             state.pending_tool_call_ids.clear();
             state.close_active_stream_when_tools_idle = false;
             state.pending_user_input_bytes = 0;
+            pending_message
+        };
+
+        if let Some((pending, token_usage, context_breakdown)) = pending_message {
+            self.emitter.stream_end(StreamEndPayload {
+                content: pending.content,
+                agent: Some(AgentName(CODEX_AGENT_NAME)),
+                model: Some(pending.model),
+                usage: token_usage,
+                reasoning: pending.reasoning,
+                tool_calls: Vec::new(),
+                context_breakdown: Some(context_breakdown),
+            });
         }
 
         if turn_status == "interrupted" {
@@ -4631,18 +4673,25 @@ enum CodexAgentMessageCompletionDisposition {
     SkipDuplicateCompleted,
 }
 
+struct CodexLoopPendingAgentMessage {
+    turn_id: String,
+    content: String,
+    reasoning: Option<String>,
+    turn_context: TurnContextEstimate,
+}
+
 fn codex_agent_message_completion_disposition(
     has_open_stream: bool,
     saw_agent_message_completed: bool,
     stream_closed_by_turn_completion: bool,
     text: &str,
 ) -> CodexAgentMessageCompletionDisposition {
-    if has_open_stream {
-        return CodexAgentMessageCompletionDisposition::EmitOnOpenStream;
-    }
-
     if saw_agent_message_completed {
         return CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted;
+    }
+
+    if has_open_stream {
+        return CodexAgentMessageCompletionDisposition::EmitOnOpenStream;
     }
 
     if stream_closed_by_turn_completion && text.trim().is_empty() {
@@ -4650,6 +4699,36 @@ fn codex_agent_message_completion_disposition(
     }
 
     CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart
+}
+
+fn add_codex_loop_turn_tool_bytes(
+    turn_context_by_turn: &mut HashMap<String, TurnContextEstimate>,
+    active_turn_id: Option<&str>,
+    bytes: u64,
+) {
+    if bytes == 0 {
+        return;
+    }
+    let Some(turn_id) = active_turn_id else {
+        return;
+    };
+    let estimate = turn_context_by_turn.entry(turn_id.to_string()).or_default();
+    estimate.tool_io_bytes = estimate.tool_io_bytes.saturating_add(bytes);
+}
+
+fn add_codex_loop_turn_reasoning_bytes(
+    turn_context_by_turn: &mut HashMap<String, TurnContextEstimate>,
+    active_turn_id: Option<&str>,
+    bytes: u64,
+) {
+    if bytes == 0 {
+        return;
+    }
+    let Some(turn_id) = active_turn_id else {
+        return;
+    };
+    let estimate = turn_context_by_turn.entry(turn_id.to_string()).or_default();
+    estimate.reasoning_bytes = estimate.reasoning_bytes.saturating_add(bytes);
 }
 
 fn codex_loop_reasoning_message_id(
@@ -5053,6 +5132,11 @@ impl Backend for CodexBackend {
             let mut active_turn_id: Option<String> = None;
             let mut pending_tool_call_ids: HashSet<String> = HashSet::new();
             let mut close_stream_when_tools_idle = false;
+            let mut pending_agent_message: Option<CodexLoopPendingAgentMessage> = None;
+            let mut token_usage_by_turn: HashMap<String, Value> = HashMap::new();
+            let mut turn_context_by_turn: HashMap<String, TurnContextEstimate> = HashMap::new();
+            let mut pending_user_input_bytes = initial_message.len() as u64;
+            let mut conversation_bytes_total = 0u64;
             let mut typing_status_active = false;
             let mut file_change_call_ids: HashMap<String, Vec<String>> = HashMap::new();
             let mut saw_agent_message_delta = false;
@@ -5177,6 +5261,18 @@ impl Backend for CodexBackend {
                                 accumulated_reasoning.clear();
                                 pending_tool_call_ids.clear();
                                 close_stream_when_tools_idle = false;
+                                pending_agent_message = None;
+                                let pending_user_input = pending_user_input_bytes;
+                                pending_user_input_bytes = 0;
+                                conversation_bytes_total = conversation_bytes_total
+                                    .saturating_add(pending_user_input);
+                                turn_context_by_turn.insert(
+                                    turn_id.clone(),
+                                    TurnContextEstimate {
+                                        conversation_history_bytes: conversation_bytes_total,
+                                        ..TurnContextEstimate::default()
+                                    },
+                                );
                                 saw_agent_message_delta = false;
                                 saw_agent_message_completed = false;
                                 stream_closed_by_turn_completion = false;
@@ -5259,7 +5355,19 @@ impl Backend for CodexBackend {
                                     );
                                 }
                                 accumulated_reasoning.push_str(&delta);
+                                add_codex_loop_turn_reasoning_bytes(
+                                    &mut turn_context_by_turn,
+                                    active_turn_id.as_deref(),
+                                    delta.len() as u64,
+                                );
                                 emitter.stream_reasoning_delta(&message_id, &delta);
+                            }
+                            "thread/tokenUsage/updated" => {
+                                if let Some((turn_id, token_usage)) =
+                                    extract_turn_token_usage(&params, Some(&model_name))
+                                {
+                                    token_usage_by_turn.insert(turn_id, token_usage);
+                                }
                             }
                             "item/completed" => {
                                 let item_type = params
@@ -5327,19 +5435,36 @@ impl Backend for CodexBackend {
                                             accumulated_text.clear();
                                             text
                                         };
-                                        emitter.stream_end(StreamEndPayload {
-                                            content: final_text,
-                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                            model: Some(model_name.clone()),
-                                            usage: None,
-                                            reasoning: contains_non_whitespace(
-                                                &accumulated_reasoning,
-                                            )
-                                            .then(|| std::mem::take(&mut accumulated_reasoning)),
-                                            tool_calls: Vec::new(),
-                                            context_breakdown: None,
-                                        });
-                                        current_message_id = None;
+                                        let reasoning = contains_non_whitespace(
+                                            &accumulated_reasoning,
+                                        )
+                                        .then(|| std::mem::take(&mut accumulated_reasoning));
+                                        conversation_bytes_total = conversation_bytes_total
+                                            .saturating_add(final_text.len() as u64);
+                                        if let Some(turn_id) = active_turn_id.clone() {
+                                            let turn_context = turn_context_by_turn
+                                                .get(&turn_id)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            pending_agent_message =
+                                                Some(CodexLoopPendingAgentMessage {
+                                                    turn_id,
+                                                    content: final_text,
+                                                    reasoning,
+                                                    turn_context,
+                                                });
+                                        } else {
+                                            emitter.stream_end(StreamEndPayload {
+                                                content: final_text,
+                                                agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                                model: Some(model_name.clone()),
+                                                usage: None,
+                                                reasoning,
+                                                tool_calls: Vec::new(),
+                                                context_breakdown: None,
+                                            });
+                                            current_message_id = None;
+                                        }
                                         stream_closed_by_turn_completion = false;
                                     }
                                     "reasoning" => {
@@ -5372,6 +5497,11 @@ impl Backend for CodexBackend {
                                                     );
                                                 }
                                                 accumulated_reasoning.push_str(&delta);
+                                                add_codex_loop_turn_reasoning_bytes(
+                                                    &mut turn_context_by_turn,
+                                                    active_turn_id.as_deref(),
+                                                    delta.len() as u64,
+                                                );
                                                 emitter.stream_reasoning_delta(&item_id, &delta);
                                             }
                                             close_stream_when_tools_idle = true;
@@ -5387,6 +5517,11 @@ impl Backend for CodexBackend {
                                         }
                                     }
                                     "commandExecution" => {
+                                        add_codex_loop_turn_tool_bytes(
+                                            &mut turn_context_by_turn,
+                                            active_turn_id.as_deref(),
+                                            estimate_command_execution_tool_bytes(&item),
+                                        );
                                         let exit_code =
                                             item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
                                                 as i32;
@@ -5425,6 +5560,11 @@ impl Backend for CodexBackend {
                                         );
                                     }
                                     "fileChange" => {
+                                        add_codex_loop_turn_tool_bytes(
+                                            &mut turn_context_by_turn,
+                                            active_turn_id.as_deref(),
+                                            estimate_file_change_tool_bytes(&item),
+                                        );
                                         let file_changes = parse_codex_file_changes(&item);
                                         let success =
                                             item.get("status").and_then(Value::as_str) == Some("completed");
@@ -5568,6 +5708,11 @@ impl Backend for CodexBackend {
                                     }
                                     "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
                                     | "dynamicToolCall" => {
+                                        add_codex_loop_turn_tool_bytes(
+                                            &mut turn_context_by_turn,
+                                            active_turn_id.as_deref(),
+                                            estimate_generic_tool_bytes(&item),
+                                        );
                                         let tool_name = item
                                             .get("tool")
                                             .and_then(Value::as_str)
@@ -5593,6 +5738,11 @@ impl Backend for CodexBackend {
                                     .and_then(Value::as_str)
                                     .unwrap_or("completed");
                                 let turn_id_for_log = active_turn_id.clone();
+                                if let Some((turn_id, token_usage)) =
+                                    extract_turn_token_usage(&params, Some(&model_name))
+                                {
+                                    token_usage_by_turn.insert(turn_id, token_usage);
+                                }
                                 let turn_error_message = (turn_status == "failed").then(|| {
                                     params
                                         .get("turn")
@@ -5606,7 +5756,45 @@ impl Backend for CodexBackend {
                                 // If we still have an open stream (no item/completed
                                 // for agentMessage was received), close it now.
                                 if current_message_id.is_some() {
-                                    let final_text = std::mem::take(&mut accumulated_text);
+                                    let pending_message = pending_agent_message.take();
+                                    let (final_text, reasoning, usage, context_breakdown) =
+                                        if let Some(pending) = pending_message {
+                                            let usage = token_usage_by_turn.remove(&pending.turn_id);
+                                            turn_context_by_turn.remove(&pending.turn_id);
+                                            let context_breakdown = estimate_context_breakdown(
+                                                usage.as_ref(),
+                                                &pending.turn_context,
+                                                Some(&model_name),
+                                            );
+                                            (
+                                                pending.content,
+                                                pending.reasoning,
+                                                usage,
+                                                context_breakdown,
+                                            )
+                                        } else {
+                                            let usage = turn_id_for_log
+                                                .as_ref()
+                                                .and_then(|turn_id| token_usage_by_turn.remove(turn_id));
+                                            let turn_context = turn_id_for_log
+                                                .as_ref()
+                                                .and_then(|turn_id| turn_context_by_turn.remove(turn_id))
+                                                .unwrap_or_default();
+                                            let context_breakdown = estimate_context_breakdown(
+                                                usage.as_ref(),
+                                                &turn_context,
+                                                Some(&model_name),
+                                            );
+                                            (
+                                                std::mem::take(&mut accumulated_text),
+                                                contains_non_whitespace(&accumulated_reasoning)
+                                                    .then(|| {
+                                                        std::mem::take(&mut accumulated_reasoning)
+                                                    }),
+                                                usage,
+                                                context_breakdown,
+                                            )
+                                        };
                                     let had_assistant_content = !final_text.trim().is_empty()
                                         || saw_agent_message_delta
                                         || saw_agent_message_completed;
@@ -5631,13 +5819,10 @@ impl Backend for CodexBackend {
                                             content: final_text,
                                             agent: Some(AgentName(CODEX_AGENT_NAME)),
                                             model: Some(model_name.clone()),
-                                            usage: None,
-                                            reasoning: contains_non_whitespace(
-                                                &accumulated_reasoning,
-                                            )
-                                            .then(|| std::mem::take(&mut accumulated_reasoning)),
+                                            usage,
+                                            reasoning,
                                             tool_calls: Vec::new(),
-                                            context_breakdown: None,
+                                            context_breakdown: Some(context_breakdown),
                                         });
                                         stream_closed_by_turn_completion = true;
                                     }
@@ -5656,6 +5841,10 @@ impl Backend for CodexBackend {
                                 }
                                 pending_tool_call_ids.clear();
                                 close_stream_when_tools_idle = false;
+                                if let Some(turn_id) = turn_id_for_log.as_ref() {
+                                    token_usage_by_turn.remove(turn_id);
+                                    turn_context_by_turn.remove(turn_id);
+                                }
                             }
                             _ => {}
                         }
@@ -5665,6 +5854,7 @@ impl Backend for CodexBackend {
                         match input {
                             AgentInput::SendMessage(payload) => {
                                 let backend_message = payload.message;
+                                pending_user_input_bytes = backend_message.len() as u64;
                                 let visible_message = backend_message.clone();
                                 let visible_images = payload.images.clone();
                                 let images = protocol_images_to_attachments(payload.images);
@@ -6009,6 +6199,17 @@ mod tests {
     }
 
     #[test]
+    fn codex_agent_message_completion_skips_pending_duplicate() {
+        let disposition =
+            codex_agent_message_completion_disposition(true, true, false, "duplicate");
+
+        assert_eq!(
+            disposition,
+            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted
+        );
+    }
+
+    #[test]
     fn codex_model_options_use_canonical_labels_and_version_sort() {
         let raw_models = vec![
             json!({
@@ -6194,6 +6395,7 @@ mod tests {
             }),
             pending_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
+            pending_agent_message: None,
             token_usage_by_turn: HashMap::new(),
             turn_context_by_turn: HashMap::new(),
             file_change_call_ids: HashMap::new(),
@@ -7376,7 +7578,41 @@ Do not describe the tool, and do not skip the tool call."#;
                 .iter()
                 .filter_map(|event| event.get("kind").and_then(Value::as_str))
                 .collect::<Vec<_>>();
-            assert_eq!(kinds, vec!["StreamEnd"]);
+            assert_eq!(
+                kinds,
+                Vec::<&str>::new(),
+                "agentMessage completion is held until turn usage is available: {events:?}"
+            );
+
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "turn": {
+                            "id": "turn-test",
+                            "status": "completed",
+                            "usage": {
+                                "inputTokens": 12,
+                                "outputTokens": 5,
+                                "totalTokens": 17
+                            }
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(kinds, vec!["StreamEnd", "TypingStatusChanged"]);
+            assert_eq!(
+                events[0]
+                    .pointer("/data/message/token_usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(17)
+            );
 
             inner.rpc.shutdown().await;
         });
