@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,6 +203,8 @@ impl CodexSession {
                 turn_network_access: codex_has_http_mcp_servers(startup_mcp_servers),
                 active_turn_id: None,
                 active_stream: None,
+                pending_tool_call_ids: HashSet::new(),
+                close_active_stream_when_tools_idle: false,
                 token_usage_by_turn: HashMap::new(),
                 turn_context_by_turn: HashMap::new(),
                 file_change_call_ids: HashMap::new(),
@@ -493,6 +495,12 @@ struct TurnContextEstimate {
     reasoning_bytes: u64,
 }
 
+struct CodexStreamSegment {
+    content: String,
+    reasoning: Option<String>,
+    model: String,
+}
+
 struct CodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
     receiver_thread_id: Option<String>,
@@ -522,6 +530,8 @@ struct CodexState {
     turn_network_access: bool,
     active_turn_id: Option<String>,
     active_stream: Option<ActiveStreamState>,
+    pending_tool_call_ids: HashSet<String>,
+    close_active_stream_when_tools_idle: bool,
     token_usage_by_turn: HashMap<String, Value>,
     turn_context_by_turn: HashMap<String, TurnContextEstimate>,
     file_change_call_ids: HashMap<String, Vec<String>>,
@@ -558,6 +568,45 @@ impl CodexInner {
         } else {
             None
         }
+    }
+
+    async fn track_tool_requests(&self, tool_call_ids: impl IntoIterator<Item = String>) {
+        let mut state = self.state.lock().await;
+        state.pending_tool_call_ids.extend(tool_call_ids);
+    }
+
+    async fn mark_tool_completed(&self, tool_call_id: &str) {
+        let segment = {
+            let mut state = self.state.lock().await;
+            state.pending_tool_call_ids.remove(tool_call_id);
+            take_codex_stream_segment_if_ready(&mut state)
+        };
+        if let Some(segment) = segment {
+            self.emit_stream_segment(segment);
+        }
+    }
+
+    async fn finish_stream_after_reasoning_item(&self) {
+        let segment = {
+            let mut state = self.state.lock().await;
+            state.close_active_stream_when_tools_idle = true;
+            take_codex_stream_segment_if_ready(&mut state)
+        };
+        if let Some(segment) = segment {
+            self.emit_stream_segment(segment);
+        }
+    }
+
+    fn emit_stream_segment(&self, segment: CodexStreamSegment) {
+        self.emitter.stream_end(StreamEndPayload {
+            content: segment.content,
+            agent: Some(AgentName(CODEX_AGENT_NAME)),
+            model: Some(segment.model),
+            usage: None,
+            reasoning: segment.reasoning,
+            tool_calls: Vec::new(),
+            context_breakdown: None,
+        });
     }
 
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
@@ -944,7 +993,8 @@ impl CodexInner {
                     true,
                     json!({"kind": "Other", "result": {"decision": decision}}),
                     None,
-                );
+                )
+                .await;
             }
             PendingRequestKind::FileChangeApproval => {
                 let decision = parse_approval_decision(message);
@@ -962,7 +1012,8 @@ impl CodexInner {
                     true,
                     json!({"kind": "Other", "result": {"decision": decision}}),
                     None,
-                );
+                )
+                .await;
             }
             PendingRequestKind::ExecCommandApproval => {
                 let decision = parse_review_decision(message);
@@ -980,7 +1031,8 @@ impl CodexInner {
                     true,
                     json!({"kind": "Other", "result": {"decision": decision}}),
                     None,
-                );
+                )
+                .await;
             }
             PendingRequestKind::ApplyPatchApproval => {
                 let decision = parse_review_decision(message);
@@ -998,7 +1050,8 @@ impl CodexInner {
                     true,
                     json!({"kind": "Other", "result": {"decision": decision}}),
                     None,
-                );
+                )
+                .await;
             }
             PendingRequestKind::UserInput { questions } => {
                 let normalized = if message.trim().is_empty() {
@@ -1024,7 +1077,8 @@ impl CodexInner {
                     true,
                     json!({"kind": "Other", "result": {"answered": true}}),
                     None,
-                );
+                )
+                .await;
             }
         }
 
@@ -1078,6 +1132,8 @@ impl CodexInner {
                         text: String::new(),
                         reasoning: String::new(),
                     });
+                    state.pending_tool_call_ids.clear();
+                    state.close_active_stream_when_tools_idle = false;
                     let pending_user_input = state.pending_user_input_bytes;
                     state.pending_user_input_bytes = 0;
                     state.conversation_bytes_total = state
@@ -1594,6 +1650,8 @@ impl CodexInner {
                 }
 
                 self.emitter.typing_status_changed(false);
+                self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &tool_call_id,
                     "ask_user_question",
@@ -1629,6 +1687,8 @@ impl CodexInner {
                 }
 
                 self.emitter.typing_status_changed(false);
+                self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &tool_call_id,
                     "ask_user_question",
@@ -1682,6 +1742,8 @@ impl CodexInner {
                 }
 
                 self.emitter.typing_status_changed(false);
+                self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &tool_call_id,
                     "ask_user_question",
@@ -1717,6 +1779,8 @@ impl CodexInner {
                 }
 
                 self.emitter.typing_status_changed(false);
+                self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &tool_call_id,
                     "ask_user_question",
@@ -1758,6 +1822,8 @@ impl CodexInner {
                 }
 
                 self.emitter.typing_status_changed(false);
+                self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &tool_call_id,
                     "ask_user_question",
@@ -1788,6 +1854,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("dynamic_tool");
 
+                self.track_tool_requests(std::iter::once(call_id.to_string()))
+                    .await;
                 self.emitter.tool_request(
                     call_id,
                     tool_name,
@@ -1820,7 +1888,8 @@ impl CodexInner {
                         "detailed_message": "Codex requested a client-side dynamic tool call that Tyde has not implemented yet."
                     }),
                     Some("Dynamic client tool calls are not yet supported in Tyde.".to_string()),
-                );
+                )
+                .await;
             }
             _ => {
                 let _ = self
@@ -1869,6 +1938,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &item_id,
                     "run_command",
@@ -1899,6 +1970,7 @@ impl CodexInner {
                         .insert(item_id.clone(), call_ids.clone());
                 }
 
+                self.track_tool_requests(call_ids.clone()).await;
                 for (change, call_id) in file_changes.into_iter().zip(call_ids.into_iter()) {
                     self.emit_modify_file_request(
                         &call_id,
@@ -1914,6 +1986,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool")
                     .to_string();
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &item_id,
                     &tool_name,
@@ -1930,6 +2004,8 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or(item_type)
                     .to_string();
+                self.track_tool_requests(std::iter::once(item_id.clone()))
+                    .await;
                 self.emitter.tool_request(
                     &item_id,
                     &tool_name,
@@ -1977,6 +2053,7 @@ impl CodexInner {
                             text: text.clone(),
                             reasoning: String::new(),
                         });
+                    state.close_active_stream_when_tools_idle = false;
                     let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
                     let token = state.token_usage_by_turn.get(&stream.turn_id).cloned();
                     let turn_context = state
@@ -2063,6 +2140,7 @@ impl CodexInner {
                     self.emitter
                         .stream_reasoning_delta(&item_id, &reasoning_text);
                 }
+                self.finish_stream_after_reasoning_item().await;
             }
             "commandExecution" => {
                 self.add_active_turn_tool_bytes(estimate_command_execution_tool_bytes(item))
@@ -2089,7 +2167,8 @@ impl CodexInner {
                     } else {
                         Some(format!("Command failed with exit code {exit_code}"))
                     },
-                );
+                )
+                .await;
             }
             "fileChange" => {
                 self.add_active_turn_tool_bytes(estimate_file_change_tool_bytes(item))
@@ -2135,7 +2214,8 @@ impl CodexInner {
                             } else {
                                 Some("File changes were not applied".to_string())
                             },
-                        );
+                        )
+                        .await;
                     }
 
                     for call_id in known_call_ids.iter().skip(total) {
@@ -2153,7 +2233,8 @@ impl CodexInner {
                             } else {
                                 Some("File changes were not applied".to_string())
                             },
-                        );
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -2174,7 +2255,8 @@ impl CodexInner {
                             } else {
                                 Some("File changes were not applied".to_string())
                             },
-                        );
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -2192,7 +2274,8 @@ impl CodexInner {
                     } else {
                         Some("File changes were not applied".to_string())
                     },
-                );
+                )
+                .await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
                 self.add_active_turn_tool_bytes(estimate_generic_tool_bytes(item))
@@ -2216,7 +2299,8 @@ impl CodexInner {
                     } else {
                         Some(format!("{tool_name} failed"))
                     },
-                );
+                )
+                .await;
                 if codex_item_looks_like_spawn_tool(item) {
                     self.spawn_codex_subagent_if_needed(item).await;
                     self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
@@ -2251,7 +2335,8 @@ impl CodexInner {
                     } else {
                         Some(format!("{tool_name} failed"))
                     },
-                );
+                )
+                .await;
                 if codex_item_looks_like_spawn_tool(item) {
                     self.spawn_codex_subagent_if_needed(item).await;
                     self.record_codex_subagent_spawn_result_if_needed(&item_id, item)
@@ -2464,6 +2549,8 @@ impl CodexInner {
             }
             state.pending_request = None;
             state.file_change_call_ids.clear();
+            state.pending_tool_call_ids.clear();
+            state.close_active_stream_when_tools_idle = false;
             state.pending_user_input_bytes = 0;
         }
 
@@ -2490,7 +2577,7 @@ impl CodexInner {
         }
     }
 
-    fn emit_tool_execution_completed(
+    async fn emit_tool_execution_completed(
         &self,
         tool_call_id: &str,
         tool_name: &str,
@@ -2505,6 +2592,7 @@ impl CodexInner {
             success,
             error: error.as_deref(),
         });
+        self.mark_tool_completed(tool_call_id).await;
     }
 
     fn emit_modify_file_request(
@@ -3246,6 +3334,28 @@ fn codex_reasoning_delta_message_id(state: &CodexState, params: &Value) -> Strin
                 .cloned()
         })
         .unwrap_or_else(|| "assistant".to_string())
+}
+
+fn take_codex_stream_segment_if_ready(state: &mut CodexState) -> Option<CodexStreamSegment> {
+    if !state.close_active_stream_when_tools_idle || !state.pending_tool_call_ids.is_empty() {
+        return None;
+    }
+
+    let Some(stream) = state.active_stream.take() else {
+        state.close_active_stream_when_tools_idle = false;
+        return None;
+    };
+    state.close_active_stream_when_tools_idle = false;
+    let reasoning = contains_non_whitespace(&stream.reasoning).then_some(stream.reasoning);
+    if !contains_non_whitespace(&stream.text) && reasoning.is_none() {
+        return None;
+    }
+
+    Some(CodexStreamSegment {
+        content: stream.text,
+        reasoning,
+        model: state.model.clone().unwrap_or_else(|| "codex".to_string()),
+    })
 }
 
 fn apply_reasoning_delta_to_state(
@@ -4542,6 +4652,59 @@ fn codex_agent_message_completion_disposition(
     CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart
 }
 
+fn codex_loop_reasoning_message_id(
+    params: &Value,
+    current_message_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> String {
+    params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("item_id").and_then(Value::as_str))
+        .or_else(|| params.get("id").and_then(Value::as_str))
+        .or(current_message_id)
+        .or(active_turn_id)
+        .unwrap_or("assistant")
+        .to_string()
+}
+
+fn maybe_finish_codex_loop_segment(
+    emitter: &TurnEmitter,
+    current_message_id: &mut Option<String>,
+    accumulated_text: &mut String,
+    accumulated_reasoning: &mut String,
+    close_stream_when_tools_idle: &mut bool,
+    pending_tool_call_ids: &HashSet<String>,
+    model_name: &str,
+) {
+    if !*close_stream_when_tools_idle || !pending_tool_call_ids.is_empty() {
+        return;
+    }
+    if current_message_id.is_none() {
+        *close_stream_when_tools_idle = false;
+        return;
+    }
+    if !contains_non_whitespace(accumulated_text) && !contains_non_whitespace(accumulated_reasoning)
+    {
+        return;
+    }
+
+    let reasoning = contains_non_whitespace(accumulated_reasoning)
+        .then(|| std::mem::take(accumulated_reasoning));
+    let content = std::mem::take(accumulated_text);
+    emitter.stream_end(StreamEndPayload {
+        content,
+        agent: Some(AgentName(CODEX_AGENT_NAME)),
+        model: Some(model_name.to_string()),
+        usage: None,
+        reasoning,
+        tool_calls: Vec::new(),
+        context_breakdown: None,
+    });
+    *current_message_id = None;
+    *close_stream_when_tools_idle = false;
+}
+
 fn spawn_codex_subagent_event_bridge(
     mut raw_rx: mpsc::UnboundedReceiver<Value>,
     event_tx: mpsc::UnboundedSender<ChatEvent>,
@@ -4885,8 +5048,11 @@ impl Backend for CodexBackend {
                 .or(model)
                 .unwrap_or_else(|| "codex".to_string());
             let mut accumulated_text = String::new();
+            let mut accumulated_reasoning = String::new();
             let mut current_message_id: Option<String> = None;
             let mut active_turn_id: Option<String> = None;
+            let mut pending_tool_call_ids: HashSet<String> = HashSet::new();
+            let mut close_stream_when_tools_idle = false;
             let mut typing_status_active = false;
             let mut file_change_call_ids: HashMap<String, Vec<String>> = HashMap::new();
             let mut saw_agent_message_delta = false;
@@ -5008,6 +5174,9 @@ impl Backend for CodexBackend {
                                 active_turn_id = Some(turn_id.clone());
                                 current_message_id = Some(turn_id.clone());
                                 accumulated_text.clear();
+                                accumulated_reasoning.clear();
+                                pending_tool_call_ids.clear();
+                                close_stream_when_tools_idle = false;
                                 saw_agent_message_delta = false;
                                 saw_agent_message_completed = false;
                                 stream_closed_by_turn_completion = false;
@@ -5059,6 +5228,38 @@ impl Backend for CodexBackend {
                                 let delta_message_id =
                                     msg_id.as_deref().unwrap_or("assistant").to_string();
                                 emitter.stream_delta(&delta_message_id, &delta);
+                            }
+                            reasoning_method if is_reasoning_notification_method(reasoning_method) => {
+                                let Some(delta) = extract_codex_reasoning_delta_text(&params) else {
+                                    continue;
+                                };
+                                let delta = merge_reasoning_delta(&accumulated_reasoning, &delta);
+                                if delta.is_empty() {
+                                    continue;
+                                }
+                                let message_id = codex_loop_reasoning_message_id(
+                                    &params,
+                                    current_message_id.as_deref(),
+                                    active_turn_id.as_deref(),
+                                );
+                                if current_message_id.is_none() {
+                                    current_message_id = Some(message_id.clone());
+                                    stream_closed_by_turn_completion = false;
+                                    accumulated_text.clear();
+                                    accumulated_reasoning.clear();
+                                    close_stream_when_tools_idle = false;
+                                    if !typing_status_active {
+                                        emitter.typing_status_changed(true);
+                                        typing_status_active = true;
+                                    }
+                                    emitter.stream_start(
+                                        &message_id,
+                                        AgentName(CODEX_AGENT_NAME),
+                                        Some(&model_name),
+                                    );
+                                }
+                                accumulated_reasoning.push_str(&delta);
+                                emitter.stream_reasoning_delta(&message_id, &delta);
                             }
                             "item/completed" => {
                                 let item_type = params
@@ -5131,12 +5332,59 @@ impl Backend for CodexBackend {
                                             agent: Some(AgentName(CODEX_AGENT_NAME)),
                                             model: Some(model_name.clone()),
                                             usage: None,
-                                            reasoning: None,
+                                            reasoning: contains_non_whitespace(
+                                                &accumulated_reasoning,
+                                            )
+                                            .then(|| std::mem::take(&mut accumulated_reasoning)),
                                             tool_calls: Vec::new(),
                                             context_breakdown: None,
                                         });
                                         current_message_id = None;
                                         stream_closed_by_turn_completion = false;
+                                    }
+                                    "reasoning" => {
+                                        if let Some(reasoning_text) = extract_codex_item_reasoning(&item)
+                                            && contains_non_whitespace(&reasoning_text)
+                                        {
+                                            let delta = merge_reasoning_delta(
+                                                &accumulated_reasoning,
+                                                &reasoning_text,
+                                            );
+                                            if !delta.is_empty() {
+                                                if current_message_id.is_none() {
+                                                    let message_id = codex_loop_reasoning_message_id(
+                                                        &params,
+                                                        current_message_id.as_deref(),
+                                                        active_turn_id.as_deref(),
+                                                    );
+                                                    current_message_id = Some(message_id.clone());
+                                                    stream_closed_by_turn_completion = false;
+                                                    accumulated_text.clear();
+                                                    accumulated_reasoning.clear();
+                                                    if !typing_status_active {
+                                                        emitter.typing_status_changed(true);
+                                                        typing_status_active = true;
+                                                    }
+                                                    emitter.stream_start(
+                                                        &message_id,
+                                                        AgentName(CODEX_AGENT_NAME),
+                                                        Some(&model_name),
+                                                    );
+                                                }
+                                                accumulated_reasoning.push_str(&delta);
+                                                emitter.stream_reasoning_delta(&item_id, &delta);
+                                            }
+                                            close_stream_when_tools_idle = true;
+                                            maybe_finish_codex_loop_segment(
+                                                &emitter,
+                                                &mut current_message_id,
+                                                &mut accumulated_text,
+                                                &mut accumulated_reasoning,
+                                                &mut close_stream_when_tools_idle,
+                                                &pending_tool_call_ids,
+                                                &model_name,
+                                            );
+                                        }
                                     }
                                     "commandExecution" => {
                                         let exit_code =
@@ -5165,6 +5413,16 @@ impl Backend for CodexBackend {
                                             success,
                                             error: error_message.as_deref(),
                                         });
+                                        pending_tool_call_ids.remove(&item_id);
+                                        maybe_finish_codex_loop_segment(
+                                            &emitter,
+                                            &mut current_message_id,
+                                            &mut accumulated_text,
+                                            &mut accumulated_reasoning,
+                                            &mut close_stream_when_tools_idle,
+                                            &pending_tool_call_ids,
+                                            &model_name,
+                                        );
                                     }
                                     "fileChange" => {
                                         let file_changes = parse_codex_file_changes(&item);
@@ -5193,7 +5451,17 @@ impl Backend for CodexBackend {
                                                     error: (!success)
                                                         .then_some("File changes were not applied"),
                                                 });
+                                                pending_tool_call_ids.remove(&call_id);
                                             }
+                                            maybe_finish_codex_loop_segment(
+                                                &emitter,
+                                                &mut current_message_id,
+                                                &mut accumulated_text,
+                                                &mut accumulated_reasoning,
+                                                &mut close_stream_when_tools_idle,
+                                                &pending_tool_call_ids,
+                                                &model_name,
+                                            );
                                         }
                                     }
                                     "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
@@ -5219,6 +5487,16 @@ impl Backend for CodexBackend {
                                             success,
                                             error: error_message.as_deref(),
                                         });
+                                        pending_tool_call_ids.remove(&item_id);
+                                        maybe_finish_codex_loop_segment(
+                                            &emitter,
+                                            &mut current_message_id,
+                                            &mut accumulated_text,
+                                            &mut accumulated_reasoning,
+                                            &mut close_stream_when_tools_idle,
+                                            &pending_tool_call_ids,
+                                            &model_name,
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -5249,6 +5527,7 @@ impl Backend for CodexBackend {
                                             .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
+                                        pending_tool_call_ids.insert(item_id.clone());
                                         emitter.tool_request(
                                             &item_id,
                                             "run_command",
@@ -5274,6 +5553,7 @@ impl Backend for CodexBackend {
                                             .collect::<Vec<_>>();
                                         file_change_call_ids
                                             .insert(item_id.clone(), call_ids.clone());
+                                        pending_tool_call_ids.extend(call_ids.iter().cloned());
                                         for (change, call_id) in
                                             file_changes.into_iter().zip(call_ids.into_iter())
                                         {
@@ -5293,6 +5573,7 @@ impl Backend for CodexBackend {
                                             .and_then(Value::as_str)
                                             .unwrap_or(item_type)
                                             .to_string();
+                                        pending_tool_call_ids.insert(item_id.clone());
                                         emitter.tool_request(
                                             &item_id,
                                             &tool_name,
@@ -5351,7 +5632,10 @@ impl Backend for CodexBackend {
                                             agent: Some(AgentName(CODEX_AGENT_NAME)),
                                             model: Some(model_name.clone()),
                                             usage: None,
-                                            reasoning: None,
+                                            reasoning: contains_non_whitespace(
+                                                &accumulated_reasoning,
+                                            )
+                                            .then(|| std::mem::take(&mut accumulated_reasoning)),
                                             tool_calls: Vec::new(),
                                             context_breakdown: None,
                                         });
@@ -5370,6 +5654,8 @@ impl Backend for CodexBackend {
                                     emitter.typing_status_changed(false);
                                     typing_status_active = false;
                                 }
+                                pending_tool_call_ids.clear();
+                                close_stream_when_tools_idle = false;
                             }
                             _ => {}
                         }
@@ -5906,6 +6192,8 @@ mod tests {
                 text: String::new(),
                 reasoning: String::new(),
             }),
+            pending_tool_call_ids: HashSet::new(),
+            close_active_stream_when_tools_idle: false,
             token_usage_by_turn: HashMap::new(),
             turn_context_by_turn: HashMap::new(),
             file_change_call_ids: HashMap::new(),
@@ -7089,6 +7377,196 @@ Do not describe the tool, and do not skip the tool call."#;
                 .filter_map(|event| event.get("kind").and_then(Value::as_str))
                 .collect::<Vec<_>>();
             assert_eq!(kinds, vec!["StreamEnd"]);
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn completed_reasoning_item_splits_codex_turn_segments() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "turn": { "id": "turn-segmented" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "type": "reasoning",
+                            "id": "reasoning-1",
+                            "summary": "Inspecting the failure first."
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["StreamReasoningDelta", "StreamEnd"],
+                "reasoning completion should close the first segment: {events:?}"
+            );
+            assert_eq!(
+                events[1]
+                    .pointer("/data/message/reasoning/text")
+                    .and_then(Value::as_str),
+                Some("Inspecting the failure first.")
+            );
+
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "exec-1",
+                            "command": "cargo test",
+                            "cwd": "/tmp"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "exec-1",
+                            "exitCode": 0,
+                            "aggregatedOutput": "ok"
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["ToolRequest", "ToolExecutionCompleted"],
+                "tool events should attach after the closed reasoning segment: {events:?}"
+            );
+
+            inner
+                .emit_reasoning_delta(
+                    &json!({ "itemId": "reasoning-2" }),
+                    "Checking the next step.".to_string(),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["TypingStatusChanged", "StreamStart", "StreamReasoningDelta"],
+                "next reasoning block should start a fresh segment: {events:?}"
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn reasoning_segment_waits_for_pending_tool_completion() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({ "turn": { "id": "turn-segmented" } }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            inner
+                .handle_notification(
+                    "item/started",
+                    &json!({
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "exec-1",
+                            "command": "cargo test",
+                            "cwd": "/tmp"
+                        }
+                    }),
+                )
+                .await;
+            drain_events(&mut rx);
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "type": "reasoning",
+                            "id": "reasoning-1",
+                            "summary": "Waiting for the command result."
+                        }
+                    }),
+                )
+                .await;
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["StreamReasoningDelta"],
+                "reasoning should stay open while its tool is pending: {events:?}"
+            );
+
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "exec-1",
+                            "exitCode": 0,
+                            "aggregatedOutput": "ok"
+                        }
+                    }),
+                )
+                .await;
+            let events = drain_events(&mut rx);
+            let kinds = events
+                .iter()
+                .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec!["ToolExecutionCompleted", "StreamEnd"],
+                "reasoning segment should close after pending tools finish: {events:?}"
+            );
 
             inner.rpc.shutdown().await;
         });
