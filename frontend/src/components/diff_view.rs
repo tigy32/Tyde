@@ -983,7 +983,7 @@ fn render_unified_virtualized(args: UnifiedVirtualizedArgs) -> AnyView {
             });
             let _ = syn;
             let _ = flat_to_pos;
-            let _task_id = client.highlight_file(
+            let task_id = client.highlight_file_concurrent(
                 if syntax_name.is_empty() {
                     relative_path.clone()
                 } else {
@@ -994,6 +994,11 @@ fn render_unified_virtualized(args: UnifiedVirtualizedArgs) -> AnyView {
                 on_chunk,
                 on_done,
             );
+            on_cleanup(move || {
+                if let Some(client) = crate::highlight_worker::shared() {
+                    client.cancel_task(task_id);
+                }
+            });
         } else {
             spawn_local(run_fallback_diff_highlight(
                 syn,
@@ -1338,16 +1343,9 @@ fn render_sbs_panes(
     );
 
     if syntax.is_some() {
-        // Cancel any prior file's worker tasks once, then spawn both
-        // sides for this file via the concurrent (no-cancel) variant
-        // so Old + New both run to completion. Without the explicit
-        // cancel_all, opening file A then file B would leave A's
-        // tokenization running indefinitely; without the concurrent
-        // variant on the per-side calls, the second side would
-        // cancel the first.
-        if let Some(client) = crate::highlight_worker::shared() {
-            client.cancel_all();
-        }
+        // Spawn both sides independently. Each returned task is cancelled
+        // by its view cleanup, so another mounted file does not clobber
+        // this file's highlighting.
         spawn_sbs_side_highlight(
             relative_path.clone(),
             &file.hunks,
@@ -1666,16 +1664,9 @@ fn render_sbs_virtualized(
     // hunk's lines for that side as a single stream; the callback maps
     // chunks back to (hunk_idx, line_idx) for the per-line signals.
     if syntax.is_some() {
-        // Cancel any prior file's worker tasks once, then spawn both
-        // sides for this file via the concurrent (no-cancel) variant
-        // so Old + New both run to completion. Without the explicit
-        // cancel_all, opening file A then file B would leave A's
-        // tokenization running indefinitely; without the concurrent
-        // variant on the per-side calls, the second side would
-        // cancel the first.
-        if let Some(client) = crate::highlight_worker::shared() {
-            client.cancel_all();
-        }
+        // Spawn both sides independently. Each returned task is cancelled
+        // by its view cleanup, so another mounted file does not clobber
+        // this file's highlighting.
         spawn_sbs_side_highlight(
             relative_path.clone(),
             &file.hunks,
@@ -2629,12 +2620,10 @@ fn spawn_sbs_side_highlight(
             .unwrap_or("")
             .to_owned();
         let theme_name = expect_context::<AppState>().syntax_theme.get_untracked();
-        // Use the concurrent variant — the SBS path spawns Old + New
-        // sides as two tasks that must both run; calling the
-        // auto-cancelling `highlight_file` here would cancel the
-        // first when the second arrives. Outer caller cancels prior
-        // file's tasks via `cancel_all` before spawning either side.
-        let _task_id = client.highlight_file_concurrent(
+        // Old and New are independent tasks for this file. The cleanup
+        // below cancels only this side's task, so other mounted diff
+        // files keep their highlighting work.
+        let task_id = client.highlight_file_concurrent(
             if syntax_name.is_empty() {
                 relative_path
             } else {
@@ -2645,6 +2634,11 @@ fn spawn_sbs_side_highlight(
             on_chunk,
             on_done,
         );
+        on_cleanup(move || {
+            if let Some(client) = crate::highlight_worker::shared() {
+                client.cancel_task(task_id);
+            }
+        });
     } else {
         // No-worker fallback: tokenize on the main thread but yielding
         // between 50-line chunks so the UI doesn't lock up.

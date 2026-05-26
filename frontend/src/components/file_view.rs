@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -42,6 +44,19 @@ const FALLBACK_CHUNK_LINES: usize = 200;
 /// realistically tokenize that much without freezing the UI even with
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
 const HIGHLIGHT_LINE_CAP: usize = 5000;
+
+fn cancel_highlight_task(active_task_id: &Arc<Mutex<Option<u64>>>) {
+    let Some(task_id) = active_task_id
+        .lock()
+        .expect("highlight task mutex poisoned")
+        .take()
+    else {
+        return;
+    };
+    if let Some(client) = crate::highlight_worker::shared() {
+        client.cancel_task(task_id);
+    }
+}
 
 fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
     TabScrollState {
@@ -164,12 +179,16 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
     // in-flight chunked task, which checks the
     // generation each chunk and exits if stale.
     let highlight_gen: ArcRwSignal<u32> = ArcRwSignal::new(0);
+    let active_worker_task: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let active_worker_task_for_cleanup = active_worker_task.clone();
+    on_cleanup(move || cancel_highlight_task(&active_worker_task_for_cleanup));
 
     let path_for_effect = f.path.relative_path.clone();
     let syntax_theme = state.syntax_theme;
     let lines_for_effect = lines.clone();
     let highlighted_for_effect = highlighted.clone();
     let gen_for_effect = highlight_gen.clone();
+    let active_worker_task_for_effect = active_worker_task.clone();
     Effect::new(move |_| {
         // Subscribe to the theme signal so a theme change drops the
         // current tokens and dispatches a fresh request with the new
@@ -178,6 +197,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
 
         let my_gen = gen_for_effect.get_untracked() + 1;
         gen_for_effect.set(my_gen);
+        cancel_highlight_task(&active_worker_task_for_effect);
 
         // Reset highlighted vec to plain text while we re-tokenize.
         // Visible rows momentarily render plain, then fill in with the
@@ -237,10 +257,10 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
         let on_chunk = {
             let gen_for_task = gen_for_task.clone();
             Box::new(move |start: usize, tokens: Vec<LineTokens>| {
-                // The client also drops superseded callbacks before
-                // dispatching new tasks, but defend in depth — a stale
-                // chunk that races a generation bump shouldn't write
-                // tokens for a torn-down highlight pass.
+                // The view cancels its prior worker task before dispatching
+                // a new one, but defend in depth — a stale chunk that races
+                // a generation bump shouldn't write tokens for a torn-down
+                // highlight pass.
                 if gen_for_task.get_untracked() != my_gen {
                     return;
                 }
@@ -277,16 +297,16 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
             );
         });
 
-        let _task_id = client.highlight_file(
+        let task_id = client.highlight_file_concurrent(
             path_for_effect.clone(),
             theme_name,
             lines_owned,
             on_chunk,
             on_done,
         );
-        // `shared()` clones the same `Rc` each time, so dropping the
-        // local clone here is a no-op for the singleton's lifetime.
-        drop(client);
+        *active_worker_task_for_effect
+            .lock()
+            .expect("highlight task mutex poisoned") = Some(task_id);
     });
 
     let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
@@ -876,6 +896,75 @@ mod wasm_tests {
             .text_content()
             .unwrap_or_default();
         assert_eq!(code_text, content);
+    }
+
+    #[wasm_bindgen_test]
+    async fn multiple_mounted_files_keep_syntax_highlighting() {
+        ensure_styles_loaded();
+
+        let first_path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "first.rs".to_owned(),
+        };
+        let second_path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "second.rs".to_owned(),
+        };
+
+        let container = make_container();
+        let mount_first_path = first_path.clone();
+        let mount_second_path = second_path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.open_files.update(|files| {
+                files.insert(
+                    mount_first_path.clone(),
+                    OpenFile {
+                        path: mount_first_path.clone(),
+                        contents: Some("fn first() {}".to_owned()),
+                        is_binary: false,
+                    },
+                );
+                files.insert(
+                    mount_second_path.clone(),
+                    OpenFile {
+                        path: mount_second_path.clone(),
+                        contents: Some("fn second() {}".to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            provide_context(state);
+            view! {
+                <div id="file-one">
+                    <FileView tab_id=TabId(20_003) path=mount_first_path.clone() />
+                </div>
+                <div id="file-two">
+                    <FileView tab_id=TabId(20_004) path=mount_second_path.clone() />
+                </div>
+            }
+        });
+
+        let selectors = [
+            "#file-one .file-line code span[style]",
+            "#file-two .file-line code span[style]",
+        ];
+        for _ in 0..20 {
+            let both_highlighted = selectors
+                .iter()
+                .all(|selector| container.query_selector_all(selector).unwrap().length() > 0);
+            if both_highlighted {
+                break;
+            }
+            next_tick().await;
+        }
+
+        for selector in selectors {
+            assert!(
+                container.query_selector_all(selector).unwrap().length() > 0,
+                "expected styled syntax spans for {selector}"
+            );
+        }
     }
 
     #[wasm_bindgen_test]
