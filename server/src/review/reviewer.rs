@@ -40,41 +40,70 @@ impl ReviewerToolBridge {
         review_handle: ReviewHandle,
     ) {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let stream = Stream::new(
-            protocol::StreamPath(format!(
-                "/agent/{}/review-bridge-{}",
-                reviewer_agent_id.0,
-                Uuid::new_v4()
-            )),
-            tx,
+        let bridge_stream_path = protocol::StreamPath(format!(
+            "/agent/{}/review-bridge-{}",
+            reviewer_agent_id.0,
+            Uuid::new_v4()
+        ));
+        let stream = Stream::new(bridge_stream_path.clone(), tx);
+        tracing::debug!(
+            reviewer_agent_id = %reviewer_agent_id,
+            bridge_stream = %bridge_stream_path,
+            "attaching AI reviewer tool bridge"
         );
         tokio::spawn(async move {
             if !agent_handle.attach(stream).await {
+                tracing::warn!(
+                    reviewer_agent_id = %reviewer_agent_id,
+                    bridge_stream = %bridge_stream_path,
+                    "failed to attach AI reviewer tool bridge"
+                );
                 let _ = review_handle
                     .ai_reviewer_exited(Err("failed to attach reviewer tool bridge".to_owned()))
                     .await;
                 return;
             }
+            tracing::debug!(
+                reviewer_agent_id = %reviewer_agent_id,
+                bridge_stream = %bridge_stream_path,
+                "attached AI reviewer tool bridge"
+            );
 
             while let Some(envelope) = rx.recv().await {
                 match envelope.kind {
                     FrameKind::AgentError => {
-                        // Backend spawn failure or runtime error from the
-                        // sub-agent. Surface it as the reviewer's exit
-                        // error so the UI flips Running → Failed.
-                        let message = envelope
-                            .parse_payload::<AgentErrorPayload>()
-                            .map(|p| p.message)
-                            .unwrap_or_else(|err| {
-                                format!("failed to parse reviewer agent_error: {err}")
-                            });
+                        let message = match envelope.parse_payload::<AgentErrorPayload>() {
+                            Ok(payload) => {
+                                tracing::warn!(
+                                    reviewer_agent_id = %reviewer_agent_id,
+                                    bridge_stream = %bridge_stream_path,
+                                    code = ?payload.code,
+                                    message_len = payload.message.len(),
+                                    "AI reviewer bridge received agent error"
+                                );
+                                payload.message
+                            }
+                            Err(err) => {
+                                let message =
+                                    format!("failed to parse reviewer agent_error: {err}");
+                                tracing::warn!(
+                                    reviewer_agent_id = %reviewer_agent_id,
+                                    bridge_stream = %bridge_stream_path,
+                                    message_len = message.len(),
+                                    "AI reviewer bridge failed to parse agent error"
+                                );
+                                message
+                            }
+                        };
                         let _ = review_handle.ai_reviewer_exited(Err(message)).await;
                         return;
                     }
                     FrameKind::AgentClosed => {
-                        // Sub-agent terminated (graceful or otherwise).
-                        // Treat as completion so the reviewer status
-                        // settles regardless of the exit reason.
+                        tracing::info!(
+                            reviewer_agent_id = %reviewer_agent_id,
+                            bridge_stream = %bridge_stream_path,
+                            "AI reviewer bridge observed agent closed"
+                        );
                         let _ = review_handle.ai_reviewer_exited(Ok(())).await;
                         return;
                     }
@@ -82,11 +111,14 @@ impl ReviewerToolBridge {
                         let event = match envelope.parse_payload::<ChatEvent>() {
                             Ok(event) => event,
                             Err(err) => {
-                                let _ = review_handle
-                                    .ai_reviewer_exited(Err(format!(
-                                        "failed to parse reviewer chat event: {err}"
-                                    )))
-                                    .await;
+                                let message = format!("failed to parse reviewer chat event: {err}");
+                                tracing::warn!(
+                                    reviewer_agent_id = %reviewer_agent_id,
+                                    bridge_stream = %bridge_stream_path,
+                                    message_len = message.len(),
+                                    "AI reviewer bridge failed to parse chat event"
+                                );
+                                let _ = review_handle.ai_reviewer_exited(Err(message)).await;
                                 return;
                             }
                         };
@@ -94,15 +126,31 @@ impl ReviewerToolBridge {
                             ChatEvent::MessageAdded(message)
                                 if matches!(message.sender, protocol::MessageSender::Error) =>
                             {
+                                tracing::warn!(
+                                    reviewer_agent_id = %reviewer_agent_id,
+                                    bridge_stream = %bridge_stream_path,
+                                    message_len = message.content.len(),
+                                    "AI reviewer bridge received error message"
+                                );
                                 let _ =
                                     review_handle.ai_reviewer_exited(Err(message.content)).await;
                                 return;
                             }
                             ChatEvent::OperationCancelled(_) => {
+                                tracing::info!(
+                                    reviewer_agent_id = %reviewer_agent_id,
+                                    bridge_stream = %bridge_stream_path,
+                                    "AI reviewer bridge observed operation cancelled"
+                                );
                                 let _ = review_handle.ai_reviewer_exited(Ok(())).await;
                                 return;
                             }
                             ChatEvent::TypingStatusChanged(false) => {
+                                tracing::info!(
+                                    reviewer_agent_id = %reviewer_agent_id,
+                                    bridge_stream = %bridge_stream_path,
+                                    "AI reviewer bridge observed idle status"
+                                );
                                 let _ = review_handle.ai_reviewer_exited(Ok(())).await;
                                 return;
                             }
@@ -113,6 +161,11 @@ impl ReviewerToolBridge {
                 }
             }
 
+            tracing::info!(
+                reviewer_agent_id = %reviewer_agent_id,
+                bridge_stream = %bridge_stream_path,
+                "AI reviewer bridge stream closed"
+            );
             let _ = review_handle.ai_reviewer_exited(Ok(())).await;
         });
     }

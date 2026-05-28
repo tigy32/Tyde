@@ -1539,6 +1539,15 @@ fn resolve_review_id(stream: &StreamPath) -> Option<ReviewId> {
 fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEventPayload) {
     match payload {
         ReviewEventPayload::Snapshot { review } => {
+            let comments = review.comments.len();
+            let suggestions = review.suggestions.len();
+            let diffs = review.diffs.len();
+            let action_gate_before = state
+                .review_action_pending
+                .with_untracked(|m| m.get(review_id).copied().unwrap_or_default());
+            let target_gate_before = state
+                .review_action_target_pending
+                .with_untracked(|set| set.iter().filter(|(rid, _)| rid == review_id).count());
             state.reviews.update(|map| {
                 map.insert(review_id.clone(), review);
             });
@@ -1550,6 +1559,10 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
             state.review_action_target_pending.update(|set| {
                 set.retain(|(rid, _)| rid != review_id);
             });
+            log::info!(
+                "review.event.snapshot review={review_id} comments={comments} suggestions={suggestions} diffs={diffs} cleared_action_gate={:?} cleared_target_gates={target_gate_before}",
+                action_gate_before
+            );
         }
         ReviewEventPayload::CommentUpsert { comment } => {
             let was_new = state.reviews.with_untracked(|map| {
@@ -1571,15 +1584,18 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                     review.comments.push(comment.clone());
                 }
             });
+            let mut cleared_add = false;
+            let mut cleared_update = false;
+            let mut cleared_accept = false;
             state.review_action_target_pending.update(|set| {
                 // New User comment — clear the AddComment gate (composer
                 // closes from its own effect on seeing the new comment).
                 if was_new && matches!(comment.source, ReviewCommentSource::User) {
-                    set.remove(&(review_id.clone(), ReviewActionTarget::AddComment));
+                    cleared_add = set.remove(&(review_id.clone(), ReviewActionTarget::AddComment));
                 }
                 // Existing comment updated — clear UpdateComment gate.
                 if !was_new {
-                    set.remove(&(
+                    cleared_update = set.remove(&(
                         review_id.clone(),
                         ReviewActionTarget::UpdateComment(comment.id.clone()),
                     ));
@@ -1587,12 +1603,16 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 // Newly-created AI-suggestion-derived comment ⇒ matching
                 // AcceptSuggestion gate clears.
                 if let ReviewCommentSource::AiSuggestion { suggestion_id, .. } = &comment.source {
-                    set.remove(&(
+                    cleared_accept = set.remove(&(
                         review_id.clone(),
                         ReviewActionTarget::AcceptSuggestion(suggestion_id.clone()),
                     ));
                 }
             });
+            log::info!(
+                "review.event.comment_upsert review={review_id} comment_id={} was_new={was_new} cleared_add={cleared_add} cleared_update={cleared_update} cleared_accept={cleared_accept}",
+                comment.id
+            );
         }
         ReviewEventPayload::CommentDelete { comment_id } => {
             state.reviews.update(|map| {
@@ -1601,12 +1621,16 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 };
                 review.comments.retain(|c| c.id != comment_id);
             });
+            let mut cleared = false;
             state.review_action_target_pending.update(|set| {
-                set.remove(&(
+                cleared = set.remove(&(
                     review_id.clone(),
-                    ReviewActionTarget::DeleteComment(comment_id),
+                    ReviewActionTarget::DeleteComment(comment_id.clone()),
                 ));
             });
+            log::info!(
+                "review.event.comment_delete review={review_id} comment_id={comment_id} cleared_delete={cleared}"
+            );
         }
         ReviewEventPayload::SuggestionUpsert { suggestion } => {
             state.reviews.update(|map| {
@@ -1623,25 +1647,45 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                     review.suggestions.push(suggestion.clone());
                 }
             });
+            let mut cleared_accept = false;
+            let mut cleared_reject = false;
+            let suggestion_state_label = match &suggestion.state {
+                ReviewSuggestionState::Pending => "pending",
+                ReviewSuggestionState::Accepted { .. } => "accepted",
+                ReviewSuggestionState::Rejected => "rejected",
+            };
             state
                 .review_action_target_pending
                 .update(|set| match &suggestion.state {
                     ReviewSuggestionState::Accepted { .. } => {
-                        set.remove(&(
+                        cleared_accept = set.remove(&(
                             review_id.clone(),
                             ReviewActionTarget::AcceptSuggestion(suggestion.id.clone()),
                         ));
                     }
                     ReviewSuggestionState::Rejected => {
-                        set.remove(&(
+                        cleared_reject = set.remove(&(
                             review_id.clone(),
                             ReviewActionTarget::RejectSuggestion(suggestion.id.clone()),
                         ));
                     }
                     ReviewSuggestionState::Pending => {}
                 });
+            log::info!(
+                "review.event.suggestion_upsert review={review_id} suggestion_id={} state={suggestion_state_label} cleared_accept={cleared_accept} cleared_reject={cleared_reject}",
+                suggestion.id
+            );
         }
         ReviewEventPayload::AiReviewerChanged { state: ai_state } => {
+            let ai_status_label = match ai_state.status {
+                protocol::ReviewAiReviewerStatus::Idle => "idle",
+                protocol::ReviewAiReviewerStatus::Running => "running",
+                protocol::ReviewAiReviewerStatus::Completed => "completed",
+                protocol::ReviewAiReviewerStatus::Failed => "failed",
+            };
+            let gate_before = state
+                .review_action_pending
+                .with_untracked(|m| m.get(review_id).copied().unwrap_or_default());
             state.reviews.update(|map| {
                 if let Some(review) = map.get_mut(review_id) {
                     review.ai_reviewer = ai_state;
@@ -1655,8 +1699,21 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                     }
                 }
             });
+            log::info!(
+                "review.event.ai_reviewer_changed review={review_id} ai_status={ai_status_label} cleared_start_ai={}",
+                gate_before.start_ai
+            );
         }
         ReviewEventPayload::StatusChanged { status } => {
+            let status_label = match &status {
+                protocol::ReviewStatus::Draft => "draft",
+                protocol::ReviewStatus::Submitted { .. } => "submitted",
+                protocol::ReviewStatus::Consumed { .. } => "consumed",
+                protocol::ReviewStatus::Cancelled { .. } => "cancelled",
+            };
+            let gate_before = state
+                .review_action_pending
+                .with_untracked(|m| m.get(review_id).copied().unwrap_or_default());
             state.reviews.update(|map| {
                 if let Some(review) = map.get_mut(review_id) {
                     review.status = status;
@@ -1671,6 +1728,11 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                     }
                 }
             });
+            log::info!(
+                "review.event.status_changed review={review_id} status={status_label} cleared_submit={} cleared_cancel={}",
+                gate_before.submit,
+                gate_before.cancel
+            );
         }
         ReviewEventPayload::Error { error } => {
             log::error!(
@@ -1679,6 +1741,26 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 error.fatal,
                 error.context,
                 error.message
+            );
+            let action_gate_before = state
+                .review_action_pending
+                .with_untracked(|m| m.get(review_id).copied().unwrap_or_default());
+            let target_gate_count_before = state
+                .review_action_target_pending
+                .with_untracked(|set| set.iter().filter(|(rid, _)| rid == review_id).count());
+            let context_label = match &error.context {
+                ReviewErrorContext::AddComment => "add_comment",
+                ReviewErrorContext::UpdateComment { .. } => "update_comment",
+                ReviewErrorContext::DeleteComment { .. } => "delete_comment",
+                ReviewErrorContext::AcceptSuggestion { .. } => "accept_suggestion",
+                ReviewErrorContext::RejectSuggestion { .. } => "reject_suggestion",
+                ReviewErrorContext::StartAiReview => "start_ai",
+                ReviewErrorContext::Submit => "submit",
+                ReviewErrorContext::Cancel => "cancel",
+            };
+            log::info!(
+                "review.event.error.gate_clear_before review={review_id} context={context_label} action_gate={:?} target_gates={target_gate_count_before}",
+                action_gate_before
             );
             // Clear only the gate matching the error context.
             match error.context {
@@ -1750,6 +1832,16 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                     });
                 }
             }
+            let action_gate_after = state
+                .review_action_pending
+                .with_untracked(|m| m.get(review_id).copied().unwrap_or_default());
+            let target_gate_count_after = state
+                .review_action_target_pending
+                .with_untracked(|set| set.iter().filter(|(rid, _)| rid == review_id).count());
+            log::info!(
+                "review.event.error.gate_clear_after review={review_id} context={context_label} action_gate={:?} target_gates={target_gate_count_after}",
+                action_gate_after
+            );
         }
     }
 }
@@ -1889,8 +1981,11 @@ fn clear_review_pending_on_error(state: &AppState, host_id: &str, payload: &Comm
                 );
                 return;
             };
+            let key = (host_id.to_string(), project_id.clone());
+            let before = state
+                .review_create_pending
+                .with_untracked(|m| m.get(&key).copied().unwrap_or(0));
             state.review_create_pending.update(|map| {
-                let key = (host_id.to_string(), project_id);
                 if let Some(count) = map.get_mut(&key) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
@@ -1898,6 +1993,12 @@ fn clear_review_pending_on_error(state: &AppState, host_id: &str, payload: &Comm
                     }
                 }
             });
+            let after = state
+                .review_create_pending
+                .with_untracked(|m| m.get(&key).copied().unwrap_or(0));
+            log::info!(
+                "review.command_error.gate_clear host={host_id} project={project_id} kind=ReviewCreate create_pending_before={before} create_pending_after={after}"
+            );
         }
         FrameKind::ReviewAction => {
             let Some(review_id) = resolve_review_id(&payload.stream) else {
@@ -1907,12 +2008,23 @@ fn clear_review_pending_on_error(state: &AppState, host_id: &str, payload: &Comm
                 );
                 return;
             };
+            let action_gate_before = state
+                .review_action_pending
+                .with_untracked(|m| m.get(&review_id).copied().unwrap_or_default());
+            let target_gate_count_before = state
+                .review_action_target_pending
+                .with_untracked(|set| set.iter().filter(|(rid, _)| rid == &review_id).count());
             state.review_action_pending.update(|map| {
                 map.remove(&review_id);
             });
             state.review_action_target_pending.update(|set| {
                 set.retain(|(rid, _)| rid != &review_id);
             });
+            log::info!(
+                "review.command_error.gate_clear host={host_id} review={review_id} kind=ReviewAction action_gate_before={:?} target_gates_before={target_gate_count_before} action_gate_after={:?} target_gates_after=0",
+                action_gate_before,
+                crate::state::ReviewActionGate::default()
+            );
         }
         _ => {}
     }

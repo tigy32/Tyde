@@ -696,15 +696,29 @@ only created on `AddComment` action and reflected back via `CommentUpsert`.
   there pending suggestions" all derive via `Memo` from the per-review signal.
 - `state.rs` adds `reviews: RwSignal<HashMap<ReviewId, Review>>`. Dispatch
   applies `ReviewEvent` deltas onto the entry.
+- `ReviewView` mounts `ReviewBody` exactly once per review id, gated only by a
+  loaded boolean. Subsequent `ReviewEvent` deltas must flow through child
+  memos/signals and must not remount `ReviewBody` or reset the diff scroll
+  container.
 - Late-subscribe replay: server emits `Snapshot` first, then current state
   events as needed.
 
 ### Diff rendering note
 
-Inline comment threads have variable height. v1 uses the non-virtualized
-render path inside `ReviewView` even where the plain diff tab uses
-virtualization. Plain diff tabs keep the existing virtualized renderer
-unchanged.
+Inline comment threads have variable height. They render as decoration slots
+inside the existing diff renderer rather than through a separate review-only
+diff path. Rows without decorations still preserve the normal virtualized
+path, but decorated rows can invalidate the fixed-row-height spacer
+assumptions. Large reviews therefore need scroll-stability regression tests;
+precise variable-height virtualization remains deferred.
+
+Thread regions must clamp to the visible diff inline-size, not the full
+horizontal scroll width. `ReviewView` maintains `--diff-scrollport-width` with
+a `ResizeObserver` on `.diff-content`, and `.review-thread-region` uses that
+custom property for its width/max-width. Do not use `100cqi` here: in WKWebView
+horizontal scroll containers, container query inline units resolve against the
+scroll-width, which lets review threads expand wider than the visible diff
+viewport.
 
 ---
 
@@ -946,12 +960,16 @@ Protocol (`protocol/tests/`):
 Server (`server/src/review/...` unit tests + `tests/tests/review.rs`):
 
 - Create review → snapshot emitted with correct frozen diff.
-- Add/update/delete comment → typed events; persistence on disk.
+- Add/update/delete comment → typed delta events; no mutation emits or requires
+  a fresh `Snapshot`; persistence on disk.
 - Invalid location (line out of range, wrong side) → typed error, no mutation.
 - AI reviewer suggestion via tool bridge → `SuggestionUpsert` with
   `state: Pending`. Accept → `ReviewComment` created with `source:
   AiSuggestion { suggestion_id, edited: false }`, suggestion transitions to
-  `Accepted { comment_id }`.
+  `Accepted { comment_id }`. Reject → suggestion transitions to `Rejected`.
+- Accept/reject suggestion and status mutations are delta events; `Snapshot` is
+  reserved for subscribe/recovery and must not be part of a normal mutation
+  response.
 - Submit with no comments → `InvalidStatus`-class error.
 - Submit with origin agent live → `Consumed` after `BundleConsumed`.
 - Submit with origin session offline → `Submitted`, then on session resume
@@ -972,6 +990,13 @@ tests are inviolate):
 - Submit button disabled when `status != Draft` or `comments.is_empty()`.
 - Counts shown in sidebar derive from the comments/suggestions signal (no
   cached count field).
+- Review deltas do not remount `ReviewBody` or replace the diff scroll
+  container; tests assert scroll container identity/scroll position survives
+  comment and suggestion mutations.
+- Inline thread regions are width-bounded to the visible diff viewport in both
+  unified and side-by-side modes.
+- The `.diff-content` `ResizeObserver` wires `--diff-scrollport-width` and
+  updates it when the scrollport is resized.
 
 End-to-end (`tests/tests/review_e2e.rs`):
 
@@ -995,4 +1020,5 @@ End-to-end (`tests/tests/review_e2e.rs`):
 - `read_files` / additional context tools for the AI reviewer.
 - Multi-root review UX polish (each root currently shown as its own diff
   block in the same view).
-- Virtualized rendering of variable-height comment threads.
+- More precise virtualized rendering/measurement for variable-height inline
+  comment threads.

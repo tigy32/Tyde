@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use protocol::types::{
@@ -4251,6 +4251,14 @@ impl HostHandle {
         payload: ReviewCreatePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "review_create";
+        tracing::info!(
+            project_id = %project_id,
+            origin_agent_id = %payload.origin_agent_id,
+            selection_kind = payload.selection.kind_name(),
+            connection_stream = %connection_host_stream,
+            output_stream = %project_output_stream.path(),
+            "received review_create"
+        );
         let (project_store, review_registry, origin_agent, origin_session_id) = {
             let state = self.state.lock().await;
             let Some(origin_agent) = state.registry.agent_handle(&payload.origin_agent_id) else {
@@ -4315,13 +4323,53 @@ impl HostHandle {
             ));
         }
 
-        let diffs = read_review_diffs(&project, &payload.selection).map_err(|error| {
-            AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-        })?;
+        let diff_started = Instant::now();
+        tracing::debug!(
+            project_id = %project_id,
+            selection_kind = payload.selection.kind_name(),
+            "reading initial review diffs"
+        );
+        let diffs = match read_review_diffs(&project, &payload.selection) {
+            Ok(diffs) => {
+                let stats = host_diff_stats(&diffs);
+                tracing::info!(
+                    project_id = %project_id,
+                    selection_kind = payload.selection.kind_name(),
+                    diff_count = stats.diff_count,
+                    file_count = stats.file_count,
+                    hunk_count = stats.hunk_count,
+                    line_count = stats.line_count,
+                    elapsed_ms = diff_started.elapsed().as_millis() as u64,
+                    "read initial review diffs"
+                );
+                diffs
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    selection_kind = payload.selection.kind_name(),
+                    elapsed_ms = diff_started.elapsed().as_millis() as u64,
+                    error_len = error.len(),
+                    "failed to read initial review diffs"
+                );
+                return Err(AppError::internal_message(
+                    OPERATION,
+                    error.clone(),
+                    anyhow!(error),
+                ));
+            }
+        };
         let review_id = ReviewId(Uuid::new_v4().to_string());
         let review_stream = project_output_stream.with_path(review_stream_path(&review_id));
+        tracing::debug!(
+            project_id = %project_id,
+            review_id = %review_id,
+            review_stream = %review_stream.path(),
+            origin_session_id = %origin_session_id,
+            "creating review actor"
+        );
         let request = build_create_request(
-            review_id,
+            review_id.clone(),
             project_id,
             origin_session_id,
             payload,
@@ -4332,6 +4380,7 @@ impl HostHandle {
         review_registry.create(request).await.map_err(|error| {
             AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
         })?;
+        tracing::info!(review_id = %review_id, "created review");
         Ok(())
     }
 
@@ -4343,6 +4392,13 @@ impl HostHandle {
         payload: ReviewActionPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "review_action";
+        tracing::info!(
+            review_id = %review_id,
+            action_kind = payload.kind_name(),
+            connection_stream = %connection_host_stream,
+            output_stream = %review_output_stream.path(),
+            "received review_action"
+        );
         let review_registry = {
             let state = self.state.lock().await;
             state.review_registry.clone()
@@ -4368,6 +4424,12 @@ impl HostHandle {
         review_id: ReviewId,
     ) -> AppResult<()> {
         const OPERATION: &str = "review_subscribe";
+        tracing::info!(
+            review_id = %review_id,
+            connection_stream = %connection_host_stream,
+            output_stream = %review_output_stream.path(),
+            "received review_subscribe"
+        );
         let review_registry = {
             let state = self.state.lock().await;
             state.review_registry.clone()
@@ -4391,15 +4453,37 @@ impl HostHandle {
         target_session_id: SessionId,
         payload: SendMessagePayload,
     ) -> ReviewDeliveryOutcome {
+        let message_len = payload.message.len();
+        let images_count = payload.images.as_ref().map_or(0, Vec::len);
+        tracing::debug!(
+            review_id = %review_id,
+            target_session_id = %target_session_id,
+            message_len,
+            images_count,
+            "resolving review delivery"
+        );
         let Some(protocol::MessageOrigin::Review {
             review_id: origin_review_id,
         }) = payload.origin.as_ref()
         else {
+            tracing::warn!(
+                review_id = %review_id,
+                target_session_id = %target_session_id,
+                reason = "missing_origin",
+                "review delivery failed before target resolution"
+            );
             return ReviewDeliveryOutcome::Failed(
                 "review delivery payload did not carry review origin".to_owned(),
             );
         };
         if origin_review_id != &review_id {
+            tracing::warn!(
+                review_id = %review_id,
+                origin_review_id = %origin_review_id,
+                target_session_id = %target_session_id,
+                reason = "origin_mismatch",
+                "review delivery failed before target resolution"
+            );
             return ReviewDeliveryOutcome::Failed(format!(
                 "review delivery payload origin {} did not match {}",
                 origin_review_id, review_id
@@ -4421,13 +4505,19 @@ impl HostHandle {
                 Err(error) => {
                     tracing::warn!(
                         target_session_id = %target_session_id,
-                        error = %error,
+                        error_len = error.len(),
                         "failed to resolve compacted review delivery target"
                     );
                 }
             }
             ids
         };
+        tracing::debug!(
+            review_id = %review_id,
+            target_session_id = %target_session_id,
+            candidate_session_count = target_session_ids.len(),
+            "resolved review delivery session candidates"
+        );
 
         let (target_agent_id, target_agent, delivered_session_id) = {
             let state = self.state.lock().await;
@@ -4443,9 +4533,28 @@ impl HostHandle {
                 })
                 .collect::<Vec<_>>();
             match matches.len() {
-                0 => return ReviewDeliveryOutcome::Offline,
+                0 => {
+                    tracing::info!(
+                        review_id = %review_id,
+                        target_session_id = %target_session_id,
+                        candidate_session_count = target_session_ids.len(),
+                        outcome = "offline",
+                        "review delivery target is offline"
+                    );
+                    return ReviewDeliveryOutcome::Offline;
+                }
                 1 => matches.into_iter().next().expect("one match must exist"),
-                _ => return ReviewDeliveryOutcome::Ambiguous,
+                _ => {
+                    tracing::warn!(
+                        review_id = %review_id,
+                        target_session_id = %target_session_id,
+                        candidate_session_count = target_session_ids.len(),
+                        match_count = matches.len(),
+                        outcome = "ambiguous",
+                        "review delivery target is ambiguous"
+                    );
+                    return ReviewDeliveryOutcome::Ambiguous;
+                }
             }
         };
 
@@ -4457,15 +4566,28 @@ impl HostHandle {
                 review_id = %review_id,
                 target_agent_id = %target_agent_id,
                 target_session_id = %delivered_session_id,
+                message_len,
+                images_count,
                 "delivered review feedback bundle to live agent"
             );
             ReviewDeliveryOutcome::Delivered
         } else {
+            tracing::warn!(
+                review_id = %review_id,
+                target_agent_id = %target_agent_id,
+                target_session_id = %delivered_session_id,
+                outcome = "offline",
+                "review delivery target went offline"
+            );
             ReviewDeliveryOutcome::Offline
         }
     }
 
     async fn deliver_submitted_reviews_for_session(&self, session_id: SessionId) {
+        tracing::info!(
+            session_id = %session_id,
+            "scanning for submitted reviews to redeliver"
+        );
         let registry = {
             let state = self.state.lock().await;
             state.review_registry.clone()
@@ -4485,14 +4607,23 @@ impl HostHandle {
                 Err(error) => {
                     tracing::warn!(
                         session_id = %session_id,
-                        error = %error,
+                        error_len = error.len(),
                         "failed to resolve compacted review delivery ancestors"
                     );
                 }
             }
             ids
         };
+        tracing::debug!(
+            session_id = %session_id,
+            origin_session_count = session_ids.len(),
+            "resolved review redelivery origin sessions"
+        );
         for origin_session_id in session_ids {
+            tracing::debug!(
+                session_id = %origin_session_id,
+                "querying submitted review bundles for redelivery"
+            );
             let bundles = match registry
                 .submitted_bundles_for_session(origin_session_id.clone())
                 .await
@@ -4501,18 +4632,38 @@ impl HostHandle {
                 Err(error) => {
                     tracing::warn!(
                         session_id = %origin_session_id,
-                        error = %error,
+                        error_len = error.len(),
                         "failed to query submitted reviews for resumed session"
                     );
                     continue;
                 }
             };
+            tracing::info!(
+                session_id = %origin_session_id,
+                bundle_count = bundles.len(),
+                "queried submitted review bundles for redelivery"
+            );
             for (review_id, payload) in bundles {
                 match self
                     .deliver_review_payload(review_id.clone(), origin_session_id.clone(), payload)
                     .await
                 {
-                    ReviewDeliveryOutcome::Delivered | ReviewDeliveryOutcome::Offline => {}
+                    ReviewDeliveryOutcome::Delivered => {
+                        tracing::info!(
+                            review_id = %review_id,
+                            session_id = %origin_session_id,
+                            outcome = "delivered",
+                            "submitted review redelivery completed"
+                        );
+                    }
+                    ReviewDeliveryOutcome::Offline => {
+                        tracing::info!(
+                            review_id = %review_id,
+                            session_id = %origin_session_id,
+                            outcome = "offline",
+                            "submitted review redelivery deferred"
+                        );
+                    }
                     ReviewDeliveryOutcome::Ambiguous => {
                         tracing::warn!(
                             review_id = %review_id,
@@ -4524,7 +4675,7 @@ impl HostHandle {
                         tracing::warn!(
                             review_id = %review_id,
                             session_id = %origin_session_id,
-                            error = %message,
+                            error_len = message.len(),
                             "submitted review delivery failed after session resume"
                         );
                     }
@@ -4583,18 +4734,32 @@ impl HostHandle {
         Result<AgentId, String>,
     ) {
         let reply = request.reply;
+        let instructions_len = request.instructions.as_ref().map_or(0, String::len);
         let roots = request
             .review
             .diffs
             .iter()
             .map(|diff| diff.root.0.clone())
             .collect::<Vec<_>>();
+        let roots_count = roots.len();
+        let stats = host_diff_stats(&request.review.diffs);
         tracing::info!(
             review_id = %request.review_id,
             backend_kind = ?request.backend_kind,
+            roots_count,
+            diff_count = stats.diff_count,
+            file_count = stats.file_count,
+            hunk_count = stats.hunk_count,
+            line_count = stats.line_count,
+            instructions_len,
             "spawning AI reviewer"
         );
-        if roots.is_empty() {
+        if roots_count == 0 {
+            tracing::warn!(
+                review_id = %request.review_id,
+                backend_kind = ?request.backend_kind,
+                "AI reviewer spawn rejected without diff roots"
+            );
             return (reply, Err("review has no frozen diff roots".to_owned()));
         }
         let review_mcp_url = {
@@ -4602,6 +4767,11 @@ impl HostHandle {
             state.review_mcp.url.clone()
         };
         if review_mcp_url.trim().is_empty() {
+            tracing::warn!(
+                review_id = %request.review_id,
+                backend_kind = ?request.backend_kind,
+                "AI reviewer spawn rejected without review MCP URL"
+            );
             return (
                 reply,
                 Err("review feedback MCP server is unavailable for AI review".to_owned()),
@@ -4609,6 +4779,7 @@ impl HostHandle {
         }
         let reviewer_system_prompt =
             build_reviewer_system_prompt(&request.review, request.instructions);
+        let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_spawn_config = ResolvedSpawnConfig {
             instructions: Some(reviewer_system_prompt),
             steering_body: String::new(),
@@ -4626,6 +4797,7 @@ impl HostHandle {
             access_mode: protocol::BackendAccessMode::ReadOnly,
         };
         let prompt = build_reviewer_user_prompt();
+        let prompt_len = prompt.len();
         let payload = SpawnAgentPayload {
             name: Some("AI Review".to_owned()),
             custom_agent_id: None,
@@ -4641,6 +4813,14 @@ impl HostHandle {
                 session_settings: None,
             },
         };
+        tracing::debug!(
+            review_id = %request.review_id,
+            backend_kind = ?request.backend_kind,
+            roots_count,
+            reviewer_system_prompt_len,
+            prompt_len,
+            "dispatching AI reviewer spawn"
+        );
         let agent_id = self
             .spawn_agent_with_origin_and_config(
                 payload,
@@ -4649,9 +4829,19 @@ impl HostHandle {
             )
             .await;
         if let Some(agent_handle) = self.agent_handle(&agent_id).await {
+            tracing::info!(
+                review_id = %request.review_id,
+                reviewer_agent_id = %agent_id,
+                "AI reviewer spawned; attaching tool bridge"
+            );
             ReviewerToolBridge::spawn(agent_id.clone(), agent_handle, request.review_handle);
             (reply, Ok(agent_id))
         } else {
+            tracing::warn!(
+                review_id = %request.review_id,
+                reviewer_agent_id = %agent_id,
+                "AI reviewer spawned but tool bridge attach target was missing"
+            );
             (
                 reply,
                 Err(format!(
@@ -4711,6 +4901,35 @@ fn read_review_diffs(
             },
         )
         .map(|diff| vec![diff]),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostDiffStats {
+    diff_count: usize,
+    file_count: usize,
+    hunk_count: usize,
+    line_count: usize,
+}
+
+fn host_diff_stats(diffs: &[protocol::ProjectGitDiffPayload]) -> HostDiffStats {
+    let file_count = diffs.iter().map(|diff| diff.files.len()).sum();
+    let hunk_count = diffs
+        .iter()
+        .flat_map(|diff| diff.files.iter())
+        .map(|file| file.hunks.len())
+        .sum();
+    let line_count = diffs
+        .iter()
+        .flat_map(|diff| diff.files.iter())
+        .flat_map(|file| file.hunks.iter())
+        .map(|hunk| hunk.lines.len())
+        .sum();
+    HostDiffStats {
+        diff_count: diffs.len(),
+        file_count,
+        hunk_count,
+        line_count,
     }
 }
 
@@ -5305,6 +5524,17 @@ fn spawn_host_review_delivery_task(
 ) {
     let worker = async move {
         while let Some(request) = rx.recv().await {
+            let review_id = request.review_id.clone();
+            let origin_session_id = request.origin_session_id.clone();
+            let message_len = request.payload.message.len();
+            let images_count = request.payload.images.as_ref().map_or(0, Vec::len);
+            tracing::debug!(
+                review_id = %review_id,
+                origin_session_id = %origin_session_id,
+                message_len,
+                images_count,
+                "review delivery worker received request"
+            );
             let outcome = host
                 .deliver_review_payload(
                     request.review_id,
@@ -5312,6 +5542,12 @@ fn spawn_host_review_delivery_task(
                     request.payload,
                 )
                 .await;
+            tracing::debug!(
+                review_id = %review_id,
+                origin_session_id = %origin_session_id,
+                outcome = outcome.label(),
+                "review delivery worker completed request"
+            );
             let _ = request.reply.send(outcome);
         }
     };

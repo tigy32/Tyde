@@ -758,6 +758,7 @@ pub async fn refresh_configured_hosts(state: &AppState) {
 }
 
 pub async fn connect_one_host(state: AppState, host_id: String) {
+    log::info!("host.connect.start host={}", host_id);
     state.connection_statuses.update(|statuses| {
         statuses.insert(host_id.clone(), ConnectionStatus::Connecting);
     });
@@ -790,9 +791,11 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         log::error!("failed to send hello to host {}: {}", host_id, error);
         state.connection_statuses.update(|statuses| {
             statuses.insert(
-                host_id,
+                host_id.clone(),
                 ConnectionStatus::Error(format!("failed to send hello: {error}")),
             );
         });
+        return;
     }
+    log::info!("host.connect.done host={}", host_id);
 }

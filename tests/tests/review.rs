@@ -77,12 +77,63 @@ async fn expect_review_event(client: &mut client::Connection, context: &str) -> 
     }
 }
 
+async fn expect_review_delta(client: &mut client::Connection, context: &str) -> ReviewEventPayload {
+    match expect_review_event(client, context).await {
+        ReviewEventPayload::Snapshot { review } => panic!(
+            "review mutation emitted unexpected Snapshot for review {} while waiting for {}",
+            review.id.0, context
+        ),
+        event => event,
+    }
+}
+
+async fn assert_no_trailing_review_snapshot(client: &mut client::Connection, context: &str) {
+    const QUIET_FOR: Duration = Duration::from_millis(75);
+    const MAX_WAIT: Duration = Duration::from_millis(250);
+
+    let start = tokio::time::Instant::now();
+    let max_deadline = start + MAX_WAIT;
+    let mut quiet_deadline = start + QUIET_FOR;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= quiet_deadline || now >= max_deadline {
+            return;
+        }
+        let deadline = if quiet_deadline <= max_deadline {
+            quiet_deadline
+        } else {
+            max_deadline
+        };
+        let wait_for = deadline.saturating_duration_since(now);
+
+        match tokio::time::timeout(wait_for, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(Some(env))) => {
+                if env.kind == FrameKind::ReviewEvent
+                    && let ReviewEventPayload::Snapshot { review } = env
+                        .parse_payload::<ReviewEventPayload>()
+                        .expect("review event payload")
+                {
+                    panic!(
+                        "review mutation emitted trailing Snapshot for review {} after {}",
+                        review.id.0, context
+                    );
+                }
+                quiet_deadline = tokio::time::Instant::now() + QUIET_FOR;
+            }
+            Ok(Ok(None)) => panic!("connection closed while checking {context}"),
+            Ok(Err(err)) => panic!("next_event failed while checking {context}: {err:?}"),
+        }
+    }
+}
+
 async fn expect_review_error(
     client: &mut client::Connection,
     context: &str,
     code: ReviewErrorCode,
 ) -> protocol::ReviewErrorPayload {
-    match expect_review_event(client, context).await {
+    match expect_review_delta(client, context).await {
         ReviewEventPayload::Error { error } => {
             assert_eq!(error.code, code);
             error
@@ -363,10 +414,12 @@ async fn add_comment(
         )
         .await
         .expect("add comment");
-    match expect_review_event(client, "comment upsert").await {
+    let comment_id = match expect_review_delta(client, "comment upsert delta").await {
         ReviewEventPayload::CommentUpsert { comment } => comment.id,
         other => panic!("expected comment upsert, got {other:?}"),
-    }
+    };
+    assert_no_trailing_review_snapshot(client, "AddComment delta").await;
+    comment_id
 }
 
 async fn call_propose_review_comment_tool(
@@ -461,13 +514,14 @@ async fn create_review_add_update_delete_and_submit_live() {
         )
         .await
         .expect("update comment");
-    match expect_review_event(&mut client, "updated comment").await {
+    match expect_review_delta(&mut client, "updated comment delta").await {
         ReviewEventPayload::CommentUpsert { comment } => {
             assert_eq!(comment.id, comment_id);
             assert_eq!(comment.body, "Updated comment.");
         }
         other => panic!("expected updated comment, got {other:?}"),
     }
+    assert_no_trailing_review_snapshot(&mut client, "UpdateComment delta").await;
 
     client
         .review_action(
@@ -478,10 +532,11 @@ async fn create_review_add_update_delete_and_submit_live() {
         )
         .await
         .expect("delete comment");
-    match expect_review_event(&mut client, "deleted comment").await {
+    match expect_review_delta(&mut client, "deleted comment delta").await {
         ReviewEventPayload::CommentDelete { comment_id: id } => assert_eq!(id, comment_id),
         other => panic!("expected comment delete, got {other:?}"),
     }
+    assert_no_trailing_review_snapshot(&mut client, "DeleteComment delta").await;
 
     let _comment_id = add_comment(&mut client, &review, "Final review comment.").await;
     client
@@ -490,7 +545,7 @@ async fn create_review_add_update_delete_and_submit_live() {
         .expect("submit review");
     let mut saw_submitted = false;
     loop {
-        match expect_review_event(&mut client, "submit status").await {
+        match expect_review_delta(&mut client, "submit status delta").await {
             ReviewEventPayload::StatusChanged {
                 status: ReviewStatus::Submitted { .. },
             } => saw_submitted = true,
@@ -627,7 +682,7 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
         )
         .await
         .expect("add comment");
-    match expect_review_event(&mut client, "comment upsert").await {
+    match expect_review_delta(&mut client, "comment upsert delta").await {
         ReviewEventPayload::CommentUpsert { .. } => {}
         other => panic!("expected comment upsert, got {other:?}"),
     }
@@ -713,12 +768,13 @@ async fn submitted_review_consumes_when_origin_session_resumes() {
         .review_action(&review.id, ReviewActionPayload::Submit)
         .await
         .expect("submit offline review");
-    match expect_review_event(&mut client, "submitted offline").await {
+    match expect_review_delta(&mut client, "submitted offline delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Submitted { .. },
         } => {}
         other => panic!("expected submitted status, got {other:?}"),
     }
+    assert_no_trailing_review_snapshot(&mut client, "offline Submit delta").await;
 
     client
         .spawn_agent(SpawnAgentPayload {
@@ -736,7 +792,7 @@ async fn submitted_review_consumes_when_origin_session_resumes() {
     let resumed = expect_new_agent(&mut client, "resumed agent").await;
     let _ = expect_agent_start(&mut client, &resumed.instance_stream).await;
 
-    match expect_review_event(&mut client, "consumed after resume").await {
+    match expect_review_delta(&mut client, "consumed after resume delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Consumed {
                 target_agent_id, ..
@@ -779,6 +835,7 @@ async fn invalid_locations_emit_typed_error_without_mutation() {
         )
         .await;
         assert!(!error.fatal);
+        assert_no_trailing_review_snapshot(&mut client, "InvalidLocation error").await;
     }
 
     let snapshot = subscribe_review(&mut client, &review.id).await;
@@ -786,7 +843,7 @@ async fn invalid_locations_emit_typed_error_without_mutation() {
 }
 
 #[tokio::test]
-async fn ai_reviewer_propose_tool_accepts_suggestion() {
+async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
     let fixture = Fixture::new().await;
     let mut client = fixture.connect().await;
     let root = tempfile::tempdir().expect("temp root");
@@ -823,6 +880,10 @@ async fn ai_reviewer_propose_tool_accepts_suggestion() {
                 }
             }
             FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
+                ReviewEventPayload::Snapshot { review } => panic!(
+                    "review mutation emitted unexpected Snapshot for review {} while waiting for AI reviewer start",
+                    review.id.0
+                ),
                 ReviewEventPayload::AiReviewerChanged { state }
                     if state.status == ReviewAiReviewerStatus::Running =>
                 {
@@ -836,11 +897,16 @@ async fn ai_reviewer_propose_tool_accepts_suggestion() {
     let reviewer_agent_id = reviewer_agent_id.expect("reviewer agent id");
     let reviewer_stream = reviewer_stream.expect("reviewer stream");
 
-    let tool_result =
-        call_propose_review_comment_tool(&fixture, &reviewer_agent_id, &review.id, location).await;
+    let tool_result = call_propose_review_comment_tool(
+        &fixture,
+        &reviewer_agent_id,
+        &review.id,
+        location.clone(),
+    )
+    .await;
     assert_eq!(tool_result["status"], "success");
 
-    let suggestion = match expect_review_event(&mut client, "AI suggestion upsert").await {
+    let suggestion = match expect_review_delta(&mut client, "AI suggestion upsert delta").await {
         ReviewEventPayload::SuggestionUpsert { suggestion } => suggestion,
         other => panic!("expected AI suggestion upsert, got {other:?}"),
     };
@@ -859,7 +925,7 @@ async fn ai_reviewer_propose_tool_accepts_suggestion() {
         )
         .await
         .expect("accept suggestion");
-    match expect_review_event(&mut client, "accepted suggestion").await {
+    match expect_review_delta(&mut client, "accepted suggestion delta").await {
         ReviewEventPayload::SuggestionUpsert {
             suggestion: accepted,
         } => {
@@ -871,7 +937,7 @@ async fn ai_reviewer_propose_tool_accepts_suggestion() {
         }
         other => panic!("expected accepted suggestion, got {other:?}"),
     }
-    match expect_review_event(&mut client, "AI comment upsert").await {
+    match expect_review_delta(&mut client, "AI comment upsert delta").await {
         ReviewEventPayload::CommentUpsert { comment } => {
             assert_eq!(comment.body, suggestion.body);
             assert_eq!(
@@ -884,9 +950,45 @@ async fn ai_reviewer_propose_tool_accepts_suggestion() {
         }
         other => panic!("expected AI comment upsert, got {other:?}"),
     }
+    assert_no_trailing_review_snapshot(&mut client, "AcceptSuggestion deltas").await;
+
+    let tool_result =
+        call_propose_review_comment_tool(&fixture, &reviewer_agent_id, &review.id, location).await;
+    assert_eq!(tool_result["status"], "success");
+
+    let rejected_suggestion =
+        match expect_review_delta(&mut client, "AI rejected-suggestion upsert delta").await {
+            ReviewEventPayload::SuggestionUpsert { suggestion } => suggestion,
+            other => panic!("expected pending suggestion before reject, got {other:?}"),
+        };
+    assert_eq!(rejected_suggestion.reviewer_agent_id, reviewer_agent_id);
+    assert_eq!(rejected_suggestion.body, "AI found a review issue.");
+    assert!(matches!(
+        rejected_suggestion.state,
+        ReviewSuggestionState::Pending
+    ));
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::RejectSuggestion {
+                suggestion_id: rejected_suggestion.id.clone(),
+            },
+        )
+        .await
+        .expect("reject suggestion");
+    match expect_review_delta(&mut client, "rejected suggestion delta").await {
+        ReviewEventPayload::SuggestionUpsert {
+            suggestion: rejected,
+        } => {
+            assert_eq!(rejected.id, rejected_suggestion.id);
+            assert!(matches!(rejected.state, ReviewSuggestionState::Rejected));
+        }
+        other => panic!("expected rejected suggestion, got {other:?}"),
+    }
 
     close_agent_and_wait(&mut client, &reviewer_stream).await;
-    match expect_review_event(&mut client, "AI reviewer completed").await {
+    match expect_review_delta(&mut client, "AI reviewer completed delta").await {
         ReviewEventPayload::AiReviewerChanged { state }
             if state.status == ReviewAiReviewerStatus::Completed => {}
         other => {
@@ -919,6 +1021,7 @@ async fn submit_without_comments_emits_invalid_status() {
     )
     .await;
     assert!(!error.fatal);
+    assert_no_trailing_review_snapshot(&mut client, "Submit error").await;
 }
 
 #[tokio::test]
@@ -955,7 +1058,7 @@ async fn submit_with_multiple_live_agents_reverts_to_draft() {
         .review_action(&review.id, ReviewActionPayload::Submit)
         .await
         .expect("submit ambiguous review");
-    match expect_review_event(&mut client, "submitted before ambiguous").await {
+    match expect_review_delta(&mut client, "submitted before ambiguous delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Submitted { .. },
         } => {}
@@ -968,7 +1071,7 @@ async fn submit_with_multiple_live_agents_reverts_to_draft() {
     )
     .await;
     assert!(!error.fatal);
-    match expect_review_event(&mut client, "draft after ambiguous").await {
+    match expect_review_delta(&mut client, "draft after ambiguous delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Draft,
         } => {}
@@ -992,7 +1095,7 @@ async fn cancel_rules_for_draft_and_submitted_reviews() {
         .review_action(&draft_review.id, ReviewActionPayload::Cancel)
         .await
         .expect("cancel draft");
-    match expect_review_event(&mut client, "draft cancel status").await {
+    match expect_review_delta(&mut client, "draft cancel status delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Cancelled { .. },
         } => {}
@@ -1007,7 +1110,7 @@ async fn cancel_rules_for_draft_and_submitted_reviews() {
         .review_action(&submitted_review.id, ReviewActionPayload::Submit)
         .await
         .expect("submit offline before cancel");
-    match expect_review_event(&mut client, "submitted status before cancel").await {
+    match expect_review_delta(&mut client, "submitted status before cancel delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Submitted { .. },
         } => {}
@@ -1082,7 +1185,7 @@ async fn second_review_create_is_rejected_while_a_draft_exists() {
         .review_action(&first.id, ReviewActionPayload::Cancel)
         .await
         .expect("cancel first draft");
-    match expect_review_event(&mut client, "first draft cancel").await {
+    match expect_review_delta(&mut client, "first draft cancel delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Cancelled { .. },
         } => {}
@@ -1121,7 +1224,7 @@ async fn queued_review_bundle_is_consumed_only_after_backend_send() {
         .review_action(&review.id, ReviewActionPayload::Submit)
         .await
         .expect("submit queued review");
-    match expect_review_event(&mut client, "queued submitted").await {
+    match expect_review_delta(&mut client, "queued submitted delta").await {
         ReviewEventPayload::StatusChanged {
             status: ReviewStatus::Submitted { .. },
         } => {}

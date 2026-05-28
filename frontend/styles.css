@@ -7754,24 +7754,23 @@ pre.tool-error-pre {
     padding: var(--space-2) var(--space-3);
     /* Stay anchored to the visible left edge even when the diff content
      * scrolls horizontally past it. The combination of `position:
-     * sticky; left: 0` plus `max-width: <pane width>` keeps the
-     * composer / cards inside the visible diff viewport instead of
-     * inheriting the wider diff-line content width. */
+     * sticky; left: 0` plus a width bounded by the visible scrollport
+     * keeps the composer / cards inside the visible diff viewport
+     * instead of inheriting the wider diff-line content width. */
     position: sticky;
     left: 0;
     box-sizing: border-box;
-    /* Clamp to the visible diff viewport. `100cqi` falls back to a
-     * sensible minimum if container queries are unavailable. */
-    max-width: 100cqi;
-    width: 100cqi;
+    /* `--diff-scrollport-width` is published by a `ResizeObserver` on
+     * `.diff-content` in `frontend/src/components/diff_view.rs`. Falls
+     * back to `100%` if the var is unset (e.g., very first paint before
+     * the observer runs). Container queries are intentionally not used
+     * here — the diff scroll container becomes wider than its pane when
+     * a long source line forces horizontal overflow, so `100cqi` would
+     * resolve to that wider width and re-introduce the bug. */
+    max-width: var(--diff-scrollport-width, 100%);
+    width: var(--diff-scrollport-width, 100%);
+    min-width: 0;
     z-index: 1;
-}
-
-/* Establish the diff content as the container for the sticky thread
- * region above. Without `container-type: inline-size` the `100cqi`
- * units resolve to the initial containing block (the whole window). */
-.review-center .diff-content {
-    container-type: inline-size;
 }
 
 .review-comment-card,
@@ -7784,6 +7783,13 @@ pre.tool-error-pre {
     border-left: 3px solid var(--accent-primary);
     border-radius: 4px;
     padding: var(--space-2) var(--space-3);
+    box-sizing: border-box;
+    /* Bound card width to the visible diff scrollport (or 80ch,
+     * whichever is smaller) so a long comment body does not stretch
+     * past the visible viewport. `min-width: 0` lets flex children
+     * actually shrink below their content's intrinsic width. */
+    max-width: min(var(--diff-scrollport-width, 100%), 80ch);
+    min-width: 0;
 }
 
 .review-suggestion-card.pending {
@@ -7874,6 +7880,12 @@ pre.tool-error-pre {
     border: 1px solid var(--border-primary);
     border-radius: 4px;
     padding: var(--space-2);
+    box-sizing: border-box;
+    /* Match `.review-comment-card` so the composer also stays inside
+     * the visible scrollport instead of growing to the diff content
+     * width. */
+    max-width: min(var(--diff-scrollport-width, 100%), 80ch);
+    min-width: 0;
 }
 
 .review-composer-actions {

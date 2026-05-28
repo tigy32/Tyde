@@ -92,11 +92,46 @@ impl TydeReviewMcpServer {
         Parameters(input): Parameters<ProposeReviewCommentToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let review_id_for_log = input.review_id.clone();
+        let body_len = input.body.len();
+        let rationale_len = input.rationale.as_ref().map_or(0, String::len);
+        let severity = input.severity.label();
+        let anchor_kind = input.location.anchor.kind_name();
         let reviewer_agent_id = match request_agent_id_from_parts(&parts) {
             Ok(Some(agent_id)) => agent_id,
-            Ok(None) => return Ok(err_text("propose_review_comment requires calling agent_id")),
-            Err(err) => return Ok(err_text(err)),
+            Ok(None) => {
+                tracing::warn!(
+                    review_id = %review_id_for_log,
+                    body_len,
+                    rationale_len,
+                    severity,
+                    anchor_kind,
+                    "review MCP proposal missing reviewer agent id"
+                );
+                return Ok(err_text("propose_review_comment requires calling agent_id"));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    review_id = %review_id_for_log,
+                    body_len,
+                    rationale_len,
+                    severity,
+                    anchor_kind,
+                    error_len = err.len(),
+                    "review MCP proposal had invalid reviewer agent id"
+                );
+                return Ok(err_text(err));
+            }
         };
+        tracing::info!(
+            review_id = %review_id_for_log,
+            reviewer_agent_id = %reviewer_agent_id,
+            body_len,
+            rationale_len,
+            severity,
+            anchor_kind,
+            "received review MCP proposal"
+        );
         let review_id = input.review_id;
         let args = ProposeReviewCommentArgs {
             location: input.location,
@@ -107,6 +142,12 @@ impl TydeReviewMcpServer {
         let Some(suggestion) =
             ReviewerToolBridge::suggestion_from_tool_args(&reviewer_agent_id, args)
         else {
+            tracing::warn!(
+                review_id = %review_id_for_log,
+                reviewer_agent_id = %reviewer_agent_id,
+                body_len,
+                "review MCP proposal rejected before registry"
+            );
             return ok_json(ProposeReviewCommentToolResult::ValidationError {
                 code: ReviewErrorCode::InvalidStatus,
                 message: "suggestion body must not be empty".to_owned(),
@@ -118,16 +159,41 @@ impl TydeReviewMcpServer {
             .await
         {
             Ok(Ok(suggestion_id)) => {
+                tracing::info!(
+                    review_id = %review_id_for_log,
+                    reviewer_agent_id = %reviewer_agent_id,
+                    suggestion_id = %suggestion_id,
+                    "accepted review MCP proposal"
+                );
                 ok_json(ProposeReviewCommentToolResult::Success { suggestion_id })
             }
-            Ok(Err(error)) => ok_json(ProposeReviewCommentToolResult::ValidationError {
-                code: error.code,
-                message: error.message,
-            }),
-            Err(error) => ok_json(ProposeReviewCommentToolResult::ValidationError {
-                code: ReviewErrorCode::Internal,
-                message: error,
-            }),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    review_id = %review_id_for_log,
+                    reviewer_agent_id = %reviewer_agent_id,
+                    code = error.code.code_name(),
+                    context = error.context.kind_name(),
+                    fatal = error.fatal,
+                    message_len = error.message.len(),
+                    "review MCP proposal rejected by registry"
+                );
+                ok_json(ProposeReviewCommentToolResult::ValidationError {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    review_id = %review_id_for_log,
+                    reviewer_agent_id = %reviewer_agent_id,
+                    error_len = error.len(),
+                    "review MCP proposal failed"
+                );
+                ok_json(ProposeReviewCommentToolResult::ValidationError {
+                    code: ReviewErrorCode::Internal,
+                    message: error,
+                })
+            }
         }
     }
 }

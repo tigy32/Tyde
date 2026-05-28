@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use wasm_bindgen::{JsCast, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
@@ -436,6 +436,65 @@ fn set_diff_context_mode(signal: RwSignal<DiffContextMode>, mode: DiffContextMod
     crate::components::settings_panel::persist_diff_context_mode(mode);
 }
 
+/// Mirror `node_ref`'s `client_width` into the `--diff-scrollport-width`
+/// CSS custom property on the same element, kept current via a
+/// `ResizeObserver`. The property cascades to descendants, so
+/// `.review-thread-region` / `.review-comment-card` /
+/// `.review-composer` use the *closest* ancestor that sets the var:
+///
+/// * `.diff-content` publishes the outer scrollport width — unified
+///   diffs and SBS file-header decorations bind to this.
+/// * each `.diff-pane` publishes its own width — comments rendered
+///   inside an SBS pane bind to the pane (narrower) value, so a long
+///   comment doesn't stretch past the visible pane.
+///
+/// Single observer per element, eagerly seeded on mount so first
+/// paint has a bounded width, and disconnected on cleanup. No
+/// polling, no rAF loop, no shared signal.
+fn install_scrollport_width_observer(node_ref: NodeRef<leptos::html::Div>) {
+    type Slot = Option<(
+        web_sys::ResizeObserver,
+        Closure<dyn FnMut(JsValue, JsValue)>,
+    )>;
+    let slot: StoredValue<Slot, LocalStorage> = StoredValue::new_local(None);
+    Effect::new(move |_| {
+        let Some(el) = node_ref.get() else {
+            return;
+        };
+        if slot.with_value(|s| s.is_some()) {
+            return;
+        }
+        let html_el: web_sys::HtmlElement = (*el).clone();
+        let write_width = move |el: &web_sys::HtmlElement| {
+            let w = el.client_width();
+            if w > 0 {
+                let _ = el
+                    .style()
+                    .set_property("--diff-scrollport-width", &format!("{w}px"));
+            }
+        };
+        // Seed once so the first paint already has a bounded width.
+        write_width(&html_el);
+        let el_for_cb = html_el.clone();
+        let cb =
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_entries: JsValue, _: JsValue| {
+                write_width(&el_for_cb);
+            });
+        if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+            let element: web_sys::Element = html_el.unchecked_into();
+            observer.observe(&element);
+            slot.update_value(|s| *s = Some((observer, cb)));
+        }
+    });
+    on_cleanup(move || {
+        slot.update_value(|s| {
+            if let Some((observer, _cb)) = s.take() {
+                observer.disconnect();
+            }
+        });
+    });
+}
+
 fn stage_hunk(root: ProjectRootPath, relative_path: String, hunk_id: String) {
     let state = expect_context::<AppState>();
     let Some(active_project) = state.active_project_ref_untracked() else {
@@ -600,6 +659,25 @@ fn DiffContent(
             }
         }
     });
+
+    // Publish the diff scrollport's visible width as a CSS custom
+    // property so descendants (review thread regions, comment cards,
+    // composer) can size themselves to the visible viewport instead
+    // of expanding to the diff's inner scroll width. Without this, a
+    // long diff line forces `.diff-content` wide enough to need
+    // horizontal scrolling, and `position: sticky` review cards
+    // inherit that wide intrinsic width — pushing the comment
+    // off-screen and forcing the user to scroll sideways to read it.
+    //
+    // SBS mode additionally installs a per-pane observer (see
+    // `install_scrollport_width_observer` calls below `.diff-pane`
+    // node_refs in `render_sbs_*`), so a comment rendered inside an
+    // SBS pane uses the pane's width, not the wider diff content
+    // width. CSS custom property inheritance picks the closest
+    // ancestor that sets the var, so the pane override "wins" for
+    // descendants while elements outside any pane (e.g. file-header
+    // decorations) still see the outer `.diff-content` value.
+    install_scrollport_width_observer(scroll_ref);
 
     // Throttle scroll updates to one per animation frame. Native scroll
     // events fire faster than 60Hz (often hundreds/sec on a trackpad);
@@ -1298,6 +1376,13 @@ fn render_sbs_panes(
     let left_pane_ref = NodeRef::<leptos::html::Div>::new();
     let right_pane_ref = NodeRef::<leptos::html::Div>::new();
 
+    // Per-pane scrollport observers: review comment decorations
+    // render inside whichever pane matches their anchor side, so
+    // they need the pane's own width (not the wider diff-content
+    // width) to stay inside the visible viewport in SBS mode.
+    install_scrollport_width_observer(left_pane_ref);
+    install_scrollport_width_observer(right_pane_ref);
+
     // No synchronous tokenization on the main thread — same architecture
     // as `render_sbs_virtualized`. Per-line signals are allocated up
     // front; the worker streams tokens into them. The eager path used
@@ -1704,6 +1789,12 @@ fn render_sbs_virtualized(
     let pair_ref = NodeRef::<leptos::html::Div>::new();
     let left_pane_ref = NodeRef::<leptos::html::Div>::new();
     let right_pane_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Per-pane scrollport observers: see the eager `render_sbs_panes`
+    // path for the rationale. SBS comment decorations render inside
+    // their anchor-side pane and must clamp to the pane width.
+    install_scrollport_width_observer(left_pane_ref);
+    install_scrollport_width_observer(right_pane_ref);
 
     // Horizontal scroll-sync handlers wired directly via `on:scroll`
     // below. When either pane scrolls, copy scrollLeft to the other

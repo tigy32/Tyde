@@ -58,13 +58,28 @@ pub async fn send_frame<T: Serialize>(
         seq,
         kind
     );
-    let envelope = Envelope::from_payload(stream, kind, seq, payload).map_err(|e| e.to_string())?;
+    let envelope =
+        Envelope::from_payload(stream.clone(), kind, seq, payload).map_err(|e| e.to_string())?;
     let line = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
-    bridge::send_host_line(bridge::SendHostLineRequest {
+    match bridge::send_host_line(bridge::SendHostLineRequest {
         host_id: host_id.to_owned(),
         line,
     })
     .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::error!(
+                "host_frame_tx_err host={} stream={} seq={} kind={} error={}",
+                host_id,
+                stream,
+                seq,
+                kind,
+                e
+            );
+            Err(e)
+        }
+    }
 }
 
 pub async fn close_agent(host_id: &str, agent_stream: StreamPath) -> Result<(), String> {

@@ -2110,6 +2110,17 @@ pub enum ReviewStatus {
     Cancelled { cancelled_at_ms: u64 },
 }
 
+impl ReviewStatus {
+    pub const fn status_label(&self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Submitted { .. } => "submitted",
+            Self::Consumed { .. } => "consumed",
+            Self::Cancelled { .. } => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewDiffSelection {
@@ -2121,6 +2132,15 @@ pub enum ReviewDiffSelection {
         scope: ProjectDiffScope,
         path: Option<String>,
     },
+}
+
+impl ReviewDiffSelection {
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::AllUncommitted => "all_uncommitted",
+            Self::Root { .. } => "root",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2146,6 +2166,16 @@ pub enum ReviewAnchor {
         start_line: u32,
         end_line: u32,
     },
+}
+
+impl ReviewAnchor {
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Hunk { .. } => "hunk",
+            Self::LineRange { .. } => "line_range",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2195,12 +2225,32 @@ pub enum ReviewSeverity {
     Bug,
 }
 
+impl ReviewSeverity {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Bug => "bug",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ReviewSuggestionState {
     Pending,
     Accepted { comment_id: ReviewCommentId },
     Rejected,
+}
+
+impl ReviewSuggestionState {
+    pub const fn status_label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted { .. } => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2233,6 +2283,17 @@ pub enum ReviewAiReviewerStatus {
     Running,
     Completed,
     Failed,
+}
+
+impl ReviewAiReviewerStatus {
+    pub const fn status_label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2274,6 +2335,21 @@ pub enum ReviewActionPayload {
     Cancel,
 }
 
+impl ReviewActionPayload {
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::AddComment { .. } => "add_comment",
+            Self::UpdateComment { .. } => "update_comment",
+            Self::DeleteComment { .. } => "delete_comment",
+            Self::AcceptSuggestion { .. } => "accept_suggestion",
+            Self::RejectSuggestion { .. } => "reject_suggestion",
+            Self::StartAiReview { .. } => "start_ai_review",
+            Self::Submit => "submit",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewEventPayload {
@@ -2284,6 +2360,20 @@ pub enum ReviewEventPayload {
     AiReviewerChanged { state: ReviewAiReviewerState },
     StatusChanged { status: ReviewStatus },
     Error { error: ReviewErrorPayload },
+}
+
+impl ReviewEventPayload {
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Snapshot { .. } => "snapshot",
+            Self::CommentUpsert { .. } => "comment_upsert",
+            Self::CommentDelete { .. } => "comment_delete",
+            Self::SuggestionUpsert { .. } => "suggestion_upsert",
+            Self::AiReviewerChanged { .. } => "ai_reviewer_changed",
+            Self::StatusChanged { .. } => "status_changed",
+            Self::Error { .. } => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2310,6 +2400,24 @@ pub enum ReviewErrorCode {
     Internal,
 }
 
+impl ReviewErrorCode {
+    pub const fn code_name(self) -> &'static str {
+        match self {
+            Self::InvalidStatus => "invalid_status",
+            Self::InvalidLocation => "invalid_location",
+            Self::UnknownComment => "unknown_comment",
+            Self::UnknownSuggestion => "unknown_suggestion",
+            Self::OriginAgentNotRunning => "origin_agent_not_running",
+            Self::AmbiguousOriginSession => "ambiguous_origin_session",
+            Self::ReviewerAlreadyRunning => "reviewer_already_running",
+            Self::ReviewerBackendUnsupported => "reviewer_backend_unsupported",
+            Self::GitFailed => "git_failed",
+            Self::IoFailed => "io_failed",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewErrorContext {
@@ -2321,6 +2429,21 @@ pub enum ReviewErrorContext {
     StartAiReview,
     Submit,
     Cancel,
+}
+
+impl ReviewErrorContext {
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::AddComment => "add_comment",
+            Self::UpdateComment { .. } => "update_comment",
+            Self::DeleteComment { .. } => "delete_comment",
+            Self::AcceptSuggestion { .. } => "accept_suggestion",
+            Self::RejectSuggestion { .. } => "reject_suggestion",
+            Self::StartAiReview => "start_ai_review",
+            Self::Submit => "submit",
+            Self::Cancel => "cancel",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

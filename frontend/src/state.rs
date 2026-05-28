@@ -1563,6 +1563,17 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        let reviews_before = self.reviews.with_untracked(|m| m.len());
+        let action_gates_before = self.review_action_pending.with_untracked(|m| m.len());
+        let target_gates_before = self
+            .review_action_target_pending
+            .with_untracked(|s| s.len());
+        let create_pending_before = self
+            .review_create_pending
+            .with_untracked(|m| m.iter().filter(|((h, _), _)| h == host_id).count());
+        log::info!(
+            "host.clear_host_runtime.start host={host_id} reviews_retained={reviews_before} action_gates_retained={action_gates_before} target_gates_retained={target_gates_before} host_create_pending={create_pending_before}"
+        );
         // Drop chat-related per-agent state for every agent on this host before
         // we forget the agent list itself. Without this, a reconnect re-replays
         // every event and the dispatcher appends duplicate messages onto the

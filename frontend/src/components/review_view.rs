@@ -126,9 +126,20 @@ pub fn ReviewView(host_id: String, review_id: protocol::ReviewId) -> impl IntoVi
         let host_for_sub = host_id.clone();
         let review_for_sub = review_id.clone();
         let already_present = review_signal.get_untracked().is_some();
+        log::info!(
+            "review.subscribe.consider host={} review={} already_present={}",
+            host_for_sub,
+            review_for_sub,
+            already_present
+        );
         if !already_present {
             spawn_local(async move {
                 let stream = StreamPath(format!("/review/{}", review_for_sub.0));
+                log::info!(
+                    "review.subscribe.send host={} review={}",
+                    host_for_sub,
+                    review_for_sub
+                );
                 if let Err(e) = send_frame(
                     &host_for_sub,
                     stream,
@@ -137,7 +148,12 @@ pub fn ReviewView(host_id: String, review_id: protocol::ReviewId) -> impl IntoVi
                 )
                 .await
                 {
-                    log::error!("failed to send ReviewSubscribe for review {review_for_sub}: {e}");
+                    log::error!(
+                        "review.subscribe.send_err host={} review={} error={}",
+                        host_for_sub,
+                        review_for_sub,
+                        e
+                    );
                 }
             });
         }
@@ -170,24 +186,46 @@ pub fn ReviewView(host_id: String, review_id: protocol::ReviewId) -> impl IntoVi
     let host_id_for_view = host_id.clone();
     let review_id_for_view = review_id.clone();
 
+    // Gate: tracks only whether a Review record exists for this id, not
+    // the record itself. The `<ReviewBody>` thus mounts exactly once per
+    // review id — subsequent `ReviewEvent` deltas (CommentUpsert,
+    // Suggestion, StatusChanged) flip individual sub-signals inside the
+    // body rather than remounting the whole diff scrollport, so the
+    // user's scroll position survives a comment add.
+    let loaded: Memo<bool> = {
+        let id = review_id.clone();
+        Memo::new(move |_| state.reviews.with(|map| map.contains_key(&id)))
+    };
+
     view! {
         <div class="review-view" data-review-id={review_id.0.clone()}>
             {move || {
-                match review_signal.get() {
-                    None => view! {
+                if !loaded.get() {
+                    return view! {
                         <div class="review-loading">
                             <p class="placeholder-text">"Loading review\u{2026}"</p>
                         </div>
-                    }.into_any(),
-                    Some(review) => view! {
-                        <ReviewBody
-                            review=review
-                            selected=selected
-                            host_id=host_id_for_view.clone()
-                            review_id=review_id_for_view.clone()
-                        />
-                    }.into_any(),
+                    }.into_any();
                 }
+                // Seed `<ReviewBody>` with the snapshot at mount time
+                // via `get_untracked` so the closure doesn't subscribe
+                // to subsequent record changes — those flow through
+                // `live` inside the body.
+                let Some(seed) = review_signal.get_untracked() else {
+                    return view! {
+                        <div class="review-loading">
+                            <p class="placeholder-text">"Loading review\u{2026}"</p>
+                        </div>
+                    }.into_any();
+                };
+                view! {
+                    <ReviewBody
+                        review=seed
+                        selected=selected
+                        host_id=host_id_for_view.clone()
+                        review_id=review_id_for_view.clone()
+                    />
+                }.into_any()
             }}
         </div>
     }
@@ -751,7 +789,14 @@ fn ReviewCenter(
                     }.into_any();
                 };
                 // Validate the selected file still exists in the (live) snapshot.
-                let exists = state.reviews.with(|map| {
+                // `with_untracked` is critical: a tracking read would
+                // subscribe this closure to every reviews-map update
+                // (CommentUpsert, Suggestion, StatusChanged), remounting
+                // `DiffView` -> `DiffContent` on each delta and silently
+                // resetting the user's scroll position. The file list
+                // inside a review is frozen at snapshot time, so we don't
+                // need to re-validate when comments change.
+                let exists = state.reviews.with_untracked(|map| {
                     map.get(&review_id).is_some_and(|r| {
                         r.diffs.iter().any(|d| {
                             d.root == sel.root
@@ -2321,9 +2366,28 @@ fn ReviewSidebar(
     let host_for_submit = host_id.clone();
     let review_for_submit = review_id.clone();
     let state_for_submit = state.clone();
+    let user_count_for_submit = user_comment_count;
+    let pending_count_for_submit = pending_suggestion_count;
+    let live_for_submit = live_for_ai;
     let on_submit = move |_| {
         let host = host_for_submit.clone();
         let rid = review_for_submit.clone();
+        let gate_before = state_for_submit
+            .review_action_pending
+            .with_untracked(|m| m.get(&rid).copied().unwrap_or_default());
+        let status = live_for_submit
+            .get_untracked()
+            .map(|r| format!("{:?}", std::mem::discriminant(&r.status)))
+            .unwrap_or_else(|| "none".to_owned());
+        let ai_status = live_for_submit
+            .get_untracked()
+            .map(|r| match r.ai_reviewer.status {
+                ReviewAiReviewerStatus::Idle => "idle",
+                ReviewAiReviewerStatus::Running => "running",
+                ReviewAiReviewerStatus::Completed => "completed",
+                ReviewAiReviewerStatus::Failed => "failed",
+            })
+            .unwrap_or("unknown");
         let mut claimed = false;
         state_for_submit.review_action_pending.update(|map| {
             let gate = map.entry(rid.clone()).or_default();
@@ -2332,25 +2396,43 @@ fn ReviewSidebar(
                 claimed = true;
             }
         });
+        log::info!(
+            "review.submit.click review={} claimed={} gate_before_submit={} comments={} pending_suggestions={} ai_status={} status_disc={} {}",
+            rid,
+            claimed,
+            gate_before.submit,
+            user_count_for_submit.get_untracked(),
+            pending_count_for_submit.get_untracked(),
+            ai_status,
+            status,
+            conn_diag(&state_for_submit, &host)
+        );
         if !claimed {
             return;
         }
         let target_state = state_for_submit.clone();
         let target_rid = rid.clone();
         spawn_local(async move {
-            if let Err(e) =
-                send_review_action_inner(&host, target_rid.clone(), ReviewActionPayload::Submit)
-                    .await
+            match send_review_action_inner(&host, target_rid.clone(), ReviewActionPayload::Submit)
+                .await
             {
-                log::error!("ReviewAction Submit local send failed for {target_rid}: {e}");
-                target_state.review_action_pending.update(|map| {
-                    if let Some(gate) = map.get_mut(&target_rid) {
-                        gate.submit = false;
-                        if gate.is_idle() {
-                            map.remove(&target_rid);
+                Ok(()) => {
+                    log::info!("review.submit.send_ok review={target_rid}");
+                }
+                Err(e) => {
+                    log::error!("review.submit.send_err review={target_rid} error={e}");
+                    target_state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(&target_rid) {
+                            gate.submit = false;
+                            if gate.is_idle() {
+                                map.remove(&target_rid);
+                            }
                         }
-                    }
-                });
+                    });
+                    log::info!(
+                        "review.submit.local_gate_clear review={target_rid} reason=send_err"
+                    );
+                }
             }
         });
     };
@@ -2374,8 +2456,12 @@ fn ReviewSidebar(
                 )
             };
             if !crate::bridge::confirm_dialog("Cancel review", &message).await {
+                log::info!("review.cancel.click review={rid} dialog=declined");
                 return;
             }
+            let gate_before = target_state
+                .review_action_pending
+                .with_untracked(|m| m.get(&rid).copied().unwrap_or_default());
             let mut claimed = false;
             target_state.review_action_pending.update(|map| {
                 let gate = map.entry(rid.clone()).or_default();
@@ -2384,23 +2470,38 @@ fn ReviewSidebar(
                     claimed = true;
                 }
             });
+            log::info!(
+                "review.cancel.click review={} claimed={} gate_before_cancel={} comments={} {}",
+                rid,
+                claimed,
+                gate_before.cancel,
+                comment_count,
+                conn_diag(&target_state, &host)
+            );
             if !claimed {
                 return;
             }
             let target_rid = rid.clone();
-            if let Err(e) =
-                send_review_action_inner(&host, target_rid.clone(), ReviewActionPayload::Cancel)
-                    .await
+            match send_review_action_inner(&host, target_rid.clone(), ReviewActionPayload::Cancel)
+                .await
             {
-                log::error!("ReviewAction Cancel local send failed for {target_rid}: {e}");
-                target_state.review_action_pending.update(|map| {
-                    if let Some(gate) = map.get_mut(&target_rid) {
-                        gate.cancel = false;
-                        if gate.is_idle() {
-                            map.remove(&target_rid);
+                Ok(()) => {
+                    log::info!("review.cancel.send_ok review={target_rid}");
+                }
+                Err(e) => {
+                    log::error!("review.cancel.send_err review={target_rid} error={e}");
+                    target_state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(&target_rid) {
+                            gate.cancel = false;
+                            if gate.is_idle() {
+                                map.remove(&target_rid);
+                            }
                         }
-                    }
-                });
+                    });
+                    log::info!(
+                        "review.cancel.local_gate_clear review={target_rid} reason=send_err"
+                    );
+                }
             }
         });
     };
@@ -2435,12 +2536,14 @@ fn ReviewSidebar(
         let ai_reason = ai_reason.clone();
         move || !ai_reason().is_empty()
     };
+    let live_for_run_ai = live_for_ai;
     let on_run_ai = move |_| {
+        let rid = review_for_ai.clone();
         let Some(backend) = backend_pick.get_untracked() else {
+            log::info!("review.start_ai.skipped review={rid} reason=no_backend");
             return;
         };
         let host = host_for_ai.clone();
-        let rid = review_for_ai.clone();
         let cost = cost_pick.get_untracked();
         let inst = {
             let raw = instructions.get_untracked();
@@ -2451,6 +2554,19 @@ fn ReviewSidebar(
                 Some(trimmed.to_owned())
             }
         };
+        let inst_len = inst.as_deref().map(|s| s.len()).unwrap_or(0);
+        let gate_before = state_for_ai
+            .review_action_pending
+            .with_untracked(|m| m.get(&rid).copied().unwrap_or_default());
+        let ai_status = live_for_run_ai
+            .get_untracked()
+            .map(|r| match r.ai_reviewer.status {
+                ReviewAiReviewerStatus::Idle => "idle",
+                ReviewAiReviewerStatus::Running => "running",
+                ReviewAiReviewerStatus::Completed => "completed",
+                ReviewAiReviewerStatus::Failed => "failed",
+            })
+            .unwrap_or("unknown");
         let mut claimed = false;
         state_for_ai.review_action_pending.update(|map| {
             let gate = map.entry(rid.clone()).or_default();
@@ -2459,6 +2575,17 @@ fn ReviewSidebar(
                 claimed = true;
             }
         });
+        log::info!(
+            "review.start_ai.click review={} claimed={} gate_before_start_ai={} backend={:?} cost={:?} instructions_len={} ai_status={} {}",
+            rid,
+            claimed,
+            gate_before.start_ai,
+            backend,
+            cost,
+            inst_len,
+            ai_status,
+            conn_diag(&state_for_ai, &host)
+        );
         if !claimed {
             return;
         }
@@ -2470,16 +2597,24 @@ fn ReviewSidebar(
                 cost_hint: cost,
                 instructions: inst,
             };
-            if let Err(e) = send_review_action_inner(&host, target_rid.clone(), payload).await {
-                log::error!("ReviewAction StartAiReview local send failed for {target_rid}: {e}");
-                target_state.review_action_pending.update(|map| {
-                    if let Some(gate) = map.get_mut(&target_rid) {
-                        gate.start_ai = false;
-                        if gate.is_idle() {
-                            map.remove(&target_rid);
+            match send_review_action_inner(&host, target_rid.clone(), payload).await {
+                Ok(()) => {
+                    log::info!("review.start_ai.send_ok review={target_rid}");
+                }
+                Err(e) => {
+                    log::error!("review.start_ai.send_err review={target_rid} error={e}");
+                    target_state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(&target_rid) {
+                            gate.start_ai = false;
+                            if gate.is_idle() {
+                                map.remove(&target_rid);
+                            }
                         }
-                    }
-                });
+                    });
+                    log::info!(
+                        "review.start_ai.local_gate_clear review={target_rid} reason=send_err"
+                    );
+                }
             }
         });
     };
@@ -2873,6 +3008,25 @@ async fn send_review_action_inner(
     send_frame(host_id, stream, FrameKind::ReviewAction, &payload).await
 }
 
+/// Short string describing the current connection state for diagnostics.
+/// Format: `conn=<connected|connecting|disconnected|error> has_host_stream=<bool>`
+fn conn_diag(state: &AppState, host_id: &str) -> String {
+    let status = state
+        .connection_statuses
+        .with_untracked(|m| m.get(host_id).cloned());
+    let label = match status {
+        Some(crate::state::ConnectionStatus::Connected) => "connected",
+        Some(crate::state::ConnectionStatus::Connecting) => "connecting",
+        Some(crate::state::ConnectionStatus::Disconnected) => "disconnected",
+        Some(crate::state::ConnectionStatus::Error(_)) => "error",
+        None => "unknown",
+    };
+    let has_stream = state
+        .host_streams
+        .with_untracked(|m| m.contains_key(host_id));
+    format!("conn={label} has_host_stream={has_stream}")
+}
+
 /// Fire a `ReviewAction` and clear the corresponding per-target gate on
 /// local send failure (so the buttons re-enable). On success the gate
 /// remains set until dispatch sees the matching server echo or error.
@@ -2883,11 +3037,32 @@ async fn send_review_action_with_failure_clear(
     payload: ReviewActionPayload,
     target: ReviewActionTarget,
 ) {
-    if let Err(e) = send_review_action_inner(host_id, review_id.clone(), payload).await {
-        log::error!("ReviewAction local send failed for {review_id}: {e}");
-        state.review_action_target_pending.update(|set| {
-            set.remove(&(review_id, target));
-        });
+    let target_label = target_label(&target);
+    match send_review_action_inner(host_id, review_id.clone(), payload).await {
+        Ok(()) => {
+            log::info!("review.action.send_ok review={review_id} target={target_label}");
+        }
+        Err(e) => {
+            log::error!(
+                "review.action.send_err review={review_id} target={target_label} error={e}"
+            );
+            state.review_action_target_pending.update(|set| {
+                set.remove(&(review_id.clone(), target));
+            });
+            log::info!(
+                "review.action.local_target_gate_clear review={review_id} target={target_label} reason=send_err"
+            );
+        }
+    }
+}
+
+fn target_label(target: &ReviewActionTarget) -> &'static str {
+    match target {
+        ReviewActionTarget::AddComment => "add_comment",
+        ReviewActionTarget::UpdateComment(_) => "update_comment",
+        ReviewActionTarget::DeleteComment(_) => "delete_comment",
+        ReviewActionTarget::AcceptSuggestion(_) => "accept_suggestion",
+        ReviewActionTarget::RejectSuggestion(_) => "reject_suggestion",
     }
 }
 
@@ -2908,6 +3083,12 @@ fn try_claim_review_action(
     state.review_action_target_pending.update(|set| {
         claimed = set.insert((review_id.clone(), target.clone()));
     });
+    log::info!(
+        "review.action.claim review={} target={} claimed={}",
+        review_id,
+        target_label(target),
+        claimed
+    );
     claimed
 }
 
@@ -3787,6 +3968,382 @@ mod wasm_tests {
             file_list.width(),
             center.width(),
             sidebar.width()
+        );
+    }
+
+    /// A diff payload with enough rendered lines to require vertical
+    /// scrolling inside `.diff-content` (container is 800px tall in
+    /// `make_container`, so 100 lines × ~16px easily overflows).
+    fn large_diff_payload() -> ProjectGitDiffPayload {
+        let mut lines = vec![ProjectGitDiffLine {
+            kind: ProjectGitDiffLineKind::Context,
+            text: "fn handle()".to_owned(),
+            old_line_number: Some(1),
+            new_line_number: Some(1),
+        }];
+        for i in 0..150 {
+            lines.push(ProjectGitDiffLine {
+                kind: ProjectGitDiffLineKind::Added,
+                text: format!("    let var_{i} = {i};"),
+                old_line_number: None,
+                new_line_number: Some((i as u32) + 2),
+            });
+        }
+        let new_count = lines.len() as u32;
+        ProjectGitDiffPayload {
+            root: root_path(),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::FullFile,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "src/foo.rs".to_owned(),
+                hunks: vec![ProjectGitDiffHunk {
+                    hunk_id: "src/foo.rs:1".to_owned(),
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count,
+                    lines,
+                }],
+            }],
+        }
+    }
+
+    fn review_with_large_diff() -> Review {
+        let mut review = make_review();
+        review.diffs = vec![large_diff_payload()];
+        review
+    }
+
+    /// A diff payload whose one Added line is wider than the visible
+    /// review-center pane, so the diff forces horizontal overflow
+    /// inside `.diff-content`. Used for the comment-width-bound test —
+    /// without the scrollport-width clamp, the sticky thread region
+    /// would inherit the wider intrinsic width and overflow the pane.
+    fn wide_line_diff_payload() -> ProjectGitDiffPayload {
+        let very_long = "x".repeat(800);
+        ProjectGitDiffPayload {
+            root: root_path(),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::FullFile,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "src/foo.rs".to_owned(),
+                hunks: vec![ProjectGitDiffHunk {
+                    hunk_id: "src/foo.rs:1".to_owned(),
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 2,
+                    lines: vec![
+                        ProjectGitDiffLine {
+                            kind: ProjectGitDiffLineKind::Context,
+                            text: "fn handle()".to_owned(),
+                            old_line_number: Some(1),
+                            new_line_number: Some(1),
+                        },
+                        ProjectGitDiffLine {
+                            kind: ProjectGitDiffLineKind::Added,
+                            text: format!("    let very_long_var = \"{very_long}\";"),
+                            old_line_number: None,
+                            new_line_number: Some(2),
+                        },
+                    ],
+                }],
+            }],
+        }
+    }
+
+    /// BUG #1 GUARD: Adding a review comment must not remount the diff
+    /// scrollport. We assert two user-perceived invariants:
+    ///   * `.diff-content` keeps the same DOM node identity across the
+    ///     comment add (a remount would replace the element).
+    ///   * `scrollTop` is preserved.
+    ///
+    /// We drive the new comment by mutating the live AppState review
+    /// signal — that's the same code path dispatch hits when it
+    /// receives a `ReviewEvent::CommentUpsert` envelope, so this
+    /// matches what production wiring does. Before the fix the
+    /// top-level `match review_signal.get()` rebuilt `<ReviewBody>` on
+    /// every record change, which dropped the diff scroll position.
+    #[wasm_bindgen_test]
+    async fn adding_comment_preserves_scroll_and_node_identity() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let review = review_with_large_diff();
+        let review_id = review.id.clone();
+        let state_holder = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        // Capture the diff scroll container, scroll it, and remember
+        // both its DOM node identity and its scroll offset.
+        let diff_before = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff-content scroll container present");
+        let diff_html_before: HtmlElement = diff_before.clone().dyn_into().unwrap();
+        diff_html_before.set_scroll_top(500);
+        // Sanity: container actually scrolled (the diff is tall enough
+        // — if this asserts false the fixture's diff isn't large
+        // enough to scroll past 500px and the test is meaningless).
+        assert!(
+            diff_html_before.scroll_top() > 0,
+            "diff-content failed to scroll; layout did not produce a scrollable height"
+        );
+        let scroll_top_before = diff_html_before.scroll_top();
+
+        // Drive a CommentUpsert through the live AppState signal —
+        // mirrors what `dispatch_review_event` does on the wire.
+        let state = state_holder.borrow().clone().unwrap();
+        state.reviews.update(|map| {
+            if let Some(r) = map.get_mut(&review_id) {
+                r.comments.push(comment_at_line(2, "preserve scroll"));
+            }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        // Same DOM node, scroll position not lost.
+        let diff_after = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff-content still present after comment upsert");
+        let diff_node_before: &web_sys::Node = diff_before.as_ref();
+        let diff_node_after: &web_sys::Node = diff_after.as_ref();
+        assert!(
+            diff_node_before.is_same_node(Some(diff_node_after)),
+            ".diff-content was remounted by the CommentUpsert — \
+             scroll position would be lost on every comment add"
+        );
+        let diff_html_after: HtmlElement = diff_after.dyn_into().unwrap();
+        let scroll_top_after = diff_html_after.scroll_top();
+        // The regression we're guarding against is a remount that
+        // resets scrollTop to 0. Browser scroll-anchoring may shift
+        // scrollTop slightly when virtualized rows above the viewport
+        // grow (e.g. a freshly rendered comment card under an
+        // upstream line), but it must not lose the user's place.
+        // Allow a generous downward tolerance — anything close to
+        // zero (i.e., a full remount) is the bug.
+        assert!(
+            scroll_top_after >= scroll_top_before - 50,
+            ".diff-content scroll position was lost after comment upsert; \
+             expected ≥ {} (within tolerance of {scroll_top_before}), got {scroll_top_after}",
+            scroll_top_before - 50
+        );
+        assert!(
+            scroll_top_after > 0,
+            ".diff-content scrollTop reset to top after comment upsert — \
+             the diff scrollport was remounted, dropping the user's place"
+        );
+    }
+
+    /// BUG #2 GUARD: a comment's rendered card must not require
+    /// horizontal scrolling beyond the visible review center pane.
+    /// Even when a diff line is wider than the pane and forces
+    /// horizontal overflow inside `.diff-content`, the sticky thread
+    /// region's width must be clamped to the visible scrollport.
+    #[wasm_bindgen_test]
+    async fn comment_width_bounded_by_visible_pane() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut review = make_review();
+        review.diffs = vec![wide_line_diff_payload()];
+        review.comments.push(comment_at_line(
+            2,
+            &format!(
+                "{} long comment body that would, absent the width \
+                 clamp, stretch to match the diff line below it.",
+                "extremely ".repeat(40)
+            ),
+        ));
+        let _ = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+        next_tick().await;
+
+        let diff_content = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff-content scroll container present");
+        let diff_html: HtmlElement = diff_content.clone().dyn_into().unwrap();
+        let viewport_width = diff_html.client_width() as f64;
+        assert!(
+            viewport_width > 0.0,
+            "diff-content has zero client_width; layout did not run"
+        );
+
+        let card = container
+            .query_selector(".review-comment-card")
+            .unwrap()
+            .expect("comment card rendered");
+        let card_rect = card.get_bounding_client_rect();
+        let diff_rect = diff_html.get_bounding_client_rect();
+
+        // Card width must be inside the visible viewport (give a 1px
+        // rounding tolerance — sub-pixel layout can produce a ~0.5px
+        // delta on some headless renderers).
+        assert!(
+            card_rect.width() <= viewport_width + 1.0,
+            "review comment card width {:.2}px exceeds diff viewport \
+             {:.2}px — the comment will require horizontal scrolling",
+            card_rect.width(),
+            viewport_width
+        );
+        // And its right edge must not extend past the diff pane's
+        // visible right edge (i.e., the comment is on-screen, not
+        // hidden behind the horizontal-scroll overflow).
+        assert!(
+            card_rect.right() <= diff_rect.right() + 1.0,
+            "comment right edge {:.2}px exceeds diff right edge {:.2}px \
+             — comment is hidden off-screen until user scrolls right",
+            card_rect.right(),
+            diff_rect.right()
+        );
+    }
+
+    /// BUG #2 GUARD (SBS): in side-by-side mode, review comment
+    /// decorations render *inside* one of the `.diff-pane` columns.
+    /// Without a per-pane scrollport observer, the comment card
+    /// inherits `--diff-scrollport-width` from `.diff-content`, which
+    /// is wider than the pane, and the comment overflows the visible
+    /// pane. The fix attaches a `ResizeObserver` to each `.diff-pane`
+    /// that publishes its own `client_width` into the same CSS var —
+    /// the cascade then picks the pane's narrower value for elements
+    /// inside the pane.
+    #[wasm_bindgen_test]
+    async fn sbs_comment_width_bounded_by_pane() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut review = make_review();
+        review.diffs = vec![wide_line_diff_payload()];
+        // New-side comment, so the thread region renders inside the
+        // right pane in SBS.
+        review.comments.push(comment_at_line(
+            2,
+            &format!(
+                "{} long comment body that would, without the pane \
+                 clamp, stretch to the diff-content scrollport width.",
+                "extremely ".repeat(40)
+            ),
+        ));
+        let state_holder = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        // Flip to side-by-side mode through the AppState signal —
+        // mirrors what the `ReviewLayoutToggle` button does on click.
+        let state = state_holder.borrow().clone().unwrap();
+        state
+            .diff_view_mode
+            .set(crate::state::DiffViewMode::SideBySide);
+
+        next_tick().await;
+        next_tick().await;
+        next_tick().await;
+
+        // Right pane is the New-side column where the comment lands.
+        let right_pane = container
+            .query_selector(".diff-pane-right")
+            .unwrap()
+            .expect("right pane present after switching to SBS");
+        let right_pane_html: HtmlElement = right_pane.clone().dyn_into().unwrap();
+        let pane_width = right_pane_html.client_width() as f64;
+        assert!(
+            pane_width > 0.0,
+            "right pane has zero client width; SBS layout did not run"
+        );
+
+        // The per-pane ResizeObserver must publish the pane's width
+        // — otherwise the CSS clamp falls through to whatever the
+        // outer `.diff-content` published (which is too wide).
+        let pane_var = right_pane_html
+            .style()
+            .get_property_value("--diff-scrollport-width")
+            .unwrap_or_default();
+        assert!(
+            !pane_var.is_empty() && pane_var.ends_with("px"),
+            "right pane missing --diff-scrollport-width inline style; \
+             got '{pane_var}'"
+        );
+
+        // Diff content is wider than the pane (the wide diff line
+        // forces it that way), so this comparison really exercises
+        // the pane-vs-content distinction. If diff_width <= pane_width
+        // the test is meaningless.
+        let diff_content = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff-content present");
+        let diff_content_html: HtmlElement = diff_content.dyn_into().unwrap();
+        let diff_width = diff_content_html.client_width() as f64;
+        assert!(
+            diff_width >= pane_width,
+            "diff content width {diff_width:.2}px should be at least \
+             the pane width {pane_width:.2}px"
+        );
+
+        let card = right_pane
+            .query_selector(".review-comment-card")
+            .unwrap()
+            .expect("comment card rendered inside right SBS pane");
+        let card_rect = card.get_bounding_client_rect();
+        let pane_rect = right_pane_html.get_bounding_client_rect();
+
+        assert!(
+            card_rect.width() <= pane_width + 1.0,
+            "SBS comment card width {:.2}px exceeds right-pane width \
+             {:.2}px — comment overflows the visible pane",
+            card_rect.width(),
+            pane_width
+        );
+        assert!(
+            card_rect.right() <= pane_rect.right() + 1.0,
+            "SBS comment right edge {:.2}px exceeds right-pane right \
+             edge {:.2}px — comment is hidden past the pane boundary",
+            card_rect.right(),
+            pane_rect.right()
+        );
+    }
+
+    /// BUG #2 GUARD (wiring): the `ResizeObserver` in `DiffContent`
+    /// must publish `--diff-scrollport-width` as an inline style on
+    /// `.diff-content` after mount. The CSS rules for the sticky
+    /// thread region depend on this var being set, so an unset var
+    /// would silently regress the comment width clamp.
+    #[wasm_bindgen_test]
+    async fn diff_content_publishes_scrollport_width_css_var() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let review = make_review();
+        let _ = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        let diff_content = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff-content present");
+        let diff_html: HtmlElement = diff_content.dyn_into().unwrap();
+        let var_value = diff_html
+            .style()
+            .get_property_value("--diff-scrollport-width")
+            .unwrap_or_default();
+        assert!(
+            !var_value.is_empty(),
+            "--diff-scrollport-width inline style is empty; ResizeObserver \
+             in DiffContent did not seed the CSS var. Got style.cssText='{}'",
+            diff_html.style().css_text()
+        );
+        // Value should be a px length matching client_width — sanity
+        // check that we're publishing a width, not some other unit.
+        assert!(
+            var_value.ends_with("px"),
+            "--diff-scrollport-width should be a px length, got '{var_value}'"
         );
     }
 

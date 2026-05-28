@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use protocol::{
     AgentId, DiffContextMode, FrameKind, MessageOrigin, Project, ProjectDiffScope,
@@ -28,6 +29,17 @@ pub(crate) enum ReviewDeliveryOutcome {
     Offline,
     Ambiguous,
     Failed(String),
+}
+
+impl ReviewDeliveryOutcome {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Offline => "offline",
+            Self::Ambiguous => "ambiguous",
+            Self::Failed(_) => "failed",
+        }
+    }
 }
 
 pub(crate) struct ReviewDeliveryRequest {
@@ -190,6 +202,13 @@ impl ReviewActor {
                     let _ = reply.send(summary_for_review(&self.review));
                 }
                 ReviewCommand::SubmittedBundleForSession { session_id, reply } => {
+                    tracing::debug!(
+                        review_id = %self.review.id,
+                        requested_session_id = %session_id,
+                        origin_session_id = %self.review.origin_session_id,
+                        status = self.review.status.status_label(),
+                        "checking submitted review bundle for session"
+                    );
                     let payload = if self.review.origin_session_id == session_id
                         && matches!(self.review.status, ReviewStatus::Submitted { .. })
                     {
@@ -223,10 +242,32 @@ impl ReviewActor {
                                 continue;
                             }
                         }
-                        self.submit_payload()
-                            .ok()
-                            .map(|payload| (self.review.id.clone(), payload))
+                        let payload = match self.submit_payload() {
+                            Ok(payload) => Some((self.review.id.clone(), payload)),
+                            Err(message) => {
+                                tracing::warn!(
+                                    review_id = %self.review.id,
+                                    requested_session_id = %session_id,
+                                    error_len = message.len(),
+                                    "failed to rebuild submitted review bundle"
+                                );
+                                None
+                            }
+                        };
+                        tracing::debug!(
+                            review_id = %self.review.id,
+                            requested_session_id = %session_id,
+                            has_bundle = payload.is_some(),
+                            "finished submitted review bundle check"
+                        );
+                        payload
                     } else {
+                        tracing::debug!(
+                            review_id = %self.review.id,
+                            requested_session_id = %session_id,
+                            has_bundle = false,
+                            "finished submitted review bundle check"
+                        );
                         None
                     };
                     let _ = reply.send(payload);
@@ -236,6 +277,13 @@ impl ReviewActor {
     }
 
     async fn subscribe(&mut self, conn: ConnectionId, stream: Stream) -> Result<(), String> {
+        tracing::debug!(
+            review_id = %self.review.id,
+            conn = %conn,
+            stream = %stream.path(),
+            subscriber_count = self.subscribers.len(),
+            "subscribing review stream"
+        );
         self.refresh_diffs().await?;
         self.send_to_stream(
             &stream,
@@ -245,10 +293,25 @@ impl ReviewActor {
         )
         .await?;
         self.subscribers.insert(conn, stream);
+        tracing::debug!(
+            review_id = %self.review.id,
+            subscriber_count = self.subscribers.len(),
+            "subscribed review stream"
+        );
         Ok(())
     }
 
     async fn handle_action(&mut self, action: ReviewActionPayload, conn: ConnectionId) {
+        let action_kind = action.kind_name();
+        if !self.subscribers.contains_key(&conn) {
+            tracing::warn!(
+                review_id = %self.review.id,
+                conn = %conn,
+                action_kind,
+                subscriber_count = self.subscribers.len(),
+                "review action received without subscriber"
+            );
+        }
         match action {
             ReviewActionPayload::AddComment { location, body } => {
                 self.add_comment(location, body, conn).await;
@@ -602,6 +665,19 @@ impl ReviewActor {
         conn: ConnectionId,
     ) {
         let context = ReviewErrorContext::StartAiReview;
+        let instructions_len = instructions.as_ref().map_or(0, String::len);
+        tracing::info!(
+            review_id = %self.review.id,
+            conn = %conn,
+            backend_kind = ?backend_kind,
+            cost_hint = ?cost_hint,
+            instructions_len,
+            current_status = self.review.ai_reviewer.status.status_label(),
+            diff_count = self.review.diffs.len(),
+            comment_count = self.review.comments.len(),
+            suggestion_count = self.review.suggestions.len(),
+            "starting AI review"
+        );
         if !self.ensure_draft(&conn, context.clone()).await {
             return;
         }
@@ -636,7 +712,18 @@ impl ReviewActor {
             review_handle: self.handle.clone(),
             reply,
         };
+        let spawn_wait_started = Instant::now();
+        tracing::debug!(
+            review_id = %self.review.id,
+            backend_kind = ?backend_kind,
+            "requesting AI reviewer spawn"
+        );
         if self.ai_spawn_tx.send(request).await.is_err() {
+            tracing::warn!(
+                review_id = %self.review.id,
+                backend_kind = ?backend_kind,
+                "AI reviewer spawn channel unavailable"
+            );
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::ReviewerBackendUnsupported,
@@ -650,6 +737,12 @@ impl ReviewActor {
 
         match response.await {
             Ok(Ok(agent_id)) => {
+                tracing::info!(
+                    review_id = %self.review.id,
+                    reviewer_agent_id = %agent_id,
+                    elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
+                    "AI reviewer spawn succeeded"
+                );
                 let previous = self.review.clone();
                 self.review.ai_reviewer = ReviewAiReviewerState {
                     status: ReviewAiReviewerStatus::Running,
@@ -666,6 +759,13 @@ impl ReviewActor {
                 .await;
             }
             Ok(Err(message)) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    backend_kind = ?backend_kind,
+                    elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
+                    error_len = message.len(),
+                    "AI reviewer spawn failed"
+                );
                 let previous = self.review.clone();
                 self.review.ai_reviewer = ReviewAiReviewerState {
                     status: ReviewAiReviewerStatus::Failed,
@@ -692,6 +792,12 @@ impl ReviewActor {
                 .await;
             }
             Err(_) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    backend_kind = ?backend_kind,
+                    elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
+                    "AI reviewer spawn response dropped"
+                );
                 self.send_error(
                     Some(&conn),
                     ReviewErrorCode::ReviewerBackendUnsupported,
@@ -706,6 +812,15 @@ impl ReviewActor {
 
     async fn submit(&mut self, conn: ConnectionId) {
         let context = ReviewErrorContext::Submit;
+        tracing::info!(
+            review_id = %self.review.id,
+            conn = %conn,
+            status = self.review.status.status_label(),
+            comment_count = self.review.comments.len(),
+            suggestion_count = self.review.suggestions.len(),
+            ai_reviewer_status = self.review.ai_reviewer.status.status_label(),
+            "submit review requested"
+        );
         if !self.ensure_draft(&conn, context.clone()).await {
             return;
         }
@@ -738,9 +853,29 @@ impl ReviewActor {
             .refresh_diffs_or_error(Some(&conn), context.clone())
             .await
         {
+            tracing::warn!(
+                review_id = %self.review.id,
+                conn = %conn,
+                "submit review stopped after diff refresh failure"
+            );
             return;
         }
+        let diff_stats = diff_stats(&self.review.diffs);
+        tracing::debug!(
+            review_id = %self.review.id,
+            diff_count = diff_stats.diff_count,
+            file_count = diff_stats.file_count,
+            hunk_count = diff_stats.hunk_count,
+            line_count = diff_stats.line_count,
+            "submit review diff refresh complete"
+        );
         if let Err(message) = self.validate_comment_locations() {
+            tracing::warn!(
+                review_id = %self.review.id,
+                conn = %conn,
+                error_len = message.len(),
+                "submit review stopped after location validation failure"
+            );
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::InvalidLocation,
@@ -752,8 +887,21 @@ impl ReviewActor {
             return;
         }
         let payload = match self.submit_payload() {
-            Ok(payload) => payload,
+            Ok(payload) => {
+                tracing::debug!(
+                    review_id = %self.review.id,
+                    message_len = payload.message.len(),
+                    images_count = payload.images.as_ref().map_or(0, Vec::len),
+                    "built submitted review delivery payload"
+                );
+                payload
+            }
             Err(message) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    error_len = message.len(),
+                    "failed to build submitted review delivery payload"
+                );
                 self.send_error(
                     Some(&conn),
                     ReviewErrorCode::Internal,
@@ -774,8 +922,19 @@ impl ReviewActor {
             .persist_or_revert(previous.clone(), Some(&conn), context.clone())
             .await
         {
+            tracing::warn!(
+                review_id = %self.review.id,
+                submitted_at_ms,
+                "failed to persist submitted review status"
+            );
             return;
         }
+        tracing::info!(
+            review_id = %self.review.id,
+            submitted_at_ms,
+            status = self.review.status.status_label(),
+            "persisted submitted review"
+        );
         self.broadcast(ReviewEventPayload::StatusChanged {
             status: self.review.status.clone(),
         })
@@ -789,7 +948,17 @@ impl ReviewActor {
             payload,
             reply,
         };
+        tracing::info!(
+            review_id = %self.review.id,
+            origin_session_id = %self.review.origin_session_id,
+            "requesting submitted review delivery"
+        );
         if self.delivery_tx.send(request).await.is_err() {
+            tracing::warn!(
+                review_id = %self.review.id,
+                origin_session_id = %self.review.origin_session_id,
+                "submitted review delivery channel unavailable"
+            );
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::OriginAgentNotRunning,
@@ -802,8 +971,29 @@ impl ReviewActor {
         }
 
         match response.await {
-            Ok(ReviewDeliveryOutcome::Delivered) | Ok(ReviewDeliveryOutcome::Offline) => {}
+            Ok(ReviewDeliveryOutcome::Delivered) => {
+                tracing::info!(
+                    review_id = %self.review.id,
+                    origin_session_id = %self.review.origin_session_id,
+                    outcome = "delivered",
+                    "submitted review delivery completed"
+                );
+            }
+            Ok(ReviewDeliveryOutcome::Offline) => {
+                tracing::info!(
+                    review_id = %self.review.id,
+                    origin_session_id = %self.review.origin_session_id,
+                    outcome = "offline",
+                    "submitted review delivery deferred"
+                );
+            }
             Ok(ReviewDeliveryOutcome::Ambiguous) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    origin_session_id = %self.review.origin_session_id,
+                    outcome = "ambiguous",
+                    "submitted review delivery ambiguous"
+                );
                 let submitted = self.review.clone();
                 self.review.status = ReviewStatus::Draft;
                 self.review.updated_at_ms = now_ms();
@@ -830,6 +1020,13 @@ impl ReviewActor {
                 }
             }
             Ok(ReviewDeliveryOutcome::Failed(message)) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    origin_session_id = %self.review.origin_session_id,
+                    outcome = "failed",
+                    error_len = message.len(),
+                    "submitted review delivery failed"
+                );
                 self.send_error(
                     Some(&conn),
                     ReviewErrorCode::OriginAgentNotRunning,
@@ -840,6 +1037,11 @@ impl ReviewActor {
                 .await;
             }
             Err(_) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    origin_session_id = %self.review.origin_session_id,
+                    "submitted review delivery response dropped"
+                );
                 self.send_error(
                     Some(&conn),
                     ReviewErrorCode::OriginAgentNotRunning,
@@ -884,6 +1086,17 @@ impl ReviewActor {
         mut suggestion: ReviewSuggestedComment,
     ) -> AiSuggestionResult {
         let context = ReviewErrorContext::StartAiReview;
+        tracing::debug!(
+            review_id = %self.review.id,
+            suggestion_id = %suggestion.id,
+            reviewer_agent_id = %suggestion.reviewer_agent_id,
+            severity = suggestion.severity.label(),
+            body_len = suggestion.body.len(),
+            rationale_len = suggestion.rationale.as_ref().map_or(0, String::len),
+            status = self.review.status.status_label(),
+            ai_reviewer_status = self.review.ai_reviewer.status.status_label(),
+            "received AI reviewer suggestion"
+        );
         if !matches!(self.review.status, ReviewStatus::Draft) {
             let error = review_error(
                 ReviewErrorCode::InvalidStatus,
@@ -973,10 +1186,30 @@ impl ReviewActor {
         self.broadcast(ReviewEventPayload::SuggestionUpsert { suggestion })
             .await;
         self.notify_project_changed();
+        tracing::info!(
+            review_id = %self.review.id,
+            suggestion_id = %suggestion_id,
+            pending_suggestion_count = self
+                .review
+                .suggestions
+                .iter()
+                .filter(|suggestion| {
+                    matches!(suggestion.state, ReviewSuggestionState::Pending)
+                })
+                .count(),
+            "accepted AI reviewer suggestion"
+        );
         Ok(suggestion_id)
     }
 
     async fn handle_ai_reviewer_exited(&mut self, result: Result<(), String>) {
+        tracing::info!(
+            review_id = %self.review.id,
+            current_status = self.review.ai_reviewer.status.status_label(),
+            result = if result.is_ok() { "ok" } else { "error" },
+            error_len = result.as_ref().err().map_or(0, String::len),
+            "AI reviewer exited"
+        );
         if !matches!(
             self.review.ai_reviewer.status,
             ReviewAiReviewerStatus::Running
@@ -1005,10 +1238,30 @@ impl ReviewActor {
             state: self.review.ai_reviewer.clone(),
         })
         .await;
+        tracing::info!(
+            review_id = %self.review.id,
+            status = self.review.ai_reviewer.status.status_label(),
+            reviewer_agent_id = self
+                .review
+                .ai_reviewer
+                .agent_id
+                .as_ref()
+                .map(|id| id.0.as_str())
+                .unwrap_or("<none>"),
+            error_len = self.review.ai_reviewer.error.as_ref().map_or(0, String::len),
+            "updated AI reviewer status"
+        );
         self.notify_project_changed();
     }
 
     async fn handle_bundle_consumed(&mut self, target_agent_id: AgentId, at_ms: u64) {
+        tracing::info!(
+            review_id = %self.review.id,
+            target_agent_id = %target_agent_id,
+            at_ms,
+            status = self.review.status.status_label(),
+            "review bundle consumed notification received"
+        );
         let ReviewStatus::Submitted { submitted_at_ms } = self.review.status.clone() else {
             self.send_error(
                 None,
@@ -1027,7 +1280,7 @@ impl ReviewActor {
         self.review.status = ReviewStatus::Consumed {
             submitted_at_ms,
             consumed_at_ms: at_ms,
-            target_agent_id,
+            target_agent_id: target_agent_id.clone(),
         };
         self.review.updated_at_ms = at_ms;
         if !self
@@ -1040,6 +1293,12 @@ impl ReviewActor {
             status: self.review.status.clone(),
         })
         .await;
+        tracing::info!(
+            review_id = %self.review.id,
+            target_agent_id = %target_agent_id,
+            status = self.review.status.status_label(),
+            "marked review bundle consumed"
+        );
         self.notify_project_changed();
     }
 
@@ -1086,13 +1345,58 @@ impl ReviewActor {
     }
 
     async fn refresh_diffs(&mut self) -> Result<(), String> {
+        let started = Instant::now();
+        tracing::debug!(
+            review_id = %self.review.id,
+            project_id = %self.review.project_id,
+            selection_kind = self.review.selection.kind_name(),
+            "refreshing review diffs"
+        );
         let project = {
             let store = self.project_store.lock().await;
-            store
-                .get(&self.review.project_id)
-                .ok_or_else(|| format!("unknown project {}", self.review.project_id))?
+            match store.get(&self.review.project_id) {
+                Some(project) => project,
+                None => {
+                    let message = format!("unknown project {}", self.review.project_id);
+                    tracing::warn!(
+                        review_id = %self.review.id,
+                        project_id = %self.review.project_id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error_len = message.len(),
+                        "failed to refresh review diffs"
+                    );
+                    return Err(message);
+                }
+            }
         };
-        self.review.diffs = read_review_diffs(&project, &self.review.selection)?;
+        match read_review_diffs(&project, &self.review.selection) {
+            Ok(diffs) => {
+                let stats = diff_stats(&diffs);
+                self.review.diffs = diffs;
+                tracing::info!(
+                    review_id = %self.review.id,
+                    project_id = %self.review.project_id,
+                    selection_kind = self.review.selection.kind_name(),
+                    diff_count = stats.diff_count,
+                    file_count = stats.file_count,
+                    hunk_count = stats.hunk_count,
+                    line_count = stats.line_count,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "refreshed review diffs"
+                );
+            }
+            Err(message) => {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    project_id = %self.review.project_id,
+                    selection_kind = self.review.selection.kind_name(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error_len = message.len(),
+                    "failed to refresh review diffs"
+                );
+                return Err(message);
+            }
+        }
         Ok(())
     }
 
@@ -1128,6 +1432,15 @@ impl ReviewActor {
         fatal: bool,
         context: ReviewErrorContext,
     ) {
+        tracing::debug!(
+            review_id = %self.review.id,
+            target = if conn.is_some() { "subscriber" } else { "broadcast" },
+            code = code.code_name(),
+            context = context.kind_name(),
+            fatal,
+            message_len = message.len(),
+            "sending review error event"
+        );
         let payload = ReviewEventPayload::Error {
             error: ReviewErrorPayload {
                 code,
@@ -1144,13 +1457,27 @@ impl ReviewActor {
 
     async fn broadcast(&mut self, payload: ReviewEventPayload) {
         let mut dead = Vec::new();
+        let event_kind = payload.kind_name();
         let streams = self
             .subscribers
             .iter()
             .map(|(conn, stream)| (conn.clone(), stream.clone()))
             .collect::<Vec<_>>();
+        tracing::debug!(
+            review_id = %self.review.id,
+            event_kind,
+            subscriber_count = streams.len(),
+            "broadcasting review event"
+        );
         for (conn, stream) in streams {
             if self.send_to_stream(&stream, payload.clone()).await.is_err() {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    conn = %conn,
+                    stream = %stream.path(),
+                    event_kind,
+                    "review event broadcast subscriber closed"
+                );
                 dead.push(conn);
             }
         }
@@ -1160,10 +1487,25 @@ impl ReviewActor {
     }
 
     async fn send_to_conn(&mut self, conn: &ConnectionId, payload: ReviewEventPayload) {
+        let event_kind = payload.kind_name();
         let Some(stream) = self.subscribers.get(conn).cloned() else {
+            tracing::warn!(
+                review_id = %self.review.id,
+                conn = %conn,
+                event_kind,
+                subscriber_count = self.subscribers.len(),
+                "targeted review event missing subscriber"
+            );
             return;
         };
         if self.send_to_stream(&stream, payload).await.is_err() {
+            tracing::warn!(
+                review_id = %self.review.id,
+                conn = %conn,
+                stream = %stream.path(),
+                event_kind,
+                "targeted review event subscriber closed"
+            );
             self.subscribers.remove(conn);
         }
     }
@@ -1173,11 +1515,28 @@ impl ReviewActor {
         stream: &Stream,
         payload: ReviewEventPayload,
     ) -> Result<(), String> {
-        let payload = serde_json::to_value(&payload)
-            .map_err(|err| format!("failed to serialize review event: {err}"))?;
+        let event_kind = payload.kind_name();
+        let payload = serde_json::to_value(&payload).map_err(|err| {
+            tracing::warn!(
+                review_id = %self.review.id,
+                stream = %stream.path(),
+                event_kind,
+                error_len = err.to_string().len(),
+                "failed to serialize review event"
+            );
+            format!("failed to serialize review event: {err}")
+        })?;
         stream
             .send_value(FrameKind::ReviewEvent, payload)
-            .map_err(|_| "review stream closed".to_owned())
+            .map_err(|_| {
+                tracing::warn!(
+                    review_id = %self.review.id,
+                    stream = %stream.path(),
+                    event_kind,
+                    "review stream closed while sending event"
+                );
+                "review stream closed".to_owned()
+            })
     }
 
     fn notify_project_changed(&self) {
@@ -1217,6 +1576,35 @@ fn read_review_diffs(
             },
         )
         .map(|diff| vec![diff]),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiffStats {
+    diff_count: usize,
+    file_count: usize,
+    hunk_count: usize,
+    line_count: usize,
+}
+
+fn diff_stats(diffs: &[ProjectGitDiffPayload]) -> DiffStats {
+    let file_count = diffs.iter().map(|diff| diff.files.len()).sum();
+    let hunk_count = diffs
+        .iter()
+        .flat_map(|diff| diff.files.iter())
+        .map(|file| file.hunks.len())
+        .sum();
+    let line_count = diffs
+        .iter()
+        .flat_map(|diff| diff.files.iter())
+        .flat_map(|file| file.hunks.iter())
+        .map(|hunk| hunk.lines.len())
+        .sum();
+    DiffStats {
+        diff_count: diffs.len(),
+        file_count,
+        hunk_count,
+        line_count,
     }
 }
 

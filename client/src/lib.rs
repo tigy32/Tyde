@@ -377,8 +377,27 @@ impl Connection {
         project_id: &ProjectId,
         payload: ReviewCreatePayload,
     ) -> Result<(), FrameError> {
-        self.send_project_payload(project_id, FrameKind::ReviewCreate, &payload)
-            .await
+        let stream = self.project_stream(project_id);
+        let seq = self
+            .outgoing_seq
+            .get(&stream)
+            .copied()
+            .expect("missing project stream sequence counter");
+        let selection_kind = payload.selection.kind_name();
+        let origin_agent_id = payload.origin_agent_id.clone();
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::ReviewCreate, seq, &payload)
+                .map_err(FrameError::Json)?;
+        tracing::debug!(
+            project_id = %project_id,
+            origin_agent_id = %origin_agent_id,
+            selection_kind,
+            stream = %stream,
+            seq,
+            "sending review_create"
+        );
+        self.outgoing_seq.insert(stream, seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
     }
 
     pub async fn review_action(
@@ -395,6 +414,13 @@ impl Connection {
         let envelope =
             Envelope::from_payload(stream.clone(), FrameKind::ReviewAction, seq, &payload)
                 .map_err(FrameError::Json)?;
+        tracing::debug!(
+            review_id = %review_id,
+            action_kind = payload.kind_name(),
+            stream = %stream,
+            seq,
+            "sending review_action"
+        );
         self.outgoing_seq.insert(stream, seq + 1);
         write_envelope(&mut self.writer, &envelope).await
     }
@@ -413,6 +439,12 @@ impl Connection {
         let envelope =
             Envelope::from_payload(stream.clone(), FrameKind::ReviewSubscribe, seq, &payload)
                 .map_err(FrameError::Json)?;
+        tracing::debug!(
+            review_id = %review_id,
+            stream = %stream,
+            seq,
+            "sending review_subscribe"
+        );
         self.outgoing_seq.insert(stream, seq + 1);
         write_envelope(&mut self.writer, &envelope).await
     }
@@ -916,8 +948,59 @@ impl Connection {
         } else if envelope.stream.0.starts_with("/review/") {
             match envelope.kind {
                 FrameKind::ReviewEvent => {
-                    let _: ReviewEventPayload =
+                    let payload: ReviewEventPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
+                    let review_id = review_id_from_stream(&envelope.stream).unwrap_or("<unknown>");
+                    match &payload {
+                        ReviewEventPayload::StatusChanged { status } => {
+                            tracing::debug!(
+                                review_id,
+                                stream = %envelope.stream,
+                                seq = envelope.seq,
+                                event_kind = payload.kind_name(),
+                                status = status.status_label(),
+                                "received review_event"
+                            );
+                        }
+                        ReviewEventPayload::AiReviewerChanged { state } => {
+                            tracing::debug!(
+                                review_id,
+                                stream = %envelope.stream,
+                                seq = envelope.seq,
+                                event_kind = payload.kind_name(),
+                                status = state.status.status_label(),
+                                reviewer_agent_id = state
+                                    .agent_id
+                                    .as_ref()
+                                    .map(|id| id.0.as_str())
+                                    .unwrap_or("<none>"),
+                                error_len = state.error.as_ref().map_or(0, String::len),
+                                "received review_event"
+                            );
+                        }
+                        ReviewEventPayload::Error { error } => {
+                            tracing::debug!(
+                                review_id,
+                                stream = %envelope.stream,
+                                seq = envelope.seq,
+                                event_kind = payload.kind_name(),
+                                code = error.code.code_name(),
+                                context = error.context.kind_name(),
+                                fatal = error.fatal,
+                                message_len = error.message.len(),
+                                "received review_event"
+                            );
+                        }
+                        _ => {
+                            tracing::debug!(
+                                review_id,
+                                stream = %envelope.stream,
+                                seq = envelope.seq,
+                                event_kind = payload.kind_name(),
+                                "received review_event"
+                            );
+                        }
+                    }
                     self.outgoing_seq
                         .entry(envelope.stream.clone())
                         .or_insert(0);
@@ -1104,6 +1187,13 @@ pub(crate) fn parse_agent_stream(stream: &StreamPath) -> AgentStreamParts {
     AgentStreamParts {
         agent_id: AgentId(segments[2].to_owned()),
     }
+}
+
+fn review_id_from_stream(stream: &StreamPath) -> Option<&str> {
+    stream
+        .0
+        .strip_prefix("/review/")
+        .filter(|id| !id.is_empty())
 }
 
 #[derive(Debug)]

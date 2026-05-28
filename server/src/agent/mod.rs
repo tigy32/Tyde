@@ -1094,6 +1094,25 @@ pub(crate) fn spawn_agent_actor(
                         let queued = queue
                             .pop_front()
                             .expect("queue reported non-empty but pop_front returned None");
+                        let review_origin = match queued.origin.as_ref() {
+                            Some(MessageOrigin::Review { review_id }) => Some(review_id.clone()),
+                            Some(MessageOrigin::User) | None => None,
+                        };
+                        if let Some(review_id) = review_origin.as_ref() {
+                            tracing::info!(
+                                review_id = %review_id,
+                                agent_id = %current_start.agent_id,
+                                session_id = current_session_id
+                                    .as_ref()
+                                    .map(|id| id.0.as_str())
+                                    .unwrap_or("<none>"),
+                                queued_message_id = %queued.id,
+                                queue_len = queue.len(),
+                                message_len = queued.message.len(),
+                                images_count = queued.images.len(),
+                                "dequeued review-origin bundle"
+                            );
+                        }
                         update_queued_messages_snapshot(
                             &canonical_stream,
                             &mut event_log,
@@ -1102,14 +1121,22 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await;
                         in_turn = true;
-                        if !backend
+                        let sent = backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
                             .send(AgentInput::SendMessage(queued_message_to_send_payload(
                                 queued.clone(),
                             )))
-                            .await
-                        {
+                            .await;
+                        if !sent {
+                            if let Some(review_id) = review_origin.as_ref() {
+                                tracing::warn!(
+                                    review_id = %review_id,
+                                    agent_id = %current_start.agent_id,
+                                    queued_message_id = %queued.id,
+                                    "failed to send dequeued review-origin bundle to backend"
+                                );
+                            }
                             let payload = AgentErrorPayload {
                                 agent_id: current_start.agent_id.clone(),
                                 code: AgentErrorCode::Internal,
@@ -1142,7 +1169,21 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             return;
                         }
+                        if let Some(review_id) = review_origin.as_ref() {
+                            tracing::info!(
+                                review_id = %review_id,
+                                agent_id = %current_start.agent_id,
+                                queued_message_id = %queued.id,
+                                "sent dequeued review-origin bundle to backend"
+                            );
+                        }
                         if let Some(MessageOrigin::Review { review_id }) = queued.origin {
+                            tracing::debug!(
+                                review_id = %review_id,
+                                agent_id = %current_start.agent_id,
+                                queued_message_id = %queued.id,
+                                "dequeued review-origin bundle sent; notifying consumed"
+                            );
                             notify_review_bundle_consumed(
                                 &review_registry,
                                 review_id,
@@ -1176,17 +1217,42 @@ pub(crate) fn spawn_agent_actor(
                             }
                             match input {
                                 AgentInput::SendMessage(msg) => {
-                                    let review_origin = match msg.origin.clone() {
+                                    let review_origin = match msg.origin.as_ref() {
+                                        Some(MessageOrigin::Review { review_id }) => {
+                                            Some(review_id.clone())
+                                        }
+                                        Some(MessageOrigin::User) | None => None,
+                                    };
+                                    let message_len = msg.message.len();
+                                    let images_count = msg.images.as_ref().map_or(0, Vec::len);
+                                    let review_origin_for_queue = match msg.origin.clone() {
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
                                         Some(MessageOrigin::User) | None => None,
                                     };
                                     if in_turn {
+                                        let queued_message_id =
+                                            QueuedMessageId(Uuid::new_v4().to_string());
                                         queue.push_back(QueuedMessageEntry {
-                                            id: QueuedMessageId(Uuid::new_v4().to_string()),
+                                            id: queued_message_id.clone(),
                                             message: msg.message,
                                             images: msg.images.unwrap_or_default(),
                                             origin: msg.origin,
                                         });
+                                        if let Some(review_id) = review_origin_for_queue {
+                                            tracing::info!(
+                                                review_id = %review_id,
+                                                agent_id = %current_start.agent_id,
+                                                session_id = current_session_id
+                                                    .as_ref()
+                                                    .map(|id| id.0.as_str())
+                                                    .unwrap_or("<none>"),
+                                                queued_message_id = %queued_message_id,
+                                                queue_len = queue.len(),
+                                                message_len,
+                                                images_count,
+                                                "queued review-origin bundle"
+                                            );
+                                        }
                                         update_queued_messages_snapshot(
                                             &canonical_stream,
                                             &mut event_log,
@@ -1196,12 +1262,37 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                     } else {
                                         in_turn = true;
-                                        if !backend
+                                        if let Some(review_id) = review_origin.as_ref() {
+                                            tracing::info!(
+                                                review_id = %review_id,
+                                                agent_id = %current_start.agent_id,
+                                                session_id = current_session_id
+                                                    .as_ref()
+                                                    .map(|id| id.0.as_str())
+                                                    .unwrap_or("<none>"),
+                                                queue_len = queue.len(),
+                                                message_len,
+                                                images_count,
+                                                "sending review-origin bundle to backend"
+                                            );
+                                        }
+                                        let sent = backend
                                             .as_ref()
                                             .expect("backend must exist while actor is running")
                                             .send(AgentInput::SendMessage(msg))
-                                            .await
-                                        {
+                                            .await;
+                                        if !sent {
+                                            if let Some(review_id) = review_origin.as_ref() {
+                                                tracing::warn!(
+                                                    review_id = %review_id,
+                                                    agent_id = %current_start.agent_id,
+                                                    session_id = current_session_id
+                                                        .as_ref()
+                                                        .map(|id| id.0.as_str())
+                                                        .unwrap_or("<none>"),
+                                                    "failed to send review-origin bundle to backend"
+                                                );
+                                            }
                                             let payload = AgentErrorPayload {
                                                 agent_id: current_start.agent_id.clone(),
                                                 code: AgentErrorCode::Internal,
@@ -1235,6 +1326,11 @@ pub(crate) fn spawn_agent_actor(
                                             return;
                                         }
                                         if let Some(review_id) = review_origin {
+                                            tracing::debug!(
+                                                review_id = %review_id,
+                                                agent_id = %current_start.agent_id,
+                                                "review-origin bundle sent; notifying consumed"
+                                            );
                                             notify_review_bundle_consumed(
                                                 &review_registry,
                                                 review_id,
@@ -1312,6 +1408,23 @@ pub(crate) fn spawn_agent_actor(
                                     let queued = queue
                                         .remove(index)
                                         .expect("queue remove failed after position()");
+                                    if let Some(MessageOrigin::Review { review_id }) =
+                                        queued.origin.as_ref()
+                                    {
+                                        tracing::info!(
+                                            review_id = %review_id,
+                                            agent_id = %current_start.agent_id,
+                                            session_id = current_session_id
+                                                .as_ref()
+                                                .map(|id| id.0.as_str())
+                                                .unwrap_or("<none>"),
+                                            queued_message_id = %queued.id,
+                                            queue_len = queue.len(),
+                                            message_len = queued.message.len(),
+                                            images_count = queued.images.len(),
+                                            "moved review-origin bundle to front of queue"
+                                        );
+                                    }
                                     queue.push_front(queued);
                                     update_queued_messages_snapshot(
                                         &canonical_stream,
@@ -1350,6 +1463,27 @@ pub(crate) fn spawn_agent_actor(
                                     let queued = queue
                                         .pop_front()
                                         .expect("queue front must exist after push_front");
+                                    let review_origin = match queued.origin.as_ref() {
+                                        Some(MessageOrigin::Review { review_id }) => {
+                                            Some(review_id.clone())
+                                        }
+                                        Some(MessageOrigin::User) | None => None,
+                                    };
+                                    if let Some(review_id) = review_origin.as_ref() {
+                                        tracing::info!(
+                                            review_id = %review_id,
+                                            agent_id = %current_start.agent_id,
+                                            session_id = current_session_id
+                                                .as_ref()
+                                                .map(|id| id.0.as_str())
+                                                .unwrap_or("<none>"),
+                                            queued_message_id = %queued.id,
+                                            queue_len = queue.len(),
+                                            message_len = queued.message.len(),
+                                            images_count = queued.images.len(),
+                                            "dequeued review-origin bundle for immediate send"
+                                        );
+                                    }
                                     update_queued_messages_snapshot(
                                         &canonical_stream,
                                         &mut event_log,
@@ -1358,14 +1492,22 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await;
                                     in_turn = true;
-                                    if !backend
+                                    let sent = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
                                         .send(AgentInput::SendMessage(
                                             queued_message_to_send_payload(queued.clone()),
                                         ))
-                                        .await
-                                    {
+                                        .await;
+                                    if !sent {
+                                        if let Some(review_id) = review_origin.as_ref() {
+                                            tracing::warn!(
+                                                review_id = %review_id,
+                                                agent_id = %current_start.agent_id,
+                                                queued_message_id = %queued.id,
+                                                "failed to send immediate review-origin bundle to backend"
+                                            );
+                                        }
                                         let payload = AgentErrorPayload {
                                             agent_id: current_start.agent_id.clone(),
                                             code: AgentErrorCode::Internal,
@@ -1398,8 +1540,22 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         return;
                                     }
+                                    if let Some(review_id) = review_origin.as_ref() {
+                                        tracing::info!(
+                                            review_id = %review_id,
+                                            agent_id = %current_start.agent_id,
+                                            queued_message_id = %queued.id,
+                                            "sent immediate review-origin bundle to backend"
+                                        );
+                                    }
                                     if let Some(MessageOrigin::Review { review_id }) = queued.origin
                                     {
+                                        tracing::debug!(
+                                            review_id = %review_id,
+                                            agent_id = %current_start.agent_id,
+                                            queued_message_id = %queued.id,
+                                            "immediate review-origin bundle sent; notifying consumed"
+                                        );
                                         notify_review_bundle_consumed(
                                             &review_registry,
                                             review_id,
@@ -2308,24 +2464,44 @@ async fn notify_review_bundle_consumed(
     review_id: protocol::ReviewId,
     target_agent_id: &AgentId,
 ) {
-    if let Err(error) = review_registry
+    tracing::debug!(
+        review_id = %review_id,
+        target_agent_id = %target_agent_id,
+        "notifying review bundle consumed"
+    );
+    match review_registry
         .bundle_consumed(review_id.clone(), target_agent_id.clone(), now_ms())
         .await
     {
-        let message = format!(
-            "failed to mark review bundle consumed by agent {}: {}",
-            target_agent_id, error
-        );
-        if let Err(report_error) = review_registry
-            .internal_error(review_id.clone(), message, ReviewErrorContext::Submit)
-            .await
-        {
+        Ok(()) => {
+            tracing::info!(
+                review_id = %review_id,
+                target_agent_id = %target_agent_id,
+                "notified review bundle consumed"
+            );
+        }
+        Err(error) => {
             tracing::warn!(
                 review_id = %review_id,
                 target_agent_id = %target_agent_id,
-                error = %report_error,
-                "failed to surface review bundle consumption error"
+                error_len = error.len(),
+                "failed to notify review bundle consumed"
             );
+            let message = format!(
+                "failed to mark review bundle consumed by agent {}: {}",
+                target_agent_id, error
+            );
+            if let Err(report_error) = review_registry
+                .internal_error(review_id.clone(), message, ReviewErrorContext::Submit)
+                .await
+            {
+                tracing::warn!(
+                    review_id = %review_id,
+                    target_agent_id = %target_agent_id,
+                    error_len = report_error.len(),
+                    "failed to surface review bundle consumption error"
+                );
+            }
         }
     }
 }
