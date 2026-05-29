@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use protocol::{AgentId, CustomAgentNotifyPayload, Envelope, FrameKind};
+use protocol::{AgentId, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload};
 use tyde_dev_driver::agent_control::AgentControlHandle;
 
 // `cargo` compiles each integration test file as its own binary, so a
@@ -44,6 +44,8 @@ pub fn init_tracing() {
 pub struct Fixture {
     pub client: client::Connection,
     #[allow(dead_code)]
+    pub bootstrap: HostBootstrapPayload,
+    #[allow(dead_code)]
     host: server::HostHandle,
     #[allow(dead_code)]
     session_store_dir: tempfile::TempDir,
@@ -70,10 +72,11 @@ impl Fixture {
             runtime_config,
         )
         .expect("initialize host with mock backend");
-        let client = connect_client(host.clone()).await;
+        let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
 
         Self {
             client,
+            bootstrap,
             host,
             session_store_dir,
         }
@@ -82,6 +85,11 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn connect(&self) -> client::Connection {
         connect_client(self.host.clone()).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn connect_with_bootstrap(&self) -> (client::Connection, HostBootstrapPayload) {
+        connect_client_with_bootstrap(self.host.clone()).await
     }
 
     #[allow(dead_code)]
@@ -101,6 +109,19 @@ impl Fixture {
         )
         .expect("initialize fresh host with existing stores");
         connect_client(host).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn connect_fresh_host_with_bootstrap(
+        &self,
+    ) -> (client::Connection, HostBootstrapPayload) {
+        let host = server::spawn_host_with_mock_backend(
+            self.session_store_path(),
+            self.project_store_path(),
+            self.settings_store_path(),
+        )
+        .expect("initialize fresh host with existing stores");
+        connect_client_with_bootstrap(host).await
     }
 
     #[allow(dead_code)]
@@ -137,42 +158,27 @@ impl Fixture {
 }
 
 async fn connect_client(host: server::HostHandle) -> client::Connection {
+    connect_client_with_bootstrap(host).await.0
+}
+
+async fn connect_client_with_bootstrap(
+    host: server::HostHandle,
+) -> (client::Connection, HostBootstrapPayload) {
     let mut client = connect_raw_client(host).await;
 
     let env = client
         .next_event()
         .await
-        .expect("initial host settings read failed")
-        .expect("connection closed before initial host settings");
+        .expect("initial host bootstrap read failed")
+        .expect("connection closed before initial host bootstrap");
     assert_eq!(
         env.kind,
-        FrameKind::HostSettings,
-        "first host event on connect must be HostSettings"
+        FrameKind::HostBootstrap,
+        "first host event on connect must be HostBootstrap"
     );
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrapPayload");
 
-    let env = client
-        .next_event()
-        .await
-        .expect("initial mobile access state read failed")
-        .expect("connection closed before initial mobile access state");
-    assert_eq!(
-        env.kind,
-        FrameKind::MobileAccessState,
-        "second host event on connect must be MobileAccessState"
-    );
-
-    let env = client
-        .next_event()
-        .await
-        .expect("initial session schemas read failed")
-        .expect("connection closed before initial session schemas");
-    assert_eq!(
-        env.kind,
-        FrameKind::SessionSchemas,
-        "third host event on connect must be SessionSchemas"
-    );
-
-    client
+    (client, bootstrap)
 }
 
 async fn connect_raw_client(host: server::HostHandle) -> client::Connection {

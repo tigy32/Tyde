@@ -7,12 +7,12 @@ use mqtt_transport::{
     host_to_client_topic,
 };
 use protocol::{
-    BackendKind, BrokerUrl, ChatEvent, CommandErrorPayload, Envelope, FrameKind, HostSettingValue,
-    HostSettingsPayload, ListSessionsPayload, MobileAccessErrorCode, MobileAccessStatePayload,
-    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload, MobilePairingStartPayload,
-    MobilePairingState, NewAgentPayload, ProjectCreatePayload, SendMessagePayload,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload,
-    TerminalLaunchTarget, write_envelope,
+    BackendKind, BrokerUrl, ChatEvent, CommandErrorPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostSettingValue, ListSessionsPayload, MobileAccessErrorCode,
+    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload,
+    MobilePairingStartPayload, MobilePairingState, NewAgentPayload, ProjectCreatePayload,
+    SendMessagePayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
 };
 use tokio::time::timeout;
 
@@ -118,18 +118,11 @@ async fn wait_for_chat_stream_end(client: &mut client::Connection, context: &str
 }
 
 async fn expect_initial_replay(client: &mut client::Connection) -> MobileAccessStatePayload {
-    let env = expect_next_kind(client, FrameKind::HostSettings, "initial HostSettings").await;
-    let _: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
-    let env = expect_next_kind(
-        client,
-        FrameKind::MobileAccessState,
-        "initial MobileAccessState",
-    )
-    .await;
-    let state: MobileAccessStatePayload = env.parse_payload().expect("parse MobileAccessState");
+    let env = expect_next_kind(client, FrameKind::HostBootstrap, "initial HostBootstrap").await;
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrap");
+    let state = bootstrap.mobile_access;
     assert_eq!(state.broker_status, MobileBrokerStatus::Disabled);
     assert_eq!(state.pairing, MobilePairingState::Idle);
-    let _ = expect_next_kind(client, FrameKind::SessionSchemas, "initial SessionSchemas").await;
     state
 }
 
@@ -382,19 +375,18 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
         Some(MobileDeviceState::Connected)
     ));
 
-    let env = expect_next_kind(&mut mobile, FrameKind::HostSettings, "mobile HostSettings").await;
-    let _: HostSettingsPayload = env.parse_payload().expect("parse mobile HostSettings");
-
-    let _ = wait_for_kind(
+    let env = expect_next_kind(
         &mut mobile,
-        FrameKind::ProjectNotify,
-        "mobile ProjectNotify",
+        FrameKind::HostBootstrap,
+        "mobile HostBootstrap",
     )
     .await;
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse mobile HostBootstrap");
+    assert_eq!(bootstrap.projects.len(), 1);
     let _ = wait_for_kind(
         &mut mobile,
-        FrameKind::ProjectFileList,
-        "mobile ProjectFileList",
+        FrameKind::ProjectBootstrap,
+        "mobile ProjectBootstrap",
     )
     .await;
 
@@ -526,12 +518,11 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
     while replayed_agent.is_none() || project_count < 12 {
         let env = next_event(&mut mobile, "mobile initial replay").await;
         match env.kind {
-            FrameKind::ProjectNotify => project_count += 1,
-            FrameKind::NewAgent => {
-                replayed_agent = Some(
-                    env.parse_payload::<NewAgentPayload>()
-                        .expect("parse replayed NewAgent"),
-                );
+            FrameKind::HostBootstrap => {
+                let bootstrap: HostBootstrapPayload =
+                    env.parse_payload().expect("parse HostBootstrap");
+                project_count = bootstrap.projects.len();
+                replayed_agent = bootstrap.agents.into_iter().next();
             }
             FrameKind::CommandError => {
                 let payload: CommandErrorPayload =
@@ -722,12 +713,11 @@ async fn expect_mobile_replay(
     while replayed_agent.is_none() || project_count < expected_projects {
         let env = next_event(mobile, context).await;
         match env.kind {
-            FrameKind::ProjectNotify => project_count += 1,
-            FrameKind::NewAgent => {
-                replayed_agent = Some(
-                    env.parse_payload::<NewAgentPayload>()
-                        .expect("parse replayed NewAgent"),
-                );
+            FrameKind::HostBootstrap => {
+                let bootstrap: HostBootstrapPayload =
+                    env.parse_payload().expect("parse HostBootstrap");
+                project_count = bootstrap.projects.len();
+                replayed_agent = bootstrap.agents.into_iter().next();
             }
             FrameKind::CommandError => {
                 let payload: CommandErrorPayload =

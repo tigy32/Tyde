@@ -2,26 +2,25 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
-use wasm_bindgen_futures::spawn_local;
 
 use protocol::MobileAccessErrorCode;
 use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
-    AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, BackendSetupPayload, ChatEvent, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FrameKind, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerNotifyPayload, NewAgentPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
+    AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, CommandErrorPayload,
+    CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload,
+    NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
     ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
-    ReviewEventPayload, ReviewId, SeqMismatch, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
+    ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
+    StreamPath, TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
     TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
-use crate::send::send_frame;
 use crate::state::MobileShellError;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
@@ -105,6 +104,82 @@ pub fn reset_inbound_seq_for_host(host: &LocalHostId) {
     INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().reset_host(host));
 }
 
+/// Test helper: prime the inbound validators for `host` so subsequent
+/// dispatch calls behave as if the server had already delivered a
+/// `Welcome` (seq 0) + `HostBootstrap` (seq 1) pair on the
+/// `/host/<host>` stream.
+///
+/// After priming, the `ProtocolValidator` considers the host stream to
+/// have observed a bootstrap, but the `FrontendSeqValidator` has been
+/// rewound so tests can dispatch their first envelope at seq `0`
+/// without a seq-mismatch error.
+#[allow(dead_code)]
+pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
+    use protocol::{
+        BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
+        HostSettings as BootstrapHostSettings, MobileAccessStatePayload as BootstrapMobileAccess,
+        MobileBrokerStatus as BootstrapBrokerStatus, MobilePairingState as BootstrapPairingState,
+        PROTOCOL_VERSION, TYDE_VERSION, TeamPresetCatalog as BootstrapTeamPresetCatalog,
+        WelcomePayload as BootstrapWelcome,
+    };
+
+    reset_inbound_seq_for_host(host);
+
+    let host_stream = StreamPath(format!("/host/{}", host.0));
+    let welcome = BootstrapWelcome {
+        protocol_version: PROTOCOL_VERSION,
+        tyde_version: TYDE_VERSION,
+    };
+    let bootstrap = BootstrapHostPayload {
+        settings: BootstrapHostSettings {
+            enabled_backends: Vec::new(),
+            default_backend: None,
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: true,
+        },
+        mobile_access: BootstrapMobileAccess {
+            broker_status: BootstrapBrokerStatus::Disabled,
+            pairing: BootstrapPairingState::Idle,
+            paired_devices: Vec::new(),
+        },
+        backend_setup: BootstrapBackendSetup {
+            backends: Vec::new(),
+        },
+        session_schemas: Vec::new(),
+        sessions: Vec::new(),
+        projects: Vec::new(),
+        mcp_servers: Vec::new(),
+        skills: Vec::new(),
+        steering: Vec::new(),
+        custom_agents: Vec::new(),
+        team_preset_catalog: BootstrapTeamPresetCatalog {
+            role_presets: Vec::new(),
+            personality_traits: Vec::new(),
+            personality_presets: Vec::new(),
+            team_templates: Vec::new(),
+        },
+        team_drafts: Vec::new(),
+        teams: Vec::new(),
+        team_members: Vec::new(),
+        team_member_bindings: Vec::new(),
+        agents: Vec::new(),
+    };
+
+    let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
+        .expect("synthetic Welcome");
+    dispatch_envelope(state, host, welcome_env);
+    let bootstrap_env =
+        Envelope::from_payload(host_stream, FrameKind::HostBootstrap, 1, &bootstrap)
+            .expect("synthetic HostBootstrap");
+    dispatch_envelope(state, host, bootstrap_env);
+
+    // Rewind only the FrontendSeqValidator. The ProtocolValidator keeps
+    // the saw_welcome/saw_bootstrap state from the synthetic frames.
+    INBOUND_SEQ.with(|validator| validator.borrow_mut().reset_host(host));
+}
+
 pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelope) {
     if let Err(error) = INBOUND_SEQ.with(|validator| {
         validator
@@ -137,21 +212,75 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 map.insert(host.clone(), ConnectionStatus::Connected);
             });
             clear_phase2_snapshots_for_host(state, host);
-
-            if let Some(stream) = state.host_stream_untracked(host) {
-                let host = host.clone();
-                spawn_local(async move {
-                    let _ = send_frame(
-                        &host,
-                        stream,
-                        FrameKind::ListSessions,
-                        &ListSessionsPayload {},
-                    )
-                    .await;
-                });
-            }
-
+            // Sessions/projects/teams etc. now arrive via HostBootstrap
+            // (seq 1 on the host stream) — see the HostBootstrap arm below.
             log::info!("connected to host {}", host);
+        }
+        FrameKind::HostBootstrap => match envelope.parse_payload::<HostBootstrapPayload>() {
+            Ok(payload) => apply_host_bootstrap(state, host, payload),
+            Err(error) => log::error!(
+                "failed to parse HostBootstrap host={} stream={} seq={}: {}",
+                host,
+                envelope.stream,
+                envelope.seq,
+                error
+            ),
+        },
+        FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
+            Ok(payload) => apply_agent_bootstrap(state, host, &envelope.stream, payload),
+            Err(error) => log::error!(
+                "failed to parse AgentBootstrap host={} stream={} seq={}: {}",
+                host,
+                envelope.stream,
+                envelope.seq,
+                error
+            ),
+        },
+        FrameKind::ProjectBootstrap => {
+            if let Some(project_id) = resolve_project_id(&envelope.stream) {
+                match envelope.parse_payload::<ProjectBootstrapPayload>() {
+                    Ok(payload) => apply_project_bootstrap(state, host, project_id, payload),
+                    Err(error) => log::error!(
+                        "failed to parse ProjectBootstrap host={} stream={} seq={}: {}",
+                        host,
+                        envelope.stream,
+                        envelope.seq,
+                        error
+                    ),
+                }
+            }
+        }
+        FrameKind::ReviewBootstrap => {
+            if let Some(review_id) = resolve_review_id(&envelope.stream) {
+                match envelope.parse_payload::<ReviewBootstrapPayload>() {
+                    Ok(payload) => apply_review_bootstrap(state, host, review_id, payload),
+                    Err(error) => log::error!(
+                        "failed to parse ReviewBootstrap host={} stream={} seq={}: {}",
+                        host,
+                        envelope.stream,
+                        envelope.seq,
+                        error
+                    ),
+                }
+            }
+        }
+        FrameKind::BrowseBootstrap => match envelope.parse_payload::<BrowseBootstrapPayload>() {
+            Ok(payload) => apply_browse_bootstrap(state, host, &envelope.stream, payload),
+            Err(error) => log::error!(
+                "failed to parse BrowseBootstrap host={} stream={} seq={}: {}",
+                host,
+                envelope.stream,
+                envelope.seq,
+                error
+            ),
+        },
+        FrameKind::TerminalBootstrap => {
+            // mobile does not yet model terminals — log and ignore.
+            log::info!(
+                "ignoring TerminalBootstrap on mobile host={} stream={}",
+                host,
+                envelope.stream
+            );
         }
         FrameKind::Reject => {
             if let Ok(payload) = envelope.parse_payload::<RejectPayload>() {
@@ -1082,6 +1211,17 @@ fn dispatch_chat_event(
         chat_event_label(&event)
     );
 
+    apply_chat_event(state, &agent_ref, event);
+}
+
+/// Apply an already-parsed `ChatEvent` for a known `agent_ref`.
+///
+/// Split out from `dispatch_chat_event` so an `AgentBootstrap` (or any
+/// future code path that already holds a parsed event) can replay inner
+/// events through the same reducer without re-encoding them through an
+/// `Envelope`.
+pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent) {
+    let agent_ref = agent_ref.clone();
     match event {
         ChatEvent::TypingStatusChanged(typing) => {
             if typing {
@@ -1129,10 +1269,9 @@ fn dispatch_chat_event(
                 streaming.text.update(|text| text.push_str(&data.text));
             } else {
                 log::error!(
-                    "StreamDelta without StreamStart host={} agent_id={} stream={}",
-                    host,
+                    "StreamDelta without StreamStart host={} agent_id={}",
+                    agent_ref.local_host_id,
                     agent_ref.agent_id,
-                    stream
                 );
             }
         }
@@ -1146,10 +1285,9 @@ fn dispatch_chat_event(
                     .update(|reasoning| reasoning.push_str(&data.text));
             } else {
                 log::error!(
-                    "StreamReasoningDelta without StreamStart host={} agent_id={} stream={}",
-                    host,
+                    "StreamReasoningDelta without StreamStart host={} agent_id={}",
+                    agent_ref.local_host_id,
                     agent_ref.agent_id,
-                    stream
                 );
             }
         }
@@ -1279,6 +1417,354 @@ fn dispatch_chat_event(
     }
 }
 
+// ── Bootstrap apply helpers ──────────────────────────────────────────────
+//
+// HostBootstrap (seq 1 on the host stream after Welcome at seq 0) carries
+// a full snapshot of host-scoped state. The apply helpers below replace
+// each host-keyed slice in `AppState` with the snapshot. Side effects that
+// depend on user intent (e.g. auto-opening a chat tab) stay in the
+// per-event arms.
+
+fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBootstrapPayload) {
+    log::info!(
+        "dispatch host_bootstrap host={} sessions={} projects={} agents={} teams={}",
+        host,
+        payload.sessions.len(),
+        payload.projects.len(),
+        payload.agents.len(),
+        payload.teams.len(),
+    );
+
+    state.host_settings_by_host.update(|map| {
+        map.insert(host.clone(), payload.settings);
+    });
+    // mobile-frontend has no mobile_access state of its own (it IS the
+    // mobile client) — the field is intentionally unused.
+    let _ = payload.mobile_access;
+    state.backend_setup_by_host.update(|map| {
+        map.insert(host.clone(), payload.backend_setup.backends);
+    });
+    state.session_schemas_by_host.update(|map| {
+        let mut schemas = HashMap::new();
+        for schema in payload.session_schemas {
+            schemas.insert(schema.backend_kind(), schema);
+        }
+        map.insert(host.clone(), schemas);
+    });
+    state.sessions.update(|sessions| {
+        sessions.retain(|s| s.local_host_id != *host);
+        sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
+            local_host_id: host.clone(),
+            summary,
+        }));
+    });
+    state.projects.update(|projects| {
+        projects.retain(|p| p.local_host_id != *host);
+        projects.extend(payload.projects.into_iter().map(|project| ProjectInfo {
+            local_host_id: host.clone(),
+            project,
+        }));
+        sort_project_infos(projects);
+    });
+    state.mcp_servers_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for mcp_server in payload.mcp_servers {
+            inner.insert(mcp_server.id.clone(), mcp_server);
+        }
+    });
+    state.skills_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for skill in payload.skills {
+            inner.insert(skill.id.clone(), skill);
+        }
+    });
+    state.steering_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for steering in payload.steering {
+            inner.insert(steering.id.clone(), steering);
+        }
+    });
+    state.custom_agents_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for custom_agent in payload.custom_agents {
+            inner.insert(custom_agent.id.clone(), custom_agent);
+        }
+    });
+    state.team_preset_catalog_by_host.update(|map| {
+        map.insert(host.clone(), payload.team_preset_catalog);
+    });
+    state.team_drafts_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for draft in payload.team_drafts {
+            inner.insert(draft.id.clone(), draft);
+        }
+    });
+    state.teams_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for team in payload.teams {
+            inner.insert(team.id.clone(), team);
+        }
+    });
+    state.team_members_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for member in payload.team_members {
+            inner.insert(member.id.clone(), member);
+        }
+    });
+    state.team_bindings_by_host.update(|outer| {
+        let inner = outer.entry(host.clone()).or_default();
+        inner.clear();
+        for binding in payload.team_member_bindings {
+            inner.insert(binding.member_id.clone(), binding);
+        }
+    });
+
+    let snapshot_ids: HashSet<AgentId> =
+        payload.agents.iter().map(|p| p.agent_id.clone()).collect();
+    state.agents.update(|agents| {
+        agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
+        for payload in payload.agents {
+            let mut info = agent_info_from_payload(host, payload);
+            if let Some(existing) = agents
+                .iter_mut()
+                .find(|a| a.local_host_id == *host && a.agent_id == info.agent_id)
+            {
+                // `agent_info_from_payload` zeroes runtime-only fields
+                // (`started`, `fatal_error`) because `NewAgentPayload`
+                // doesn't carry them. Preserve whatever the live event
+                // stream had set on the existing entry so a bootstrap
+                // re-application doesn't reset an already-started agent
+                // to `started: false`.
+                info.started = existing.started;
+                info.fatal_error = existing.fatal_error.clone();
+                *existing = info;
+            } else {
+                agents.push(info);
+            }
+        }
+    });
+}
+
+fn agent_info_from_payload(host: &LocalHostId, payload: NewAgentPayload) -> AgentInfo {
+    AgentInfo {
+        local_host_id: host.clone(),
+        agent_id: payload.agent_id,
+        name: payload.name,
+        origin: payload.origin,
+        backend_kind: payload.backend_kind,
+        workspace_roots: payload.workspace_roots,
+        project_id: payload.project_id,
+        parent_agent_id: payload.parent_agent_id,
+        custom_agent_id: payload.custom_agent_id,
+        created_at_ms: payload.created_at_ms,
+        instance_stream: payload.instance_stream,
+        started: false,
+        fatal_error: None,
+    }
+}
+
+fn apply_agent_bootstrap(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: AgentBootstrapPayload,
+) {
+    let Some(agent_ref) = resolve_agent_ref(state, host, stream) else {
+        log::warn!("agent_bootstrap on unknown stream host={host} stream={stream}");
+        return;
+    };
+    log::info!(
+        "dispatch agent_bootstrap host={} stream={} agent_id={} events={}",
+        host,
+        stream,
+        agent_ref.agent_id,
+        payload.events.len()
+    );
+    // Replace prior per-agent chat/stream/queue/task state so the bootstrap
+    // snapshot is authoritative.
+    state.chat_messages.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.streaming_text.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.agent_turn_active.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.transient_events.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.task_lists.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.agent_message_queue.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.agent_session_settings.update(|m| {
+        m.remove(&agent_ref);
+    });
+
+    for event in payload.events {
+        match event {
+            AgentBootstrapEvent::AgentStart(_) => {
+                state.agents.update(|agents| {
+                    if let Some(agent) = agents
+                        .iter_mut()
+                        .find(|a| a.local_host_id == *host && a.agent_id == agent_ref.agent_id)
+                    {
+                        agent.started = true;
+                    }
+                });
+            }
+            AgentBootstrapEvent::AgentError(inner) => {
+                if inner.fatal {
+                    state.agents.update(|agents| {
+                        if let Some(agent) = agents
+                            .iter_mut()
+                            .find(|a| a.local_host_id == *host && a.agent_id == agent_ref.agent_id)
+                        {
+                            agent.fatal_error = Some(inner.message.clone());
+                        }
+                    });
+                }
+                let entry = ChatMessageEntry {
+                    message: protocol::ChatMessage {
+                        timestamp: js_sys::Date::now() as u64,
+                        sender: protocol::MessageSender::Error,
+                        content: inner.message,
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                    tool_requests: Vec::new(),
+                };
+                state.chat_messages.update(|map| {
+                    map.entry(agent_ref.clone()).or_default().push(entry);
+                });
+            }
+            AgentBootstrapEvent::SessionSettings(inner) => {
+                state.agent_session_settings.update(|map| {
+                    map.insert(agent_ref.clone(), inner.values);
+                });
+            }
+            AgentBootstrapEvent::QueuedMessages(inner) => {
+                state.agent_message_queue.update(|map| {
+                    map.insert(agent_ref.clone(), inner.messages);
+                });
+            }
+            AgentBootstrapEvent::ChatEvent(event) => {
+                apply_chat_event(state, &agent_ref, event);
+            }
+        }
+    }
+}
+
+fn apply_project_bootstrap(
+    state: &AppState,
+    host: &LocalHostId,
+    project_id: ProjectId,
+    payload: ProjectBootstrapPayload,
+) {
+    log::info!(
+        "dispatch project_bootstrap host={} project_id={} reviews={}",
+        host,
+        project_id,
+        payload.review_summaries.len()
+    );
+    state.projects.update(|projects| {
+        if let Some(existing) = projects
+            .iter_mut()
+            .find(|e| e.local_host_id == *host && e.project.id == payload.project.id)
+        {
+            existing.project = payload.project;
+        } else {
+            projects.push(ProjectInfo {
+                local_host_id: host.clone(),
+                project: payload.project,
+            });
+            sort_project_infos(projects);
+        }
+    });
+    // The bootstrap file_list is a full snapshot — drop any prior entries
+    // for this project before re-applying so we don't merge stale paths.
+    state.file_tree.update(|file_tree| {
+        file_tree.remove(&(host.clone(), project_id.clone()));
+        apply_project_file_list(file_tree, host, project_id.clone(), payload.file_list);
+    });
+    state.git_status.update(|git_status| {
+        git_status.insert((host.clone(), project_id.clone()), payload.git_status.roots);
+    });
+    state.review_summaries.update(|map| {
+        map.insert((host.clone(), project_id), payload.review_summaries);
+    });
+}
+
+fn apply_review_bootstrap(
+    state: &AppState,
+    host: &LocalHostId,
+    review_id: ReviewId,
+    payload: ReviewBootstrapPayload,
+) {
+    log::info!(
+        "dispatch review_bootstrap host={} review={} comments={} suggestions={}",
+        host,
+        review_id,
+        payload.review.comments.len(),
+        payload.review.suggestions.len(),
+    );
+    apply_review_event(
+        state,
+        host,
+        review_id,
+        ReviewEventPayload::Snapshot {
+            review: payload.review,
+        },
+    );
+}
+
+fn apply_browse_bootstrap(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: BrowseBootstrapPayload,
+) {
+    log::info!("dispatch browse_bootstrap host={} stream={}", host, stream);
+    let key = (host.clone(), stream.clone());
+    state.host_browses.update(|browses| {
+        let session = browses
+            .entry(key.clone())
+            .or_insert_with(|| HostBrowseSession {
+                local_host_id: host.clone(),
+                stream: stream.clone(),
+                opened: None,
+                entries_by_path: HashMap::new(),
+                latest_error: None,
+            });
+        session.opened = Some(payload.opened);
+        match payload.listing {
+            BrowseBootstrapListing::Entries { entries } => {
+                session.latest_error = None;
+                session
+                    .entries_by_path
+                    .insert(entries.path.clone(), entries);
+            }
+            BrowseBootstrapListing::Error { error } => {
+                session.latest_error = Some(error);
+            }
+        }
+    });
+}
+
 fn chat_event_label(event: &ChatEvent) -> &'static str {
     match event {
         ChatEvent::TypingStatusChanged(_) => "TypingStatusChanged",
@@ -1301,20 +1787,45 @@ mod wasm_tests {
     use leptos::prelude::{GetUntracked, WithUntracked};
     use protocol::{
         AgentId, DiffContextMode, Envelope, FrameKind, HostAbsPath, HostBrowseOpenedPayload,
-        HostPlatform, ProjectDiffScope, ProjectFileContentsPayload, ProjectGitDiffPayload,
-        ProjectId, ProjectPath, ProjectRootPath, ReviewAiReviewerState, ReviewAiReviewerStatus,
-        ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection,
-        ReviewEventPayload, ReviewId, ReviewStatus, StreamPath, TeamCompactNotifyPayload,
-        TeamCompactStatus, TeamId, TeamMemberId,
+        HostPlatform, ListSessionsPayload, ProjectDiffScope, ProjectFileContentsPayload,
+        ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootPath, ReviewAiReviewerState,
+        ReviewAiReviewerStatus, ReviewComment, ReviewCommentId, ReviewCommentSource,
+        ReviewDiffSelection, ReviewEventPayload, ReviewId, ReviewStatus, StreamPath,
+        TeamCompactNotifyPayload, TeamCompactStatus, TeamId, TeamMemberId,
     };
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    /// Use only by tests that want the validator state to be unprimed
+    /// (e.g. seq-mismatch tests where the first frame must hit the
+    /// raw FrontendSeqValidator). Most tests should call `primed_host`.
     fn host(id: &str) -> LocalHostId {
         let host = LocalHostId(id.to_owned());
         reset_inbound_seq_for_host(&host);
         host
+    }
+
+    fn primed_host(state: &AppState, id: &str) -> LocalHostId {
+        let host = LocalHostId(id.to_owned());
+        prime_host_for_tests(state, &host);
+        host
+    }
+
+    /// Dispatch a synthetic `AgentBootstrap` so subsequent dispatches on
+    /// the given agent instance stream pass the bootstrap-first check,
+    /// then rewind the per-stream seq counter so the test's first
+    /// envelope on that stream can use seq 0.
+    fn prime_agent_stream(state: &AppState, host: &LocalHostId, stream: &StreamPath) {
+        let bootstrap = protocol::AgentBootstrapPayload { events: Vec::new() };
+        let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
+            .expect("synthetic AgentBootstrap");
+        dispatch_envelope(state, host, env);
+        INBOUND_SEQ.with(|v| {
+            v.borrow_mut()
+                .expected
+                .remove(&(host.clone(), stream.clone()));
+        });
     }
 
     fn envelope<T: serde::Serialize>(
@@ -1359,13 +1870,37 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn dispatch_project_file_and_diff_updates_host_keyed_state() {
         let state = AppState::new();
-        let host = host("mobile-project-foundation");
+        let host = primed_host(&state, "mobile-project-foundation");
         let project_id = ProjectId("project-a".to_owned());
         let root = ProjectRootPath("/repo".to_owned());
         let path = ProjectPath {
             root: root.clone(),
             relative_path: "src/lib.rs".to_owned(),
         };
+        // ProjectBootstrap is required as the first frame on a /project/ stream.
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/project/project-a",
+                FrameKind::ProjectBootstrap,
+                0,
+                &protocol::ProjectBootstrapPayload {
+                    project: protocol::Project {
+                        id: project_id.clone(),
+                        name: "project-a".to_owned(),
+                        roots: vec![root.0.clone()],
+                        sort_order: 0,
+                    },
+                    file_list: ProjectFileListPayload {
+                        incremental: false,
+                        roots: Vec::new(),
+                    },
+                    git_status: ProjectGitStatusPayload { roots: Vec::new() },
+                    review_summaries: Vec::new(),
+                },
+            ),
+        );
 
         dispatch_envelope(
             &state,
@@ -1373,7 +1908,7 @@ mod wasm_tests {
             envelope(
                 "/project/project-a",
                 FrameKind::ProjectFileContents,
-                0,
+                1,
                 &ProjectFileContentsPayload {
                     path: path.clone(),
                     contents: Some("fn main() {}".to_owned()),
@@ -1387,7 +1922,7 @@ mod wasm_tests {
             envelope(
                 "/project/project-a",
                 FrameKind::ProjectGitDiff,
-                1,
+                2,
                 &ProjectGitDiffPayload {
                     root: root.clone(),
                     scope: ProjectDiffScope::Uncommitted,
@@ -1419,7 +1954,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn dispatch_review_snapshot_and_comment_delta() {
         let state = AppState::new();
-        let host = host("mobile-review-foundation");
+        let host = primed_host(&state, "mobile-review-foundation");
         let review_id = ReviewId("review-a".to_owned());
         let review = protocol::Review {
             id: review_id.clone(),
@@ -1445,9 +1980,9 @@ mod wasm_tests {
             &host,
             envelope(
                 "/review/review-a",
-                FrameKind::ReviewEvent,
+                FrameKind::ReviewBootstrap,
                 0,
-                &ReviewEventPayload::Snapshot { review },
+                &protocol::ReviewBootstrapPayload { review },
             ),
         );
         dispatch_envelope(
@@ -1491,7 +2026,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn compaction_completion_preserves_active_chat_and_tap_target() {
         let state = AppState::new();
-        let host = host("mobile-compaction-navigation");
+        let host = primed_host(&state, "mobile-compaction-navigation");
         let old_agent_id = AgentId("old-agent".to_owned());
         let new_agent_id = AgentId("new-agent".to_owned());
 
@@ -1499,7 +2034,7 @@ mod wasm_tests {
             &state,
             &host,
             envelope(
-                "/host/h",
+                "/host/mobile-compaction-navigation",
                 FrameKind::NewAgent,
                 0,
                 &protocol::NewAgentPayload {
@@ -1517,6 +2052,11 @@ mod wasm_tests {
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
                 },
             ),
+        );
+        prime_agent_stream(
+            &state,
+            &host,
+            &StreamPath("/agent/old-agent/inst".to_owned()),
         );
         assert_eq!(
             state.active_agent.get_untracked(),
@@ -1548,7 +2088,7 @@ mod wasm_tests {
             &state,
             &host,
             envelope(
-                "/host/h",
+                "/host/mobile-compaction-navigation",
                 FrameKind::NewAgent,
                 1,
                 &protocol::NewAgentPayload {
@@ -1620,7 +2160,7 @@ mod wasm_tests {
             &state,
             &host,
             envelope(
-                "/host/h",
+                "/host/mobile-compaction-navigation",
                 FrameKind::AgentClosed,
                 2,
                 &protocol::AgentClosedPayload {
@@ -1641,13 +2181,13 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn dispatch_team_browse_and_compaction_foundation() {
         let state = AppState::new();
-        let host = host("mobile-team-browse-foundation");
+        let host = primed_host(&state, "mobile-team-browse-foundation");
 
         dispatch_envelope(
             &state,
             &host,
             envelope(
-                "/host/h",
+                "/host/mobile-team-browse-foundation",
                 FrameKind::TeamCompactNotify,
                 0,
                 &TeamCompactNotifyPayload {
@@ -1673,13 +2213,38 @@ mod wasm_tests {
                 .is_some_and(|teams| teams.contains_key(&TeamId("team-a".to_owned())))
         }));
 
+        // BrowseBootstrap must be the first frame on a /browse/ stream.
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/browse/browse-a",
+                FrameKind::BrowseBootstrap,
+                0,
+                &protocol::BrowseBootstrapPayload {
+                    opened: HostBrowseOpenedPayload {
+                        home: HostAbsPath("/Users/mike".to_owned()),
+                        root: HostAbsPath("/".to_owned()),
+                        separator: '/',
+                        platform: HostPlatform::Macos,
+                    },
+                    listing: protocol::BrowseBootstrapListing::Entries {
+                        entries: protocol::HostBrowseEntriesPayload {
+                            path: HostAbsPath("/".to_owned()),
+                            parent: None,
+                            entries: Vec::new(),
+                        },
+                    },
+                },
+            ),
+        );
         dispatch_envelope(
             &state,
             &host,
             envelope(
                 "/browse/browse-a",
                 FrameKind::HostBrowseOpened,
-                0,
+                1,
                 &HostBrowseOpenedPayload {
                     home: HostAbsPath("/Users/mike".to_owned()),
                     root: HostAbsPath("/".to_owned()),
@@ -1694,5 +2259,241 @@ mod wasm_tests {
                 .and_then(|session| session.opened.as_ref())
                 .is_some()
         }));
+    }
+
+    #[wasm_bindgen_test]
+    fn host_bootstrap_applies_sessions_projects_and_agents() {
+        let state = AppState::new();
+        let host = LocalHostId("mobile-host-bootstrap".to_owned());
+        reset_inbound_seq_for_host(&host);
+
+        // Welcome at seq 0 + HostBootstrap at seq 1 carry the initial
+        // host snapshot — no separate ListSessions, ProjectNotify, etc.
+        // is required.
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-host-bootstrap",
+                FrameKind::Welcome,
+                0,
+                &protocol::WelcomePayload {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    tyde_version: protocol::TYDE_VERSION,
+                },
+            ),
+        );
+        let session = protocol::SessionSummary {
+            id: protocol::SessionId("sess-1".to_owned()),
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            alias: None,
+            user_alias: None,
+            parent_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            message_count: 0,
+            token_count: None,
+            resumable: true,
+            compacted_from_session_id: None,
+            compacted_to_session_id: None,
+            compacted_at_ms: None,
+            compaction_summary_preview: None,
+        };
+        let project = protocol::Project {
+            id: ProjectId("p-1".to_owned()),
+            name: "Project One".to_owned(),
+            roots: vec!["/repo".to_owned()],
+            sort_order: 0,
+        };
+        let agent_payload = protocol::NewAgentPayload {
+            agent_id: AgentId("a-1".to_owned()),
+            name: "Agent One".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 1,
+            instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
+        };
+        let bootstrap = protocol::HostBootstrapPayload {
+            settings: protocol::HostSettings {
+                enabled_backends: vec![protocol::BackendKind::Codex],
+                default_backend: Some(protocol::BackendKind::Codex),
+                enable_mobile_connections: false,
+                mobile_broker_url: None,
+                tyde_debug_mcp_enabled: false,
+                tyde_agent_control_mcp_enabled: true,
+            },
+            mobile_access: protocol::MobileAccessStatePayload {
+                broker_status: protocol::MobileBrokerStatus::Disabled,
+                pairing: protocol::MobilePairingState::Idle,
+                paired_devices: Vec::new(),
+            },
+            backend_setup: protocol::BackendSetupPayload {
+                backends: Vec::new(),
+            },
+            session_schemas: Vec::new(),
+            sessions: vec![session.clone()],
+            projects: vec![project.clone()],
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            steering: Vec::new(),
+            custom_agents: Vec::new(),
+            team_preset_catalog: protocol::TeamPresetCatalog {
+                role_presets: Vec::new(),
+                personality_traits: Vec::new(),
+                personality_presets: Vec::new(),
+                team_templates: Vec::new(),
+            },
+            team_drafts: Vec::new(),
+            teams: Vec::new(),
+            team_members: Vec::new(),
+            team_member_bindings: Vec::new(),
+            agents: vec![agent_payload.clone()],
+        };
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-host-bootstrap",
+                FrameKind::HostBootstrap,
+                1,
+                &bootstrap,
+            ),
+        );
+
+        // Session list is populated for this host without any
+        // ListSessions roundtrip.
+        let sessions = state.sessions.get_untracked();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].summary.id, session.id);
+        assert_eq!(sessions[0].local_host_id, host);
+
+        // Projects landed in the per-host list.
+        let projects = state.projects.get_untracked();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project.id, project.id);
+
+        // Agent landed in state.agents without auto-focus (the
+        // HostBootstrap path must not run NewAgent's auto-open logic).
+        let agents = state.agents.get_untracked();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_id, agent_payload.agent_id);
+        assert!(
+            state.active_agent.get_untracked().is_none(),
+            "HostBootstrap-delivered agent must not steal active_agent"
+        );
+
+        // Host settings landed for this host.
+        let settings = state
+            .host_settings_by_host
+            .with_untracked(|m| m.get(&host).cloned());
+        assert!(
+            settings.is_some_and(|s| s.default_backend == Some(protocol::BackendKind::Codex)),
+            "HostBootstrap should set host settings"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn agent_bootstrap_replays_inner_events_through_chat_reducer() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-agent-bootstrap");
+        let agent_id = AgentId("a-1".to_owned());
+        let instance_stream = StreamPath("/agent/a-1/inst".to_owned());
+
+        // Register the agent so resolve_agent_ref finds it for the
+        // AgentBootstrap dispatch.
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-agent-bootstrap",
+                FrameKind::NewAgent,
+                0,
+                &protocol::NewAgentPayload {
+                    agent_id: agent_id.clone(),
+                    name: "Agent One".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    workspace_roots: Vec::new(),
+                    custom_agent_id: None,
+                    team_id: None,
+                    team_member_id: None,
+                    project_id: None,
+                    parent_agent_id: None,
+                    created_at_ms: 1,
+                    instance_stream: instance_stream.clone(),
+                },
+            ),
+        );
+
+        let agent_start = protocol::AgentStartPayload {
+            agent_id: agent_id.clone(),
+            name: "Agent One".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 1,
+        };
+        let chat_event = protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+            timestamp: 2,
+            sender: protocol::MessageSender::User,
+            content: "Hello".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        });
+        let bootstrap = protocol::AgentBootstrapPayload {
+            events: vec![
+                protocol::AgentBootstrapEvent::AgentStart(agent_start),
+                protocol::AgentBootstrapEvent::ChatEvent(chat_event),
+            ],
+        };
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                instance_stream.0.as_str(),
+                FrameKind::AgentBootstrap,
+                0,
+                &bootstrap,
+            ),
+        );
+
+        // AgentStart was replayed → started=true.
+        let started = state
+            .agents
+            .with_untracked(|agents| agents.iter().any(|a| a.agent_id == agent_id && a.started));
+        assert!(
+            started,
+            "AgentStart inside bootstrap should mark agent started"
+        );
+
+        // ChatEvent::MessageAdded was replayed through the same reducer
+        // as a live ChatEvent → chat_messages has the entry.
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id,
+        };
+        let msgs = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).cloned())
+            .unwrap_or_default();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message.content, "Hello");
     }
 }

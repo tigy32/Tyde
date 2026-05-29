@@ -1022,3 +1022,7 @@ End-to-end (`tests/tests/review_e2e.rs`):
   block in the same view).
 - More precise virtualized rendering/measurement for variable-height inline
   comment threads.
+
+---
+
+Protocol v4 note: review streams start with `review_bootstrap` seq 0 carrying the current review snapshot. Later review changes remain `review_event` deltas. Project-level review summaries are part of `project_bootstrap`.

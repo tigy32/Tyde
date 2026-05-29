@@ -605,3 +605,7 @@ Not part of the first version:
 
 Those can come later, but this stream should first provide a clean typed model
 for browse, read, status, diff, and staging.
+
+---
+
+Protocol v4 note: every project stream starts with `project_bootstrap` seq 0 containing the project, initial file list, initial git status, and review summaries. Granular project events are live deltas after that bootstrap.

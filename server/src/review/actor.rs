@@ -6,10 +6,11 @@ use protocol::{
     AgentId, DiffContextMode, FrameKind, MessageOrigin, Project, ProjectDiffScope,
     ProjectGitDiffFile, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
     ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerState,
-    ReviewAiReviewerStatus, ReviewAnchor, ReviewComment, ReviewCommentId, ReviewCommentSource,
-    ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload,
-    ReviewEventPayload, ReviewId, ReviewLocation, ReviewStatus, ReviewSuggestedComment,
-    ReviewSuggestionId, ReviewSuggestionState, SendMessagePayload, StreamPath,
+    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewComment, ReviewCommentId,
+    ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewErrorContext,
+    ReviewErrorPayload, ReviewEventPayload, ReviewId, ReviewLocation, ReviewStatus,
+    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, SendMessagePayload,
+    StreamPath,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -285,13 +286,13 @@ impl ReviewActor {
             "subscribing review stream"
         );
         self.refresh_diffs().await?;
-        self.send_to_stream(
-            &stream,
-            ReviewEventPayload::Snapshot {
-                review: self.review.clone(),
-            },
-        )
-        .await?;
+        let payload = serde_json::to_value(ReviewBootstrapPayload {
+            review: self.review.clone(),
+        })
+        .map_err(|error| format!("failed to serialize ReviewBootstrap payload: {error}"))?;
+        stream
+            .send_value(FrameKind::ReviewBootstrap, payload)
+            .map_err(|_| "review stream closed".to_owned())?;
         self.subscribers.insert(conn, stream);
         tracing::debug!(
             review_id = %self.review.id,

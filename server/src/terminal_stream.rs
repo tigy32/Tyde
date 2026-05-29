@@ -1,12 +1,13 @@
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use protocol::{
-    FrameKind, NewTerminalPayload, ProjectId, ProjectRootPath, TerminalErrorCode,
-    TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
-    TerminalSendPayload, TerminalStartPayload,
+    FrameKind, NewTerminalPayload, ProjectId, ProjectRootPath, TerminalBootstrapPayload,
+    TerminalErrorCode, TerminalErrorPayload, TerminalExitPayload, TerminalId,
+    TerminalOutputPayload, TerminalSendPayload, TerminalStartPayload,
 };
 use tokio::sync::{Notify, mpsc};
 
@@ -28,6 +29,8 @@ pub(crate) struct TerminalHandle {
     start: TerminalStartPayload,
     state: Arc<TerminalState>,
     event_tx: mpsc::UnboundedSender<TerminalEvent>,
+    startup: Arc<Mutex<Option<TerminalIoStartup>>>,
+    io_started: Arc<AtomicBool>,
 }
 
 struct TerminalState {
@@ -52,6 +55,11 @@ struct CreatedTerminalSession {
     shell: String,
 }
 
+struct TerminalIoStartup {
+    reader: Box<dyn Read + Send>,
+    event_rx: mpsc::UnboundedReceiver<TerminalEvent>,
+}
+
 impl TerminalHandle {
     pub(crate) fn new_terminal_payload(&self) -> NewTerminalPayload {
         NewTerminalPayload {
@@ -60,10 +68,16 @@ impl TerminalHandle {
         }
     }
 
-    pub(crate) async fn emit_start(&self) -> Result<(), StreamClosed> {
-        let payload =
-            serde_json::to_value(&self.start).expect("failed to serialize terminal start payload");
-        self.stream.send_value(FrameKind::TerminalStart, payload)
+    pub(crate) async fn emit_bootstrap_and_start_io(&self) -> Result<(), StreamClosed> {
+        let payload = serde_json::to_value(TerminalBootstrapPayload {
+            terminal_id: self.id.clone(),
+            start: self.start.clone(),
+        })
+        .expect("failed to serialize terminal bootstrap payload");
+        self.stream
+            .send_value(FrameKind::TerminalBootstrap, payload)?;
+        self.start_io();
+        Ok(())
     }
 
     pub(crate) async fn send(&self, payload: TerminalSendPayload) {
@@ -182,6 +196,54 @@ impl TerminalHandle {
     fn emit_error(&self, payload: TerminalErrorPayload) {
         let _ = self.event_tx.send(TerminalEvent::Error(payload));
     }
+
+    fn start_io(&self) {
+        if self.io_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let startup = self
+            .startup
+            .lock()
+            .expect("terminal startup lock poisoned")
+            .take();
+        let Some(TerminalIoStartup {
+            reader,
+            mut event_rx,
+        }) = startup
+        else {
+            return;
+        };
+
+        let sender_stream = self.stream.clone();
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                let result = match event {
+                    TerminalEvent::Output(payload) => {
+                        send_terminal_payload(&sender_stream, FrameKind::TerminalOutput, &payload)
+                            .await
+                    }
+                    TerminalEvent::Exit(payload) => {
+                        send_terminal_payload(&sender_stream, FrameKind::TerminalExit, &payload)
+                            .await
+                    }
+                    TerminalEvent::Error(payload) => {
+                        send_terminal_payload(&sender_stream, FrameKind::TerminalError, &payload)
+                            .await
+                    }
+                };
+
+                if result.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let state = Arc::clone(&self.state);
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            read_terminal_output(reader, state, event_tx);
+        });
+    }
 }
 
 impl TerminalState {
@@ -220,28 +282,7 @@ pub(crate) async fn create_terminal(
         exit: Mutex::new(None),
         exit_notify: Notify::new(),
     });
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-
-    let sender_stream = stream.clone();
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            let result = match event {
-                TerminalEvent::Output(payload) => {
-                    send_terminal_payload(&sender_stream, FrameKind::TerminalOutput, &payload).await
-                }
-                TerminalEvent::Exit(payload) => {
-                    send_terminal_payload(&sender_stream, FrameKind::TerminalExit, &payload).await
-                }
-                TerminalEvent::Error(payload) => {
-                    send_terminal_payload(&sender_stream, FrameKind::TerminalError, &payload).await
-                }
-            };
-
-            if result.is_err() {
-                return;
-            }
-        }
-    });
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let handle = TerminalHandle {
         id: terminal_id,
@@ -257,11 +298,12 @@ pub(crate) async fn create_terminal(
         stream,
         state: Arc::clone(&state),
         event_tx: event_tx.clone(),
+        startup: Arc::new(Mutex::new(Some(TerminalIoStartup {
+            reader: created.reader,
+            event_rx,
+        }))),
+        io_started: Arc::new(AtomicBool::new(false)),
     };
-
-    std::thread::spawn(move || {
-        read_terminal_output(created.reader, state, event_tx);
-    });
 
     Ok(handle)
 }

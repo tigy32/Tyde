@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode, CommandErrorPayload,
-    DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
-    ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review,
-    ReviewActionPayload, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor,
-    ReviewCommentId, ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide,
-    ReviewErrorCode, ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
+    AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode,
+    CommandErrorPayload, DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender,
+    NewAgentPayload, Project, ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload,
+    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
+    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
+    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewCommentId,
+    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
+    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
     ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, SessionId,
     SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
@@ -62,8 +63,21 @@ async fn expect_agent_start(
 ) -> AgentStartPayload {
     loop {
         let env = next_env(client, "agent start").await;
-        if env.kind == FrameKind::AgentStart && env.stream == *stream {
-            return env.parse_payload().expect("agent start payload");
+        if env.stream != *stream {
+            continue;
+        }
+        match env.kind {
+            FrameKind::AgentStart => return env.parse_payload().expect("agent start payload"),
+            FrameKind::AgentBootstrap => {
+                let bootstrap: protocol::AgentBootstrapPayload =
+                    env.parse_payload().expect("agent bootstrap payload");
+                for event in bootstrap.events {
+                    if let AgentBootstrapEvent::AgentStart(start) = event {
+                        return start;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -174,9 +188,13 @@ async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId)
         .review_subscribe(review_id, ReviewSubscribePayload::default())
         .await
         .expect("review subscribe");
-    match expect_review_event(client, "review subscribe snapshot").await {
-        ReviewEventPayload::Snapshot { review } => review,
-        other => panic!("expected subscribe snapshot, got {other:?}"),
+    loop {
+        let env = next_env(client, "review subscribe bootstrap").await;
+        if env.kind == FrameKind::ReviewBootstrap {
+            let bootstrap: ReviewBootstrapPayload =
+                env.parse_payload().expect("review bootstrap payload");
+            return bootstrap.review;
+        }
     }
 }
 
@@ -233,6 +251,21 @@ async fn spawn_project_agent_with_prompt(
     while !saw_start || !saw_idle || session_id.is_none() {
         let env = next_env(client, "origin agent startup").await;
         match env.kind {
+            FrameKind::AgentBootstrap if env.stream == new_agent.instance_stream => {
+                let bootstrap: protocol::AgentBootstrapPayload =
+                    env.parse_payload().expect("agent bootstrap payload");
+                for event in bootstrap.events {
+                    match event {
+                        AgentBootstrapEvent::AgentStart(_) => {
+                            saw_start = true;
+                        }
+                        AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)) => {
+                            saw_idle = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             FrameKind::AgentStart if env.stream == new_agent.instance_stream => {
                 let _: AgentStartPayload = env.parse_payload().expect("agent start payload");
                 saw_start = true;
@@ -392,9 +425,13 @@ async fn create_review(
         )
         .await
         .expect("review create");
-    match expect_review_event(client, "review snapshot").await {
-        ReviewEventPayload::Snapshot { review } => review,
-        other => panic!("expected review snapshot, got {other:?}"),
+    loop {
+        let env = next_env(client, "review bootstrap").await;
+        if env.kind == FrameKind::ReviewBootstrap {
+            let bootstrap: ReviewBootstrapPayload =
+                env.parse_payload().expect("review bootstrap payload");
+            return bootstrap.review;
+        }
     }
 }
 

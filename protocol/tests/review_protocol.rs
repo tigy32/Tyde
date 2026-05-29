@@ -14,6 +14,23 @@ where
     assert_eq!(&decoded, value);
 }
 
+fn round_trip_json<T>(value: &T)
+where
+    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let json = serde_json::to_string(value).expect("serialize value");
+    let decoded: T = serde_json::from_str(&json).expect("deserialize value");
+    assert_eq!(&decoded, value);
+}
+
+fn round_trip_json_without_eq<T>(value: &T)
+where
+    T: Serialize + DeserializeOwned,
+{
+    let json = serde_json::to_string(value).expect("serialize value");
+    let _: T = serde_json::from_str(&json).expect("deserialize value");
+}
+
 fn review_id() -> ReviewId {
     ReviewId("review-1".to_owned())
 }
@@ -409,9 +426,139 @@ fn new_frame_kinds_and_project_diff_scope_use_snake_case() {
     assert_eq!(FrameKind::ReviewAction.to_string(), "review_action");
     assert_eq!(FrameKind::ReviewEvent.to_string(), "review_event");
     assert_eq!(FrameKind::ReviewSubscribe.to_string(), "review_subscribe");
+    assert_eq!(FrameKind::HostBootstrap.to_string(), "host_bootstrap");
+    assert_eq!(FrameKind::AgentBootstrap.to_string(), "agent_bootstrap");
+    assert_eq!(FrameKind::ProjectBootstrap.to_string(), "project_bootstrap");
+    assert_eq!(FrameKind::ReviewBootstrap.to_string(), "review_bootstrap");
+    assert_eq!(FrameKind::BrowseBootstrap.to_string(), "browse_bootstrap");
+    assert_eq!(
+        FrameKind::TerminalBootstrap.to_string(),
+        "terminal_bootstrap"
+    );
     round_trip(&ReviewSubscribePayload::default());
     assert_eq!(
         serde_json::to_value(ProjectDiffScope::Uncommitted).expect("serialize diff scope"),
         json!("uncommitted")
     );
+}
+
+#[test]
+fn bootstrap_payloads_round_trip() {
+    round_trip_json(&HostBootstrapPayload {
+        settings: HostSettings {
+            enabled_backends: vec![BackendKind::Claude],
+            default_backend: Some(BackendKind::Claude),
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: true,
+        },
+        mobile_access: MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::Disabled,
+            pairing: MobilePairingState::Idle,
+            paired_devices: vec![],
+        },
+        backend_setup: BackendSetupPayload { backends: vec![] },
+        session_schemas: vec![],
+        sessions: vec![SessionSummary {
+            id: session_id(),
+            backend_kind: BackendKind::Claude,
+            workspace_roots: vec!["/repo".to_owned()],
+            project_id: Some(project_id()),
+            alias: Some("Work".to_owned()),
+            user_alias: None,
+            parent_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            message_count: 3,
+            token_count: Some(4),
+            resumable: true,
+            compacted_from_session_id: None,
+            compacted_to_session_id: None,
+            compacted_at_ms: None,
+            compaction_summary_preview: None,
+        }],
+        projects: vec![Project {
+            id: project_id(),
+            name: "Repo".to_owned(),
+            roots: vec!["/repo".to_owned()],
+            sort_order: 0,
+        }],
+        mcp_servers: vec![],
+        skills: vec![],
+        steering: vec![],
+        custom_agents: vec![],
+        team_preset_catalog: TeamPresetCatalog {
+            role_presets: vec![],
+            personality_traits: vec![],
+            personality_presets: vec![],
+            team_templates: vec![],
+        },
+        team_drafts: vec![],
+        teams: vec![],
+        team_members: vec![],
+        team_member_bindings: vec![],
+        agents: vec![NewAgentPayload {
+            agent_id: agent_id(),
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: vec!["/repo".to_owned()],
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: Some(project_id()),
+            parent_agent_id: None,
+            created_at_ms: 1,
+            instance_stream: StreamPath("/agent/agent-1/instance-1".to_owned()),
+        }],
+    });
+
+    round_trip_json_without_eq(&AgentBootstrapPayload {
+        events: vec![AgentBootstrapEvent::ChatEvent(
+            ChatEvent::TypingStatusChanged(true),
+        )],
+    });
+    round_trip_json(&ProjectBootstrapPayload {
+        project: Project {
+            id: project_id(),
+            name: "Repo".to_owned(),
+            roots: vec!["/repo".to_owned()],
+            sort_order: 0,
+        },
+        file_list: ProjectFileListPayload {
+            incremental: false,
+            roots: vec![],
+        },
+        git_status: ProjectGitStatusPayload { roots: vec![] },
+        review_summaries: vec![review_summary()],
+    });
+    round_trip_json(&ReviewBootstrapPayload { review: review() });
+    round_trip_json(&BrowseBootstrapPayload {
+        opened: HostBrowseOpenedPayload {
+            home: HostAbsPath("/home".to_owned()),
+            root: HostAbsPath("/".to_owned()),
+            separator: '/',
+            platform: HostPlatform::Linux,
+        },
+        listing: BrowseBootstrapListing::Entries {
+            entries: HostBrowseEntriesPayload {
+                path: HostAbsPath("/home".to_owned()),
+                parent: Some(HostAbsPath("/".to_owned())),
+                entries: vec![],
+            },
+        },
+    });
+    round_trip_json(&TerminalBootstrapPayload {
+        terminal_id: TerminalId("terminal-1".to_owned()),
+        start: TerminalStartPayload {
+            project_id: None,
+            root: None,
+            cwd: "/repo".to_owned(),
+            shell: "/bin/sh".to_owned(),
+            cols: 80,
+            rows: 24,
+            created_at_ms: 1,
+        },
+    });
 }

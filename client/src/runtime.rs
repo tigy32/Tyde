@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload, ChatEvent,
-    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameError, FrameKind,
-    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerNotifyPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectEventPayload,
+    AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload, AgentStartPayload,
+    BackendSetupPayload, ChatEvent, CommandErrorPayload, CustomAgentNotifyPayload, Envelope,
+    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
+    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
+    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
@@ -16,9 +17,9 @@ use protocol::{
     SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload, StreamPath,
     TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
-    TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
-    TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
-    read_envelope, write_envelope,
+    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
+    TerminalStartPayload, read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -118,6 +119,7 @@ pub struct TerminalCommands {
 }
 
 pub enum HostEvent {
+    HostBootstrap(Box<HostBootstrapPayload>),
     HostSettings(HostSettingsPayload),
     BackendSetup(BackendSetupPayload),
     SessionSchemas(SessionSchemasPayload),
@@ -142,6 +144,7 @@ pub enum HostEvent {
 }
 
 pub enum AgentEvent {
+    Bootstrap(AgentBootstrapPayload),
     Start(AgentStartPayload),
     Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
@@ -151,6 +154,7 @@ pub enum AgentEvent {
 }
 
 pub enum ProjectEvent {
+    Bootstrap(ProjectBootstrapPayload),
     FileList(ProjectFileListPayload),
     GitStatus(ProjectGitStatusPayload),
     FileContents(ProjectFileContentsPayload),
@@ -159,6 +163,7 @@ pub enum ProjectEvent {
 }
 
 pub enum TerminalEvent {
+    Bootstrap(TerminalBootstrapPayload),
     Start(TerminalStartPayload),
     Output(TerminalOutputPayload),
     Exit(TerminalExitPayload),
@@ -271,7 +276,22 @@ impl HostCommands {
         &self,
         project_id: ProjectId,
     ) -> Result<ProjectEndpoint, ClientError> {
-        let stream = StreamPath(format!("/project/{}", project_id.0));
+        let stream = project_stream(&project_id);
+        if let Some(rx) = self.shared.take_pending_project_events(&project_id) {
+            return Ok(ProjectEndpoint {
+                project_id,
+                events: ProjectEvents {
+                    stream: stream.clone(),
+                    shared: self.shared.clone(),
+                    rx,
+                },
+                commands: ProjectCommands {
+                    stream,
+                    shared: self.shared.clone(),
+                },
+            });
+        }
+
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         self.shared
             .register_route(stream.clone(), Route::Project(tx))?;
@@ -421,6 +441,7 @@ impl Drop for TerminalEvents {
 
 struct Shared {
     routes: Mutex<HashMap<StreamPath, Route>>,
+    pending_project_events: Mutex<HashMap<ProjectId, mpsc::Receiver<ProjectEvent>>>,
     write_tx: mpsc::Sender<WriteRequest>,
     _read_task: JoinHandle<()>,
     _write_task: JoinHandle<()>,
@@ -465,6 +486,7 @@ fn spawn_runtime(parts: ConnectedParts) -> HostEndpoint {
 
         Shared {
             routes: Mutex::new(routes),
+            pending_project_events: Mutex::new(HashMap::new()),
             write_tx,
             _read_task: read_task,
             _write_task: write_task,
@@ -497,6 +519,69 @@ impl Shared {
     fn unregister_route(&self, stream: &StreamPath) {
         let mut routes = self.routes.lock().expect("route registry poisoned");
         routes.remove(stream);
+    }
+
+    async fn pre_register_project_endpoint(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), ClientError> {
+        let stream = project_stream(&project_id);
+        {
+            let routes = self.routes.lock().expect("route registry poisoned");
+            if routes.contains_key(&stream) {
+                return Ok(());
+            }
+        }
+
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        {
+            let mut routes = self.routes.lock().expect("route registry poisoned");
+            if routes.contains_key(&stream) {
+                return Ok(());
+            }
+            routes.insert(stream.clone(), Route::Project(tx));
+        }
+        {
+            let mut pending = self
+                .pending_project_events
+                .lock()
+                .expect("pending project registry poisoned");
+            pending.insert(project_id.clone(), rx);
+        }
+
+        if let Err(error) = self.register_writable_stream(stream.clone(), 0).await {
+            self.unregister_route(&stream);
+            self.pending_project_events
+                .lock()
+                .expect("pending project registry poisoned")
+                .remove(&project_id);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn take_pending_project_events(
+        &self,
+        project_id: &ProjectId,
+    ) -> Option<mpsc::Receiver<ProjectEvent>> {
+        self.pending_project_events
+            .lock()
+            .expect("pending project registry poisoned")
+            .remove(project_id)
+    }
+
+    fn remove_pending_project_endpoint(&self, project_id: &ProjectId) {
+        let stream = project_stream(project_id);
+        let removed = self
+            .pending_project_events
+            .lock()
+            .expect("pending project registry poisoned")
+            .remove(project_id)
+            .is_some();
+        if removed {
+            self.unregister_route(&stream);
+        }
     }
 
     async fn register_writable_stream(
@@ -640,6 +725,32 @@ async fn handle_host_envelope(
     shared: Arc<Shared>,
 ) -> bool {
     match envelope.kind {
+        FrameKind::HostBootstrap => {
+            let payload: HostBootstrapPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let agents = payload.agents.clone();
+            let projects = payload.projects.clone();
+            for project in &projects {
+                if shared
+                    .pre_register_project_endpoint(project.id.clone())
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            let _ = host_tx
+                .send(HostEvent::HostBootstrap(Box::new(payload)))
+                .await;
+            for agent in agents {
+                if !emit_new_agent_endpoint(agent, &host_tx, &shared).await {
+                    return false;
+                }
+            }
+            true
+        }
         FrameKind::HostSettings => {
             let payload: HostSettingsPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -685,6 +796,20 @@ async fn handle_host_envelope(
                 Ok(payload) => payload,
                 Err(_) => return false,
             };
+            match &payload {
+                ProjectNotifyPayload::Upsert { project } => {
+                    if shared
+                        .pre_register_project_endpoint(project.id.clone())
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                ProjectNotifyPayload::Delete { project } => {
+                    shared.remove_pending_project_endpoint(&project.id);
+                }
+            }
             let _ = host_tx.send(HostEvent::ProjectNotify(payload)).await;
             true
         }
@@ -803,48 +928,7 @@ async fn handle_host_envelope(
                 Ok(payload) => payload,
                 Err(_) => return false,
             };
-            let stream = payload.instance_stream.clone();
-            let stream_parts = parse_agent_stream(&stream);
-            assert_eq!(
-                payload.agent_id, stream_parts.agent_id,
-                "new_agent payload agent_id {} does not match instance_stream {}",
-                payload.agent_id, stream
-            );
-
-            let (agent_tx, agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
-            if shared
-                .register_route(stream.clone(), Route::Agent(agent_tx))
-                .is_err()
-            {
-                return false;
-            }
-            if shared
-                .register_writable_stream(stream.clone(), 0)
-                .await
-                .is_err()
-            {
-                shared.unregister_route(&stream);
-                return false;
-            }
-
-            let endpoint = AgentEndpoint {
-                info: payload,
-                events: AgentEvents {
-                    stream: stream.clone(),
-                    shared: shared.clone(),
-                    rx: agent_rx,
-                },
-                commands: AgentCommands {
-                    stream: stream.clone(),
-                    shared: shared.clone(),
-                },
-            };
-            if host_tx.send(HostEvent::NewAgent(endpoint)).await.is_err() {
-                // Host event consumer dropped — unregister the route so the agent
-                // stream doesn't accumulate buffered events with no reader.
-                shared.unregister_route(&stream);
-            }
-            true
+            emit_new_agent_endpoint(payload, &host_tx, &shared).await
         }
         FrameKind::NewTerminal => {
             let payload: NewTerminalPayload = match envelope.parse_payload() {
@@ -903,18 +987,67 @@ async fn handle_host_envelope(
     }
 }
 
+async fn emit_new_agent_endpoint(
+    payload: NewAgentPayload,
+    host_tx: &mpsc::Sender<HostEvent>,
+    shared: &Arc<Shared>,
+) -> bool {
+    let stream = payload.instance_stream.clone();
+    let stream_parts = parse_agent_stream(&stream);
+    assert_eq!(
+        payload.agent_id, stream_parts.agent_id,
+        "new_agent payload agent_id {} does not match instance_stream {}",
+        payload.agent_id, stream
+    );
+
+    let (agent_tx, agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    if shared
+        .register_route(stream.clone(), Route::Agent(agent_tx))
+        .is_err()
+    {
+        return false;
+    }
+    if shared
+        .register_writable_stream(stream.clone(), 0)
+        .await
+        .is_err()
+    {
+        shared.unregister_route(&stream);
+        return false;
+    }
+
+    let endpoint = AgentEndpoint {
+        info: payload,
+        events: AgentEvents {
+            stream: stream.clone(),
+            shared: shared.clone(),
+            rx: agent_rx,
+        },
+        commands: AgentCommands {
+            stream: stream.clone(),
+            shared: shared.clone(),
+        },
+    };
+    if host_tx.send(HostEvent::NewAgent(endpoint)).await.is_err() {
+        shared.unregister_route(&stream);
+    }
+    true
+}
+
 async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
     let Some(RouteRef::Agent(tx)) = shared.route_for(&envelope.stream) else {
         return;
     };
 
     let event = match envelope.kind {
+        FrameKind::AgentBootstrap => {
+            let payload: AgentBootstrapPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            AgentEvent::Bootstrap(payload)
+        }
         FrameKind::AgentStart => {
-            assert_eq!(
-                envelope.seq, 0,
-                "AgentStart must be seq 0 on agent stream {}, got seq {}",
-                envelope.stream, envelope.seq
-            );
             let payload: AgentStartPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
                 Err(_) => return,
@@ -983,12 +1116,23 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
     let _ = tx.send(event).await;
 }
 
+fn project_stream(project_id: &ProjectId) -> StreamPath {
+    StreamPath(format!("/project/{}", project_id.0))
+}
+
 async fn handle_project_envelope(envelope: Envelope, shared: &Arc<Shared>) {
     let Some(RouteRef::Project(tx)) = shared.route_for(&envelope.stream) else {
         return;
     };
 
     let event = match envelope.kind {
+        FrameKind::ProjectBootstrap => {
+            let payload: ProjectBootstrapPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::Bootstrap(payload)
+        }
         FrameKind::ProjectFileList => {
             let payload: ProjectFileListPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -1043,12 +1187,14 @@ async fn handle_terminal_envelope(envelope: Envelope, shared: &Arc<Shared>) {
     };
 
     let event = match envelope.kind {
+        FrameKind::TerminalBootstrap => {
+            let payload: TerminalBootstrapPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            TerminalEvent::Bootstrap(payload)
+        }
         FrameKind::TerminalStart => {
-            assert_eq!(
-                envelope.seq, 0,
-                "TerminalStart must be seq 0 on terminal stream {}, got seq {}",
-                envelope.stream, envelope.seq
-            );
             let payload: TerminalStartPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
                 Err(_) => return,

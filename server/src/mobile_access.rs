@@ -48,15 +48,24 @@ impl MobileAccessHandle {
         Self { tx }
     }
 
-    pub(crate) async fn register_subscriber(&self, stream: Stream) -> Result<(), StreamClosed> {
+    pub(crate) async fn register_bootstrap_subscriber(
+        &self,
+        stream: Stream,
+    ) -> Result<MobileAccessStatePayload, StreamClosed> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(MobileAccessCommand::RegisterSubscriber {
+            .send(MobileAccessCommand::RegisterBootstrapSubscriber {
                 stream,
                 reply: reply_tx,
             })
             .map_err(|_| StreamClosed)?;
         reply_rx.await.map_err(|_| StreamClosed)?
+    }
+
+    pub(crate) fn activate_bootstrap_subscriber(&self, path: StreamPath) {
+        let _ = self
+            .tx
+            .send(MobileAccessCommand::ActivateBootstrapSubscriber { path });
     }
 
     pub(crate) fn unregister_subscriber(&self, path: StreamPath) {
@@ -166,9 +175,12 @@ pub(crate) fn spawn_mobile_access_actor(
 
 pub(crate) enum MobileAccessCommand {
     Shutdown,
-    RegisterSubscriber {
+    RegisterBootstrapSubscriber {
         stream: Stream,
-        reply: oneshot::Sender<Result<(), StreamClosed>>,
+        reply: oneshot::Sender<Result<MobileAccessStatePayload, StreamClosed>>,
+    },
+    ActivateBootstrapSubscriber {
+        path: StreamPath,
     },
     UnregisterSubscriber {
         path: StreamPath,
@@ -282,6 +294,7 @@ pub(crate) struct MobileAccessActor {
     broker_status: MobileBrokerStatus,
     pairing: MobilePairingState,
     subscribers: HashMap<StreamPath, Stream>,
+    bootstrap_subscribers: HashMap<StreamPath, PendingBootstrapSubscriber>,
     active_requester: Option<StreamPath>,
     accept_tasks: HashMap<AcceptTaskKey, JoinHandle<()>>,
     connected_tasks: HashMap<MobileDeviceId, ConnectedMobileTask>,
@@ -293,6 +306,11 @@ pub(crate) struct MobileAccessActor {
 struct ConnectedMobileTask {
     instance_id: u64,
     task: JoinHandle<()>,
+}
+
+struct PendingBootstrapSubscriber {
+    stream: Stream,
+    snapshot: MobileAccessStatePayload,
 }
 
 #[derive(Debug)]
@@ -424,6 +442,7 @@ impl MobileAccessActor {
             broker_status,
             pairing,
             subscribers: HashMap::new(),
+            bootstrap_subscribers: HashMap::new(),
             active_requester: None,
             accept_tasks: HashMap::new(),
             connected_tasks: HashMap::new(),
@@ -444,9 +463,12 @@ impl MobileAccessActor {
                     self.shutdown_runtime_state().await;
                     break;
                 }
-                MobileAccessCommand::RegisterSubscriber { stream, reply } => {
-                    let result = self.register_subscriber(stream).await;
+                MobileAccessCommand::RegisterBootstrapSubscriber { stream, reply } => {
+                    let result = self.register_bootstrap_subscriber(stream).await;
                     let _ = reply.send(result);
+                }
+                MobileAccessCommand::ActivateBootstrapSubscriber { path } => {
+                    self.activate_bootstrap_subscriber(path).await;
                 }
                 MobileAccessCommand::UnregisterSubscriber { path } => {
                     self.unregister_subscriber(&path).await;
@@ -509,16 +531,41 @@ impl MobileAccessActor {
         }
     }
 
-    async fn register_subscriber(&mut self, stream: Stream) -> Result<(), StreamClosed> {
+    async fn register_bootstrap_subscriber(
+        &mut self,
+        stream: Stream,
+    ) -> Result<MobileAccessStatePayload, StreamClosed> {
         let path = stream.path().clone();
-        let payload = self.state_payload();
-        send_mobile_access_state(&stream, &payload).await?;
-        self.subscribers.insert(path, stream);
-        Ok(())
+        let snapshot = self.state_payload();
+        self.subscribers.remove(&path);
+        self.bootstrap_subscribers.insert(
+            path,
+            PendingBootstrapSubscriber {
+                stream,
+                snapshot: snapshot.clone(),
+            },
+        );
+        Ok(snapshot)
+    }
+
+    async fn activate_bootstrap_subscriber(&mut self, path: StreamPath) {
+        let Some(pending) = self.bootstrap_subscribers.remove(&path) else {
+            return;
+        };
+        let current = self.state_payload();
+        if current != pending.snapshot
+            && send_mobile_access_state(&pending.stream, &current)
+                .await
+                .is_err()
+        {
+            return;
+        }
+        self.subscribers.insert(path, pending.stream);
     }
 
     async fn unregister_subscriber(&mut self, path: &StreamPath) {
         self.subscribers.remove(path);
+        self.bootstrap_subscribers.remove(path);
         if self.active_requester.as_ref() == Some(path) {
             if let Some(active) = self.pairings.active_pairing.clone() {
                 self.pairing_failed(
@@ -536,6 +583,7 @@ impl MobileAccessActor {
         self.abort_all_tasks();
         self.mobile_pairings_lease = None;
         self.subscribers.clear();
+        self.bootstrap_subscribers.clear();
     }
 
     async fn apply_settings(&mut self, settings: HostSettings) {
@@ -1626,11 +1674,14 @@ mod tests {
     async fn pairing_offer_contains_configured_mqtt_qr() {
         let mut test = test_actor();
         let (requester_stream, mut requester_rx) = stream("/host/requester");
+        let requester_path = requester_stream.path().clone();
         test.actor
-            .register_subscriber(requester_stream)
+            .register_bootstrap_subscriber(requester_stream)
             .await
             .expect("register requester");
-        let _ = recv_kind(&mut requester_rx).await;
+        test.actor
+            .activate_bootstrap_subscriber(requester_path)
+            .await;
         test.actor
             .apply_settings(loopback_tls_test_settings(true))
             .await;
@@ -1661,16 +1712,20 @@ mod tests {
         let mut test = test_actor();
         let (requester_stream, mut requester_rx) = stream("/host/requester");
         let (other_stream, mut other_rx) = stream("/host/other");
+        let requester_path = requester_stream.path().clone();
+        let other_path = other_stream.path().clone();
         test.actor
-            .register_subscriber(requester_stream)
+            .register_bootstrap_subscriber(requester_stream)
             .await
             .expect("register requester");
         test.actor
-            .register_subscriber(other_stream)
+            .register_bootstrap_subscriber(other_stream)
             .await
             .expect("register other");
-        let _ = recv_kind(&mut requester_rx).await;
-        let _ = recv_kind(&mut other_rx).await;
+        test.actor
+            .activate_bootstrap_subscriber(requester_path)
+            .await;
+        test.actor.activate_bootstrap_subscriber(other_path).await;
         test.actor
             .apply_settings(loopback_tls_test_settings(true))
             .await;

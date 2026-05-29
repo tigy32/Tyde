@@ -1452,9 +1452,8 @@ mod wasm_tests {
     /// reset, a NewAgent for `/agent/a-new/inst` in one test would trip
     /// the duplicate-stream check in the next test that uses the same
     /// path.
-    fn reset_inbound_seqs(host_id: &str) {
-        crate::dispatch::clear_host_seqs(host_id);
-        crate::dispatch::reset_inbound_protocol();
+    fn reset_inbound_seqs(state: &AppState, host_id: &str) {
+        crate::dispatch::prime_host_for_tests(state, host_id);
     }
 
     /// Real backend stream format for an agent instance. The protocol
@@ -1501,6 +1500,27 @@ mod wasm_tests {
                 instance_stream: agent_stream(agent_id),
             },
         );
+        // Prime the agent's instance stream so subsequent
+        // AgentCompactNotify / AgentClosed / ChatEvent frames pass the
+        // bootstrap-first check the protocol validator now enforces.
+        crate::dispatch::prime_agent_stream_for_tests(
+            state,
+            host_id,
+            &agent_stream(agent_id),
+            &protocol::AgentStartPayload {
+                agent_id: AgentId(agent_id.to_owned()),
+                name: name.to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                custom_agent_id: None,
+                team_id: None,
+                team_member_id: None,
+                project_id: None,
+                parent_agent_id: None,
+                created_at_ms,
+            },
+        );
     }
 
     /// `AgentCompactNotify` with status `Started` flips the agent into
@@ -1510,8 +1530,8 @@ mod wasm_tests {
     /// path is exercised, not bypassed.
     #[wasm_bindgen_test]
     async fn dispatch_compact_notify_started_marks_in_progress() {
-        reset_inbound_seqs("h-started");
         let state = make_app_state("h-started");
+        reset_inbound_seqs(&state, "h-started");
         register_agent_via_new_agent(&state, "h-started", "a-old", "Agent", 0, 0);
         seed_chat_row(&state, "a-old");
         dispatch_frame(
@@ -1543,8 +1563,8 @@ mod wasm_tests {
     /// it inline without flipping the agent to Terminated.
     #[wasm_bindgen_test]
     async fn dispatch_compact_notify_failed_clears_in_progress_and_stores_error() {
-        reset_inbound_seqs("h-failed");
         let state = make_app_state("h-failed");
+        reset_inbound_seqs(&state, "h-failed");
         register_agent_via_new_agent(&state, "h-failed", "a-old", "Agent", 0, 0);
         seed_chat_row(&state, "a-old");
         state.mark_compaction_started("h-failed", AgentId("a-old".to_owned()));
@@ -1584,8 +1604,8 @@ mod wasm_tests {
     /// contract. Uses real `/agent/<id>/<uuid>` streams.
     #[wasm_bindgen_test]
     async fn dispatch_compact_notify_completed_after_new_agent_retargets_tab() {
-        reset_inbound_seqs("h-after");
         let state = make_app_state("h-after");
+        reset_inbound_seqs(&state, "h-after");
         // Register `a-old` via a real NewAgent frame. For User-origin
         // agents this also auto-opens a chat tab — that's the very
         // user-perceived tab the retarget needs to preserve.
@@ -1661,8 +1681,8 @@ mod wasm_tests {
     /// streams so the protocol validator path is exercised.
     #[wasm_bindgen_test]
     async fn dispatch_compact_notify_completed_before_new_agent_defers_then_flushes() {
-        reset_inbound_seqs("h-defer");
         let state = make_app_state("h-defer");
+        reset_inbound_seqs(&state, "h-defer");
         register_agent_via_new_agent(&state, "h-defer", "a-old", "Old Agent", 0, 0);
         seed_chat_row(&state, "a-old");
         let tab_id_before = state
@@ -1761,8 +1781,8 @@ mod wasm_tests {
     ///      (agents row, chat_rows, etc.) is gone.
     #[wasm_bindgen_test]
     async fn qa_ordering_new_then_completed_then_close_preserves_tab() {
-        reset_inbound_seqs("h-qa");
         let state = make_app_state("h-qa");
+        reset_inbound_seqs(&state, "h-qa");
         // Register a-old via a real NewAgent. For User-origin agents
         // this also auto-opens the user's chat tab.
         register_agent_via_new_agent(&state, "h-qa", "a-old", "Old Agent", 0, 0);
@@ -2014,8 +2034,8 @@ mod wasm_tests {
     /// click handler had already marked them.
     #[wasm_bindgen_test]
     async fn dispatch_team_compact_notify_started_marks_all_targets_in_progress() {
-        reset_inbound_seqs("h-team-started");
         let state = make_app_state("h-team-started");
+        reset_inbound_seqs(&state, "h-team-started");
         register_agent_via_new_agent(&state, "h-team-started", "a-mgr", "Manager", 0, 0);
         register_agent_via_new_agent(&state, "h-team-started", "a-rep", "Reporter", 1, 1);
         seed_chat_row(&state, "a-mgr");
@@ -2061,8 +2081,8 @@ mod wasm_tests {
     /// only place the UI learns of completion.
     #[wasm_bindgen_test]
     async fn dispatch_team_compact_notify_completed_retargets_each_member_tab() {
-        reset_inbound_seqs("h-team-completed");
         let state = make_app_state("h-team-completed");
+        reset_inbound_seqs(&state, "h-team-completed");
         register_agent_via_new_agent(&state, "h-team-completed", "a-mgr-old", "Manager", 0, 0);
         register_agent_via_new_agent(&state, "h-team-completed", "a-rep-old", "Reporter", 1, 1);
         seed_chat_row(&state, "a-mgr-old");
@@ -2157,8 +2177,8 @@ mod wasm_tests {
     /// the per-agent Compact button re-enables.
     #[wasm_bindgen_test]
     async fn dispatch_team_compact_notify_failed_applies_per_agent_results() {
-        reset_inbound_seqs("h-team-mixed");
         let state = make_app_state("h-team-mixed");
+        reset_inbound_seqs(&state, "h-team-mixed");
         register_agent_via_new_agent(&state, "h-team-mixed", "a-ok-old", "OK", 0, 0);
         register_agent_via_new_agent(&state, "h-team-mixed", "a-bad-old", "Bad", 1, 1);
         seed_chat_row(&state, "a-ok-old");
@@ -2244,8 +2264,8 @@ mod wasm_tests {
     /// would remain disabled forever.
     #[wasm_bindgen_test]
     async fn dispatch_team_compact_notify_missing_result_falls_back_to_team_message() {
-        reset_inbound_seqs("h-team-missing");
         let state = make_app_state("h-team-missing");
+        reset_inbound_seqs(&state, "h-team-missing");
         register_agent_via_new_agent(&state, "h-team-missing", "a-orphan", "Orphan", 0, 0);
         seed_chat_row(&state, "a-orphan");
         state.mark_compaction_started("h-team-missing", AgentId("a-orphan".to_owned()));

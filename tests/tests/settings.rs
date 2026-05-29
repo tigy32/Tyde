@@ -6,9 +6,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use fixture::Fixture;
-use protocol::{
-    BackendKind, BackendSetupPayload, BackendSetupStatus, FrameKind, HostSettings, SessionId,
-};
+use protocol::{BackendKind, BackendSetupStatus, FrameKind, HostSettings, SessionId};
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
 use server::store::settings::HostSettingsStore;
@@ -47,6 +45,17 @@ impl Drop for EnvVarGuard {
     }
 }
 
+async fn expect_no_backend_setup_replay(client: &mut client::Connection) {
+    match tokio::time::timeout(Duration::from_millis(100), client.next_event()).await {
+        Err(_) | Ok(Ok(None)) => {}
+        Ok(Ok(Some(env))) if env.kind == FrameKind::BackendSetup => {
+            panic!("backend_setup should be bundled in HostBootstrap, not replayed afterward")
+        }
+        Ok(Ok(Some(_))) => {}
+        Ok(Err(err)) => panic!("next_event failed after HostBootstrap: {err:?}"),
+    }
+}
+
 fn write_fake_tycode_binary(home: &Path) -> PathBuf {
     let path = home
         .join(".tyde")
@@ -67,23 +76,6 @@ fn write_fake_tycode_binary(home: &Path) -> PathBuf {
         std::fs::set_permissions(&path, perms).expect("chmod fake Tycode binary");
     }
     path
-}
-
-async fn expect_backend_setup(
-    client: &mut client::Connection,
-    context: &str,
-) -> BackendSetupPayload {
-    loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
-        if env.kind == FrameKind::BackendSetup {
-            return env.parse_payload().expect("parse BackendSetupPayload");
-        }
-    }
 }
 
 fn expected_empty_settings() -> HostSettings {
@@ -243,7 +235,8 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
 
     let mut fixture = Fixture::new().await;
-    let payload = expect_backend_setup(&mut fixture.client, "BackendSetup").await;
+    let payload = fixture.bootstrap.backend_setup.clone();
+    expect_no_backend_setup_replay(&mut fixture.client).await;
 
     let tycode = payload
         .backends

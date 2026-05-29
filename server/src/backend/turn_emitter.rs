@@ -692,8 +692,11 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, ChatEvent, Envelope, FrameKind, NewAgentPayload,
-        ProtocolValidator, StreamPath,
+        AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, AgentStartPayload,
+        BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind, HostBootstrapPayload,
+        HostSettings, MobileAccessStatePayload, MobileBrokerStatus, MobilePairingState,
+        NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath, TeamPresetCatalog,
+        Version, WelcomePayload,
     };
 
     fn recv_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
@@ -718,30 +721,107 @@ mod tests {
 
     fn assert_protocol_valid(events: &[Value]) {
         let mut validator = ProtocolValidator::new();
+        let host_stream = StreamPath("/host/local".to_string());
         let agent_stream = StreamPath("/agent/agent-1/instance-1".to_string());
-        let new_agent = Envelope::from_payload(
-            StreamPath("/host/local".to_string()),
-            FrameKind::NewAgent,
-            1,
-            &NewAgentPayload {
-                agent_id: AgentId("agent-1".to_string()),
-                name: "Test Agent".to_string(),
-                origin: AgentOrigin::User,
-                backend_kind: BackendKind::Codex,
-                workspace_roots: vec!["/tmp".to_string()],
-                custom_agent_id: None,
-                team_id: None,
-                team_member_id: None,
-                project_id: None,
-                parent_agent_id: None,
-                created_at_ms: 0,
-                instance_stream: agent_stream.clone(),
+        let agent_id = AgentId("agent-1".to_string());
+        let new_agent = NewAgentPayload {
+            agent_id: agent_id.clone(),
+            name: "Test Agent".to_string(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Codex,
+            workspace_roots: vec!["/tmp".to_string()],
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: agent_stream.clone(),
+        };
+        let welcome = Envelope::from_payload(
+            host_stream.clone(),
+            FrameKind::Welcome,
+            0,
+            &WelcomePayload {
+                protocol_version: PROTOCOL_VERSION,
+                tyde_version: Version {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                },
             },
         )
-        .expect("serialize NewAgent");
+        .expect("serialize Welcome");
         validator
-            .validate_envelope(&new_agent)
-            .expect("NewAgent validates");
+            .validate_envelope(&welcome)
+            .expect("Welcome validates");
+        let bootstrap = Envelope::from_payload(
+            host_stream,
+            FrameKind::HostBootstrap,
+            1,
+            &HostBootstrapPayload {
+                settings: HostSettings {
+                    enabled_backends: vec![BackendKind::Codex],
+                    default_backend: Some(BackendKind::Codex),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+                mobile_access: MobileAccessStatePayload {
+                    broker_status: MobileBrokerStatus::Disabled,
+                    pairing: MobilePairingState::Idle,
+                    paired_devices: vec![],
+                },
+                backend_setup: BackendSetupPayload { backends: vec![] },
+                session_schemas: vec![],
+                sessions: vec![],
+                projects: vec![],
+                mcp_servers: vec![],
+                skills: vec![],
+                steering: vec![],
+                custom_agents: vec![],
+                team_preset_catalog: TeamPresetCatalog {
+                    role_presets: vec![],
+                    personality_traits: vec![],
+                    personality_presets: vec![],
+                    team_templates: vec![],
+                },
+                team_drafts: vec![],
+                teams: vec![],
+                team_members: vec![],
+                team_member_bindings: vec![],
+                agents: vec![new_agent.clone()],
+            },
+        )
+        .expect("serialize HostBootstrap");
+        validator
+            .validate_envelope(&bootstrap)
+            .expect("HostBootstrap validates");
+        let agent_bootstrap = Envelope::from_payload(
+            agent_stream.clone(),
+            FrameKind::AgentBootstrap,
+            0,
+            &AgentBootstrapPayload {
+                events: vec![AgentBootstrapEvent::AgentStart(AgentStartPayload {
+                    agent_id,
+                    name: new_agent.name,
+                    origin: new_agent.origin,
+                    backend_kind: new_agent.backend_kind,
+                    workspace_roots: new_agent.workspace_roots,
+                    custom_agent_id: new_agent.custom_agent_id,
+                    team_id: new_agent.team_id,
+                    team_member_id: new_agent.team_member_id,
+                    project_id: new_agent.project_id,
+                    parent_agent_id: new_agent.parent_agent_id,
+                    created_at_ms: new_agent.created_at_ms,
+                })],
+            },
+        )
+        .expect("serialize AgentBootstrap");
+        validator
+            .validate_envelope(&agent_bootstrap)
+            .expect("AgentBootstrap validates");
 
         for (index, event) in events.iter().enumerate() {
             let chat_event: ChatEvent =
@@ -749,7 +829,7 @@ mod tests {
             let envelope = Envelope::from_payload(
                 agent_stream.clone(),
                 FrameKind::ChatEvent,
-                index as u64 + 2,
+                index as u64 + 1,
                 &chat_event,
             )
             .expect("serialize ChatEvent");

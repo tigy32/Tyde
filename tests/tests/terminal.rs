@@ -36,8 +36,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
-                | FrameKind::ProjectFileList
-                | FrameKind::ProjectGitStatus
+                | FrameKind::ProjectBootstrap
         ) {
             continue;
         }
@@ -62,8 +61,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionList
-                            | FrameKind::ProjectFileList
-                            | FrameKind::ProjectGitStatus
+                            | FrameKind::ProjectBootstrap
                     ) =>
             {
                 continue;
@@ -116,11 +114,13 @@ async fn create_terminal(
         .parse_payload()
         .expect("failed to parse NewTerminalPayload");
 
-    let start_env = expect_next_event(client, "terminal_start").await;
-    assert_eq!(start_env.kind, FrameKind::TerminalStart);
-    let start: TerminalStartPayload = start_env
+    let bootstrap_env = expect_next_event(client, "terminal bootstrap").await;
+    assert_eq!(bootstrap_env.kind, FrameKind::TerminalBootstrap);
+    let bootstrap: protocol::TerminalBootstrapPayload = bootstrap_env
         .parse_payload()
-        .expect("failed to parse TerminalStartPayload");
+        .expect("failed to parse TerminalBootstrapPayload");
+    assert_eq!(bootstrap.terminal_id, new_terminal.terminal_id);
+    let start: TerminalStartPayload = bootstrap.start;
 
     (new_terminal, start)
 }

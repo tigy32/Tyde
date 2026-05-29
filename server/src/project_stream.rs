@@ -12,7 +12,8 @@ use protocol::{
     ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile,
     ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
     ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, StreamPath,
+    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -63,6 +64,7 @@ enum ProjectStreamCommand {
     AddSubscriber {
         host_path: StreamPath,
         stream: Stream,
+        review_summaries: Vec<ReviewSummary>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     RemoveSubscriber {
@@ -109,12 +111,14 @@ impl ProjectStreamHandle {
         &self,
         host_path: StreamPath,
         stream: Stream,
+        review_summaries: Vec<ReviewSummary>,
     ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ProjectStreamCommand::AddSubscriber {
                 host_path,
                 stream,
+                review_summaries,
                 reply,
             })
             .map_err(|_| "project stream subscription stopped".to_owned())?;
@@ -274,7 +278,7 @@ async fn run_project_subscription(
                     return;
                 };
                 match command {
-                    ProjectStreamCommand::AddSubscriber { host_path, stream, reply } => {
+                    ProjectStreamCommand::AddSubscriber { host_path, stream, review_summaries, reply } => {
                         use std::collections::hash_map::Entry;
                         match subscribers.entry(host_path.clone()) {
                             Entry::Occupied(mut e) => {
@@ -286,7 +290,7 @@ async fn run_project_subscription(
                                 e.insert(stream.clone());
                             }
                         }
-                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot).await;
+                        let result = emit_snapshot_to_stream(&stream, &project, &snapshot, review_summaries).await;
                         if result.is_err() {
                             subscribers.remove(&host_path);
                             snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
@@ -546,15 +550,21 @@ async fn emit_snapshot_to_stream(
     stream: &Stream,
     project: &Project,
     snapshot: &ProjectSnapshotState,
+    review_summaries: Vec<ReviewSummary>,
 ) -> Result<(), String> {
     let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
-    send_payload(stream, FrameKind::ProjectFileList, &file_list).await?;
     let Some(git_status) = snapshot.git_status.clone() else {
         return Err("project git status snapshot was not initialized".to_owned());
     };
-    stream
-        .send_value(FrameKind::ProjectGitStatus, git_status)
-        .map_err(|_| "project stream closed".to_owned())
+    let git_status = serde_json::from_value(git_status)
+        .map_err(|error| format!("failed to parse project git status snapshot: {error}"))?;
+    let bootstrap = protocol::ProjectBootstrapPayload {
+        project: project.clone(),
+        file_list,
+        git_status,
+        review_summaries,
+    };
+    send_payload(stream, FrameKind::ProjectBootstrap, &bootstrap).await
 }
 
 async fn fan_out_payload<T: serde::Serialize>(

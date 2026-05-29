@@ -5043,8 +5043,6 @@ mod wasm_tests {
         // settings_panel test the runner happens to schedule before
         // us. `reset_inbound_protocol` also clears stream-registration
         // state so a fresh host stream is accepted.
-        crate::dispatch::clear_host_seqs("h-mobile-mismatch");
-        crate::dispatch::reset_inbound_protocol();
 
         let state = AppState::new();
         let host_id = "h-mobile-mismatch";
@@ -5055,6 +5053,8 @@ mod wasm_tests {
                 protocol::StreamPath(format!("/host/{host_id}")),
             );
         });
+
+        crate::dispatch::prime_host_for_tests(&state, host_id);
 
         // Seed: bystander already has offer A stored from an earlier
         // pairing the server broadcast.
@@ -5116,9 +5116,6 @@ mod wasm_tests {
         use crate::dispatch::dispatch_envelope;
         use protocol::{Envelope, MobilePairingOfferId, MobilePairingQrUri};
 
-        crate::dispatch::clear_host_seqs("h-mobile-match");
-        crate::dispatch::reset_inbound_protocol();
-
         let state = AppState::new();
         let host_id = "h-mobile-match";
         state.selected_host_id.set(Some(host_id.to_owned()));
@@ -5128,6 +5125,8 @@ mod wasm_tests {
                 protocol::StreamPath(format!("/host/{host_id}")),
             );
         });
+
+        crate::dispatch::prime_host_for_tests(&state, host_id);
 
         let offer_id_str = "offer-X";
         let offer = protocol::MobilePairingOfferPayload {
@@ -5174,9 +5173,6 @@ mod wasm_tests {
         use crate::dispatch::dispatch_envelope;
         use protocol::{Envelope, MobilePairingOfferId, MobilePairingQrUri};
 
-        crate::dispatch::clear_host_seqs("h-mobile-cancelled");
-        crate::dispatch::reset_inbound_protocol();
-
         let state = AppState::new();
         let host_id = "h-mobile-cancelled";
         state.selected_host_id.set(Some(host_id.to_owned()));
@@ -5186,6 +5182,8 @@ mod wasm_tests {
                 protocol::StreamPath(format!("/host/{host_id}")),
             );
         });
+
+        crate::dispatch::prime_host_for_tests(&state, host_id);
 
         let offer = protocol::MobilePairingOfferPayload {
             offer_id: MobilePairingOfferId("offer-Z".to_owned()),

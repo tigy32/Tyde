@@ -3,13 +3,16 @@ mod fixture;
 use fixture::Fixture;
 use protocol::types::AgentClosedPayload;
 use protocol::{
-    AgentControlStatus, AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    BackendKind, ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
-    ListSessionsPayload, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload,
-    SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorPayload, AgentOrigin,
+    AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode,
+    CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload, ListSessionsPayload,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectId, ProjectNotifyPayload, ProjectRenamePayload, SessionListPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath,
 };
 use serde_json::{Value, json};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -24,6 +27,14 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             Err(_) => panic!("timed out waiting for {context}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+
+        if env.kind == FrameKind::AgentBootstrap {
+            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
+            if let Some(first) = record_agent_bootstrap_events(&env.stream, bootstrap) {
+                return first;
+            }
             continue;
         }
 
@@ -43,6 +54,71 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
     }
 }
 
+fn pending_agent_events() -> &'static Mutex<HashMap<StreamPath, VecDeque<Envelope>>> {
+    static PENDING: OnceLock<Mutex<HashMap<StreamPath, VecDeque<Envelope>>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_agent_bootstrap_events(
+    stream: &StreamPath,
+    bootstrap: AgentBootstrapPayload,
+) -> Option<Envelope> {
+    let mut events = bootstrap
+        .events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
+    let first = events.next();
+    let mut rest = events.collect::<VecDeque<_>>();
+    if !rest.is_empty() {
+        pending_agent_events()
+            .lock()
+            .expect("pending agent event mutex poisoned")
+            .entry(stream.clone())
+            .or_default()
+            .append(&mut rest);
+    }
+    first
+}
+
+fn agent_bootstrap_event_envelope(
+    stream: &StreamPath,
+    seq: u64,
+    event: AgentBootstrapEvent,
+) -> Envelope {
+    match event {
+        AgentBootstrapEvent::AgentStart(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::AgentStart, seq, &payload)
+        }
+        AgentBootstrapEvent::AgentError(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::AgentError, seq, &payload)
+        }
+        AgentBootstrapEvent::SessionSettings(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::SessionSettings, seq, &payload)
+        }
+        AgentBootstrapEvent::QueuedMessages(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::QueuedMessages, seq, &payload)
+        }
+        AgentBootstrapEvent::ChatEvent(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::ChatEvent, seq, &payload)
+        }
+    }
+    .expect("serialize synthetic bootstrap event")
+}
+
+fn pop_pending_agent_event(stream: &StreamPath, kind: FrameKind) -> Option<Envelope> {
+    let mut pending = pending_agent_events()
+        .lock()
+        .expect("pending agent event mutex poisoned");
+    let queue = pending.get_mut(stream)?;
+    let index = queue.iter().position(|env| env.kind == kind)?;
+    let env = queue.remove(index);
+    if queue.is_empty() {
+        pending.remove(stream);
+    }
+    env
+}
+
 /// Wait for the first envelope of a specific kind, skipping noise frames.
 async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: &str) -> Envelope {
     loop {
@@ -55,6 +131,18 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
+        let env = if env.kind == FrameKind::AgentBootstrap {
+            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
+            match record_agent_bootstrap_events(&env.stream, bootstrap) {
+                Some(first) => first,
+                None => continue,
+            }
+        } else {
+            env
+        };
+        if env.kind == kind {
+            return env;
+        }
         if matches!(
             env.kind,
             FrameKind::SessionSettings
@@ -64,9 +152,6 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
                 | FrameKind::QueuedMessages
         ) {
             continue;
-        }
-        if env.kind == kind {
-            return env;
         }
         // Skip other frame kinds while waiting for the target kind.
     }
@@ -377,6 +462,9 @@ async fn expect_chat_event_on_stream(
     context: &str,
 ) -> Envelope {
     loop {
+        if let Some(env) = pop_pending_agent_event(stream, FrameKind::ChatEvent) {
+            return env;
+        }
         let env = expect_chat_event(client, context).await;
         if env.kind == FrameKind::ChatEvent && env.stream == *stream {
             return env;
@@ -391,12 +479,42 @@ async fn expect_agent_error_message(
     context: &str,
 ) -> AgentErrorPayload {
     loop {
+        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+            let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+            if payload.message == expected_message {
+                return payload;
+            }
+        }
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::AgentError || env.stream != *stream {
             continue;
         }
         let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
         if payload.message == expected_message {
+            return payload;
+        }
+    }
+}
+
+async fn expect_agent_error_containing(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_message: &str,
+    context: &str,
+) -> AgentErrorPayload {
+    loop {
+        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+            let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+            if payload.message.contains(expected_message) {
+                return payload;
+            }
+        }
+        let env = expect_next_event(client, context).await;
+        if env.kind != FrameKind::AgentError || env.stream != *stream {
+            continue;
+        }
+        let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+        if payload.message.contains(expected_message) {
             return payload;
         }
     }
@@ -410,6 +528,16 @@ async fn expect_agent_error_message_without(
     context: &str,
 ) -> AgentErrorPayload {
     loop {
+        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+            let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+            assert_ne!(
+                payload.message, forbidden_message,
+                "unexpected AgentError while waiting for {context}"
+            );
+            if payload.message == expected_message {
+                return payload;
+            }
+        }
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::AgentError || env.stream != *stream {
             continue;
@@ -514,12 +642,27 @@ async fn expect_replayed_new_agent(
     }
 }
 
+fn bootstrapped_agent(
+    bootstrap: &HostBootstrapPayload,
+    agent_id: &protocol::AgentId,
+) -> NewAgentPayload {
+    bootstrap
+        .agents
+        .iter()
+        .find(|agent| &agent.agent_id == agent_id)
+        .cloned()
+        .expect("agent missing from HostBootstrap")
+}
+
 async fn expect_agent_start_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
     context: &str,
 ) -> AgentStartPayload {
     loop {
+        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentStart) {
+            return env.parse_payload().expect("parse AgentStart");
+        }
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::AgentStart || env.stream != *stream {
             continue;
@@ -712,7 +855,11 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
         "agent should be removed from registry after close"
     );
 
-    let mut late_client = fixture.connect().await;
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.agents.is_empty(),
+        "closed agent should not replay to new clients"
+    );
     expect_no_event(
         &mut late_client,
         Duration::from_millis(200),
@@ -1206,10 +1353,8 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
         Some(parent_new.agent_id.0.as_str())
     );
 
-    let mut late_client = fixture.connect().await;
-    let replayed_child_new =
-        expect_replayed_new_agent(&mut late_client, &child_new.agent_id, "late child NewAgent")
-            .await;
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_child_new = bootstrapped_agent(&bootstrap, &child_new.agent_id);
     assert_eq!(replayed_child_new.origin, AgentOrigin::BackendNative);
     assert_eq!(
         replayed_child_new.parent_agent_id.as_ref(),
@@ -1380,13 +1525,8 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
     // Connect a late client — this triggers register_host_stream, which
     // snapshots every registered agent. Without the park, this panics the
     // server and the client sees a closed connection.
-    let mut late_client = fixture.connect().await;
-    let replayed_child_new = expect_replayed_new_agent(
-        &mut late_client,
-        &child_new.agent_id,
-        "late client native child NewAgent",
-    )
-    .await;
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_child_new = bootstrapped_agent(&bootstrap, &child_new.agent_id);
     assert_eq!(replayed_child_new.origin, AgentOrigin::BackendNative);
 
     let replayed_child_start = expect_agent_start_on_stream(
@@ -1627,10 +1767,13 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
     assert_eq!(start.name, "spawn-failure");
     assert_eq!(start.backend_kind, BackendKind::Tycode);
 
-    let env = expect_next_event(&mut fixture.client, "fatal AgentError").await;
-    assert_eq!(env.kind, FrameKind::AgentError);
-    assert_eq!(env.stream, agent_stream);
-    let err: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+    let err = expect_agent_error_containing(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend forced spawn failure",
+        "fatal AgentError",
+    )
+    .await;
     assert!(
         err.fatal,
         "startup failure should terminate the agent stream"
@@ -1663,10 +1806,13 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
         .await
         .expect("send_message after failure should still write protocol frame");
 
-    let env = expect_next_event(&mut fixture.client, "agent not running error").await;
-    assert_eq!(env.kind, FrameKind::AgentError);
-    assert_eq!(env.stream, agent_stream);
-    let err: AgentErrorPayload = env.parse_payload().expect("parse post-failure AgentError");
+    let err = expect_agent_error_message(
+        &mut fixture.client,
+        &agent_stream,
+        "agent not running",
+        "agent not running error",
+    )
+    .await;
     assert!(!err.fatal, "follow-up router error should not be fatal");
     assert_eq!(err.message, "agent not running");
 }
@@ -1788,10 +1934,8 @@ async fn renaming_agent_updates_live_streams_and_replay() {
         Some("Renamed Agent")
     );
 
-    let mut late_client = fixture.connect().await;
-    let env = expect_next_event(&mut late_client, "late renamed NewAgent").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let replayed_agent: NewAgentPayload = env.parse_payload().expect("parse replayed NewAgent");
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
     assert_eq!(replayed_agent.name, "Renamed Agent");
 
     let env = expect_next_event(&mut late_client, "late renamed AgentStart").await;
@@ -1851,12 +1995,7 @@ async fn multiple_agents() {
     // Two agents = 14 events total (after filtering).
     let mut events = Vec::new();
     while events.len() < 14 {
-        let env = fixture
-            .client
-            .next_event()
-            .await
-            .expect("next_event failed")
-            .expect("connection closed before all events received");
+        let env = expect_next_event(&mut fixture.client, "multiple agent events").await;
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
@@ -2057,15 +2196,8 @@ async fn late_joining_client_gets_replay() {
         .expect("failed to parse TypingStatusChanged(false) for client 1");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
     // Client 2 connects late and should receive NewAgent + full replay on its own instance stream.
-    let mut client2 = fixture.connect().await;
-
-    let env = expect_next_event(&mut client2, "NewAgent for client 2").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    assert!(env.stream.0.starts_with("/host/"));
-
-    let client2_new_agent: NewAgentPayload = env
-        .parse_payload()
-        .expect("failed to parse NewAgentPayload for client 2");
+    let (mut client2, bootstrap) = fixture.connect_with_bootstrap().await;
+    let client2_new_agent = bootstrapped_agent(&bootstrap, &agent_id);
     assert_eq!(client2_new_agent.agent_id, agent_id);
     assert_ne!(
         client2_new_agent.instance_stream, client1_instance_stream,
@@ -2116,11 +2248,12 @@ async fn project_mutations_fan_out_and_delete() {
     assert_eq!(created.name, "Tyde");
     assert_eq!(created.roots, vec!["/tmp/tyde".to_owned()]);
 
-    let mut client2 = fixture.connect().await;
-    let replayed = match expect_project_notify(&mut client2, "project replay on connect").await {
-        ProjectNotifyPayload::Upsert { project } => project,
-        other => panic!("expected replayed upsert project notification, got {other:?}"),
-    };
+    let (mut client2, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed = bootstrap
+        .projects
+        .first()
+        .cloned()
+        .expect("project missing from HostBootstrap");
     assert_eq!(replayed, created);
 
     fixture
@@ -2187,7 +2320,11 @@ async fn project_mutations_fan_out_and_delete() {
         }
     }
 
-    let mut client3 = fixture.connect().await;
+    let (mut client3, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.projects.is_empty(),
+        "deleted project should not replay to new clients"
+    );
     expect_no_event(
         &mut client3,
         Duration::from_millis(150),
@@ -2249,22 +2386,11 @@ async fn project_replay_happens_before_agent_replay() {
     )
     .await;
 
-    let mut client2 = fixture.connect().await;
-
-    let replayed_first = expect_project_notify(&mut client2, "first project replay").await;
-    let replayed_second = expect_project_notify(&mut client2, "second project replay").await;
-    let replayed_projects = vec![replayed_first, replayed_second]
-        .into_iter()
-        .map(|payload| match payload {
-            ProjectNotifyPayload::Upsert { project } => project,
-            other => panic!("expected replayed upsert project notification, got {other:?}"),
-        })
-        .collect::<Vec<_>>();
+    let (mut client2, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_projects = bootstrap.projects.clone();
     assert_eq!(replayed_projects, vec![project.clone(), sibling]);
 
-    let env = expect_next_event(&mut client2, "new agent after project replay").await;
-    assert_eq!(env.kind, FrameKind::NewAgent);
-    let replayed_agent: NewAgentPayload = env.parse_payload().expect("parse replayed NewAgent");
+    let replayed_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
     assert_eq!(replayed_agent.project_id.as_ref(), Some(&project.id));
 
     let env = expect_next_event(&mut client2, "agent start after project replay").await;
@@ -2293,18 +2419,9 @@ async fn projects_persist_to_disk_and_replay_from_fresh_host() {
     )
     .await;
 
-    let mut fresh_client = fixture.connect_fresh_host().await;
+    let (mut fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
 
-    let replayed_a = match expect_project_notify(&mut fresh_client, "persisted project A").await {
-        ProjectNotifyPayload::Upsert { project } => project,
-        other => panic!("expected persisted upsert project notification, got {other:?}"),
-    };
-    let replayed_b = match expect_project_notify(&mut fresh_client, "persisted project B").await {
-        ProjectNotifyPayload::Upsert { project } => project,
-        other => panic!("expected persisted upsert project notification, got {other:?}"),
-    };
-
-    assert_eq!(vec![replayed_a, replayed_b], vec![project_a, project_b]);
+    assert_eq!(bootstrap.projects, vec![project_a, project_b]);
     expect_no_event(
         &mut fresh_client,
         Duration::from_millis(150),
@@ -2377,11 +2494,8 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
     )
     .await;
 
-    let mut fresh_client = fixture.connect_fresh_host().await;
-    match expect_project_notify(&mut fresh_client, "project survives rejected delete").await {
-        ProjectNotifyPayload::Upsert { project: replayed } => assert_eq!(replayed, project),
-        other => panic!("expected surviving project upsert after rejected delete, got {other:?}"),
-    }
+    let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(bootstrap.projects, vec![project]);
 }
 
 #[tokio::test]
@@ -2414,7 +2528,11 @@ async fn invalid_project_input_surfaces_command_error_and_keeps_connection_alive
     )
     .await;
 
-    let mut fresh_client = fixture.connect_fresh_host().await;
+    let (mut fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap.projects.is_empty(),
+        "invalid project_create should not persist any project"
+    );
     expect_no_event(
         &mut fresh_client,
         Duration::from_millis(150),
@@ -2461,10 +2579,13 @@ async fn spawn_with_missing_project_id_emits_terminal_agent_error() {
     let start: AgentStartPayload = env.parse_payload().expect("parse AgentStartPayload");
     assert_eq!(start.project_id, None);
 
-    let env = expect_next_event(&mut fixture.client, "missing project AgentError").await;
-    assert_eq!(env.kind, FrameKind::AgentError);
-    assert_eq!(env.stream, agent_stream);
-    let err: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
+    let err = expect_agent_error_containing(
+        &mut fixture.client,
+        &agent_stream,
+        &format!("cannot spawn agent in missing project {missing_project_id}"),
+        "missing project AgentError",
+    )
+    .await;
     assert!(err.fatal, "missing project should terminate the agent");
     assert_eq!(err.code, protocol::AgentErrorCode::BackendFailed);
     assert!(
@@ -2482,7 +2603,11 @@ async fn spawn_with_missing_project_id_emits_terminal_agent_error() {
     )
     .await;
 
-    let mut fresh_client = fixture.connect_fresh_host().await;
+    let (mut fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap.projects.is_empty(),
+        "missing-project spawn should not persist any project state"
+    );
     expect_no_event(
         &mut fresh_client,
         Duration::from_millis(150),

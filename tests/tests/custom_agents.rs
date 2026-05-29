@@ -7,16 +7,37 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentErrorPayload, AgentStartPayload, BackendKind, CommandErrorCode, CommandErrorPayload,
-    CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
-    NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, Skill, SkillId,
-    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, Steering,
-    SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload,
-    ToolPolicy,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload, BackendKind,
+    CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
+    McpTransportConfig, NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, Skill,
+    SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    Steering, SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, ToolPolicy,
 };
 use serde_json::to_string_pretty;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+
+fn pending_agent_events() -> &'static Mutex<HashMap<protocol::StreamPath, VecDeque<Envelope>>> {
+    static PENDING: OnceLock<Mutex<HashMap<protocol::StreamPath, VecDeque<Envelope>>>> =
+        OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pop_pending_agent_event(stream: &protocol::StreamPath, kind: FrameKind) -> Option<Envelope> {
+    let mut pending = pending_agent_events()
+        .lock()
+        .expect("pending agent event mutex poisoned");
+    let queue = pending.get_mut(stream)?;
+    let index = queue.iter().position(|env| env.kind == kind)?;
+    let env = queue.remove(index);
+    if queue.is_empty() {
+        pending.remove(stream);
+    }
+    env
+}
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
@@ -29,6 +50,27 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
+        if env.kind == FrameKind::AgentBootstrap {
+            let payload: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            let mut events = payload
+                .events
+                .into_iter()
+                .filter_map(|event| bootstrap_event_envelope(&env.stream, env.seq, event));
+            if let Some(first) = events.next() {
+                let mut rest = events.collect::<VecDeque<_>>();
+                if !rest.is_empty() {
+                    pending_agent_events()
+                        .lock()
+                        .expect("pending agent event mutex poisoned")
+                        .entry(env.stream.clone())
+                        .or_default()
+                        .append(&mut rest);
+                }
+                return first;
+            }
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -38,6 +80,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
         ) {
@@ -45,6 +88,35 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
         }
         return env;
     }
+}
+
+fn bootstrap_event_envelope(
+    stream: &protocol::StreamPath,
+    seq: u64,
+    event: AgentBootstrapEvent,
+) -> Option<Envelope> {
+    match event {
+        AgentBootstrapEvent::AgentStart(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::AgentStart,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::AgentError(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::AgentError,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::ChatEvent(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ChatEvent,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::SessionSettings(_) | AgentBootstrapEvent::QueuedMessages(_) => None,
+    }
+    .map(|result| result.expect("serialize AgentBootstrap event"))
 }
 
 async fn raw_next_event(client: &mut client::Connection, context: &str) -> Envelope {
@@ -69,30 +141,16 @@ fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
     .collect()
 }
 
-async fn collect_builtin_team_custom_agents(
-    client: &mut client::Connection,
-    context: &str,
+fn collect_builtin_team_custom_agents_from_bootstrap(
+    bootstrap: &protocol::HostBootstrapPayload,
 ) -> HashMap<CustomAgentId, CustomAgent> {
     let expected = builtin_team_custom_agent_ids();
-    let mut found = HashMap::new();
-    while found.len() < expected.len() {
-        let env = raw_next_event(client, context).await;
-        if !fixture::is_builtin_team_custom_agent_notify(&env) {
-            continue;
-        }
-        match env
-            .parse_payload::<CustomAgentNotifyPayload>()
-            .expect("parse built-in CustomAgentNotifyPayload")
-        {
-            CustomAgentNotifyPayload::Upsert { custom_agent } => {
-                found.insert(custom_agent.id.clone(), custom_agent);
-            }
-            CustomAgentNotifyPayload::Delete { id } => {
-                panic!("unexpected built-in custom agent delete for {id}")
-            }
-        }
-    }
-    found
+    bootstrap
+        .custom_agents
+        .iter()
+        .filter(|agent| expected.contains(agent.id.0.as_str()))
+        .map(|agent| (agent.id.clone(), agent.clone()))
+        .collect()
 }
 
 async fn expect_custom_agent_upsert_raw(
@@ -127,6 +185,30 @@ async fn expect_command_error(
         .expect("failed to parse CommandErrorPayload")
 }
 
+async fn expect_agent_error_containing(
+    client: &mut client::Connection,
+    stream: &protocol::StreamPath,
+    expected: &str,
+    context: &str,
+) -> AgentErrorPayload {
+    loop {
+        if let Some(env) = pop_pending_agent_event(stream, FrameKind::AgentError) {
+            let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
+            if payload.message.contains(expected) {
+                return payload;
+            }
+        }
+        let env = expect_next_event(client, context).await;
+        if env.kind != FrameKind::AgentError || env.stream != *stream {
+            continue;
+        }
+        let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
+        if payload.message.contains(expected) {
+            return payload;
+        }
+    }
+}
+
 async fn expect_session_list(
     client: &mut client::Connection,
     context: &str,
@@ -149,6 +231,7 @@ async fn expect_session_list(
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
         ) {
@@ -202,6 +285,7 @@ async fn wait_for_session_list(
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
         ) {
@@ -294,9 +378,7 @@ fn sample_custom_agent(
 #[tokio::test]
 async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     let mut fixture = Fixture::new().await;
-    let builtins =
-        collect_builtin_team_custom_agents(&mut fixture.client, "initial built-in custom agents")
-            .await;
+    let builtins = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap);
     assert_eq!(
         builtins.len(),
         6,
@@ -341,10 +423,8 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
             .await;
     assert_eq!(notified, edited);
 
-    let mut fresh = fixture.connect_fresh_host().await;
-    let replayed =
-        collect_builtin_team_custom_agents(&mut fresh, "fresh host built-in custom agent replay")
-            .await;
+    let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let replayed = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
     assert_eq!(
         replayed.get(&reviewer_id),
         Some(&edited),
@@ -441,57 +521,11 @@ async fn host_customization_upsert_delete_round_trip_and_notify() {
         }
     );
 
-    let mut replay = fixture.connect_fresh_host().await;
-    let mut saw_mcp = false;
-    let mut saw_skill = false;
-    let mut saw_steering = false;
-    let mut saw_custom_agent = false;
-    while !(saw_mcp && saw_skill && saw_steering && saw_custom_agent) {
-        let env = expect_next_event(&mut replay, "customization replay").await;
-        match env.kind {
-            FrameKind::McpServerNotify => {
-                saw_mcp = true;
-                assert_eq!(
-                    env.parse_payload::<McpServerNotifyPayload>()
-                        .expect("parse replay McpServerNotifyPayload"),
-                    McpServerNotifyPayload::Upsert {
-                        mcp_server: mcp_server.clone()
-                    }
-                );
-            }
-            FrameKind::SkillNotify => {
-                saw_skill = true;
-                assert_eq!(
-                    env.parse_payload::<SkillNotifyPayload>()
-                        .expect("parse replay SkillNotifyPayload"),
-                    SkillNotifyPayload::Upsert {
-                        skill: skill.clone()
-                    }
-                );
-            }
-            FrameKind::SteeringNotify => {
-                saw_steering = true;
-                assert_eq!(
-                    env.parse_payload::<SteeringNotifyPayload>()
-                        .expect("parse replay SteeringNotifyPayload"),
-                    SteeringNotifyPayload::Upsert {
-                        steering: steering.clone()
-                    }
-                );
-            }
-            FrameKind::CustomAgentNotify => {
-                saw_custom_agent = true;
-                assert_eq!(
-                    env.parse_payload::<CustomAgentNotifyPayload>()
-                        .expect("parse replay CustomAgentNotifyPayload"),
-                    CustomAgentNotifyPayload::Upsert {
-                        custom_agent: custom_agent.clone()
-                    }
-                );
-            }
-            other => panic!("unexpected replay event: {other:?}"),
-        }
-    }
+    let (_replay, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(bootstrap.mcp_servers.contains(&mcp_server));
+    assert!(bootstrap.skills.contains(&skill));
+    assert!(bootstrap.steering.contains(&steering));
+    assert!(bootstrap.custom_agents.contains(&custom_agent));
 
     fixture
         .client
@@ -740,35 +774,16 @@ async fn replay_order_replays_customization_before_agents() {
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     let _ = expect_turn_text(&mut fixture.client, "ordered turn").await;
 
-    let mut replay = fixture.connect().await;
-    let mut observed = Vec::new();
-    while !observed.contains(&FrameKind::AgentStart) {
-        let env = expect_next_event(&mut replay, "ordered replay").await;
-        match env.kind {
-            FrameKind::ProjectNotify
-            | FrameKind::McpServerNotify
-            | FrameKind::SkillNotify
-            | FrameKind::SteeringNotify
-            | FrameKind::CustomAgentNotify
-            | FrameKind::NewAgent
-            | FrameKind::AgentStart => observed.push(env.kind),
-            FrameKind::ChatEvent => {}
-            other => panic!("unexpected replay event kind {other:?}"),
-        }
-    }
+    let (mut replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.projects.iter().any(|item| item.id == project.id));
+    assert!(bootstrap.mcp_servers.contains(&mcp_server));
+    assert!(bootstrap.skills.contains(&skill));
+    assert!(bootstrap.steering.contains(&steering));
+    assert!(bootstrap.custom_agents.contains(&custom_agent));
+    assert!(bootstrap.agents.iter().any(|agent| agent.name == "ordered"));
 
-    assert_eq!(
-        observed,
-        vec![
-            FrameKind::ProjectNotify,
-            FrameKind::McpServerNotify,
-            FrameKind::SkillNotify,
-            FrameKind::SteeringNotify,
-            FrameKind::CustomAgentNotify,
-            FrameKind::NewAgent,
-            FrameKind::AgentStart,
-        ]
-    );
+    let env = expect_next_event(&mut replay, "ordered agent bootstrap").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
 }
 
 #[tokio::test]
@@ -954,12 +969,16 @@ async fn tool_policy_rejection_for_non_claude_backends() {
             .await
             .expect("spawn_agent should enqueue startup failure");
 
-        let _ = expect_next_event(&mut fixture.client, "NewAgent for tool policy failure").await;
+        let env = expect_next_event(&mut fixture.client, "NewAgent for tool policy failure").await;
+        let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
         let _ = expect_next_event(&mut fixture.client, "AgentStart for tool policy failure").await;
-        let env =
-            expect_next_event(&mut fixture.client, "AgentError for tool policy failure").await;
-        assert_eq!(env.kind, FrameKind::AgentError);
-        let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
+        let payload = expect_agent_error_containing(
+            &mut fixture.client,
+            &new_agent.instance_stream,
+            "does not support tool policy",
+            "AgentError for tool policy failure",
+        )
+        .await;
         assert!(payload.fatal);
         assert!(
             payload.message.contains("does not support tool policy"),
@@ -1059,11 +1078,13 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
         .expect("parse resumed AgentStartPayload");
     assert_eq!(agent_start.custom_agent_id, None);
 
-    let env = expect_next_event(&mut fixture.client, "resume warning").await;
-    assert_eq!(env.kind, FrameKind::AgentError);
-    let warning: AgentErrorPayload = env
-        .parse_payload()
-        .expect("parse warning AgentErrorPayload");
+    let warning = expect_agent_error_containing(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "was deleted; resuming without custom agent configuration",
+        "resume warning",
+    )
+    .await;
     assert!(!warning.fatal);
     assert!(
         warning
@@ -1127,12 +1148,16 @@ async fn reserved_mcp_name_collision_returns_spawn_error() {
         .await
         .expect("spawn_agent should enqueue startup failure");
 
-    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
-    let env = expect_next_event(&mut fixture.client, "collision AgentError").await;
-    let payload: AgentErrorPayload = env
-        .parse_payload()
-        .expect("parse collision AgentErrorPayload");
+    let payload = expect_agent_error_containing(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "reserved MCP server name 'tyde-debug'",
+        "collision AgentError",
+    )
+    .await;
     assert!(payload.fatal);
     assert!(
         payload

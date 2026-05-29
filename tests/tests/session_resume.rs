@@ -2,9 +2,10 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentStartPayload, BackendKind, ChatEvent, DeleteSessionPayload, Envelope, FrameKind,
-    ListSessionsPayload, NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload,
-    SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
+    DeleteSessionPayload, Envelope, FrameKind, ListSessionsPayload, NewAgentPayload, Project,
+    ProjectCreatePayload, ProjectNotifyPayload, SessionId, SessionListPayload, SpawnAgentParams,
+    SpawnAgentPayload,
 };
 use std::time::Duration;
 
@@ -17,6 +18,34 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             Err(_) => panic!("timed out waiting for {context}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::AgentBootstrap {
+            let payload: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            if let Some(env) = payload.events.into_iter().find_map(|event| match event {
+                AgentBootstrapEvent::AgentStart(payload) => Some(
+                    Envelope::from_payload(
+                        env.stream.clone(),
+                        FrameKind::AgentStart,
+                        env.seq,
+                        &payload,
+                    )
+                    .expect("serialize AgentStart"),
+                ),
+                AgentBootstrapEvent::ChatEvent(payload) => Some(
+                    Envelope::from_payload(
+                        env.stream.clone(),
+                        FrameKind::ChatEvent,
+                        env.seq,
+                        &payload,
+                    )
+                    .expect("serialize ChatEvent"),
+                ),
+                _ => None,
+            }) {
+                return env;
+            }
             continue;
         }
         if matches!(
@@ -48,6 +77,9 @@ async fn wait_for_session_list(
             Err(_) => panic!("timed out waiting for {context}"),
         };
         if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::AgentBootstrap {
             continue;
         }
         if matches!(

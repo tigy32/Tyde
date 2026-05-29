@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use protocol::{
-    BootstrapData, Envelope, FrameError, FrameKind, HelloPayload, RejectCode, RejectPayload,
-    SeqValidator, StreamPath, WelcomePayload, read_envelope, write_envelope,
+    Envelope, FrameError, FrameKind, HelloPayload, RejectCode, RejectPayload, SeqValidator,
+    StreamPath, WelcomePayload, read_envelope, write_envelope,
 };
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -137,7 +137,6 @@ where
     let welcome = WelcomePayload {
         protocol_version: config.protocol_version,
         tyde_version: config.tyde_version,
-        bootstrap: BootstrapData::default(),
     };
     let envelope = Envelope::from_payload(first.stream.clone(), FrameKind::Welcome, 0, &welcome)
         .map_err(HandshakeError::InvalidPayload)?;

@@ -3,11 +3,12 @@ mod fixture;
 use fixture::Fixture;
 use protocol::{
     CommandErrorCode, CommandErrorPayload, DiffContextMode, Envelope, FileEntryOp, FrameKind,
-    Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDiffScope,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    Project, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload,
+    ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload,
+    ProjectStageHunkPayload,
 };
 use std::fs;
 use std::path::Path;
@@ -90,6 +91,16 @@ async fn expect_command_error(
         .expect("failed to parse CommandErrorPayload")
 }
 
+async fn expect_project_bootstrap(
+    client: &mut client::Connection,
+    context: &str,
+) -> ProjectBootstrapPayload {
+    let env = expect_next_event(client, context).await;
+    assert_eq!(env.kind, FrameKind::ProjectBootstrap);
+    env.parse_payload()
+        .expect("failed to parse ProjectBootstrapPayload")
+}
+
 async fn expect_project_file_list(
     client: &mut client::Connection,
     context: &str,
@@ -163,15 +174,14 @@ async fn create_project(
 }
 
 /// Create a project with real filesystem roots.
-/// Drains the server-pushed initial file list + git status.
+/// Drains the server-pushed project bootstrap.
 async fn create_project_with_real_roots(
     client: &mut client::Connection,
     name: &str,
     roots: Vec<String>,
 ) -> Project {
     let project = create_project(client, name, roots).await;
-    let _ = expect_project_file_list(client, "initial server-pushed file list").await;
-    let _ = expect_project_git_status(client, "initial server-pushed git status").await;
+    let _ = expect_project_bootstrap(client, "initial server-pushed project bootstrap").await;
     project
 }
 
@@ -275,19 +285,8 @@ async fn late_joining_client_gets_all_existing_projects() {
     let project_c =
         create_project(&mut fixture.client, "Gamma", vec!["/tmp/gamma".to_owned()]).await;
 
-    let mut late_client = fixture.connect().await;
-
-    let replayed = vec![
-        expect_project_notify(&mut late_client, "project replay 1").await,
-        expect_project_notify(&mut late_client, "project replay 2").await,
-        expect_project_notify(&mut late_client, "project replay 3").await,
-    ]
-    .into_iter()
-    .map(|payload| match payload {
-        ProjectNotifyPayload::Upsert { project } => project,
-        other => panic!("expected replayed upsert project notification, got {other:?}"),
-    })
-    .collect::<Vec<_>>();
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed = bootstrap.projects;
 
     assert_eq!(replayed, vec![project_a, project_b, project_c]);
 }
@@ -370,18 +369,8 @@ async fn reorder_projects_persists_and_replays_in_custom_order() {
     ];
     assert_eq!(reordered, expected);
 
-    let mut fresh_client = fixture.connect_fresh_host().await;
-    let replayed = vec![
-        expect_project_notify(&mut fresh_client, "reordered replay 1").await,
-        expect_project_notify(&mut fresh_client, "reordered replay 2").await,
-        expect_project_notify(&mut fresh_client, "reordered replay 3").await,
-    ]
-    .into_iter()
-    .map(|payload| match payload {
-        ProjectNotifyPayload::Upsert { project } => project,
-        other => panic!("expected reordered replay upsert project notification, got {other:?}"),
-    })
-    .collect::<Vec<_>>();
+    let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let replayed = bootstrap.projects;
 
     assert_eq!(replayed, expected);
 }
@@ -436,7 +425,11 @@ async fn delete_project_emits_delete_and_removes_it_from_replay() {
         other => panic!("expected delete project notification, got {other:?}"),
     }
 
-    let mut late_client = fixture.connect().await;
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.projects.is_empty(),
+        "deleted project should not appear in HostBootstrap"
+    );
     expect_no_event(
         &mut late_client,
         Duration::from_millis(150),
@@ -465,17 +458,8 @@ async fn projects_persist_and_replay_from_fresh_host() {
     )
     .await;
 
-    let mut fresh_client = fixture.connect_fresh_host().await;
-    let replayed = vec![
-        expect_project_notify(&mut fresh_client, "persisted replay 1").await,
-        expect_project_notify(&mut fresh_client, "persisted replay 2").await,
-    ]
-    .into_iter()
-    .map(|payload| match payload {
-        ProjectNotifyPayload::Upsert { project } => project,
-        other => panic!("expected persisted upsert project notification, got {other:?}"),
-    })
-    .collect::<Vec<_>>();
+    let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let replayed = bootstrap.projects;
 
     assert_eq!(replayed, vec![project_a, project_b]);
 }
@@ -523,20 +507,21 @@ async fn late_joining_client_gets_server_pushed_project_state() {
     )
     .await;
 
-    let mut late_client = fixture.connect().await;
-
-    // Late client should get the project notify replay
-    match expect_project_notify(&mut late_client, "late project replay").await {
-        ProjectNotifyPayload::Upsert { project: replayed } => {
-            assert_eq!(replayed.id, project.id);
-        }
-        other => panic!("expected upsert, got {other:?}"),
-    }
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .projects
+            .iter()
+            .any(|replayed| replayed.id == project.id)
+    );
 
     // Project state is server-pushed on subscription replay; the frontend does
     // not request a refresh.
-    let file_list =
-        expect_project_file_list(&mut late_client, "late server-pushed file list").await;
+    let ProjectBootstrapPayload {
+        file_list,
+        git_status,
+        ..
+    } = expect_project_bootstrap(&mut late_client, "late server-pushed project bootstrap").await;
     assert_eq!(file_list.roots.len(), 1);
     assert!(
         file_list.roots[0]
@@ -545,8 +530,6 @@ async fn late_joining_client_gets_server_pushed_project_state() {
             .any(|entry| entry.relative_path == "src/lib.rs")
     );
 
-    let git_status =
-        expect_project_git_status(&mut late_client, "late server-pushed git status").await;
     assert_eq!(git_status.roots.len(), 1);
     assert!(git_status.roots[0].clean);
 }
@@ -564,8 +547,15 @@ async fn create_project_pushes_file_list_and_git_status() {
     .await;
 
     // Server owns project state and pushes it after the project is created.
-    let file_list =
-        expect_project_file_list(&mut fixture.client, "server-pushed file list after create").await;
+    let ProjectBootstrapPayload {
+        file_list,
+        git_status,
+        ..
+    } = expect_project_bootstrap(
+        &mut fixture.client,
+        "server-pushed project bootstrap after create",
+    )
+    .await;
     assert_eq!(file_list.roots.len(), 1);
     assert_eq!(file_list.roots[0].root.0, project.roots[0]);
     assert!(
@@ -575,9 +565,6 @@ async fn create_project_pushes_file_list_and_git_status() {
             .any(|entry| entry.relative_path == "src/lib.rs")
     );
 
-    let git_status =
-        expect_project_git_status(&mut fixture.client, "server-pushed git status after create")
-            .await;
     assert_eq!(git_status.roots.len(), 1);
     assert!(git_status.roots[0].clean);
 }
@@ -598,8 +585,11 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     )
     .await;
 
-    let file_list =
-        expect_project_file_list(&mut fixture.client, "server-pushed project file list").await;
+    let ProjectBootstrapPayload {
+        file_list,
+        git_status,
+        ..
+    } = expect_project_bootstrap(&mut fixture.client, "server-pushed project bootstrap").await;
     assert_eq!(file_list.roots.len(), 2);
     assert_eq!(file_list.roots[0].root.0, project.roots[0]);
     assert_eq!(file_list.roots[1].root.0, project.roots[1]);
@@ -616,7 +606,6 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
             .any(|entry| entry.relative_path == "app/main.rs")
     );
 
-    let git_status = expect_project_git_status(&mut fixture.client, "project git status").await;
     assert_eq!(git_status.roots.len(), 2);
     assert!(git_status.roots.iter().all(|root| root.clean));
     assert!(git_status.roots.iter().all(|root| root.files.is_empty()));
@@ -1443,10 +1432,14 @@ async fn project_list_dir_returns_deeper_entries() {
     )
     .await;
 
-    let baseline =
-        expect_project_file_list(&mut fixture.client, "server-pushed baseline file list").await;
-    let _ =
-        expect_project_git_status(&mut fixture.client, "server-pushed baseline git status").await;
+    let ProjectBootstrapPayload {
+        file_list: baseline,
+        ..
+    } = expect_project_bootstrap(
+        &mut fixture.client,
+        "server-pushed baseline project bootstrap",
+    )
+    .await;
     let paths: Vec<&str> = baseline.roots[0]
         .entries
         .iter()
@@ -1548,7 +1541,8 @@ async fn server_pushed_snapshots_send_all_add_ops() {
     )
     .await;
 
-    let file_list = expect_project_file_list(&mut fixture.client, "server-pushed file list").await;
+    let ProjectBootstrapPayload { file_list, .. } =
+        expect_project_bootstrap(&mut fixture.client, "server-pushed project bootstrap").await;
     assert!(
         file_list.roots[0]
             .entries
@@ -1563,5 +1557,4 @@ async fn server_pushed_snapshots_send_all_add_ops() {
             .any(|e| e.relative_path == "lib.rs"),
         "lib.rs should be present in server-pushed listing"
     );
-    let _ = expect_project_git_status(&mut fixture.client, "server-pushed git status").await;
 }

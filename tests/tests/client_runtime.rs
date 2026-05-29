@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent};
-use protocol::{BackendKind, ChatEvent, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload};
+use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent, ProjectEvent};
+use protocol::{
+    AgentBootstrapEvent, BackendKind, ChatEvent, SendMessagePayload, SpawnAgentParams,
+    SpawnAgentPayload,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -37,17 +40,12 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
         commands,
     } = host_endpoint;
 
-    match next_host_event(&mut events, "initial host settings").await {
-        HostEvent::HostSettings(_) => {}
-        _ => panic!("expected initial HostSettings"),
-    }
-    match next_host_event(&mut events, "initial mobile access state").await {
-        HostEvent::MobileAccessState(_) => {}
-        _ => panic!("expected initial MobileAccessState"),
-    }
-    match next_host_event(&mut events, "initial session schemas").await {
-        HostEvent::SessionSchemas(_) => {}
-        _ => panic!("expected initial SessionSchemas"),
+    match next_host_event(&mut events, "initial host bootstrap").await {
+        HostEvent::HostBootstrap(payload) => {
+            assert!(payload.sessions.is_empty());
+            assert!(payload.projects.is_empty());
+        }
+        _ => panic!("expected initial HostBootstrap"),
     }
 
     let (session_list_tx, session_list_rx) = oneshot::channel();
@@ -70,6 +68,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     }
                 }
                 HostEvent::HostSettings(_)
+                | HostEvent::HostBootstrap(_)
                 | HostEvent::BackendSetup(_)
                 | HostEvent::AgentClosed(_)
                 | HostEvent::ProjectNotify(_)
@@ -145,6 +144,29 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
+                AgentEvent::Bootstrap(payload) => {
+                    for event in payload.events {
+                        match event {
+                            AgentBootstrapEvent::AgentStart(payload) => {
+                                if probe_tx
+                                    .send(AgentProbe::Started(payload.name))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            AgentBootstrapEvent::ChatEvent(payload) => {
+                                if send_chat_probe(&probe_tx, payload).await.is_err() {
+                                    return;
+                                }
+                            }
+                            AgentBootstrapEvent::AgentError(_)
+                            | AgentBootstrapEvent::SessionSettings(_)
+                            | AgentBootstrapEvent::QueuedMessages(_) => {}
+                        }
+                    }
+                }
                 AgentEvent::Start(payload) => {
                     if probe_tx
                         .send(AgentProbe::Started(payload.name))
@@ -154,19 +176,11 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                         break;
                     }
                 }
-                AgentEvent::Chat(payload) => match *payload {
-                    ChatEvent::MessageAdded(_) => {}
-                    ChatEvent::StreamEnd(data) => {
-                        if probe_tx
-                            .send(AgentProbe::Final(data.message.content))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                AgentEvent::Chat(payload) => {
+                    if send_chat_probe(&probe_tx, *payload).await.is_err() {
+                        break;
                     }
-                    _ => {}
-                },
+                }
                 AgentEvent::Renamed(_)
                 | AgentEvent::SessionSettings(_)
                 | AgentEvent::QueuedMessages(_) => {}
@@ -207,6 +221,73 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
             );
         }
         other => panic!("expected follow-up final response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn runtime_preserves_project_bootstrap_until_project_endpoint_is_opened() {
+    init_tracing();
+
+    let session_store_dir = tempfile::tempdir().expect("create session tempdir");
+    let project_root = tempfile::tempdir().expect("create project root");
+    let project_path = session_store_dir.path().join("projects.json");
+    let project = server::store::project::ProjectStore::load(project_path.clone())
+        .expect("load project store")
+        .create(
+            "runtime-bootstrap-project".to_owned(),
+            vec![project_root.path().to_string_lossy().to_string()],
+        )
+        .expect("create project");
+    let host = server::spawn_host_with_mock_backend(
+        session_store_dir.path().join("sessions.json"),
+        project_path,
+        session_store_dir.path().join("settings.json"),
+    )
+    .expect("initialize host with mock backend");
+
+    let HostEndpoint {
+        mut events,
+        commands,
+    } = connect_runtime(host).await;
+
+    match next_host_event(&mut events, "initial host bootstrap").await {
+        HostEvent::HostBootstrap(payload) => {
+            assert!(
+                payload.projects.iter().any(|item| item.id == project.id),
+                "HostBootstrap should include the persisted project"
+            );
+        }
+        _ => panic!("expected initial HostBootstrap"),
+    }
+
+    let mut project_endpoint = commands
+        .open_project(project.id.clone())
+        .await
+        .expect("bootstrapped project endpoint should be available");
+    match timeout(Duration::from_secs(5), project_endpoint.events.recv())
+        .await
+        .expect("timed out waiting for project bootstrap")
+        .expect("project event stream closed before bootstrap")
+    {
+        ProjectEvent::Bootstrap(payload) => {
+            assert_eq!(payload.project.id, project.id);
+            assert_eq!(payload.project.name, project.name);
+            assert!(
+                payload.review_summaries.is_empty(),
+                "new project should not have review summaries"
+            );
+        }
+        _ => panic!("expected ProjectBootstrap"),
+    }
+}
+
+async fn send_chat_probe(
+    tx: &mpsc::Sender<AgentProbe>,
+    event: ChatEvent,
+) -> Result<(), mpsc::error::SendError<AgentProbe>> {
+    match event {
+        ChatEvent::StreamEnd(data) => tx.send(AgentProbe::Final(data.message.content)).await,
+        _ => Ok(()),
     }
 }
 

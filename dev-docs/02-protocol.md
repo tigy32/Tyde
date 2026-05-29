@@ -121,7 +121,7 @@ are valid until the handshake completes.
   "kind": "hello",
   "seq": 0,
   "payload": {
-    "protocol_version": 1,
+    "protocol_version": 4,
     "tyde_version": { "major": 2, "minor": 0, "patch": 0 },
     "client_name": "tyde-desktop",
     "platform": "macos"
@@ -137,15 +137,15 @@ are valid until the handshake completes.
   "kind": "welcome",
   "seq": 0,
   "payload": {
-    "protocol_version": 1,
-    "tyde_version": { "major": 2, "minor": 1, "patch": 0 },
-    "bootstrap": {}
+    "protocol_version": 4,
+    "tyde_version": { "major": 2, "minor": 1, "patch": 0 }
   }
 }
 ```
 
-After `welcome`, the connection is established. Both sides may send messages on
-other streams.
+After `welcome`, the server sends `host_bootstrap` on the same host stream at
+seq `1`. The connection is established after `welcome`; stream bootstrap rules
+are specified in `21-bootstrap-streams.md`.
 
 ### 4.3 Reject (server → client)
 
@@ -156,8 +156,8 @@ other streams.
   "seq": 0,
   "payload": {
     "code": "incompatible_protocol",
-    "message": "Server requires protocol version 3, client sent 2",
-    "server_protocol_version": 3,
+    "message": "Server requires protocol version 4, client sent 3",
+    "server_protocol_version": 4,
     "server_tyde_version": { "major": 3, "minor": 0, "patch": 0 }
   }
 }
@@ -194,7 +194,7 @@ rejection, surfaces the message, and does not retry without updating.
 - Bumped for application-level changes (new stream types, new payload fields)
 - **Informational during handshake** — not a compatibility gate
 - Exchanged so both sides can log it and so the server can surface warnings in
-  `bootstrap` if versions are far apart
+  host bootstrap or later diagnostics if versions are far apart
 
 ---
 
@@ -279,7 +279,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The current protocol version. Bump when the wire shape changes.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // ── Primitives ──────────────────────────────────────────────────────
 
@@ -332,12 +332,8 @@ pub struct HelloPayload {
 pub struct WelcomePayload {
     pub protocol_version: u32,
     pub tyde_version: Version,
-    pub bootstrap: BootstrapData,
 }
 
-/// Bootstrap data sent with Welcome. Starts minimal, will grow.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BootstrapData {}
 
 /// Server → Client: handshake rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,10 +355,10 @@ pub enum RejectCode {
 
 ### Notes on the types
 
-- `FrameKind` only contains handshake kinds for now. Post-handshake kinds will
-  be added as features are designed (see decision log in `01-philosophy.md`).
-- `BootstrapData` is an empty struct, not `Value`. It will grow with typed
-  fields — never a bag of untyped JSON.
+- Post-handshake `FrameKind` variants are typed protocol events. Version 4
+  adds explicit bootstrap frame kinds; see `21-bootstrap-streams.md`.
+- `WelcomePayload` has no bootstrap field. Initial state is sent as typed
+  stream bootstrap frames after the handshake.
 - `StreamPath` wraps `String` for type safety. It will gain validation
   (must start with `/`, valid segments) when we add stream creation logic.
 

@@ -3927,53 +3927,110 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
         let host_stream = protocol::StreamPath("/host/test".to_string());
         let agent_stream = protocol::StreamPath("/agent/test-agent/test-instance".to_string());
         let agent_id = protocol::AgentId("test-agent".to_string());
+        let workspace_roots = vec![workspace_root.to_string_lossy().to_string()];
         let mut validator = protocol::ProtocolValidator::new();
-        let new_agent = protocol::Envelope::from_payload(
-            host_stream,
-            protocol::FrameKind::NewAgent,
+        let new_agent = protocol::NewAgentPayload {
+            agent_id: agent_id.clone(),
+            name: "test".to_string(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Kiro,
+            workspace_roots: workspace_roots.clone(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: agent_stream.clone(),
+        };
+        let welcome = protocol::Envelope::from_payload(
+            host_stream.clone(),
+            protocol::FrameKind::Welcome,
             0,
-            &protocol::NewAgentPayload {
-                agent_id: agent_id.clone(),
-                name: "test".to_string(),
-                origin: protocol::AgentOrigin::User,
-                backend_kind: protocol::BackendKind::Kiro,
-                workspace_roots: vec![workspace_root.to_string_lossy().to_string()],
-                custom_agent_id: None,
-                team_id: None,
-                team_member_id: None,
-                project_id: None,
-                parent_agent_id: None,
-                created_at_ms: 0,
-                instance_stream: agent_stream.clone(),
+            &protocol::WelcomePayload {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                tyde_version: protocol::Version {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                },
             },
         )
-        .expect("serialize NewAgent");
+        .expect("serialize Welcome");
         validator
-            .validate_envelope(&new_agent)
-            .expect("validate NewAgent");
+            .validate_envelope(&welcome)
+            .expect("validate Welcome");
 
-        let agent_start = protocol::Envelope::from_payload(
-            agent_stream.clone(),
-            protocol::FrameKind::AgentStart,
-            0,
-            &protocol::AgentStartPayload {
-                agent_id,
-                name: "test".to_string(),
-                origin: protocol::AgentOrigin::User,
-                backend_kind: protocol::BackendKind::Kiro,
-                workspace_roots: vec![workspace_root.to_string_lossy().to_string()],
-                custom_agent_id: None,
-                team_id: None,
-                team_member_id: None,
-                project_id: None,
-                parent_agent_id: None,
-                created_at_ms: 0,
+        let host_bootstrap = protocol::Envelope::from_payload(
+            host_stream,
+            protocol::FrameKind::HostBootstrap,
+            1,
+            &protocol::HostBootstrapPayload {
+                settings: protocol::HostSettings {
+                    enabled_backends: vec![protocol::BackendKind::Kiro],
+                    default_backend: Some(protocol::BackendKind::Kiro),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+                mobile_access: protocol::MobileAccessStatePayload {
+                    broker_status: protocol::MobileBrokerStatus::Disabled,
+                    pairing: protocol::MobilePairingState::Idle,
+                    paired_devices: vec![],
+                },
+                backend_setup: protocol::BackendSetupPayload { backends: vec![] },
+                session_schemas: vec![],
+                sessions: vec![],
+                projects: vec![],
+                mcp_servers: vec![],
+                skills: vec![],
+                steering: vec![],
+                custom_agents: vec![],
+                team_preset_catalog: protocol::TeamPresetCatalog {
+                    role_presets: vec![],
+                    personality_traits: vec![],
+                    personality_presets: vec![],
+                    team_templates: vec![],
+                },
+                team_drafts: vec![],
+                teams: vec![],
+                team_members: vec![],
+                team_member_bindings: vec![],
+                agents: vec![new_agent],
             },
         )
-        .expect("serialize AgentStart");
+        .expect("serialize HostBootstrap");
         validator
-            .validate_envelope(&agent_start)
-            .expect("validate AgentStart");
+            .validate_envelope(&host_bootstrap)
+            .expect("validate HostBootstrap");
+
+        let agent_bootstrap = protocol::Envelope::from_payload(
+            agent_stream.clone(),
+            protocol::FrameKind::AgentBootstrap,
+            0,
+            &protocol::AgentBootstrapPayload {
+                events: vec![protocol::AgentBootstrapEvent::AgentStart(
+                    protocol::AgentStartPayload {
+                        agent_id,
+                        name: "test".to_string(),
+                        origin: protocol::AgentOrigin::User,
+                        backend_kind: protocol::BackendKind::Kiro,
+                        workspace_roots,
+                        custom_agent_id: None,
+                        team_id: None,
+                        team_member_id: None,
+                        project_id: None,
+                        parent_agent_id: None,
+                        created_at_ms: 0,
+                    },
+                )],
+            },
+        )
+        .expect("serialize AgentBootstrap");
+        validator
+            .validate_envelope(&agent_bootstrap)
+            .expect("validate AgentBootstrap");
 
         for (index, event) in events.iter().enumerate() {
             let env = protocol::Envelope::from_payload(

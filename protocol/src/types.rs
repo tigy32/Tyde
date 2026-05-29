@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -488,6 +488,12 @@ pub enum FrameKind {
     SetSessionSettings,
 
     // Output events (server -> client)
+    HostBootstrap,
+    AgentBootstrap,
+    ProjectBootstrap,
+    ReviewBootstrap,
+    BrowseBootstrap,
+    TerminalBootstrap,
     HostSettings,
     BackendSetup,
     NewAgent,
@@ -603,6 +609,12 @@ impl fmt::Display for FrameKind {
             Self::MobilePairingCancel => f.write_str("mobile_pairing_cancel"),
             Self::MobileDeviceRevoke => f.write_str("mobile_device_revoke"),
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
+            Self::HostBootstrap => f.write_str("host_bootstrap"),
+            Self::AgentBootstrap => f.write_str("agent_bootstrap"),
+            Self::ProjectBootstrap => f.write_str("project_bootstrap"),
+            Self::ReviewBootstrap => f.write_str("review_bootstrap"),
+            Self::BrowseBootstrap => f.write_str("browse_bootstrap"),
+            Self::TerminalBootstrap => f.write_str("terminal_bootstrap"),
             Self::HostSettings => f.write_str("host_settings"),
             Self::BackendSetup => f.write_str("backend_setup"),
             Self::NewAgent => f.write_str("new_agent"),
@@ -696,11 +708,86 @@ pub struct HelloPayload {
 pub struct WelcomePayload {
     pub protocol_version: u32,
     pub tyde_version: Version,
-    pub bootstrap: BootstrapData,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BootstrapData {}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostBootstrapPayload {
+    pub settings: HostSettings,
+    pub mobile_access: MobileAccessStatePayload,
+    pub backend_setup: BackendSetupPayload,
+    pub session_schemas: Vec<SessionSchemaEntry>,
+    pub sessions: Vec<SessionSummary>,
+    pub projects: Vec<Project>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub skills: Vec<Skill>,
+    pub steering: Vec<Steering>,
+    pub custom_agents: Vec<CustomAgent>,
+    pub team_preset_catalog: TeamPresetCatalog,
+    pub team_drafts: Vec<TeamDraft>,
+    pub teams: Vec<Team>,
+    pub team_members: Vec<TeamMember>,
+    pub team_member_bindings: Vec<TeamMemberBindingPayload>,
+    pub agents: Vec<NewAgentPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentBootstrapPayload {
+    pub events: Vec<AgentBootstrapEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum AgentBootstrapEvent {
+    AgentStart(AgentStartPayload),
+    AgentError(AgentErrorPayload),
+    SessionSettings(SessionSettingsPayload),
+    QueuedMessages(QueuedMessagesPayload),
+    ChatEvent(ChatEvent),
+}
+
+impl AgentBootstrapEvent {
+    pub fn frame_kind(&self) -> FrameKind {
+        match self {
+            Self::AgentStart(_) => FrameKind::AgentStart,
+            Self::AgentError(_) => FrameKind::AgentError,
+            Self::SessionSettings(_) => FrameKind::SessionSettings,
+            Self::QueuedMessages(_) => FrameKind::QueuedMessages,
+            Self::ChatEvent(_) => FrameKind::ChatEvent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectBootstrapPayload {
+    pub project: Project,
+    pub file_list: ProjectFileListPayload,
+    pub git_status: ProjectGitStatusPayload,
+    pub review_summaries: Vec<ReviewSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewBootstrapPayload {
+    pub review: Review,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowseBootstrapPayload {
+    pub opened: HostBrowseOpenedPayload,
+    pub listing: BrowseBootstrapListing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrowseBootstrapListing {
+    Entries { entries: HostBrowseEntriesPayload },
+    Error { error: HostBrowseErrorPayload },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalBootstrapPayload {
+    pub terminal_id: TerminalId,
+    pub start: TerminalStartPayload,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSettings {
@@ -1061,7 +1148,7 @@ pub struct DeleteSessionPayload {
     pub session_id: SessionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
     pub backend_kind: BackendKind,
@@ -1254,7 +1341,7 @@ pub struct AgentClosedPayload {
     pub agent_id: AgentId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgentPayload {
     pub agent_id: AgentId,
     pub name: String,
@@ -1973,20 +2060,20 @@ pub struct ProjectListDirPayload {
     pub path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectFileListPayload {
     #[serde(default)]
     pub incremental: bool,
     pub roots: Vec<ProjectRootListing>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRootListing {
     pub root: ProjectRootPath,
     pub entries: Vec<ProjectFileEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectFileEntry {
     pub relative_path: String,
     pub kind: ProjectFileKind,
@@ -2008,12 +2095,12 @@ pub enum ProjectFileKind {
     Symlink,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitStatusPayload {
     pub roots: Vec<ProjectRootGitStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRootGitStatus {
     pub root: ProjectRootPath,
     pub branch: Option<String>,
@@ -2023,7 +2110,7 @@ pub struct ProjectRootGitStatus {
     pub files: Vec<ProjectGitFileStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitFileStatus {
     pub relative_path: String,
     pub staged: Option<ProjectGitChangeKind>,
@@ -2501,7 +2588,7 @@ pub struct HostBrowseClosePayload {}
 
 /// Seq 0 on `/browse/<uuid>`. Birth certificate of the browse stream — declares
 /// the host's filesystem shape so the client never has to infer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBrowseOpenedPayload {
     pub home: HostAbsPath,
     pub root: HostAbsPath,
@@ -2509,14 +2596,14 @@ pub struct HostBrowseOpenedPayload {
     pub platform: HostPlatform,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBrowseEntriesPayload {
     pub path: HostAbsPath,
     pub parent: Option<HostAbsPath>,
     pub entries: Vec<HostBrowseEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBrowseEntry {
     pub name: String,
     pub kind: ProjectFileKind,
@@ -2535,7 +2622,7 @@ pub enum HostBrowseEntryError {
     StatFailed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBrowseErrorPayload {
     pub path: HostAbsPath,
     pub code: HostBrowseErrorCode,
@@ -2604,7 +2691,7 @@ pub struct NewTerminalPayload {
     pub stream: StreamPath,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalStartPayload {
     pub project_id: Option<ProjectId>,
     pub root: Option<ProjectRootPath>,

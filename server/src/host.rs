@@ -12,12 +12,13 @@ use protocol::types::{
 };
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
-    CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    FrameKind, HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData,
-    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, CustomAgent, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBootstrapPayload,
+    HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
+    McpTransportConfig, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
@@ -33,9 +34,8 @@ use protocol::{
     TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
     TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalCreatePayload, TerminalId, TerminalLaunchTarget, TerminalResizePayload,
-    TerminalSendPayload,
+    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -102,6 +102,7 @@ use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal
 
 struct HostSubscriber {
     stream: Stream,
+    last_session_schemas: Option<Vec<SessionSchemaEntry>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -368,6 +369,7 @@ impl HostHandle {
             host_path.clone(),
             HostSubscriber {
                 stream: host_stream,
+                last_session_schemas: None,
             },
         );
         assert!(
@@ -386,55 +388,26 @@ impl HostHandle {
             .enabled_backends
             .contains(&protocol::BackendKind::Kiro);
         let schemas = session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
-        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-            panic!(
-                "host stream {} disappeared during settings replay",
-                host_path
-            );
+
+        let mobile_access = {
+            let Some(subscriber) = state.host_streams.get(&host_path) else {
+                panic!(
+                    "host stream {} disappeared during mobile access bootstrap registration",
+                    host_path
+                );
+            };
+            match state
+                .mobile_access
+                .register_bootstrap_subscriber(subscriber.stream.clone())
+                .await
+            {
+                Ok(payload) => payload,
+                Err(_) => {
+                    state.host_streams.remove(&host_path);
+                    return Vec::new();
+                }
+            }
         };
-        if emit_host_settings_for_subscriber(&settings, subscriber)
-            .await
-            .is_err()
-        {
-            state.host_streams.remove(&host_path);
-            return Vec::new();
-        }
-        let Some(subscriber) = state.host_streams.get(&host_path) else {
-            panic!(
-                "host stream {} disappeared during mobile access replay",
-                host_path
-            );
-        };
-        if state
-            .mobile_access
-            .register_subscriber(subscriber.stream.clone())
-            .await
-            .is_err()
-        {
-            state.host_streams.remove(&host_path);
-            return Vec::new();
-        }
-        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-            panic!(
-                "host stream {} disappeared during session schema replay",
-                host_path
-            );
-        };
-        if emit_session_schemas_for_subscriber(&schemas, subscriber)
-            .await
-            .is_err()
-        {
-            state.mobile_access.unregister_subscriber(host_path.clone());
-            state.host_streams.remove(&host_path);
-            return Vec::new();
-        }
-        if emit_backend_setup_for_subscriber(&backend_setup, subscriber)
-            .await
-            .is_err()
-        {
-            state.host_streams.remove(&host_path);
-            return Vec::new();
-        }
 
         let projects = state
             .project_store
@@ -446,46 +419,13 @@ impl HostHandle {
             .iter()
             .map(|project| project.id.clone())
             .collect::<Vec<_>>();
-        for project in projects {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during project registration replay",
-                    host_path
-                );
-            };
-            if emit_project_notify_for_subscriber(
-                &ProjectNotifyPayload::Upsert { project },
-                subscriber,
-            )
+
+        let sessions = state
+            .session_store
+            .lock()
             .await
-            .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
-        for project_id in project_ids {
-            if let Err(error) =
-                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
-            {
-                tracing::warn!(
-                    host_stream = %host_path,
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to subscribe host to project stream during registration"
-                );
-            }
-            if let Err(error) =
-                emit_review_list_changed_for_project(&mut state, project_id.clone()).await
-            {
-                tracing::warn!(
-                    host_stream = %host_path,
-                    project_id = %project_id,
-                    error = %error,
-                    "failed to emit review list during registration"
-                );
-            }
-        }
+            .summaries()
+            .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
 
         let mcp_servers = state
             .mcp_server_store
@@ -495,24 +435,6 @@ impl HostHandle {
             .unwrap_or_else(|err| {
                 panic!("failed to list MCP servers for host registration: {err}")
             });
-        for mcp_server in mcp_servers {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during MCP server registration replay",
-                    host_path
-                );
-            };
-            if emit_mcp_server_notify_for_subscriber(
-                &McpServerNotifyPayload::Upsert { mcp_server },
-                subscriber,
-            )
-            .await
-            .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
 
         let skills = {
             let store = state.skill_store.lock().await;
@@ -535,21 +457,6 @@ impl HostHandle {
                 }
             }
         };
-        for skill in skills {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during skill registration replay",
-                    host_path
-                );
-            };
-            if emit_skill_notify_for_subscriber(&SkillNotifyPayload::Upsert { skill }, subscriber)
-                .await
-                .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
 
         let steering = state
             .steering_store
@@ -557,24 +464,6 @@ impl HostHandle {
             .await
             .list()
             .unwrap_or_else(|err| panic!("failed to list steering for host registration: {err}"));
-        for steering in steering {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during steering registration replay",
-                    host_path
-                );
-            };
-            if emit_steering_notify_for_subscriber(
-                &SteeringNotifyPayload::Upsert { steering },
-                subscriber,
-            )
-            .await
-            .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
 
         let custom_agents = state
             .custom_agent_store
@@ -584,24 +473,6 @@ impl HostHandle {
             .unwrap_or_else(|err| {
                 panic!("failed to list custom agents for host registration: {err}")
             });
-        for custom_agent in custom_agents {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during custom agent registration replay",
-                    host_path
-                );
-            };
-            if emit_custom_agent_notify_for_subscriber(
-                &CustomAgentNotifyPayload::Upsert { custom_agent },
-                subscriber,
-            )
-            .await
-            .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
 
         let team_snapshot = match state.team_registry.snapshot().await {
             Ok(snapshot) => snapshot,
@@ -611,81 +482,14 @@ impl HostHandle {
                     error = %err,
                     "failed to snapshot teams for host registration"
                 );
+                state.mobile_access.unregister_subscriber(host_path.clone());
                 state.host_streams.remove(&host_path);
                 return Vec::new();
             }
         };
-        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-            panic!(
-                "host stream {} disappeared during team catalog registration replay",
-                host_path
-            );
-        };
-        if emit_team_preset_catalog_notify_for_subscriber(
-            &TeamPresetCatalogNotifyPayload {
-                catalog: team_snapshot.catalog,
-            },
-            subscriber,
-        )
-        .await
-        .is_err()
-        {
-            state.host_streams.remove(&host_path);
-            return Vec::new();
-        }
-        for draft in team_snapshot.drafts {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during team draft registration replay",
-                    host_path
-                );
-            };
-            if emit_team_draft_notify_for_subscriber(
-                &TeamDraftNotifyPayload::Upsert { draft },
-                subscriber,
-            )
-            .await
-            .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
-        for team in team_snapshot.teams {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during team registration replay",
-                    host_path
-                );
-            };
-            if emit_team_notify_for_subscriber(&TeamNotifyPayload::Upsert { team }, subscriber)
-                .await
-                .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
-        for member in team_snapshot.members {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during team member registration replay",
-                    host_path
-                );
-            };
-            if emit_team_member_notify_for_subscriber(
-                &TeamMemberNotifyPayload::Upsert { member },
-                subscriber,
-            )
-            .await
-            .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
-        }
 
         let agent_ids = state.registry.agent_ids();
+        let mut agents = Vec::new();
         let mut deferred_attachments = Vec::new();
         for agent_id in agent_ids {
             let agent_handle = state.registry.agent_handle(&agent_id).unwrap_or_else(|| {
@@ -695,9 +499,9 @@ impl HostHandle {
                 )
             });
             let start = agent_handle.snapshot();
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+            let Some(subscriber) = state.host_streams.get(&host_path) else {
                 panic!(
-                    "host stream {} disappeared during registration replay",
+                    "host stream {} disappeared during registration bootstrap build",
                     host_path
                 );
             };
@@ -716,48 +520,62 @@ impl HostHandle {
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
             };
-            let payload = serde_json::to_value(&new_agent)
-                .expect("failed to serialize NewAgent payload for host stream fanout");
-            if subscriber
-                .stream
-                .send_value(FrameKind::NewAgent, payload)
-                .is_err()
-            {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
             let agent_stream = subscriber.stream.with_path(instance_stream);
+            agents.push(new_agent);
             deferred_attachments.push((agent_handle, agent_stream));
         }
 
-        let team_snapshot = match state.team_registry.snapshot().await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                tracing::error!(
-                    host_stream = %host_path,
-                    error = %err,
-                    "failed to snapshot team bindings for host registration"
-                );
-                state.host_streams.remove(&host_path);
-                return Vec::new();
-            }
+        let bootstrap = HostBootstrapPayload {
+            settings,
+            mobile_access,
+            backend_setup,
+            session_schemas: schemas,
+            sessions,
+            projects,
+            mcp_servers,
+            skills,
+            steering,
+            custom_agents,
+            team_preset_catalog: team_snapshot.catalog,
+            team_drafts: team_snapshot.drafts,
+            teams: team_snapshot.teams,
+            team_members: team_snapshot.members,
+            team_member_bindings: team_snapshot.bindings,
+            agents,
         };
-        for binding in team_snapshot.bindings {
-            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-                panic!(
-                    "host stream {} disappeared during team binding registration replay",
-                    host_path
-                );
-            };
-            if emit_team_member_binding_notify_for_subscriber(
-                &TeamMemberBindingNotifyPayload::Upsert { binding },
-                subscriber,
-            )
-            .await
+
+        let payload = serde_json::to_value(&bootstrap)
+            .expect("failed to serialize HostBootstrap payload for host stream registration");
+        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+            panic!(
+                "host stream {} disappeared before HostBootstrap emission",
+                host_path
+            );
+        };
+        if subscriber
+            .stream
+            .send_value(FrameKind::HostBootstrap, payload)
             .is_err()
+        {
+            state.mobile_access.unregister_subscriber(host_path.clone());
+            state.host_streams.remove(&host_path);
+            return Vec::new();
+        }
+        subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
+        state
+            .mobile_access
+            .activate_bootstrap_subscriber(host_path.clone());
+
+        for project_id in project_ids {
+            if let Err(error) =
+                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
             {
-                state.host_streams.remove(&host_path);
-                return Vec::new();
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to subscribe host to project stream during registration"
+                );
             }
         }
 
@@ -3454,7 +3272,7 @@ impl HostHandle {
         {
             return Ok(None);
         }
-        let _ = terminal.emit_start().await;
+        let _ = terminal.emit_bootstrap_and_start_io().await;
         Ok(Some(terminal))
     }
 
@@ -3919,12 +3737,19 @@ impl HostHandle {
 
         let initial = payload.initial.unwrap_or_else(browse_stream::home_dir);
         let opened = browse_stream::opened_payload(&initial);
-        browse_stream::emit_opened(&browse_stream, &opened).await;
-
-        match browse_stream::list_dir(&initial, payload.include_hidden).await {
-            Ok(entries) => browse_stream::emit_entries(&browse_stream, &entries).await,
-            Err(error) => browse_stream::emit_error(&browse_stream, &error).await,
-        }
+        let listing = match browse_stream::list_dir(&initial, payload.include_hidden).await {
+            Ok(entries) => BrowseBootstrapListing::Entries { entries },
+            Err(error) => BrowseBootstrapListing::Error { error },
+        };
+        let payload =
+            serde_json::to_value(BrowseBootstrapPayload { opened, listing }).map_err(|error| {
+                AppError::internal_message(
+                    OPERATION,
+                    "failed to serialize BrowseBootstrap payload",
+                    error,
+                )
+            })?;
+        let _ = browse_stream.send_value(FrameKind::BrowseBootstrap, payload);
         Ok(())
     }
 
@@ -3978,6 +3803,11 @@ impl HostHandle {
         operation: &'static str,
     ) -> AppResult<ProjectStreamHandle> {
         let mut state = self.state.lock().await;
+        let summaries = state
+            .review_registry
+            .summaries(project_id.clone())
+            .await
+            .map_err(|error| project_command_error(operation, error))?;
         let handle = ensure_project_actor(&mut state, project_id)
             .await
             .map_err(|error| project_command_error(operation, error))?;
@@ -3985,6 +3815,7 @@ impl HostHandle {
             .add_subscriber(
                 connection_host_stream.clone(),
                 project_output_stream.clone(),
+                summaries,
             )
             .await
             .map_err(|error| project_command_error(operation, error))?;
@@ -6166,9 +5997,10 @@ async fn subscribe_host_to_project(
     let project_output_stream = subscriber
         .stream
         .with_path(project_stream_path(&project_id));
+    let summaries = state.review_registry.summaries(project_id.clone()).await?;
     let handle = ensure_project_actor(state, project_id).await?;
     handle
-        .add_subscriber(host_path.clone(), project_output_stream)
+        .add_subscriber(host_path.clone(), project_output_stream, summaries)
         .await
 }
 
@@ -6288,17 +6120,6 @@ async fn emit_team_member_binding_notify_for_subscriber(
         .send_value(FrameKind::TeamMemberBindingNotify, payload)
 }
 
-async fn emit_team_preset_catalog_notify_for_subscriber(
-    payload: &TeamPresetCatalogNotifyPayload,
-    subscriber: &mut HostSubscriber,
-) -> Result<(), StreamClosed> {
-    let payload = serde_json::to_value(payload)
-        .expect("failed to serialize TeamPresetCatalogNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::TeamPresetCatalogNotify, payload)
-}
-
 async fn emit_team_draft_notify_for_subscriber(
     payload: &TeamDraftNotifyPayload,
     subscriber: &mut HostSubscriber,
@@ -6414,13 +6235,18 @@ async fn emit_session_schemas_for_subscriber(
     schemas: &[SessionSchemaEntry],
     subscriber: &mut HostSubscriber,
 ) -> Result<(), StreamClosed> {
+    if subscriber.last_session_schemas.as_deref() == Some(schemas) {
+        return Ok(());
+    }
     let payload = serde_json::to_value(SessionSchemasPayload {
         schemas: schemas.to_vec(),
     })
     .expect("failed to serialize SessionSchemas payload for host stream fanout");
     subscriber
         .stream
-        .send_value(FrameKind::SessionSchemas, payload)
+        .send_value(FrameKind::SessionSchemas, payload)?;
+    subscriber.last_session_schemas = Some(schemas.to_vec());
+    Ok(())
 }
 
 fn session_schema_for_backend(

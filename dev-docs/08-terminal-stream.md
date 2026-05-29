@@ -646,3 +646,7 @@ Not part of the first version:
 
 If we need any of those later, they should be added as explicit protocol types
 and events, not inferred in the frontend.
+
+---
+
+Protocol v4 note: terminal streams start with `terminal_bootstrap` seq 0, which wraps the previous terminal start data. Terminal output begins only after that bootstrap has been queued.

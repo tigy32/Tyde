@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentId, AgentStartPayload, BackendKind, ChatEvent, Envelope, FrameKind, NewAgentPayload,
-    QueuedMessagesPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentStartPayload, BackendKind, ChatEvent,
+    Envelope, FrameKind, NewAgentPayload, QueuedMessagesPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath,
 };
 
 async fn raw_next(client: &mut client::Connection, context: &str) -> Envelope {
@@ -55,10 +56,23 @@ async fn spawn_agent(
 
     let start = loop {
         let env = raw_next(client, "AgentStart").await;
-        if env.kind != FrameKind::AgentStart || env.stream != new_agent.instance_stream {
+        if env.stream != new_agent.instance_stream {
             continue;
         }
-        break env.parse_payload().expect("parse AgentStartPayload");
+        match env.kind {
+            FrameKind::AgentStart => break env.parse_payload().expect("parse AgentStartPayload"),
+            FrameKind::AgentBootstrap => {
+                let bootstrap: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse AgentBootstrapPayload");
+                if let Some(start) = bootstrap.events.into_iter().find_map(|event| match event {
+                    AgentBootstrapEvent::AgentStart(start) => Some(start),
+                    _ => None,
+                }) {
+                    break start;
+                }
+            }
+            _ => {}
+        }
     };
 
     (new_agent, start)
@@ -67,6 +81,18 @@ async fn spawn_agent(
 async fn wait_for_typing_true(client: &mut client::Connection, stream: &StreamPath) {
     loop {
         let env = raw_next(client, "TypingStatusChanged(true)").await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == *stream {
+            let bootstrap: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            if bootstrap.events.into_iter().any(|event| {
+                matches!(
+                    event,
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true))
+                )
+            }) {
+                return;
+            }
+        }
         if env.kind != FrameKind::ChatEvent || env.stream != *stream {
             continue;
         }
@@ -78,6 +104,18 @@ async fn wait_for_typing_true(client: &mut client::Connection, stream: &StreamPa
 }
 
 fn assert_no_nonempty_parent_queue(env: &Envelope, parent_stream: &StreamPath) {
+    if env.kind == FrameKind::AgentBootstrap && env.stream == *parent_stream {
+        let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+        for event in payload.events {
+            if let AgentBootstrapEvent::QueuedMessages(payload) = event {
+                assert!(
+                    payload.messages.is_empty(),
+                    "child completion must not enqueue messages on parent queue: {:?}",
+                    payload.messages
+                );
+            }
+        }
+    }
     if env.kind != FrameKind::QueuedMessages || env.stream != *parent_stream {
         return;
     }

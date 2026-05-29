@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    BackendAccessMode, BackendKind, ChatEvent, Envelope, FrameKind, HostSettings,
-    HostSettingsPayload, NewAgentPayload, ProjectId, SendMessagePayload, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, StreamPath,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorPayload, AgentId,
+    AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendKind, ChatEvent, Envelope,
+    FrameKind, HostBootstrapPayload, HostSettings, HostSettingsPayload, NewAgentPayload, ProjectId,
+    SendMessagePayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -662,11 +662,11 @@ async fn bootstrap_runtime(
         .next_event()
         .await
         .map_err(|err| format!("failed to read initial host event: {err:?}"))?
-        .ok_or_else(|| "Tyde host closed before sending initial HostSettings".to_string())?;
+        .ok_or_else(|| "Tyde host closed before sending initial HostBootstrap".to_string())?;
 
-    if first.kind != FrameKind::HostSettings {
+    if first.kind != FrameKind::HostBootstrap {
         return Err(format!(
-            "expected initial HostSettings event from Tyde host, received {}",
+            "expected initial HostBootstrap event from Tyde host, received {}",
             first.kind
         ));
     }
@@ -707,8 +707,70 @@ fn fail_runtime(
     publish_snapshot(&mut state.snapshot, snapshot_tx);
 }
 
+fn apply_new_agent_payload(snapshot: &mut SnapshotState, payload: NewAgentPayload) {
+    let activity = snapshot
+        .agents
+        .get(&payload.agent_id)
+        .map(|agent| agent.activity_counter.saturating_add(1))
+        .unwrap_or(1);
+    snapshot.agents.insert(
+        payload.agent_id.clone(),
+        AgentState {
+            agent_id: payload.agent_id,
+            name: payload.name,
+            backend_kind: payload.backend_kind,
+            workspace_roots: payload.workspace_roots,
+            project_id: payload.project_id,
+            parent_agent_id: payload.parent_agent_id,
+            created_at_ms: payload.created_at_ms,
+            instance_stream: payload.instance_stream,
+            is_thinking: false,
+            turn_completed: false,
+            terminated: false,
+            last_error: None,
+            activity_counter: activity,
+            event_log: Vec::new(),
+        },
+    );
+}
+
+fn apply_agent_bootstrap_event(
+    snapshot: &mut SnapshotState,
+    stream: &StreamPath,
+    event: AgentBootstrapEvent,
+) {
+    let envelope = match event {
+        AgentBootstrapEvent::AgentStart(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::AgentStart, 0, &payload)
+        }
+        AgentBootstrapEvent::AgentError(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::AgentError, 0, &payload)
+        }
+        AgentBootstrapEvent::SessionSettings(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::SessionSettings, 0, &payload)
+        }
+        AgentBootstrapEvent::QueuedMessages(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::QueuedMessages, 0, &payload)
+        }
+        AgentBootstrapEvent::ChatEvent(payload) => {
+            Envelope::from_payload(stream.clone(), FrameKind::ChatEvent, 0, &payload)
+        }
+    }
+    .expect("serialize AgentBootstrap event");
+    apply_envelope(snapshot, &envelope);
+}
+
 fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
     match envelope.kind {
+        FrameKind::HostBootstrap => {
+            let payload: HostBootstrapPayload = envelope
+                .parse_payload()
+                .expect("validated HostBootstrap payload should parse");
+            snapshot.host_settings = Some(payload.settings);
+            for agent in payload.agents {
+                apply_new_agent_payload(snapshot, agent);
+            }
+        }
         FrameKind::HostSettings => {
             let payload: HostSettingsPayload = envelope
                 .parse_payload()
@@ -719,30 +781,15 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
             let payload: NewAgentPayload = envelope
                 .parse_payload()
                 .expect("validated NewAgent payload should parse");
-            let activity = snapshot
-                .agents
-                .get(&payload.agent_id)
-                .map(|agent| agent.activity_counter.saturating_add(1))
-                .unwrap_or(1);
-            snapshot.agents.insert(
-                payload.agent_id.clone(),
-                AgentState {
-                    agent_id: payload.agent_id,
-                    name: payload.name,
-                    backend_kind: payload.backend_kind,
-                    workspace_roots: payload.workspace_roots,
-                    project_id: payload.project_id,
-                    parent_agent_id: payload.parent_agent_id,
-                    created_at_ms: payload.created_at_ms,
-                    instance_stream: payload.instance_stream,
-                    is_thinking: false,
-                    turn_completed: false,
-                    terminated: false,
-                    last_error: None,
-                    activity_counter: activity,
-                    event_log: Vec::new(),
-                },
-            );
+            apply_new_agent_payload(snapshot, payload);
+        }
+        FrameKind::AgentBootstrap => {
+            let payload: AgentBootstrapPayload = envelope
+                .parse_payload()
+                .expect("validated AgentBootstrap payload should parse");
+            for event in payload.events {
+                apply_agent_bootstrap_event(snapshot, &envelope.stream, event);
+            }
         }
         FrameKind::AgentStart => {
             let payload: AgentStartPayload = envelope

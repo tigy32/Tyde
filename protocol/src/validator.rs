@@ -2,29 +2,34 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use crate::types::{
-    AgentCompactNotifyPayload, AgentCompactPayload, CloseAgentPayload, NewTerminalPayload,
-    TeamCompactNotifyPayload, TeamCompactPayload,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactNotifyPayload, AgentCompactPayload,
+    BrowseBootstrapPayload, CloseAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
+    ReviewBootstrapPayload, TeamCompactNotifyPayload, TeamCompactPayload, TerminalBootstrapPayload,
 };
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
     ChatEvent, CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBrowseClosePayload,
-    HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
+    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
     MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
     NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
-    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetSettingPayload,
-    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
+    ProjectRenamePayload, ProjectReorderPayload, ReviewEventPayload, RunBackendSetupPayload,
+    SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
+    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
     TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
     TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
     TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalCreatePayload, ToolExecutionCompletedData, ToolRequest,
+    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    ToolExecutionCompletedData, ToolRequest, WelcomePayload,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -33,7 +38,12 @@ const DEFAULT_HISTORY_LIMIT: usize = 32;
 pub struct ProtocolValidator {
     history_limit: usize,
     recent: VecDeque<ObservedFrame>,
+    host_streams: HashMap<StreamPath, HostStreamState>,
     agent_streams: HashMap<StreamPath, AgentStreamState>,
+    project_streams: HashMap<StreamPath, BootstrapStreamState>,
+    review_streams: HashMap<StreamPath, BootstrapStreamState>,
+    browse_streams: HashMap<StreamPath, BootstrapStreamState>,
+    terminal_streams: HashMap<StreamPath, BootstrapStreamState>,
 }
 
 impl Default for ProtocolValidator {
@@ -47,7 +57,12 @@ impl ProtocolValidator {
         Self {
             history_limit: DEFAULT_HISTORY_LIMIT,
             recent: VecDeque::with_capacity(DEFAULT_HISTORY_LIMIT),
+            host_streams: HashMap::new(),
             agent_streams: HashMap::new(),
+            project_streams: HashMap::new(),
+            review_streams: HashMap::new(),
+            browse_streams: HashMap::new(),
+            terminal_streams: HashMap::new(),
         }
     }
 
@@ -55,7 +70,12 @@ impl ProtocolValidator {
         Self {
             history_limit: history_limit.max(1),
             recent: VecDeque::with_capacity(history_limit.max(1)),
+            host_streams: HashMap::new(),
             agent_streams: HashMap::new(),
+            project_streams: HashMap::new(),
+            review_streams: HashMap::new(),
+            browse_streams: HashMap::new(),
+            terminal_streams: HashMap::new(),
         }
     }
 
@@ -70,11 +90,113 @@ impl ProtocolValidator {
             return self.validate_agent_envelope(envelope);
         }
 
+        if envelope.stream.0.starts_with("/project/") {
+            return self.validate_project_envelope(envelope);
+        }
+
+        if envelope.stream.0.starts_with("/review/") {
+            return self.validate_review_envelope(envelope);
+        }
+
+        if envelope.stream.0.starts_with("/browse/") {
+            return self.validate_browse_envelope(envelope);
+        }
+
+        if envelope.stream.0.starts_with("/terminal/") {
+            return self.validate_terminal_envelope(envelope);
+        }
+
         Ok(())
     }
 
     fn validate_host_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
+        let host_state = self
+            .host_streams
+            .get(&envelope.stream)
+            .copied()
+            .unwrap_or_default();
+
         match envelope.kind {
+            FrameKind::Welcome => {
+                if envelope.seq != 0 {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        format!("Welcome must be seq 0 on host stream {}", envelope.stream),
+                    ));
+                }
+                let _: WelcomePayload = envelope.parse_payload().map_err(|error| {
+                    self.violation(
+                        envelope,
+                        None,
+                        format!("failed to parse Welcome payload: {error}"),
+                    )
+                })?;
+                self.host_streams.insert(
+                    envelope.stream.clone(),
+                    HostStreamState {
+                        saw_welcome: true,
+                        saw_bootstrap: host_state.saw_bootstrap,
+                    },
+                );
+                Ok(())
+            }
+            FrameKind::HostBootstrap => {
+                if host_state.saw_bootstrap {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        format!("duplicate HostBootstrap for stream {}", envelope.stream),
+                    ));
+                }
+                if host_state.saw_welcome && envelope.seq != 1 {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        format!(
+                            "HostBootstrap must be seq 1 after Welcome on host stream {}, got {}",
+                            envelope.stream, envelope.seq
+                        ),
+                    ));
+                }
+                if !host_state.saw_welcome && envelope.seq != 0 {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        format!(
+                            "HostBootstrap must be first observed host event on {}, got seq {}",
+                            envelope.stream, envelope.seq
+                        ),
+                    ));
+                }
+                let payload: HostBootstrapPayload = envelope.parse_payload().map_err(|error| {
+                    self.violation(
+                        envelope,
+                        None,
+                        format!("failed to parse HostBootstrap payload: {error}"),
+                    )
+                })?;
+                for agent in payload.agents {
+                    self.register_agent_stream_from_new_agent(envelope, agent)?;
+                }
+                self.host_streams.insert(
+                    envelope.stream.clone(),
+                    HostStreamState {
+                        saw_welcome: host_state.saw_welcome,
+                        saw_bootstrap: true,
+                    },
+                );
+                Ok(())
+            }
+            FrameKind::Reject => Ok(()),
+            _ if !host_state.saw_bootstrap => Err(self.violation(
+                envelope,
+                None,
+                format!(
+                    "received host frame {} before HostBootstrap on {}",
+                    envelope.kind, envelope.stream
+                ),
+            )),
             FrameKind::NewAgent => {
                 let payload: NewAgentPayload = envelope.parse_payload().map_err(|error| {
                     self.violation(
@@ -83,36 +205,7 @@ impl ProtocolValidator {
                         format!("failed to parse NewAgent payload: {error}"),
                     )
                 })?;
-
-                if self.agent_streams.contains_key(&payload.instance_stream) {
-                    return Err(self.violation(
-                        envelope,
-                        Some(payload.backend_kind),
-                        format!("duplicate NewAgent for stream {}", payload.instance_stream),
-                    ));
-                }
-
-                validate_agent_origin(
-                    payload.origin,
-                    payload.parent_agent_id.as_ref(),
-                    payload.team_id.as_ref(),
-                    payload.team_member_id.as_ref(),
-                )
-                .map_err(|message| self.violation(envelope, Some(payload.backend_kind), message))?;
-
-                self.agent_streams.insert(
-                    payload.instance_stream,
-                    AgentStreamState {
-                        agent_id: payload.agent_id,
-                        backend_kind: payload.backend_kind,
-                        saw_agent_start: false,
-                        active_stream: None,
-                        assistant_turn_open: false,
-                        pending_tool_calls: HashMap::new(),
-                        cancelled_tool_calls: HashMap::new(),
-                    },
-                );
-                Ok(())
+                self.register_agent_stream_from_new_agent(envelope, payload)
             }
             FrameKind::AgentClosed => {
                 let payload: AgentClosedPayload = envelope.parse_payload().map_err(|error| {
@@ -375,6 +468,50 @@ impl ProtocolValidator {
         };
 
         match envelope.kind {
+            FrameKind::AgentBootstrap => {
+                if state.saw_bootstrap {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("duplicate AgentBootstrap for stream {}", envelope.stream),
+                    ));
+                }
+                if envelope.seq != 0 {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "AgentBootstrap must be seq 0 on {}, got {}",
+                            envelope.stream, envelope.seq
+                        ),
+                    ));
+                }
+                let payload: AgentBootstrapPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse AgentBootstrap payload: {error}"),
+                    )
+                })?;
+                state.saw_bootstrap = true;
+                for event in payload.events {
+                    validate_agent_bootstrap_event(&recent_frames, envelope, state, event)?;
+                }
+            }
+            _ if !state.saw_bootstrap => {
+                return Err(build_violation(
+                    &recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "received agent frame {} before AgentBootstrap on {}",
+                        envelope.kind, envelope.stream
+                    ),
+                ));
+            }
             FrameKind::AgentStart => {
                 if state.saw_agent_start {
                     return Err(build_violation(
@@ -484,6 +621,204 @@ impl ProtocolValidator {
         Ok(())
     }
 
+    fn register_agent_stream_from_new_agent(
+        &mut self,
+        envelope: &Envelope,
+        payload: NewAgentPayload,
+    ) -> Result<(), ProtocolViolation> {
+        if self.agent_streams.contains_key(&payload.instance_stream) {
+            return Err(self.violation(
+                envelope,
+                Some(payload.backend_kind),
+                format!("duplicate agent stream {}", payload.instance_stream),
+            ));
+        }
+
+        validate_agent_origin(
+            payload.origin,
+            payload.parent_agent_id.as_ref(),
+            payload.team_id.as_ref(),
+            payload.team_member_id.as_ref(),
+        )
+        .map_err(|message| self.violation(envelope, Some(payload.backend_kind), message))?;
+
+        self.agent_streams.insert(
+            payload.instance_stream,
+            AgentStreamState {
+                agent_id: payload.agent_id,
+                backend_kind: payload.backend_kind,
+                saw_bootstrap: false,
+                saw_agent_start: false,
+                active_stream: None,
+                assistant_turn_open: false,
+                pending_tool_calls: HashMap::new(),
+                cancelled_tool_calls: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    fn validate_project_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
+        validate_bootstrap_stream(
+            &mut self.project_streams,
+            &self.recent,
+            envelope,
+            FrameKind::ProjectBootstrap,
+            "ProjectBootstrap",
+        )?;
+        match envelope.kind {
+            FrameKind::ProjectBootstrap => parse_stream_payload::<ProjectBootstrapPayload>(
+                &self.recent,
+                envelope,
+                "ProjectBootstrap",
+            ),
+            FrameKind::ProjectFileList => parse_stream_payload::<ProjectFileListPayload>(
+                &self.recent,
+                envelope,
+                "ProjectFileList",
+            ),
+            FrameKind::ProjectGitStatus => parse_stream_payload::<ProjectGitStatusPayload>(
+                &self.recent,
+                envelope,
+                "ProjectGitStatus",
+            ),
+            FrameKind::ProjectFileContents => parse_stream_payload::<ProjectFileContentsPayload>(
+                &self.recent,
+                envelope,
+                "ProjectFileContents",
+            ),
+            FrameKind::ProjectGitDiff => parse_stream_payload::<ProjectGitDiffPayload>(
+                &self.recent,
+                envelope,
+                "ProjectGitDiff",
+            ),
+            FrameKind::ProjectEvent => {
+                parse_stream_payload::<ProjectEventPayload>(&self.recent, envelope, "ProjectEvent")
+            }
+            FrameKind::CommandError => {
+                parse_stream_payload::<CommandErrorPayload>(&self.recent, envelope, "CommandError")
+            }
+            other => Err(build_violation(
+                &self.recent.iter().cloned().collect::<Vec<_>>(),
+                envelope,
+                None,
+                format!(
+                    "unexpected frame kind {other} on project stream {}",
+                    envelope.stream
+                ),
+            )),
+        }
+    }
+
+    fn validate_review_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
+        validate_bootstrap_stream(
+            &mut self.review_streams,
+            &self.recent,
+            envelope,
+            FrameKind::ReviewBootstrap,
+            "ReviewBootstrap",
+        )?;
+        match envelope.kind {
+            FrameKind::ReviewBootstrap => parse_stream_payload::<ReviewBootstrapPayload>(
+                &self.recent,
+                envelope,
+                "ReviewBootstrap",
+            ),
+            FrameKind::ReviewEvent => {
+                parse_stream_payload::<ReviewEventPayload>(&self.recent, envelope, "ReviewEvent")
+            }
+            other => Err(build_violation(
+                &self.recent.iter().cloned().collect::<Vec<_>>(),
+                envelope,
+                None,
+                format!(
+                    "unexpected frame kind {other} on review stream {}",
+                    envelope.stream
+                ),
+            )),
+        }
+    }
+
+    fn validate_browse_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
+        validate_bootstrap_stream(
+            &mut self.browse_streams,
+            &self.recent,
+            envelope,
+            FrameKind::BrowseBootstrap,
+            "BrowseBootstrap",
+        )?;
+        match envelope.kind {
+            FrameKind::BrowseBootstrap => parse_stream_payload::<BrowseBootstrapPayload>(
+                &self.recent,
+                envelope,
+                "BrowseBootstrap",
+            ),
+            FrameKind::HostBrowseOpened => parse_stream_payload::<HostBrowseOpenedPayload>(
+                &self.recent,
+                envelope,
+                "HostBrowseOpened",
+            ),
+            FrameKind::HostBrowseEntries => parse_stream_payload::<HostBrowseEntriesPayload>(
+                &self.recent,
+                envelope,
+                "HostBrowseEntries",
+            ),
+            FrameKind::HostBrowseError => parse_stream_payload::<HostBrowseErrorPayload>(
+                &self.recent,
+                envelope,
+                "HostBrowseError",
+            ),
+            other => Err(build_violation(
+                &self.recent.iter().cloned().collect::<Vec<_>>(),
+                envelope,
+                None,
+                format!(
+                    "unexpected frame kind {other} on browse stream {}",
+                    envelope.stream
+                ),
+            )),
+        }
+    }
+
+    fn validate_terminal_envelope(&mut self, envelope: &Envelope) -> Result<(), ProtocolViolation> {
+        validate_bootstrap_stream(
+            &mut self.terminal_streams,
+            &self.recent,
+            envelope,
+            FrameKind::TerminalBootstrap,
+            "TerminalBootstrap",
+        )?;
+        match envelope.kind {
+            FrameKind::TerminalBootstrap => parse_stream_payload::<TerminalBootstrapPayload>(
+                &self.recent,
+                envelope,
+                "TerminalBootstrap",
+            ),
+            FrameKind::TerminalOutput => parse_stream_payload::<TerminalOutputPayload>(
+                &self.recent,
+                envelope,
+                "TerminalOutput",
+            ),
+            FrameKind::TerminalExit => {
+                parse_stream_payload::<TerminalExitPayload>(&self.recent, envelope, "TerminalExit")
+            }
+            FrameKind::TerminalError => parse_stream_payload::<TerminalErrorPayload>(
+                &self.recent,
+                envelope,
+                "TerminalError",
+            ),
+            other => Err(build_violation(
+                &self.recent.iter().cloned().collect::<Vec<_>>(),
+                envelope,
+                None,
+                format!(
+                    "unexpected frame kind {other} on terminal stream {}",
+                    envelope.stream
+                ),
+            )),
+        }
+    }
+
     fn record(&mut self, envelope: &Envelope) {
         let observed = ObservedFrame {
             stream: envelope.stream.clone(),
@@ -550,6 +885,121 @@ fn parse_host_payload<T: serde::de::DeserializeOwned>(
         )
     })?;
     Ok(())
+}
+
+fn parse_stream_payload<T: serde::de::DeserializeOwned>(
+    recent: &VecDeque<ObservedFrame>,
+    envelope: &Envelope,
+    label: &str,
+) -> Result<(), ProtocolViolation> {
+    let _: T = envelope.parse_payload().map_err(|error| {
+        build_violation(
+            &recent.iter().cloned().collect::<Vec<_>>(),
+            envelope,
+            None,
+            format!("failed to parse {label} payload: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_bootstrap_stream(
+    streams: &mut HashMap<StreamPath, BootstrapStreamState>,
+    recent: &VecDeque<ObservedFrame>,
+    envelope: &Envelope,
+    bootstrap_kind: FrameKind,
+    bootstrap_label: &str,
+) -> Result<(), ProtocolViolation> {
+    let recent_frames = recent.iter().cloned().collect::<Vec<_>>();
+    let state = streams.entry(envelope.stream.clone()).or_default();
+    if envelope.kind == bootstrap_kind {
+        if state.saw_bootstrap {
+            return Err(build_violation(
+                &recent_frames,
+                envelope,
+                None,
+                format!("duplicate {bootstrap_label} for stream {}", envelope.stream),
+            ));
+        }
+        if envelope.seq != 0 {
+            return Err(build_violation(
+                &recent_frames,
+                envelope,
+                None,
+                format!(
+                    "{bootstrap_label} must be seq 0 on {}, got {}",
+                    envelope.stream, envelope.seq
+                ),
+            ));
+        }
+        state.saw_bootstrap = true;
+        return Ok(());
+    }
+
+    if !state.saw_bootstrap {
+        return Err(build_violation(
+            &recent_frames,
+            envelope,
+            None,
+            format!(
+                "received {} before {bootstrap_label} on {}",
+                envelope.kind, envelope.stream
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_agent_bootstrap_event(
+    recent_frames: &[ObservedFrame],
+    envelope: &Envelope,
+    state: &mut AgentStreamState,
+    event: AgentBootstrapEvent,
+) -> Result<(), ProtocolViolation> {
+    match event {
+        AgentBootstrapEvent::AgentStart(payload) => {
+            if state.saw_agent_start {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "duplicate AgentStart inside AgentBootstrap on {}",
+                        envelope.stream
+                    ),
+                ));
+            }
+            validate_agent_origin(
+                payload.origin,
+                payload.parent_agent_id.as_ref(),
+                payload.team_id.as_ref(),
+                payload.team_member_id.as_ref(),
+            )
+            .map_err(|message| {
+                build_violation(recent_frames, envelope, Some(state.backend_kind), message)
+            })?;
+            state.saw_agent_start = true;
+            Ok(())
+        }
+        AgentBootstrapEvent::AgentError(_) => Ok(()),
+        AgentBootstrapEvent::SessionSettings(_) => Ok(()),
+        AgentBootstrapEvent::QueuedMessages(_) => Ok(()),
+        AgentBootstrapEvent::ChatEvent(event) => {
+            if !state.saw_agent_start {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "ChatEvent arrived before AgentStart inside {}",
+                        envelope.kind
+                    ),
+                ));
+            }
+            validate_chat_event(recent_frames, envelope, state, &event)
+        }
+    }
 }
 
 fn validate_chat_event(
@@ -780,10 +1230,22 @@ pub struct ObservedFrame {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct HostStreamState {
+    saw_welcome: bool,
+    saw_bootstrap: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BootstrapStreamState {
+    saw_bootstrap: bool,
+}
+
 #[derive(Debug, Clone)]
 struct AgentStreamState {
     agent_id: crate::AgentId,
     backend_kind: BackendKind,
+    saw_bootstrap: bool,
     saw_agent_start: bool,
     active_stream: Option<ActiveStreamState>,
     assistant_turn_open: bool,
@@ -892,49 +1354,100 @@ mod tests {
         StreamPath("/agent/test-agent".to_owned())
     }
 
-    fn new_agent_envelope() -> Envelope {
-        Envelope::from_payload(
-            host_stream(),
-            FrameKind::NewAgent,
-            0,
-            &NewAgentPayload {
-                agent_id: crate::AgentId("test-agent".to_owned()),
-                name: "test".to_owned(),
-                origin: AgentOrigin::User,
-                backend_kind: BackendKind::Claude,
-                workspace_roots: vec![],
-                custom_agent_id: None,
-                team_id: None,
-                team_member_id: None,
-                project_id: None,
-                parent_agent_id: None,
-                created_at_ms: 0,
-                instance_stream: agent_stream(),
-            },
-        )
-        .expect("serialize NewAgent")
+    fn new_agent_payload(
+        origin: AgentOrigin,
+        team_id: Option<crate::TeamId>,
+        team_member_id: Option<crate::TeamMemberId>,
+    ) -> NewAgentPayload {
+        NewAgentPayload {
+            agent_id: crate::AgentId("test-agent".to_owned()),
+            name: "test".to_owned(),
+            origin,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: vec![],
+            custom_agent_id: None,
+            team_id,
+            team_member_id,
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: agent_stream(),
+        }
     }
 
-    fn agent_start_envelope(seq: u64) -> Envelope {
+    fn host_bootstrap_with_agents(agents: Vec<NewAgentPayload>) -> Envelope {
         Envelope::from_payload(
-            agent_stream(),
-            FrameKind::AgentStart,
-            seq,
-            &crate::AgentStartPayload {
-                agent_id: crate::AgentId("test-agent".to_owned()),
-                name: "test".to_owned(),
-                origin: AgentOrigin::User,
-                backend_kind: BackendKind::Claude,
-                workspace_roots: vec![],
-                custom_agent_id: None,
-                team_id: None,
-                team_member_id: None,
-                project_id: None,
-                parent_agent_id: None,
-                created_at_ms: 0,
+            host_stream(),
+            FrameKind::HostBootstrap,
+            0,
+            &HostBootstrapPayload {
+                settings: crate::HostSettings {
+                    enabled_backends: vec![],
+                    default_backend: None,
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+                mobile_access: MobileAccessStatePayload {
+                    broker_status: crate::MobileBrokerStatus::Disabled,
+                    pairing: crate::MobilePairingState::Idle,
+                    paired_devices: vec![],
+                },
+                backend_setup: BackendSetupPayload { backends: vec![] },
+                session_schemas: vec![],
+                sessions: vec![],
+                projects: vec![],
+                mcp_servers: vec![],
+                skills: vec![],
+                steering: vec![],
+                custom_agents: vec![],
+                team_preset_catalog: crate::TeamPresetCatalog {
+                    role_presets: vec![],
+                    personality_traits: vec![],
+                    personality_presets: vec![],
+                    team_templates: vec![],
+                },
+                team_drafts: vec![],
+                teams: vec![],
+                team_members: vec![],
+                team_member_bindings: vec![],
+                agents,
             },
         )
-        .expect("serialize AgentStart")
+        .expect("serialize HostBootstrap")
+    }
+
+    fn new_agent_envelope() -> Envelope {
+        host_bootstrap_with_agents(vec![new_agent_payload(AgentOrigin::User, None, None)])
+    }
+
+    fn agent_start_payload() -> crate::AgentStartPayload {
+        crate::AgentStartPayload {
+            agent_id: crate::AgentId("test-agent".to_owned()),
+            name: "test".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: vec![],
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 0,
+        }
+    }
+
+    fn agent_bootstrap_start_envelope() -> Envelope {
+        Envelope::from_payload(
+            agent_stream(),
+            FrameKind::AgentBootstrap,
+            0,
+            &AgentBootstrapPayload {
+                events: vec![AgentBootstrapEvent::AgentStart(agent_start_payload())],
+            },
+        )
+        .expect("serialize AgentBootstrap")
     }
 
     fn chat_envelope(seq: u64, event: &ChatEvent) -> Envelope {
@@ -947,26 +1460,7 @@ mod tests {
         team_id: Option<crate::TeamId>,
         team_member_id: Option<crate::TeamMemberId>,
     ) -> Envelope {
-        Envelope::from_payload(
-            host_stream(),
-            FrameKind::NewAgent,
-            0,
-            &NewAgentPayload {
-                agent_id: crate::AgentId("test-agent".to_owned()),
-                name: "test".to_owned(),
-                origin,
-                backend_kind: BackendKind::Claude,
-                workspace_roots: vec![],
-                custom_agent_id: None,
-                team_id,
-                team_member_id,
-                project_id: None,
-                parent_agent_id: None,
-                created_at_ms: 0,
-                instance_stream: agent_stream(),
-            },
-        )
-        .expect("serialize NewAgent")
+        host_bootstrap_with_agents(vec![new_agent_payload(origin, team_id, team_member_id)])
     }
 
     fn assistant_message(content: &str) -> ChatMessage {
@@ -1026,6 +1520,83 @@ mod tests {
     }
 
     #[test]
+    fn host_bootstrap_after_welcome_registers_agent_streams() {
+        let mut validator = ProtocolValidator::new();
+        let welcome = Envelope::from_payload(
+            host_stream(),
+            FrameKind::Welcome,
+            0,
+            &crate::WelcomePayload {
+                protocol_version: crate::PROTOCOL_VERSION,
+                tyde_version: crate::TYDE_VERSION,
+            },
+        )
+        .expect("serialize Welcome");
+        let mut bootstrap = new_agent_envelope();
+        bootstrap.seq = 1;
+
+        validator.validate_envelope(&welcome).unwrap();
+        validator.validate_envelope(&bootstrap).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_host_replay_before_host_bootstrap() {
+        let mut validator = ProtocolValidator::new();
+        let envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::HostSettings,
+            0,
+            &HostSettingsPayload {
+                settings: crate::HostSettings {
+                    enabled_backends: vec![],
+                    default_backend: None,
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+            },
+        )
+        .expect("serialize HostSettings");
+        let violation = validator
+            .validate_envelope(&envelope)
+            .expect_err("HostSettings before HostBootstrap should be invalid");
+
+        assert!(violation.to_string().contains("before HostBootstrap"));
+    }
+
+    #[test]
+    fn rejects_agent_event_before_agent_bootstrap() {
+        let mut validator = ProtocolValidator::new();
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(0, &assistant_message_added("hi")))
+            .expect_err("agent events before AgentBootstrap should be invalid");
+
+        assert!(violation.to_string().contains("before AgentBootstrap"));
+    }
+
+    #[test]
+    fn rejects_project_event_before_project_bootstrap() {
+        let mut validator = ProtocolValidator::new();
+        let envelope = Envelope::from_payload(
+            StreamPath("/project/test".to_owned()),
+            FrameKind::ProjectEvent,
+            0,
+            &crate::ProjectEventPayload::ReviewListChanged { reviews: vec![] },
+        )
+        .expect("serialize ProjectEvent");
+        let violation = validator
+            .validate_envelope(&envelope)
+            .expect_err("ProjectEvent before ProjectBootstrap should be invalid");
+
+        assert!(violation.to_string().contains("before ProjectBootstrap"));
+    }
+
+    #[test]
     fn accepts_team_member_origin_with_team_fields() {
         let mut validator = ProtocolValidator::new();
         validator
@@ -1071,7 +1642,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(
@@ -1114,7 +1685,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(1, &assistant_message_added("hi")))
@@ -1133,7 +1704,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(
@@ -1167,7 +1738,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         let violation = validator
             .validate_envelope(&chat_envelope(1, &tool_request("call-1")))
@@ -1183,7 +1754,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         let violation = validator
             .validate_envelope(&chat_envelope(
@@ -1208,7 +1779,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(
@@ -1255,7 +1826,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(
@@ -1304,7 +1875,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(
@@ -1346,7 +1917,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(1, &assistant_message_added("hi")))
@@ -1365,7 +1936,7 @@ mod tests {
 
         validator.validate_envelope(&new_agent_envelope()).unwrap();
         validator
-            .validate_envelope(&agent_start_envelope(0))
+            .validate_envelope(&agent_bootstrap_start_envelope())
             .unwrap();
         validator
             .validate_envelope(&chat_envelope(1, &assistant_message_added("")))

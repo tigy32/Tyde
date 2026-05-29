@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, BackendKind, ChatEvent, ChatMessage, Envelope, FrameKind, MessageOrigin,
-    MessageSender, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
-    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
-    StreamStartData, StreamTextDeltaData,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId,
+    AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
+    ChatMessage, Envelope, FrameKind, MessageOrigin, MessageSender, QueuedMessageEntry,
+    QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
+    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamStartData,
+    StreamTextDeltaData,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -2851,26 +2852,55 @@ fn attach_subscriber(
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) {
-    for event in event_log {
-        if stream
-            .send_value(event.kind, event.payload.clone())
-            .is_err()
-        {
-            return;
-        }
+    let mut events = event_log
+        .iter()
+        .map(agent_bootstrap_event_from_envelope)
+        .collect::<Vec<_>>();
+    if let Some(replay_state) = replay_state {
+        events.extend(
+            replay_state
+                .active_stream_events()
+                .into_iter()
+                .map(AgentBootstrapEvent::ChatEvent),
+        );
     }
 
-    if let Some(replay_state) = replay_state {
-        for event in replay_state.active_stream_events() {
-            let payload = serde_json::to_value(&event)
-                .expect("failed to serialize active stream replay event");
-            if stream.send_value(FrameKind::ChatEvent, payload).is_err() {
-                return;
-            }
-        }
+    let payload = serde_json::to_value(AgentBootstrapPayload { events })
+        .expect("failed to serialize AgentBootstrap payload");
+    if stream
+        .send_value(FrameKind::AgentBootstrap, payload)
+        .is_err()
+    {
+        return;
     }
 
     subscribers.push(stream);
+}
+
+fn agent_bootstrap_event_from_envelope(envelope: &Envelope) -> AgentBootstrapEvent {
+    match envelope.kind {
+        FrameKind::AgentStart => AgentBootstrapEvent::AgentStart(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse AgentStart from replay log"),
+        ),
+        FrameKind::AgentError => AgentBootstrapEvent::AgentError(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse AgentError from replay log"),
+        ),
+        FrameKind::SessionSettings => AgentBootstrapEvent::SessionSettings(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse SessionSettings from replay log"),
+        ),
+        FrameKind::QueuedMessages => AgentBootstrapEvent::QueuedMessages(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse QueuedMessages from replay log"),
+        ),
+        FrameKind::ChatEvent => AgentBootstrapEvent::ChatEvent(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse ChatEvent from replay log"),
+        ),
+        other => panic!("unsupported agent replay event kind {other} in AgentBootstrap"),
+    }
 }
 
 async fn apply_runtime_session_updates(
@@ -3052,9 +3082,10 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        AgentInput, AgentStartPayload, ChatEvent, ChatMessage, FrameKind, MessageSender,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData,
-        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+        AgentBootstrapEvent, AgentBootstrapPayload, AgentInput, AgentStartPayload, ChatEvent,
+        ChatMessage, FrameKind, MessageSender, StreamEndData, StreamPath, StreamStartData,
+        StreamTextDeltaData, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType,
     };
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
@@ -3160,17 +3191,18 @@ mod tests {
         }
     }
 
-    async fn recv_chat_event(
+    async fn recv_agent_bootstrap_events(
         rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
         context: &str,
-    ) -> ChatEvent {
+    ) -> Vec<AgentBootstrapEvent> {
         let env = timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
             .unwrap_or_else(|| panic!("stream closed before {context}"));
-        assert_eq!(env.kind, FrameKind::ChatEvent);
-        env.parse_payload()
+        assert_eq!(env.kind, FrameKind::AgentBootstrap);
+        env.parse_payload::<AgentBootstrapPayload>()
             .unwrap_or_else(|_| panic!("failed to parse {context}"))
+            .events
     }
 
     fn replay_stream(tx: mpsc::UnboundedSender<protocol::Envelope>) -> Stream {
@@ -3273,20 +3305,28 @@ mod tests {
             replay_stream(tx),
         );
 
+        let mut events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap")
+            .await
+            .into_iter();
         assert!(matches!(
-            recv_chat_event(&mut rx, "typing true").await,
-            ChatEvent::TypingStatusChanged(true)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::TypingStatusChanged(true)
+            ))
         ));
-        match recv_chat_event(&mut rx, "compacted message").await {
-            ChatEvent::MessageAdded(message) => {
+        match events.next() {
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))) => {
                 assert_eq!(message.content, "hello world");
             }
             other => panic!("expected compacted MessageAdded, got {other:?}"),
         }
         assert!(matches!(
-            recv_chat_event(&mut rx, "typing false").await,
-            ChatEvent::TypingStatusChanged(false)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::TypingStatusChanged(false)
+            ))
         ));
+        assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "replay should not include granular stream events after compaction"
@@ -3342,20 +3382,26 @@ mod tests {
             replay_stream(tx),
         );
 
+        let mut events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap")
+            .await
+            .into_iter();
         assert!(matches!(
-            recv_chat_event(&mut rx, "typing true").await,
-            ChatEvent::TypingStatusChanged(true)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::TypingStatusChanged(true)
+            ))
         ));
         assert!(matches!(
-            recv_chat_event(&mut rx, "active stream start").await,
-            ChatEvent::StreamStart(..)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(..)))
         ));
-        match recv_chat_event(&mut rx, "aggregated stream delta").await {
-            ChatEvent::StreamDelta(delta) => {
+        match events.next() {
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamDelta(delta))) => {
                 assert_eq!(delta.text, "alpha beta");
             }
             other => panic!("expected aggregated StreamDelta, got {other:?}"),
         }
+        assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "active replay should collapse historical deltas into one delta"
@@ -3433,18 +3479,24 @@ mod tests {
             replay_stream(tx),
         );
 
+        let mut events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap")
+            .await
+            .into_iter();
         assert!(matches!(
-            recv_chat_event(&mut rx, "message row").await,
-            ChatEvent::MessageAdded(_)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_)))
         ));
         assert!(matches!(
-            recv_chat_event(&mut rx, "tool request").await,
-            ChatEvent::ToolRequest(_)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(_)))
         ));
         assert!(matches!(
-            recv_chat_event(&mut rx, "tool completion").await,
-            ChatEvent::ToolExecutionCompleted(_)
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::ToolExecutionCompleted(_)
+            ))
         ));
+        assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "completed stream tool replay should not include raw stream events"
@@ -3487,13 +3539,14 @@ mod tests {
         let stream = Stream::new(StreamPath("/agent/agent-failed".to_string()), tx);
         assert!(handle.attach(stream).await);
 
-        let env = timeout(Duration::from_secs(1), rx.recv())
+        let mut events = recv_agent_bootstrap_events(&mut rx, "AgentBootstrap")
             .await
-            .expect("timed out waiting for AgentError")
-            .expect("agent stream closed before AgentError");
-        assert_eq!(env.kind, FrameKind::AgentError);
-        let payload: protocol::AgentErrorPayload =
-            serde_json::from_value(env.payload).expect("parse AgentError");
+            .into_iter();
+        let payload = match events.next() {
+            Some(AgentBootstrapEvent::AgentError(payload)) => payload,
+            other => panic!("expected AgentError in AgentBootstrap, got {other:?}"),
+        };
+        assert!(events.next().is_none());
         assert!(payload.fatal);
         assert_eq!(payload.message, "backend blew up");
     }

@@ -2,27 +2,26 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
-use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, BackendSetupPayload, ChatEvent, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FrameKind, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
-    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitCommitResultPayload,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload,
-    ProtocolValidator, QueuedMessagesPayload, RejectPayload, ReviewCommentSource,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
+    AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, CommandErrorPayload,
+    CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, MobilePairingState, NewAgentPayload,
+    NewTerminalPayload, ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
     StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId,
     TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TerminalErrorPayload, TerminalExitPayload,
-    TerminalOutputPayload, TerminalStartPayload,
+    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
 };
 
-use crate::send::send_frame;
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
     OpenFile, ProjectInfo, ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest,
@@ -70,6 +69,16 @@ pub fn clear_host_seqs(host_id: &str) {
     INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
 }
 
+/// Test helper: drop the seq counter for a single `(host_id, stream)`
+/// pair so the next envelope on that stream is accepted at seq 0.
+#[allow(dead_code)]
+pub fn clear_stream_seq_for_tests(host_id: &str, stream: &StreamPath) {
+    INBOUND_SEQ.with(|validator| {
+        let key = (host_id.to_string(), stream.clone());
+        validator.borrow_mut().expected.remove(&key);
+    });
+}
+
 /// Reset the inbound `ProtocolValidator`. The validator carries per-stream
 /// state (registered agent streams, recent-frame history) which persists for
 /// the lifetime of the wasm thread. Production code never calls this; it
@@ -78,6 +87,126 @@ pub fn clear_host_seqs(host_id: &str) {
 #[allow(dead_code)]
 pub fn reset_inbound_protocol() {
     INBOUND_PROTOCOL.with(|validator| *validator.borrow_mut() = ProtocolValidator::new());
+}
+
+/// Test helper: prime the inbound validators for `host_id` so subsequent
+/// dispatch calls behave as if the server had already delivered a
+/// `Welcome` (seq 0) + `HostBootstrap` (seq 1) pair on the
+/// `/host/<host_id>` stream.
+///
+/// After priming, the `ProtocolValidator` considers the host stream to
+/// have observed a bootstrap (so non-bootstrap frames will not be
+/// rejected as "before HostBootstrap"), but the `FrontendSeqValidator`
+/// has been rewound so tests can dispatch their first envelope at seq
+/// `0` without a seq-mismatch error.
+///
+/// The synthetic `HostBootstrap` is empty, so any host-keyed slice the
+/// test populated via `AppState` setters survives — the bootstrap only
+/// inserts empty maps/vecs for the keyed slots that already accept
+/// upserts.
+#[allow(dead_code)]
+pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
+    use protocol::{
+        BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
+        HostSettings as BootstrapHostSettings, MobileAccessStatePayload as BootstrapMobileAccess,
+        MobileBrokerStatus as BootstrapBrokerStatus, MobilePairingState as BootstrapPairingState,
+        PROTOCOL_VERSION, TYDE_VERSION, TeamPresetCatalog as BootstrapTeamPresetCatalog,
+        WelcomePayload as BootstrapWelcome,
+    };
+
+    let host_stream = StreamPath(format!("/host/{host_id}"));
+
+    // Reset both validators so we start from a known state.
+    clear_host_seqs(host_id);
+    reset_inbound_protocol();
+
+    let welcome = BootstrapWelcome {
+        protocol_version: PROTOCOL_VERSION,
+        tyde_version: TYDE_VERSION,
+    };
+    let bootstrap = BootstrapHostPayload {
+        settings: BootstrapHostSettings {
+            enabled_backends: Vec::new(),
+            default_backend: None,
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: true,
+        },
+        mobile_access: BootstrapMobileAccess {
+            broker_status: BootstrapBrokerStatus::Disabled,
+            pairing: BootstrapPairingState::Idle,
+            paired_devices: Vec::new(),
+        },
+        backend_setup: BootstrapBackendSetup {
+            backends: Vec::new(),
+        },
+        session_schemas: Vec::new(),
+        sessions: Vec::new(),
+        projects: Vec::new(),
+        mcp_servers: Vec::new(),
+        skills: Vec::new(),
+        steering: Vec::new(),
+        custom_agents: Vec::new(),
+        team_preset_catalog: BootstrapTeamPresetCatalog {
+            role_presets: Vec::new(),
+            personality_traits: Vec::new(),
+            personality_presets: Vec::new(),
+            team_templates: Vec::new(),
+        },
+        team_drafts: Vec::new(),
+        teams: Vec::new(),
+        team_members: Vec::new(),
+        team_member_bindings: Vec::new(),
+        agents: Vec::new(),
+    };
+
+    let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
+        .expect("synthetic Welcome");
+    dispatch_envelope(state, host_id, welcome_env);
+    let bootstrap_env =
+        Envelope::from_payload(host_stream, FrameKind::HostBootstrap, 1, &bootstrap)
+            .expect("synthetic HostBootstrap");
+    dispatch_envelope(state, host_id, bootstrap_env);
+
+    // Rewind only the FrontendSeqValidator. The ProtocolValidator keeps
+    // the saw_welcome/saw_bootstrap state from the synthetic frames, so
+    // a follow-up test envelope at seq 0 passes the bootstrap-first
+    // check while the seq counter restarts at 0.
+    clear_host_seqs(host_id);
+}
+
+/// Test helper: dispatch a synthetic `AgentBootstrap` on
+/// `instance_stream` so subsequent dispatches on that agent stream pass
+/// the bootstrap-first check, and rewind the per-stream seq counter so
+/// the test's first envelope can use seq 0.
+///
+/// Use after seeding the agent into `state.agents` (e.g. via a
+/// `NewAgent` dispatch on the host stream). The bootstrap payload
+/// includes an `AgentStart` so the validator's `chat_event` checks pass
+/// for follow-up `ChatEvent` frames.
+#[allow(dead_code)]
+pub fn prime_agent_stream_for_tests(
+    state: &AppState,
+    host_id: &str,
+    instance_stream: &StreamPath,
+    agent_payload: &protocol::AgentStartPayload,
+) {
+    use protocol::AgentBootstrapEvent as BootstrapEvent;
+    use protocol::AgentBootstrapPayload as BootstrapPayload;
+
+    let bootstrap_env = Envelope::from_payload(
+        instance_stream.clone(),
+        FrameKind::AgentBootstrap,
+        0,
+        &BootstrapPayload {
+            events: vec![BootstrapEvent::AgentStart(agent_payload.clone())],
+        },
+    )
+    .expect("synthetic AgentBootstrap");
+    dispatch_envelope(state, host_id, bootstrap_env);
+
+    clear_stream_seq_for_tests(host_id, instance_stream);
 }
 
 thread_local! {
@@ -132,21 +261,86 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             state.connection_statuses.update(|statuses| {
                 statuses.insert(host_id.to_string(), ConnectionStatus::Connected);
             });
-
-            if let Some(stream) = state.host_stream_untracked(host_id) {
-                let host_id = host_id.to_string();
-                spawn_local(async move {
-                    let _ = send_frame(
-                        &host_id,
-                        stream,
-                        FrameKind::ListSessions,
-                        &ListSessionsPayload {},
-                    )
-                    .await;
-                });
-            }
-
+            // Sessions/projects/teams etc. now arrive via HostBootstrap
+            // (seq 1 on the host stream) — see the HostBootstrap arm below.
             log::info!("connected to host {}", host_id);
+        }
+        FrameKind::HostBootstrap => match envelope.parse_payload::<HostBootstrapPayload>() {
+            Ok(payload) => apply_host_bootstrap(state, host_id, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse host_bootstrap payload: {error}"),
+            ),
+        },
+        FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
+            Ok(payload) => apply_agent_bootstrap(state, host_id, &envelope.stream, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse agent_bootstrap payload: {error}"),
+            ),
+        },
+        FrameKind::ProjectBootstrap => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "project_bootstrap on malformed project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<ProjectBootstrapPayload>() {
+                Ok(payload) => apply_project_bootstrap(state, host_id, project_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_bootstrap payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::ReviewBootstrap => {
+            let Some(review_id) = resolve_review_id(&envelope.stream) else {
+                log::warn!("review_bootstrap on non-review stream {}", envelope.stream);
+                return;
+            };
+            match envelope.parse_payload::<ReviewBootstrapPayload>() {
+                Ok(payload) => apply_review_bootstrap(state, &review_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse review_bootstrap payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::BrowseBootstrap => match envelope.parse_payload::<BrowseBootstrapPayload>() {
+            Ok(payload) => apply_browse_bootstrap(state, host_id, &envelope.stream, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse browse_bootstrap payload: {error}"),
+            ),
+        },
+        FrameKind::TerminalBootstrap => {
+            match envelope.parse_payload::<TerminalBootstrapPayload>() {
+                Ok(payload) => apply_terminal_bootstrap(state, host_id, &envelope.stream, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse terminal_bootstrap payload: {error}"),
+                ),
+            }
         }
         FrameKind::Reject => match envelope.parse_payload::<RejectPayload>() {
             Ok(payload) => {
@@ -234,61 +428,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         },
         FrameKind::MobileAccessState => {
             match envelope.parse_payload::<MobileAccessStatePayload>() {
-                Ok(payload) => {
-                    // Don't log the QR uri here — pairing payloads are
-                    // log-sensitive even though the QR itself only
-                    // contains the embedded broker/secret room. The
-                    // Display impl on `MobilePairingState` is structural
-                    // so this is safe.
-                    log::info!(
-                        "dispatch mobile_access_state host={} pairing={:?} paired_devices={}",
-                        host_id,
-                        std::mem::discriminant(&payload.pairing),
-                        payload.paired_devices.len()
-                    );
-                    // Clear the start-pending gate once the server has
-                    // moved out of Idle: any non-Idle state means the
-                    // server received our Start (or someone else's).
-                    if !matches!(payload.pairing, MobilePairingState::Idle) {
-                        state.mobile_pairing_start_pending.update(|set| {
-                            set.remove(host_id);
-                        });
-                    }
-                    // Drop any stored offer that doesn't match the
-                    // server's current pairing phase. Two cases:
-                    //   1. Phase is not Active → no offer should be
-                    //      rendered at all (Consumed / Expired /
-                    //      Cancelled / Failed / Idle).
-                    //   2. Phase is Active { offer_id: NEW } but our
-                    //      stored offer's id is something else (or
-                    //      we have no stored offer yet). The server
-                    //      may roll one Active session into a
-                    //      different one — pushing `Active { offer_id:
-                    //      B }` to a broadcast while only sending the
-                    //      matching `MobilePairingOffer { offer_id:
-                    //      B }` to the *requesting* connection. A
-                    //      bystander UI that previously rendered
-                    //      offer A would otherwise keep showing A's
-                    //      QR (and Cancel would target stale A).
-                    let drop_offer = match &payload.pairing {
-                        MobilePairingState::Active { offer_id, .. } => {
-                            state.mobile_pairing_offer.with_untracked(|m| {
-                                m.get(host_id)
-                                    .map(|stored| &stored.offer_id != offer_id)
-                                    .unwrap_or(false)
-                            })
-                        }
-                        _ => true,
-                    };
-                    if drop_offer {
-                        state.mobile_pairing_offer.update(|m| {
-                            m.remove(host_id);
-                        });
-                    }
-                    state.mobile_access_state.update(|m| {
-                        m.insert(host_id.to_string(), payload);
-                    });
-                }
+                Ok(payload) => apply_mobile_access_state(state, host_id, payload),
                 Err(error) => report_dispatch_error(
                     state,
                     host_id,
@@ -2382,6 +2522,17 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
         }
     };
 
+    apply_chat_event(state, host_id, &agent_id, event);
+}
+
+/// Apply an already-parsed `ChatEvent` to the per-agent state.
+///
+/// Split out from `dispatch_chat_event` so an `AgentBootstrap` (or any
+/// future code path that already holds a parsed event) can replay inner
+/// events through the same reducer without re-encoding them through an
+/// `Envelope`.
+pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, event: ChatEvent) {
+    let agent_id = agent_id.clone();
     match event {
         ChatEvent::TypingStatusChanged(typing) => {
             log::trace!(
@@ -2668,6 +2819,453 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
             });
         }
     }
+}
+
+// ── Bootstrap apply helpers ──────────────────────────────────────────────
+//
+// HostBootstrap (seq 1 on the host stream after Welcome at seq 0) carries
+// a full snapshot of host-scoped state that previously arrived as a flurry
+// of independent notify frames. The apply helpers below replace each
+// host-keyed slice in `AppState` with the snapshot. They must not have
+// side effects that depend on user intent (e.g. opening chat tabs,
+// stealing focus) — those live in the per-event arms.
+
+/// Apply a `MobileAccessStatePayload` to per-host state.
+///
+/// Used by the live `MobileAccessState` arm and by `apply_host_bootstrap`,
+/// so a bootstrap that arrives while the previous connection's stored
+/// pairing offer is stale gets the same reconciliation as a live update.
+///
+/// Reconciliation rules:
+///   1. Phase not `Active` → drop any stored pairing offer (Consumed /
+///      Expired / Cancelled / Failed / Idle should render no QR).
+///   2. Phase `Active { offer_id: NEW }` but stored offer's id is
+///      different → drop the stored offer. The server may broadcast a
+///      new `Active` to bystanders without re-sending the matching
+///      `MobilePairingOffer` (only the requester gets the offer
+///      payload). A bystander would otherwise keep rendering the stale
+///      QR and Cancel would target the wrong id.
+fn apply_mobile_access_state(state: &AppState, host_id: &str, payload: MobileAccessStatePayload) {
+    // Don't log the QR uri — pairing payloads are log-sensitive. The
+    // Display impl on `MobilePairingState` is structural so this is
+    // safe.
+    log::info!(
+        "dispatch mobile_access_state host={} pairing={:?} paired_devices={}",
+        host_id,
+        std::mem::discriminant(&payload.pairing),
+        payload.paired_devices.len()
+    );
+    // Any non-Idle state means the server received our Start (or
+    // someone else's), so the start-pending gate can clear.
+    if !matches!(payload.pairing, MobilePairingState::Idle) {
+        state.mobile_pairing_start_pending.update(|set| {
+            set.remove(host_id);
+        });
+    }
+    let drop_offer = match &payload.pairing {
+        MobilePairingState::Active { offer_id, .. } => {
+            state.mobile_pairing_offer.with_untracked(|m| {
+                m.get(host_id)
+                    .map(|stored| &stored.offer_id != offer_id)
+                    .unwrap_or(false)
+            })
+        }
+        _ => true,
+    };
+    if drop_offer {
+        state.mobile_pairing_offer.update(|m| {
+            m.remove(host_id);
+        });
+    }
+    state.mobile_access_state.update(|m| {
+        m.insert(host_id.to_string(), payload);
+    });
+}
+
+fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapPayload) {
+    log::info!(
+        "dispatch host_bootstrap host={} sessions={} projects={} agents={} teams={} team_members={}",
+        host_id,
+        payload.sessions.len(),
+        payload.projects.len(),
+        payload.agents.len(),
+        payload.teams.len(),
+        payload.team_members.len(),
+    );
+
+    state.host_settings_by_host.update(|map| {
+        map.insert(host_id.to_string(), payload.settings);
+    });
+    // Route mobile access through the shared reconciler so a stale
+    // pairing offer from a previous connection is dropped when the
+    // bootstrap's pairing state no longer matches.
+    apply_mobile_access_state(state, host_id, payload.mobile_access);
+    state.backend_setup_by_host.update(|map| {
+        map.insert(host_id.to_string(), payload.backend_setup.backends);
+    });
+    state.session_schemas.update(|schemas_by_host| {
+        let host_schemas = schemas_by_host.entry(host_id.to_string()).or_default();
+        host_schemas.clear();
+        for schema in payload.session_schemas {
+            host_schemas.insert(schema.backend_kind(), schema);
+        }
+    });
+    state.schemas_loaded_for_host.update(|loaded| {
+        loaded.insert(host_id.to_string(), true);
+    });
+    state.sessions.update(|sessions| {
+        sessions.retain(|session| session.host_id != host_id);
+        sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
+            host_id: host_id.to_string(),
+            summary,
+        }));
+        sessions.sort_by(|a, b| b.summary.updated_at_ms.cmp(&a.summary.updated_at_ms));
+    });
+    state.projects.update(|projects| {
+        projects.retain(|entry| entry.host_id != host_id);
+        projects.extend(payload.projects.into_iter().map(|project| ProjectInfo {
+            host_id: host_id.to_string(),
+            project,
+        }));
+        sort_project_infos(projects);
+    });
+    state.mcp_servers.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for mcp_server in payload.mcp_servers {
+            host_map.insert(mcp_server.id.clone(), mcp_server);
+        }
+    });
+    state.skills.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for skill in payload.skills {
+            host_map.insert(skill.id.clone(), skill);
+        }
+    });
+    state.steering.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for steering in payload.steering {
+            host_map.insert(steering.id.clone(), steering);
+        }
+    });
+    state.custom_agents.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for custom_agent in payload.custom_agents {
+            host_map.insert(custom_agent.id.clone(), custom_agent);
+        }
+    });
+    state.team_preset_catalogs.update(|map| {
+        map.insert(host_id.to_string(), payload.team_preset_catalog);
+    });
+    state.team_drafts.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for draft in payload.team_drafts {
+            host_map.insert(draft.id.clone(), draft);
+        }
+    });
+    state.teams.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for team in payload.teams {
+            host_map.insert(team.id.clone(), team);
+        }
+    });
+    state.team_members.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for member in payload.team_members {
+            host_map.insert(member.id.clone(), member);
+        }
+    });
+    state.team_member_bindings.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for binding in payload.team_member_bindings {
+            host_map.insert(binding.member_id.clone(), binding);
+        }
+    });
+    // Drop any agents the snapshot doesn't know about and upsert the rest
+    // without opening tabs or stealing focus. The live `NewAgent` arm is
+    // the only place that runs the auto-tab / compaction side effects.
+    let snapshot_ids: HashSet<AgentId> =
+        payload.agents.iter().map(|p| p.agent_id.clone()).collect();
+    state.agents.update(|agents| {
+        agents.retain(|agent| agent.host_id != host_id || snapshot_ids.contains(&agent.agent_id));
+        for payload in payload.agents {
+            let mut info = agent_info_from_payload(host_id, payload);
+            if let Some(existing) = agents
+                .iter_mut()
+                .find(|a| a.host_id == host_id && a.agent_id == info.agent_id)
+            {
+                // `agent_info_from_payload` zeroes runtime-only fields
+                // (`started`, `fatal_error`) because `NewAgentPayload`
+                // doesn't carry them. Preserve whatever the live event
+                // stream had set on the existing entry so a bootstrap
+                // re-application doesn't reset an already-started agent
+                // to `started: false`.
+                info.started = existing.started;
+                info.fatal_error = existing.fatal_error.clone();
+                *existing = info;
+            } else {
+                agents.push(info);
+            }
+        }
+    });
+}
+
+fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
+    AgentInfo {
+        host_id: host_id.to_string(),
+        agent_id: payload.agent_id,
+        name: payload.name,
+        origin: payload.origin,
+        backend_kind: payload.backend_kind,
+        workspace_roots: payload.workspace_roots,
+        project_id: payload.project_id,
+        parent_agent_id: payload.parent_agent_id,
+        custom_agent_id: payload.custom_agent_id,
+        created_at_ms: payload.created_at_ms,
+        instance_stream: payload.instance_stream,
+        started: false,
+        fatal_error: None,
+    }
+}
+
+fn apply_agent_bootstrap(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: AgentBootstrapPayload,
+) {
+    let Some(agent_id) = resolve_agent_id(state, host_id, stream) else {
+        log::warn!("agent_bootstrap on unknown stream {stream}");
+        return;
+    };
+    log::info!(
+        "dispatch agent_bootstrap host={} stream={} agent_id={} events={}",
+        host_id,
+        stream,
+        agent_id,
+        payload.events.len()
+    );
+    // Replace prior chat/stream/queue/task state for this agent so the
+    // bootstrap snapshot is authoritative. Any inner events below replay
+    // back into these now-clean slots.
+    state.chat_rows.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.chat_tool_rows.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.streaming_text.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.agent_turn_active.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.transient_events.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.task_lists.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.agent_message_queue.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.agent_session_settings.update(|map| {
+        map.remove(&agent_id);
+    });
+
+    for event in payload.events {
+        match event {
+            AgentBootstrapEvent::AgentStart(_) => {
+                apply_agent_started(state, host_id, &agent_id);
+            }
+            AgentBootstrapEvent::AgentError(inner) => {
+                if inner.fatal {
+                    state.agents.update(|agents| {
+                        if let Some(agent) = agents
+                            .iter_mut()
+                            .find(|agent| agent.host_id == host_id && agent.agent_id == agent_id)
+                        {
+                            agent.fatal_error = Some(inner.message.clone());
+                        }
+                    });
+                }
+                let entry = ChatMessageEntry {
+                    message: protocol::ChatMessage {
+                        timestamp: js_sys::Date::now() as u64,
+                        sender: protocol::MessageSender::Error,
+                        content: inner.message,
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                    tool_requests: Vec::new(),
+                };
+                state.push_chat_entry(agent_id.clone(), entry);
+            }
+            AgentBootstrapEvent::SessionSettings(inner) => {
+                state.agent_session_settings.update(|map| {
+                    map.insert(agent_id.clone(), inner.values);
+                });
+            }
+            AgentBootstrapEvent::QueuedMessages(inner) => {
+                state.agent_message_queue.update(|map| {
+                    map.insert(agent_id.clone(), inner.messages);
+                });
+            }
+            AgentBootstrapEvent::ChatEvent(event) => {
+                apply_chat_event(state, host_id, &agent_id, event);
+            }
+        }
+    }
+}
+
+fn apply_project_bootstrap(
+    state: &AppState,
+    host_id: &str,
+    project_id: ProjectId,
+    payload: ProjectBootstrapPayload,
+) {
+    log::info!(
+        "dispatch project_bootstrap host={} project_id={} reviews={}",
+        host_id,
+        project_id,
+        payload.review_summaries.len()
+    );
+
+    state.projects.update(|projects| {
+        if let Some(existing) = projects
+            .iter_mut()
+            .find(|entry| entry.host_id == host_id && entry.project.id == payload.project.id)
+        {
+            existing.project = payload.project;
+        } else {
+            projects.push(ProjectInfo {
+                host_id: host_id.to_string(),
+                project: payload.project,
+            });
+            sort_project_infos(projects);
+        }
+    });
+
+    state.file_tree.update(|file_tree| {
+        // The bootstrap file_list is a full snapshot. Force non-incremental
+        // apply so we replace the per-root listing rather than merging.
+        let full_payload = ProjectFileListPayload {
+            incremental: false,
+            roots: payload.file_list.roots,
+        };
+        apply_project_file_list(file_tree, project_id.clone(), full_payload);
+    });
+    state.git_status.update(|git_status| {
+        git_status.insert(project_id.clone(), payload.git_status.roots);
+    });
+    state.review_summaries.update(|map| {
+        map.insert(project_id, payload.review_summaries);
+    });
+}
+
+fn apply_review_bootstrap(state: &AppState, review_id: &ReviewId, payload: ReviewBootstrapPayload) {
+    log::info!(
+        "dispatch review_bootstrap review={} comments={} suggestions={} diffs={}",
+        review_id,
+        payload.review.comments.len(),
+        payload.review.suggestions.len(),
+        payload.review.diffs.len(),
+    );
+    apply_review_event(
+        state,
+        review_id,
+        ReviewEventPayload::Snapshot {
+            review: payload.review,
+        },
+    );
+}
+
+fn apply_browse_bootstrap(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: BrowseBootstrapPayload,
+) {
+    log::info!(
+        "dispatch browse_bootstrap host={} stream={}",
+        host_id,
+        stream
+    );
+    dispatch_browse_opened(state, host_id, stream, payload.opened);
+    match payload.listing {
+        BrowseBootstrapListing::Entries { entries } => {
+            dispatch_browse_entries(state, host_id, stream, entries);
+        }
+        BrowseBootstrapListing::Error { error } => {
+            dispatch_browse_error(state, host_id, stream, error);
+        }
+    }
+}
+
+fn apply_terminal_bootstrap(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: TerminalBootstrapPayload,
+) {
+    log::info!(
+        "dispatch terminal_bootstrap host={} stream={} terminal_id={}",
+        host_id,
+        stream,
+        payload.terminal_id
+    );
+    // Upsert the terminal: the NewTerminal arm normally creates the row,
+    // but a bootstrap means the terminal already exists server-side and
+    // this client just (re)subscribed. Avoid duplicate rows on resub.
+    state.terminals.update(|terminals| {
+        let exists = terminals
+            .iter()
+            .any(|t| t.host_id == host_id && t.terminal_id == payload.terminal_id);
+        if !exists {
+            terminals.push(TerminalInfo {
+                host_id: host_id.to_string(),
+                terminal_id: payload.terminal_id.clone(),
+                stream: stream.clone(),
+                project_id: payload.start.project_id.clone(),
+                root: payload.start.root.clone(),
+                cwd: payload.start.cwd.clone(),
+                shell: payload.start.shell.clone(),
+                cols: payload.start.cols,
+                rows: payload.start.rows,
+                created_at_ms: payload.start.created_at_ms,
+                pending_output: Vec::new(),
+                widget_mounted: false,
+                exited: false,
+                exit_code: None,
+                exit_signal: None,
+            });
+            return;
+        }
+        if let Some(terminal) = terminals
+            .iter_mut()
+            .find(|t| t.host_id == host_id && t.terminal_id == payload.terminal_id)
+        {
+            terminal.stream = stream.clone();
+            terminal.project_id = payload.start.project_id;
+            terminal.root = payload.start.root;
+            terminal.cwd = payload.start.cwd;
+            terminal.shell = payload.start.shell;
+            terminal.cols = payload.start.cols;
+            terminal.rows = payload.start.rows;
+            terminal.created_at_ms = payload.start.created_at_ms;
+        }
+    });
 }
 
 #[cfg(test)]

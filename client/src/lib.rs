@@ -8,31 +8,34 @@ mod runtime;
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
-    CancelQueuedMessagePayload, CommandErrorPayload, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError,
-    FrameKind, HelloPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
+    AgentBootstrapPayload, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
+    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload, HostBootstrapPayload,
+    HostBrowseStartPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
     McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    PROTOCOL_VERSION, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, RejectPayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId, ReviewSubscribePayload,
-    SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION,
-    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    PROTOCOL_VERSION, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
+    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
+    RejectPayload, ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload,
+    ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SeqValidator, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION, TeamCreatePayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
     TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
     TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
     TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
     TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalId,
-    TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload, TerminalStartPayload,
-    Version, WelcomePayload, read_envelope, write_envelope,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
+    TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
+    write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
@@ -135,6 +138,22 @@ impl Connection {
                 .map_err(FrameError::Json)?;
         self.outgoing_seq.insert(host_stream, seq + 1);
         write_envelope(&mut self.writer, &envelope).await
+    }
+
+    pub async fn host_browse_start(
+        &mut self,
+        payload: HostBrowseStartPayload,
+    ) -> Result<(), FrameError> {
+        let browse_stream = payload.browse_stream.clone();
+        assert!(
+            !self.outgoing_seq.contains_key(&browse_stream),
+            "duplicate browse stream {}",
+            browse_stream
+        );
+        self.send_host_payload(FrameKind::HostBrowseStart, &payload)
+            .await?;
+        self.outgoing_seq.insert(browse_stream, 0);
+        Ok(())
     }
 
     pub async fn delete_session(
@@ -708,6 +727,24 @@ impl Connection {
 
         if envelope.stream.0.starts_with("/host/") {
             match envelope.kind {
+                FrameKind::HostBootstrap => {
+                    let payload: HostBootstrapPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    for agent in payload.agents {
+                        let stream_parts = parse_agent_stream(&agent.instance_stream);
+                        assert_eq!(
+                            agent.agent_id, stream_parts.agent_id,
+                            "host_bootstrap agent_id {} does not match instance_stream {}",
+                            agent.agent_id, agent.instance_stream
+                        );
+                        assert!(
+                            !self.outgoing_seq.contains_key(&agent.instance_stream),
+                            "duplicate bootstrapped agent stream {}",
+                            agent.instance_stream
+                        );
+                        self.outgoing_seq.insert(agent.instance_stream, 0);
+                    }
+                }
                 FrameKind::NewAgent => {
                     let payload: NewAgentPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -837,12 +874,21 @@ impl Connection {
             }
         } else if envelope.stream.0.starts_with("/agent/") {
             match envelope.kind {
-                FrameKind::AgentStart => {
+                FrameKind::AgentBootstrap => {
                     assert_eq!(
                         envelope.seq, 0,
-                        "AgentStart must be seq 0 on agent stream {}, got seq {}",
+                        "AgentBootstrap must be seq 0 on agent stream {}, got seq {}",
                         envelope.stream, envelope.seq
                     );
+                    let _: AgentBootstrapPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    assert!(
+                        self.outgoing_seq.contains_key(&envelope.stream),
+                        "AgentBootstrap on stream {} before HostBootstrap/NewAgent",
+                        envelope.stream
+                    );
+                }
+                FrameKind::AgentStart => {
                     let payload: AgentStartPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                     let stream_parts = parse_agent_stream(&envelope.stream);
@@ -914,6 +960,13 @@ impl Connection {
             // when projects are created, so the stream may not have been
             // initiated by the client yet.
             match envelope.kind {
+                FrameKind::ProjectBootstrap => {
+                    let _: ProjectBootstrapPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    self.outgoing_seq
+                        .entry(envelope.stream.clone())
+                        .or_insert(0);
+                }
                 FrameKind::ProjectFileList => {
                     let _: ProjectFileListPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -947,6 +1000,13 @@ impl Connection {
             }
         } else if envelope.stream.0.starts_with("/review/") {
             match envelope.kind {
+                FrameKind::ReviewBootstrap => {
+                    let _: ReviewBootstrapPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    self.outgoing_seq
+                        .entry(envelope.stream.clone())
+                        .or_insert(0);
+                }
                 FrameKind::ReviewEvent => {
                     let payload: ReviewEventPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
@@ -1012,19 +1072,48 @@ impl Connection {
                     );
                 }
             }
-        } else if envelope.stream.0.starts_with("/terminal/") {
-            assert!(
-                self.outgoing_seq.contains_key(&envelope.stream),
-                "server emitted terminal event on unknown stream {}",
-                envelope.stream
-            );
+        } else if envelope.stream.0.starts_with("/browse/") {
             match envelope.kind {
-                FrameKind::TerminalStart => {
+                FrameKind::BrowseBootstrap => {
+                    let _: BrowseBootstrapPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::HostBrowseOpened => {
+                    let _: protocol::HostBrowseOpenedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::HostBrowseEntries => {
+                    let _: protocol::HostBrowseEntriesPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::HostBrowseError => {
+                    let _: protocol::HostBrowseErrorPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                other => {
+                    panic!(
+                        "unexpected server frame kind {} on browse stream {}",
+                        other, envelope.stream
+                    );
+                }
+            }
+        } else if envelope.stream.0.starts_with("/terminal/") {
+            match envelope.kind {
+                FrameKind::TerminalBootstrap => {
                     assert_eq!(
                         envelope.seq, 0,
-                        "TerminalStart must be seq 0 on terminal stream {}, got seq {}",
+                        "TerminalBootstrap must be seq 0 on terminal stream {}, got seq {}",
                         envelope.stream, envelope.seq
                     );
+                    let _: TerminalBootstrapPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    assert!(
+                        self.outgoing_seq.contains_key(&envelope.stream),
+                        "TerminalBootstrap on stream {} before NewTerminal",
+                        envelope.stream
+                    );
+                }
+                FrameKind::TerminalStart => {
                     let _: TerminalStartPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }

@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentErrorPayload, AgentStartPayload, BackendKind, CancelQueuedMessagePayload, ChatEvent,
-    Envelope, FrameKind, NewAgentPayload, QueuedMessageId, QueuedMessagesPayload,
-    SendQueuedMessageNowPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload, BackendKind,
+    CancelQueuedMessagePayload, ChatEvent, Envelope, FrameKind, NewAgentPayload, QueuedMessageId,
+    QueuedMessagesPayload, SendQueuedMessageNowPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,17 @@ async fn expect_queued_messages_with_count(
                 return payload;
             }
         }
+        if env.kind == FrameKind::AgentBootstrap {
+            let payload: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            for event in payload.events {
+                if let AgentBootstrapEvent::QueuedMessages(payload) = event
+                    && payload.messages.len() == count
+                {
+                    return payload;
+                }
+            }
+        }
     }
 }
 
@@ -46,6 +58,22 @@ async fn skip_noise(client: &mut client::Connection, context: &str) -> Envelope 
     loop {
         let env = raw_next(client, context).await;
         if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::AgentBootstrap {
+            let payload: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            for event in payload.events {
+                if let AgentBootstrapEvent::AgentStart(payload) = event {
+                    return Envelope::from_payload(
+                        env.stream.clone(),
+                        FrameKind::AgentStart,
+                        env.seq,
+                        &payload,
+                    )
+                    .expect("serialize AgentStart");
+                }
+            }
             continue;
         }
         if matches!(

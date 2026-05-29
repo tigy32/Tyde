@@ -4,20 +4,20 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentControlStatus, AgentId, BackendKind, CommandErrorCode, CommandErrorPayload, CustomAgent,
-    CustomAgentDeletePayload, CustomAgentId, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    Envelope, FrameKind, HostSettingValue, NewAgentPayload, Project, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectNotifyPayload, SessionSettingValue, SessionSettingsPayload,
-    SetSettingPayload, SpawnCostHint, StreamPath, Team, TeamCreatePayload, TeamDeletePayload,
-    TeamDraft, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftId, TeamDraftMember, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberBindingPayload, TeamMemberCreatePayload,
-    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberPresetProfile, TeamMemberRole, TeamMemberState, TeamNotifyPayload,
-    TeamPersonalityPresetId, TeamPersonalityTrait, TeamPresetCatalogNotifyPayload,
-    TeamRenamePayload, TeamRolePresetId, TeamSetManagerPayload, TeamTemplateId, ToolPolicy,
-    write_envelope,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentId, BackendKind,
+    CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, HostSettingValue,
+    NewAgentPayload, Project, ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload,
+    SessionSettingValue, SessionSettingsPayload, SetSettingPayload, SpawnCostHint, StreamPath,
+    Team, TeamCreatePayload, TeamDeletePayload, TeamDraft, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftId, TeamDraftMember,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
+    TeamId, TeamMember, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberBindingPayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberPresetProfile,
+    TeamMemberRole, TeamMemberState, TeamNotifyPayload, TeamPersonalityPresetId,
+    TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId, TeamSetManagerPayload,
+    TeamTemplateId, ToolPolicy, write_envelope,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -39,6 +39,43 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
+        if env.kind == FrameKind::AgentBootstrap {
+            let payload: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            if let Some(env) = payload.events.into_iter().find_map(|event| match event {
+                AgentBootstrapEvent::AgentStart(payload) => Some(
+                    Envelope::from_payload(
+                        env.stream.clone(),
+                        FrameKind::AgentStart,
+                        env.seq,
+                        &payload,
+                    )
+                    .expect("serialize AgentStart"),
+                ),
+                AgentBootstrapEvent::AgentError(payload) => Some(
+                    Envelope::from_payload(
+                        env.stream.clone(),
+                        FrameKind::AgentError,
+                        env.seq,
+                        &payload,
+                    )
+                    .expect("serialize AgentError"),
+                ),
+                AgentBootstrapEvent::ChatEvent(payload) => Some(
+                    Envelope::from_payload(
+                        env.stream.clone(),
+                        FrameKind::ChatEvent,
+                        env.seq,
+                        &payload,
+                    )
+                    .expect("serialize ChatEvent"),
+                ),
+                _ => None,
+            }) {
+                return env;
+            }
+            continue;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings
@@ -47,6 +84,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::SessionList
+                | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectFileList
                 | FrameKind::ProjectGitStatus
                 | FrameKind::TeamPresetCatalogNotify
@@ -193,20 +231,6 @@ async fn expect_team_draft_delete_notify(
     }
 }
 
-async fn expect_team_catalog_notify(
-    client: &mut client::Connection,
-    context: &str,
-) -> TeamPresetCatalogNotifyPayload {
-    loop {
-        let env = next_env(client, context).await;
-        if env.kind == FrameKind::TeamPresetCatalogNotify {
-            return env
-                .parse_payload()
-                .expect("parse TeamPresetCatalogNotifyPayload");
-        }
-    }
-}
-
 async fn expect_session_settings_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
@@ -214,6 +238,15 @@ async fn expect_session_settings_on_stream(
 ) -> SessionSettingsPayload {
     loop {
         let env = next_env(client, context).await;
+        if env.kind == FrameKind::AgentBootstrap && &env.stream == stream {
+            let payload: AgentBootstrapPayload =
+                env.parse_payload().expect("parse AgentBootstrapPayload");
+            for event in payload.events {
+                if let AgentBootstrapEvent::SessionSettings(payload) = event {
+                    return payload;
+                }
+            }
+        }
         if env.kind == FrameKind::SessionSettings && &env.stream == stream {
             return env.parse_payload().expect("parse SessionSettingsPayload");
         }
@@ -565,109 +598,42 @@ async fn team_creation_round_trip_and_replay_order() {
     assert_eq!(binding.current_agent_id, None);
     assert_eq!(binding.status, AgentControlStatus::Idle);
 
-    let mut replay = fixture.connect().await;
-    let mut observed = Vec::new();
-    while observed.len() < 5 {
-        let env = expect_next_event(&mut replay, "team replay").await;
-        match env.kind {
-            FrameKind::CustomAgentNotify => {
-                assert_eq!(
-                    env.parse_payload::<CustomAgentNotifyPayload>()
-                        .expect("parse replay CustomAgentNotify"),
-                    CustomAgentNotifyPayload::Upsert {
-                        custom_agent: custom_agent.clone()
-                    }
-                );
-                observed.push(FrameKind::CustomAgentNotify);
-            }
-            FrameKind::ProjectNotify => {
-                match env
-                    .parse_payload::<ProjectNotifyPayload>()
-                    .expect("parse replay ProjectNotify")
-                {
-                    ProjectNotifyPayload::Upsert { project: observed } => {
-                        assert_eq!(observed.id, project.id)
-                    }
-                    other => panic!("expected ProjectNotify::Upsert, got {other:?}"),
-                }
-                observed.push(FrameKind::ProjectNotify);
-            }
-            FrameKind::TeamNotify => {
-                assert_eq!(
-                    env.parse_payload::<TeamNotifyPayload>()
-                        .expect("parse replay TeamNotify"),
-                    TeamNotifyPayload::Upsert { team: team.clone() }
-                );
-                observed.push(FrameKind::TeamNotify);
-            }
-            FrameKind::TeamMemberNotify => {
-                assert_eq!(
-                    env.parse_payload::<TeamMemberNotifyPayload>()
-                        .expect("parse replay TeamMemberNotify"),
-                    TeamMemberNotifyPayload::Upsert {
-                        member: manager.clone()
-                    }
-                );
-                observed.push(FrameKind::TeamMemberNotify);
-            }
-            FrameKind::TeamMemberBindingNotify => {
-                assert_eq!(
-                    env.parse_payload::<TeamMemberBindingNotifyPayload>()
-                        .expect("parse replay TeamMemberBindingNotify"),
-                    TeamMemberBindingNotifyPayload::Upsert {
-                        binding: binding.clone()
-                    }
-                );
-                observed.push(FrameKind::TeamMemberBindingNotify);
-            }
-            other => panic!("unexpected replay event: {other:?}"),
-        }
-    }
-
-    assert_eq!(
-        observed,
-        vec![
-            FrameKind::ProjectNotify,
-            FrameKind::CustomAgentNotify,
-            FrameKind::TeamNotify,
-            FrameKind::TeamMemberNotify,
-            FrameKind::TeamMemberBindingNotify,
-        ]
-    );
+    let (_replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.projects.iter().any(|item| item.id == project.id));
+    assert!(bootstrap.custom_agents.contains(&custom_agent));
+    assert!(bootstrap.teams.contains(&team));
+    assert!(bootstrap.team_members.contains(&manager));
+    assert!(bootstrap.team_member_bindings.contains(&binding));
 }
 
 #[tokio::test]
 async fn team_preset_catalog_replays_before_team_state() {
-    let mut fixture = Fixture::new().await;
-
-    let catalog = expect_team_catalog_notify(&mut fixture.client, "initial team catalog").await;
+    let fixture = Fixture::new().await;
+    let catalog = &fixture.bootstrap.team_preset_catalog;
 
     assert!(
         catalog
-            .catalog
             .role_presets
             .iter()
             .any(|preset| preset.name == "Frontend specialist"),
         "catalog should include frontend specialist: {:?}",
-        catalog.catalog.role_presets
+        catalog.role_presets
     );
     assert!(
         catalog
-            .catalog
             .personality_presets
             .iter()
             .any(|preset| preset.name == "Skeptical reviewer"),
         "catalog should include personality presets: {:?}",
-        catalog.catalog.personality_presets
+        catalog.personality_presets
     );
     assert!(
         catalog
-            .catalog
             .team_templates
             .iter()
             .any(|template| template.name == "Small feature team" && template.balanced),
         "catalog should include balanced template: {:?}",
-        catalog.catalog.team_templates
+        catalog.team_templates
     );
 }
 
@@ -829,28 +795,16 @@ async fn team_draft_template_shuffle_and_commit_is_atomic() {
         draft.id
     );
 
-    let mut replay = fixture.connect().await;
-    let mut saw_profile = false;
-    while !saw_profile {
-        let env = expect_next_event(&mut replay, "profile replay").await;
-        match env.kind {
-            FrameKind::TeamMemberNotify => {
-                let payload = env
-                    .parse_payload::<TeamMemberNotifyPayload>()
-                    .expect("parse replay TeamMemberNotify");
-                if let TeamMemberNotifyPayload::Upsert { member } = payload
-                    && member.team_id == team.id
-                    && member.profile.is_some()
-                {
-                    saw_profile = true;
-                }
-            }
-            FrameKind::TeamNotify
-            | FrameKind::ProjectNotify
-            | FrameKind::TeamMemberBindingNotify => {}
-            other => panic!("unexpected replay event while looking for profile: {other:?}"),
-        }
-    }
+    let (_replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.teams.iter().any(|item| item.id == team.id));
+    assert!(
+        bootstrap
+            .team_members
+            .iter()
+            .any(|member| member.team_id == team.id && member.profile.is_some()),
+        "bootstrap should replay committed team member profiles: {:?}",
+        bootstrap.team_members
+    );
 }
 
 #[tokio::test]
@@ -889,9 +843,13 @@ async fn team_draft_commit_validation_keeps_draft_without_half_created_team() {
         error.message
     );
 
-    let mut replay = fixture.connect().await;
-    let replayed_draft =
-        expect_team_draft_notify(&mut replay, "draft replay after failed commit").await;
+    let (_replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_draft = bootstrap
+        .team_drafts
+        .iter()
+        .find(|item| item.id == draft.id)
+        .cloned()
+        .expect("draft missing from HostBootstrap after failed commit");
     assert_eq!(replayed_draft.id, draft.id);
     assert_eq!(replayed_draft.name, "Invalid Draft");
 }
@@ -1007,9 +965,13 @@ async fn invalid_team_draft_mutation_preserves_draft_for_replay() {
         error.message
     );
 
-    let mut replay = fixture.connect().await;
-    let replayed_draft =
-        expect_team_draft_notify(&mut replay, "draft replay after invalid profile mutation").await;
+    let (_replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed_draft = bootstrap
+        .team_drafts
+        .iter()
+        .find(|item| item.id == draft.id)
+        .cloned()
+        .expect("draft missing from HostBootstrap after invalid profile mutation");
     assert_eq!(replayed_draft, draft);
 }
 
@@ -1726,34 +1688,36 @@ async fn manager_replacement_swaps_roles_atomically() {
 #[tokio::test]
 async fn replay_order_pins_dependencies_before_teams() {
     let mut fixture = Fixture::new().await;
-    let (_custom_agent, _project, _team, _manager, _report) =
+    let (custom_agent, project, team, manager, report) =
         create_team_with_report(&mut fixture, "replay-order").await;
 
-    let mut replay = fixture.connect().await;
-    let mut observed = Vec::new();
-    while observed.len() < 5 {
-        let env = expect_next_event(&mut replay, "team dependency replay").await;
-        match env.kind {
-            FrameKind::ProjectNotify
-            | FrameKind::CustomAgentNotify
-            | FrameKind::TeamNotify
-            | FrameKind::TeamMemberNotify
-            | FrameKind::TeamMemberBindingNotify => {
-                observed.push(env.kind);
-            }
-            other => panic!("unexpected replay frame: {other:?}"),
-        }
-    }
-
-    assert_eq!(
-        observed,
-        vec![
-            FrameKind::ProjectNotify,
-            FrameKind::CustomAgentNotify,
-            FrameKind::TeamNotify,
-            FrameKind::TeamMemberNotify,
-            FrameKind::TeamMemberNotify,
-        ]
+    let (_replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.projects.iter().any(|item| item.id == project.id));
+    assert!(bootstrap.custom_agents.contains(&custom_agent));
+    assert!(bootstrap.teams.iter().any(|item| item.id == team.id));
+    assert!(
+        bootstrap
+            .team_members
+            .iter()
+            .any(|item| item.id == manager.id)
+    );
+    assert!(
+        bootstrap
+            .team_members
+            .iter()
+            .any(|item| item.id == report.id)
+    );
+    assert!(
+        bootstrap
+            .team_member_bindings
+            .iter()
+            .any(|binding| binding.member_id == manager.id)
+    );
+    assert!(
+        bootstrap
+            .team_member_bindings
+            .iter()
+            .any(|binding| binding.member_id == report.id)
     );
 }
 
@@ -1885,9 +1849,24 @@ async fn team_draft_replace_member_preserves_server_owned_profile() {
 #[tokio::test]
 async fn custom_agent_delete_rejected_for_builtin_role_preset_default() {
     let mut fixture = Fixture::new().await;
-    // Wait for the host to replay built-in team CustomAgents and the
-    // preset catalog so we know seeding has run.
-    let _catalog = expect_team_catalog_notify(&mut fixture.client, "preset catalog").await;
+    assert!(
+        fixture
+            .bootstrap
+            .team_preset_catalog
+            .role_presets
+            .iter()
+            .any(|preset| preset.default_custom_agent_id
+                == Some(CustomAgentId("tyde-frontend-engineer".to_owned()))),
+        "HostBootstrap should include role preset defaults before team state"
+    );
+    assert!(
+        fixture
+            .bootstrap
+            .custom_agents
+            .iter()
+            .any(|agent| agent.id == CustomAgentId("tyde-frontend-engineer".to_owned())),
+        "HostBootstrap should include built-in team custom agents"
+    );
 
     fixture
         .client
