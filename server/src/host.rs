@@ -50,7 +50,8 @@ use crate::agent::registry::{
 };
 use crate::agent::{
     AgentHandle, CompactionStart, CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES,
-    GenerateAgentNameRequest, MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name, generate_agent_name,
+    GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name,
+    generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
@@ -3499,11 +3500,11 @@ impl HostHandle {
         self.state.lock().await.registry.agent_handle(agent_id)
     }
 
-    pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> bool {
+    pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> InterruptOutcome {
         let (parent_handle, candidate_handles) = {
             let state = self.state.lock().await;
             let Some(parent_handle) = state.registry.agent_handle(agent_id) else {
-                return false;
+                return InterruptOutcome::NotRunning;
             };
             let candidate_handles = state
                 .registry
@@ -3525,12 +3526,12 @@ impl HostHandle {
             }
         }
 
-        let interrupted = parent_handle.interrupt().await;
+        let outcome = parent_handle.interrupt().await;
         for child in tyde_owned_children {
             let _ = child.interrupt().await;
         }
 
-        interrupted
+        outcome
     }
 
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {

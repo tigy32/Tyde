@@ -111,6 +111,36 @@ async fn wait_for_typing_true(client: &mut client::Connection, agent_stream: &St
     }
 }
 
+async fn assert_queue_not_emptied_before_next_typing_true(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    context: &str,
+) {
+    loop {
+        let env = raw_next(client, context).await;
+        if env.stream != *agent_stream {
+            continue;
+        }
+        match env.kind {
+            FrameKind::QueuedMessages => {
+                let payload: QueuedMessagesPayload =
+                    env.parse_payload().expect("parse QueuedMessagesPayload");
+                assert!(
+                    !payload.messages.is_empty(),
+                    "stale TypingStatusChanged(false) drained the queue before the next turn became busy"
+                );
+            }
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                if matches!(event, ChatEvent::TypingStatusChanged(true)) {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 1 — Queue while busy: snapshot grows with each new message
 // ---------------------------------------------------------------------------
@@ -202,6 +232,56 @@ async fn fifo_drain_on_typing_status_false() {
         "only B should remain after draining A"
     );
     assert_eq!(after.messages[0].message, "drain B");
+}
+
+#[tokio::test]
+async fn duplicate_typing_false_drains_only_once() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+
+    let agent_stream = spawn_and_start(
+        &mut fixture.client,
+        "queue-duplicate-idle",
+        "__mock_slow__ __mock_duplicate_idle__ duplicate-idle-test",
+    )
+    .await;
+
+    wait_for_typing_true(&mut fixture.client, &agent_stream).await;
+
+    fixture
+        .client
+        .send_message(&agent_stream, "duplicate A".to_owned())
+        .await
+        .expect("send duplicate A");
+    fixture
+        .client
+        .send_message(&agent_stream, "duplicate B".to_owned())
+        .await
+        .expect("send duplicate B");
+
+    let before = expect_queued_messages_with_count(
+        &mut fixture.client,
+        2,
+        "QueuedMessages(2) before duplicate idle",
+    )
+    .await;
+    assert_eq!(before.messages[0].message, "duplicate A");
+    assert_eq!(before.messages[1].message, "duplicate B");
+
+    let after_first_idle = expect_queued_messages_with_count(
+        &mut fixture.client,
+        1,
+        "QueuedMessages(1) after first idle",
+    )
+    .await;
+    assert_eq!(after_first_idle.messages[0].message, "duplicate B");
+
+    assert_queue_not_emptied_before_next_typing_true(
+        &mut fixture.client,
+        &agent_stream,
+        "next queued turn should become busy before the queue drains again",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ use protocol::{
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::agent::InterruptOutcome;
 use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
 use crate::stream::Stream;
@@ -460,9 +461,9 @@ pub(crate) async fn route_client_envelope(
                 let agent_id = parse_agent_id(&stream_path)?;
                 let _: InterruptPayload = parse_payload(&envelope, "interrupt")?;
 
-                let interrupted = host.interrupt_agent(&agent_id).await;
+                let outcome = host.interrupt_agent(&agent_id).await;
 
-                if !interrupted {
+                if matches!(outcome, InterruptOutcome::NotRunning) {
                     let stream = host_output_stream.with_path(stream_path);
                     send_agent_not_running_error(stream, agent_id).await;
                 }

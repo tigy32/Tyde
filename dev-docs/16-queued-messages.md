@@ -199,7 +199,8 @@ The actor should continue treating `TypingStatusChanged(bool)` as the
 authoritative signal for overall agent activity. Queue drain happens only on
 `TypingStatusChanged(false)`, not on `StreamEnd`.
 
-When the backend emits `ChatEvent::TypingStatusChanged(false)`:
+When the backend emits a real busy-to-idle
+`ChatEvent::TypingStatusChanged(false)` transition:
 
 - Set `in_turn = false`.
 - If `queue` is empty, do nothing else.
@@ -213,10 +214,20 @@ The actor must not wait for a later `TypingStatusChanged(true)` before marking
 itself busy again. Once it has decided to dispatch the next queued message, the
 turn is logically re-opened.
 
+Duplicate or stale `TypingStatusChanged(false)` events must not drain the next
+queued item. The actor arms idle-drain only after seeing the backend's
+`TypingStatusChanged(true)` for the current logical turn; a false event that
+does not close an armed busy state is still appended to the event log and used
+to update rendered status, but it is ignored for queue scheduling, close
+completion, and compaction completion. This gating lives entirely on the
+server side; the protocol still surfaces every raw `TypingStatusChanged` event
+to subscribers.
+
 This also matches the existing agent protocol: `TypingStatusChanged(false)` is
 the only reliable "agent is idle now" signal. Backends may differ on the exact
 relative ordering of `StreamEnd` vs `TypingStatusChanged(false)`, so queue
-drain must key off `TypingStatusChanged(false)` only.
+drain must key off real busy-to-idle `TypingStatusChanged(false)` transitions
+only.
 
 ### 3.4 Queue-management commands
 
@@ -380,7 +391,8 @@ When the user clicks "send now":
 
 ### 5.3 Draining
 
-When the agent becomes idle (`TypingStatusChanged(false)`):
+When the agent becomes idle via a real busy-to-idle
+`TypingStatusChanged(false)` transition:
 
 - If the queue is empty, nothing happens.
 - If the queue is non-empty, the front entry is removed from the queue,

@@ -32,6 +32,7 @@ const MOCK_COMPACT_SENTINEL: &str = "/compact";
 /// is still in-turn, without relying on wall-clock races.  The long window also
 /// gives replay tests enough time to connect a second client and verify state.
 pub(crate) const MOCK_SLOW_TURN_SENTINEL: &str = "__mock_slow__";
+pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// Causes the mock backend task to emit `TypingStatusChanged(true)`, sleep 300 ms,
 /// then exit without completing the turn.  The events channel closes when the
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
@@ -477,9 +478,20 @@ async fn emit_turn(
         sleep(Duration::from_millis(MOCK_SLOW_SLEEP_MS)).await;
     }
 
-    events_tx
+    if events_tx
         .send(ChatEvent::TypingStatusChanged(false))
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+
+    if user_message.contains(MOCK_DUPLICATE_IDLE_SENTINEL) {
+        return events_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .is_ok();
+    }
+
+    true
 }
 
 async fn maybe_spawn_native_child(

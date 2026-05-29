@@ -86,7 +86,9 @@ enum AgentCommand {
         limit: usize,
         reply: oneshot::Sender<Vec<Envelope>>,
     },
-    Interrupt,
+    Interrupt {
+        reply: oneshot::Sender<InterruptOutcome>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -168,6 +170,13 @@ pub(crate) struct AgentHandle {
     /// without a message round-trip — which makes it structurally impossible
     /// for a stopped actor to cause the old "agent disappeared" panic.
     start: watch::Receiver<AgentStartPayload>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterruptOutcome {
+    Interrupted,
+    Rejected,
+    NotRunning,
 }
 
 impl AgentHandle {
@@ -265,11 +274,16 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
-    pub async fn interrupt(&self) -> bool {
-        if !self.accepting_input.load(Ordering::SeqCst) {
-            return false;
+    pub async fn interrupt(&self) -> InterruptOutcome {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::Interrupt { reply: reply_tx })
+            .is_err()
+        {
+            return InterruptOutcome::NotRunning;
         }
-        self.tx.send(AgentCommand::Interrupt).is_ok()
+        reply_rx.await.unwrap_or(InterruptOutcome::NotRunning)
     }
 
     pub async fn close(&self) -> bool {
@@ -770,6 +784,7 @@ pub(crate) fn spawn_agent_actor(
         };
         let mut backend = Some(backend);
         let mut in_turn = is_new_spawn;
+        let mut idle_transition_armed = false;
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut active_compaction: Option<ActiveCompaction> = None;
@@ -850,6 +865,7 @@ pub(crate) fn spawn_agent_actor(
                     .is_some_and(|images| !images.is_empty())
         }) {
             in_turn = true;
+            idle_transition_armed = false;
             if !backend
                 .as_ref()
                 .expect("backend must exist after successful startup")
@@ -941,6 +957,7 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         return;
                     };
+                    let mut real_idle_transition = false;
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if let Some(compaction) = active_compaction.as_mut() {
@@ -1007,8 +1024,13 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
-                            if !typing {
+                            if typing {
+                                in_turn = true;
+                                idle_transition_armed = true;
+                            } else if in_turn && idle_transition_armed {
+                                real_idle_transition = true;
                                 in_turn = false;
+                                idle_transition_armed = false;
                             }
                             status_handle.update(|s| {
                                 s.is_thinking = typing;
@@ -1047,7 +1069,7 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await;
 
-                    if matches!(event, ChatEvent::TypingStatusChanged(false))
+                    if real_idle_transition
                         && let Some(compaction) = active_compaction.take()
                     {
                         let session_id = current_session_id
@@ -1072,7 +1094,7 @@ pub(crate) fn spawn_agent_actor(
                     }
 
 
-                    if matches!(event, ChatEvent::TypingStatusChanged(false))
+                    if real_idle_transition
                         && matches!(lifecycle, ActorLifecycle::Closing)
                     {
                         let reply = close_reply
@@ -1086,7 +1108,7 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     }
 
-                    if matches!(event, ChatEvent::TypingStatusChanged(false))
+                    if real_idle_transition
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
                         && !queue.is_empty()
@@ -1121,6 +1143,7 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await;
                         in_turn = true;
+                        idle_transition_armed = false;
                         let sent = backend
                             .as_ref()
                             .expect("backend must exist while actor is running")
@@ -1262,6 +1285,7 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                     } else {
                                         in_turn = true;
+                                        idle_transition_armed = false;
                                         if let Some(review_id) = review_origin.as_ref() {
                                             tracing::info!(
                                                 review_id = %review_id,
@@ -1492,6 +1516,7 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await;
                                     in_turn = true;
+                                    idle_transition_armed = false;
                                     let sent = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
@@ -1668,6 +1693,7 @@ pub(crate) fn spawn_agent_actor(
 
                             compaction_blocked = true;
                             in_turn = true;
+                            idle_transition_armed = false;
                             active_compaction = Some(ActiveCompaction {
                                 reply,
                                 summary: String::new(),
@@ -1698,6 +1724,7 @@ pub(crate) fn spawn_agent_actor(
                                     .expect("active compaction disappeared after backend send failed");
                                 compaction_blocked = false;
                                 in_turn = false;
+                                idle_transition_armed = false;
                                 status_handle
                                     .update(|s| {
                                         s.is_thinking = false;
@@ -1748,8 +1775,9 @@ pub(crate) fn spawn_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
-                        AgentCommand::Interrupt => {
+                        AgentCommand::Interrupt { reply } => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
+                                let _ = reply.send(InterruptOutcome::NotRunning);
                                 continue;
                             }
                             if active_compaction.is_some() || compaction_blocked {
@@ -1763,14 +1791,15 @@ pub(crate) fn spawn_agent_actor(
                                     &payload,
                                 )
                                 .await;
+                                let _ = reply.send(InterruptOutcome::Rejected);
                                 continue;
                             }
-                            if !backend
+                            let interrupted = backend
                                 .as_ref()
                                 .expect("backend must exist while actor is running")
                                 .interrupt()
-                                .await
-                            {
+                                .await;
+                            if !interrupted {
                                 let payload = AgentErrorPayload {
                                     agent_id: current_start.agent_id.clone(),
                                     code: AgentErrorCode::Internal,
@@ -1786,6 +1815,12 @@ pub(crate) fn spawn_agent_actor(
                                 )
                                 .await;
                             }
+                            let outcome = if interrupted {
+                                InterruptOutcome::Interrupted
+                            } else {
+                                InterruptOutcome::Rejected
+                            };
+                            let _ = reply.send(outcome);
                         }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
@@ -2007,7 +2042,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         AgentCommand::ReleaseCompaction { reply } => {
                             let _ = reply.send(());
                         }
-                        AgentCommand::SendInput(_) | AgentCommand::Interrupt => {
+                        AgentCommand::SendInput(_) => {
                             let payload = relay_input_rejected_payload(&current_start.agent_id);
                             append_event(
                                 &canonical_stream,
@@ -2017,6 +2052,18 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &payload,
                             )
                             .await;
+                        }
+                        AgentCommand::Interrupt { reply } => {
+                            let payload = relay_input_rejected_payload(&current_start.agent_id);
+                            append_event(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                FrameKind::AgentError,
+                                &payload,
+                            )
+                            .await;
+                            let _ = reply.send(InterruptOutcome::Rejected);
                         }
                         AgentCommand::SetName {
                             name,
@@ -2272,7 +2319,10 @@ async fn park_terminal_agent(
             AgentCommand::ReleaseCompaction { reply } => {
                 let _ = reply.send(());
             }
-            AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
+            AgentCommand::SendInput(_) => {}
+            AgentCommand::Interrupt { reply } => {
+                let _ = reply.send(InterruptOutcome::NotRunning);
+            }
         }
     }
 }
@@ -2337,7 +2387,7 @@ async fn park_relay_terminal_agent(
             AgentCommand::ReleaseCompaction { reply } => {
                 let _ = reply.send(());
             }
-            AgentCommand::SendInput(_) | AgentCommand::Interrupt => {
+            AgentCommand::SendInput(_) => {
                 let payload = relay_input_rejected_payload(&current_start.agent_id);
                 append_event(
                     canonical_stream,
@@ -2347,6 +2397,18 @@ async fn park_relay_terminal_agent(
                     &payload,
                 )
                 .await;
+            }
+            AgentCommand::Interrupt { reply } => {
+                let payload = relay_input_rejected_payload(&current_start.agent_id);
+                append_event(
+                    canonical_stream,
+                    event_log,
+                    subscribers,
+                    FrameKind::AgentError,
+                    &payload,
+                )
+                .await;
+                let _ = reply.send(InterruptOutcome::Rejected);
             }
         }
     }
@@ -2998,9 +3060,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        AgentCommand, AgentHandle, AgentReplayState, append_chat_event, append_event,
-        attach_subscriber, generate_mock_name, name_generation_fallback, output_events_since,
-        sanitize_generated_agent_name,
+        AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome, append_chat_event,
+        append_event, attach_subscriber, generate_mock_name, name_generation_fallback,
+        output_events_since, sanitize_generated_agent_name,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::stream::Stream;
@@ -3067,7 +3129,10 @@ mod tests {
                     AgentCommand::ReleaseCompaction { reply } => {
                         let _ = reply.send(());
                     }
-                    AgentCommand::SendInput(_) | AgentCommand::Interrupt => {}
+                    AgentCommand::SendInput(_) => {}
+                    AgentCommand::Interrupt { reply } => {
+                        let _ = reply.send(InterruptOutcome::NotRunning);
+                    }
                 }
             }
         });

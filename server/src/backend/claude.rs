@@ -191,6 +191,7 @@ impl ClaudeSession {
 struct ActiveTurn {
     id: u64,
     cancel_tx: Option<oneshot::Sender<()>>,
+    quiesced_waiters: Vec<oneshot::Sender<()>>,
 }
 
 struct ClaudeState {
@@ -611,6 +612,7 @@ impl ClaudeInner {
             state.active_turn = Some(ActiveTurn {
                 id: turn_id,
                 cancel_tx: Some(cancel_tx),
+                quiesced_waiters: Vec::new(),
             });
             state.conversation_bytes_total =
                 state.conversation_bytes_total.saturating_add(input_bytes);
@@ -717,7 +719,10 @@ impl ClaudeInner {
                         None,
                     )
                     .await;
+                    let quiesced_waiters = self.clear_active_turn(turn_id).await;
                     self.emit_operation_cancelled("Claude turn cancelled.");
+                    notify_turn_quiesced(quiesced_waiters);
+                    return;
                 }
                 TurnOutcome::Failed { summary, error } => {
                     let mut summary = summary;
@@ -738,8 +743,9 @@ impl ClaudeInner {
                 }
             }
 
-            self.clear_active_turn(turn_id).await;
+            let quiesced_waiters = self.clear_active_turn(turn_id).await;
             self.emit_typing_status(false);
+            notify_turn_quiesced(quiesced_waiters);
         });
     }
 
@@ -1029,28 +1035,36 @@ impl ClaudeInner {
     }
 
     async fn cancel_active_turn(&self) {
-        let cancel_tx = {
+        let quiesced_rx = {
             let mut state = self.state.lock().await;
-            state
-                .active_turn
-                .as_mut()
-                .and_then(|active| active.cancel_tx.take())
+            let Some(active) = state.active_turn.as_mut() else {
+                return;
+            };
+            let (quiesced_tx, quiesced_rx) = oneshot::channel();
+            active.quiesced_waiters.push(quiesced_tx);
+            if let Some(cancel_tx) = active.cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
+            quiesced_rx
         };
 
-        if let Some(cancel_tx) = cancel_tx {
-            let _ = cancel_tx.send(());
-        }
+        let _ = quiesced_rx.await;
     }
 
-    async fn clear_active_turn(&self, turn_id: u64) {
+    async fn clear_active_turn(&self, turn_id: u64) -> Vec<oneshot::Sender<()>> {
         let mut state = self.state.lock().await;
         if state
             .active_turn
             .as_ref()
             .is_some_and(|active| active.id == turn_id)
         {
-            state.active_turn = None;
+            return state
+                .active_turn
+                .take()
+                .map(|active| active.quiesced_waiters)
+                .unwrap_or_default();
         }
+        Vec::new()
     }
 
     /// Commit the Claude CLI session_id into backend state.
@@ -5089,6 +5103,12 @@ pub(crate) fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn notify_turn_quiesced(waiters: Vec<oneshot::Sender<()>>) {
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backend trait implementation
 // ---------------------------------------------------------------------------
@@ -5119,9 +5139,13 @@ fn claude_permission_mode_for_access_mode(access_mode: BackendAccessMode) -> &'s
 /// the task writes stdin of the child process accordingly.
 pub struct ClaudeBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
-    interrupt_tx: mpsc::UnboundedSender<()>,
+    interrupt_tx: mpsc::UnboundedSender<ClaudeInterrupt>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+}
+
+struct ClaudeInterrupt {
+    reply: oneshot::Sender<bool>,
 }
 
 impl ClaudeBackend {
@@ -5146,7 +5170,7 @@ impl ClaudeBackend {
         initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
@@ -5262,6 +5286,23 @@ impl ClaudeBackend {
 
             loop {
                 tokio::select! {
+                    biased;
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(interrupt) = interrupt else {
+                            break;
+                        };
+                        let interrupted = match handle.execute(SessionCommand::CancelConversation).await {
+                            Ok(()) => true,
+                            Err(err) => {
+                                tracing::error!("Failed to interrupt Claude turn: {err}");
+                                false
+                            }
+                        };
+                        let _ = interrupt.reply.send(interrupted);
+                        if !interrupted {
+                            break;
+                        }
+                    }
                     incoming = input_rx.recv() => {
                         let Some(input) = incoming else {
                             break;
@@ -5299,15 +5340,6 @@ impl ClaudeBackend {
                                     "queued-message inputs must be handled by the agent actor before reaching the backend"
                                 );
                             }
-                        }
-                    }
-                    interrupt = interrupt_rx.recv() => {
-                        let Some(()) = interrupt else {
-                            break;
-                        };
-                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
-                            tracing::error!("Failed to interrupt Claude turn: {err}");
-                            break;
                         }
                     }
                     changed = subagent_emitter_rx.changed() => {
@@ -5599,7 +5631,7 @@ impl Backend for ClaudeBackend {
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
@@ -5681,72 +5713,80 @@ impl Backend for ClaudeBackend {
 
             loop {
                 tokio::select! {
-                        incoming = raw_events.recv() => {
-                            let Some(raw) = incoming else {
-                                break;
-                            };
-                            if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None).await {
-                                break;
-                            }
-                        }
-                        input = input_rx.recv() => {
-                            let Some(input) = input else {
-                                break;
-                            };
-                            match input {
-                                AgentInput::SendMessage(payload) => {
-                                    let images = protocol_images_to_attachments(payload.images);
-                                    if let Err(err) = handle
-                                        .execute(SessionCommand::SendMessage {
-                                            message: payload.message,
-                                            images,
-                                        })
-                                        .await
-                                    {
-                                        tracing::error!("Failed to send Claude resume follow-up: {err}");
-                                        break;
-                                    }
-                                }
-                                AgentInput::UpdateSessionSettings(payload) => {
-                                    if let Err(err) = handle
-                                        .execute(SessionCommand::UpdateSettings {
-                                            settings: session_settings_to_json(&payload.values),
-                                            persist: false,
-                                        })
-                                        .await
-                                    {
-                                        tracing::error!("Failed to update resumed Claude session settings: {err}");
-                                        break;
-                                    }
-                                }
-                                AgentInput::EditQueuedMessage(_)
-                                | AgentInput::CancelQueuedMessage(_)
-                                | AgentInput::SendQueuedMessageNow(_) => {
-                                    panic!(
-                                        "queued-message inputs must be handled by the agent actor before reaching the backend"
-                                    );
-                                }
-                            }
-                        }
-                        interrupt = interrupt_rx.recv() => {
-                            let Some(()) = interrupt else {
-                                break;
-                            };
-                            if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                    biased;
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(interrupt) = interrupt else {
+                            break;
+                        };
+                        let interrupted = match handle.execute(SessionCommand::CancelConversation).await {
+                            Ok(()) => true,
+                            Err(err) => {
                                 tracing::error!("Failed to interrupt resumed Claude turn: {err}");
-                                break;
+                                false
                             }
+                        };
+                        let _ = interrupt.reply.send(interrupted);
+                        if !interrupted {
+                            break;
                         }
-                        changed = subagent_emitter_rx.changed() => {
-                            if changed.is_err() {
-                                break;
+                    }
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if !forward_claude_backend_event(raw, &events_tx, &backend_session_id_task, None).await {
+                            break;
+                        }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else {
+                            break;
+                        };
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Claude resume follow-up: {err}");
+                                    break;
+                                }
                             }
-                            let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                if let Some(emitter) = maybe_emitter {
-                                session.set_subagent_emitter(emitter).await;
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to update resumed Claude session settings: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
                             }
                         }
                     }
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
+                        if let Some(emitter) = maybe_emitter {
+                            session.set_subagent_emitter(emitter).await;
+                        }
+                    }
+                }
             }
 
             session.shutdown().await;
@@ -5780,7 +5820,14 @@ impl Backend for ClaudeBackend {
     }
 
     async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).is_ok()
+        let (reply, done) = oneshot::channel();
+        if self.interrupt_tx.send(ClaudeInterrupt { reply }).is_err() {
+            return false;
+        }
+        // Claude intentionally provides stronger semantics than the Backend
+        // trait baseline: for the deferred-cancel race,
+        // ClaudeBackend::interrupt().await is a quiescence barrier.
+        done.await.unwrap_or(false)
     }
 
     async fn shutdown(self) {
@@ -5838,6 +5885,75 @@ mod tests {
             }),
         };
         (inner, event_rx)
+    }
+
+    #[tokio::test]
+    async fn cancel_active_turn_waits_until_idle_is_published() {
+        let (inner, mut rx) = make_test_inner();
+        let inner = Arc::new(inner);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+
+        {
+            let mut state = inner.state.lock().await;
+            state.active_turn = Some(ActiveTurn {
+                id: 42,
+                cancel_tx: Some(cancel_tx),
+                quiesced_waiters: Vec::new(),
+            });
+        }
+
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let cancel_inner = Arc::clone(&inner);
+        tokio::spawn(async move {
+            cancel_inner.cancel_active_turn().await;
+            let _ = done_tx.send(());
+        });
+
+        timeout(Duration::from_secs(1), cancel_rx)
+            .await
+            .expect("cancel signal should be sent")
+            .expect("cancel receiver should stay open");
+        assert!(
+            timeout(Duration::from_millis(50), &mut done_rx)
+                .await
+                .is_err(),
+            "interrupt must not resolve while active_turn is still set"
+        );
+
+        let waiters = inner.clear_active_turn(42).await;
+        assert!(
+            inner.state.lock().await.active_turn.is_none(),
+            "active turn should be cleared before publishing idle"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), &mut done_rx)
+                .await
+                .is_err(),
+            "interrupt must not resolve before OperationCancelled publishes idle"
+        );
+
+        inner.emit_operation_cancelled("Claude turn cancelled.");
+        assert!(
+            timeout(Duration::from_millis(50), &mut done_rx)
+                .await
+                .is_err(),
+            "interrupt must not resolve before quiescence waiters are notified"
+        );
+        notify_turn_quiesced(waiters);
+
+        timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("interrupt should resolve after idle is published")
+            .expect("interrupt completion channel should stay open");
+        let cancelled = rx.recv().await.expect("cancelled event");
+        assert_eq!(event_kind(&cancelled), Some("OperationCancelled"));
+        let idle = rx.recv().await.expect("idle event");
+        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
+        assert_eq!(idle.get("data").and_then(Value::as_bool), Some(false));
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled turn should emit one idle"
+        );
     }
 
     #[tokio::test]

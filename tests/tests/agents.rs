@@ -402,6 +402,70 @@ async fn expect_agent_error_message(
     }
 }
 
+async fn expect_agent_error_message_without(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_message: &str,
+    forbidden_message: &str,
+    context: &str,
+) -> AgentErrorPayload {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind != FrameKind::AgentError || env.stream != *stream {
+            continue;
+        }
+        let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+        assert_ne!(
+            payload.message, forbidden_message,
+            "unexpected AgentError while waiting for {context}"
+        );
+        if payload.message == expected_message {
+            return payload;
+        }
+    }
+}
+
+async fn expect_no_agent_error_message(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    forbidden_message: &str,
+    duration: Duration,
+    context: &str,
+) {
+    loop {
+        match tokio::time::timeout(duration, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(env)))
+                if fixture::is_builtin_team_custom_agent_notify(&env)
+                    || matches!(
+                        env.kind,
+                        FrameKind::HostSettings
+                            | FrameKind::SessionSettings
+                            | FrameKind::TeamPresetCatalogNotify
+                            | FrameKind::SessionSchemas
+                            | FrameKind::BackendSetup
+                            | FrameKind::QueuedMessages
+                            | FrameKind::SessionList
+                    ) =>
+            {
+                continue;
+            }
+            Ok(Ok(Some(env))) => {
+                if env.kind != FrameKind::AgentError || env.stream != *stream {
+                    continue;
+                }
+                let payload: AgentErrorPayload = env.parse_payload().expect("parse AgentError");
+                assert_ne!(
+                    payload.message, forbidden_message,
+                    "unexpected AgentError before {context}"
+                );
+            }
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
+    }
+}
+
 async fn expect_connection_close(client: &mut client::Connection, context: &str) {
     loop {
         match client
@@ -1335,6 +1399,88 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
 }
 
 #[tokio::test]
+async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
+    let mut fixture = Fixture::new().await;
+
+    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_AND_DROP_SENTINEL}");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("parent-with-dropped-native-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/dropped-sub-agent-parent".to_owned()],
+                prompt: parent_prompt,
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent with native child failed");
+
+    let parent_new_env = expect_next_event(&mut fixture.client, "parent NewAgent").await;
+    assert_eq!(parent_new_env.kind, FrameKind::NewAgent);
+    let parent_new: NewAgentPayload = parent_new_env.parse_payload().expect("parse NewAgent");
+
+    let parent_start_env = expect_next_event(&mut fixture.client, "parent AgentStart").await;
+    assert_eq!(parent_start_env.kind, FrameKind::AgentStart);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "mock backend response to: parent prompt",
+    )
+    .await;
+
+    let child_new_env = expect_next_event(&mut fixture.client, "native child NewAgent").await;
+    assert_eq!(child_new_env.kind, FrameKind::NewAgent);
+    let child_new: NewAgentPayload = child_new_env
+        .parse_payload()
+        .expect("parse native child NewAgent");
+
+    let child_start_env = expect_next_event(&mut fixture.client, "native child AgentStart").await;
+    assert_eq!(child_start_env.kind, FrameKind::AgentStart);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock native child response to: parent prompt",
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    fixture
+        .client
+        .interrupt(&child_new.instance_stream)
+        .await
+        .expect("interrupt parked backend-native child failed");
+
+    let err = expect_agent_error_message_without(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "backend-native relay agents do not accept direct input",
+        "agent not running",
+        "parked backend-native child relay rejection",
+    )
+    .await;
+    assert!(!err.fatal);
+    expect_no_agent_error_message(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "agent not running",
+        Duration::from_millis(100),
+        "router generic error after relay rejection",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn cancelling_parent_cascades_to_user_children_and_closes_relay_children() {
     let mut fixture = Fixture::new().await;
 
@@ -1495,6 +1641,21 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
         "unexpected startup failure message: {}",
         err.message
     );
+
+    fixture
+        .client
+        .interrupt(&agent_stream)
+        .await
+        .expect("interrupt terminal agent should still write protocol frame");
+
+    let interrupt_not_running = expect_agent_error_message(
+        &mut fixture.client,
+        &agent_stream,
+        "agent not running",
+        "terminal agent interrupt should reject with generic not-running",
+    )
+    .await;
+    assert!(!interrupt_not_running.fatal);
 
     fixture
         .client

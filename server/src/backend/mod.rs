@@ -183,8 +183,12 @@ pub trait Backend: Send + 'static {
     /// Returns false if the backend has terminated and can't accept input.
     fn send(&self, input: AgentInput) -> impl std::future::Future<Output = bool> + Send;
 
-    /// Interrupt the currently active turn, if any.
-    /// Returns false if the backend has terminated or doesn't support interruption.
+    /// Request interruption of the currently active turn, if any.
+    /// The returned future may resolve after the backend accepts or dispatches
+    /// the interrupt request, before the interrupted turn has fully quiesced.
+    /// Backends that provide stronger semantics should document them.
+    /// Returns false if the backend has terminated or does not support
+    /// interruption.
     fn interrupt(&self) -> impl std::future::Future<Output = bool> + Send;
 
     /// Shut down the live backend session and release any subprocess resources.
