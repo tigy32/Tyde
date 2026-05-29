@@ -34,6 +34,16 @@ The paired room must not carry Tyde NDJSON frames. It exists only to negotiate a
 fresh data room so stale MQTT clients cannot inject old data into a new app
 connection.
 
+The native mobile shell assigns a `connection_instance_id` to each successful
+ephemeral data-room connection. Replayed shell status for the same instance is
+only a frontend reattach and must not trigger another Tyde `hello`. A new
+instance means a fresh data room and therefore a fresh Tyde protocol connection;
+the mobile frontend must send `hello` and accept the normal `welcome` /
+`host_bootstrap` sequence. Retryable MQTT drops are surfaced as a soft
+reconnecting state while the shell opens a new data room; terminal
+`disconnected` is reserved for explicit user/device removal, and `failed` for
+non-retryable failures.
+
 ---
 
 ## 2. Message Envelope

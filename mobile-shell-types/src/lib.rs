@@ -86,6 +86,7 @@ pub struct PairedHostsChangedEvent {
 pub struct PairedHostConnectionStatusEvent {
     pub local_host_id: LocalHostId,
     pub status: PairedHostConnectionStatus,
+    pub connection_instance_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +136,23 @@ mod tests {
         assert!(encoded.contains("transport_failed"));
         let decoded: PairedHostConnectionStatus = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, status);
+        Ok(())
+    }
+
+    #[test]
+    fn connection_status_event_carries_instance_id() -> Result<(), Box<dyn std::error::Error>> {
+        let event = PairedHostConnectionStatusEvent {
+            local_host_id: LocalHostId("host-1".to_owned()),
+            status: PairedHostConnectionStatus::Connected,
+            connection_instance_id: Some(42),
+        };
+
+        let encoded = serde_json::to_string(&event)?;
+        assert!(encoded.contains("connectionInstanceId"));
+        let decoded: PairedHostConnectionStatusEvent = serde_json::from_str(&encoded)?;
+
+        assert_eq!(decoded.connection_instance_id, Some(42));
+        assert_eq!(decoded.status, PairedHostConnectionStatus::Connected);
         Ok(())
     }
 

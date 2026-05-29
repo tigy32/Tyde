@@ -196,7 +196,12 @@ fn install_event_listeners(state: AppState) {
             &state,
             "paired-host-connection-status",
             bridge::listen_paired_host_connection_status(move |event| {
-                apply_connection_status(&state_status, event.local_host_id, event.status);
+                apply_connection_status(
+                    &state_status,
+                    event.local_host_id,
+                    event.status,
+                    event.connection_instance_id,
+                );
             })
             .await,
         );
@@ -212,7 +217,6 @@ fn install_event_listeners(state: AppState) {
             .await,
         );
 
-        prepare_frontend_reattach(&state);
         if let Err(error) = bridge::frontend_attached().await {
             log::error!("frontend_attached failed: {error}");
             report_shell_error(
@@ -225,7 +229,12 @@ fn install_event_listeners(state: AppState) {
         match bridge::list_paired_host_connection_statuses().await {
             Ok(statuses) => {
                 for event in statuses {
-                    apply_connection_status(&state, event.local_host_id, event.status);
+                    apply_connection_status(
+                        &state,
+                        event.local_host_id,
+                        event.status,
+                        event.connection_instance_id,
+                    );
                 }
                 drain_pending_host_lines(state.clone());
             }
@@ -329,6 +338,7 @@ fn register_listener(
     }
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
 fn prepare_frontend_reattach(state: &AppState) {
     let hosts = state
         .host_streams
@@ -379,27 +389,63 @@ fn apply_connection_status(
     state: &AppState,
     host: LocalHostId,
     status: PairedHostConnectionStatus,
+    connection_instance_id: Option<u64>,
 ) {
-    let already_connected = matches!(
-        state.connection_statuses.get_untracked().get(&host),
-        Some(ConnectionStatus::Connected)
-    ) && state.host_stream_untracked(&host).is_some();
     let connection: ConnectionStatus = status.clone().into();
     state.connection_statuses.update(|m| {
         m.insert(host.clone(), connection.clone());
     });
     match status {
         PairedHostConnectionStatus::Connected => {
-            if already_connected {
+            // Determine whether this Connected event refers to the same
+            // underlying MQTT connection we already set up.  If so there is
+            // no need to allocate a new host stream or send Hello — doing so
+            // would reset protocol seq state and trigger a full rebootstrap
+            // for no reason (e.g. the WASM frontend reattached while the
+            // native connection stayed alive).
+            let same_connection = match connection_instance_id {
+                Some(id) => {
+                    // Native side is providing an instance id: use it as the
+                    // authoritative check.
+                    state
+                        .active_connection_instance_ids
+                        .get_untracked()
+                        .get(&host)
+                        .copied()
+                        == Some(id)
+                        && state.host_stream_untracked(&host).is_some()
+                }
+                None => {
+                    // Older native binary with no instance id: fall back to
+                    // the heuristic used before instance tracking existed.
+                    matches!(
+                        state.connection_statuses.get_untracked().get(&host),
+                        Some(ConnectionStatus::Connected)
+                    ) && state.host_stream_untracked(&host).is_some()
+                }
+            };
+
+            if same_connection {
+                // Same live connection: just ensure a host is selected.
                 if state.active_local_host_id.get_untracked().is_none() {
                     state.active_local_host_id.set(Some(host));
                 }
                 return;
             }
-            // Allocate a fresh host stream for this host and send Hello.
+
+            // New or changed connection: allocate a fresh host stream and
+            // send Hello.  Intentionally do NOT pre-clear host data here —
+            // apply_host_bootstrap will replace all bootstrap-owned slices
+            // atomically when it arrives, avoiding a visible flash between
+            // clear and refill.
             let stream = make_host_stream();
             reset_inbound_seq_for_host(&host);
             reset_seq_for_host(&host);
+            if let Some(id) = connection_instance_id {
+                state.active_connection_instance_ids.update(|m| {
+                    m.insert(host.clone(), id);
+                });
+            }
             state.host_streams.update(|m| {
                 m.insert(host.clone(), stream.clone());
             });
@@ -428,23 +474,37 @@ fn apply_connection_status(
                     );
                 }
             });
-            // If no host is currently selected, surface this one so the
-            // workspace shows something useful as soon as a connection lands.
             if state.active_local_host_id.get_untracked().is_none() {
                 state.active_local_host_id.set(Some(host));
             }
         }
         PairedHostConnectionStatus::Disconnected { reason } => {
+            // Terminal: clear tracked instance so the next Connected event
+            // unconditionally starts a fresh protocol session.
+            state.active_connection_instance_ids.update(|m| {
+                m.remove(&host);
+            });
             apply_disconnect(state, &host, Some(reason));
         }
         PairedHostConnectionStatus::Failed { message, .. } => {
+            state.active_connection_instance_ids.update(|m| {
+                m.remove(&host);
+            });
             apply_disconnect(state, &host, Some(message));
         }
-        PairedHostConnectionStatus::Connecting => {}
+        PairedHostConnectionStatus::Connecting => {
+            // Transient reconnect: status signal already updated above.
+            // Keep all reactive state visible so the UI shows stale-but-
+            // present data rather than a blank screen while the connection
+            // re-establishes.
+        }
     }
 }
 
 fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String>) {
+    state.active_connection_instance_ids.update(|m| {
+        m.remove(host);
+    });
     state.connection_statuses.update(|m| {
         let entry = m
             .entry(host.clone())
@@ -641,18 +701,32 @@ mod wasm_tests {
         assert!(error.message.contains("unknown_frame"));
     }
 
+    // ── apply_connection_status tests ──────────────────────────────────
+
+    /// Second `Connected` with no instance id and status already Connected +
+    /// host_stream present uses the legacy heuristic: same stream, no re-Hello.
     #[wasm_bindgen_test]
     fn connected_status_replay_does_not_replace_host_stream() {
         install_tauri_invoke_stub();
         let state = AppState::new();
         let host = LocalHostId("host-connected-replay".to_owned());
 
-        apply_connection_status(&state, host.clone(), PairedHostConnectionStatus::Connected);
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            None,
+        );
         let first_stream = state
             .host_stream_untracked(&host)
             .expect("connected host should have stream");
 
-        apply_connection_status(&state, host.clone(), PairedHostConnectionStatus::Connected);
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            None,
+        );
         let second_stream = state
             .host_stream_untracked(&host)
             .expect("connected host should still have stream");
@@ -660,13 +734,21 @@ mod wasm_tests {
         assert_eq!(second_stream, first_stream);
     }
 
+    /// `prepare_frontend_reattach` clears host streams so the next Connected
+    /// event creates a new one.  This function is no longer called from
+    /// `install_event_listeners`; the test documents its inherent behavior.
     #[wasm_bindgen_test]
     fn frontend_reattach_forces_connected_status_to_refresh_host_stream() {
         install_tauri_invoke_stub();
         let state = AppState::new();
         let host = LocalHostId("host-frontend-reattach".to_owned());
 
-        apply_connection_status(&state, host.clone(), PairedHostConnectionStatus::Connected);
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            None,
+        );
         let first_stream = state
             .host_stream_untracked(&host)
             .expect("connected host should have stream");
@@ -677,12 +759,368 @@ mod wasm_tests {
             "reattach must drop the old host stream so the next Connected status sends Hello"
         );
 
-        apply_connection_status(&state, host.clone(), PairedHostConnectionStatus::Connected);
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            None,
+        );
         let second_stream = state
             .host_stream_untracked(&host)
             .expect("reattached connected host should have a stream");
 
         assert_ne!(second_stream, first_stream);
+    }
+
+    // ── New instance-id lifecycle tests ────────────────────────────────
+
+    /// Same `connection_instance_id` on a second Connected event: no new
+    /// host stream, no seq reset — the frontend is already attached to this
+    /// exact MQTT connection.
+    #[wasm_bindgen_test]
+    fn same_instance_id_connected_replay_preserves_stream() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-same-instance".to_owned());
+
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(7),
+        );
+        let first_stream = state
+            .host_stream_untracked(&host)
+            .expect("first Connected should allocate a stream");
+        assert_eq!(
+            state
+                .active_connection_instance_ids
+                .get_untracked()
+                .get(&host)
+                .copied(),
+            Some(7),
+            "instance id should be recorded"
+        );
+
+        // Replay same instance id (simulates frontend_attached() when the
+        // native manager keeps the connection alive).
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(7),
+        );
+        let second_stream = state
+            .host_stream_untracked(&host)
+            .expect("stream must survive same-instance replay");
+
+        assert_eq!(
+            second_stream, first_stream,
+            "same-instance replay must not replace the host stream"
+        );
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::Connected),
+        );
+    }
+
+    /// A `frontend_attached()` call alone — with no actual reconnect — must
+    /// never clear reactive state.  With the native manager no longer
+    /// restarting healthy connections, the frontend receives a Connected
+    /// replay with the same instance id; the stream and data must survive.
+    #[wasm_bindgen_test]
+    fn frontend_attach_alone_does_not_clear_state() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-attach-no-clear".to_owned());
+
+        // Simulate an established connection with some host-scoped data.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(3),
+        );
+        let established_stream = state
+            .host_stream_untracked(&host)
+            .expect("established connection must have a stream");
+
+        // Seed a project so we can assert it survives.
+        use crate::state::ProjectInfo;
+        state.projects.update(|v| {
+            v.push(ProjectInfo {
+                local_host_id: host.clone(),
+                project: protocol::Project {
+                    id: protocol::ProjectId("proj-1".to_owned()),
+                    name: "Persist Me".to_owned(),
+                    roots: Vec::new(),
+                    sort_order: 0,
+                },
+            });
+        });
+
+        // Simulate what install_event_listeners now does: call
+        // frontend_attached() on the native side (no-op in tests), then
+        // receive a Connected status replay with the same instance id.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(3),
+        );
+
+        assert_eq!(
+            state.host_stream_untracked(&host).as_ref(),
+            Some(&established_stream),
+            "frontend attach alone must not replace the host stream"
+        );
+        let projects = state.projects.get_untracked();
+        assert!(
+            projects.iter().any(|p| p.local_host_id == host),
+            "project data must survive a same-instance Connected replay"
+        );
+    }
+
+    /// A new `connection_instance_id` on a Connected event allocates a new
+    /// host stream (so Hello is sent) but does NOT wipe existing reactive
+    /// state — that arrives and replaces atomically via host_bootstrap.
+    #[wasm_bindgen_test]
+    fn new_instance_id_sends_new_hello_without_pre_clearing_state() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-new-instance".to_owned());
+
+        // Establish with instance 1.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(1),
+        );
+        let first_stream = state
+            .host_stream_untracked(&host)
+            .expect("first connection must have a stream");
+
+        // Seed a project to verify it survives the new-instance transition.
+        use crate::state::ProjectInfo;
+        state.projects.update(|v| {
+            v.push(ProjectInfo {
+                local_host_id: host.clone(),
+                project: protocol::Project {
+                    id: protocol::ProjectId("proj-x".to_owned()),
+                    name: "Keep Me".to_owned(),
+                    roots: Vec::new(),
+                    sort_order: 0,
+                },
+            });
+        });
+
+        // MQTT reconnect: new instance id.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(2),
+        );
+        let second_stream = state
+            .host_stream_untracked(&host)
+            .expect("new-instance Connected must allocate a fresh stream");
+
+        assert_ne!(
+            second_stream, first_stream,
+            "new instance id must produce a different host stream (new Hello)"
+        );
+        assert_eq!(
+            state
+                .active_connection_instance_ids
+                .get_untracked()
+                .get(&host)
+                .copied(),
+            Some(2),
+            "tracked instance id must advance to the new value"
+        );
+        // Data must NOT have been pre-cleared; bootstrap will replace it.
+        let projects = state.projects.get_untracked();
+        assert!(
+            projects.iter().any(|p| p.local_host_id == host),
+            "existing data must survive the new-instance transition; bootstrap clears it"
+        );
+    }
+
+    /// `Connecting` after a previous Connected keeps all reactive state
+    /// visible so the UI shows stale projections during reconnect.
+    #[wasm_bindgen_test]
+    fn connecting_after_connected_preserves_stale_state() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-connecting-stale".to_owned());
+
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(5),
+        );
+        let stream = state
+            .host_stream_untracked(&host)
+            .expect("connected host must have a stream");
+
+        // Seed a project.
+        use crate::state::ProjectInfo;
+        state.projects.update(|v| {
+            v.push(ProjectInfo {
+                local_host_id: host.clone(),
+                project: protocol::Project {
+                    id: protocol::ProjectId("proj-stale".to_owned()),
+                    name: "Stale But Visible".to_owned(),
+                    roots: Vec::new(),
+                    sort_order: 0,
+                },
+            });
+        });
+
+        // Simulate the MQTT drop: manager emits Connecting while retrying.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connecting,
+            None,
+        );
+
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::Connecting),
+            "status must reflect the reconnecting state"
+        );
+        assert_eq!(
+            state.host_stream_untracked(&host).as_ref(),
+            Some(&stream),
+            "host stream must survive a Connecting transition"
+        );
+        let projects = state.projects.get_untracked();
+        assert!(
+            projects.iter().any(|p| p.local_host_id == host),
+            "project data must remain visible while reconnecting"
+        );
+        assert_eq!(
+            state
+                .active_connection_instance_ids
+                .get_untracked()
+                .get(&host)
+                .copied(),
+            Some(5),
+            "tracked instance id must survive a Connecting transition"
+        );
+    }
+
+    /// Terminal `Disconnected` and `Failed` statuses clear all per-host
+    /// reactive state exactly as they did before.
+    #[wasm_bindgen_test]
+    fn terminal_disconnected_and_failed_clear_state() {
+        install_tauri_invoke_stub();
+
+        // ── Disconnected ─────────────────────────────────────────────
+        {
+            let state = AppState::new();
+            let host = LocalHostId("host-term-disconnected".to_owned());
+
+            apply_connection_status(
+                &state,
+                host.clone(),
+                PairedHostConnectionStatus::Connected,
+                Some(9),
+            );
+            use crate::state::ProjectInfo;
+            state.projects.update(|v| {
+                v.push(ProjectInfo {
+                    local_host_id: host.clone(),
+                    project: protocol::Project {
+                        id: protocol::ProjectId("p".to_owned()),
+                        name: "Gone".to_owned(),
+                        roots: Vec::new(),
+                        sort_order: 0,
+                    },
+                });
+            });
+
+            apply_connection_status(
+                &state,
+                host.clone(),
+                PairedHostConnectionStatus::Disconnected {
+                    reason: "user disconnect".to_owned(),
+                },
+                None,
+            );
+
+            assert!(
+                state.host_stream_untracked(&host).is_none(),
+                "Disconnected must clear the host stream"
+            );
+            assert!(
+                state.projects.get_untracked().is_empty(),
+                "Disconnected must clear projects"
+            );
+            assert!(
+                state
+                    .active_connection_instance_ids
+                    .get_untracked()
+                    .get(&host)
+                    .is_none(),
+                "Disconnected must clear the tracked instance id"
+            );
+        }
+
+        // ── Failed ───────────────────────────────────────────────────
+        {
+            let state = AppState::new();
+            let host = LocalHostId("host-term-failed".to_owned());
+
+            apply_connection_status(
+                &state,
+                host.clone(),
+                PairedHostConnectionStatus::Connected,
+                Some(11),
+            );
+            use crate::state::ProjectInfo;
+            state.projects.update(|v| {
+                v.push(ProjectInfo {
+                    local_host_id: host.clone(),
+                    project: protocol::Project {
+                        id: protocol::ProjectId("q".to_owned()),
+                        name: "Also Gone".to_owned(),
+                        roots: Vec::new(),
+                        sort_order: 0,
+                    },
+                });
+            });
+
+            apply_connection_status(
+                &state,
+                host.clone(),
+                PairedHostConnectionStatus::Failed {
+                    code: protocol::MobileAccessErrorCode::TransportFailed,
+                    message: "fatal error".to_owned(),
+                },
+                None,
+            );
+
+            assert!(
+                state.host_stream_untracked(&host).is_none(),
+                "Failed must clear the host stream"
+            );
+            assert!(
+                state.projects.get_untracked().is_empty(),
+                "Failed must clear projects"
+            );
+            assert!(
+                state
+                    .active_connection_instance_ids
+                    .get_untracked()
+                    .get(&host)
+                    .is_none(),
+                "Failed must clear the tracked instance id"
+            );
+        }
     }
 
     #[wasm_bindgen_test]

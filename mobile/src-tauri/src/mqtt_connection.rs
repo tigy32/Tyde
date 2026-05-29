@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use host_config::{HostDisconnectedEvent, HostErrorEvent, HostLineEvent};
@@ -68,7 +69,7 @@ impl Manager {
             statuses: HashMap::new(),
             pending_host_lines: HashMap::new(),
             next_host_line_delivery_id: 0,
-            next_connection_instance_id: 0,
+            next_connection_instance_id: Arc::new(AtomicU64::new(0)),
         };
         tauri::async_runtime::spawn(actor.run());
         Self { tx }
@@ -165,17 +166,19 @@ enum ManagerCommand {
     },
     ConnectionStatusChanged {
         local_host_id: LocalHostId,
-        instance_id: u64,
+        actor_instance_id: u64,
+        connection_instance_id: Option<u64>,
         status: PairedHostConnectionStatus,
     },
     HostLineReceived {
         local_host_id: LocalHostId,
-        instance_id: u64,
+        actor_instance_id: u64,
+        connection_instance_id: u64,
         line: String,
     },
     HostError {
         local_host_id: LocalHostId,
-        instance_id: u64,
+        actor_instance_id: u64,
         message: String,
     },
     ListPendingHostLines {
@@ -188,7 +191,7 @@ enum ManagerCommand {
     },
     ActorEnded {
         local_host_id: LocalHostId,
-        instance_id: u64,
+        actor_instance_id: u64,
     },
     FrontendAttached {
         reply: oneshot::Sender<Result<(), ManagerError>>,
@@ -197,8 +200,15 @@ enum ManagerCommand {
 
 struct ActiveConnection {
     tx: mpsc::Sender<ConnectionCommand>,
-    instance_id: u64,
+    actor_instance_id: u64,
+    connection_instance_id: Option<u64>,
     _task: tauri::async_runtime::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct StoredConnectionStatus {
+    status: PairedHostConnectionStatus,
+    connection_instance_id: Option<u64>,
 }
 
 struct ManagerActor {
@@ -208,10 +218,10 @@ struct ManagerActor {
     rx: mpsc::Receiver<ManagerCommand>,
     tx: mpsc::Sender<ManagerCommand>,
     active: HashMap<LocalHostId, ActiveConnection>,
-    statuses: HashMap<LocalHostId, PairedHostConnectionStatus>,
+    statuses: HashMap<LocalHostId, StoredConnectionStatus>,
     pending_host_lines: HashMap<LocalHostId, VecDeque<BufferedHostLine>>,
     next_host_line_delivery_id: u64,
-    next_connection_instance_id: u64,
+    next_connection_instance_id: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -255,14 +265,7 @@ impl ManagerActor {
                                 .collect::<HashSet<_>>();
                             self.statuses
                                 .retain(|local_host_id, _| known_ids.contains(local_host_id));
-                            Ok(self
-                                .statuses
-                                .iter()
-                                .map(|(local_host_id, status)| PairedHostConnectionStatusEvent {
-                                    local_host_id: local_host_id.clone(),
-                                    status: status.clone(),
-                                })
-                                .collect())
+                            Ok(connection_status_events(&self.statuses))
                         }
                         Err(error) => Err(ManagerError::Store(error)),
                     };
@@ -270,24 +273,36 @@ impl ManagerActor {
                 }
                 ManagerCommand::ConnectionStatusChanged {
                     local_host_id,
-                    instance_id,
+                    actor_instance_id,
+                    connection_instance_id,
                     status,
                 } => {
-                    self.connection_status_changed(local_host_id, instance_id, status);
+                    self.connection_status_changed(
+                        local_host_id,
+                        actor_instance_id,
+                        connection_instance_id,
+                        status,
+                    );
                 }
                 ManagerCommand::HostLineReceived {
                     local_host_id,
-                    instance_id,
+                    actor_instance_id,
+                    connection_instance_id,
                     line,
                 } => {
-                    self.host_line_received(local_host_id, instance_id, line);
+                    self.host_line_received(
+                        local_host_id,
+                        actor_instance_id,
+                        connection_instance_id,
+                        line,
+                    );
                 }
                 ManagerCommand::HostError {
                     local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     message,
                 } => {
-                    self.host_error(local_host_id, instance_id, message);
+                    self.host_error(local_host_id, actor_instance_id, message);
                 }
                 ManagerCommand::ListPendingHostLines { reply } => {
                     let _send_result = reply.send(Ok(self.pending_host_lines()));
@@ -302,17 +317,17 @@ impl ManagerActor {
                 }
                 ManagerCommand::ActorEnded {
                     local_host_id,
-                    instance_id,
+                    actor_instance_id,
                 } => {
                     if self
                         .active
                         .get(&local_host_id)
-                        .is_some_and(|active| active.instance_id == instance_id)
+                        .is_some_and(|active| active.actor_instance_id == actor_instance_id)
                     {
                         let should_mark_disconnected =
-                            self.statuses.get(&local_host_id).is_none_or(|status| {
+                            self.statuses.get(&local_host_id).is_none_or(|stored| {
                                 matches!(
-                                    status,
+                                    stored.status,
                                     PairedHostConnectionStatus::Connecting
                                         | PairedHostConnectionStatus::Connected
                                 )
@@ -324,6 +339,7 @@ impl ManagerActor {
                                 PairedHostConnectionStatus::Disconnected {
                                     reason: "connection actor ended".to_owned(),
                                 },
+                                None,
                             );
                         }
                     }
@@ -357,6 +373,7 @@ impl ManagerActor {
             PairedHostConnectionStatus::Disconnected {
                 reason: "disconnect requested".to_owned(),
             },
+            None,
         );
         active.tx.send(ConnectionCommand::Stop).await.map_err(|_| {
             ManagerError::ConnectionActorStopped {
@@ -366,33 +383,22 @@ impl ManagerActor {
     }
 
     async fn frontend_attached(&mut self) -> Result<(), ManagerError> {
-        let host_ids = self.active.keys().cloned().collect::<Vec<_>>();
         tracing::info!(
-            active_connections = host_ids.len(),
-            "frontend attached; reconciling paired host connections"
+            active_connections = self.active.len(),
+            "frontend attached; replaying paired host connection state"
         );
-        let mut restarted = HashSet::new();
-        for local_host_id in host_ids {
-            let Some(active) = self.active.remove(&local_host_id) else {
-                continue;
-            };
-            let _send_result = active.tx.send(ConnectionCommand::Stop).await;
-            restarted.insert(local_host_id.clone());
-            self.spawn_connection(local_host_id).await?;
+        for (local_host_id, stored) in self.statuses.clone() {
+            self.emit_status_event(local_host_id, stored);
         }
-        let records = self.store.list_records().await?;
-        for record in records
-            .into_iter()
-            .filter(|record| record.auto_connect && !restarted.contains(&record.local_host_id))
+        let active_ids = self.active.keys().cloned().collect::<HashSet<_>>();
+        for local_host_id in
+            missing_auto_connect_hosts(self.store.list_records().await?, &active_ids)
         {
-            if self.active.contains_key(&record.local_host_id) {
-                continue;
-            }
             tracing::info!(
-                local_host_id = %record.local_host_id,
+                local_host_id = %local_host_id,
                 "frontend attach found auto-connect host without an active connection; connecting"
             );
-            self.spawn_connection(record.local_host_id).await?;
+            self.spawn_connection(local_host_id).await?;
         }
         Ok(())
     }
@@ -405,19 +411,32 @@ impl ManagerActor {
         let app = self.app.clone();
         let store = self.store.clone();
         let manager_tx = self.tx.clone();
+        let connection_instance_ids = self.next_connection_instance_id.clone();
         let task_host_id = local_host_id.clone();
-        let instance_id = self.allocate_connection_instance_id();
+        let actor_instance_id = self.allocate_connection_instance_id();
         self.set_status_and_emit(
             local_host_id.clone(),
             PairedHostConnectionStatus::Connecting,
+            None,
         );
         let task = tauri::async_runtime::spawn(async move {
-            run_connection_actor(app, store, record, psk, manager_tx.clone(), instance_id, rx)
-                .await;
+            run_connection_actor(
+                ConnectionActorInit {
+                    app,
+                    store,
+                    record,
+                    psk,
+                    manager_tx: manager_tx.clone(),
+                    actor_instance_id,
+                    connection_instance_ids,
+                },
+                rx,
+            )
+            .await;
             let _send_result = manager_tx
                 .send(ManagerCommand::ActorEnded {
                     local_host_id: task_host_id,
-                    instance_id,
+                    actor_instance_id,
                 })
                 .await;
         });
@@ -425,7 +444,8 @@ impl ManagerActor {
             local_host_id,
             ActiveConnection {
                 tx,
-                instance_id,
+                actor_instance_id,
+                connection_instance_id: None,
                 _task: task,
             },
         );
@@ -433,15 +453,7 @@ impl ManagerActor {
     }
 
     fn allocate_connection_instance_id(&mut self) -> u64 {
-        let instance_id = self.next_connection_instance_id;
-        self.next_connection_instance_id = self
-            .next_connection_instance_id
-            .checked_add(1)
-            .unwrap_or_else(|| {
-                tracing::warn!("connection instance id overflow; wrapping to zero");
-                0
-            });
-        instance_id
+        allocate_connection_instance_id(&self.next_connection_instance_id)
     }
 
     async fn send_line(
@@ -475,33 +487,54 @@ impl ManagerActor {
     fn connection_status_changed(
         &mut self,
         local_host_id: LocalHostId,
-        instance_id: u64,
+        actor_instance_id: u64,
+        connection_instance_id: Option<u64>,
         status: PairedHostConnectionStatus,
     ) {
         if self
             .active
             .get(&local_host_id)
-            .is_none_or(|active| active.instance_id != instance_id)
+            .is_none_or(|active| active.actor_instance_id != actor_instance_id)
         {
             tracing::info!(
                 local_host_id = %local_host_id,
-                instance_id,
+                actor_instance_id,
                 "ignoring stale paired host connection status"
             );
             return;
         }
-        self.set_status_and_emit(local_host_id, status);
+        if matches!(status, PairedHostConnectionStatus::Connected)
+            && connection_instance_id.is_none()
+        {
+            tracing::warn!(
+                local_host_id = %local_host_id,
+                actor_instance_id,
+                "ignoring connected status without connection instance id"
+            );
+            return;
+        }
+        if let Some(active) = self.active.get_mut(&local_host_id)
+            && matches!(status, PairedHostConnectionStatus::Connected)
+        {
+            active.connection_instance_id = connection_instance_id;
+        }
+        self.set_status_and_emit(local_host_id, status, connection_instance_id);
     }
 
     fn set_status_and_emit(
         &mut self,
         local_host_id: LocalHostId,
         status: PairedHostConnectionStatus,
+        connection_instance_id: Option<u64>,
     ) {
-        if matches!(status, PairedHostConnectionStatus::Connecting) {
+        if matches!(status, PairedHostConnectionStatus::Connected) {
             self.pending_host_lines.remove(&local_host_id);
         }
-        self.statuses.insert(local_host_id.clone(), status.clone());
+        let stored = StoredConnectionStatus {
+            status: status.clone(),
+            connection_instance_id,
+        };
+        self.statuses.insert(local_host_id.clone(), stored.clone());
         if matches!(
             status,
             PairedHostConnectionStatus::Disconnected { .. }
@@ -514,26 +547,31 @@ impl ManagerActor {
         ) {
             tracing::warn!(error = %error, "failed to emit host disconnected event");
         }
+        self.emit_status_event(local_host_id, stored);
+    }
+
+    fn emit_status_event(&self, local_host_id: LocalHostId, stored: StoredConnectionStatus) {
         if let Err(error) = self.app.emit(
             PAIRED_HOST_CONNECTION_STATUS_EVENT,
             PairedHostConnectionStatusEvent {
                 local_host_id,
-                status,
+                status: stored.status,
+                connection_instance_id: stored.connection_instance_id,
             },
         ) {
             tracing::warn!(error = %error, "failed to emit paired host connection status");
         }
     }
 
-    fn host_error(&mut self, local_host_id: LocalHostId, instance_id: u64, message: String) {
+    fn host_error(&mut self, local_host_id: LocalHostId, actor_instance_id: u64, message: String) {
         if self
             .active
             .get(&local_host_id)
-            .is_none_or(|active| active.instance_id != instance_id)
+            .is_none_or(|active| active.actor_instance_id != actor_instance_id)
         {
             tracing::info!(
                 local_host_id = %local_host_id,
-                instance_id,
+                actor_instance_id,
                 "ignoring stale host error"
             );
             return;
@@ -549,15 +587,21 @@ impl ManagerActor {
         }
     }
 
-    fn host_line_received(&mut self, local_host_id: LocalHostId, instance_id: u64, line: String) {
-        if self
-            .active
-            .get(&local_host_id)
-            .is_none_or(|active| active.instance_id != instance_id)
-        {
+    fn host_line_received(
+        &mut self,
+        local_host_id: LocalHostId,
+        actor_instance_id: u64,
+        connection_instance_id: u64,
+        line: String,
+    ) {
+        if self.active.get(&local_host_id).is_none_or(|active| {
+            active.actor_instance_id != actor_instance_id
+                || active.connection_instance_id != Some(connection_instance_id)
+        }) {
             tracing::info!(
                 local_host_id = %local_host_id,
-                instance_id,
+                actor_instance_id,
+                connection_instance_id,
                 "ignoring stale host line"
             );
             return;
@@ -653,15 +697,29 @@ enum ConnectedOutcome {
     Disconnected(ConnectionError),
 }
 
-async fn run_connection_actor(
+struct ConnectionActorInit {
     app: tauri::AppHandle,
     store: Arc<Store>,
     record: PairedHostRecord,
     psk: PreSharedKey,
     manager_tx: mpsc::Sender<ManagerCommand>,
-    instance_id: u64,
+    actor_instance_id: u64,
+    connection_instance_ids: Arc<AtomicU64>,
+}
+
+async fn run_connection_actor(
+    init: ConnectionActorInit,
     mut rx: mpsc::Receiver<ConnectionCommand>,
 ) {
+    let ConnectionActorInit {
+        app,
+        store,
+        record,
+        psk,
+        manager_tx,
+        actor_instance_id,
+        connection_instance_ids,
+    } = init;
     let mut backoff = MqttReconnectBackoff::default();
     loop {
         match store.get(record.local_host_id.clone()).await {
@@ -670,7 +728,7 @@ async fn run_connection_actor(
                 emit_disconnected(
                     &manager_tx,
                     &record.local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     "paired host was removed".to_owned(),
                 );
                 return;
@@ -679,7 +737,7 @@ async fn run_connection_actor(
                 emit_final_failure(
                     &manager_tx,
                     &record.local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     &ConnectionError::Store(error),
                 );
                 return;
@@ -689,7 +747,8 @@ async fn run_connection_actor(
         emit_connection_status(
             &manager_tx,
             &record.local_host_id,
-            instance_id,
+            actor_instance_id,
+            None,
             PairedHostConnectionStatus::Connecting,
         );
 
@@ -700,7 +759,7 @@ async fn run_connection_actor(
                     emit_disconnected(
                         &manager_tx,
                         &record.local_host_id,
-                        instance_id,
+                        actor_instance_id,
                         "disconnected by user".to_owned(),
                     );
                     return;
@@ -713,13 +772,18 @@ async fn run_connection_actor(
             Ok(stream) => stream,
             Err(error) => {
                 if !error_is_retryable(&error) {
-                    emit_final_failure(&manager_tx, &record.local_host_id, instance_id, &error);
+                    emit_final_failure(
+                        &manager_tx,
+                        &record.local_host_id,
+                        actor_instance_id,
+                        &error,
+                    );
                     return;
                 }
                 emit_host_error(
                     &manager_tx,
                     &record.local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     format!("MQTT connection failed; retrying: {error}"),
                 );
                 match wait_backoff_or_stop(&mut rx, &mut backoff).await {
@@ -727,14 +791,19 @@ async fn run_connection_actor(
                         emit_disconnected(
                             &manager_tx,
                             &record.local_host_id,
-                            instance_id,
+                            actor_instance_id,
                             "disconnected by user".to_owned(),
                         );
                         return;
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        emit_final_failure(&manager_tx, &record.local_host_id, instance_id, &error);
+                        emit_final_failure(
+                            &manager_tx,
+                            &record.local_host_id,
+                            actor_instance_id,
+                            &error,
+                        );
                         return;
                     }
                 }
@@ -743,10 +812,12 @@ async fn run_connection_actor(
         };
 
         backoff.reset();
+        let connection_instance_id = allocate_connection_instance_id(&connection_instance_ids);
         emit_connection_status(
             &manager_tx,
             &record.local_host_id,
-            instance_id,
+            actor_instance_id,
+            Some(connection_instance_id),
             PairedHostConnectionStatus::Connected,
         );
         match now_ms() {
@@ -758,14 +829,14 @@ async fn run_connection_actor(
                 Err(error) => emit_host_error(
                     &manager_tx,
                     &record.local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     format!("failed to persist last_connected_at_ms: {error}"),
                 ),
             },
             Err(error) => emit_host_error(
                 &manager_tx,
                 &record.local_host_id,
-                instance_id,
+                actor_instance_id,
                 format!("failed to compute last_connected_at_ms: {error}"),
             ),
         }
@@ -773,7 +844,8 @@ async fn run_connection_actor(
         match run_connected_loop(
             &manager_tx,
             &record.local_host_id,
-            instance_id,
+            actor_instance_id,
+            connection_instance_id,
             stream,
             &mut rx,
         )
@@ -783,20 +855,32 @@ async fn run_connection_actor(
                 emit_disconnected(
                     &manager_tx,
                     &record.local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     "disconnected by user".to_owned(),
                 );
                 return;
             }
             ConnectedOutcome::Disconnected(error) => {
                 if !error_is_retryable(&error) {
-                    emit_final_failure(&manager_tx, &record.local_host_id, instance_id, &error);
+                    emit_final_failure(
+                        &manager_tx,
+                        &record.local_host_id,
+                        actor_instance_id,
+                        &error,
+                    );
                     return;
                 }
+                emit_connection_status(
+                    &manager_tx,
+                    &record.local_host_id,
+                    actor_instance_id,
+                    None,
+                    PairedHostConnectionStatus::Connecting,
+                );
                 emit_host_error(
                     &manager_tx,
                     &record.local_host_id,
-                    instance_id,
+                    actor_instance_id,
                     format!("MQTT connection dropped; reconnecting: {error}"),
                 );
                 match wait_backoff_or_stop(&mut rx, &mut backoff).await {
@@ -804,14 +888,19 @@ async fn run_connection_actor(
                         emit_disconnected(
                             &manager_tx,
                             &record.local_host_id,
-                            instance_id,
+                            actor_instance_id,
                             "disconnected by user".to_owned(),
                         );
                         return;
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        emit_final_failure(&manager_tx, &record.local_host_id, instance_id, &error);
+                        emit_final_failure(
+                            &manager_tx,
+                            &record.local_host_id,
+                            actor_instance_id,
+                            &error,
+                        );
                         return;
                     }
                 }
@@ -855,7 +944,8 @@ where
 async fn run_connected_loop(
     manager_tx: &mpsc::Sender<ManagerCommand>,
     local_host_id: &LocalHostId,
-    instance_id: u64,
+    actor_instance_id: u64,
+    connection_instance_id: u64,
     stream: mqtt_transport::EnvelopeStream,
     rx: &mut mpsc::Receiver<ConnectionCommand>,
 ) -> ConnectedOutcome {
@@ -877,7 +967,13 @@ async fn run_connected_loop(
                             continue;
                         }
                         if let Err(error) =
-                            buffer_host_line(manager_tx, local_host_id, instance_id, line.clone()).await
+                            buffer_host_line(
+                                manager_tx,
+                                local_host_id,
+                                actor_instance_id,
+                                connection_instance_id,
+                                line.clone(),
+                            ).await
                         {
                             return ConnectedOutcome::Disconnected(error);
                         }
@@ -1018,12 +1114,14 @@ fn mobile_error_code_for_transport(error: &MqttTransportError) -> MobileAccessEr
 fn emit_connection_status(
     manager_tx: &mpsc::Sender<ManagerCommand>,
     local_host_id: &LocalHostId,
-    instance_id: u64,
+    actor_instance_id: u64,
+    connection_instance_id: Option<u64>,
     status: PairedHostConnectionStatus,
 ) {
     if let Err(error) = manager_tx.try_send(ManagerCommand::ConnectionStatusChanged {
         local_host_id: local_host_id.clone(),
-        instance_id,
+        actor_instance_id,
+        connection_instance_id,
         status,
     }) {
         tracing::warn!(error = %error, "failed to record paired host connection status");
@@ -1033,13 +1131,15 @@ fn emit_connection_status(
 async fn buffer_host_line(
     manager_tx: &mpsc::Sender<ManagerCommand>,
     local_host_id: &LocalHostId,
-    instance_id: u64,
+    actor_instance_id: u64,
+    connection_instance_id: u64,
     line: String,
 ) -> Result<(), ConnectionError> {
     manager_tx
         .send(ManagerCommand::HostLineReceived {
             local_host_id: local_host_id.clone(),
-            instance_id,
+            actor_instance_id,
+            connection_instance_id,
             line,
         })
         .await
@@ -1052,13 +1152,14 @@ async fn buffer_host_line(
 fn emit_disconnected(
     manager_tx: &mpsc::Sender<ManagerCommand>,
     local_host_id: &LocalHostId,
-    instance_id: u64,
+    actor_instance_id: u64,
     reason: String,
 ) {
     emit_connection_status(
         manager_tx,
         local_host_id,
-        instance_id,
+        actor_instance_id,
+        None,
         PairedHostConnectionStatus::Disconnected { reason },
     );
 }
@@ -1066,15 +1167,21 @@ fn emit_disconnected(
 fn emit_final_failure(
     manager_tx: &mpsc::Sender<ManagerCommand>,
     local_host_id: &LocalHostId,
-    instance_id: u64,
+    actor_instance_id: u64,
     error: &ConnectionError,
 ) {
     let message = error.to_string();
-    emit_host_error(manager_tx, local_host_id, instance_id, message.clone());
+    emit_host_error(
+        manager_tx,
+        local_host_id,
+        actor_instance_id,
+        message.clone(),
+    );
     emit_connection_status(
         manager_tx,
         local_host_id,
-        instance_id,
+        actor_instance_id,
+        None,
         PairedHostConnectionStatus::Failed {
             code: error_code(error),
             message,
@@ -1085,16 +1192,48 @@ fn emit_final_failure(
 fn emit_host_error(
     manager_tx: &mpsc::Sender<ManagerCommand>,
     local_host_id: &LocalHostId,
-    instance_id: u64,
+    actor_instance_id: u64,
     message: String,
 ) {
     if let Err(error) = manager_tx.try_send(ManagerCommand::HostError {
         local_host_id: local_host_id.clone(),
-        instance_id,
+        actor_instance_id,
         message,
     }) {
         tracing::warn!(error = %error, "failed to record host error");
     }
+}
+
+fn allocate_connection_instance_id(next: &AtomicU64) -> u64 {
+    let id = next.fetch_add(1, Ordering::Relaxed);
+    if id == u64::MAX {
+        tracing::warn!("connection instance id overflow; wrapping to zero");
+    }
+    id
+}
+
+fn connection_status_events(
+    statuses: &HashMap<LocalHostId, StoredConnectionStatus>,
+) -> Vec<PairedHostConnectionStatusEvent> {
+    statuses
+        .iter()
+        .map(|(local_host_id, stored)| PairedHostConnectionStatusEvent {
+            local_host_id: local_host_id.clone(),
+            status: stored.status.clone(),
+            connection_instance_id: stored.connection_instance_id,
+        })
+        .collect()
+}
+
+fn missing_auto_connect_hosts(
+    records: Vec<PairedHostRecord>,
+    active_ids: &HashSet<LocalHostId>,
+) -> Vec<LocalHostId> {
+    records
+        .into_iter()
+        .filter(|record| record.auto_connect && !active_ids.contains(&record.local_host_id))
+        .map(|record| record.local_host_id)
+        .collect()
 }
 
 pub async fn emit_paired_hosts_changed(app: &tauri::AppHandle, store: &Store) {
@@ -1122,7 +1261,14 @@ fn now_ms() -> Result<u64, ConnectionError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
+
+    use mqtt_transport::{BrokerAuth, BrokerEndpoint, RoomId};
+    use protocol::BrokerUrl;
+
+    use crate::types::KeychainSecretId;
 
     use super::*;
 
@@ -1164,5 +1310,87 @@ mod tests {
             error_code(&error),
             MobileAccessErrorCode::BrokerConnectionFailed
         );
+    }
+
+    #[test]
+    fn frontend_attach_missing_auto_connect_does_not_restart_active_hosts() {
+        let active = HashSet::from([LocalHostId("active".to_owned())]);
+        let records = vec![
+            paired_host_record("active", true),
+            paired_host_record("missing", true),
+            paired_host_record("manual", false),
+        ];
+
+        let missing = missing_auto_connect_hosts(records, &active);
+
+        assert_eq!(missing, vec![LocalHostId("missing".to_owned())]);
+    }
+
+    #[test]
+    fn same_active_data_room_replays_same_connection_instance_id() {
+        let host = LocalHostId("host".to_owned());
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            host.clone(),
+            StoredConnectionStatus {
+                status: PairedHostConnectionStatus::Connected,
+                connection_instance_id: Some(42),
+            },
+        );
+
+        let events = connection_status_events(&statuses);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].local_host_id, host);
+        assert_eq!(events[0].status, PairedHostConnectionStatus::Connected);
+        assert_eq!(events[0].connection_instance_id, Some(42));
+    }
+
+    #[test]
+    fn retry_reconnect_gets_new_connection_instance_id() {
+        let next = AtomicU64::new(7);
+
+        let first = allocate_connection_instance_id(&next);
+        let second = allocate_connection_instance_id(&next);
+
+        assert_eq!(first, 7);
+        assert_eq!(second, 8);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn terminal_statuses_have_no_connection_instance_id() {
+        let host = LocalHostId("host".to_owned());
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            host,
+            StoredConnectionStatus {
+                status: PairedHostConnectionStatus::Failed {
+                    code: MobileAccessErrorCode::TransportFailed,
+                    message: "terminal".to_owned(),
+                },
+                connection_instance_id: None,
+            },
+        );
+
+        let events = connection_status_events(&statuses);
+
+        assert_eq!(events[0].connection_instance_id, None);
+    }
+
+    fn paired_host_record(id: &str, auto_connect: bool) -> PairedHostRecord {
+        PairedHostRecord {
+            local_host_id: LocalHostId(id.to_owned()),
+            host_label: id.to_owned(),
+            broker: BrokerEndpoint {
+                url: BrokerUrl::new("wss://broker.example.test/mqtt").unwrap(),
+                auth: BrokerAuth::Anonymous,
+            },
+            room: RoomId([1; 16]),
+            psk_keychain_key_id: KeychainSecretId(format!("psk-{id}")),
+            credential_fingerprint: format!("fp-{id}"),
+            auto_connect,
+            last_connected_at_ms: None,
+        }
     }
 }

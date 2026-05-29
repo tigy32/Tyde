@@ -211,9 +211,11 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             state.connection_statuses.update(|map| {
                 map.insert(host.clone(), ConnectionStatus::Connected);
             });
-            clear_phase2_snapshots_for_host(state, host);
-            // Sessions/projects/teams etc. now arrive via HostBootstrap
-            // (seq 1 on the host stream) — see the HostBootstrap arm below.
+            // Sessions/projects/teams etc. arrive via HostBootstrap (seq 1
+            // on the host stream).  We do not pre-clear anything here because
+            // apply_host_bootstrap replaces each collection atomically, so
+            // data stays visible until the moment it is refreshed rather than
+            // flashing blank between Welcome and HostBootstrap.
             log::info!("connected to host {}", host);
         }
         FrameKind::HostBootstrap => match envelope.parse_payload::<HostBootstrapPayload>() {
@@ -861,54 +863,6 @@ fn report_protocol_error(state: &AppState, host: &LocalHostId, message: String) 
         code: MobileAccessErrorCode::BrokerProtocol,
         message,
     }));
-}
-
-fn clear_phase2_snapshots_for_host(state: &AppState, host: &LocalHostId) {
-    state.project_file_contents.update(|m| {
-        m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.project_diffs.update(|m| {
-        m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.review_summaries.update(|m| {
-        m.retain(|(h, _), _| h != host);
-    });
-    state.reviews.update(|m| {
-        m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.review_errors.update(|m| {
-        m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.review_streams.update(|m| {
-        m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.agent_compactions.update(|m| {
-        m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.teams_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.team_members_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.team_bindings_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.team_compactions_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.team_preset_catalog_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.team_drafts_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.team_shuffle_suggestions_by_host.update(|m| {
-        m.remove(host);
-    });
-    state.host_browses.update(|m| {
-        m.retain(|(h, _), _| h != host);
-    });
 }
 
 fn has_compaction_in_progress_for_host(state: &AppState, host: &LocalHostId) -> bool {

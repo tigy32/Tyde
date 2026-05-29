@@ -319,6 +319,10 @@ pub struct AppState {
     // Multi-host
     pub paired_hosts: RwSignal<Vec<PairedHostSummary>>,
     pub connection_statuses: RwSignal<HashMap<LocalHostId, ConnectionStatus>>,
+    /// Tracks the `connection_instance_id` of the MQTT connection for which
+    /// the frontend last sent Hello.  Used to detect same-connection status
+    /// replays (no re-Hello needed) vs. genuinely new connections.
+    pub active_connection_instance_ids: RwSignal<HashMap<LocalHostId, u64>>,
     pub host_streams: RwSignal<HashMap<LocalHostId, StreamPath>>,
     pub host_settings_by_host: RwSignal<HashMap<LocalHostId, HostSettings>>,
     pub command_errors_by_host: RwSignal<HashMap<LocalHostId, String>>,
@@ -404,6 +408,7 @@ impl AppState {
 
             paired_hosts: RwSignal::new(Vec::new()),
             connection_statuses: RwSignal::new(HashMap::new()),
+            active_connection_instance_ids: RwSignal::new(HashMap::new()),
             host_streams: RwSignal::new(HashMap::new()),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
@@ -530,6 +535,9 @@ impl AppState {
     /// forgotten (the user removed the pairing) or fully disconnects in a way
     /// that should clear cached snapshots.
     pub fn clear_host_runtime(&self, host: &LocalHostId) {
+        self.active_connection_instance_ids.update(|m| {
+            m.remove(host);
+        });
         self.host_streams.update(|m| {
             m.remove(host);
         });
