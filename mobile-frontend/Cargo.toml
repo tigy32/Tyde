@@ -23,6 +23,7 @@ web-sys = { version = "0.3", features = [
     "HtmlTextAreaElement",
     "Navigator",
     "Node",
+    "NodeList",
     "Storage",
     "Window",
     "console",

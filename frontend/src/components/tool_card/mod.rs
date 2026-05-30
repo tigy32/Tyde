@@ -20,6 +20,7 @@ use wasm_bindgen::JsCast;
 
 use crate::state::{AppState, StreamingToolRequest, ToolOutputMode, ToolRequestEntry};
 
+mod ask_user_question;
 mod error_result;
 mod get_type_docs;
 mod modify_file;
@@ -49,7 +50,7 @@ pub fn ToolCardListView(entries: Vec<ToolRequestEntry>) -> impl IntoView {
                     move || {
                         let expanded = expanded.get();
                         visible_tool_indexes(entries.len(), expanded, |idx| {
-                            is_operational_tool(&entries[idx])
+                            is_important_tool(&entries[idx])
                         })
                         .into_iter()
                         .map(|idx| entries[idx].clone())
@@ -67,7 +68,7 @@ pub fn ToolCardListView(entries: Vec<ToolRequestEntry>) -> impl IntoView {
                     let entries = entries.clone();
                     move || {
                         let visible = visible_tool_indexes(entries.len(), expanded.get(), |idx| {
-                            is_operational_tool(&entries[idx])
+                            is_important_tool(&entries[idx])
                         })
                         .len();
                         entries.len().saturating_sub(visible)
@@ -92,7 +93,7 @@ pub fn StreamingToolCardListView(entries: ArcRwSignal<Vec<StreamingToolRequest>>
                         let expanded = expanded.get();
                         entries.with(|tools| {
                             visible_tool_indexes(tools.len(), expanded, |idx| {
-                                tools[idx].entry.with_untracked(is_operational_tool)
+                                tools[idx].entry.with_untracked(is_important_tool)
                             })
                             .into_iter()
                             .map(|idx| tools[idx].clone())
@@ -115,7 +116,7 @@ pub fn StreamingToolCardListView(entries: ArcRwSignal<Vec<StreamingToolRequest>>
                     move || {
                         entries.with(|tools| {
                             let visible = visible_tool_indexes(tools.len(), expanded.get(), |idx| {
-                                tools[idx].entry.with_untracked(is_operational_tool)
+                                tools[idx].entry.with_untracked(is_important_tool)
                             })
                             .len();
                             tools.len().saturating_sub(visible)
@@ -202,8 +203,11 @@ where
         .collect()
 }
 
-fn is_operational_tool(entry: &ToolRequestEntry) -> bool {
-    entry.result.as_ref().is_none_or(|result| !result.success)
+fn is_important_tool(entry: &ToolRequestEntry) -> bool {
+    matches!(
+        &entry.request.tool_type,
+        ToolRequestType::AskUserQuestion { .. }
+    ) || entry.result.as_ref().is_none_or(|result| !result.success)
 }
 
 #[component]
@@ -240,17 +244,24 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
         .as_ref()
         .map(|r| completion_header_summary(&tool_type, &r.tool_result));
 
-    // Body is reactive on tool_output_mode so the user can flip the global
-    // toggle and every card re-lays out without remounting.
+    let is_ask_user_question = matches!(tool_type, ToolRequestType::AskUserQuestion { .. });
     let body_tool_type = tool_type.clone();
     let body_result = result.as_ref().map(|r| r.tool_result.clone());
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
     let body_result_slot = StoredValue::new_local(body_result);
-    let details_open = RwSignal::new(!has_result || !result_success);
-    let default_open_for_body =
-        move || !has_result || !result_success || tool_output_mode.get() != ToolOutputMode::Summary;
-    let default_open_for_prop =
-        move || !has_result || !result_success || tool_output_mode.get() != ToolOutputMode::Summary;
+    let details_open = RwSignal::new(is_ask_user_question || !has_result || !result_success);
+    let default_open_for_body = move || {
+        is_ask_user_question
+            || !has_result
+            || !result_success
+            || tool_output_mode.get() != ToolOutputMode::Summary
+    };
+    let default_open_for_prop = move || {
+        is_ask_user_question
+            || !has_result
+            || !result_success
+            || tool_output_mode.get() != ToolOutputMode::Summary
+    };
     let render_body_when = move || default_open_for_body() || details_open.get();
 
     view! {
@@ -315,6 +326,9 @@ fn render_body(
         ToolRequestType::ReadFiles { .. } => read_files::render(req, result, mode).into_any(),
         ToolRequestType::SearchTypes { .. } => search_types::render(req, result, mode).into_any(),
         ToolRequestType::GetTypeDocs { .. } => get_type_docs::render(req, result, mode).into_any(),
+        ToolRequestType::AskUserQuestion { .. } => {
+            ask_user_question::render(req, result, mode).into_any()
+        }
         ToolRequestType::Other { .. } => other::render(req, result, mode).into_any(),
     }
 }
@@ -342,6 +356,14 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
         }
         ToolRequestType::SearchTypes { type_name, .. } => ("\u{1f50d}", Some(type_name.clone())),
         ToolRequestType::GetTypeDocs { type_path, .. } => ("\u{1f4d6}", Some(type_path.clone())),
+        ToolRequestType::AskUserQuestion { questions } => {
+            let detail = match questions.len() {
+                0 => None,
+                1 => questions[0].header.clone(),
+                n => Some(format!("{n} questions")),
+            };
+            ("\u{2753}", detail)
+        }
         ToolRequestType::Other { .. } => {
             let icon = match name {
                 n if n.contains("spawn") || n.contains("agent") => "\u{1f916}",
@@ -468,6 +490,75 @@ pub(crate) fn count_summary_lines(text: &str) -> usize {
         0
     } else {
         text.split('\n').count()
+    }
+}
+
+#[cfg(test)]
+mod tool_visibility_tests {
+    use super::*;
+    use protocol::{
+        AskUserQuestion, AskUserQuestionOption, ToolExecutionCompletedData, ToolRequest,
+    };
+    use serde_json::json;
+
+    fn completed_entry(idx: usize, tool_type: ToolRequestType) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: format!("toolu_{idx}"),
+                tool_name: match &tool_type {
+                    ToolRequestType::AskUserQuestion { .. } => "AskUserQuestion".to_owned(),
+                    _ => "OtherTool".to_owned(),
+                },
+                tool_type,
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: format!("toolu_{idx}"),
+                tool_name: "OtherTool".to_owned(),
+                tool_result: ToolExecutionResult::Other { result: json!({}) },
+                success: true,
+                error: None,
+            }),
+        }
+    }
+
+    fn completed_other_entry(idx: usize) -> ToolRequestEntry {
+        completed_entry(idx, ToolRequestType::Other { args: json!({}) })
+    }
+
+    fn completed_ask_entry(idx: usize) -> ToolRequestEntry {
+        completed_entry(
+            idx,
+            ToolRequestType::AskUserQuestion {
+                questions: vec![AskUserQuestion {
+                    id: None,
+                    question: "Which language?".to_owned(),
+                    header: Some("Language".to_owned()),
+                    options: vec![AskUserQuestionOption {
+                        label: "Rust".to_owned(),
+                        description: None,
+                    }],
+                    multi_select: false,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn collapsed_large_lists_keep_successful_ask_questions_visible() {
+        let mut entries: Vec<_> = (0..100).map(completed_other_entry).collect();
+        entries[40] = completed_ask_entry(40);
+
+        let visible =
+            visible_tool_indexes(entries.len(), false, |idx| is_important_tool(&entries[idx]));
+
+        assert!(
+            visible.contains(&40),
+            "successful AskUserQuestion should remain visible in collapsed lists"
+        );
+        assert!(
+            !visible.contains(&41),
+            "nearby successful non-important tool should stay hidden"
+        );
     }
 }
 

@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -2949,9 +2949,32 @@ pub enum ToolRequestType {
         workspace_root: String,
         type_path: String,
     },
+    AskUserQuestion {
+        questions: Vec<AskUserQuestion>,
+    },
     Other {
         args: Value,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskUserQuestion {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<AskUserQuestionOption>,
+    #[serde(default, rename = "multiSelect")]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskUserQuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

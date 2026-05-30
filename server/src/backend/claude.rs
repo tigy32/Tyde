@@ -3496,6 +3496,10 @@ fn claude_is_todo_write_tool_name(tool_name: &str) -> bool {
     normalize_tool_name(tool_name) == "todowrite"
 }
 
+fn claude_is_ask_user_question_tool_name(tool_name: &str) -> bool {
+    normalize_tool_name(tool_name) == "askuserquestion"
+}
+
 fn claude_is_user_input_tool_name(tool_name: &str) -> bool {
     matches!(
         normalize_tool_name(tool_name).as_str(),
@@ -3916,6 +3920,67 @@ fn claude_modify_preview(tool_name: &str, arguments: &Value) -> Option<ClaudeMod
     })
 }
 
+fn claude_ask_user_questions(arguments: &Value) -> Vec<protocol::AskUserQuestion> {
+    if let Some(questions) = arguments.get("questions").and_then(Value::as_array) {
+        return questions
+            .iter()
+            .map(claude_ask_user_question_from_value)
+            .collect();
+    }
+
+    if arguments
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        return vec![claude_ask_user_question_from_value(arguments)];
+    }
+
+    Vec::new()
+}
+
+fn claude_ask_user_question_from_value(value: &Value) -> protocol::AskUserQuestion {
+    protocol::AskUserQuestion {
+        id: claude_argument_string(value, &["id"]),
+        question: claude_argument_string(value, &["question", "prompt"]).unwrap_or_default(),
+        header: claude_argument_string(value, &["header", "title"]),
+        options: claude_ask_user_question_options(value),
+        multi_select: claude_argument_bool(value, &["multiSelect", "multi_select"])
+            .unwrap_or(false),
+    }
+}
+
+fn claude_ask_user_question_options(value: &Value) -> Vec<protocol::AskUserQuestionOption> {
+    let Some(options) = value.get("options").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    options
+        .iter()
+        .map(|option| {
+            if let Some(label) = option.as_str().and_then(normalize_nonempty) {
+                return protocol::AskUserQuestionOption {
+                    label,
+                    description: None,
+                };
+            }
+
+            protocol::AskUserQuestionOption {
+                label: claude_argument_string(option, &["label", "value"]).unwrap_or_default(),
+                description: claude_argument_string(option, &["description"]),
+            }
+        })
+        .collect()
+}
+
+fn claude_argument_bool(arguments: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(value) = arguments.get(*key).and_then(Value::as_bool) {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
     if let Some(preview) = claude_modify_preview(tool_name, arguments) {
         return json!({
@@ -3950,6 +4015,13 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
         return json!({
             "kind": "ReadFiles",
             "file_paths": claude_argument_file_paths(arguments),
+        });
+    }
+
+    if claude_is_ask_user_question_tool_name(tool_name) {
+        return json!({
+            "kind": "AskUserQuestion",
+            "questions": claude_ask_user_questions(arguments),
         });
     }
 
@@ -8197,6 +8269,64 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_request_type_maps_ask_user_question() {
+        let request = claude_tool_request_type(
+            "AskUserQuestion",
+            &json!({
+                "questions": [{
+                    "id": "language",
+                    "question": "Which language?",
+                    "header": "Language",
+                    "options": [
+                        { "label": "Rust", "description": "Systems lang" },
+                        { "label": "Python", "description": "Scripting lang" }
+                    ],
+                    "multiSelect": false
+                }]
+            }),
+        );
+
+        let parsed: protocol::ToolRequestType =
+            serde_json::from_value(request).expect("typed AskUserQuestion request");
+        let protocol::ToolRequestType::AskUserQuestion { questions } = parsed else {
+            panic!("expected AskUserQuestion request");
+        };
+        assert_eq!(questions.len(), 1);
+        let question = &questions[0];
+        assert_eq!(question.id.as_deref(), Some("language"));
+        assert_eq!(question.question, "Which language?");
+        assert_eq!(question.header.as_deref(), Some("Language"));
+        assert!(!question.multi_select);
+        assert_eq!(question.options.len(), 2);
+        assert_eq!(question.options[0].label, "Rust");
+        assert_eq!(
+            question.options[0].description.as_deref(),
+            Some("Systems lang")
+        );
+    }
+
+    #[test]
+    fn claude_tool_request_type_maps_top_level_prompt_ask_user_question() {
+        let request = claude_tool_request_type(
+            "AskUserQuestion",
+            &json!({
+                "prompt": "Continue?"
+            }),
+        );
+
+        let parsed: protocol::ToolRequestType =
+            serde_json::from_value(request).expect("typed AskUserQuestion request");
+        let protocol::ToolRequestType::AskUserQuestion { questions } = parsed else {
+            panic!("expected AskUserQuestion request");
+        };
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].question, "Continue?");
+        assert_eq!(questions[0].header, None);
+        assert!(questions[0].options.is_empty());
+        assert!(!questions[0].multi_select);
+    }
+
+    #[test]
     fn extract_tool_result_events_maps_modify_file_result() {
         let message = json!({
             "content": [
@@ -8797,6 +8927,33 @@ mod tests {
             kinds.contains(&"ToolExecutionCompleted"),
             "expected ToolExecutionCompleted in events, got: {kinds:?}"
         );
+
+        let request = events
+            .iter()
+            .find(|ev| event_kind(ev) == Some("ToolRequest"))
+            .expect("ToolRequest should be present");
+        assert_eq!(
+            request
+                .pointer("/data/tool_type/kind")
+                .and_then(Value::as_str),
+            Some("AskUserQuestion")
+        );
+        let parsed_request: protocol::ToolRequest =
+            serde_json::from_value(request["data"].clone()).expect("typed ToolRequest");
+        let protocol::ToolRequestType::AskUserQuestion { questions } = parsed_request.tool_type
+        else {
+            panic!("expected AskUserQuestion tool type");
+        };
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].question, "Which language?");
+        assert_eq!(questions[0].header.as_deref(), Some("Language"));
+        assert_eq!(questions[0].options.len(), 2);
+        assert_eq!(questions[0].options[0].label, "Rust");
+        assert_eq!(
+            questions[0].options[0].description.as_deref(),
+            Some("Systems lang")
+        );
+        assert!(!questions[0].multi_select);
 
         // ToolExecutionCompleted should be success (overridden from is_error)
         let completion = events

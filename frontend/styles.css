@@ -2641,6 +2641,116 @@ kbd {
     border-top: 1px solid var(--border-primary);
 }
 
+.ask-question-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.ask-question {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.ask-question-header {
+    font-size: 0.846rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.ask-question-text {
+    color: var(--text-primary);
+}
+
+.ask-question-options {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.ask-question-options.multi {
+    gap: var(--space-2);
+}
+
+.ask-question-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 5px;
+    background: var(--surface-1);
+    color: var(--text-primary);
+    cursor: pointer;
+    text-align: left;
+}
+
+.ask-question-option:hover {
+    border-color: var(--accent-primary);
+    background: var(--surface-hover);
+}
+
+.ask-question-option.selected {
+    border-color: var(--accent-primary);
+    background: var(--accent-subtle);
+    box-shadow: inset 3px 0 0 var(--accent-primary);
+}
+
+.ask-question-option-label {
+    font-weight: 600;
+}
+
+.ask-question-option-desc {
+    color: var(--text-tertiary);
+    font-size: 0.846rem;
+}
+
+.ask-question-custom {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 5px;
+    background: var(--surface-base);
+    color: var(--text-primary);
+}
+
+.ask-question-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.ask-question-submit {
+    padding: 5px 10px;
+    border: 1px solid var(--accent-primary);
+    border-radius: 5px;
+    background: var(--accent-subtle);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.ask-question-submit:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
+.ask-question-sent-note,
+.ask-question-error-note {
+    font-size: 0.846rem;
+}
+
+.ask-question-sent-note {
+    color: var(--success);
+}
+
+.ask-question-error-note {
+    color: var(--error);
+}
+
 .tool-request-detail {
     font-size: 0.923rem;
     color: var(--text-secondary);

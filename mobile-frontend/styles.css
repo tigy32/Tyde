@@ -1322,6 +1322,104 @@ input, textarea, select {
     word-break: break-all;
 }
 
+.ask-question-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+}
+
+.ask-question {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.ask-question-header {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.ask-question-text {
+    color: var(--text-primary);
+}
+
+.ask-question-options {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.ask-question-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: var(--space-2);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    text-align: left;
+}
+
+.ask-question-option.selected {
+    border-color: var(--accent-primary);
+    background: var(--bg-active);
+    box-shadow: inset 3px 0 0 var(--accent-primary);
+}
+
+.ask-question-option-label {
+    font-weight: 600;
+}
+
+.ask-question-option-desc {
+    color: var(--text-tertiary);
+    font-size: 12px;
+}
+
+.ask-question-custom {
+    width: 100%;
+    padding: var(--space-2);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+}
+
+.ask-question-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.ask-question-submit {
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background: var(--accent-primary);
+    color: var(--text-bright);
+}
+
+.ask-question-submit:disabled {
+    opacity: 0.55;
+}
+
+.ask-question-sent-note,
+.ask-question-error-note {
+    font-size: 12px;
+}
+
+.ask-question-sent-note {
+    color: var(--accent-success);
+}
+
+.ask-question-error-note {
+    color: var(--accent-error);
+}
+
 /* ── Task List ──────────────────────────────────────────────────────── */
 
 .task-list-card {

@@ -1,112 +1,29 @@
+//! Interactive renderer for Claude's typed `AskUserQuestion` tool call.
+//!
+//! Claude emits `AskUserQuestion` to ask the user one or more multiple-choice
+//! questions (single- or multi-select), each with an optional free-text answer.
+//! Rather than dumping the raw JSON, this card renders the questions as
+//! selectable options plus a custom-text field and a Submit button.
+//!
+//! MVP answer flow: submitting composes the chosen answers into a plain message
+//! and sends it through the normal `SendMessage` path, resuming Claude on the
+//! next turn. There is no live stdin channel.
+
+use std::sync::Arc;
+
 use leptos::prelude::*;
+use protocol::{
+    AskUserQuestion, FrameKind, SendMessagePayload, StreamPath, ToolExecutionResult,
+    ToolRequestType,
+};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::state::{AppState, ToolOutputMode, ToolRequestEntry};
+use crate::send::send_frame;
+use crate::state::{AppState, ToolOutputMode};
 
-use protocol::{AskUserQuestion, FrameKind, SendMessagePayload, StreamPath, ToolRequestType};
-
-/// Renders a single tool request inside an assistant message.
-///
-/// Carries semantic state through the `data-mobile-test` selector
-/// (`tool-card-running`, `tool-card-success`, `tool-card-failed`) so
-/// tests don't need to guess at color or icon. Failed and running
-/// cards always reveal their output detail; successful cards honor
-/// the global `ToolOutputMode`.
-///
-/// Claude's typed `AskUserQuestion` tool is special-cased: instead of the raw
-/// result it renders an interactive question card whose answer is sent back
-/// through the normal `SendMessage` path (see [`AskUserQuestionCard`]).
-#[component]
-pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let tool_output_mode = state.tool_output_mode;
-
-    let tool_name = entry.request.tool_name.clone();
-
-    if let ToolRequestType::AskUserQuestion { questions } = &entry.request.tool_type
-        && entry.result.as_ref().is_none_or(|result| result.success)
-    {
-        let questions = questions.clone();
-        return view! {
-            <div class="tool-card ask-question" data-mobile-test="tool-card-ask-question">
-                <div class="tool-card-header">
-                    <span class="tool-name">{tool_name}</span>
-                </div>
-                <AskUserQuestionCard questions=questions />
-            </div>
-        }
-        .into_any();
-    }
-
-    let is_completed = entry.result.is_some();
-    let success = entry.result.as_ref().map(|r| r.success).unwrap_or(false);
-    let result_summary = entry
-        .result
-        .as_ref()
-        .map(|r| format!("{:?}", r.tool_result))
-        .unwrap_or_default();
-
-    let (status_class, status_icon, status_test, aria_label) = if is_completed {
-        if success {
-            (
-                "completed success",
-                "\u{2713}",
-                "tool-card-success",
-                "Tool completed successfully",
-            )
-        } else {
-            (
-                "completed failed",
-                "\u{2717}",
-                "tool-card-failed",
-                "Tool failed",
-            )
-        }
-    } else {
-        (
-            "running",
-            "\u{25D4}",
-            "tool-card-running",
-            "Tool is running",
-        )
-    };
-
-    // Failed/running cards always show their detail; otherwise honor the mode.
-    let force_show = !is_completed || !success;
-
-    view! {
-        <div class=format!("tool-card {status_class}") data-mobile-test=status_test aria-label=aria_label>
-            <div class="tool-card-header">
-                <span class="tool-status-icon" aria-hidden="true">{status_icon}</span>
-                <span class="tool-name">{tool_name}</span>
-            </div>
-            {
-                let rs = result_summary.clone();
-                let rs2 = result_summary.clone();
-                let show = move || {
-                    !rs.is_empty()
-                        && (force_show || tool_output_mode.get() != ToolOutputMode::Summary)
-                };
-                view! {
-                    <Show when=show>
-                        <details class="tool-result" data-mobile-test="tool-card-result" prop:open=move || tool_output_mode.get() == ToolOutputMode::Full>
-                            <summary>"Result"</summary>
-                            <pre class="tool-output">{rs2.clone()}</pre>
-                        </details>
-                    </Show>
-                }
-            }
-        </div>
-    }
-    .into_any()
-}
-
-// ── AskUserQuestion ─────────────────────────────────────────────────────
-//
-// Mirrors the desktop `tool_card::ask_user_question` renderer. The two
-// frontends are separate crates with separate component trees, so the small
-// view-model / format helpers are duplicated rather than shared.
-
+/// Compose the chosen answers into the message sent back to the agent. One line
+/// per answered question: `"{header}: {answers}"`, answers comma-joined.
+/// Pure function so the message format is unit-tested without a DOM.
 fn format_answer(questions: &[AskUserQuestion], responses: &[(Vec<usize>, String)]) -> String {
     let mut lines = Vec::new();
     for (q, (selected, custom)) in questions.iter().zip(responses) {
@@ -132,6 +49,18 @@ fn format_answer(questions: &[AskUserQuestion], responses: &[(Vec<usize>, String
     lines.join("\n")
 }
 
+pub(crate) fn render(
+    req: &ToolRequestType,
+    _result: Option<&ToolExecutionResult>,
+    _mode: ToolOutputMode,
+) -> AnyView {
+    let ToolRequestType::AskUserQuestion { questions } = req else {
+        unreachable!("ask_user_question::render dispatched on non-AskUserQuestion request");
+    };
+
+    view! { <AskUserQuestionCard questions=questions.clone() /> }.into_any()
+}
+
 #[derive(Clone, Copy)]
 struct QuestionState {
     selected: RwSignal<Vec<usize>>,
@@ -142,8 +71,8 @@ struct QuestionState {
 fn AskUserQuestionCard(questions: Vec<AskUserQuestion>) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let questions = std::sync::Arc::new(questions);
-    let states: std::sync::Arc<Vec<QuestionState>> = std::sync::Arc::new(
+    let questions = Arc::new(questions);
+    let states: Arc<Vec<QuestionState>> = Arc::new(
         questions
             .iter()
             .map(|_| QuestionState {
@@ -205,12 +134,11 @@ fn AskUserQuestionCard(questions: Vec<AskUserQuestion>) -> impl IntoView {
     };
 
     view! {
-        <div class="ask-question-body" data-mobile-test="ask-question-body">
+        <div class="ask-question-card">
             {question_views}
             <div class="ask-question-actions">
                 <button
                     class="ask-question-submit"
-                    data-mobile-test="ask-question-submit"
                     prop:disabled=submit_disabled
                     on:click=on_submit
                 >
@@ -225,12 +153,12 @@ fn AskUserQuestionCard(questions: Vec<AskUserQuestion>) -> impl IntoView {
                     }}
                 </button>
                 <Show when=move || submitted.get()>
-                    <span class="ask-question-sent-note" data-mobile-test="ask-question-sent" role="status">
+                    <span class="ask-question-sent-note" role="status">
                         "Sent — Claude will continue on the next turn."
                     </span>
                 </Show>
                 <Show when=move || send_error.get().is_some()>
-                    <span class="ask-question-error-note" data-mobile-test="ask-question-error" role="alert">
+                    <span class="ask-question-error-note" role="alert">
                         {move || send_error.get().unwrap_or_default()}
                     </span>
                 </Show>
@@ -290,7 +218,6 @@ fn render_question(
             view! {
                 <button
                     class="ask-question-option"
-                    data-mobile-test="ask-question-option"
                     class:selected=is_selected
                     prop:disabled=move || submitted.get() || sending.get()
                     aria-pressed=move || if is_selected() { "true" } else { "false" }
@@ -306,7 +233,7 @@ fn render_question(
         .collect::<Vec<_>>();
 
     let custom = qstate.custom;
-    let on_custom_input = move |ev: web_sys::Event| {
+    let on_custom_input = move |ev: leptos::ev::Event| {
         if submitted.get_untracked() || sending.get_untracked() {
             return;
         }
@@ -314,7 +241,7 @@ fn render_question(
     };
 
     view! {
-        <div class="ask-question" data-mobile-test="ask-question">
+        <div class="ask-question">
             {(!header.is_empty()).then(|| view! {
                 <div class="ask-question-header">{header}</div>
             })}
@@ -324,7 +251,6 @@ fn render_question(
             </div>
             <input
                 class="ask-question-custom"
-                data-mobile-test="ask-question-custom"
                 r#type="text"
                 placeholder="Or type your own answer"
                 prop:disabled=move || submitted.get() || sending.get()
@@ -335,28 +261,24 @@ fn render_question(
     .into_any()
 }
 
-fn answer_target(
-    state: &AppState,
-) -> Result<(crate::state::LocalHostId, StreamPath), &'static str> {
+fn answer_target(state: &AppState) -> Result<(String, StreamPath), &'static str> {
     let Some(active) = state.active_agent.get_untracked() else {
         log::error!("ask_user_question: no active agent to answer");
         return Err("No active agent is available. Reopen the chat and try again.");
     };
-    let stream = state.agents.with_untracked(|agents| {
-        agents.iter().find_map(|a| {
-            (a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
-                .then(|| a.instance_stream.clone())
-        })
+    let stream = state.agents.get_untracked().iter().find_map(|a| {
+        (a.host_id == active.host_id && a.agent_id == active.agent_id)
+            .then(|| a.instance_stream.clone())
     });
     let Some(stream) = stream else {
         log::error!("ask_user_question: active agent has no instance stream");
         return Err("The active agent stream is not available yet. Try again after reconnecting.");
     };
-    Ok((active.local_host_id, stream))
+    Ok((active.host_id, stream))
 }
 
 fn send_answer(
-    host_id: crate::state::LocalHostId,
+    host_id: String,
     stream: StreamPath,
     message: String,
     submitted: RwSignal<bool>,
@@ -369,7 +291,7 @@ fn send_answer(
             images: None,
             origin: None,
         };
-        match crate::send::send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
+        match send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
             Ok(()) => {
                 submitted.set(true);
                 send_error.set(None);
@@ -388,72 +310,115 @@ mod tests {
     use super::*;
     use protocol::AskUserQuestionOption;
 
-    fn question() -> AskUserQuestion {
+    fn opt(label: &str) -> AskUserQuestionOption {
+        AskUserQuestionOption {
+            label: label.to_owned(),
+            description: None,
+        }
+    }
+
+    fn question(
+        header: Option<&str>,
+        prompt: &str,
+        labels: &[&str],
+        multi: bool,
+    ) -> AskUserQuestion {
         AskUserQuestion {
             id: None,
-            question: "Which language?".to_owned(),
-            header: Some("Language".to_owned()),
-            options: vec![
-                AskUserQuestionOption {
-                    label: "Rust".to_owned(),
-                    description: None,
-                },
-                AskUserQuestionOption {
-                    label: "Python".to_owned(),
-                    description: None,
-                },
-            ],
-            multi_select: true,
+            question: prompt.to_owned(),
+            header: header.map(str::to_owned),
+            options: labels.iter().map(|l| opt(l)).collect(),
+            multi_select: multi,
         }
     }
 
     #[test]
-    fn format_answer_joins_selected_and_custom() {
-        let qs = vec![question()];
-        let responses = vec![(vec![0usize, 1usize], "Go".to_owned())];
-        assert_eq!(format_answer(&qs, &responses), "Language: Rust, Python, Go");
+    fn format_answer_single_select_uses_header() {
+        let qs = vec![question(
+            Some("Language"),
+            "Which language?",
+            &["Rust", "Python"],
+            false,
+        )];
+        let responses = vec![(vec![0usize], String::new())];
+        assert_eq!(format_answer(&qs, &responses), "Language: Rust");
+    }
+
+    #[test]
+    fn format_answer_multi_select_joins_with_comma() {
+        let qs = vec![question(
+            Some("Language"),
+            "Which?",
+            &["Rust", "Python"],
+            true,
+        )];
+        let responses = vec![(vec![0usize, 1usize], String::new())];
+        assert_eq!(format_answer(&qs, &responses), "Language: Rust, Python");
+    }
+
+    #[test]
+    fn format_answer_appends_custom_text() {
+        let qs = vec![question(Some("Language"), "Which?", &["Rust"], false)];
+        let responses = vec![(vec![0usize], "  Go  ".to_owned())];
+        assert_eq!(format_answer(&qs, &responses), "Language: Rust, Go");
+    }
+
+    #[test]
+    fn format_answer_custom_only() {
+        let qs = vec![question(Some("Language"), "Which?", &["Rust"], false)];
+        let responses = vec![(vec![], "Zig".to_owned())];
+        assert_eq!(format_answer(&qs, &responses), "Language: Zig");
     }
 
     #[test]
     fn format_answer_falls_back_to_question_without_header() {
-        let mut q = question();
-        q.header = None;
+        let qs = vec![question(None, "Which language?", &["Rust"], false)];
         let responses = vec![(vec![0usize], String::new())];
-        assert_eq!(format_answer(&[q], &responses), "Which language?: Rust");
+        assert_eq!(format_answer(&qs, &responses), "Which language?: Rust");
+    }
+
+    #[test]
+    fn format_answer_multiple_questions_one_line_each() {
+        let qs = vec![
+            question(Some("Language"), "Lang?", &["Rust"], false),
+            question(Some("Framework"), "Framework?", &["Leptos", "Axum"], true),
+        ];
+        let responses = vec![
+            (vec![0usize], String::new()),
+            (vec![0usize, 1usize], String::new()),
+        ];
+        assert_eq!(
+            format_answer(&qs, &responses),
+            "Language: Rust\nFramework: Leptos, Axum"
+        );
+    }
+
+    #[test]
+    fn format_answer_skips_unanswered_questions() {
+        let qs = vec![
+            question(Some("Language"), "Lang?", &["Rust"], false),
+            question(Some("Framework"), "Framework?", &["Leptos"], false),
+        ];
+        let responses = vec![(vec![0usize], String::new()), (vec![], String::new())];
+        assert_eq!(format_answer(&qs, &responses), "Language: Rust");
     }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{ActiveAgentRef, AgentInfo, AppState, LocalHostId, ToolRequestEntry};
+    use crate::components::tool_card::{ToolCardView, test_utils::*};
+    use crate::state::{ActiveAgentRef, AgentInfo, AppState, TabContent, ToolRequestEntry};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, AskUserQuestion, AskUserQuestionOption, BackendKind, StreamPath,
-        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+        AgentId, AgentOrigin, AskUserQuestionOption, BackendKind, StreamPath,
+        ToolExecutionCompletedData, ToolRequest,
     };
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_test::*;
-    use web_sys::{HtmlButtonElement, HtmlElement, HtmlInputElement};
+    use web_sys::{HtmlButtonElement, HtmlDetailsElement, HtmlElement, HtmlInputElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
-
-    fn make_container() -> HtmlElement {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let container = document.create_element("div").unwrap();
-        document.body().unwrap().append_child(&container).unwrap();
-        container.dyn_into::<HtmlElement>().unwrap()
-    }
-
-    async fn next_tick() {
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
-                .unwrap();
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-    }
 
     fn opt(label: &str, desc: &str) -> AskUserQuestionOption {
         AskUserQuestionOption {
@@ -462,35 +427,42 @@ mod wasm_tests {
         }
     }
 
-    fn ask_entry(multi_select: bool) -> ToolRequestEntry {
-        ToolRequestEntry {
-            request: ToolRequest {
-                tool_call_id: "toolu_ask".to_owned(),
-                tool_name: "AskUserQuestion".to_owned(),
-                tool_type: ToolRequestType::AskUserQuestion {
-                    questions: vec![AskUserQuestion {
-                        id: None,
-                        question: "Which language?".to_owned(),
-                        header: Some("Language".to_owned()),
-                        options: vec![
-                            opt("Rust", "Systems lang"),
-                            opt("Python", "Scripting lang"),
-                            opt("Go", ""),
-                        ],
-                        multi_select,
-                    }],
-                },
-            },
-            result: None,
+    fn single_select_req() -> ToolRequestType {
+        ToolRequestType::AskUserQuestion {
+            questions: vec![AskUserQuestion {
+                id: None,
+                question: "Which language?".to_owned(),
+                header: Some("Language".to_owned()),
+                options: vec![opt("Rust", "Systems lang"), opt("Python", "Scripting lang")],
+                multi_select: false,
+            }],
         }
     }
 
-    fn mount_card(entry: ToolRequestEntry) -> HtmlElement {
-        mount_card_with_setup(entry, |_| {})
+    fn multi_select_req() -> ToolRequestType {
+        ToolRequestType::AskUserQuestion {
+            questions: vec![AskUserQuestion {
+                id: None,
+                question: "Which frameworks?".to_owned(),
+                header: Some("Frameworks".to_owned()),
+                options: vec![opt("Leptos", ""), opt("Axum", ""), opt("Tauri", "")],
+                multi_select: true,
+            }],
+        }
     }
 
-    fn mount_card_with_setup<S>(entry: ToolRequestEntry, setup: S) -> HtmlElement
+    /// Mount a renderer fn with an `AppState` in context so the card can read
+    /// the active agent on submit.
+    fn mount_with_state<F>(view_fn: F) -> HtmlElement
     where
+        F: FnOnce() -> AnyView + 'static,
+    {
+        mount_with_state_setup(|_| {}, view_fn)
+    }
+
+    fn mount_with_state_setup<F, S>(setup: S, view_fn: F) -> HtmlElement
+    where
+        F: FnOnce() -> AnyView + 'static,
         S: FnOnce(&AppState) + 'static,
     {
         let container = make_container();
@@ -498,23 +470,19 @@ mod wasm_tests {
             let state = AppState::new();
             setup(&state);
             provide_context(state);
-            view! { <ToolCardView entry=entry.clone() /> }
+            view_fn()
         });
         handle.forget();
         container
     }
 
     fn configure_active_agent(state: &AppState) {
-        let local_host_id = LocalHostId("host-1".to_owned());
+        let host_id = "host-1".to_owned();
         let agent_id = AgentId("agent-1".to_owned());
-        state.active_agent.set(Some(ActiveAgentRef {
-            local_host_id: local_host_id.clone(),
-            agent_id: agent_id.clone(),
-        }));
         state.agents.update(|agents| {
             agents.push(AgentInfo {
-                local_host_id,
-                agent_id,
+                host_id: host_id.clone(),
+                agent_id: agent_id.clone(),
                 name: "Claude".to_owned(),
                 origin: AgentOrigin::User,
                 backend_kind: BackendKind::Claude,
@@ -528,6 +496,11 @@ mod wasm_tests {
                 fatal_error: None,
             });
         });
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef { host_id, agent_id }),
+            "Claude".to_owned(),
+            true,
+        );
     }
 
     fn install_deferred_send_stub() -> js_sys::Array {
@@ -592,7 +565,7 @@ mod wasm_tests {
 
     fn option_buttons(container: &HtmlElement) -> Vec<HtmlButtonElement> {
         let nodes = container
-            .query_selector_all("[data-mobile-test='ask-question-option']")
+            .query_selector_all(".ask-question-option")
             .unwrap();
         (0..nodes.length())
             .filter_map(|i| nodes.get(i))
@@ -602,7 +575,7 @@ mod wasm_tests {
 
     fn submit_button(container: &HtmlElement) -> HtmlButtonElement {
         container
-            .query_selector("[data-mobile-test='ask-question-submit']")
+            .query_selector(".ask-question-submit")
             .unwrap()
             .expect("submit button")
             .dyn_into::<HtmlButtonElement>()
@@ -611,7 +584,7 @@ mod wasm_tests {
 
     fn custom_input(container: &HtmlElement) -> HtmlInputElement {
         container
-            .query_selector("[data-mobile-test='ask-question-custom']")
+            .query_selector(".ask-question-custom")
             .unwrap()
             .expect("custom input")
             .dyn_into::<HtmlInputElement>()
@@ -637,114 +610,105 @@ mod wasm_tests {
 
     fn has_sent_note(container: &HtmlElement) -> bool {
         container
-            .query_selector("[data-mobile-test='ask-question-sent']")
+            .query_selector(".ask-question-sent-note")
             .unwrap()
             .is_some()
     }
 
     fn error_note_text(container: &HtmlElement) -> String {
         container
-            .query_selector("[data-mobile-test='ask-question-error']")
+            .query_selector(".ask-question-error-note")
             .unwrap()
             .and_then(|el| el.text_content())
             .unwrap_or_default()
     }
 
     #[wasm_bindgen_test]
-    async fn renders_interactive_card_instead_of_raw_result() {
-        let container = mount_card(ask_entry(false));
+    async fn renders_question_text_and_all_options() {
+        let req = single_select_req();
+        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
         next_tick().await;
 
-        let body = container.text_content().unwrap_or_default();
-        assert!(body.contains("Which language?"), "question: {body}");
-        assert!(body.contains("Rust") && body.contains("Python") && body.contains("Go"));
-        assert_eq!(option_buttons(&container).len(), 3);
-        assert!(
-            container
-                .query_selector("[data-mobile-test='tool-card-result']")
-                .unwrap()
-                .is_none(),
-            "should not render the generic result block"
-        );
+        let body = text(&container);
+        assert!(body.contains("Which language?"), "question text: {body}");
+        assert!(body.contains("Rust"), "option Rust: {body}");
+        assert!(body.contains("Python"), "option Python: {body}");
+        assert_eq!(option_buttons(&container).len(), 2);
     }
 
     #[wasm_bindgen_test]
-    async fn successful_ask_user_question_still_renders_interactive_card() {
-        let mut entry = ask_entry(false);
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_ask".to_owned(),
-            tool_name: "AskUserQuestion".to_owned(),
-            tool_result: ToolExecutionResult::Other {
-                result: serde_json::json!({}),
+    async fn completed_tool_card_stays_open_for_answering() {
+        let entry = ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_type: single_select_req(),
             },
-            success: true,
-            error: None,
-        });
-        let container = mount_card(entry);
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_result: ToolExecutionResult::Other {
+                    result: serde_json::json!({}),
+                },
+                success: true,
+                error: None,
+            }),
+        };
+        let container = mount_with_state(move || view! { <ToolCardView entry=entry /> }.into_any());
         next_tick().await;
 
-        assert!(
-            container
-                .query_selector("[data-mobile-test='tool-card-ask-question']")
-                .unwrap()
-                .is_some(),
-            "successful AskUserQuestion should remain interactive"
-        );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='ask-question-body']")
-                .unwrap()
-                .is_some(),
-            "interactive body should be visible"
-        );
+        let details = container
+            .query_selector("details.tool-card")
+            .unwrap()
+            .expect("tool card details")
+            .dyn_into::<HtmlDetailsElement>()
+            .unwrap();
+        assert!(details.open(), "completed question card should stay open");
+        assert!(text(&container).contains("Which language?"));
     }
 
     #[wasm_bindgen_test]
-    async fn failed_ask_user_question_renders_error_completion() {
-        let mut entry = ask_entry(false);
-        entry.result = Some(ToolExecutionCompletedData {
-            tool_call_id: "toolu_ask".to_owned(),
-            tool_name: "AskUserQuestion".to_owned(),
-            tool_result: ToolExecutionResult::Error {
-                short_message: "ask failed".to_owned(),
-                detailed_message: "AskUserQuestion failed".to_owned(),
-            },
-            success: false,
-            error: Some("ask failed".to_owned()),
-        });
-        let container = mount_card(entry);
+    async fn submit_disabled_until_an_option_is_chosen() {
+        let req = single_select_req();
+        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         assert!(
-            container
-                .query_selector("[data-mobile-test='tool-card-failed']")
-                .unwrap()
-                .is_some(),
-            "failed AskUserQuestion should render the failed completion card"
+            submit_button(&container).disabled(),
+            "disabled before choice"
         );
-        assert!(
-            container
-                .query_selector("[data-mobile-test='ask-question-body']")
-                .unwrap()
-                .is_none(),
-            "failed AskUserQuestion should not render the interactive body"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    async fn submit_enables_after_selection() {
-        let container = mount_card(ask_entry(false));
-        next_tick().await;
-        assert!(submit_button(&container).disabled());
 
         option_buttons(&container)[0].click();
         next_tick().await;
-        assert!(!submit_button(&container).disabled());
+
+        assert!(
+            !submit_button(&container).disabled(),
+            "enabled after choice"
+        );
     }
 
     #[wasm_bindgen_test]
-    async fn multi_select_allows_multiple() {
-        let container = mount_card(ask_entry(true));
+    async fn single_select_replaces_previous_choice() {
+        let req = single_select_req();
+        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
+        next_tick().await;
+
+        let buttons = option_buttons(&container);
+        buttons[0].click();
+        next_tick().await;
+        assert!(is_pressed(&buttons[0]));
+        assert!(!is_pressed(&buttons[1]));
+
+        buttons[1].click();
+        next_tick().await;
+        assert!(!is_pressed(&buttons[0]), "first deselected");
+        assert!(is_pressed(&buttons[1]), "second selected");
+    }
+
+    #[wasm_bindgen_test]
+    async fn multi_select_keeps_multiple_choices() {
+        let req = multi_select_req();
+        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         let buttons = option_buttons(&container);
@@ -754,43 +718,18 @@ mod wasm_tests {
         assert!(is_pressed(&buttons[0]));
         assert!(!is_pressed(&buttons[1]));
         assert!(is_pressed(&buttons[2]));
-    }
 
-    #[wasm_bindgen_test]
-    async fn submit_waits_for_successful_send_before_showing_sent() {
-        let calls = install_deferred_send_stub();
-        let container = mount_card_with_setup(ask_entry(false), configure_active_agent);
+        // Clicking an already-selected option toggles it off.
+        buttons[0].click();
         next_tick().await;
-
-        option_buttons(&container)[0].click();
-        next_tick().await;
-        submit_button(&container).click();
-        next_tick().await;
-
-        assert_eq!(calls.length(), 1, "send_frame should be invoked once");
-        assert!(
-            submit_button(&container).disabled(),
-            "disabled while sending"
-        );
-        assert_answer_controls_disabled(&container);
-        assert!(
-            !has_sent_note(&container),
-            "not marked sent before send resolves"
-        );
-
-        resolve_deferred_send();
-        next_tick().await;
-
-        assert!(
-            has_sent_note(&container),
-            "sent note appears after send resolves"
-        );
-        assert_answer_controls_disabled(&container);
+        assert!(!is_pressed(&buttons[0]));
+        assert!(is_pressed(&buttons[2]));
     }
 
     #[wasm_bindgen_test]
     async fn submit_without_active_agent_shows_retryable_error() {
-        let container = mount_card(ask_entry(false));
+        let req = single_select_req();
+        let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));
         next_tick().await;
 
         option_buttons(&container)[0].click();
@@ -810,9 +749,49 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn submit_waits_for_successful_send_before_showing_sent() {
+        let calls = install_deferred_send_stub();
+        let req = single_select_req();
+        let container = mount_with_state_setup(configure_active_agent, move || {
+            render(&req, None, ToolOutputMode::Summary)
+        });
+        next_tick().await;
+
+        option_buttons(&container)[0].click();
+        next_tick().await;
+        submit_button(&container).click();
+        next_tick().await;
+
+        assert_eq!(calls.length(), 1, "send_frame should be invoked once");
+        assert!(
+            submit_button(&container).disabled(),
+            "disabled while sending"
+        );
+        assert_answer_controls_disabled(&container);
+        assert!(text(&container).contains("Sending..."));
+        assert!(
+            !has_sent_note(&container),
+            "not marked sent before send resolves"
+        );
+
+        resolve_deferred_send();
+        next_tick().await;
+
+        assert!(
+            has_sent_note(&container),
+            "sent note appears after send resolves"
+        );
+        assert!(text(&container).contains("Answer sent"));
+        assert_answer_controls_disabled(&container);
+    }
+
+    #[wasm_bindgen_test]
     async fn send_failure_leaves_answer_retryable() {
         install_failing_send_stub();
-        let container = mount_card_with_setup(ask_entry(false), configure_active_agent);
+        let req = single_select_req();
+        let container = mount_with_state_setup(configure_active_agent, move || {
+            render(&req, None, ToolOutputMode::Summary)
+        });
         next_tick().await;
 
         option_buttons(&container)[0].click();

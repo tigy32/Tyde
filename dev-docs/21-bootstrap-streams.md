@@ -1,6 +1,6 @@
 # Bootstrap Streams
 
-Protocol version 5 retains the typed bootstrap frames introduced in protocol
+Protocol version 6 retains the typed bootstrap frames introduced in protocol
 version 4. `welcome` only accepts the handshake; it no longer carries bootstrap
 data.
 

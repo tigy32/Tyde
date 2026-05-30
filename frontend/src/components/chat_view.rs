@@ -310,6 +310,10 @@ pub fn ChatView(
         let listener_pending = std::rc::Rc::new(std::cell::Cell::new(false));
         let listener_mounted = view_mounted_for_listeners.clone();
         let scroll_handler = Closure::<dyn Fn()>::new(move || {
+            let scroll_top = el_clone.scroll_top() as f64;
+            if (scroll_top_sig.get_untracked() - scroll_top).abs() >= 1.0 {
+                scroll_top_sig.set(scroll_top);
+            }
             if listener_pending.get() {
                 return;
             }
