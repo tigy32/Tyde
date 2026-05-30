@@ -1613,6 +1613,7 @@ impl KiroInner {
         self.emitter
             .assistant_message(crate::backend::turn_emitter::AssistantMessagePayload {
                 agent: AgentName(KIRO_AGENT_NAME),
+                message_id: None,
                 content: text,
                 reasoning: None,
                 tool_calls: Vec::new(),
@@ -3616,6 +3617,7 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
                 .map(|s| s.to_string());
             Some(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
+                    message_id: None,
                     timestamp: msg
                         .get("timestamp")
                         .and_then(Value::as_u64)

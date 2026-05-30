@@ -31,7 +31,7 @@ Key principles:
 ### Relation to old Tyde protocol
 
 Carry forward (minimal subset):
-- A trimmed `ChatEvent` enum with 11 core variants and their data types
+- A trimmed `ChatEvent` enum with 12 core variants and their data types
   (`ChatMessage`, `TypingStatusChanged`, `StreamStartData`,
   `StreamTextDeltaData`, `StreamEndData`, `ToolRequest`,
   `ToolExecutionCompletedData`, etc.)
@@ -86,8 +86,15 @@ When a new frontend subscribes to an existing agent, the server replays a
 semantic history on the new instance stream, then continues streaming live
 events. Live subscribers receive granular streaming events as they happen, but
 completed streams are stored for replay as `MessageAdded` plus any tool
-events. If a subscriber joins while a stream is active, the replay includes the
-completed semantic history, then one `StreamStart` plus aggregated text and
+events. Metadata-only `MessageMetadataUpdated` events are stored in the raw
+agent output log with their own sequence numbers, so incremental readers such
+as `read_output(after_seq)` and `tyde_read_agent` can observe them. The
+`agent_bootstrap` projection folds those metadata updates into the matching
+`MessageAdded` row when the referenced `message_id` is present, then omits the
+standalone metadata event from the bootstrap payload. Late subscribers
+therefore see one patched bootstrap row instead of an unpatched row followed by
+a patch. If a subscriber joins while a stream is active, the replay includes
+the completed semantic history, then one `StreamStart` plus aggregated text and
 reasoning deltas for the in-progress stream. The replayed events have fresh
 sequence numbers (starting at 0) on the new instance — they are not copies of
 sequence numbers from other instances.
@@ -471,6 +478,7 @@ Data types are carried forward from the old protocol (minus `ts_rs`/
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
     MessageAdded(ChatMessage),
+    MessageMetadataUpdated(MessageMetadataUpdateData),
     TypingStatusChanged(bool),
     StreamStart(StreamStartData),
     StreamDelta(StreamTextDeltaData),
@@ -482,6 +490,10 @@ pub enum ChatEvent {
     OperationCancelled(OperationCancelledData),
     RetryAttempt(RetryAttemptData),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChatMessageId(pub String);
 
 // ── Message types ──────────────────────────────────────────────────
 
@@ -496,6 +508,7 @@ pub enum MessageSender {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    pub message_id: Option<ChatMessageId>,
     pub timestamp: u64,
     pub sender: MessageSender,
     pub content: String,
@@ -505,6 +518,14 @@ pub struct ChatMessage {
     pub token_usage: Option<TokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
     pub images: Option<Vec<ImageData>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageMetadataUpdateData {
+    pub message_id: ChatMessageId,
+    pub model_info: Option<ModelInfo>,
+    pub token_usage: Option<TokenUsage>,
+    pub context_breakdown: Option<ContextBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,10 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId,
     AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
-    ChatMessage, Envelope, FrameKind, MessageOrigin, MessageSender, QueuedMessageEntry,
-    QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamStartData,
-    StreamTextDeltaData,
+    ChatMessage, ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
+    MessageSender, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
+    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
+    StreamStartData, StreamTextDeltaData,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -130,16 +130,17 @@ impl AgentReplayState {
             return Vec::new();
         };
 
+        let current_message_id = active.current_message_id.clone();
         let mut events = vec![ChatEvent::StreamStart(active.start.clone())];
         if !active.reasoning.is_empty() {
             events.push(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
-                message_id: active.start.message_id.clone(),
+                message_id: current_message_id.clone(),
                 text: active.reasoning.clone(),
             }));
         }
         if !active.text.is_empty() {
             events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
-                message_id: active.start.message_id.clone(),
+                message_id: current_message_id,
                 text: active.text.clone(),
             }));
         }
@@ -149,6 +150,7 @@ impl AgentReplayState {
 }
 
 struct ReplayActiveStream {
+    current_message_id: Option<String>,
     start: StreamStartData,
     text: String,
     reasoning: String,
@@ -2667,6 +2669,7 @@ fn record_chat_event_for_replay(
     match event {
         ChatEvent::StreamStart(start) => {
             replay_state.active_stream = Some(ReplayActiveStream {
+                current_message_id: start.message_id.clone(),
                 start: start.clone(),
                 text: String::new(),
                 reasoning: String::new(),
@@ -2675,6 +2678,9 @@ fn record_chat_event_for_replay(
         }
         ChatEvent::StreamDelta(delta) => {
             if let Some(active) = replay_state.active_stream.as_mut() {
+                if let Some(message_id) = &delta.message_id {
+                    active.current_message_id = Some(message_id.clone());
+                }
                 active.text.push_str(&delta.text);
             } else {
                 tracing::error!(
@@ -2685,6 +2691,9 @@ fn record_chat_event_for_replay(
         }
         ChatEvent::StreamReasoningDelta(delta) => {
             if let Some(active) = replay_state.active_stream.as_mut() {
+                if let Some(message_id) = &delta.message_id {
+                    active.current_message_id = Some(message_id.clone());
+                }
                 active.reasoning.push_str(&delta.text);
             } else {
                 tracing::error!(
@@ -2694,21 +2703,36 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::StreamEnd(data) => {
-            let tool_events = replay_state
-                .active_stream
-                .take()
-                .map(|stream| stream.tool_events)
+            let active_stream = replay_state.active_stream.take();
+            let mut message = data.message.clone();
+            let tool_events = active_stream
+                .map(|stream| {
+                    if message.message_id.is_none()
+                        && let Some(message_id) =
+                            stream.current_message_id.or(stream.start.message_id)
+                    {
+                        message.message_id = Some(ChatMessageId(message_id));
+                    }
+                    stream.tool_events
+                })
                 .unwrap_or_default();
-            if message_has_renderable_content(&data.message, !tool_events.is_empty()) {
+            if message_has_renderable_content(&message, !tool_events.is_empty()) {
                 push_chat_event_to_replay_log(
                     canonical_stream,
                     event_log,
-                    &ChatEvent::MessageAdded(data.message.clone()),
+                    &ChatEvent::MessageAdded(message),
                 );
             }
             for tool_event in tool_events {
                 push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
             }
+        }
+        ChatEvent::MessageMetadataUpdated(update) => {
+            push_chat_event_to_replay_log(
+                canonical_stream,
+                event_log,
+                &ChatEvent::MessageMetadataUpdated(update.clone()),
+            );
         }
         ChatEvent::ToolRequest(_) | ChatEvent::ToolExecutionCompleted(_) => {
             if let Some(active) = replay_state.active_stream.as_mut() {
@@ -2852,10 +2876,7 @@ fn attach_subscriber(
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) {
-    let mut events = event_log
-        .iter()
-        .map(agent_bootstrap_event_from_envelope)
-        .collect::<Vec<_>>();
+    let mut events = agent_bootstrap_events_from_log(event_log);
     if let Some(replay_state) = replay_state {
         events.extend(
             replay_state
@@ -2875,6 +2896,50 @@ fn attach_subscriber(
     }
 
     subscribers.push(stream);
+}
+
+fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrapEvent> {
+    let mut events = Vec::new();
+    for envelope in event_log {
+        let event = agent_bootstrap_event_from_envelope(envelope);
+        if let AgentBootstrapEvent::ChatEvent(ChatEvent::MessageMetadataUpdated(update)) = &event {
+            if fold_message_metadata_update_into_bootstrap_events(&mut events, update) {
+                continue;
+            }
+            tracing::warn!(
+                message_id = %update.message_id,
+                "skipping MessageMetadataUpdated without a matching bootstrap message"
+            );
+            continue;
+        }
+        events.push(event);
+    }
+    events
+}
+
+fn fold_message_metadata_update_into_bootstrap_events(
+    events: &mut [AgentBootstrapEvent],
+    update: &MessageMetadataUpdateData,
+) -> bool {
+    for event in events.iter_mut().rev() {
+        let AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) = event else {
+            continue;
+        };
+        if message.message_id.as_ref() != Some(&update.message_id) {
+            continue;
+        }
+        if update.model_info.is_some() {
+            message.model_info = update.model_info.clone();
+        }
+        if update.token_usage.is_some() {
+            message.token_usage = update.token_usage.clone();
+        }
+        if update.context_breakdown.is_some() {
+            message.context_breakdown = update.context_breakdown.clone();
+        }
+        return true;
+    }
+    false
 }
 
 fn agent_bootstrap_event_from_envelope(envelope: &Envelope) -> AgentBootstrapEvent {
@@ -2920,6 +2985,13 @@ async fn apply_runtime_session_updates(
                     .as_ref()
                     .map(|usage| usage.total_tokens)
                 {
+                    record.token_count =
+                        Some(record.token_count.unwrap_or(0).saturating_add(delta));
+                }
+            }),
+            ChatEvent::MessageMetadataUpdated(data) => store.update(session_id, |record| {
+                record.updated_at_ms = now_ms();
+                if let Some(delta) = data.token_usage.as_ref().map(|usage| usage.total_tokens) {
                     record.token_count =
                         Some(record.token_count.unwrap_or(0).saturating_add(delta));
                 }
@@ -3083,9 +3155,9 @@ mod tests {
 
     use protocol::{
         AgentBootstrapEvent, AgentBootstrapPayload, AgentInput, AgentStartPayload, ChatEvent,
-        ChatMessage, FrameKind, MessageSender, StreamEndData, StreamPath, StreamStartData,
-        StreamTextDeltaData, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType,
+        ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData, MessageSender, ModelInfo,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TokenUsage,
+        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
     };
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
@@ -3177,6 +3249,7 @@ mod tests {
 
     fn assistant_message(content: &str) -> ChatMessage {
         ChatMessage {
+            message_id: None,
             timestamp: 1,
             sender: MessageSender::Assistant {
                 agent: "mock".to_owned(),
@@ -3189,6 +3262,24 @@ mod tests {
             context_breakdown: None,
             images: None,
         }
+    }
+
+    fn metadata_update(message_id: &str, total_tokens: u64) -> ChatEvent {
+        ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
+            message_id: ChatMessageId(message_id.to_owned()),
+            model_info: Some(ModelInfo {
+                model: "mock-model".to_owned(),
+            }),
+            token_usage: Some(TokenUsage {
+                input_tokens: total_tokens / 2,
+                output_tokens: total_tokens - (total_tokens / 2),
+                total_tokens,
+                cached_prompt_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                reasoning_tokens: Some(0),
+            }),
+            context_breakdown: None,
+        })
     }
 
     async fn recv_agent_bootstrap_events(
@@ -3259,7 +3350,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("message-1".to_owned()),
+                message_id: Some("turn-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -3293,6 +3384,14 @@ mod tests {
             &mut event_log,
             &mut subscribers,
             &mut replay_state,
+            &metadata_update("message-1", 42),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
             &ChatEvent::TypingStatusChanged(false),
         )
         .await;
@@ -3317,6 +3416,14 @@ mod tests {
         match events.next() {
             Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))) => {
                 assert_eq!(message.content, "hello world");
+                assert_eq!(
+                    message.message_id,
+                    Some(ChatMessageId("message-1".to_owned()))
+                );
+                assert_eq!(
+                    message.token_usage.as_ref().map(|usage| usage.total_tokens),
+                    Some(42)
+                );
             }
             other => panic!("expected compacted MessageAdded, got {other:?}"),
         }
@@ -3331,6 +3438,86 @@ mod tests {
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "replay should not include granular stream events after compaction"
         );
+    }
+
+    #[tokio::test]
+    async fn output_events_since_returns_metadata_update_after_message_seq() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("turn-1".to_owned()),
+                agent: "mock".to_owned(),
+                model: Some("mock-model".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "hello world".to_owned(),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message("hello world"),
+            }),
+        )
+        .await;
+
+        let message_seq = event_log
+            .iter()
+            .find_map(|event| match event.parse_payload::<ChatEvent>().ok()? {
+                ChatEvent::MessageAdded(message)
+                    if message.message_id == Some(ChatMessageId("message-1".to_owned())) =>
+                {
+                    Some(event.seq)
+                }
+                _ => None,
+            })
+            .expect("expected replay MessageAdded");
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &metadata_update("message-1", 42),
+        )
+        .await;
+
+        let events = output_events_since(&event_log, Some(message_seq), 10);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].seq > message_seq);
+        match events[0]
+            .parse_payload::<ChatEvent>()
+            .expect("failed to parse output event")
+        {
+            ChatEvent::MessageMetadataUpdated(update) => {
+                assert_eq!(update.message_id, ChatMessageId("message-1".to_owned()));
+                assert_eq!(
+                    update.token_usage.as_ref().map(|usage| usage.total_tokens),
+                    Some(42)
+                );
+            }
+            other => panic!("expected MessageMetadataUpdated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3354,7 +3541,7 @@ mod tests {
             &mut subscribers,
             &mut replay_state,
             &ChatEvent::StreamStart(StreamStartData {
-                message_id: Some("message-1".to_owned()),
+                message_id: Some("turn-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: Some("mock-model".to_owned()),
             }),
@@ -3397,6 +3584,7 @@ mod tests {
         ));
         match events.next() {
             Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamDelta(delta))) => {
+                assert_eq!(delta.message_id, Some("message-1".to_owned()));
                 assert_eq!(delta.text, "alpha beta");
             }
             other => panic!("expected aggregated StreamDelta, got {other:?}"),
@@ -3406,6 +3594,91 @@ mod tests {
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "active replay should collapse historical deltas into one delta"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_active_reasoning_uses_latest_message_id_before_live_end() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("turn-1".to_owned()),
+                agent: "mock".to_owned(),
+                model: Some("mock-model".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                message_id: Some("reasoning-item-1".to_owned()),
+                text: "thinking".to_owned(),
+            }),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+
+        let mut events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap")
+            .await
+            .into_iter();
+        assert!(matches!(
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(..)))
+        ));
+        match events.next() {
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamReasoningDelta(delta))) => {
+                assert_eq!(delta.message_id, Some("reasoning-item-1".to_owned()));
+                assert_eq!(delta.text, "thinking");
+            }
+            other => panic!("expected aggregated StreamReasoningDelta, got {other:?}"),
+        }
+        assert!(events.next().is_none());
+
+        let mut message = assistant_message("");
+        message.message_id = Some(ChatMessageId("reasoning-item-1".to_owned()));
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData { message }),
+        )
+        .await;
+
+        let env = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for live StreamEnd")
+            .expect("stream closed before live StreamEnd");
+        assert_eq!(env.kind, FrameKind::ChatEvent);
+        match env
+            .parse_payload::<ChatEvent>()
+            .expect("failed to parse live StreamEnd")
+        {
+            ChatEvent::StreamEnd(data) => {
+                assert_eq!(
+                    data.message.message_id,
+                    Some(ChatMessageId("reasoning-item-1".to_owned()))
+                );
+            }
+            other => panic!("expected live StreamEnd, got {other:?}"),
+        }
     }
 
     #[tokio::test]

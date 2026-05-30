@@ -834,6 +834,7 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                     agent.turn_completed = true;
                 }
                 ChatEvent::MessageAdded(_)
+                | ChatEvent::MessageMetadataUpdated(_)
                 | ChatEvent::ToolRequest(_)
                 | ChatEvent::ToolExecutionCompleted(_)
                 | ChatEvent::TaskUpdate(_)

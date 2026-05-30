@@ -378,6 +378,7 @@ async fn emit_turn(
     if user_message.trim() == MOCK_COMPACT_SENTINEL {
         if events_tx
             .send(ChatEvent::MessageAdded(ChatMessage {
+                message_id: None,
                 timestamp: now_ms(),
                 sender: MessageSender::System,
                 content: "Conversation compacted.".to_string(),
@@ -396,6 +397,7 @@ async fn emit_turn(
         if events_tx
             .send(ChatEvent::StreamEnd(StreamEndData {
                 message: ChatMessage {
+                    message_id: None,
                     timestamp: now_ms(),
                     sender: MessageSender::Assistant {
                         agent: "mock".to_owned(),
@@ -443,6 +445,7 @@ async fn emit_turn(
     }
 
     let message = ChatMessage {
+        message_id: message_id.clone().map(protocol::ChatMessageId),
         timestamp: now_ms(),
         sender: MessageSender::Assistant {
             agent: "mock".to_owned(),
@@ -570,6 +573,7 @@ fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &
     }));
     let _ = event_tx.send(ChatEvent::StreamEnd(StreamEndData {
         message: ChatMessage {
+            message_id: message_id.map(protocol::ChatMessageId),
             timestamp: now_ms(),
             sender: MessageSender::Assistant {
                 agent: "mock-native-child".to_owned(),

@@ -1127,6 +1127,7 @@ mod wasm_tests {
     fn mk_user_msg(text: &str) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                message_id: None,
                 timestamp: 0,
                 sender: MessageSender::User,
                 content: text.to_owned(),

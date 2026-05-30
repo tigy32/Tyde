@@ -1178,6 +1178,7 @@ mod wasm_tests {
                 AgentId(agent_id.to_owned()),
                 vec![ChatRowHandle::new(ChatMessageEntry {
                     message: ChatMessage {
+                        message_id: None,
                         timestamp: 0,
                         sender: MessageSender::User,
                         content: "hi".to_owned(),

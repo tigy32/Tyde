@@ -739,6 +739,7 @@ mod wasm_tests {
     fn make_message(sender: MessageSender, content: &str) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
+                message_id: None,
                 timestamp: 0,
                 sender,
                 content: content.to_owned(),

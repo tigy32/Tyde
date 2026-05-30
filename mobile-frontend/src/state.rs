@@ -7,15 +7,16 @@ pub use mobile_shell_types::{
 };
 use protocol::types::AgentCompactNotifyPayload;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
-    DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, Project, ProjectDiffScope,
-    ProjectFileContentsPayload, ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus,
-    ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review, ReviewErrorPayload, ReviewId,
-    ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
-    Steering, SteeringId, StreamPath, TaskList, Team, TeamCompactNotifyPayload, TeamDraft,
-    TeamDraftId, TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
-    TeamPresetCatalog, ToolExecutionCompletedData, ToolRequest,
+    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
+    CustomAgentId, DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
+    Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectGitDiffFile, ProjectId,
+    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, QueuedMessageEntry,
+    Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionSchemaEntry, SessionSettingsValues,
+    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team,
+    TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog, ToolExecutionCompletedData,
+    ToolRequest,
 };
 
 // ── Tool output viewing mode ───────────────────────────────────────────
@@ -357,6 +358,14 @@ pub struct AppState {
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub active_agent: RwSignal<Option<ActiveAgentRef>>,
     pub chat_messages: RwSignal<HashMap<AgentRef, Vec<ChatMessageEntry>>>,
+    /// Per-agent index from server-issued `ChatMessageId` to the position
+    /// in `chat_messages[agent]` that carries it. Populated when a row is
+    /// pushed (live `MessageAdded`/`StreamEnd`, replayed bootstrap events)
+    /// if the message's `message_id` is `Some`, and read when a
+    /// `MessageMetadataUpdated` event lands so the existing row can be
+    /// patched in place. Cleared anywhere `chat_messages` is cleared
+    /// (host runtime reset, agent close, agent bootstrap snapshot).
+    pub chat_message_index: RwSignal<HashMap<AgentRef, HashMap<ChatMessageId, usize>>>,
     pub streaming_text: RwSignal<HashMap<AgentRef, StreamingState>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
@@ -438,6 +447,7 @@ impl AppState {
             agents: RwSignal::new(Vec::new()),
             active_agent: RwSignal::new(None),
             chat_messages: RwSignal::new(HashMap::new()),
+            chat_message_index: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
@@ -470,6 +480,91 @@ impl AppState {
 
     pub fn host_stream_untracked(&self, host: &LocalHostId) -> Option<StreamPath> {
         self.host_streams.get_untracked().get(host).cloned()
+    }
+
+    /// Append a chat row for `agent_ref` and, if the message carries a
+    /// server-issued `message_id`, register it in `chat_message_index` so
+    /// a later `ChatEvent::MessageMetadataUpdated` can patch the row in
+    /// place. The two writes are performed under separate signal updates
+    /// because they target separate signals — there is no torn-state
+    /// window for any single observer (each signal is internally
+    /// consistent), and consumers only ever read the index after they
+    /// can see the row that produced it.
+    pub fn push_chat_message_entry(&self, agent_ref: &AgentRef, entry: ChatMessageEntry) {
+        let message_id = entry.message.message_id.clone();
+        self.chat_messages.update(|messages| {
+            messages.entry(agent_ref.clone()).or_default().push(entry);
+        });
+        if let Some(message_id) = message_id {
+            let position = self
+                .chat_messages
+                .with_untracked(|m| m.get(agent_ref).map(|v| v.len().saturating_sub(1)));
+            if let Some(position) = position {
+                self.chat_message_index.update(|indexes| {
+                    indexes
+                        .entry(agent_ref.clone())
+                        .or_default()
+                        .insert(message_id, position);
+                });
+            }
+        }
+    }
+
+    /// Patch the row matching `update.message_id` with whichever of
+    /// `model_info` / `token_usage` / `context_breakdown` are `Some`.
+    /// Same semantics as the desktop `apply_chat_message_metadata`.
+    pub fn apply_chat_message_metadata(
+        &self,
+        agent_ref: &AgentRef,
+        update: MessageMetadataUpdateData,
+    ) {
+        let position = self.chat_message_index.with_untracked(|indexes| {
+            indexes
+                .get(agent_ref)
+                .and_then(|index| index.get(&update.message_id).copied())
+        });
+        let Some(position) = position else {
+            log::warn!(
+                "chat_event message_metadata_updated unknown message_id host={} agent_id={} message_id={}",
+                agent_ref.local_host_id,
+                agent_ref.agent_id,
+                update.message_id
+            );
+            return;
+        };
+        let MessageMetadataUpdateData {
+            message_id,
+            model_info,
+            token_usage,
+            context_breakdown,
+        } = update;
+        let mut patched = false;
+        self.chat_messages.update(|messages| {
+            if let Some(agent_messages) = messages.get_mut(agent_ref)
+                && let Some(entry) = agent_messages.get_mut(position)
+                && entry.message.message_id.as_ref() == Some(&message_id)
+            {
+                if let Some(model_info) = model_info {
+                    entry.message.model_info = Some(model_info);
+                }
+                if let Some(token_usage) = token_usage {
+                    entry.message.token_usage = Some(token_usage);
+                }
+                if let Some(context_breakdown) = context_breakdown {
+                    entry.message.context_breakdown = Some(context_breakdown);
+                }
+                patched = true;
+            }
+        });
+        if !patched {
+            log::warn!(
+                "chat_event message_metadata_updated row missing after lookup host={} agent_id={} message_id={} position={}",
+                agent_ref.local_host_id,
+                agent_ref.agent_id,
+                message_id,
+                position
+            );
+        }
     }
 
     pub fn active_host_settings(&self) -> Option<HostSettings> {
@@ -599,6 +694,9 @@ impl AppState {
         });
 
         self.chat_messages.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.chat_message_index.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.streaming_text.update(|m| {

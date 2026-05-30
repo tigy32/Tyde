@@ -1,7 +1,8 @@
 # Bootstrap Streams
 
-Protocol version 4 makes initial state explicit with typed bootstrap frames.
-`welcome` only accepts the handshake; it no longer carries bootstrap data.
+Protocol version 5 retains the typed bootstrap frames introduced in protocol
+version 4. `welcome` only accepts the handshake; it no longer carries bootstrap
+data.
 
 ## Sequence semantics
 
@@ -45,8 +46,9 @@ Sent as seq `0` on `/project/<project_id>`. It contains:
 
 Implementation note: the previous initial review-summary replay was emitted on
 project streams (`ProjectEventPayload::ReviewListChanged` from the host's
-project subscription path), not on the host stream. Therefore version 4 keeps
-review summaries in `ProjectBootstrap`, not `HostBootstrap`.
+project subscription path), not on the host stream. The v4 bootstrap design
+therefore kept review summaries in `ProjectBootstrap`, not `HostBootstrap`, and
+that remains true in the current protocol.
 
 ### `agent_bootstrap`
 

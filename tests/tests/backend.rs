@@ -1,6 +1,6 @@
 mod fixture;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use fixture::Fixture;
 use protocol::{
-    AgentOrigin, AgentStartPayload, BackendKind, ChatEvent, Envelope, FrameKind, HostSettingValue,
-    ImageData, ListSessionsPayload, MessageSender, NewAgentPayload, ProtocolValidator,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentOrigin, AgentStartPayload, BackendKind,
+    ChatEvent, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
+    MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator,
     SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsValues, SessionSummary, SetSettingPayload,
     SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData,
@@ -258,6 +259,32 @@ async fn expect_fixture_event(client: &mut client::Connection, context: &str) ->
     }
 }
 
+fn agent_start_from_bootstrap(env: Envelope, context: &str) -> AgentStartPayload {
+    assert_eq!(env.kind, FrameKind::AgentBootstrap, "expected {context}");
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    payload
+        .events
+        .into_iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentStart(start) => Some(start),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("AgentBootstrap missing AgentStart for {context}"))
+}
+
+async fn expect_fixture_agent_start(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    context: &str,
+) -> AgentStartPayload {
+    loop {
+        let env = expect_fixture_event(client, context).await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == *agent_stream {
+            return agent_start_from_bootstrap(env, context);
+        }
+    }
+}
+
 async fn spawn_mock_agent_and_collect_turn(
     client: &mut client::Connection,
     backend_kind: BackendKind,
@@ -287,9 +314,8 @@ async fn spawn_mock_agent_and_collect_turn(
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
     let agent_stream = new_agent.instance_stream;
 
-    let env = expect_fixture_event(client, "AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
+    let agent_start = expect_fixture_agent_start(client, &agent_stream, "AgentStart").await;
+    assert_eq!(agent_start.agent_id, new_agent.agent_id);
 
     loop {
         let env = expect_fixture_event(client, "ChatEvent").await;
@@ -469,12 +495,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
     };
     let agent_stream = new_agent.instance_stream.clone();
 
-    loop {
-        let env = expect_fixture_event(&mut fixture.client, "Kiro AgentStart").await;
-        if env.kind == FrameKind::AgentStart && env.stream == agent_stream {
-            break;
-        }
-    }
+    expect_fixture_agent_start(&mut fixture.client, &agent_stream, "Kiro AgentStart").await;
 
     loop {
         let env = expect_fixture_event(&mut fixture.client, "Kiro StreamEnd").await;
@@ -546,12 +567,7 @@ async fn compact_turn_emits_system_message_and_stream_end_without_error() {
     };
     let agent_stream = new_agent.instance_stream.clone();
 
-    loop {
-        let env = expect_fixture_event(&mut fixture.client, "compact AgentStart").await;
-        if env.kind == FrameKind::AgentStart && env.stream == agent_stream {
-            break;
-        }
-    }
+    expect_fixture_agent_start(&mut fixture.client, &agent_stream, "compact AgentStart").await;
 
     let mut saw_system_message = false;
     let mut saw_stream_end = false;
@@ -611,6 +627,7 @@ struct RealBackendFixture {
 struct ValidatedConnection {
     inner: client::Connection,
     validator: ProtocolValidator,
+    pending_bootstrap_events: VecDeque<Envelope>,
 }
 
 impl ValidatedConnection {
@@ -629,6 +646,10 @@ impl ValidatedConnection {
     }
 
     async fn next_event(&mut self) -> Result<Option<Envelope>, protocol::FrameError> {
+        if let Some(envelope) = self.pending_bootstrap_events.pop_front() {
+            return Ok(Some(envelope));
+        }
+
         let Some(envelope) = self.inner.next_event().await? else {
             return Ok(None);
         };
@@ -637,7 +658,31 @@ impl ValidatedConnection {
             panic!("protocol violation while reading backend events: {error}");
         }
 
+        self.queue_agent_bootstrap_chat_events(&envelope);
+
         Ok(Some(envelope))
+    }
+
+    fn queue_agent_bootstrap_chat_events(&mut self, envelope: &Envelope) {
+        if envelope.kind != FrameKind::AgentBootstrap {
+            return;
+        }
+
+        let payload: AgentBootstrapPayload = envelope
+            .parse_payload()
+            .expect("parse AgentBootstrap for replayed ChatEvents");
+        for event in payload.events {
+            let AgentBootstrapEvent::ChatEvent(chat_event) = event else {
+                continue;
+            };
+            self.pending_bootstrap_events.push_back(Envelope {
+                stream: envelope.stream.clone(),
+                kind: FrameKind::ChatEvent,
+                seq: envelope.seq,
+                payload: serde_json::to_value(chat_event)
+                    .expect("serialize replayed bootstrap ChatEvent"),
+            });
+        }
     }
 
     async fn interrupt(&mut self, stream: &StreamPath) -> Result<(), protocol::FrameError> {
@@ -692,6 +737,7 @@ impl RealBackendFixture {
             client: ValidatedConnection {
                 inner: client,
                 validator: ProtocolValidator::new(),
+                pending_bootstrap_events: VecDeque::new(),
             },
             session_store_dir,
             workspace_dir,
@@ -740,16 +786,15 @@ async fn expect_next_event_kind(
     }
 }
 
-async fn expect_next_event_kind_on_stream(
+async fn expect_agent_start_on_stream(
     client: &mut ValidatedConnection,
-    expected_kind: FrameKind,
     expected_stream: &StreamPath,
     context: &str,
-) -> Envelope {
+) -> AgentStartPayload {
     loop {
         let env = expect_next_event(client, context).await;
-        if env.kind == expected_kind && env.stream == *expected_stream {
-            return env;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == *expected_stream {
+            return agent_start_from_bootstrap(env, context);
         }
     }
 }
@@ -853,14 +898,9 @@ async fn spawn_agent_via_protocol_with_options(
     let agent_stream = new_agent.instance_stream;
 
     let agent_start_context = format!("{backend_kind:?} AgentStart");
-    let env = expect_next_event_kind_on_stream(
-        client,
-        FrameKind::AgentStart,
-        &agent_stream,
-        &agent_start_context,
-    )
-    .await;
-    assert_eq!(env.stream, agent_stream);
+    let agent_start =
+        expect_agent_start_on_stream(client, &agent_stream, &agent_start_context).await;
+    assert_eq!(agent_start.agent_id, new_agent.agent_id);
 
     agent_stream
 }
@@ -889,14 +929,9 @@ async fn resume_agent_via_protocol(
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse resumed NewAgent");
     let agent_stream = new_agent.instance_stream;
 
-    let env = expect_next_event_kind_on_stream(
-        client,
-        FrameKind::AgentStart,
-        &agent_stream,
-        "resumed AgentStart",
-    )
-    .await;
-    assert_eq!(env.stream, agent_stream);
+    let agent_start =
+        expect_agent_start_on_stream(client, &agent_stream, "resumed AgentStart").await;
+    assert_eq!(agent_start.agent_id, new_agent.agent_id);
 
     agent_stream
 }
@@ -1370,6 +1405,9 @@ async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
 
     let mut got_user_message_echo = false;
     let mut saw_typing_false = false;
+    let mut answer_message_id = None;
+    let mut pending_metadata_updates = Vec::new();
+    let mut saw_metadata_update = false;
     let mut saw_token_usage = None;
     let mut saw_context_breakdown = None;
     let mut final_text = String::new();
@@ -1392,25 +1430,77 @@ async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
                 }
             }
             ChatEvent::StreamEnd(data) if got_user_message_echo => {
-                if !data.message.content.trim().is_empty() {
-                    final_text = data.message.content;
+                let message_id =
+                    data.message.message_id.clone().unwrap_or_else(|| {
+                        panic!("expected Codex StreamEnd to include message_id")
+                    });
+                assert!(
+                    data.message.token_usage.is_none(),
+                    "Codex StreamEnd should leave late token usage for MessageMetadataUpdated; message_id={message_id}"
+                );
+                assert!(
+                    data.message.context_breakdown.is_none(),
+                    "Codex StreamEnd should leave late context breakdown for MessageMetadataUpdated; message_id={message_id}"
+                );
+                let visible_text = data.message.content;
+                if visible_text.contains("USAGE_OK") {
+                    assert!(
+                        answer_message_id.is_none(),
+                        "expected one Codex answer StreamEnd for token usage turn; first_id={:?}, second_id={message_id}",
+                        answer_message_id
+                    );
+                    final_text = visible_text;
+                    for update in pending_metadata_updates.iter().filter(
+                        |update: &&MessageMetadataUpdateData| update.message_id == message_id,
+                    ) {
+                        assert!(
+                            !saw_metadata_update,
+                            "expected one Codex metadata update for message_id {message_id}"
+                        );
+                        saw_token_usage = update.token_usage.clone();
+                        saw_context_breakdown = update.context_breakdown.clone();
+                        saw_metadata_update = true;
+                    }
+                    answer_message_id = Some(message_id);
                 }
-                if let Some(usage) = data.message.token_usage {
-                    saw_token_usage = Some(usage);
-                }
-                if let Some(breakdown) = data.message.context_breakdown {
-                    saw_context_breakdown = Some(breakdown);
+            }
+            ChatEvent::MessageMetadataUpdated(update) if got_user_message_echo => {
+                if let Some(message_id) = answer_message_id.as_ref() {
+                    if &update.message_id == message_id {
+                        assert!(
+                            !saw_metadata_update,
+                            "expected one Codex metadata update for message_id {message_id}"
+                        );
+                        saw_token_usage = update.token_usage;
+                        saw_context_breakdown = update.context_breakdown;
+                        saw_metadata_update = true;
+                    }
+                } else {
+                    pending_metadata_updates.push(update);
                 }
             }
             ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
+                assert!(
+                    answer_message_id.is_some(),
+                    "Codex typing stopped before visible answer StreamEnd"
+                );
+                assert!(
+                    saw_metadata_update,
+                    "Codex typing stopped before late metadata update; final_text={final_text:?}"
+                );
                 saw_typing_false = true;
             }
             _ => {}
         }
     }
 
+    let message_id = answer_message_id
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected Codex StreamEnd before typing stopped"));
     let usage = saw_token_usage.unwrap_or_else(|| {
-        panic!("expected Codex StreamEnd to include token usage; final_text={final_text:?}")
+        panic!(
+            "expected Codex MessageMetadataUpdated for {message_id} to include token usage; final_text={final_text:?}"
+        )
     });
     assert!(
         usage.total_tokens > 0,
@@ -1423,7 +1513,9 @@ async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
         "expected positive Codex input/cache token usage; got {usage:?}"
     );
     let breakdown = saw_context_breakdown.unwrap_or_else(|| {
-        panic!("expected Codex StreamEnd to include context breakdown; final_text={final_text:?}")
+        panic!(
+            "expected Codex MessageMetadataUpdated for {message_id} to include context breakdown; final_text={final_text:?}"
+        )
     });
     assert!(
         breakdown.input_tokens > 0,
@@ -2268,14 +2360,12 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
         let parent_new: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
         assert_eq!(parent_new.origin, AgentOrigin::User);
 
-        let env = expect_next_event_kind_on_stream(
+        let parent_start = expect_agent_start_on_stream(
             &mut fixture.client,
-            FrameKind::AgentStart,
             &parent_new.instance_stream,
             "parent AgentStart",
         )
         .await;
-        let parent_start: AgentStartPayload = env.parse_payload().expect("parse parent AgentStart");
         assert_eq!(parent_start.agent_id, parent_new.agent_id);
 
         let child_new = expect_backend_native_child_for_parent(
@@ -2290,14 +2380,12 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
             Some(&parent_new.agent_id)
         );
 
-        let env = expect_next_event_kind_on_stream(
+        let child_start = expect_agent_start_on_stream(
             &mut fixture.client,
-            FrameKind::AgentStart,
             &child_new.instance_stream,
             "backend-native child AgentStart",
         )
         .await;
-        let child_start: AgentStartPayload = env.parse_payload().expect("parse child AgentStart");
         assert_eq!(child_start.origin, AgentOrigin::BackendNative);
         assert_eq!(
             child_start.parent_agent_id.as_ref(),

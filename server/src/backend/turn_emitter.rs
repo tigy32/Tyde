@@ -86,6 +86,7 @@ pub struct ToolCompletedPayload<'a> {
 
 pub struct AssistantMessagePayload<'a> {
     pub agent: AgentName<'a>,
+    pub message_id: Option<&'a str>,
     pub content: String,
     pub reasoning: Option<Value>,
     pub tool_calls: Vec<Value>,
@@ -93,6 +94,13 @@ pub struct AssistantMessagePayload<'a> {
     pub token_usage: Option<Value>,
     pub context_breakdown: Option<Value>,
     pub images: Vec<Value>,
+}
+
+pub struct MessageMetadataUpdatePayload {
+    pub message_id: String,
+    pub model_info: Option<Value>,
+    pub token_usage: Option<Value>,
+    pub context_breakdown: Option<Value>,
 }
 
 pub struct RetryAttemptPayload<'a> {
@@ -178,6 +186,7 @@ impl TurnEmitter {
         state.send(json!({
             "kind": "MessageAdded",
             "data": {
+                "message_id": Value::Null,
                 "timestamp": now_ms(),
                 "sender": "User",
                 "content": content,
@@ -197,6 +206,7 @@ impl TurnEmitter {
         state.send(json!({
             "kind": "MessageAdded",
             "data": {
+                "message_id": Value::Null,
                 "timestamp": now_ms(),
                 "sender": "System",
                 "content": content,
@@ -216,6 +226,7 @@ impl TurnEmitter {
         state.send(json!({
             "kind": "MessageAdded",
             "data": {
+                "message_id": Value::Null,
                 "timestamp": now_ms(),
                 "sender": "Warning",
                 "content": content,
@@ -235,6 +246,7 @@ impl TurnEmitter {
         state.send(json!({
             "kind": "MessageAdded",
             "data": {
+                "message_id": Value::Null,
                 "timestamp": now_ms(),
                 "sender": "Error",
                 "content": content,
@@ -250,6 +262,10 @@ impl TurnEmitter {
 
     pub fn assistant_message(&self, payload: AssistantMessagePayload<'_>) {
         self.lock().assistant_message(payload);
+    }
+
+    pub fn message_metadata_updated(&self, payload: MessageMetadataUpdatePayload) {
+        self.lock().message_metadata_updated(payload);
     }
 
     // ---------- Misc chat events ----------
@@ -427,9 +443,14 @@ impl TurnEmitterState {
         if !self.stream_open {
             self.open_synthetic_stream("assistant");
         }
+        let message_id = self.current_stream_message_id.clone();
         self.stream_open = false;
         self.current_stream_message_id = None;
-        self.send(build_stream_end_value(&payload, &self.default_agent));
+        self.send(build_stream_end_value(
+            &payload,
+            &self.default_agent,
+            message_id.as_deref(),
+        ));
     }
 
     fn assistant_message(&mut self, payload: AssistantMessagePayload<'_>) {
@@ -438,6 +459,28 @@ impl TurnEmitterState {
         );
         self.assistant_turn_open = true;
         self.send(build_assistant_message_value(&payload));
+    }
+
+    fn message_metadata_updated(&mut self, payload: MessageMetadataUpdatePayload) {
+        let message_id = payload.message_id.trim().to_string();
+        if message_id.is_empty() {
+            return;
+        }
+        if payload.model_info.is_none()
+            && payload.token_usage.is_none()
+            && payload.context_breakdown.is_none()
+        {
+            return;
+        }
+        self.send(json!({
+            "kind": "MessageMetadataUpdated",
+            "data": {
+                "message_id": message_id,
+                "model_info": payload.model_info.unwrap_or(Value::Null),
+                "token_usage": payload.token_usage.unwrap_or(Value::Null),
+                "context_breakdown": payload.context_breakdown.unwrap_or(Value::Null),
+            },
+        }));
     }
 
     fn tool_request(&mut self, tool_call_id: &str, tool_name: &str, tool_type: Value) {
@@ -616,7 +659,11 @@ impl TurnEmitterState {
     }
 }
 
-fn build_stream_end_value(payload: &StreamEndPayload<'_>, default_agent: &str) -> Value {
+fn build_stream_end_value(
+    payload: &StreamEndPayload<'_>,
+    default_agent: &str,
+    message_id: Option<&str>,
+) -> Value {
     let agent_name = payload.agent.map(|a| a.0).unwrap_or(default_agent);
     let model_info = payload
         .model
@@ -637,6 +684,7 @@ fn build_stream_end_value(payload: &StreamEndPayload<'_>, default_agent: &str) -
         "kind": "StreamEnd",
         "data": {
             "message": {
+                "message_id": message_id,
                 "timestamp": now_ms(),
                 "sender": { "Assistant": { "agent": agent_name } },
                 "content": payload.content,
@@ -667,6 +715,7 @@ fn build_assistant_message_value(payload: &AssistantMessagePayload<'_>) -> Value
     json!({
         "kind": "MessageAdded",
         "data": {
+            "message_id": payload.message_id,
             "timestamp": now_ms(),
             "sender": { "Assistant": { "agent": payload.agent.0 } },
             "content": payload.content,
@@ -940,6 +989,60 @@ mod tests {
         let events = recv_events(&mut rx);
         assert_protocol_valid(&events);
         assert_eq!(event_kinds(&events), vec!["StreamStart", "StreamEnd"]);
+    }
+
+    #[test]
+    fn stream_end_carries_active_stream_message_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new_for_agent(tx, AgentName("codex"));
+        emitter.stream_start("turn-1", AgentName("codex"), Some("gpt-5-codex"));
+        emitter.stream_delta("message-1", "hello");
+        emitter.stream_end(StreamEndPayload {
+            content: "hello".to_string(),
+            agent: Some(AgentName("codex")),
+            model: Some("gpt-5-codex".to_string()),
+            usage: None,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            context_breakdown: None,
+        });
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            events[2]
+                .pointer("/data/message/message_id")
+                .and_then(Value::as_str),
+            Some("message-1")
+        );
+    }
+
+    #[test]
+    fn message_metadata_updated_emits_patch_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.message_metadata_updated(MessageMetadataUpdatePayload {
+            message_id: "message-1".to_string(),
+            model_info: Some(json!({ "model": "gpt-5-codex" })),
+            token_usage: Some(json!({
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+                "cached_prompt_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "reasoning_tokens": 0
+            })),
+            context_breakdown: None,
+        });
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_eq!(event_kinds(&events), vec!["MessageMetadataUpdated"]);
+        assert_eq!(
+            events[0]
+                .pointer("/data/message_id")
+                .and_then(Value::as_str),
+            Some("message-1")
+        );
     }
 
     #[test]

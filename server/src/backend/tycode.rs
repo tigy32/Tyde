@@ -355,6 +355,7 @@ impl Backend for TycodeBackend {
             if stream_open {
                 let _ = events_tx.send(ChatEvent::StreamEnd(StreamEndData {
                     message: ChatMessage {
+                        message_id: None,
                         timestamp: unix_now_ms(),
                         sender: MessageSender::Assistant {
                             agent: "tycode".to_string(),
@@ -584,6 +585,7 @@ impl Backend for TycodeBackend {
             if stream_open {
                 let _ = events_tx.send(ChatEvent::StreamEnd(StreamEndData {
                     message: ChatMessage {
+                        message_id: None,
                         timestamp: unix_now_ms(),
                         sender: MessageSender::Assistant {
                             agent: "tycode".to_string(),

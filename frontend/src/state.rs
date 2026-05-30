@@ -4,15 +4,15 @@ use std::collections::{HashMap, HashSet};
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, CustomAgent, CustomAgentId,
-    DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload, HostPlatform,
-    HostSettings, McpServerConfig, McpServerId, MobileAccessStatePayload,
-    MobilePairingOfferPayload, Project, ProjectDiffScope, ProjectGitDiffFile,
-    ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId,
-    ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
-    Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
+    CustomAgentId, DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload,
+    HostPlatform, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
+    MobileAccessStatePayload, MobilePairingOfferPayload, Project, ProjectDiffScope,
+    ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus,
+    ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
+    ReviewSuggestionId, ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary,
+    Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId,
+    TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
     TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
     ToolExecutionCompletedData, ToolRequest,
 };
@@ -682,6 +682,14 @@ pub struct AppState {
     pub active_agent: Memo<Option<ActiveAgentRef>>,
     pub chat_rows: RwSignal<HashMap<AgentId, Vec<ChatRowHandle>>>,
     pub chat_tool_rows: RwSignal<HashMap<AgentId, HashMap<ToolCallId, ChatRowId>>>,
+    /// Per-agent index from server-issued `ChatMessageId` to the row that
+    /// carries it. Populated by `push_chat_entry` when the entry's
+    /// `message.message_id` is present, and consulted when a
+    /// `ChatEvent::MessageMetadataUpdated` arrives so the existing row's
+    /// token/model/context fields can be patched in place instead of
+    /// appending a duplicate row. Cleared anywhere `chat_rows` is cleared
+    /// (host runtime reset, agent close, agent bootstrap snapshot).
+    pub chat_message_rows: RwSignal<HashMap<AgentId, HashMap<ChatMessageId, ChatRowId>>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
@@ -933,6 +941,7 @@ impl AppState {
             active_agent,
             chat_rows: RwSignal::new(HashMap::new()),
             chat_tool_rows: RwSignal::new(HashMap::new()),
+            chat_message_rows: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
@@ -1208,6 +1217,9 @@ impl AppState {
         self.chat_tool_rows.update(|map| {
             map.remove(agent_id);
         });
+        self.chat_message_rows.update(|map| {
+            map.remove(agent_id);
+        });
         self.streaming_text.update(|map| {
             map.remove(agent_id);
         });
@@ -1342,12 +1354,15 @@ impl AppState {
 
     pub fn push_chat_entry(&self, agent_id: AgentId, entry: ChatMessageEntry) -> ChatRowHandle {
         let handle = ChatRowHandle::new(entry);
-        let indexed_tool_call_ids = handle.entry.with_untracked(|entry| {
-            entry
-                .tool_requests
-                .iter()
-                .map(|tool| tool.request.tool_call_id.clone())
-                .collect::<Vec<_>>()
+        let (indexed_tool_call_ids, message_id) = handle.entry.with_untracked(|entry| {
+            (
+                entry
+                    .tool_requests
+                    .iter()
+                    .map(|tool| tool.request.tool_call_id.clone())
+                    .collect::<Vec<_>>(),
+                entry.message.message_id.clone(),
+            )
         });
 
         self.chat_rows.update(|rows| {
@@ -1358,14 +1373,85 @@ impl AppState {
 
         if !indexed_tool_call_ids.is_empty() {
             self.chat_tool_rows.update(|indexes| {
-                let agent_index = indexes.entry(agent_id).or_default();
+                let agent_index = indexes.entry(agent_id.clone()).or_default();
                 for tool_call_id in indexed_tool_call_ids {
                     agent_index.insert(ToolCallId(tool_call_id), handle.id);
                 }
             });
         }
 
+        if let Some(message_id) = message_id {
+            self.chat_message_rows.update(|indexes| {
+                indexes
+                    .entry(agent_id)
+                    .or_default()
+                    .insert(message_id, handle.id);
+            });
+        }
+
         handle
+    }
+
+    /// Patch the row matching `update.message_id` with whichever of
+    /// `model_info` / `token_usage` / `context_breakdown` are `Some`. A
+    /// `None` update field means "leave the existing value alone" — this
+    /// is a partial update, not a replace. Unknown message ids are
+    /// logged and otherwise ignored: server-side guarantees that the
+    /// `MessageMetadataUpdated` for a Codex turn arrives after the
+    /// visible `StreamEnd` that created the row, but if the row was
+    /// dropped (compaction, agent close) by the time the update lands
+    /// we just want to no-op, not crash.
+    pub fn apply_chat_message_metadata(
+        &self,
+        agent_id: &AgentId,
+        update: MessageMetadataUpdateData,
+    ) {
+        let row_id = self.chat_message_rows.with_untracked(|indexes| {
+            indexes
+                .get(agent_id)
+                .and_then(|agent_index| agent_index.get(&update.message_id).copied())
+        });
+        let Some(row_id) = row_id else {
+            log::warn!(
+                "chat_event message_metadata_updated unknown message_id agent_id={} message_id={}",
+                agent_id,
+                update.message_id
+            );
+            return;
+        };
+        let Some(handle) = self.chat_row_by_id_untracked(agent_id, row_id) else {
+            log::warn!(
+                "chat_event message_metadata_updated row gone agent_id={} message_id={} row_id={:?}",
+                agent_id,
+                update.message_id,
+                row_id
+            );
+            return;
+        };
+        let row_message_id = handle
+            .entry
+            .with_untracked(|entry| entry.message.message_id.clone());
+        if row_message_id.as_ref() != Some(&update.message_id) {
+            log::warn!(
+                "chat_event message_metadata_updated stale row agent_id={} expected_message_id={} row_message_id={:?} row_id={:?}",
+                agent_id,
+                update.message_id,
+                row_message_id,
+                row_id
+            );
+            return;
+        }
+        handle.entry.update(|entry| {
+            if let Some(model_info) = update.model_info {
+                entry.message.model_info = Some(model_info);
+            }
+            if let Some(token_usage) = update.token_usage {
+                entry.message.token_usage = Some(token_usage);
+            }
+            if let Some(context_breakdown) = update.context_breakdown {
+                entry.message.context_breakdown = Some(context_breakdown);
+            }
+        });
     }
 
     pub fn last_chat_row_untracked(&self, agent_id: &AgentId) -> Option<ChatRowHandle> {
@@ -1591,6 +1677,9 @@ impl AppState {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.chat_tool_rows.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.chat_message_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.streaming_text.update(|map| {
@@ -2598,6 +2687,7 @@ mod tests {
 
             let mk_msg = || ChatMessageEntry {
                 message: ChatMessage {
+                    message_id: None,
                     timestamp: 0,
                     sender: protocol::MessageSender::User,
                     content: "hi".to_owned(),
@@ -2735,6 +2825,146 @@ mod tests {
                 state
                     .open_files
                     .with_untracked(|m| m.contains_key(&file_path))
+            );
+        });
+    }
+
+    #[test]
+    fn apply_chat_message_metadata_patches_existing_row_in_place() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-meta".to_owned());
+            let message_id = protocol::ChatMessageId("msg-1".to_owned());
+
+            let initial = ChatMessageEntry {
+                message: ChatMessage {
+                    message_id: Some(message_id.clone()),
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "test-agent".to_owned(),
+                    },
+                    content: "hello world".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+                tool_requests: Vec::new(),
+            };
+            let handle = state.push_chat_entry(agent_id.clone(), initial);
+            let original_row_id = handle.id;
+
+            let update = MessageMetadataUpdateData {
+                message_id: message_id.clone(),
+                model_info: Some(protocol::ModelInfo {
+                    model: "gpt-test".to_owned(),
+                }),
+                token_usage: Some(protocol::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    total_tokens: 10,
+                    cached_prompt_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                context_breakdown: None,
+            };
+            state.apply_chat_message_metadata(&agent_id, update);
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|m| m.get(&agent_id).cloned())
+                .expect("agent rows");
+            assert_eq!(rows.len(), 1, "metadata update must not append a row");
+            assert_eq!(rows[0].id, original_row_id, "row identity preserved");
+            let entry = rows[0].entry.get_untracked();
+            assert_eq!(entry.message.content, "hello world", "content untouched");
+            assert!(
+                entry
+                    .message
+                    .model_info
+                    .as_ref()
+                    .is_some_and(|m| m.model == "gpt-test"),
+                "model_info patched"
+            );
+            assert!(
+                entry
+                    .message
+                    .token_usage
+                    .as_ref()
+                    .is_some_and(|t| t.total_tokens == 10),
+                "token_usage patched"
+            );
+            assert!(
+                entry.message.context_breakdown.is_none(),
+                "None update fields leave existing value alone"
+            );
+
+            // A second update that only carries context_breakdown must
+            // not stomp on the previously-patched model_info / token_usage.
+            let breakdown = protocol::ContextBreakdown {
+                system_prompt_bytes: 1,
+                tool_io_bytes: 2,
+                conversation_history_bytes: 3,
+                reasoning_bytes: 4,
+                context_injection_bytes: 5,
+                input_tokens: 6,
+                context_window: 8000,
+            };
+            state.apply_chat_message_metadata(
+                &agent_id,
+                MessageMetadataUpdateData {
+                    message_id: message_id.clone(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: Some(breakdown),
+                },
+            );
+            let entry = rows[0].entry.get_untracked();
+            assert!(
+                entry
+                    .message
+                    .model_info
+                    .as_ref()
+                    .is_some_and(|m| m.model == "gpt-test"),
+                "prior model_info preserved across partial update"
+            );
+            assert!(
+                entry
+                    .message
+                    .token_usage
+                    .as_ref()
+                    .is_some_and(|t| t.total_tokens == 10),
+                "prior token_usage preserved across partial update"
+            );
+            assert!(
+                entry
+                    .message
+                    .context_breakdown
+                    .as_ref()
+                    .is_some_and(|c| c.context_window == 8000),
+                "context_breakdown patched"
+            );
+
+            // Unknown message id is a warning, not a crash.
+            state.apply_chat_message_metadata(
+                &agent_id,
+                MessageMetadataUpdateData {
+                    message_id: protocol::ChatMessageId("missing".to_owned()),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                },
+            );
+            assert_eq!(
+                state
+                    .chat_rows
+                    .with_untracked(|m| m.get(&agent_id).map(|r| r.len()).unwrap_or(0)),
+                1,
+                "unknown message id must not append a row"
             );
         });
     }

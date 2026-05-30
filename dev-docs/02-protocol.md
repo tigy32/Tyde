@@ -131,7 +131,7 @@ are valid until the handshake completes.
   "kind": "hello",
   "seq": 0,
   "payload": {
-    "protocol_version": 4,
+    "protocol_version": 5,
     "tyde_version": { "major": 2, "minor": 0, "patch": 0 },
     "client_name": "tyde-desktop",
     "platform": "macos"
@@ -147,7 +147,7 @@ are valid until the handshake completes.
   "kind": "welcome",
   "seq": 0,
   "payload": {
-    "protocol_version": 4,
+    "protocol_version": 5,
     "tyde_version": { "major": 2, "minor": 1, "patch": 0 }
   }
 }
@@ -166,8 +166,8 @@ are specified in `21-bootstrap-streams.md`.
   "seq": 0,
   "payload": {
     "code": "incompatible_protocol",
-    "message": "Server requires protocol version 4, client sent 3",
-    "server_protocol_version": 4,
+    "message": "Server requires protocol version 5, client sent 3",
+    "server_protocol_version": 5,
     "server_tyde_version": { "major": 3, "minor": 0, "patch": 0 }
   }
 }
@@ -289,7 +289,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The current protocol version. Bump when the wire shape changes.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 // ── Primitives ──────────────────────────────────────────────────────
 

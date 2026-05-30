@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -183,6 +183,16 @@ impl fmt::Display for SessionId {
 pub struct QueuedMessageId(pub String);
 
 impl fmt::Display for QueuedMessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChatMessageId(pub String);
+
+impl fmt::Display for ChatMessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -2797,6 +2807,7 @@ pub struct AgentErrorPayload {
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
     MessageAdded(ChatMessage),
+    MessageMetadataUpdated(MessageMetadataUpdateData),
     TypingStatusChanged(bool),
     StreamStart(StreamStartData),
     StreamDelta(StreamTextDeltaData),
@@ -2820,6 +2831,8 @@ pub enum MessageSender {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default)]
+    pub message_id: Option<ChatMessageId>,
     pub timestamp: u64,
     pub sender: MessageSender,
     pub content: String,
@@ -2829,6 +2842,14 @@ pub struct ChatMessage {
     pub token_usage: Option<TokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
     pub images: Option<Vec<ImageData>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageMetadataUpdateData {
+    pub message_id: ChatMessageId,
+    pub model_info: Option<ModelInfo>,
+    pub token_usage: Option<TokenUsage>,
+    pub context_breakdown: Option<ContextBreakdown>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

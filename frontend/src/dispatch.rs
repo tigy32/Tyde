@@ -857,6 +857,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
 
                 let entry = ChatMessageEntry {
                     message: protocol::ChatMessage {
+                        message_id: None,
                         timestamp: js_sys::Date::now() as u64,
                         sender: protocol::MessageSender::Error,
                         content: payload.message,
@@ -2366,6 +2367,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.chat_tool_rows.update(|map| {
         map.remove(&agent_id);
     });
+    state.chat_message_rows.update(|map| {
+        map.remove(&agent_id);
+    });
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -2567,6 +2571,15 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 tool_requests: Vec::new(),
             };
             state.push_chat_entry(agent_id.clone(), entry);
+        }
+        ChatEvent::MessageMetadataUpdated(data) => {
+            log::trace!(
+                "dispatch chat_event host={} agent_id={} type=message_metadata_updated message_id={}",
+                host_id,
+                agent_id,
+                data.message_id
+            );
+            state.apply_chat_message_metadata(&agent_id, data);
         }
         ChatEvent::StreamStart(data) => {
             log::trace!(
@@ -3061,6 +3074,9 @@ fn apply_agent_bootstrap(
     state.chat_tool_rows.update(|map| {
         map.remove(&agent_id);
     });
+    state.chat_message_rows.update(|map| {
+        map.remove(&agent_id);
+    });
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -3098,6 +3114,7 @@ fn apply_agent_bootstrap(
                 }
                 let entry = ChatMessageEntry {
                     message: protocol::ChatMessage {
+                        message_id: None,
                         timestamp: js_sys::Date::now() as u64,
                         sender: protocol::MessageSender::Error,
                         content: inner.message,
@@ -3317,6 +3334,108 @@ mod tests {
         assert_eq!(roots[1].root.0, "/repo/root-b");
         assert_eq!(roots[0].entries[0].relative_path, "same.txt");
         assert_eq!(roots[1].entries[0].relative_path, "same.txt");
+    }
+
+    #[test]
+    fn stream_end_then_metadata_updated_patches_existing_row() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let agent_id = AgentId("a-stream-meta".to_owned());
+            let message_id = protocol::ChatMessageId("msg-stream-meta".to_owned());
+
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamStart(protocol::StreamStartData {
+                    message_id: Some(message_id.0.clone()),
+                    agent: "test-agent".to_owned(),
+                    model: Some("gpt-test".to_owned()),
+                }),
+            );
+
+            let chat_message = protocol::ChatMessage {
+                message_id: Some(message_id.clone()),
+                timestamp: 1,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "test-agent".to_owned(),
+                },
+                content: "streamed body".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: chat_message,
+                }),
+            );
+
+            let row_id_before = state
+                .chat_rows
+                .with_untracked(|m| m.get(&agent_id).map(|rows| rows[0].id))
+                .expect("row created by StreamEnd");
+
+            apply_chat_event(
+                &state,
+                "host-1",
+                &agent_id,
+                ChatEvent::MessageMetadataUpdated(protocol::MessageMetadataUpdateData {
+                    message_id: message_id.clone(),
+                    model_info: Some(protocol::ModelInfo {
+                        model: "gpt-test".to_owned(),
+                    }),
+                    token_usage: Some(protocol::TokenUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        total_tokens: 10,
+                        cached_prompt_tokens: None,
+                        cache_creation_input_tokens: None,
+                        reasoning_tokens: None,
+                    }),
+                    context_breakdown: None,
+                }),
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|m| m.get(&agent_id).cloned())
+                .expect("agent rows");
+            assert_eq!(
+                rows.len(),
+                1,
+                "MessageMetadataUpdated must not append a new row after StreamEnd"
+            );
+            assert_eq!(
+                rows[0].id, row_id_before,
+                "row identity preserved by in-place patch"
+            );
+            let entry = rows[0].entry.get_untracked();
+            assert_eq!(entry.message.content, "streamed body");
+            assert!(
+                entry
+                    .message
+                    .model_info
+                    .as_ref()
+                    .is_some_and(|m| m.model == "gpt-test"),
+                "model_info patched"
+            );
+            assert!(
+                entry
+                    .message
+                    .token_usage
+                    .as_ref()
+                    .is_some_and(|t| t.total_tokens == 10),
+                "token_usage patched"
+            );
+        });
     }
 
     #[test]

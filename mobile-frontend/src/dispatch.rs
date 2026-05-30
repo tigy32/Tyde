@@ -493,6 +493,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 }
                 let entry = ChatMessageEntry {
                     message: protocol::ChatMessage {
+                        message_id: None,
                         timestamp: js_sys::Date::now() as u64,
                         sender: protocol::MessageSender::Error,
                         content: payload.message,
@@ -877,6 +878,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.chat_messages.update(|m| {
         m.remove(agent_ref);
     });
+    state.chat_message_index.update(|m| {
+        m.remove(agent_ref);
+    });
     state.streaming_text.update(|m| {
         m.remove(agent_ref);
     });
@@ -1196,9 +1200,16 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 message,
                 tool_requests: Vec::new(),
             };
-            state.chat_messages.update(|messages| {
-                messages.entry(agent_ref.clone()).or_default().push(entry);
-            });
+            state.push_chat_message_entry(&agent_ref, entry);
+        }
+        ChatEvent::MessageMetadataUpdated(data) => {
+            log::trace!(
+                "dispatch chat_event host={} agent_id={} type=message_metadata_updated message_id={}",
+                agent_ref.local_host_id,
+                agent_ref.agent_id,
+                data.message_id
+            );
+            state.apply_chat_message_metadata(&agent_ref, data);
         }
         ChatEvent::StreamStart(data) => {
             state.transient_events.update(|events| {
@@ -1276,9 +1287,7 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 message: data.message,
                 tool_requests,
             };
-            state.chat_messages.update(|messages| {
-                messages.entry(agent_ref.clone()).or_default().push(entry);
-            });
+            state.push_chat_message_entry(&agent_ref, entry);
         }
         ChatEvent::ToolRequest(request) => {
             let tool_entry = ToolRequestEntry {
@@ -1546,6 +1555,9 @@ fn apply_agent_bootstrap(
     state.chat_messages.update(|m| {
         m.remove(&agent_ref);
     });
+    state.chat_message_index.update(|m| {
+        m.remove(&agent_ref);
+    });
     state.streaming_text.update(|m| {
         m.remove(&agent_ref);
     });
@@ -1590,6 +1602,7 @@ fn apply_agent_bootstrap(
                 }
                 let entry = ChatMessageEntry {
                     message: protocol::ChatMessage {
+                        message_id: None,
                         timestamp: js_sys::Date::now() as u64,
                         sender: protocol::MessageSender::Error,
                         content: inner.message,
@@ -1723,6 +1736,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
     match event {
         ChatEvent::TypingStatusChanged(_) => "TypingStatusChanged",
         ChatEvent::MessageAdded(_) => "MessageAdded",
+        ChatEvent::MessageMetadataUpdated(_) => "MessageMetadataUpdated",
         ChatEvent::StreamStart(_) => "StreamStart",
         ChatEvent::StreamDelta(_) => "StreamDelta",
         ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta",
@@ -2401,6 +2415,7 @@ mod wasm_tests {
             created_at_ms: 1,
         };
         let chat_event = protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+            message_id: None,
             timestamp: 2,
             sender: protocol::MessageSender::User,
             content: "Hello".to_owned(),
@@ -2449,5 +2464,243 @@ mod wasm_tests {
             .unwrap_or_default();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].message.content, "Hello");
+    }
+
+    #[wasm_bindgen_test]
+    fn message_metadata_updated_patches_existing_row_in_place() {
+        let state = AppState::new();
+        let agent_ref = AgentRef {
+            local_host_id: LocalHostId("mobile-meta-host".to_owned()),
+            agent_id: AgentId("a-meta".to_owned()),
+        };
+        let message_id = protocol::ChatMessageId("msg-meta-1".to_owned());
+
+        let initial = protocol::ChatMessage {
+            message_id: Some(message_id.clone()),
+            timestamp: 1,
+            sender: protocol::MessageSender::Assistant {
+                agent: "test-agent".to_owned(),
+            },
+            content: "hello world".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        };
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::MessageAdded(initial),
+        );
+
+        let update = protocol::MessageMetadataUpdateData {
+            message_id: message_id.clone(),
+            model_info: Some(protocol::ModelInfo {
+                model: "gpt-test".to_owned(),
+            }),
+            token_usage: Some(protocol::TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                total_tokens: 10,
+                cached_prompt_tokens: None,
+                cache_creation_input_tokens: None,
+                reasoning_tokens: None,
+            }),
+            context_breakdown: None,
+        };
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::MessageMetadataUpdated(update),
+        );
+
+        let rows = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).cloned())
+            .expect("agent rows");
+        assert_eq!(rows.len(), 1, "metadata update must not append a row");
+        assert_eq!(rows[0].message.content, "hello world", "content untouched");
+        assert!(
+            rows[0]
+                .message
+                .model_info
+                .as_ref()
+                .is_some_and(|m| m.model == "gpt-test"),
+            "model_info patched"
+        );
+        assert!(
+            rows[0]
+                .message
+                .token_usage
+                .as_ref()
+                .is_some_and(|t| t.total_tokens == 10),
+            "token_usage patched"
+        );
+        assert!(
+            rows[0].message.context_breakdown.is_none(),
+            "None update fields leave existing value alone"
+        );
+
+        // A follow-up update that only carries context_breakdown must
+        // not stomp on the previously-patched model_info / token_usage.
+        let breakdown = protocol::ContextBreakdown {
+            system_prompt_bytes: 1,
+            tool_io_bytes: 2,
+            conversation_history_bytes: 3,
+            reasoning_bytes: 4,
+            context_injection_bytes: 5,
+            input_tokens: 6,
+            context_window: 8000,
+        };
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::MessageMetadataUpdated(protocol::MessageMetadataUpdateData {
+                message_id: message_id.clone(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: Some(breakdown),
+            }),
+        );
+        let rows = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).cloned())
+            .expect("agent rows");
+        assert!(
+            rows[0]
+                .message
+                .model_info
+                .as_ref()
+                .is_some_and(|m| m.model == "gpt-test"),
+            "prior model_info preserved across partial update"
+        );
+        assert!(
+            rows[0]
+                .message
+                .token_usage
+                .as_ref()
+                .is_some_and(|t| t.total_tokens == 10),
+            "prior token_usage preserved across partial update"
+        );
+        assert!(
+            rows[0]
+                .message
+                .context_breakdown
+                .as_ref()
+                .is_some_and(|c| c.context_window == 8000),
+            "context_breakdown patched"
+        );
+
+        // Unknown message id is a warning, not a crash.
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::MessageMetadataUpdated(protocol::MessageMetadataUpdateData {
+                message_id: protocol::ChatMessageId("missing".to_owned()),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+            }),
+        );
+        let rows_after = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).map(|r| r.len()).unwrap_or(0));
+        assert_eq!(rows_after, 1, "unknown message id must not append a row");
+    }
+
+    #[wasm_bindgen_test]
+    fn stream_end_then_metadata_updated_patches_existing_row() {
+        let state = AppState::new();
+        let agent_ref = AgentRef {
+            local_host_id: LocalHostId("mobile-stream-meta".to_owned()),
+            agent_id: AgentId("a-stream-meta".to_owned()),
+        };
+        let message_id = protocol::ChatMessageId("msg-stream-1".to_owned());
+
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::StreamStart(protocol::StreamStartData {
+                message_id: Some(message_id.0.clone()),
+                agent: "test-agent".to_owned(),
+                model: Some("gpt-test".to_owned()),
+            }),
+        );
+
+        let chat_message = protocol::ChatMessage {
+            message_id: Some(message_id.clone()),
+            timestamp: 1,
+            sender: protocol::MessageSender::Assistant {
+                agent: "test-agent".to_owned(),
+            },
+            content: "streamed body".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        };
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: chat_message,
+            }),
+        );
+
+        let rows_after_stream = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).map(|r| r.len()).unwrap_or(0));
+        assert_eq!(rows_after_stream, 1, "StreamEnd appends one row");
+
+        apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::MessageMetadataUpdated(protocol::MessageMetadataUpdateData {
+                message_id: message_id.clone(),
+                model_info: Some(protocol::ModelInfo {
+                    model: "gpt-test".to_owned(),
+                }),
+                token_usage: Some(protocol::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    total_tokens: 10,
+                    cached_prompt_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                context_breakdown: None,
+            }),
+        );
+
+        let rows = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).cloned())
+            .expect("agent rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "MessageMetadataUpdated must not append a row after StreamEnd"
+        );
+        assert_eq!(rows[0].message.content, "streamed body");
+        assert!(
+            rows[0]
+                .message
+                .model_info
+                .as_ref()
+                .is_some_and(|m| m.model == "gpt-test"),
+            "model_info patched in place"
+        );
+        assert!(
+            rows[0]
+                .message
+                .token_usage
+                .as_ref()
+                .is_some_and(|t| t.total_tokens == 10),
+            "token_usage patched in place"
+        );
     }
 }

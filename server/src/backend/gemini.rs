@@ -1621,6 +1621,7 @@ pub(crate) fn resolve_session_settings(
 
 fn backend_error_message(content: String) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Error,
         content,

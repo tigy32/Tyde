@@ -8,9 +8,9 @@ use crate::types::{
 };
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
-    ChatEvent, CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    ChatEvent, ChatMessage, ChatMessageId, CommandErrorPayload, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
     ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
@@ -159,12 +159,12 @@ impl ProtocolValidator {
                         ),
                     ));
                 }
-                if !host_state.saw_welcome && envelope.seq != 0 {
+                if !host_state.saw_welcome && !matches!(envelope.seq, 0 | 1) {
                     return Err(self.violation(
                         envelope,
                         None,
                         format!(
-                            "HostBootstrap must be first observed host event on {}, got seq {}",
+                            "HostBootstrap must be first observed host event with seq 0 or 1 on {}, got seq {}",
                             envelope.stream, envelope.seq
                         ),
                     ));
@@ -651,6 +651,7 @@ impl ProtocolValidator {
                 saw_agent_start: false,
                 active_stream: None,
                 assistant_turn_open: false,
+                known_message_ids: HashMap::new(),
                 pending_tool_calls: HashMap::new(),
                 cancelled_tool_calls: HashMap::new(),
             },
@@ -1009,25 +1010,51 @@ fn validate_chat_event(
     event: &ChatEvent,
 ) -> Result<(), ProtocolViolation> {
     match event {
-        ChatEvent::MessageAdded(message) => match message.sender {
-            crate::MessageSender::Assistant { .. } => {
-                if !state.pending_tool_calls.is_empty() {
-                    return Err(build_violation(
-                        recent_frames,
-                        envelope,
-                        Some(state.backend_kind),
-                        "received assistant MessageAdded while previous tool requests are still unresolved"
-                            .to_owned(),
-                    ));
+        ChatEvent::MessageAdded(message) => {
+            register_message_id(recent_frames, envelope, state, message)?;
+            match &message.sender {
+                crate::MessageSender::Assistant { .. } => {
+                    if !state.pending_tool_calls.is_empty() {
+                        return Err(build_violation(
+                            recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            "received assistant MessageAdded while previous tool requests are still unresolved"
+                                .to_owned(),
+                        ));
+                    }
+                    state.assistant_turn_open = true;
+                    Ok(())
                 }
-                state.assistant_turn_open = true;
-                Ok(())
+                _ => {
+                    state.assistant_turn_open = false;
+                    Ok(())
+                }
             }
-            _ => {
-                state.assistant_turn_open = false;
-                Ok(())
+        }
+        ChatEvent::MessageMetadataUpdated(update) => {
+            match state.known_message_ids.get(&update.message_id) {
+                Some(KnownMessageKind::Assistant) => Ok(()),
+                Some(KnownMessageKind::Other) => Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "received MessageMetadataUpdated for non-assistant message_id {}",
+                        update.message_id
+                    ),
+                )),
+                None => Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "received MessageMetadataUpdated for unknown message_id {}",
+                        update.message_id
+                    ),
+                )),
             }
-        },
+        }
         ChatEvent::StreamStart(data) => {
             if state.active_stream.is_some() {
                 return Err(build_violation(
@@ -1066,16 +1093,30 @@ fn validate_chat_event(
             }
             Ok(())
         }
-        ChatEvent::StreamEnd(_) => {
-            if state.active_stream.is_none() {
+        ChatEvent::StreamEnd(data) => {
+            let Some(active_stream) = state.active_stream.take() else {
                 return Err(build_violation(
                     recent_frames,
                     envelope,
                     Some(state.backend_kind),
                     "received StreamEnd before StreamStart".to_owned(),
                 ));
+            };
+            if let (Some(expected), Some(actual)) = (
+                active_stream.message_id.as_deref(),
+                data.message.message_id.as_ref().map(|id| id.0.as_str()),
+            ) && expected != actual
+            {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "received StreamEnd message_id {actual} but active stream message_id is {expected}"
+                    ),
+                ));
             }
-            state.active_stream = None;
+            register_message_id(recent_frames, envelope, state, &data.message)?;
             Ok(())
         }
         ChatEvent::ToolRequest(request) => {
@@ -1095,6 +1136,36 @@ fn validate_chat_event(
         | ChatEvent::TaskUpdate(_)
         | ChatEvent::RetryAttempt(_) => Ok(()),
     }
+}
+
+fn register_message_id(
+    recent_frames: &[ObservedFrame],
+    envelope: &Envelope,
+    state: &mut AgentStreamState,
+    message: &ChatMessage,
+) -> Result<(), ProtocolViolation> {
+    let Some(message_id) = &message.message_id else {
+        return Ok(());
+    };
+    let kind = match &message.sender {
+        crate::MessageSender::Assistant { .. } => KnownMessageKind::Assistant,
+        _ => KnownMessageKind::Other,
+    };
+    if let Some(existing) = state.known_message_ids.get(message_id)
+        && *existing != kind
+    {
+        return Err(build_violation(
+            recent_frames,
+            envelope,
+            Some(state.backend_kind),
+            format!(
+                "received message_id {} for {:?} message after it was used for {:?}",
+                message_id, kind, existing
+            ),
+        ));
+    }
+    state.known_message_ids.insert(message_id.clone(), kind);
+    Ok(())
 }
 
 fn validate_tool_request(
@@ -1249,6 +1320,7 @@ struct AgentStreamState {
     saw_agent_start: bool,
     active_stream: Option<ActiveStreamState>,
     assistant_turn_open: bool,
+    known_message_ids: HashMap<ChatMessageId, KnownMessageKind>,
     pending_tool_calls: HashMap<String, String>,
     cancelled_tool_calls: HashMap<String, String>,
 }
@@ -1256,6 +1328,12 @@ struct AgentStreamState {
 #[derive(Debug, Clone)]
 struct ActiveStreamState {
     message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownMessageKind {
+    Assistant,
+    Other,
 }
 
 fn summarize_envelope(envelope: &Envelope) -> String {
@@ -1277,6 +1355,10 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
         ChatEvent::MessageAdded(message) => {
             format!("event=message_added sender={:?}", message.sender)
         }
+        ChatEvent::MessageMetadataUpdated(data) => format!(
+            "event=message_metadata_updated message_id={}",
+            data.message_id
+        ),
         ChatEvent::StreamStart(data) => format!(
             "event=stream_start message_id={:?} agent={:?}",
             data.message_id, data.agent
@@ -1327,6 +1409,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
     match event {
         ChatEvent::TypingStatusChanged(_) => "TypingStatusChanged",
         ChatEvent::MessageAdded(_) => "MessageAdded",
+        ChatEvent::MessageMetadataUpdated(_) => "MessageMetadataUpdated",
         ChatEvent::StreamStart(_) => "StreamStart",
         ChatEvent::StreamDelta(_) => "StreamDelta",
         ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta",
@@ -1344,7 +1427,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{ChatMessage, MessageSender, StreamEndData, StreamStartData, StreamTextDeltaData};
+    use crate::{
+        ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageSender, ModelInfo,
+        StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
+    };
 
     fn host_stream() -> StreamPath {
         StreamPath("/host/test".to_owned())
@@ -1465,6 +1551,7 @@ mod tests {
 
     fn assistant_message(content: &str) -> ChatMessage {
         ChatMessage {
+            message_id: None,
             timestamp: 0,
             sender: MessageSender::Assistant {
                 agent: "assistant".to_owned(),
@@ -1479,12 +1566,24 @@ mod tests {
         }
     }
 
+    fn assistant_message_with_id(id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: Some(ChatMessageId(id.to_owned())),
+            ..assistant_message(content)
+        }
+    }
+
     fn assistant_message_added(content: &str) -> ChatEvent {
         ChatEvent::MessageAdded(assistant_message(content))
     }
 
+    fn assistant_message_added_with_id(id: &str, content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(assistant_message_with_id(id, content))
+    }
+
     fn user_message(content: &str) -> ChatMessage {
         ChatMessage {
+            message_id: None,
             timestamp: 0,
             sender: MessageSender::User,
             content: content.to_owned(),
@@ -1499,6 +1598,31 @@ mod tests {
 
     fn user_message_added(content: &str) -> ChatEvent {
         ChatEvent::MessageAdded(user_message(content))
+    }
+
+    fn user_message_added_with_id(id: &str, content: &str) -> ChatEvent {
+        ChatEvent::MessageAdded(ChatMessage {
+            message_id: Some(ChatMessageId(id.to_owned())),
+            ..user_message(content)
+        })
+    }
+
+    fn metadata_updated(message_id: &str) -> ChatEvent {
+        ChatEvent::MessageMetadataUpdated(MessageMetadataUpdateData {
+            message_id: ChatMessageId(message_id.to_owned()),
+            model_info: Some(ModelInfo {
+                model: "gpt-5-codex".to_owned(),
+            }),
+            token_usage: Some(TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+                cached_prompt_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                reasoning_tokens: Some(0),
+            }),
+            context_breakdown: None,
+        })
     }
 
     fn tool_request(call_id: &str) -> ChatEvent {
@@ -1536,6 +1660,18 @@ mod tests {
         bootstrap.seq = 1;
 
         validator.validate_envelope(&welcome).unwrap();
+        validator.validate_envelope(&bootstrap).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+    }
+
+    #[test]
+    fn post_handshake_host_bootstrap_registers_agent_streams() {
+        let mut validator = ProtocolValidator::new();
+        let mut bootstrap = new_agent_envelope();
+        bootstrap.seq = 1;
+
         validator.validate_envelope(&bootstrap).unwrap();
         validator
             .validate_envelope(&agent_bootstrap_start_envelope())
@@ -1696,6 +1832,91 @@ mod tests {
         validator
             .validate_envelope(&chat_envelope(3, &tool_completed("call-1")))
             .unwrap();
+    }
+
+    #[test]
+    fn accepts_metadata_update_after_known_assistant_message_id() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &assistant_message_added_with_id("msg-1", "hi"),
+            ))
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(2, &metadata_updated("msg-1")))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_metadata_update_for_unknown_message_id() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(1, &metadata_updated("missing-msg")))
+            .expect_err("metadata update without a known message id should be invalid");
+
+        assert!(violation.to_string().contains("unknown message_id"));
+    }
+
+    #[test]
+    fn rejects_metadata_update_for_non_assistant_message_id() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &user_message_added_with_id("user-msg", "hi"),
+            ))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(2, &metadata_updated("user-msg")))
+            .expect_err("metadata update for a user message should be invalid");
+
+        assert!(violation.to_string().contains("non-assistant message_id"));
+    }
+
+    #[test]
+    fn rejects_stream_end_message_id_mismatch() {
+        let mut validator = ProtocolValidator::new();
+
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+        validator
+            .validate_envelope(&chat_envelope(
+                1,
+                &ChatEvent::StreamStart(StreamStartData {
+                    message_id: Some("msg-1".to_owned()),
+                    agent: "assistant".to_owned(),
+                    model: None,
+                }),
+            ))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&chat_envelope(
+                2,
+                &ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message_with_id("msg-2", "hi"),
+                }),
+            ))
+            .expect_err("StreamEnd should preserve the active stream message id");
+
+        assert!(violation.to_string().contains("active stream message_id"));
     }
 
     #[test]

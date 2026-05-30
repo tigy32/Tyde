@@ -1357,6 +1357,7 @@ impl ClaudeInner {
             .unwrap_or_default();
         self.emitter.assistant_message(AssistantMessagePayload {
             agent: AgentName(CLAUDE_AGENT_NAME),
+            message_id: None,
             content,
             reasoning,
             tool_calls,
@@ -5418,6 +5419,7 @@ pub(crate) fn resolve_session_settings(
 
 fn backend_error_message(content: String) -> ChatEvent {
     ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
         timestamp: unix_now_ms(),
         sender: MessageSender::Error,
         content,
