@@ -131,6 +131,7 @@ async fn connect_inner(
         outbound_topic,
         local_salt,
         pending_peer_salt: None,
+        established_peer_salt: None,
         pending_data_frames: VecDeque::new(),
         outbound_rx,
         inbound_tx,
@@ -488,6 +489,7 @@ struct MqttActor {
     outbound_topic: String,
     local_salt: [u8; SESSION_SALT_LEN],
     pending_peer_salt: Option<[u8; SESSION_SALT_LEN]>,
+    established_peer_salt: Option<[u8; SESSION_SALT_LEN]>,
     pending_data_frames: VecDeque<PendingDataFrame>,
     outbound_rx: OutboundReceiver<OutboundChunk>,
     inbound_tx: mpsc::Sender<InboundEvent>,
@@ -547,12 +549,15 @@ impl MqttActor {
         let peer_salt = match self.config.role {
             ParticipantRole::Host => {
                 let peer_salt = self.await_peer_salt().await?;
+                self.established_peer_salt = Some(peer_salt);
                 self.publish_local_salt().await?;
                 peer_salt
             }
             ParticipantRole::Client => {
                 self.publish_local_salt().await?;
-                self.await_peer_salt_with_client_retries().await?
+                let peer_salt = self.await_peer_salt_with_client_retries().await?;
+                self.established_peer_salt = Some(peer_salt);
+                peer_salt
             }
         };
         let (host_salt, client_salt) = match self.config.role {
@@ -871,9 +876,7 @@ impl MqttActor {
             Event::Incoming(Packet::Publish(publish)) => {
                 let frame = self.decode_publish(publish)?;
                 match frame {
-                    TransportFrame::Handshake { .. } => Err(MqttTransportError::Framing(
-                        FramingError::HandshakeAfterSession,
-                    )),
+                    TransportFrame::Handshake { salt } => self.handle_post_session_handshake(salt),
                     TransportFrame::Data {
                         counter,
                         ciphertext_with_tag,
@@ -893,6 +896,30 @@ impl MqttActor {
             }
             Event::Incoming(_) | Event::Outgoing(_) => Ok(()),
         }
+    }
+
+    fn handle_handshake_before_session(
+        &mut self,
+        salt: [u8; SESSION_SALT_LEN],
+    ) -> Result<(), MqttTransportError> {
+        if self.established_peer_salt.is_some() {
+            return self.handle_post_session_handshake(salt);
+        }
+
+        self.pending_peer_salt = Some(salt);
+        Ok(())
+    }
+
+    fn handle_post_session_handshake(
+        &self,
+        salt: [u8; SESSION_SALT_LEN],
+    ) -> Result<(), MqttTransportError> {
+        validate_post_session_handshake(self.established_peer_salt, salt)?;
+        tracing::debug!(
+            role = ?self.config.role,
+            "MQTT duplicate peer handshake ignored after session established"
+        );
+        Ok(())
     }
 
     fn decode_publish(&self, publish: Publish) -> Result<TransportFrame, MqttTransportError> {
@@ -1035,7 +1062,7 @@ impl MqttActor {
                 }
                 Event::Incoming(Packet::Publish(publish)) => match self.decode_publish(publish)? {
                     TransportFrame::Handshake { salt } => {
-                        self.pending_peer_salt = Some(salt);
+                        self.handle_handshake_before_session(salt)?;
                     }
                     TransportFrame::Data {
                         counter,
@@ -1207,6 +1234,19 @@ impl PublishPacer {
             delay_ms = delay.as_millis(),
             "MQTT broker quota exceeded; pacing subsequent publishes"
         );
+    }
+}
+
+fn validate_post_session_handshake(
+    established_peer_salt: Option<[u8; SESSION_SALT_LEN]>,
+    salt: [u8; SESSION_SALT_LEN],
+) -> Result<(), MqttTransportError> {
+    if established_peer_salt == Some(salt) {
+        Ok(())
+    } else {
+        Err(MqttTransportError::Framing(
+            FramingError::HandshakeAfterSession,
+        ))
     }
 }
 
@@ -1562,6 +1602,36 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_same_salt_after_session_is_ignored() -> Result<(), Box<dyn Error>> {
+        validate_post_session_handshake(Some(CLIENT_SALT), CLIENT_SALT)?;
+        Ok(())
+    }
+
+    #[test]
+    fn different_salt_after_session_fails() -> Result<(), Box<dyn Error>> {
+        let err = validate_post_session_handshake(Some(CLIENT_SALT), [0x23; SESSION_SALT_LEN])
+            .err()
+            .ok_or("different salt unexpectedly accepted")?;
+        assert!(matches!(
+            err,
+            MqttTransportError::Framing(FramingError::HandshakeAfterSession)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_established_salt_after_session_fails() -> Result<(), Box<dyn Error>> {
+        let err = validate_post_session_handshake(None, CLIENT_SALT)
+            .err()
+            .ok_or("missing established salt unexpectedly accepted")?;
+        assert!(matches!(
+            err,
+            MqttTransportError::Framing(FramingError::HandshakeAfterSession)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn default_tls_roots_include_static_webpki_roots() {
         let roots = default_root_cert_store();
         assert!(
@@ -1690,6 +1760,52 @@ mod tests {
         let mut received = vec![0_u8; "hello after delayed host".len()];
         host.read_exact(&mut received).await?;
         assert_eq!(received, b"hello after delayed host");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_client_handshake_after_ready_preserves_data_stream()
+    -> Result<(), Box<dyn Error>> {
+        let _broker_guard = BROKER_TEST_LOCK.lock().await;
+        let broker = start_tls_broker(None)?;
+        let room = RoomId([0x3d; 16]);
+        let psk = PreSharedKey([0xd1; 32]);
+        let (mut host, mut client) = connect_pair(&broker, room, psk.clone(), psk).await?;
+
+        publish_raw(
+            &broker,
+            &client_to_host_topic(&room),
+            encode_handshake_frame(&CLIENT_SALT),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client.write_all(b"data after duplicate handshake").await?;
+        client.flush().await?;
+        let mut received = vec![0_u8; b"data after duplicate handshake".len()];
+        timeout(Duration::from_secs(5), host.read_exact(&mut received)).await??;
+        assert_eq!(received, b"data after duplicate handshake");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn different_client_handshake_after_ready_fails_stream() -> Result<(), Box<dyn Error>> {
+        let _broker_guard = BROKER_TEST_LOCK.lock().await;
+        let broker = start_tls_broker(None)?;
+        let room = RoomId([0x3e; 16]);
+        let psk = PreSharedKey([0xd2; 32]);
+        let (mut host, _client) = connect_pair(&broker, room, psk.clone(), psk).await?;
+
+        publish_raw(
+            &broker,
+            &client_to_host_topic(&room),
+            encode_handshake_frame(&[0x23; SESSION_SALT_LEN]),
+        )
+        .await?;
+
+        let mut buf = [0_u8; 1];
+        let read_result = timeout(Duration::from_secs(5), host.read(&mut buf)).await?;
+        assert_handshake_after_session(read_result.err())?;
         Ok(())
     }
 
@@ -2184,6 +2300,21 @@ mod tests {
         assert!(matches!(
             *transport,
             MqttTransportError::Crypto(CryptoError::AeadFailure)
+        ));
+        Ok(())
+    }
+
+    fn assert_handshake_after_session(err: Option<std::io::Error>) -> Result<(), Box<dyn Error>> {
+        let err = err.ok_or("expected handshake-after-session read error")?;
+        let inner = err
+            .into_inner()
+            .ok_or("expected MqttTransportError inside io::Error")?;
+        let transport = inner
+            .downcast::<MqttTransportError>()
+            .map_err(|inner| format!("expected MqttTransportError, got {inner:?}"))?;
+        assert!(matches!(
+            *transport,
+            MqttTransportError::Framing(FramingError::HandshakeAfterSession)
         ));
         Ok(())
     }
