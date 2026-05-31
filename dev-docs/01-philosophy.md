@@ -33,23 +33,29 @@ is wrong.
    reinterpret state, or manually parse ad hoc payloads. If Tauri has protocol
    awareness beyond "deserialize, dispatch, serialize," the layering is wrong.
 
-5. **State flows through events, not hidden caches.**
+5. **Tyde must not fight the backend.**
+   Tyde is a UI/protocol layer over agent backends, not a replacement for
+   backend-native features. Map native capabilities into typed protocol and UI
+   surfaces, especially Claude-native tools like `AskUserQuestion`, while
+   preserving the backend's native semantics and result shapes.
+
+6. **State flows through events, not hidden caches.**
    Initial state and live updates use the same event model. Subscriptions come
    first, then the server replays current state as events. Caches and mirrors
    are a smell unless they are strictly derived and unavoidable.
 
-6. **Do not cache by default.**
+7. **Do not cache by default.**
    Read from the source of truth directly unless profiling or tests prove a
    cache is necessary. Default caches create coherence bugs, race conditions,
    and hidden invalidation rules. Add a cache only after the uncached path is
    measured and shown to be too slow.
 
-7. **Ownership must be explicit in the protocol.**
+8. **Ownership must be explicit in the protocol.**
    If a session, project, or event belongs to a host, that ownership is encoded
    directly in the protocol — not inferred indirectly or patched in later.
    Routing should be obvious from typed data.
 
-8. **Everything must use protocol types end-to-end.**
+9. **Everything must use protocol types end-to-end.**
    Host actors, registries, and connection handlers pass protocol enums/payloads
    directly. Do not translate protocol frames into parallel app-level structs
    that duplicate shape and semantics. If we need additional variants, add them

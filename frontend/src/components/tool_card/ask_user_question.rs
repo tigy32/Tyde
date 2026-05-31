@@ -668,6 +668,51 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn failed_completion_renders_non_interactive_card() {
+        // A question that completes with `success=false` (and a non-`Error`
+        // result, so the dispatcher's `Error` short-circuit does not fire) is no
+        // longer answerable. Mirror mobile: render the normal completion body,
+        // not the interactive card.
+        let entry = ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_type: single_select_req(),
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_result: ToolExecutionResult::Other {
+                    result: serde_json::json!({ "error": "question failed" }),
+                },
+                success: false,
+                error: Some("question failed".to_owned()),
+            }),
+        };
+        let container = mount_with_state(move || view! { <ToolCardView entry=entry /> }.into_any());
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".ask-question-option")
+                .unwrap()
+                .is_none(),
+            "failed question must not render interactive options"
+        );
+        assert!(
+            container
+                .query_selector(".ask-question-submit")
+                .unwrap()
+                .is_none(),
+            "failed question must not render the submit button"
+        );
+        assert!(
+            text(&container).contains("Failed"),
+            "failed status should remain visible in the header"
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn submit_disabled_until_an_option_is_chosen() {
         let req = single_select_req();
         let container = mount_with_state(move || render(&req, None, ToolOutputMode::Summary));

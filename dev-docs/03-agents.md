@@ -760,6 +760,13 @@ pub trait Backend: Send + 'static {
   compile time. The trait uses `impl Future` (not `async fn` in trait) by
   design.
 
+The trait has since grown beyond this minimal sketch. In addition to
+`session_id()` / `resume()` / `list_sessions()` from `05-session-resume.md`, it
+exposes `interrupt(&self) -> bool` (cooperative cancel of the active turn,
+returns `false` if unsupported) and `shutdown(self)` (hard teardown). The agent
+actor type-erases these through a `BackendSender` so the actor loop can drive
+any concrete backend.
+
 ### EventStream
 
 Separate type for reading `ChatEvent`s from the backend:
@@ -789,8 +796,12 @@ pub enum AgentInput {
 }
 ```
 
-Currently has one variant. Will grow as capabilities expand (`Cancel`,
-`Interrupt`, etc).
+`AgentInput` models *content* sent to the backend. Out-of-band control such as
+interrupt is **not** an `AgentInput` variant — it is a separate `Backend`
+capability (`interrupt()`), dispatched to the agent actor as
+`AgentCommand::Interrupt`. See `22-claude-persistent-process.md` for how the
+Claude backend implements interrupt as a cooperative control_request over a
+long-lived process.
 
 ### BackendKind dispatch
 
@@ -1161,7 +1172,14 @@ Add variants when error scenarios are implemented, not preemptively.
 
 ### What about `interrupt_agent` / `cancel_agent` / `terminate_agent`?
 
-Deferred. Will be designed when needed.
+Implemented. Interrupt is a first-class capability:
+`FrameKind::Interrupt` + `InterruptPayload` on the agent stream → host/router →
+`AgentCommand::Interrupt` → `Backend::interrupt()`, which reports an
+`InterruptOutcome`. Each backend maps it onto its native cancel
+(`SessionCommand::CancelConversation`). The wire-visible result is an
+`OperationCancelled` `ChatEvent` followed by `TypingStatusChanged(false)`. See
+`22-claude-persistent-process.md` for the Claude backend's interrupt
+implementation. Hard termination (`CloseAgent` / `shutdown`) is separate.
 
 ### What about `reasoning` deltas?
 

@@ -1,0 +1,307 @@
+# Persistent Claude Code Process
+
+This document specifies the move from a **per-turn** Claude Code subprocess to a
+single **long-lived** Claude Code process per agent session. It builds on
+`03-agents.md` (backend abstraction, turn lifecycle), `05-session-resume.md`
+(session identity / resume), and the interrupt plumbing already present in the
+protocol, client, and agent actor.
+
+The core change is **isolated to the Claude backend**
+(`server/src/backend/claude.rs`) and introduces **no wire-protocol or client
+changes**. The persistent process additionally enables a native
+`AskUserQuestion` bridge (§2.5) that reuses the existing question cards; the only
+frontend touch is a failure-rendering refinement to those cards (§6.4). See §6
+for the full UI/client/protocol analysis.
+
+---
+
+## 1. Motivation
+
+The current Claude backend spawns a fresh `claude --print --output-format
+stream-json --input-format stream-json [--resume <id>]` process for **every
+turn**:
+
+- The user message is written to the child's stdin, then stdin is closed
+  (`drop(stdin)`).
+- The turn is considered finished when the **process exits** (`child.wait()`).
+- Interrupt is implemented by **killing the child** (`child.kill()`).
+- Cross-turn continuity is achieved by passing `--resume <session_id>` to each
+  new process so it reloads history from disk.
+
+This has real costs:
+
+- **Per-turn cold start.** Every turn re-spawns the CLI, reloads the session
+  transcript from disk, re-initializes MCP servers, and re-reads system prompt /
+  agent definitions. That latency is paid on every message.
+- **Resume-replay churn.** Reloading history per turn is the reason the agent
+  actor has to compact re-emitted historical events on resume.
+- **Interrupt = process death.** Killing the process to cancel a turn throws
+  away the warm session and forces the next turn to cold-start and re-resume.
+
+A long-lived process eliminates the per-turn cold start, keeps MCP servers and
+the loaded transcript warm, and lets interrupt be a cooperative cancel that
+leaves the session alive.
+
+---
+
+## 2. Target Design
+
+One Claude Code process lives for the **lifetime of the agent backend**, driven
+over the stream-json **control protocol** on a persistent stdin/stdout pipe.
+
+### 2.1 Spawn
+
+- Spawn `claude` once, with the existing streaming flags
+  (`--print --verbose --output-format stream-json --input-format stream-json
+  --include-partial-messages`) plus `--permission-prompt-tool stdio` and the
+  model / effort / MCP / agent-identity / steering / tool-policy args already
+  assembled today.
+- stdin stays **open** for the life of the process. It is never dropped after a
+  message; that is what keeps the session alive between turns.
+- Permissions use `--permission-prompt-tool stdio` **together with** the
+  configured permission mode (`--permission-mode <mode>`, defaulting to
+  `bypassPermissions`, which additionally adds `--dangerously-skip-permissions`).
+  These are not an either/or: the `stdio` prompt tool is what routes tool
+  permission decisions (and the native `AskUserQuestion` bridge, see §2.5)
+  through the control channel, while the permission mode governs the danger
+  gating. The backend answers each `can_use_tool` control_request on the control
+  channel — auto-`allow` (echoing `updatedInput`) for ordinary tools, and the
+  interactive bridge for `AskUserQuestion`. The policy is recorded in the
+  backend, not the protocol.
+- If the control protocol requires an `initialize` control_request at startup,
+  the backend issues it immediately after spawn and waits for the matching
+  control_response before accepting user input.
+
+### 2.2 A turn
+
+- A user message is sent as a stream-json `user` message on the **already-open**
+  stdin. stdin is **not** closed.
+- Streaming output (`StreamStart` / deltas / tool events) is read off the
+  persistent stdout exactly as today.
+- The turn ends on the **`result`** event, **not** on process EOF. The backend
+  treats `result` as the turn boundary that produces `StreamEnd` /
+  `TypingStatusChanged(false)` and finalizes usage/context-window from the
+  `result` payload (the `result_*` summary fields already do this).
+- The process staying alive across turns means **no per-turn `--resume`** and no
+  per-turn re-spawn.
+
+### 2.3 Interrupt
+
+- Interrupt is a stream-json **`control_request` with subtype `interrupt`**
+  written to the persistent stdin, replacing today's `child.kill()`.
+- The process **stays alive**. Claude finalizes the in-flight turn (emitting a
+  terminal `result`) and returns to idle, ready for the next user message.
+- The backend's existing `SessionCommand::CancelConversation` →
+  `Backend::interrupt()` path is reused; only its *implementation* changes from
+  "kill the child" to "send the control_request". The wire-visible event
+  sequence is unchanged (see §6.2).
+
+### 2.4 Session id and resume
+
+- **New sessions** pre-assign their id: the spawn passes
+  `--session-id <fresh uuid>`, generated by Tyde. This means `session_id()` is
+  known immediately at spawn — satisfying the `05-session-resume.md` invariant
+  that the constructor not return until the session id is known — without having
+  to wait for the CLI to emit one.
+- **Resume / restart** uses a **single** `--resume <existing_id>` at process
+  **spawn**. There is no per-turn resume. The same `--resume <id>` path is taken
+  when the persistent process is intentionally re-spawned (after an idle exit, or
+  after a setting change that requires a fresh process — see §4): the committed
+  `session_id` is replayed so the warm session is restored transparently.
+- `--session-id <existing_id>` is **not** used as a *resume* mechanism (only to
+  seed a brand-new session) unless a haiku validation run proves it actually
+  loads prior history. Absent that proof, `--resume` remains the contract
+  required by `05-session-resume.md` (`Backend::resume` must attach to the exact
+  existing session and `session_id()` must report the same id).
+
+### 2.5 Native `AskUserQuestion` bridge
+
+The `--permission-prompt-tool stdio` channel is what makes Claude's native
+`AskUserQuestion` tool interactive without inventing any new wire types. The
+backend bridges it onto the **existing** `ToolRequest` / `AskUserQuestion`
+protocol surface and the **existing** `SendMessage` answer path:
+
+1. **Ask.** Claude emits a `can_use_tool` control_request whose tool is
+   `AskUserQuestion`. The backend recognizes it (rather than auto-allowing), holds
+   the pending control_request, and emits, on the agent stream:
+   - a `StreamEnd` that closes the current assistant turn with the tool call
+     attached,
+   - a `ToolRequest` with `ToolRequestType::AskUserQuestion { questions }` (the
+     same typed payload the desktop and mobile cards already render), and
+   - `TypingStatusChanged(false)` — the agent goes idle, waiting on the human.
+2. **Answer.** The user submits the card, which sends a normal `SendMessage` (the
+   chosen labels / custom text composed into a plain message). The backend
+   intercepts that `SendMessage` while a question is pending and treats it as the
+   answer instead of starting a new turn: it emits the user `MessageAdded`, a
+   `ToolExecutionCompleted` for the question, and `TypingStatusChanged(true)`,
+   then writes the **control_response** (`behavior: "allow"` with the answer
+   folded into `updatedInput`) back on the persistent stdin. Claude resumes from
+   exactly where it asked.
+
+Consequences for the rest of the system:
+
+- **No protocol or wire change.** `AskUserQuestion` / `AskUserQuestionOption`,
+  `ToolRequest`, `ToolExecutionCompleted`, and `SendMessage` all already exist in
+  `protocol/src/types.rs`. The bridge is entirely inside the Claude backend.
+- **No client change.** The card answers through the ordinary `SendMessage`
+  envelope; the client never knows a control_request is involved.
+- **Single live question at a time.** A second `AskUserQuestion` while one is
+  still pending is rejected by the backend (it denies the duplicate
+  control_request). The persistent process is required: the answer is delivered
+  as a control_response to the *same* live process that asked, which a per-turn
+  process could not do.
+- **Failure rendering is a frontend concern.** If the question completes with a
+  failed `ToolExecutionCompleted`, the frontends render the normal failed
+  tool-completion card instead of the interactive one (see the desktop/mobile
+  tool-card renderers).
+
+---
+
+## 3. Turn-end signal: `result`, not EOF
+
+This is the single most important behavioral change and the one the rest of the
+system implicitly depends on.
+
+- **Old:** "turn done" ⇔ child process exited. The `result` event populated
+  summary fields but the *boundary* was the EOF.
+- **New:** "turn done" ⇔ `result` event observed on the persistent stdout. The
+  process keeps running.
+
+Everything downstream of the backend (the agent actor's replay log, the
+`StreamEnd` / `TypingStatusChanged(false)` events, usage and context-window
+accounting) is driven by the backend emitting the same `ChatEvent`s at the same
+logical moment. Because the backend already extracts `result_text`,
+`result_cumulative_usage`, and `result_context_window` from the `result` event,
+the turn-finalization data is already sourced from `result`; only the lifecycle
+trigger moves off the process exit.
+
+---
+
+## 4. Failure modes
+
+A persistent process introduces a failure surface the per-turn model did not
+have: the process can die *between* turns or *mid*-stream. The two cases are
+handled differently, by **when** the exit happens:
+
+- **Idle exit** (process EOF with no active turn): not a failure. The backend
+  simply clears the dead process handle; the next turn lazily re-spawns via
+  `ensure_process_ready` and `--resume <session_id>` (§2.4), transparently
+  restoring the warm session. This is a deliberate, bounded re-spawn of a process
+  whose session is recoverable from disk — not a speculative fallback that masks
+  an error. The same lazy re-spawn services an intentional shutdown after a
+  setting change (model/effort/permission-mode), which tears the process down at
+  the end of the turn so the next turn starts it with the new flags.
+- **Active-turn exit** (process EOF *before* a `result` for the in-flight turn):
+  the turn **fails**. The backend completes that turn as `TurnOutcome::Failed`
+  ("Claude process exited before returning a result") — or `Cancelled` if the
+  turn was already interrupting — surfaces the error on the turn via the backend
+  error event, and ends typing. The agent itself is not torn down; the cleared
+  process handle means the *next* message re-spawns and resumes. The failure is
+  visible and scoped to the affected turn, per `02-protocol.md` §6.2.
+- **`result` carries an error**: handled as today via
+  `extract_result_error` → `TurnOutcome::Failed`, surfaced as a non-fatal or
+  fatal `AgentError` as appropriate; the process may remain usable.
+- **Interrupt control_request not acknowledged**: if the control channel does
+  not confirm the interrupt, `Backend::interrupt()` returns `false`, which the
+  agent actor already turns into
+  `AgentError { code: internal, "agent backend does not support interrupt",
+  fatal: false }`.
+- **Shutdown**: closing the agent (`CloseAgent`) shuts the process down
+  explicitly via the existing `shutdown()` path rather than relying on stdin
+  drop.
+
+---
+
+## 5. Why this is Claude-only
+
+`03-agents.md` defines `Backend` as the abstraction boundary. Process lifecycle,
+stdin discipline, control-protocol framing, and resume flags are all **internal
+to the concrete backend**. The agent actor only ever calls `send()`,
+`interrupt()`, `session_id()`, and `shutdown()` and consumes `ChatEvent`s. None
+of those signatures or their semantics change, so Codex, Gemini, Kiro, Tycode,
+and Mock are untouched.
+
+---
+
+## 6. UI / client / protocol impact: none
+
+The persistent-process change is invisible above the `Backend` trait. Concretely:
+
+### 6.1 Interrupt is already wired end-to-end
+
+The interrupt path predates this change and is fully implemented:
+
+- **Protocol:** `FrameKind::Interrupt` and `InterruptPayload` exist in
+  `protocol/src/types.rs` (the source of truth).
+- **Client:** `client` exposes `interrupt(stream)` / `interrupt_stream()` and
+  the runtime's `interrupt()`, which send a `FrameKind::Interrupt` envelope on
+  the agent stream.
+- **Frontends:** both desktop (`frontend/src/components/chat_input.rs`) and
+  mobile (`mobile-frontend/src/components/chat_view.rs` /
+  `chat_input.rs` / `actions.rs`) drive interrupt/steer off `is_thinking`
+  (i.e. `TypingStatusChanged`).
+- **Server:** the host/router route `Interrupt` to the agent actor as
+  `AgentCommand::Interrupt`, which calls `Backend::interrupt()` and reports an
+  `InterruptOutcome`.
+
+No new frame kind, payload, client method, or UI control is needed — the feature
+re-implements the *backend side* of an interrupt contract that already exists on
+the wire.
+
+### 6.2 Wire-visible turn/interrupt semantics are preserved
+
+The frontend's only contract with turn boundaries and cancellation is the
+`ChatEvent` stream:
+
+- Turn activity is signaled exclusively by `TypingStatusChanged(bool)`
+  (`03-agents.md` §8). Whether the turn ends because the process exited (old) or
+  because a `result` arrived (new), the backend still emits the same
+  `StreamEnd` + `TypingStatusChanged(false)`.
+- Interrupt still produces `OperationCancelled` followed by
+  `TypingStatusChanged(false)` (the Claude backend's interrupt is a quiescence
+  barrier that publishes idle before returning). The UI renders the cancellation
+  identically.
+
+Because the backend emits the same events at the same logical points, the UI is
+a pure projection of unchanged state.
+
+### 6.3 Reconnect / replay unaffected
+
+Multi-frontend replay and reconnect are owned by the **agent actor's** replay
+log (`03-agents.md` §2, §9), not by the backend process. A subscriber that
+joins or reattaches replays the same compacted semantic history regardless of
+whether one warm process or many per-turn processes produced it. Mobile MQTT
+reconnect (`02-protocol.md` §1) is a transport concern below the agent stream
+and is likewise unaffected.
+
+### 6.4 Conclusion
+
+**The persistent-process and interrupt change needs no protocol, client, or
+frontend changes** — it is confined to `server/src/backend/claude.rs`. If
+implementation reveals that interrupt or turn-end produces a *different*
+observable `ChatEvent` sequence than today, that is a backend bug to fix so the
+existing contract holds — not a reason to change the wire or the UI.
+
+The **`AskUserQuestion` bridge** (§2.5) likewise needs no protocol or client
+change and reuses the existing desktop and mobile question cards. The only
+frontend refinement it warrants is failure rendering: a question that completes
+with `success=false` is no longer answerable, so the tool card renders the
+normal failed/raw completion body instead of the interactive card. Mobile
+already gated on `result.success`; desktop now matches it (a `ToolExecutionResult::Error`
+result was already short-circuited to the error card, and a non-`Error`
+`success=false` result now renders the raw result rather than an un-answerable
+card).
+
+---
+
+## 7. Validation
+
+- Lightweight, non-billing checks (compile, clippy, the existing wasm UI tests)
+  cover the client/frontend side; none of them should change behavior.
+- Real-agent verification of turn-end-on-`result` and cooperative interrupt
+  belongs to the Claude `backend.rs` tests and should be run with **haiku** to
+  keep cost low, per `AGENTS.md` §3 (only the touched backend's `backend.rs`
+  tests run, and only when that backend changes).
+- End-to-end behavior (start a turn, interrupt mid-stream, confirm the agent
+  goes idle and accepts a follow-up without a cold start) should be exercised
+  against a live dev instance via the `tyde-debug` MCP.

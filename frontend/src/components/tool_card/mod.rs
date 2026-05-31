@@ -221,6 +221,7 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
 
     let has_result = result.is_some();
     let result_success = result.as_ref().map(|r| r.success).unwrap_or(false);
+    let result_failed = has_result && !result_success;
 
     let status_class = if !has_result {
         "tool-status-text pending"
@@ -294,7 +295,7 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
                         let mode = tool_output_mode.get();
                         body_tool_type_slot.with_value(|body_tool_type| {
                             body_result_slot.with_value(|body_result| {
-                                render_body(body_tool_type, body_result.as_ref(), mode)
+                                render_body(body_tool_type, body_result.as_ref(), mode, result_failed)
                             })
                         })
                     }}
@@ -315,6 +316,7 @@ fn render_body(
     req: &ToolRequestType,
     result: Option<&ToolExecutionResult>,
     mode: ToolOutputMode,
+    result_failed: bool,
 ) -> AnyView {
     if let Some(ToolExecutionResult::Error { .. }) = result {
         return error_result::render(result.unwrap(), mode).into_any();
@@ -326,11 +328,31 @@ fn render_body(
         ToolRequestType::ReadFiles { .. } => read_files::render(req, result, mode).into_any(),
         ToolRequestType::SearchTypes { .. } => search_types::render(req, result, mode).into_any(),
         ToolRequestType::GetTypeDocs { .. } => get_type_docs::render(req, result, mode).into_any(),
+        // A failed completion for a question is no longer answerable: render the
+        // raw result instead of the interactive card, mirroring the mobile tool
+        // card. The realistic failure carries `ToolExecutionResult::Error`, which
+        // the shell short-circuits above; this arm covers a non-`Error` result
+        // that still reports `success=false`.
+        ToolRequestType::AskUserQuestion { .. } if result_failed => {
+            failed_result_body(result).into_any()
+        }
         ToolRequestType::AskUserQuestion { .. } => {
             ask_user_question::render(req, result, mode).into_any()
         }
         ToolRequestType::Other { .. } => other::render(req, result, mode).into_any(),
     }
+}
+
+/// Body for a tool whose request kind has an interactive renderer (currently
+/// only `AskUserQuestion`) but whose completion failed, so the interactive UI
+/// must not show. `Error` results are handled by the shell's short-circuit; this
+/// renders any other non-success result as raw JSON.
+fn failed_result_body(result: Option<&ToolExecutionResult>) -> AnyView {
+    let Some(result) = result else {
+        return ().into_any();
+    };
+    let pretty = serde_json::to_string_pretty(result).unwrap_or_else(|_| format!("{result:?}"));
+    view! { <pre class="tool-raw-result">{pretty}</pre> }.into_any()
 }
 
 // ── Header bits ─────────────────────────────────────────────────────────
