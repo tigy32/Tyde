@@ -3,7 +3,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 pub use host_config::{HostDisconnectedEvent, HostErrorEvent, HostLineEvent};
-pub use mobile_shell_types::{PairedHostConnectionStatusEvent, PairedHostsChangedEvent};
+pub use mobile_shell_types::{
+    KnownConnectionInstance, PairedHostConnectionStatusEvent, PairedHostsChangedEvent,
+};
 
 use crate::state::{LocalHostId, MobilePairingPreview, MobileShellError, PairedHostSummary};
 
@@ -58,6 +60,12 @@ struct SendHostLineRequest<'a> {
 struct AckHostLineRequest<'a> {
     local_host_id: &'a LocalHostId,
     delivery_id: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FrontendAttachedRequest<'a> {
+    known_connection_instance_ids: &'a [KnownConnectionInstance],
 }
 
 // --- Command invocations ---
@@ -164,8 +172,14 @@ pub async fn ack_host_line(local_host_id: &LocalHostId, delivery_id: u64) -> Res
     invoke_unit("ack_host_line", args).await
 }
 
-pub async fn frontend_attached() -> Result<(), String> {
-    invoke_unit("frontend_attached", JsValue::NULL).await
+pub async fn frontend_attached(
+    known_connection_instance_ids: &[KnownConnectionInstance],
+) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&FrontendAttachedRequest {
+        known_connection_instance_ids,
+    })
+    .map_err(|e| e.to_string())?;
+    invoke_unit("frontend_attached", args).await
 }
 
 // --- Barcode scanner ---

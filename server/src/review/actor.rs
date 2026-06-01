@@ -1312,6 +1312,7 @@ impl ReviewActor {
             origin: Some(MessageOrigin::Review {
                 review_id: self.review.id.clone(),
             }),
+            tool_response: None,
         })
     }
 

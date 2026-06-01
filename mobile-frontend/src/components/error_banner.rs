@@ -10,20 +10,28 @@ use crate::state::AppState;
 #[component]
 pub fn MobileShellErrorBanner() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
-    let dismiss_state = state.clone();
-    let on_close = move |_| dismiss_state.mobile_shell_error.set(None);
 
     view! {
         {move || {
             state.mobile_shell_error.get().map(|err| {
                 let code_label = format!("{:?}", err.code);
                 let message = err.message.clone();
-                let close = on_close;
+                let dismiss_state = state.clone();
                 view! {
-                    <div class="mobile-shell-error-banner" role="alert">
+                    <div
+                        class="mobile-shell-error-banner"
+                        role="alert"
+                        data-mobile-test="mobile-shell-error-banner"
+                    >
                         <span class="mobile-shell-error-code">{code_label}</span>
                         <span class="mobile-shell-error-message">{message}</span>
-                        <button class="mobile-shell-error-close" on:click=close>
+                        <button
+                            type="button"
+                            class="mobile-shell-error-close error-banner-dismiss"
+                            data-mobile-test="mobile-shell-error-dismiss"
+                            aria-label="Dismiss error"
+                            on:click=move |_| dismiss_state.mobile_shell_error.set(None)
+                        >
                             "×"
                         </button>
                     </div>
@@ -95,6 +103,30 @@ mod wasm_tests {
             text.contains("scan a real QR"),
             "expected error message visible, got: {text}"
         );
+
+        let close: HtmlElement = container
+            .query_selector("[data-mobile-test='mobile-shell-error-dismiss']")
+            .unwrap()
+            .expect("dismiss button should render")
+            .dyn_into()
+            .unwrap();
+        close.click();
+        next_tick().await;
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "clicking dismiss should clear the shell error signal"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("scan a real QR"),
+            "banner should hide after clicking dismiss, got: {text}"
+        );
+
+        state.mobile_shell_error.set(Some(MobileShellError {
+            code: MobileAccessErrorCode::InvalidPairingQr,
+            message: "scan a real QR".to_owned(),
+        }));
+        next_tick().await;
 
         // Clearing the signal removes the banner.
         state.mobile_shell_error.set(None);

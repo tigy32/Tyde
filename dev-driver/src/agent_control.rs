@@ -576,6 +576,7 @@ async fn run_runtime(
                                 message,
                                 images: None,
                                 origin: None,
+                                tool_response: None,
                             },
                         ).await {
                             Ok(()) => {

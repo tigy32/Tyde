@@ -217,7 +217,18 @@ fn install_event_listeners(state: AppState) {
             .await,
         );
 
-        if let Err(error) = bridge::frontend_attached().await {
+        let known_connection_instance_ids = state
+            .active_connection_instance_ids
+            .get_untracked()
+            .into_iter()
+            .map(
+                |(local_host_id, connection_instance_id)| bridge::KnownConnectionInstance {
+                    local_host_id,
+                    connection_instance_id,
+                },
+            )
+            .collect::<Vec<_>>();
+        if let Err(error) = bridge::frontend_attached(&known_connection_instance_ids).await {
             log::error!("frontend_attached failed: {error}");
             report_shell_error(
                 &state,
@@ -252,6 +263,40 @@ fn install_event_listeners(state: AppState) {
 
 fn handle_host_line_event(state: &AppState, event: bridge::HostLineEvent) {
     let host = LocalHostId(event.host_id);
+    if let Some(connection_instance_id) = event.connection_instance_id {
+        match state
+            .active_connection_instance_ids
+            .get_untracked()
+            .get(&host)
+            .copied()
+        {
+            Some(active_connection_instance_id)
+                if active_connection_instance_id != connection_instance_id =>
+            {
+                log::info!(
+                    "dropping stale host line host={} connection_instance_id={} active_connection_instance_id={}",
+                    host,
+                    connection_instance_id,
+                    active_connection_instance_id
+                );
+                if let Some(delivery_id) = event.delivery_id {
+                    mark_host_line_seen(&host, delivery_id);
+                    ack_host_line_delivery(host, delivery_id);
+                }
+                return;
+            }
+            Some(_) => {}
+            None if event.delivery_id.is_some() => {
+                log::info!(
+                    "deferring host line until connection status arrives host={} connection_instance_id={}",
+                    host,
+                    connection_instance_id
+                );
+                return;
+            }
+            None => {}
+        }
+    }
     let delivery_id = event.delivery_id;
     if let Some(delivery_id) = delivery_id
         && !mark_host_line_seen(&host, delivery_id)
@@ -428,8 +473,9 @@ fn apply_connection_status(
             if same_connection {
                 // Same live connection: just ensure a host is selected.
                 if state.active_local_host_id.get_untracked().is_none() {
-                    state.active_local_host_id.set(Some(host));
+                    state.active_local_host_id.set(Some(host.clone()));
                 }
+                drain_pending_host_lines(state.clone());
                 return;
             }
 
@@ -477,6 +523,7 @@ fn apply_connection_status(
             if state.active_local_host_id.get_untracked().is_none() {
                 state.active_local_host_id.set(Some(host));
             }
+            drain_pending_host_lines(state.clone());
         }
         PairedHostConnectionStatus::Disconnected { reason } => {
             // Terminal: clear tracked instance so the next Connected event
@@ -688,6 +735,7 @@ mod wasm_tests {
                 host_id: host.0.clone(),
                 line: r#"{"stream":"/host/test","kind":"unknown_frame","seq":0,"payload":{}}"#
                     .to_owned(),
+                connection_instance_id: None,
                 delivery_id: None,
             },
         );
@@ -827,10 +875,10 @@ mod wasm_tests {
         );
     }
 
-    /// A `frontend_attached()` call alone — with no actual reconnect — must
-    /// never clear reactive state.  With the native manager no longer
-    /// restarting healthy connections, the frontend receives a Connected
-    /// replay with the same instance id; the stream and data must survive.
+    /// A status replay for an already-known connection must never clear
+    /// reactive state. When the native side preserves a connection the
+    /// frontend receives a Connected replay with the same instance id; the
+    /// stream and data must survive.
     #[wasm_bindgen_test]
     fn frontend_attach_alone_does_not_clear_state() {
         install_tauri_invoke_stub();
@@ -862,9 +910,9 @@ mod wasm_tests {
             });
         });
 
-        // Simulate what install_event_listeners now does: call
-        // frontend_attached() on the native side (no-op in tests), then
-        // receive a Connected status replay with the same instance id.
+        // Simulate receiving a Connected status replay with the same
+        // instance id after telling native that this frontend already knows
+        // about the connection.
         apply_connection_status(
             &state,
             host.clone(),
@@ -1133,6 +1181,46 @@ mod wasm_tests {
         assert!(mark_host_line_seen(&host, 42));
         assert!(!mark_host_line_seen(&host, 42));
         assert!(mark_host_line_seen(&host, 43));
+    }
+
+    #[wasm_bindgen_test]
+    fn stale_host_lines_from_previous_connection_are_ignored() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-stale-line".to_owned());
+
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(1),
+        );
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(2),
+        );
+
+        handle_host_line_event(
+            &state,
+            bridge::HostLineEvent {
+                host_id: host.0.clone(),
+                line: r#"{"not":"an envelope from the active connection"}"#.to_owned(),
+                connection_instance_id: Some(1),
+                delivery_id: Some(12),
+            },
+        );
+
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::Connected),
+            "stale line must not poison the active connection"
+        );
+        assert!(
+            state.mobile_shell_error.get_untracked().is_none(),
+            "stale line must be dropped before parse/protocol validation"
+        );
     }
 
     /// Empty `paired_hosts` → onboarding screen. Adding a host while

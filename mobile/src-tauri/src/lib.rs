@@ -16,8 +16,8 @@ use tauri::{Emitter, Manager};
 use crate::paired_hosts::{PairedHostRecord, credential_fingerprint};
 use crate::psk_store::{PskStore, SystemPskStore};
 use crate::types::{
-    LocalHostId, MobilePairingPreview, MobileShellErrorEvent, PairedHostConnectionStatusEvent,
-    PairedHostSummary, PairedHostsChangedEvent,
+    KnownConnectionInstance, LocalHostId, MobilePairingPreview, MobileShellErrorEvent,
+    PairedHostConnectionStatusEvent, PairedHostSummary, PairedHostsChangedEvent,
 };
 
 const MOBILE_SHELL_ERROR_EVENT: &str = "tyde://mobile-shell-error";
@@ -124,10 +124,11 @@ async fn ack_host_line(
 #[tauri::command]
 async fn frontend_attached(
     state: tauri::State<'_, MobileShellState>,
+    known_connection_instance_ids: Option<Vec<KnownConnectionInstance>>,
 ) -> Result<(), MobileCommandError> {
     state
         .connections
-        .frontend_attached()
+        .frontend_attached(known_connection_instance_ids.unwrap_or_default())
         .await
         .map_err(Into::into)
 }

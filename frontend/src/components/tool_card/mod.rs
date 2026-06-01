@@ -22,6 +22,7 @@ use crate::state::{AppState, StreamingToolRequest, ToolOutputMode, ToolRequestEn
 
 mod ask_user_question;
 mod error_result;
+mod exit_plan_mode;
 mod get_type_docs;
 mod modify_file;
 mod other;
@@ -204,9 +205,11 @@ where
 }
 
 fn is_important_tool(entry: &ToolRequestEntry) -> bool {
+    // Approval-gated tools (questions, plan approval) stay visible even in
+    // collapsed long lists so a successful decision remains discoverable.
     matches!(
         &entry.request.tool_type,
-        ToolRequestType::AskUserQuestion { .. }
+        ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. }
     ) || entry.result.as_ref().is_none_or(|result| !result.success)
 }
 
@@ -216,6 +219,7 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
     let tool_output_mode = state.tool_output_mode;
 
     let tool_name = entry.request.tool_name.clone();
+    let tool_call_id = entry.request.tool_call_id.clone();
     let tool_type = entry.request.tool_type;
     let result = entry.result;
 
@@ -250,6 +254,7 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
     let body_result = result.as_ref().map(|r| r.tool_result.clone());
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
     let body_result_slot = StoredValue::new_local(body_result);
+    let tool_call_id_slot = StoredValue::new_local(tool_call_id);
     let details_open = RwSignal::new(is_ask_user_question || !has_result || !result_success);
     let default_open_for_body = move || {
         is_ask_user_question
@@ -293,9 +298,17 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
                 <div class="tool-card-body">
                     {move || {
                         let mode = tool_output_mode.get();
-                        body_tool_type_slot.with_value(|body_tool_type| {
-                            body_result_slot.with_value(|body_result| {
-                                render_body(body_tool_type, body_result.as_ref(), mode, result_failed)
+                        tool_call_id_slot.with_value(|tool_call_id| {
+                            body_tool_type_slot.with_value(|body_tool_type| {
+                                body_result_slot.with_value(|body_result| {
+                                    render_body(
+                                        tool_call_id,
+                                        body_tool_type,
+                                        body_result.as_ref(),
+                                        mode,
+                                        result_failed,
+                                    )
+                                })
                             })
                         })
                     }}
@@ -313,6 +326,7 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
 /// `Error` renders via `error_result`, regardless of which request kind issued
 /// it.
 fn render_body(
+    tool_call_id: &str,
     req: &ToolRequestType,
     result: Option<&ToolExecutionResult>,
     mode: ToolOutputMode,
@@ -338,6 +352,9 @@ fn render_body(
         }
         ToolRequestType::AskUserQuestion { .. } => {
             ask_user_question::render(req, result, mode).into_any()
+        }
+        ToolRequestType::ExitPlanMode { .. } => {
+            exit_plan_mode::render(tool_call_id, req, result, mode).into_any()
         }
         ToolRequestType::Other { .. } => other::render(req, result, mode).into_any(),
     }
@@ -386,6 +403,10 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
             };
             ("\u{2753}", detail)
         }
+        ToolRequestType::ExitPlanMode { plan_path, .. } => (
+            "\u{1f4dd}",
+            plan_path.clone().or_else(|| Some("Plan".to_owned())),
+        ),
         ToolRequestType::Other { .. } => {
             let icon = match name {
                 n if n.contains("spawn") || n.contains("agent") => "\u{1f916}",
@@ -565,6 +586,16 @@ mod tool_visibility_tests {
         )
     }
 
+    fn completed_exit_plan_entry(idx: usize) -> ToolRequestEntry {
+        completed_entry(
+            idx,
+            ToolRequestType::ExitPlanMode {
+                plan: Some("Step 1".to_owned()),
+                plan_path: Some("docs/plan.md".to_owned()),
+            },
+        )
+    }
+
     #[test]
     fn collapsed_large_lists_keep_successful_ask_questions_visible() {
         let mut entries: Vec<_> = (0..100).map(completed_other_entry).collect();
@@ -576,6 +607,24 @@ mod tool_visibility_tests {
         assert!(
             visible.contains(&40),
             "successful AskUserQuestion should remain visible in collapsed lists"
+        );
+        assert!(
+            !visible.contains(&41),
+            "nearby successful non-important tool should stay hidden"
+        );
+    }
+
+    #[test]
+    fn collapsed_large_lists_keep_successful_exit_plan_mode_visible() {
+        let mut entries: Vec<_> = (0..100).map(completed_other_entry).collect();
+        entries[40] = completed_exit_plan_entry(40);
+
+        let visible =
+            visible_tool_indexes(entries.len(), false, |idx| is_important_tool(&entries[idx]));
+
+        assert!(
+            visible.contains(&40),
+            "successful ExitPlanMode should remain discoverable in collapsed lists"
         );
         assert!(
             !visible.contains(&41),

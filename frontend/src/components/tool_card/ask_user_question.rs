@@ -290,6 +290,7 @@ fn send_answer(
             message,
             images: None,
             origin: None,
+            tool_response: None,
         };
         match send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
             Ok(()) => {

@@ -209,6 +209,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
             message: follow_up.to_owned(),
             images: None,
             origin: None,
+            tool_response: None,
         })
         .await
         .expect("follow-up send should succeed");

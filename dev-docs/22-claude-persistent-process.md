@@ -6,12 +6,12 @@ single **long-lived** Claude Code process per agent session. It builds on
 (session identity / resume), and the interrupt plumbing already present in the
 protocol, client, and agent actor.
 
-The core change is **isolated to the Claude backend**
-(`server/src/backend/claude.rs`) and introduces **no wire-protocol or client
-changes**. The persistent process additionally enables a native
-`AskUserQuestion` bridge (§2.5) that reuses the existing question cards; the only
-frontend touch is a failure-rendering refinement to those cards (§6.4). See §6
-for the full UI/client/protocol analysis.
+The persistent-process lifecycle is **isolated to the Claude backend**
+(`server/src/backend/claude.rs`). Native `AskUserQuestion` (§2.5) reuses the
+existing question cards, and native `ExitPlanMode` approval (§2.6) adds only a
+minimal structured `SendMessage` extension. Both reuse existing agent-stream
+events rather than adding a new frame kind. See §6 for the full
+UI/client/protocol analysis.
 
 ---
 
@@ -62,12 +62,12 @@ over the stream-json **control protocol** on a persistent stdin/stdout pipe.
   configured permission mode (`--permission-mode <mode>`, defaulting to
   `bypassPermissions`, which additionally adds `--dangerously-skip-permissions`).
   These are not an either/or: the `stdio` prompt tool is what routes tool
-  permission decisions (and the native `AskUserQuestion` bridge, see §2.5)
+  permission decisions (and the native interactive bridges, see §2.5 and §2.6)
   through the control channel, while the permission mode governs the danger
   gating. The backend answers each `can_use_tool` control_request on the control
-  channel — auto-`allow` (echoing `updatedInput`) for ordinary tools, and the
-  interactive bridge for `AskUserQuestion`. The policy is recorded in the
-  backend, not the protocol.
+  channel — auto-`allow` (echoing `updatedInput`) for ordinary tools, and an
+  interactive bridge for `AskUserQuestion` / `ExitPlanMode`. The policy is
+  recorded in the backend, not the protocol.
 - If the control protocol requires an `initialize` control_request at startup,
   the backend issues it immediately after spawn and waits for the matching
   control_response before accepting user input.
@@ -154,6 +154,34 @@ Consequences for the rest of the system:
   failed `ToolExecutionCompleted`, the frontends render the normal failed
   tool-completion card instead of the interactive one (see the desktop/mobile
   tool-card renderers).
+
+### 2.6 Native `ExitPlanMode` bridge
+
+Claude emits `ExitPlanMode` as a tool permission `control_request` when it is
+ready to leave plan mode. Tyde handles it as a structured `SendMessage`
+extension rather than adding another frame kind:
+
+1. **Request approval.** The Claude backend recognizes `ExitPlanMode` before the
+   generic permission auto-allow path. It closes the current assistant phase,
+   emits `ToolRequest { tool_type: ExitPlanMode { plan, plan_path } }`, and then
+   emits `TypingStatusChanged(false)` so the UI can present an approve/reject
+   affordance. The plan body/path come from Claude's control input when present,
+   or from the preceding `.claude/plans/...` `Write` tool call in the same turn.
+2. **Approve/reject.** The UI sends a normal `SendMessage` whose
+   `tool_response` is `ExitPlanMode { tool_call_id, decision, feedback }`. While
+   the approval is pending, the backend consumes that payload instead of
+   starting a new turn. Approval writes Claude's permission `control_response`
+   with `behavior: "allow"` and `updatedInput` equal to the captured tool input.
+   Rejection writes `behavior: "deny"` with the user's feedback in `message`.
+3. **Resume.** After the control response is written, the backend emits
+   `ToolExecutionCompleted` for the `ExitPlanMode` request and
+   `TypingStatusChanged(true)`. Claude then continues the same turn and
+   eventually ends it with the normal `result` boundary.
+
+The historical replay path remains compatible with older `--print` transcripts:
+when an `ExitPlanMode` `tool_result` is marked `is_error` because it needed
+interactive input, replay still treats it as a successful user-input tool and
+extracts `plan_content` from the preceding plan-file `Write`.
 
 ---
 
@@ -291,6 +319,11 @@ already gated on `result.success`; desktop now matches it (a `ToolExecutionResul
 result was already short-circuited to the error card, and a non-`Error`
 `success=false` result now renders the raw result rather than an un-answerable
 card).
+
+The **`ExitPlanMode` bridge** (§2.6) adds protocol structure but still no new
+frame kind: `ToolRequestType::ExitPlanMode` carries plan metadata to the UI, and
+`SendMessagePayload.tool_response` carries the approval/rejection marker back to
+the backend.
 
 ---
 

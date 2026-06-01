@@ -90,6 +90,13 @@ pub struct PairedHostConnectionStatusEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownConnectionInstance {
+    pub local_host_id: LocalHostId,
+    pub connection_instance_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PairedHostConnectionStatus {
     Connecting,

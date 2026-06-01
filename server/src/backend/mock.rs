@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use protocol::{
     AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo,
     OperationCancelledData, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TokenUsage, ToolPolicy,
+    TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest,
+    ToolRequestType,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, sleep};
@@ -37,6 +38,10 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// then exit without completing the turn.  The events channel closes when the
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
+const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
+const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
+const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
+const MOCK_EXIT_PLAN_MODE_PLAN_PATH: &str = "/tmp/mock/.claude/plans/mock-plan.md";
 /// Sleep for __mock_slow__ turns — long enough for replay tests to connect a
 /// second client and see the queued-message snapshot before the turn ends.
 const MOCK_SLOW_SLEEP_MS: u64 = 2_000;
@@ -150,39 +155,72 @@ impl Backend for MockBackend {
                 return;
             }
             let mut active_subagents = Vec::new();
+            let mut pending_exit_plan_mode = None;
             record_prompt(&session_id_for_task, &initial_message);
-            if !emit_turn(
-                &events_tx,
-                &session_id_for_task,
-                &initial_message,
-                slow_initial_turn,
-            )
-            .await
-            {
-                return;
+            if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
+                if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+                    return;
+                }
+                pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+            } else {
+                if !emit_turn(
+                    &events_tx,
+                    &session_id_for_task,
+                    &initial_message,
+                    slow_initial_turn,
+                )
+                .await
+                {
+                    return;
+                }
+                maybe_spawn_native_child(
+                    &initial_message,
+                    &mut subagent_emitter_rx,
+                    &mut active_subagents,
+                )
+                .await;
             }
-            maybe_spawn_native_child(
-                &initial_message,
-                &mut subagent_emitter_rx,
-                &mut active_subagents,
-            )
-            .await;
 
             while let Some(command) = command_rx.recv().await {
                 match command {
                     MockCommand::Input(AgentInput::SendMessage(payload)) => {
-                        record_prompt(&session_id_for_task, &payload.message);
-                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
-                            .await
-                        {
-                            return;
+                        if let Some(tool_response) = payload.tool_response {
+                            handle_exit_plan_mode_tool_response(
+                                &events_tx,
+                                &session_id_for_task,
+                                &mut pending_exit_plan_mode,
+                                tool_response,
+                            )
+                            .await;
+                            continue;
                         }
-                        maybe_spawn_native_child(
-                            &payload.message,
-                            &mut subagent_emitter_rx,
-                            &mut active_subagents,
-                        )
-                        .await;
+                        if pending_exit_plan_mode.is_some() {
+                            emit_mock_error(
+                                &events_tx,
+                                "mock backend received normal input while ExitPlanMode is pending",
+                            );
+                            continue;
+                        }
+                        record_prompt(&session_id_for_task, &payload.message);
+                        if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
+                            if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+                                return;
+                            }
+                            pending_exit_plan_mode =
+                                Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+                        } else {
+                            if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
+                                .await
+                            {
+                                return;
+                            }
+                            maybe_spawn_native_child(
+                                &payload.message,
+                                &mut subagent_emitter_rx,
+                                &mut active_subagents,
+                            )
+                            .await;
+                        }
                     }
                     MockCommand::Input(AgentInput::UpdateSessionSettings(_)) => {}
                     MockCommand::Input(AgentInput::EditQueuedMessage(_))
@@ -252,21 +290,47 @@ impl Backend for MockBackend {
 
         tokio::spawn(async move {
             let mut active_subagents = Vec::new();
+            let mut pending_exit_plan_mode = None;
             while let Some(command) = command_rx.recv().await {
                 match command {
                     MockCommand::Input(AgentInput::SendMessage(payload)) => {
-                        record_prompt(&session_id_for_task, &payload.message);
-                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
-                            .await
-                        {
-                            return;
+                        if let Some(tool_response) = payload.tool_response {
+                            handle_exit_plan_mode_tool_response(
+                                &events_tx,
+                                &session_id_for_task,
+                                &mut pending_exit_plan_mode,
+                                tool_response,
+                            )
+                            .await;
+                            continue;
                         }
-                        maybe_spawn_native_child(
-                            &payload.message,
-                            &mut subagent_emitter_rx,
-                            &mut active_subagents,
-                        )
-                        .await;
+                        if pending_exit_plan_mode.is_some() {
+                            emit_mock_error(
+                                &events_tx,
+                                "mock backend received normal input while ExitPlanMode is pending",
+                            );
+                            continue;
+                        }
+                        record_prompt(&session_id_for_task, &payload.message);
+                        if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
+                            if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+                                return;
+                            }
+                            pending_exit_plan_mode =
+                                Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+                        } else {
+                            if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
+                                .await
+                            {
+                                return;
+                            }
+                            maybe_spawn_native_child(
+                                &payload.message,
+                                &mut subagent_emitter_rx,
+                                &mut active_subagents,
+                            )
+                            .await;
+                        }
                     }
                     MockCommand::Input(AgentInput::UpdateSessionSettings(_)) => {}
                     MockCommand::Input(AgentInput::EditQueuedMessage(_))
@@ -497,6 +561,168 @@ async fn emit_turn(
     true
 }
 
+async fn emit_exit_plan_mode_request(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> Option<String> {
+    let message_id = Some(Uuid::new_v4().to_string());
+    if events_tx
+        .send(ChatEvent::TypingStatusChanged(true))
+        .is_err()
+    {
+        return None;
+    }
+    if events_tx
+        .send(ChatEvent::StreamStart(StreamStartData {
+            message_id: message_id.clone(),
+            agent: "mock".to_owned(),
+            model: Some(MOCK_MODEL.to_owned()),
+        }))
+        .is_err()
+    {
+        return None;
+    }
+    if events_tx
+        .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: message_id.clone(),
+            text: "mock ExitPlanMode waiting for approval".to_owned(),
+        }))
+        .is_err()
+    {
+        return None;
+    }
+    let tool_call_id = MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned();
+    if events_tx
+        .send(ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: "ExitPlanMode".to_owned(),
+            tool_type: ToolRequestType::ExitPlanMode {
+                plan: Some(MOCK_EXIT_PLAN_MODE_PLAN.to_owned()),
+                plan_path: Some(MOCK_EXIT_PLAN_MODE_PLAN_PATH.to_owned()),
+            },
+        }))
+        .is_err()
+    {
+        return None;
+    }
+    if events_tx
+        .send(ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id: message_id.map(protocol::ChatMessageId),
+                timestamp: now_ms(),
+                sender: MessageSender::Assistant {
+                    agent: "mock".to_owned(),
+                },
+                content: "mock ExitPlanMode waiting for approval".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: Some(ModelInfo {
+                    model: MOCK_MODEL.to_owned(),
+                }),
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        }))
+        .is_err()
+    {
+        return None;
+    }
+    if events_tx
+        .send(ChatEvent::TypingStatusChanged(false))
+        .is_err()
+    {
+        return None;
+    }
+    Some(tool_call_id)
+}
+
+async fn handle_exit_plan_mode_tool_response(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    session_id: &SessionId,
+    pending_exit_plan_mode: &mut Option<String>,
+    tool_response: protocol::SendMessageToolResponse,
+) {
+    let protocol::SendMessageToolResponse::ExitPlanMode {
+        tool_call_id,
+        decision,
+        feedback,
+    } = tool_response;
+    let Some(pending_tool_call_id) = pending_exit_plan_mode.as_deref() else {
+        emit_mock_error(
+            events_tx,
+            "No matching pending tool request is waiting for that response.",
+        );
+        return;
+    };
+    if pending_tool_call_id != tool_call_id {
+        emit_mock_error(
+            events_tx,
+            &format!(
+                "ExitPlanMode response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {pending_tool_call_id}."
+            ),
+        );
+        return;
+    }
+
+    *pending_exit_plan_mode = None;
+    emit_exit_plan_mode_completion(events_tx, session_id, &tool_call_id, decision, feedback).await;
+}
+
+async fn emit_exit_plan_mode_completion(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    session_id: &SessionId,
+    tool_call_id: &str,
+    decision: protocol::ExitPlanModeDecision,
+    feedback: Option<String>,
+) -> bool {
+    let approved = decision == protocol::ExitPlanModeDecision::Approve;
+    let decision_label = if approved { "approved" } else { "rejected" };
+    let message = if approved {
+        "mock ExitPlanMode approved".to_owned()
+    } else {
+        format!(
+            "mock ExitPlanMode rejected: {}",
+            feedback.as_deref().unwrap_or("Plan rejected by user.")
+        )
+    };
+
+    if events_tx
+        .send(ChatEvent::ToolExecutionCompleted(
+            ToolExecutionCompletedData {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
+                tool_result: ToolExecutionResult::Other {
+                    result: serde_json::json!({
+                        "decision": decision_label,
+                        "feedback": feedback,
+                    }),
+                },
+                success: true,
+                error: None,
+            },
+        ))
+        .is_err()
+    {
+        return false;
+    }
+    emit_turn(events_tx, session_id, &message, false).await
+}
+
+fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) {
+    let _ = events_tx.send(ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::Error,
+        content: message.to_owned(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    }));
+}
+
 async fn maybe_spawn_native_child(
     prompt: &str,
     subagent_emitter_rx: &mut watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
@@ -668,6 +894,7 @@ mod tests {
                 message: "hello".to_string(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await

@@ -9,11 +9,13 @@ use crate::state::{AppState, ConnectionStatus};
 #[component]
 pub fn ConnectionBanner() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    let status_state = state.clone();
+    let command_error_state = state.clone();
 
     view! {
         <div class="connection-banner" data-mobile-test="connection-banner">
-            {let state = state.clone(); move || {
-                let status = state.active_host_connection_status();
+            {move || {
+                let status = status_state.active_host_connection_status();
                 match status {
                     ConnectionStatus::Connected => {
                         view! {
@@ -51,29 +53,71 @@ pub fn ConnectionBanner() -> impl IntoView {
                     }
                     ConnectionStatus::Error(ref msg) => {
                         let msg = msg.clone();
+                        let dismiss_state = status_state.clone();
                         view! {
-                            <div class="connection-banner-inner error">
+                            <div class="connection-banner-inner error" role="alert">
                                 <StatusDot
                                     label="Error".to_string()
                                     tone=StatusTone::Error
                                     data_mobile_test="connection-banner-dot-error"
                                 />
                                 <span class="status-text">{msg}</span>
+                                <button
+                                    type="button"
+                                    class="connection-banner-dismiss error-banner-dismiss"
+                                    data-mobile-test="connection-error-dismiss"
+                                    aria-label="Dismiss connection error"
+                                    on:click=move |_| dismiss_active_connection_error(&dismiss_state)
+                                >
+                                    "×"
+                                </button>
                             </div>
                         }.into_any()
                     }
                 }
             }}
             {move || {
-                let error = state.active_host_command_error();
-                error.map(|msg| view! {
-                    <div class="command-error-banner" role="alert">
-                        <span class="error-text">{msg}</span>
-                    </div>
+                let error = command_error_state.active_host_command_error();
+                error.map(|msg| {
+                    let dismiss_state = command_error_state.clone();
+                    view! {
+                        <div class="command-error-banner" role="alert">
+                            <span class="error-text">{msg}</span>
+                            <button
+                                type="button"
+                                class="command-error-dismiss error-banner-dismiss"
+                                data-mobile-test="command-error-dismiss"
+                                aria-label="Dismiss command error"
+                                on:click=move |_| dismiss_active_command_error(&dismiss_state)
+                            >
+                                "×"
+                            </button>
+                        </div>
+                    }
                 })
             }}
         </div>
     }
+}
+
+fn dismiss_active_connection_error(state: &AppState) {
+    let Some(host) = state.active_local_host_id.get_untracked() else {
+        return;
+    };
+    state.connection_statuses.update(|statuses| {
+        if matches!(statuses.get(&host), Some(ConnectionStatus::Error(_))) {
+            statuses.insert(host, ConnectionStatus::Disconnected);
+        }
+    });
+}
+
+fn dismiss_active_command_error(state: &AppState) {
+    let Some(host) = state.active_local_host_id.get_untracked() else {
+        return;
+    };
+    state.command_errors_by_host.update(|errors| {
+        errors.remove(&host);
+    });
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -136,6 +180,113 @@ mod wasm_tests {
                 .trim()
                 .is_empty(),
             "connected state should not render a text status bar"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn connection_error_can_be_dismissed() {
+        let host = LocalHostId("host-error".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_handle_for_mount = state_handle.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::Error("host unreachable".to_owned()),
+                );
+            });
+            *state_handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("host unreachable"),
+            "connection error should render before dismissal"
+        );
+        let dismiss: HtmlElement = container
+            .query_selector("[data-mobile-test='connection-error-dismiss']")
+            .unwrap()
+            .expect("connection error dismiss should render")
+            .dyn_into()
+            .unwrap();
+        dismiss.click();
+        next_tick().await;
+
+        let state = state_handle.borrow().as_ref().unwrap().clone();
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::Disconnected),
+            "dismissing should downgrade the visible connection error"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("host unreachable"),
+            "connection error text should disappear after dismissal"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn command_error_can_be_dismissed() {
+        let host = LocalHostId("host-command-error".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_handle_for_mount = state_handle.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.command_errors_by_host.update(|errors| {
+                errors.insert(host_for_mount.clone(), "SpawnAgent failed".to_owned());
+            });
+            *state_handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("SpawnAgent failed"),
+            "command error should render before dismissal"
+        );
+        let dismiss: HtmlElement = container
+            .query_selector("[data-mobile-test='command-error-dismiss']")
+            .unwrap()
+            .expect("command error dismiss should render")
+            .dyn_into()
+            .unwrap();
+        dismiss.click();
+        next_tick().await;
+
+        let state = state_handle.borrow().as_ref().unwrap().clone();
+        assert!(
+            !state
+                .command_errors_by_host
+                .get_untracked()
+                .contains_key(&host),
+            "dismissing should remove the active host command error"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("SpawnAgent failed"),
+            "command error text should disappear after dismissal"
         );
     }
 }

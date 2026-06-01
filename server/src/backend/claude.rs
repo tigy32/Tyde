@@ -13,7 +13,7 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use protocol::{BackendAccessMode, ToolPolicy};
+use protocol::{BackendAccessMode, ExitPlanModeDecision, SendMessageToolResponse, ToolPolicy};
 
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
@@ -63,6 +63,19 @@ pub struct ClaudeCommandHandle {
 impl ClaudeCommandHandle {
     pub async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         ClaudeInner::execute_arc(Arc::clone(&self.inner), command).await
+    }
+
+    async fn send_message_payload(
+        &self,
+        payload: protocol::SendMessagePayload,
+    ) -> Result<(), String> {
+        ClaudeInner::send_message(
+            Arc::clone(&self.inner),
+            payload.message,
+            protocol_images_to_attachments(payload.images),
+            payload.tool_response,
+        )
+        .await
     }
 }
 
@@ -157,6 +170,7 @@ impl ClaudeSession {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
                 session_id: None,
+                start_session_fresh: false,
                 ephemeral: mode.no_session_persistence,
                 model: None,
                 effort: Some("high".to_string()),
@@ -201,6 +215,7 @@ struct ActiveTurn {
     outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
     interrupt_requested: bool,
     pending_ask_user_question: Option<PendingAskUserQuestionControl>,
+    pending_exit_plan_mode: Option<PendingExitPlanModeControl>,
     quiesced_waiters: Vec<oneshot::Sender<()>>,
 }
 
@@ -212,10 +227,21 @@ struct PendingAskUserQuestionControl {
     input: Value,
 }
 
+#[derive(Clone)]
+struct PendingExitPlanModeControl {
+    request_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    input: Value,
+    plan: Option<String>,
+    plan_path: Option<String>,
+}
+
 struct ClaudeState {
     workspace_root: String,
     ssh_host: Option<String>,
     session_id: Option<String>,
+    start_session_fresh: bool,
     ephemeral: bool,
     model: Option<String>,
     effort: Option<String>,
@@ -237,6 +263,7 @@ impl Default for ClaudeState {
             workspace_root: String::new(),
             ssh_host: None,
             session_id: None,
+            start_session_fresh: false,
             ephemeral: false,
             model: None,
             effort: None,
@@ -512,6 +539,40 @@ struct ClaudeSessionReplay {
     conversation_bytes_total: u64,
 }
 
+#[derive(Debug)]
+enum ClaudeSessionHistoryError {
+    Missing { target: String, detail: String },
+    Other(String),
+}
+
+impl ClaudeSessionHistoryError {
+    fn missing(target: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::Missing {
+            target: target.into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn other(message: impl Into<String>) -> Self {
+        Self::Other(message.into())
+    }
+
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing { .. })
+    }
+}
+
+impl std::fmt::Display for ClaudeSessionHistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { target, detail } => {
+                write!(f, "Claude session history '{target}' is missing: {detail}")
+            }
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
 enum TurnOutcome {
     Completed {
         summary: ClaudeStdoutSummary,
@@ -563,6 +624,7 @@ struct ClaudeProcessSpawnConfig {
     workspace_root: String,
     ssh_host: Option<String>,
     session_id: Option<String>,
+    resume_existing_session: bool,
     ephemeral: bool,
     model: Option<String>,
     effort: Option<String>,
@@ -575,6 +637,14 @@ struct ClaudeProcessSpawnConfig {
 
 #[derive(Clone)]
 struct AskUserQuestionControlRequest {
+    request_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    input: Value,
+}
+
+#[derive(Clone)]
+struct ExitPlanModeControlRequest {
     request_id: String,
     tool_call_id: String,
     tool_name: String,
@@ -608,15 +678,7 @@ impl ClaudeInner {
     async fn execute_arc(this: Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage { message, images } => {
-                if this
-                    .answer_pending_ask_user_question(message.clone(), images.clone())
-                    .await?
-                {
-                    return Ok(());
-                }
-                this.emit_user_message_added(&message, images.as_deref());
-                this.start_turn(message, images).await;
-                Ok(())
+                Self::send_message(this, message, images, None).await
             }
             SessionCommand::CancelConversation => {
                 this.cancel_active_turn().await;
@@ -699,6 +761,34 @@ impl ClaudeInner {
         }
     }
 
+    async fn send_message(
+        this: Arc<Self>,
+        message: String,
+        images: Option<Vec<ImageAttachment>>,
+        tool_response: Option<SendMessageToolResponse>,
+    ) -> Result<(), String> {
+        if let Some(tool_response) = tool_response {
+            if this
+                .answer_pending_tool_response(tool_response, message.clone())
+                .await?
+            {
+                return Ok(());
+            }
+            this.emit_error("No matching pending tool request is waiting for that response.");
+            return Ok(());
+        }
+
+        if this
+            .answer_pending_ask_user_question(message.clone(), images.clone())
+            .await?
+        {
+            return Ok(());
+        }
+        this.emit_user_message_added(&message, images.as_deref());
+        this.start_turn(message, images).await;
+        Ok(())
+    }
+
     async fn start_turn(self: Arc<Self>, message: String, images: Option<Vec<ImageAttachment>>) {
         let images = images.unwrap_or_default();
         let input_bytes = estimate_turn_input_bytes(&message, &images);
@@ -716,6 +806,7 @@ impl ClaudeInner {
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
                 quiesced_waiters: Vec::new(),
             });
             state.conversation_bytes_total =
@@ -807,6 +898,7 @@ impl ClaudeInner {
             state.workspace_root = workspace_root.to_string();
             state.ssh_host = ssh_host.map(str::to_string);
             state.session_id = session_id;
+            state.start_session_fresh = false;
             state.ephemeral = ephemeral;
             state.model = model.clone();
             state.effort = effort;
@@ -820,6 +912,7 @@ impl ClaudeInner {
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
                 quiesced_waiters: Vec::new(),
             });
             state.conversation_bytes_total = state
@@ -883,6 +976,7 @@ impl ClaudeInner {
         };
         if let Some(message) = pending_question_failure.as_deref() {
             self.fail_pending_ask_user_question(turn_id, message).await;
+            self.fail_pending_exit_plan_mode(turn_id, message).await;
         }
 
         // Persist the CLI-assigned session id regardless of turn outcome.
@@ -1011,6 +1105,55 @@ impl ClaudeInner {
         Ok(())
     }
 
+    async fn begin_exit_plan_mode_control_request(
+        &self,
+        request: ExitPlanModeControlRequest,
+    ) -> Result<(), String> {
+        let plan_info = exit_plan_mode_plan_info_from_arguments(&request.input);
+        {
+            let mut state = self.state.lock().await;
+            let active = state
+                .active_turn
+                .as_mut()
+                .ok_or_else(|| "Claude requested plan approval with no active turn".to_string())?;
+            if active.pending_ask_user_question.is_some() || active.pending_exit_plan_mode.is_some()
+            {
+                return Err(
+                    "Claude requested plan approval while another user response is pending"
+                        .to_string(),
+                );
+            }
+            active.pending_exit_plan_mode = Some(PendingExitPlanModeControl {
+                request_id: request.request_id,
+                tool_call_id: request.tool_call_id,
+                tool_name: request.tool_name,
+                input: request.input,
+                plan: plan_info.plan,
+                plan_path: plan_info.plan_path,
+            });
+        }
+
+        self.emit_typing_status(false);
+        Ok(())
+    }
+
+    async fn answer_pending_tool_response(
+        &self,
+        tool_response: SendMessageToolResponse,
+        message: String,
+    ) -> Result<bool, String> {
+        match tool_response {
+            SendMessageToolResponse::ExitPlanMode {
+                tool_call_id,
+                decision,
+                feedback,
+            } => {
+                self.answer_pending_exit_plan_mode(tool_call_id, decision, feedback, message)
+                    .await
+            }
+        }
+    }
+
     async fn answer_pending_ask_user_question(
         &self,
         message: String,
@@ -1077,6 +1220,103 @@ impl ClaudeInner {
         Ok(true)
     }
 
+    async fn answer_pending_exit_plan_mode(
+        &self,
+        tool_call_id: String,
+        decision: ExitPlanModeDecision,
+        feedback: Option<String>,
+        message: String,
+    ) -> Result<bool, String> {
+        let _turn_event_guard = self.turn_event_gate.lock().await;
+        let (turn_id, pending) = {
+            let state = self.state.lock().await;
+            let Some(active) = state.active_turn.as_ref() else {
+                return Ok(false);
+            };
+            (active.id, active.pending_exit_plan_mode.clone())
+        };
+        let Some(pending) = pending else {
+            return Ok(false);
+        };
+        if pending.tool_call_id != tool_call_id {
+            self.emit_error(&format!(
+                "ExitPlanMode response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {}.",
+                pending.tool_call_id
+            ));
+            return Ok(true);
+        }
+
+        let normalized_feedback = feedback
+            .and_then(|value| normalize_nonempty(&value))
+            .or_else(|| normalize_nonempty(&message))
+            .unwrap_or_else(|| "Plan rejected by user.".to_string());
+        let payload = exit_plan_mode_control_response_payload(
+            &pending.request_id,
+            decision,
+            pending.input.clone(),
+            &normalized_feedback,
+        );
+        if let Err(err) = self.write_process_json_line(&payload).await {
+            self.fail_pending_exit_plan_mode(
+                turn_id,
+                &format!("Failed to send ExitPlanMode response to Claude: {err}"),
+            )
+            .await;
+            self.complete_active_turn_with_outcome(
+                turn_id,
+                TurnOutcome::Failed {
+                    summary: ClaudeStdoutSummary::default(),
+                    error: format!("Failed to send ExitPlanMode response to Claude: {err}"),
+                },
+            )
+            .await;
+            self.shutdown_process().await;
+            return Ok(true);
+        }
+
+        let Some(pending) = self
+            .take_pending_exit_plan_mode(turn_id, &pending.request_id)
+            .await
+        else {
+            return Ok(true);
+        };
+
+        let decision_label = match decision {
+            ExitPlanModeDecision::Approve => "approved",
+            ExitPlanModeDecision::Reject => "rejected",
+        };
+        let mut result = serde_json::Map::new();
+        result.insert(
+            "decision".to_string(),
+            Value::String(decision_label.to_string()),
+        );
+        if decision == ExitPlanModeDecision::Reject {
+            result.insert(
+                "feedback".to_string(),
+                Value::String(normalized_feedback.clone()),
+            );
+        }
+        if let Some(plan) = pending.plan {
+            result.insert("plan".to_string(), Value::String(plan));
+        }
+        if let Some(plan_path) = pending.plan_path {
+            result.insert("plan_path".to_string(), Value::String(plan_path));
+        }
+
+        self.emit_tool_execution_completed(
+            &pending.tool_call_id,
+            &pending.tool_name,
+            true,
+            json!({
+                "kind": "Other",
+                "result": Value::Object(result),
+            }),
+            None,
+        );
+        self.emit_typing_status(true);
+        Ok(true)
+    }
+
     async fn take_pending_ask_user_question(
         &self,
         turn_id: u64,
@@ -1093,6 +1333,27 @@ impl ClaudeInner {
             .is_some_and(|pending| pending.request_id == request_id)
         {
             active.pending_ask_user_question.take()
+        } else {
+            None
+        }
+    }
+
+    async fn take_pending_exit_plan_mode(
+        &self,
+        turn_id: u64,
+        request_id: &str,
+    ) -> Option<PendingExitPlanModeControl> {
+        let mut state = self.state.lock().await;
+        let active = state.active_turn.as_mut()?;
+        if active.id != turn_id {
+            return None;
+        }
+        if active
+            .pending_exit_plan_mode
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            active.pending_exit_plan_mode.take()
         } else {
             None
         }
@@ -1126,6 +1387,34 @@ impl ClaudeInner {
         true
     }
 
+    async fn fail_pending_exit_plan_mode(&self, turn_id: u64, message: &str) -> bool {
+        let pending = {
+            let mut state = self.state.lock().await;
+            let Some(active) = state.active_turn.as_mut() else {
+                return false;
+            };
+            if active.id != turn_id {
+                return false;
+            }
+            active.pending_exit_plan_mode.take()
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        self.emit_tool_execution_completed(
+            &pending.tool_call_id,
+            &pending.tool_name,
+            false,
+            json!({
+                "kind": "Error",
+                "short_message": "ExitPlanMode failed",
+                "detailed_message": message,
+            }),
+            Some(message.to_string()),
+        );
+        true
+    }
+
     async fn ensure_process_ready(self: &Arc<Self>) -> Result<(), String> {
         if self.runtime.lock().await.is_some() {
             return Ok(());
@@ -1141,6 +1430,7 @@ impl ClaudeInner {
                 } else {
                     state.session_id.clone()
                 },
+                resume_existing_session: !state.start_session_fresh,
                 ephemeral: state.ephemeral,
                 model: state.model.clone(),
                 effort: state.effort.clone(),
@@ -1457,7 +1747,9 @@ impl ClaudeInner {
     async fn set_session_id(&self, session_id: String) {
         let mut state = self.state.lock().await;
         match &state.session_id {
-            Some(existing) if existing == &session_id => {}
+            Some(existing) if existing == &session_id => {
+                state.start_session_fresh = false;
+            }
             Some(existing) => {
                 let existing = existing.clone();
                 drop(state);
@@ -1468,6 +1760,7 @@ impl ClaudeInner {
             }
             None => {
                 state.session_id = Some(session_id);
+                state.start_session_fresh = false;
             }
         }
     }
@@ -1520,6 +1813,7 @@ impl ClaudeInner {
         let (workspace_root, ssh_host) = {
             let mut state = self.state.lock().await;
             state.session_id = Some(normalized.clone());
+            state.start_session_fresh = false;
             state.last_cumulative_usage = None;
             state.conversation_bytes_total = 0;
             (state.workspace_root.clone(), state.ssh_host.clone())
@@ -1529,10 +1823,18 @@ impl ClaudeInner {
         self.emitter.conversation_cleared();
         self.emitter.typing_status_changed(false);
 
-        let replay = if let Some(host) = &ssh_host {
-            load_claude_session_history_remote(host, &workspace_root, &normalized).await?
+        let replay = match if let Some(host) = &ssh_host {
+            load_claude_session_history_remote(host, &workspace_root, &normalized).await
         } else {
-            load_claude_session_history(&workspace_root, &normalized).await?
+            load_claude_session_history(&workspace_root, &normalized).await
+        } {
+            Ok(replay) => replay,
+            Err(err) if err.is_missing() => {
+                self.recover_missing_session_history(&normalized, &workspace_root, &err)
+                    .await;
+                return Ok(());
+            }
+            Err(err) => return Err(err.to_string()),
         };
         for item in replay.items {
             match item {
@@ -1557,7 +1859,32 @@ impl ClaudeInner {
         let mut state = self.state.lock().await;
         state.last_cumulative_usage = replay.last_cumulative_usage;
         state.conversation_bytes_total = replay.conversation_bytes_total;
+        state.start_session_fresh = false;
         Ok(())
+    }
+
+    async fn recover_missing_session_history(
+        &self,
+        session_id: &str,
+        workspace_root: &str,
+        error: &ClaudeSessionHistoryError,
+    ) {
+        tracing::warn!(
+            session_id = %session_id,
+            workspace_root = %workspace_root,
+            error = %error,
+            "Claude session history is missing; starting a fresh Claude CLI session with the same id"
+        );
+        {
+            let mut state = self.state.lock().await;
+            state.session_id = Some(session_id.to_string());
+            state.start_session_fresh = true;
+            state.last_cumulative_usage = None;
+            state.conversation_bytes_total = 0;
+        }
+        self.emitter.warning_message(&format!(
+            "Claude session history for '{session_id}' is no longer available. Starting a fresh Claude session."
+        ));
     }
 
     async fn delete_session(&self, session_id: String) -> Result<(), String> {
@@ -1567,6 +1894,7 @@ impl ClaudeInner {
             let mut state = self.state.lock().await;
             if state.session_id.as_deref() == Some(normalized.as_str()) {
                 state.session_id = None;
+                state.start_session_fresh = false;
                 state.last_cumulative_usage = None;
                 state.conversation_bytes_total = 0;
             }
@@ -1985,7 +2313,11 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     if !config.ephemeral
         && let Some(existing_session) = config.session_id.as_deref().and_then(normalize_nonempty)
     {
-        cli_args.push("--resume".to_string());
+        if config.resume_existing_session {
+            cli_args.push("--resume".to_string());
+        } else {
+            cli_args.push("--session-id".to_string());
+        }
         cli_args.push(existing_session);
     } else {
         cli_args.push("--session-id".to_string());
@@ -2161,6 +2493,9 @@ async fn read_claude_stdout_persistent(
         };
 
         if route_control_response(&value, &control_waiters).await {
+            continue;
+        }
+        if handle_exit_plan_mode_control_request(&value, &inner, &mut turn_state, &stdin).await {
             continue;
         }
         if handle_ask_user_question_control_request(&value, &inner, &mut turn_state, &stdin).await {
@@ -2407,6 +2742,34 @@ async fn handle_ask_user_question_control_request(
     true
 }
 
+async fn handle_exit_plan_mode_control_request(
+    value: &Value,
+    inner: &Arc<ClaudeInner>,
+    turn_state: &mut PersistentStdoutTurnState,
+    stdin: &Arc<Mutex<ChildStdin>>,
+) -> bool {
+    let Some(request) = exit_plan_mode_control_request(value) else {
+        return false;
+    };
+    let request_id = request.request_id.clone();
+    let _turn_event_guard = inner.turn_event_gate.lock().await;
+    let result = bridge_exit_plan_mode_control_request(inner, turn_state, request).await;
+    if let Err(err) = result {
+        tracing::warn!("Failed to bridge Claude ExitPlanMode control_request: {err}");
+        let payload = tool_permission_control_response_payload(
+            &request_id,
+            json!({
+                "behavior": "deny",
+                "message": err,
+            }),
+        );
+        if let Err(write_err) = write_json_line_to_stdin(stdin, &payload).await {
+            tracing::warn!("Failed to write Claude ExitPlanMode deny response: {write_err}");
+        }
+    }
+    true
+}
+
 async fn respond_to_control_request(value: &Value, stdin: &Arc<Mutex<ChildStdin>>) -> bool {
     let Some(payload) = control_response_payload_for_request(value) else {
         return false;
@@ -2445,6 +2808,31 @@ async fn bridge_ask_user_question_control_request(
         .await
 }
 
+async fn bridge_exit_plan_mode_control_request(
+    inner: &Arc<ClaudeInner>,
+    turn_state: &mut PersistentStdoutTurnState,
+    request: ExitPlanModeControlRequest,
+) -> Result<(), String> {
+    prepare_persistent_stdout_turn(inner, turn_state)
+        .await
+        .ok_or_else(|| "Claude requested plan approval with no active turn".to_string())?;
+
+    let tool_call = ensure_exit_plan_mode_tool_request_emitted(
+        &mut turn_state.summary,
+        &mut turn_state.segment,
+        inner,
+        request.clone(),
+    );
+    inner
+        .begin_exit_plan_mode_control_request(ExitPlanModeControlRequest {
+            tool_call_id: tool_call.id,
+            tool_name: tool_call.name,
+            input: tool_call.arguments,
+            ..request
+        })
+        .await
+}
+
 fn ensure_ask_user_question_tool_request_emitted(
     summary: &mut ClaudeStdoutSummary,
     segment: &mut SegmentState,
@@ -2465,6 +2853,88 @@ fn ensure_ask_user_question_tool_request_emitted(
 
     if !has_meaningful_tool_arguments(&tool_call.arguments) {
         tool_call.arguments = request.input.clone();
+        if let Some(existing) = summary
+            .tool_calls
+            .iter_mut()
+            .find(|existing| existing.id == tool_call.id)
+        {
+            existing.arguments = tool_call.arguments.clone();
+        }
+        summary
+            .tool_call_by_id
+            .insert(tool_call.id.clone(), tool_call.clone());
+    }
+
+    let already_emitted = summary.unresolved_tool_requests.contains_key(&tool_call.id);
+    let in_current_phase = summary
+        .tool_calls
+        .iter()
+        .any(|tool| tool.id == tool_call.id);
+    if !already_emitted && !in_current_phase {
+        register_tool_call_for_phase(summary, segment, tool_call.clone());
+    }
+
+    let mut emitted = already_emitted;
+    if !emitted {
+        if phase_has_pending_output(summary, segment) {
+            close_current_phase(summary, segment, inner);
+        }
+        emitted = summary
+            .unresolved_tool_requests
+            .remove(&tool_call.id)
+            .is_some();
+    } else {
+        summary.unresolved_tool_requests.remove(&tool_call.id);
+    }
+
+    if !emitted {
+        inner.emit_stream_end(
+            String::new(),
+            None,
+            None,
+            None,
+            vec![json!({
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            })],
+            None,
+        );
+        inner.emit_tool_request(&tool_call);
+    }
+
+    tool_call
+}
+
+fn ensure_exit_plan_mode_tool_request_emitted(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+    inner: &ClaudeInner,
+    request: ExitPlanModeControlRequest,
+) -> ClaudeToolCall {
+    enrich_exit_plan_mode_tool_calls(summary);
+    flush_pending_tool_uses(summary, segment);
+    enrich_exit_plan_mode_tool_calls(summary);
+
+    let request_input = enrich_exit_plan_mode_arguments(
+        request.input.clone(),
+        exit_plan_mode_plan_info_from_tool_calls(summary.tool_call_by_id.values()),
+    );
+    let mut tool_call = summary
+        .tool_call_by_id
+        .get(&request.tool_call_id)
+        .cloned()
+        .unwrap_or_else(|| ClaudeToolCall {
+            id: request.tool_call_id.clone(),
+            name: request.tool_name.clone(),
+            arguments: request_input.clone(),
+        });
+
+    let existing_info = exit_plan_mode_plan_info_from_arguments(&tool_call.arguments);
+    if !has_meaningful_tool_arguments(&tool_call.arguments)
+        || (existing_info.plan.is_none() && existing_info.plan_path.is_none())
+    {
+        tool_call.arguments = request_input.clone();
         if let Some(existing) = summary
             .tool_calls
             .iter_mut()
@@ -2549,6 +3019,15 @@ fn control_response_payload_for_request(value: &Value) -> Option<Value> {
                 }),
             ));
         }
+        if claude_is_exit_plan_mode_tool_name(tool_name) {
+            return Some(tool_permission_control_response_payload(
+                &request_id,
+                json!({
+                    "behavior": "deny",
+                    "message": "Claude ExitPlanMode permission requests must be bridged through Tyde's plan approval flow.",
+                }),
+            ));
+        }
         json!({
             "behavior": "allow",
             "updatedInput": input,
@@ -2611,6 +3090,38 @@ fn ask_user_question_control_request(value: &Value) -> Option<AskUserQuestionCon
         )
     });
     Some(AskUserQuestionControlRequest {
+        request_id,
+        tool_call_id,
+        tool_name: tool_name.to_string(),
+        input,
+    })
+}
+
+fn exit_plan_mode_control_request(value: &Value) -> Option<ExitPlanModeControlRequest> {
+    if value.get("type").and_then(Value::as_str) != Some("control_request") {
+        return None;
+    }
+    let request = value.get("request").unwrap_or(&Value::Null);
+    let subtype = request
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_tool_permission_subtype(subtype) {
+        return None;
+    }
+    let tool_name = control_request_tool_name(value, request)?;
+    if !claude_is_exit_plan_mode_tool_name(tool_name) {
+        return None;
+    }
+    let request_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .or_else(|| request.get("request_id").and_then(Value::as_str))
+        .and_then(normalize_nonempty)?;
+    let input = control_request_input(request);
+    let tool_call_id = control_request_tool_call_id(value, request)
+        .unwrap_or_else(|| format!("claude-exit-plan-mode-{}", normalize_tool_name(&request_id)));
+    Some(ExitPlanModeControlRequest {
         request_id,
         tool_call_id,
         tool_name: tool_name.to_string(),
@@ -2685,6 +3196,25 @@ fn ask_user_question_control_response_payload(request_id: &str, updated_input: V
     )
 }
 
+fn exit_plan_mode_control_response_payload(
+    request_id: &str,
+    decision: ExitPlanModeDecision,
+    updated_input: Value,
+    feedback: &str,
+) -> Value {
+    let response = match decision {
+        ExitPlanModeDecision::Approve => json!({
+            "behavior": "allow",
+            "updatedInput": updated_input,
+        }),
+        ExitPlanModeDecision::Reject => json!({
+            "behavior": "deny",
+            "message": feedback,
+        }),
+    };
+    tool_permission_control_response_payload(request_id, response)
+}
+
 fn ask_user_question_input_with_answer(input: &Value, answer: &str) -> Value {
     let mut updated = if input.is_object() {
         input.clone()
@@ -2693,8 +3223,6 @@ fn ask_user_question_input_with_answer(input: &Value, answer: &str) -> Value {
     };
     let answers = ask_user_question_answer_map(input, answer);
     if let Some(object) = updated.as_object_mut() {
-        object.insert("answer".to_string(), Value::String(answer.to_string()));
-        object.insert("answersText".to_string(), Value::String(answer.to_string()));
         object.insert("answers".to_string(), Value::Object(answers));
     }
     updated
@@ -2760,13 +3288,15 @@ fn answer_for_ask_user_question(
 }
 
 fn ask_user_question_answer_key(index: usize, question: &protocol::AskUserQuestion) -> String {
-    if let Some(id) = question.id.as_deref().and_then(normalize_nonempty) {
-        return id;
+    if let Some(question_text) = normalize_nonempty(&question.question) {
+        return question_text;
     }
-    if let Some(header) = question.header.as_deref().and_then(normalize_nonempty) {
-        return header;
-    }
-    normalize_nonempty(&question.question).unwrap_or_else(|| format!("question_{}", index + 1))
+    question
+        .header
+        .as_deref()
+        .and_then(normalize_nonempty)
+        .or_else(|| question.id.as_deref().and_then(normalize_nonempty))
+        .unwrap_or_else(|| format!("question_{}", index + 1))
 }
 
 async fn fail_pending_control_waiters(control_waiters: &ClaudeControlWaiters, message: &str) {
@@ -3650,6 +4180,7 @@ fn close_current_phase(
     inner: &ClaudeInner,
 ) {
     flush_pending_tool_uses(summary, segment);
+    enrich_exit_plan_mode_tool_calls(summary);
 
     if let Some(phase) = take_phase_emission(summary) {
         let tool_calls = phase
@@ -4565,6 +5096,10 @@ fn claude_is_ask_user_question_tool_name(tool_name: &str) -> bool {
     normalize_tool_name(tool_name) == "askuserquestion"
 }
 
+fn claude_is_exit_plan_mode_tool_name(tool_name: &str) -> bool {
+    normalize_tool_name(tool_name) == "exitplanmode"
+}
+
 fn claude_is_user_input_tool_name(tool_name: &str) -> bool {
     matches!(
         normalize_tool_name(tool_name).as_str(),
@@ -4880,6 +5415,97 @@ fn claude_argument_file_paths(arguments: &Value) -> Vec<String> {
     paths
 }
 
+#[derive(Clone, Default)]
+struct ExitPlanModePlanInfo {
+    plan: Option<String>,
+    plan_path: Option<String>,
+}
+
+fn exit_plan_mode_plan_info_from_arguments(arguments: &Value) -> ExitPlanModePlanInfo {
+    ExitPlanModePlanInfo {
+        plan: claude_argument_string(
+            arguments,
+            &["plan", "plan_content", "planContent", "content"],
+        ),
+        plan_path: claude_argument_string(
+            arguments,
+            &[
+                "plan_path",
+                "planPath",
+                "planFilePath",
+                "file_path",
+                "filePath",
+                "path",
+            ],
+        ),
+    }
+}
+
+fn exit_plan_mode_plan_info_from_tool_calls<'a>(
+    tool_calls: impl IntoIterator<Item = &'a ClaudeToolCall>,
+) -> Option<ExitPlanModePlanInfo> {
+    tool_calls.into_iter().find_map(|tool_call| {
+        if normalize_tool_name(&tool_call.name) != "write" {
+            return None;
+        }
+        let plan_path = claude_argument_file_path(&tool_call.arguments)?;
+        if !plan_path.contains(".claude/plans/") {
+            return None;
+        }
+        let plan =
+            claude_argument_string(&tool_call.arguments, &["content", "text", "new_content"])?;
+        Some(ExitPlanModePlanInfo {
+            plan: Some(plan),
+            plan_path: Some(plan_path),
+        })
+    })
+}
+
+fn enrich_exit_plan_mode_arguments(
+    arguments: Value,
+    fallback: Option<ExitPlanModePlanInfo>,
+) -> Value {
+    let mut object = arguments.as_object().cloned().unwrap_or_default();
+    let existing = exit_plan_mode_plan_info_from_arguments(&Value::Object(object.clone()));
+    if existing.plan.is_none()
+        && let Some(plan) = fallback.as_ref().and_then(|info| info.plan.clone())
+    {
+        object.insert("plan".to_string(), Value::String(plan));
+    }
+    if existing.plan_path.is_none()
+        && let Some(plan_path) = fallback.as_ref().and_then(|info| info.plan_path.clone())
+    {
+        object.insert("planFilePath".to_string(), Value::String(plan_path));
+    }
+    Value::Object(object)
+}
+
+fn enrich_exit_plan_mode_tool_calls(summary: &mut ClaudeStdoutSummary) {
+    let Some(plan_info) = exit_plan_mode_plan_info_from_tool_calls(summary.tool_calls.iter())
+        .or_else(|| exit_plan_mode_plan_info_from_tool_calls(summary.tool_call_by_id.values()))
+    else {
+        return;
+    };
+
+    let mut changed = Vec::new();
+    for tool_call in &mut summary.tool_calls {
+        if !claude_is_exit_plan_mode_tool_name(&tool_call.name) {
+            continue;
+        }
+        let enriched =
+            enrich_exit_plan_mode_arguments(tool_call.arguments.clone(), Some(plan_info.clone()));
+        if enriched != tool_call.arguments {
+            tool_call.arguments = enriched;
+            changed.push(tool_call.clone());
+        }
+    }
+    for tool_call in changed {
+        summary
+            .tool_call_by_id
+            .insert(tool_call.id.clone(), tool_call);
+    }
+}
+
 fn estimate_line_delta(before: &str, after: &str) -> (u64, u64) {
     let before_lines = if before.is_empty() {
         Vec::new()
@@ -5087,6 +5713,15 @@ fn claude_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
         return json!({
             "kind": "AskUserQuestion",
             "questions": claude_ask_user_questions(arguments),
+        });
+    }
+
+    if claude_is_exit_plan_mode_tool_name(tool_name) {
+        let plan_info = exit_plan_mode_plan_info_from_arguments(arguments);
+        return json!({
+            "kind": "ExitPlanMode",
+            "plan": plan_info.plan,
+            "plan_path": plan_info.plan_path,
         });
     }
 
@@ -5365,8 +6000,31 @@ fn extract_preview_from_session_line(value: &Value) -> Option<String> {
 async fn load_claude_session_history(
     workspace_root: &str,
     session_id: &str,
-) -> Result<ClaudeSessionReplay, String> {
-    let session_file = claude_session_file_path(workspace_root, session_id)?;
+) -> Result<ClaudeSessionReplay, ClaudeSessionHistoryError> {
+    let session_file = claude_session_file_path(workspace_root, session_id)
+        .map_err(ClaudeSessionHistoryError::other)?;
+    match tokio_fs::metadata(&session_file).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(ClaudeSessionHistoryError::other(format!(
+                "Claude session '{}' is not a file",
+                session_file.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ClaudeSessionHistoryError::missing(
+                session_file.display().to_string(),
+                err.to_string(),
+            ));
+        }
+        Err(err) => {
+            return Err(ClaudeSessionHistoryError::other(format!(
+                "Failed to inspect Claude session '{}' for resume: {err}",
+                session_file.display()
+            )));
+        }
+    }
+
     let mut last_err = None;
     for attempt in 0..20 {
         match tokio_fs::read_to_string(&session_file).await {
@@ -5376,10 +6034,10 @@ async fn load_claude_session_history(
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(err) => {
-                return Err(format!(
+                return Err(ClaudeSessionHistoryError::other(format!(
                     "Failed to read Claude session '{}' for resume: {err}",
                     session_file.display()
-                ));
+                )));
             }
         }
     }
@@ -5390,9 +6048,9 @@ async fn load_claude_session_history(
             "Claude session file did not appear in time",
         )
     });
-    Err(format!(
-        "Failed to read Claude session '{}' for resume: {err}",
-        session_file.display()
+    Err(ClaudeSessionHistoryError::missing(
+        session_file.display().to_string(),
+        err.to_string(),
     ))
 }
 
@@ -5711,24 +6369,13 @@ fn extract_tool_result_events_from_message(
             // treat them as successful end-of-turn signals.
             if claude_is_user_input_tool_name(&tool_name) {
                 let tool_result = if normalize_tool_name(&tool_name) == "exitplanmode" {
-                    // Find plan file content from a preceding Write tool in this turn.
-                    let plan_content = tool_call_by_id
-                        .values()
-                        .filter(|tc| normalize_tool_name(&tc.name) == "write")
-                        .find_map(|tc| {
-                            let path = claude_argument_file_path(&tc.arguments)?;
-                            if !path.contains(".claude/plans/") {
-                                return None;
-                            }
-                            claude_argument_string(
-                                &tc.arguments,
-                                &["content", "text", "new_content"],
-                            )
-                        });
-                    match plan_content {
-                        Some(content) => json!({
+                    match exit_plan_mode_plan_info_from_tool_calls(tool_call_by_id.values()) {
+                        Some(info) => json!({
                             "kind": "Other",
-                            "result": { "plan_content": content }
+                            "result": {
+                                "plan_content": info.plan,
+                                "plan_path": info.plan_path,
+                            }
                         }),
                         None => json!({ "kind": "Other", "result": null }),
                     }
@@ -6198,21 +6845,45 @@ async fn load_claude_session_history_remote(
     host: &str,
     workspace_root: &str,
     session_id: &str,
-) -> Result<ClaudeSessionReplay, String> {
-    use crate::remote::run_ssh_raw;
+) -> Result<ClaudeSessionReplay, ClaudeSessionHistoryError> {
+    use crate::remote::{run_ssh_raw, shell_quote_arg};
 
     let encoded = encode_workspace_root(workspace_root);
-    let id = normalize_nonempty(session_id).ok_or("Invalid session id")?;
-    let cmd = format!("cat \"$HOME/.claude/projects/{encoded}/{id}.jsonl\"");
-    let output = run_ssh_raw(host, &cmd).await?;
+    let id = normalize_nonempty(session_id)
+        .ok_or_else(|| ClaudeSessionHistoryError::other("Invalid session id".to_string()))?;
+    let relative_path = format!(".claude/projects/{encoded}/{id}.jsonl");
+    let quoted_relative_path = shell_quote_arg(&relative_path);
+    let cmd = format!(
+        "file=\"$HOME\"/{quoted_relative_path}; \
+         [ -f \"$file\" ] || {{ echo \"Claude session file is missing: $file\" >&2; exit 66; }}; \
+         cat \"$file\""
+    );
+    let output = run_ssh_raw(host, &cmd).await.map_err(|err| {
+        ClaudeSessionHistoryError::other(format!(
+            "Failed to read remote Claude session '{id}': {err}"
+        ))
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+        if output.status.code() == Some(66) || is_remote_missing_session_stderr(&stderr) {
+            return Err(ClaudeSessionHistoryError::missing(
+                format!("{host}:~/{relative_path}"),
+                stderr.trim().to_string(),
+            ));
+        }
+        return Err(ClaudeSessionHistoryError::other(format!(
             "Failed to read remote Claude session '{id}': {stderr}"
-        ));
+        )));
     }
     let contents = String::from_utf8_lossy(&output.stdout);
     Ok(parse_claude_session_replay(&contents))
+}
+
+fn is_remote_missing_session_stderr(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no such file or directory")
+        || lower.contains("does not exist")
+        || (lower.contains("cannot open") && lower.contains("no such file"))
 }
 
 async fn delete_claude_session_remote(
@@ -6404,13 +7075,7 @@ impl ClaudeBackend {
                 .await;
             });
 
-            if let Err(err) = handle
-                .execute(SessionCommand::SendMessage {
-                    message: initial_input.message,
-                    images: protocol_images_to_attachments(initial_input.images),
-                })
-                .await
-            {
+            if let Err(err) = handle.send_message_payload(initial_input).await {
                 tracing::error!("Failed to send initial Claude prompt: {err}");
                 signal_ready(
                     &ready_tx,
@@ -6447,14 +7112,7 @@ impl ClaudeBackend {
                         };
                         match input {
                             AgentInput::SendMessage(payload) => {
-                                let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message: payload.message,
-                                        images,
-                                    })
-                                    .await
-                                {
+                                if let Err(err) = handle.send_message_payload(payload).await {
                                     tracing::error!("Failed to send Claude follow-up: {err}");
                                     break;
                                 }
@@ -6883,14 +7541,7 @@ impl Backend for ClaudeBackend {
                         };
                         match input {
                             AgentInput::SendMessage(payload) => {
-                                let images = protocol_images_to_attachments(payload.images);
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message: payload.message,
-                                        images,
-                                    })
-                                    .await
-                                {
+                                if let Err(err) = handle.send_message_payload(payload).await {
                                     tracing::error!("Failed to send Claude resume follow-up: {err}");
                                     break;
                                 }
@@ -7001,6 +7652,12 @@ mod tests {
     }
 
     fn make_test_inner() -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
+        make_test_inner_with_workspace("/tmp/test-workspace".to_string())
+    }
+
+    fn make_test_inner_with_workspace(
+        workspace_root: String,
+    ) -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = ClaudeInner {
             emitter: Arc::new(TurnEmitter::new_for_agent(
@@ -7008,9 +7665,10 @@ mod tests {
                 AgentName(CLAUDE_AGENT_NAME),
             )),
             state: Mutex::new(ClaudeState {
-                workspace_root: "/tmp/test-workspace".to_string(),
+                workspace_root,
                 ssh_host: None,
                 session_id: None,
+                start_session_fresh: false,
                 ephemeral: false,
                 model: None,
                 effort: None,
@@ -7044,6 +7702,7 @@ mod tests {
                 outcome_tx: Some(outcome_tx),
                 interrupt_requested: false,
                 pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
                 quiesced_waiters: Vec::new(),
             });
         }
@@ -7287,6 +7946,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_cli_args_resume_valid_session_with_resume() {
+        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
+            workspace_root: "/tmp/workspace".to_string(),
+            ssh_host: None,
+            session_id: Some("valid-session".to_string()),
+            resume_existing_session: true,
+            ephemeral: false,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            startup_mcp_config_json: None,
+            steering_content: None,
+            agent_identity: None,
+            tool_policy: ToolPolicy::Unrestricted,
+        });
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--resume" && pair[1] == "valid-session")
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == "--session-id" && pair[1] == "valid-session"),
+            "valid resumes should keep using Claude's --resume path"
+        );
+    }
+
+    #[test]
+    fn claude_cli_args_recovered_missing_session_starts_fresh() {
+        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
+            workspace_root: "/tmp/workspace".to_string(),
+            ssh_host: None,
+            session_id: Some("stale-session".to_string()),
+            resume_existing_session: false,
+            ephemeral: false,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            startup_mcp_config_json: None,
+            steering_content: None,
+            agent_identity: None,
+            tool_policy: ToolPolicy::Unrestricted,
+        });
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--session-id" && pair[1] == "stale-session"),
+            "missing-session recovery should create a fresh Claude CLI session under the same id"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == "--resume" && pair[1] == "stale-session"),
+            "missing-session recovery must not pass the stale id back through --resume"
+        );
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestSubAgentSpawnRecord {
         tool_use_id: String,
@@ -7374,6 +8092,69 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {expected}"))
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_session_missing_history_marks_session_for_fresh_start() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
+        }
+
+        let (inner, mut rx) =
+            make_test_inner_with_workspace(workspace.path().to_string_lossy().to_string());
+        let inner = Arc::new(inner);
+
+        inner
+            .resume_session("stale-missing-session".to_string())
+            .await
+            .expect("missing Claude history should recover");
+
+        let session_started = rx.recv().await.expect("session started event");
+        assert_eq!(event_kind(&session_started), Some("SessionStarted"));
+        let cleared = rx.recv().await.expect("conversation cleared event");
+        assert_eq!(event_kind(&cleared), Some("ConversationCleared"));
+        let idle = rx.recv().await.expect("idle event");
+        assert_eq!(event_kind(&idle), Some("TypingStatusChanged"));
+        let warning = rx.recv().await.expect("warning event");
+        assert_eq!(event_kind(&warning), Some("MessageAdded"));
+        assert_eq!(
+            warning
+                .get("data")
+                .and_then(|data| data.get("sender"))
+                .and_then(Value::as_str),
+            Some("Warning")
+        );
+        assert!(
+            warning
+                .get("data")
+                .and_then(|data| data.get("content"))
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("Starting a fresh Claude session"))
+        );
+
+        {
+            let state = inner.state.lock().await;
+            assert_eq!(state.session_id.as_deref(), Some("stale-missing-session"));
+            assert!(
+                state.start_session_fresh,
+                "next Claude process should use --session-id instead of --resume"
+            );
+            assert_eq!(state.last_cumulative_usage, None);
+            assert_eq!(state.conversation_bytes_total, 0);
+        }
+
+        unsafe {
+            if let Some(value) = previous_claude_config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", value);
+            } else {
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+    }
+
     struct AskAnswerRaceHookGuard;
 
     impl Drop for AskAnswerRaceHookGuard {
@@ -7400,11 +8181,181 @@ mod tests {
         (after_write, resume, AskAnswerRaceHookGuard)
     }
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)
+            .unwrap_or_else(|err| panic!("stat fake Claude script {}: {err}", path.display()))
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)
+            .unwrap_or_else(|err| panic!("chmod fake Claude script {}: {err}", path.display()));
+    }
+
     fn stream_end_message(event: &Value) -> &Value {
         event
             .get("data")
             .and_then(|data| data.get("message"))
             .expect("stream end message")
+    }
+
+    fn write_fake_exit_plan_mode_script(fake: &Path) {
+        std::fs::write(
+            fake,
+            r##"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-exit-plan-session"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
+plan_path = "/repo/.claude/plans/test-plan.md"
+plan_content = "# Plan\n\nDo the work.\nRun the tests."
+
+def log(message):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+log("START " + " ".join(args))
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    log("IN " + line)
+    value = json.loads(line)
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        if request.get("subtype") == "initialize":
+            emit({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            })
+        continue
+    if value.get("type") == "control_response":
+        response = value.get("response", {})
+        if response.get("request_id") == "plan-1":
+            control = response.get("response", {})
+            behavior = control.get("behavior")
+            updated = control.get("updatedInput") or {}
+            feedback = control.get("message") or control.get("feedback") or ""
+            if behavior == "allow":
+                text = "plan approved: " + (updated.get("plan") or "")
+            else:
+                text = "plan rejected: " + feedback
+            emit({
+                "type": "stream_event",
+                "session_id": session_id,
+                "event": {
+                    "type": "message_start",
+                    "message": {"id": "plan-answer-msg", "model": "fake-model", "usage": {"input_tokens": 2}},
+                },
+            })
+            emit({
+                "type": "stream_event",
+                "session_id": session_id,
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            })
+            emit({
+                "type": "stream_event",
+                "session_id": session_id,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            })
+            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
+            emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+            emit({
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": text,
+                "session_id": session_id,
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            })
+        continue
+    if value.get("type") == "user":
+        emit({
+            "type": "system",
+            "subtype": "init",
+            "session_id": session_id,
+            "model": "fake-model",
+        })
+        emit({
+            "type": "stream_event",
+            "session_id": session_id,
+            "event": {
+                "type": "message_start",
+                "message": {"id": "plan-msg-1", "model": "fake-model", "usage": {"input_tokens": 1}},
+            },
+        })
+        emit({
+            "type": "stream_event",
+            "session_id": session_id,
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_write",
+                    "name": "Write",
+                    "input": {
+                        "file_path": plan_path,
+                        "content": plan_content,
+                    },
+                },
+            },
+        })
+        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
+        emit({
+            "type": "stream_event",
+            "session_id": session_id,
+            "event": {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_exit",
+                    "name": "ExitPlanMode",
+                    "input": {},
+                },
+            },
+        })
+        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 1}})
+        emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+        emit({
+            "type": "control_request",
+            "request_id": "plan-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "tool_call_id": "toolu_exit",
+                "input": {},
+            },
+        })
+"##,
+        )
+        .expect("write fake Claude ExitPlanMode script");
+        #[cfg(unix)]
+        make_executable(fake);
     }
 
     fn stream_end_tool_call_ids(event: &Value) -> Vec<String> {
@@ -7566,6 +8517,40 @@ mod tests {
     }
 
     #[test]
+    fn control_request_detects_exit_plan_mode_for_bridge() {
+        let value = json!({
+            "type": "control_request",
+            "request_id": "req-plan",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "tool_call_id": "toolu_exit",
+                "input": {
+                    "plan": "# Plan\n\nDo the work.",
+                    "planFilePath": "/repo/.claude/plans/test.md",
+                },
+            },
+        });
+        let request = exit_plan_mode_control_request(&value).expect("ExitPlanMode bridge request");
+
+        assert_eq!(request.request_id, "req-plan");
+        assert_eq!(request.tool_call_id, "toolu_exit");
+        assert_eq!(request.tool_name, "ExitPlanMode");
+        assert_eq!(
+            request.input.get("plan").and_then(Value::as_str),
+            Some("# Plan\n\nDo the work.")
+        );
+        let fallback_payload =
+            control_response_payload_for_request(&value).expect("fallback response payload");
+        assert_eq!(
+            fallback_payload
+                .pointer("/response/response/behavior")
+                .and_then(Value::as_str),
+            Some("deny")
+        );
+    }
+
+    #[test]
     fn control_request_allows_non_interactive_tool_permissions() {
         let input = json!({ "command": "echo ok" });
         let payload = control_response_payload_for_request(&json!({
@@ -7588,6 +8573,69 @@ mod tests {
             Some("allow")
         );
         assert_eq!(response.get("updatedInput"), Some(&input));
+    }
+
+    #[test]
+    fn exit_plan_mode_response_payloads_match_claude_permissions() {
+        let input = json!({"plan": "# Plan"});
+        let approve = exit_plan_mode_control_response_payload(
+            "req-plan",
+            ExitPlanModeDecision::Approve,
+            input.clone(),
+            "",
+        );
+        assert_eq!(
+            approve
+                .pointer("/response/response/behavior")
+                .and_then(Value::as_str),
+            Some("allow")
+        );
+        assert_eq!(
+            approve.pointer("/response/response/updatedInput"),
+            Some(&input)
+        );
+
+        let reject = exit_plan_mode_control_response_payload(
+            "req-plan",
+            ExitPlanModeDecision::Reject,
+            input,
+            "Needs tests",
+        );
+        assert_eq!(
+            reject
+                .pointer("/response/response/behavior")
+                .and_then(Value::as_str),
+            Some("deny")
+        );
+        assert_eq!(
+            reject
+                .pointer("/response/response/message")
+                .and_then(Value::as_str),
+            Some("Needs tests")
+        );
+    }
+
+    #[test]
+    fn ask_user_question_answer_uses_question_text_key() {
+        let input = json!({
+            "questions": [{
+                "id": "choice",
+                "question": "Which choice?",
+                "header": "Choice",
+                "options": [{"label": "Blue"}, {"label": "Green"}],
+            }]
+        });
+
+        let updated = ask_user_question_input_with_answer(&input, "Choice: Blue");
+
+        assert_eq!(
+            updated
+                .pointer("/answers/Which choice?")
+                .and_then(Value::as_str),
+            Some("Blue")
+        );
+        assert!(updated.get("answer").is_none());
+        assert!(updated.get("answersText").is_none());
     }
 
     #[tokio::test]
@@ -7848,6 +8896,468 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fake_resume_missing_history_starts_fresh_and_accepts_follow_up() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let fake = workspace.path().join("fake-claude-stale-resume.py");
+        let log = workspace.path().join("fake-claude-stale-resume.log");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+session_id = "fake-stale-resume-default"
+if "--session-id" in args:
+    session_id = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    session_id = args[args.index("--resume") + 1]
+log_path = os.environ["TYDE_FAKE_CLAUDE_LOG"]
+
+def log(message):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+def emit(value):
+    print(json.dumps(value), flush=True)
+
+log("START " + " ".join(args))
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    log("IN " + line)
+    value = json.loads(line)
+    if value.get("type") == "control_request":
+        request = value.get("request", {})
+        request_id = value.get("request_id") or request.get("request_id")
+        if request.get("subtype") == "initialize":
+            emit({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            })
+        continue
+    if value.get("type") != "user":
+        continue
+    emit({
+        "type": "system",
+        "subtype": "init",
+        "session_id": session_id,
+        "model": "fake-model",
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "message_start",
+            "message": {"id": "fresh-resume-msg", "model": "fake-model", "usage": {"input_tokens": 1}},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    })
+    emit({
+        "type": "stream_event",
+        "session_id": session_id,
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "fresh follow-up ok"},
+        },
+    })
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "content_block_stop", "index": 0}})
+    emit({"type": "stream_event", "session_id": session_id, "event": {"type": "message_stop"}})
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "fresh follow-up ok",
+        "session_id": session_id,
+        "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+    })
+"#,
+        )
+        .expect("write fake Claude stale resume script");
+        make_executable(&fake);
+
+        let previous_claude_bin = std::env::var_os(TYDE_CLAUDE_BIN_ENV);
+        let previous_fake_log = std::env::var_os("TYDE_FAKE_CLAUDE_LOG");
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
+            std::env::set_var("CLAUDE_CONFIG_DIR", claude_home.path());
+        }
+
+        let stale_session_id = protocol::SessionId("stale-missing-session".to_string());
+        let (backend, mut events) = ClaudeBackend::resume(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            stale_session_id,
+        )
+        .await
+        .expect("resume should recover missing Claude history");
+
+        let warning = timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("backend event");
+                if let protocol::ChatEvent::MessageAdded(message) = event
+                    && matches!(message.sender, protocol::MessageSender::Warning)
+                {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("missing-session warning should be emitted");
+        assert!(warning.content.contains("Starting a fresh Claude session"));
+
+        assert!(
+            backend
+                .send(protocol::AgentInput::SendMessage(
+                    protocol::SendMessagePayload {
+                        message: "follow up after stale resume".to_string(),
+                        images: None,
+                        origin: None,
+                        tool_response: None,
+                    },
+                ))
+                .await,
+            "backend should remain alive after missing-session recovery"
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("backend event after follow-up");
+                if let protocol::ChatEvent::StreamEnd(end) = event
+                    && end.message.content == "fresh follow-up ok"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("fresh follow-up should complete");
+
+        backend.shutdown().await;
+        unsafe {
+            if let Some(value) = previous_claude_bin {
+                std::env::set_var(TYDE_CLAUDE_BIN_ENV, value);
+            } else {
+                std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            }
+            if let Some(value) = previous_fake_log {
+                std::env::set_var("TYDE_FAKE_CLAUDE_LOG", value);
+            } else {
+                std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
+            }
+            if let Some(value) = previous_claude_config_dir {
+                std::env::set_var("CLAUDE_CONFIG_DIR", value);
+            } else {
+                std::env::remove_var("CLAUDE_CONFIG_DIR");
+            }
+        }
+
+        let log_contents = std::fs::read_to_string(&log).expect("read fake Claude stale log");
+        let start_line = log_contents
+            .lines()
+            .find(|line| line.starts_with("START "))
+            .expect("fake Claude process should start after follow-up");
+        assert!(
+            start_line.contains("--session-id stale-missing-session"),
+            "fresh recovery should start Claude with the stale id as a new session: {start_line}"
+        );
+        assert!(
+            !start_line.contains("--resume"),
+            "fresh recovery must not ask Claude CLI to resume the missing jsonl: {start_line}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_exit_plan_mode_control_request_waits_for_approval_message() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-exit-plan.py");
+        let log = workspace.path().join("fake-claude-exit-plan.log");
+        write_fake_exit_plan_mode_script(&fake);
+
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
+        }
+
+        let (backend, mut events) = ClaudeBackend::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig {
+                cost_hint: Some(protocol::SpawnCostHint::Low),
+                ..BackendSpawnConfig::default()
+            },
+            protocol::SendMessagePayload {
+                message: "plan first".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Claude backend");
+
+        let mut saw_pause = false;
+        let tool_request = timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("backend event");
+                match event {
+                    protocol::ChatEvent::ToolRequest(request)
+                        if request.tool_call_id == "toolu_exit" =>
+                    {
+                        return request;
+                    }
+                    protocol::ChatEvent::TypingStatusChanged(false) => {
+                        saw_pause = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("ExitPlanMode ToolRequest should arrive");
+
+        assert_eq!(tool_request.tool_name, "ExitPlanMode");
+        let protocol::ToolRequestType::ExitPlanMode { plan, plan_path } = tool_request.tool_type
+        else {
+            panic!("expected ExitPlanMode tool request");
+        };
+        assert_eq!(
+            plan.as_deref(),
+            Some("# Plan\n\nDo the work.\nRun the tests.")
+        );
+        assert_eq!(
+            plan_path.as_deref(),
+            Some("/repo/.claude/plans/test-plan.md")
+        );
+
+        timeout(Duration::from_secs(2), async {
+            while !saw_pause {
+                if let protocol::ChatEvent::TypingStatusChanged(false) =
+                    events.recv().await.expect("backend event")
+                {
+                    saw_pause = true;
+                }
+            }
+        })
+        .await
+        .expect("ExitPlanMode should pause typing while waiting for approval");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let log_before_approval =
+            std::fs::read_to_string(&log).expect("read fake Claude ExitPlanMode log");
+        assert!(
+            !log_before_approval.contains("\"request_id\":\"plan-1\"")
+                && !log_before_approval.contains("\"request_id\": \"plan-1\""),
+            "ExitPlanMode control_response must wait for user approval; log={log_before_approval}"
+        );
+
+        assert!(
+            backend
+                .send(protocol::AgentInput::SendMessage(
+                    protocol::SendMessagePayload {
+                        message: String::new(),
+                        images: None,
+                        origin: None,
+                        tool_response: Some(protocol::SendMessageToolResponse::ExitPlanMode {
+                            tool_call_id: "toolu_exit".to_string(),
+                            decision: protocol::ExitPlanModeDecision::Approve,
+                            feedback: None,
+                        }),
+                    },
+                ))
+                .await,
+            "backend should accept ExitPlanMode approval"
+        );
+
+        let mut saw_completion = false;
+        let mut saw_typing_restart = false;
+        let mut saw_answer = false;
+        timeout(Duration::from_secs(2), async {
+            while !(saw_completion && saw_typing_restart && saw_answer) {
+                let event = events.recv().await.expect("backend event after approval");
+                match event {
+                    protocol::ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == "toolu_exit" =>
+                    {
+                        assert!(completion.success);
+                        let protocol::ToolExecutionResult::Other { result } =
+                            &completion.tool_result
+                        else {
+                            panic!("expected Other result");
+                        };
+                        assert_eq!(
+                            result.get("decision").and_then(Value::as_str),
+                            Some("approved")
+                        );
+                        saw_completion = true;
+                    }
+                    protocol::ChatEvent::TypingStatusChanged(true) => {
+                        saw_typing_restart = true;
+                    }
+                    protocol::ChatEvent::StreamEnd(end)
+                        if end.message.content.contains("plan approved: # Plan") =>
+                    {
+                        saw_answer = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("approval should release Claude control_request");
+
+        backend.shutdown().await;
+        unsafe {
+            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
+        }
+
+        let log_after_approval =
+            std::fs::read_to_string(&log).expect("read fake Claude ExitPlanMode log");
+        assert!(log_after_approval.contains("\"request_id\":\"plan-1\""));
+        assert!(log_after_approval.contains("\"behavior\":\"allow\""));
+        assert!(log_after_approval.contains("\"updatedInput\""));
+        assert!(log_after_approval.contains("Run the tests."));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_exit_plan_mode_reject_sends_deny_feedback() {
+        let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let fake = workspace.path().join("fake-claude-exit-plan-reject.py");
+        let log = workspace.path().join("fake-claude-exit-plan-reject.log");
+        write_fake_exit_plan_mode_script(&fake);
+
+        unsafe {
+            std::env::set_var(TYDE_CLAUDE_BIN_ENV, &fake);
+            std::env::set_var("TYDE_FAKE_CLAUDE_LOG", &log);
+        }
+
+        let (backend, mut events) = ClaudeBackend::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig {
+                cost_hint: Some(protocol::SpawnCostHint::Low),
+                ..BackendSpawnConfig::default()
+            },
+            protocol::SendMessagePayload {
+                message: "plan first".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Claude backend");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("backend event");
+                if matches!(
+                    event,
+                    protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
+                        ref tool_call_id,
+                        ..
+                    }) if tool_call_id == "toolu_exit"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ExitPlanMode ToolRequest should arrive");
+
+        let feedback = "Please add a rollback step.";
+        assert!(
+            backend
+                .send(protocol::AgentInput::SendMessage(
+                    protocol::SendMessagePayload {
+                        message: String::new(),
+                        images: None,
+                        origin: None,
+                        tool_response: Some(protocol::SendMessageToolResponse::ExitPlanMode {
+                            tool_call_id: "toolu_exit".to_string(),
+                            decision: protocol::ExitPlanModeDecision::Reject,
+                            feedback: Some(feedback.to_string()),
+                        }),
+                    },
+                ))
+                .await,
+            "backend should accept ExitPlanMode rejection"
+        );
+
+        let mut saw_completion = false;
+        let mut saw_typing_restart = false;
+        let mut saw_answer = false;
+        timeout(Duration::from_secs(2), async {
+            while !(saw_completion && saw_typing_restart && saw_answer) {
+                let event = events.recv().await.expect("backend event after rejection");
+                match event {
+                    protocol::ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_call_id == "toolu_exit" =>
+                    {
+                        assert!(completion.success);
+                        let protocol::ToolExecutionResult::Other { result } =
+                            &completion.tool_result
+                        else {
+                            panic!("expected Other result");
+                        };
+                        assert_eq!(
+                            result.get("decision").and_then(Value::as_str),
+                            Some("rejected")
+                        );
+                        assert_eq!(
+                            result.get("feedback").and_then(Value::as_str),
+                            Some(feedback)
+                        );
+                        saw_completion = true;
+                    }
+                    protocol::ChatEvent::TypingStatusChanged(true) => {
+                        saw_typing_restart = true;
+                    }
+                    protocol::ChatEvent::StreamEnd(end)
+                        if end.message.content.contains("plan rejected: Please add") =>
+                    {
+                        saw_answer = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("rejection should release Claude control_request");
+
+        backend.shutdown().await;
+        unsafe {
+            std::env::remove_var(TYDE_CLAUDE_BIN_ENV);
+            std::env::remove_var("TYDE_FAKE_CLAUDE_LOG");
+        }
+
+        let log_after_rejection =
+            std::fs::read_to_string(&log).expect("read fake Claude ExitPlanMode log");
+        assert!(log_after_rejection.contains("\"behavior\":\"deny\""));
+        assert!(log_after_rejection.contains("\"message\":\"Please add a rollback step.\""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fake_ask_user_question_control_request_waits_for_answer_message() {
         let _guard = FAKE_CLAUDE_ENV_LOCK.lock().await;
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -7900,7 +9410,7 @@ for raw_line in sys.stdin:
         if response.get("request_id") == "ask-1":
             control = response.get("response", {})
             updated = control.get("updatedInput", {})
-            answer = updated.get("answer") or updated.get("answersText") or json.dumps(updated.get("answers", {}))
+            answer = updated.get("answers", {}).get("Which choice?", "")
             emit({
                 "type": "stream_event",
                 "session_id": session_id,
@@ -8029,6 +9539,7 @@ for raw_line in sys.stdin:
                 message: "ask me before continuing".to_string(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -8100,6 +9611,7 @@ for raw_line in sys.stdin:
                         message: "Choice: Blue".to_string(),
                         images: None,
                         origin: None,
+                        tool_response: None,
                     },
                 ))
                 .await,
@@ -8126,10 +9638,7 @@ for raw_line in sys.stdin:
                         saw_completion = true;
                     }
                     protocol::ChatEvent::StreamEnd(end)
-                        if end
-                            .message
-                            .content
-                            .contains("answer accepted: Choice: Blue") =>
+                        if end.message.content.contains("answer accepted: Blue") =>
                     {
                         saw_answer = true;
                     }
@@ -8158,7 +9667,8 @@ for raw_line in sys.stdin:
         let log_after_answer =
             std::fs::read_to_string(&log).expect("read fake Claude AskUserQuestion log");
         assert!(log_after_answer.contains("\"request_id\":\"ask-1\""));
-        assert!(log_after_answer.contains("Choice: Blue"));
+        assert!(log_after_answer.contains("Which choice?"));
+        assert!(log_after_answer.contains("Blue"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8340,6 +9850,7 @@ for raw_line in sys.stdin:
                 message: "ask me before racing".to_string(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -8370,6 +9881,7 @@ for raw_line in sys.stdin:
                         message: "Choice: Blue".to_string(),
                         images: None,
                         origin: None,
+                        tool_response: None,
                     },
                 ))
                 .await,
@@ -8682,6 +10194,7 @@ for raw_line in sys.stdin:
                 message: "ask then exit".to_string(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -8762,6 +10275,7 @@ for raw_line in sys.stdin:
                         }],
                     }),
                 }),
+                pending_exit_plan_mode: None,
                 quiesced_waiters: Vec::new(),
             });
         }
@@ -8977,6 +10491,7 @@ for raw_line in sys.stdin:
                 message: "ask then close stdin".to_string(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -9006,6 +10521,7 @@ for raw_line in sys.stdin:
                         message: "Choice: Blue".to_string(),
                         images: None,
                         origin: None,
+                        tool_response: None,
                     },
                 ))
                 .await,
@@ -9050,6 +10566,7 @@ for raw_line in sys.stdin:
                         message: "follow up after write failure".to_string(),
                         images: None,
                         origin: None,
+                        tool_response: None,
                     },
                 ))
                 .await,
@@ -9211,6 +10728,7 @@ for raw_line in sys.stdin:
                 message: "ask then interrupt".to_string(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -10599,6 +12117,7 @@ for raw_line in sys.stdin:
                     workspace_root,
                     ssh_host: None,
                     session_id: None,
+                    start_session_fresh: false,
                     ephemeral: true,
                     model: None,
                     effort: Some("high".to_string()),
@@ -11178,6 +12697,25 @@ for raw_line in sys.stdin:
         assert_eq!(questions[0].header, None);
         assert!(questions[0].options.is_empty());
         assert!(!questions[0].multi_select);
+    }
+
+    #[test]
+    fn claude_tool_request_type_maps_exit_plan_mode() {
+        let request = claude_tool_request_type(
+            "ExitPlanMode",
+            &json!({
+                "plan": "# Plan\n\nDo the work.",
+                "planFilePath": "/repo/.claude/plans/test.md",
+            }),
+        );
+
+        let parsed: protocol::ToolRequestType =
+            serde_json::from_value(request).expect("typed ExitPlanMode request");
+        let protocol::ToolRequestType::ExitPlanMode { plan, plan_path } = parsed else {
+            panic!("expected ExitPlanMode tool type");
+        };
+        assert_eq!(plan.as_deref(), Some("# Plan\n\nDo the work."));
+        assert_eq!(plan_path.as_deref(), Some("/repo/.claude/plans/test.md"));
     }
 
     #[test]

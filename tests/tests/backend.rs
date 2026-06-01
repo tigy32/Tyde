@@ -173,6 +173,7 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
                         message: "Reply exactly with ok".to_owned(),
                         images: None,
                         origin: None,
+                        tool_response: None,
                     },
                 ),
             )
@@ -211,6 +212,7 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
                         message: "Reply exactly with ok".to_owned(),
                         images: None,
                         origin: None,
+                        tool_response: None,
                     },
                 ),
             )

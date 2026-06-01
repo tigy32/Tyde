@@ -640,6 +640,7 @@ async fn do_send_message(
             message,
             images: None,
             origin: None,
+            tool_response: None,
         }))
         .await;
     if !sent {

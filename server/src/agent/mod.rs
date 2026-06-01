@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -350,6 +350,7 @@ pub(crate) async fn generate_agent_name(
         message: name_prompt,
         images: None,
         origin: None,
+        tool_response: None,
     };
     let name_agent_id = AgentId(Uuid::new_v4().to_string());
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
@@ -788,6 +789,7 @@ pub(crate) fn spawn_agent_actor(
         let mut backend = Some(backend);
         let mut in_turn = is_new_spawn;
         let mut idle_transition_armed = false;
+        let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
         let mut active_compaction: Option<ActiveCompaction> = None;
@@ -1030,6 +1032,8 @@ pub(crate) fn spawn_agent_actor(
                             if typing {
                                 in_turn = true;
                                 idle_transition_armed = true;
+                            } else if !pending_tool_response_ids.is_empty() {
+                                idle_transition_armed = false;
                             } else if in_turn && idle_transition_armed {
                                 real_idle_transition = true;
                                 in_turn = false;
@@ -1041,11 +1045,36 @@ pub(crate) fn spawn_agent_actor(
                             }).await;
                         }
                         ChatEvent::OperationCancelled(_) => {
+                            pending_tool_response_ids.clear();
                             if let Some(compaction) = active_compaction.as_mut() {
                                 compaction.error = Some("compaction summary turn was cancelled".to_owned());
                             }
                             status_handle.update(|s| {
                                 s.turn_completed = true;
+                                s.activity_counter = s.activity_counter.saturating_add(1);
+                            }).await;
+                        }
+                        ChatEvent::ToolRequest(request) => {
+                            if matches!(
+                                &request.tool_type,
+                                protocol::ToolRequestType::ExitPlanMode { .. }
+                            ) {
+                                pending_tool_response_ids.insert(request.tool_call_id.clone());
+                                in_turn = true;
+                                idle_transition_armed = false;
+                            }
+                            status_handle.update(|s| {
+                                s.activity_counter = s.activity_counter.saturating_add(1);
+                            }).await;
+                        }
+                        ChatEvent::ToolExecutionCompleted(completion) => {
+                            if pending_tool_response_ids.remove(&completion.tool_call_id)
+                                && pending_tool_response_ids.is_empty()
+                                && in_turn
+                            {
+                                idle_transition_armed = true;
+                            }
+                            status_handle.update(|s| {
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -1255,7 +1284,8 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
                                         Some(MessageOrigin::User) | None => None,
                                     };
-                                    if in_turn {
+                                    let is_tool_response = msg.tool_response.is_some();
+                                    if in_turn && !is_tool_response {
                                         let queued_message_id =
                                             QueuedMessageId(Uuid::new_v4().to_string());
                                         queue.push_back(QueuedMessageEntry {
@@ -1287,8 +1317,10 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                     } else {
-                                        in_turn = true;
-                                        idle_transition_armed = false;
+                                        if !is_tool_response {
+                                            in_turn = true;
+                                            idle_transition_armed = false;
+                                        }
                                         if let Some(review_id) = review_origin.as_ref() {
                                             tracing::info!(
                                                 review_id = %review_id,
@@ -1719,6 +1751,7 @@ pub(crate) fn spawn_agent_actor(
                                     message: summary_prompt,
                                     images: None,
                                     origin: None,
+                                    tool_response: None,
                                 }))
                                 .await
                             {
@@ -2521,6 +2554,7 @@ fn queued_message_to_send_payload(entry: QueuedMessageEntry) -> SendMessagePaylo
         message: entry.message,
         images: (!entry.images.is_empty()).then_some(entry.images),
         origin: entry.origin,
+        tool_response: None,
     }
 }
 
@@ -3801,6 +3835,7 @@ mod tests {
                     message: "hello".to_string(),
                     images: None,
                     origin: None,
+                    tool_response: None,
                 }))
                 .await
         );

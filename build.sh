@@ -446,6 +446,9 @@ cmd_ios() {
             run_tauri_clean "$tauri_bin" ios init --ci
         )
     fi
+    mkdir -p \
+        "$SCRIPT_DIR/mobile/src-tauri/gen/apple/assets" \
+        "$SCRIPT_DIR/mobile/src-tauri/gen/apple/Externals"
 
     if [[ -n "$ios_team" ]]; then
         log "Configuring iOS development team $ios_team..."

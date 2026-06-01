@@ -554,6 +554,7 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
                 message: "hello from mobile mqtt test".to_owned(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -664,6 +665,7 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
                 message: "hello after mobile reconnect".to_owned(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await

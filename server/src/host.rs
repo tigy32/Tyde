@@ -1612,6 +1612,7 @@ impl HostHandle {
                         message: prompt,
                         images,
                         origin: None,
+                        tool_response: None,
                     }),
                     cost_hint,
                     session_settings,
@@ -1823,6 +1824,7 @@ impl HostHandle {
                         message: prompt,
                         images: None,
                         origin: None,
+                        tool_response: None,
                     }),
                     cost_hint: None,
                     session_settings: sanitized_settings,
@@ -2586,6 +2588,7 @@ impl HostHandle {
                 message,
                 images,
                 origin: None,
+                tool_response: None,
             }))
             .await;
         if !sent {
@@ -7239,6 +7242,7 @@ mod tests {
                 message: "This input must wait behind compaction".to_owned(),
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .expect("send envelope");

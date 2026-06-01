@@ -403,6 +403,7 @@ fn message_origin_round_trips_and_defaults_to_none() {
     assert_eq!(decoded.message, "hello");
     assert_eq!(decoded.images, None);
     assert_eq!(decoded.origin, None);
+    assert_eq!(decoded.tool_response, None);
 
     let decoded: SendMessagePayload = serde_json::from_value(json!({
         "message": "hello",
@@ -416,6 +417,25 @@ fn message_origin_round_trips_and_defaults_to_none() {
         decoded.origin,
         Some(MessageOrigin::Review {
             review_id: review_id()
+        })
+    );
+
+    let decoded: SendMessagePayload = serde_json::from_value(json!({
+        "message": "",
+        "tool_response": {
+            "kind": "ExitPlanMode",
+            "tool_call_id": "toolu_exit",
+            "decision": "reject",
+            "feedback": "Needs tests"
+        }
+    }))
+    .expect("deserialize SendMessagePayload with tool response");
+    assert_eq!(
+        decoded.tool_response,
+        Some(protocol::SendMessageToolResponse::ExitPlanMode {
+            tool_call_id: "toolu_exit".to_string(),
+            decision: protocol::ExitPlanModeDecision::Reject,
+            feedback: Some("Needs tests".to_string()),
         })
     );
 }

@@ -1067,6 +1067,8 @@ pub struct SendMessagePayload {
     pub images: Option<Vec<ImageData>>,
     #[serde(default)]
     pub origin: Option<MessageOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_response: Option<SendMessageToolResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1074,6 +1076,24 @@ pub struct SendMessagePayload {
 pub enum MessageOrigin {
     User,
     Review { review_id: ReviewId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum SendMessageToolResponse {
+    ExitPlanMode {
+        tool_call_id: String,
+        decision: ExitPlanModeDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitPlanModeDecision {
+    Approve,
+    Reject,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2951,6 +2971,12 @@ pub enum ToolRequestType {
     },
     AskUserQuestion {
         questions: Vec<AskUserQuestion>,
+    },
+    ExitPlanMode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_path: Option<String>,
     },
     Other {
         args: Value,

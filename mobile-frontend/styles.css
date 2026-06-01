@@ -116,6 +116,59 @@ input, textarea, select {
     padding-bottom: var(--safe-area-bottom);
 }
 
+/* ── Mobile Shell Error Banner ──────────────────────────────────────── */
+
+.mobile-shell-error-banner {
+    position: fixed;
+    top: calc(var(--safe-area-top) + var(--space-2));
+    left: var(--space-3);
+    right: var(--space-3);
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: 36px;
+    padding: var(--space-2) var(--space-3);
+    background: var(--accent-error-bg);
+    border: 1px solid var(--accent-error);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    color: var(--accent-error);
+}
+
+.mobile-shell-error-code {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.mobile-shell-error-message {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+}
+
+.error-banner-dismiss {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-full);
+    color: inherit;
+    line-height: 1;
+    pointer-events: auto;
+}
+
+.error-banner-dismiss:hover,
+.error-banner-dismiss:focus-visible {
+    background: color-mix(in srgb, var(--accent-error) 14%, transparent);
+    outline: none;
+}
+
 /* ── Connection Banner ──────────────────────────────────────────────── */
 
 .connection-banner {
@@ -206,6 +259,9 @@ input, textarea, select {
 }
 
 .command-error-banner {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
     max-width: min(280px, calc(100vw - var(--space-6)));
     padding: 5px 9px;
     background: var(--accent-error-bg);
@@ -215,14 +271,22 @@ input, textarea, select {
     font-size: 12px;
     line-height: 1.2;
     color: var(--accent-error);
-    pointer-events: none;
+    pointer-events: auto;
 }
 
 .command-error-banner .error-text {
     display: block;
+    min-width: 0;
+    flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.connection-banner-dismiss,
+.command-error-dismiss {
+    width: 22px;
+    height: 22px;
 }
 
 /* ── Bottom Navigation ──────────────────────────────────────────────── */
@@ -1071,49 +1135,52 @@ input, textarea, select {
     flex: 1;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: var(--space-3);
+    padding: var(--space-2) var(--space-2);
 }
 
 .chat-transcript {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: 0;
 }
 
 /* ── Chat Messages ──────────────────────────────────────────────────── */
 
 .chat-message {
-    padding: var(--space-3) var(--space-4);
-    border-radius: var(--radius-md);
+    padding: var(--space-2) var(--space-3);
     font-size: 15px;
     line-height: 1.6;
 }
 
 .chat-message.user {
-    background: var(--accent-primary);
-    color: white;
-    margin-left: var(--space-6);
-    border-bottom-right-radius: var(--space-1);
+    background: transparent;
+    color: inherit;
+    border-left: 3px solid var(--accent-primary);
+    box-shadow: inset 0 1px 0 0 var(--border-default);
 }
 
 .chat-message.assistant {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    margin-right: var(--space-4);
-    border-bottom-left-radius: var(--space-1);
+    background: transparent;
+    color: inherit;
+    border-left: 3px solid var(--border-strong);
+    box-shadow: inset 0 1px 0 0 var(--border-default);
 }
 
 .chat-message.system {
+    margin: var(--space-2) var(--space-2);
     background: var(--bg-surface-2);
     border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
     font-size: 13px;
     color: var(--text-secondary);
     text-align: center;
 }
 
 .chat-message.error {
+    margin: var(--space-2) var(--space-2);
     background: var(--accent-error-bg);
     border: 1px solid var(--accent-error);
+    border-radius: var(--radius-md);
     color: var(--accent-error);
 }
 
@@ -1132,10 +1199,6 @@ input, textarea, select {
     color: var(--text-secondary);
 }
 
-.chat-message.user .message-header {
-    color: rgba(255,255,255,0.8);
-}
-
 .model-badge {
     font-size: 10px;
     font-weight: 500;
@@ -1143,11 +1206,6 @@ input, textarea, select {
     border-radius: var(--radius-full);
     background: var(--bg-surface-2);
     color: var(--text-tertiary);
-}
-
-.chat-message.user .model-badge {
-    background: rgba(255,255,255,0.2);
-    color: rgba(255,255,255,0.7);
 }
 
 .sender-name { text-transform: capitalize; }
@@ -1271,6 +1329,7 @@ input, textarea, select {
     background: var(--bg-surface-2);
     border-radius: var(--radius-sm);
     font-size: 13px;
+    border: 1px solid var(--border-default);
     border-left: 3px solid var(--text-tertiary);
 }
 
@@ -1320,6 +1379,89 @@ input, textarea, select {
     border-radius: var(--radius-sm);
     white-space: pre-wrap;
     word-break: break-all;
+}
+
+/* ── ExitPlanMode ───────────────────────────────────────────────────── */
+
+.exit-plan-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+}
+
+.exit-plan-readonly {
+    margin-top: 0;
+}
+
+.exit-plan-path {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.exit-plan-text {
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+}
+
+.exit-plan-feedback {
+    width: 100%;
+    min-height: 72px;
+    padding: var(--space-2);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    resize: vertical;
+}
+
+.exit-plan-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.exit-plan-approve,
+.exit-plan-reject {
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.exit-plan-approve {
+    border: 1px solid var(--accent-primary);
+    background: var(--bg-surface);
+    color: var(--accent-primary);
+}
+
+.exit-plan-reject {
+    border: 1px solid var(--border-default);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+}
+
+.exit-plan-approve:disabled,
+.exit-plan-reject:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
+.exit-plan-sent-note,
+.exit-plan-error-note {
+    font-size: 12px;
+}
+
+.exit-plan-sent-note {
+    color: var(--accent-success);
+}
+
+.exit-plan-error-note {
+    color: var(--accent-error);
 }
 
 .ask-question-body {

@@ -231,10 +231,25 @@ path identifies the target agent — no `agent_id` field needed.
 ```rust
 pub struct SendMessagePayload {
     pub message: String,
+    pub images: Option<Vec<ImageData>>,
+    pub origin: Option<MessageOrigin>,
+    pub tool_response: Option<SendMessageToolResponse>,
+}
+
+#[serde(tag = "kind")]
+pub enum SendMessageToolResponse {
+    ExitPlanMode {
+        tool_call_id: String,
+        decision: ExitPlanModeDecision, // approve | reject
+        feedback: Option<String>,
+    },
 }
 ```
 
 - `message` — The follow-up message content.
+- `tool_response` — Optional structured response to an interactive tool request
+  (currently `ExitPlanMode` approval/rejection). When present, the backend
+  consumes the payload instead of treating it as a normal user turn.
 
 **Terminated agent rule:** If the client sends `SendMessage` to an agent that
 is terminated, the server emits
@@ -441,6 +456,9 @@ pub enum SpawnCostHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessagePayload {
     pub message: String,
+    pub images: Option<Vec<ImageData>>,
+    pub origin: Option<MessageOrigin>,
+    pub tool_response: Option<SendMessageToolResponse>,
 }
 ```
 
@@ -628,6 +646,13 @@ pub enum ToolRequestType {
         language: String,
         workspace_root: String,
         type_path: String,
+    },
+    AskUserQuestion {
+        questions: Vec<AskUserQuestion>,
+    },
+    ExitPlanMode {
+        plan: Option<String>,
+        plan_path: Option<String>,
     },
     Other {
         args: Value,

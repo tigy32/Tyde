@@ -3,7 +3,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::state::{AppState, ToolOutputMode, ToolRequestEntry};
 
-use protocol::{AskUserQuestion, FrameKind, SendMessagePayload, StreamPath, ToolRequestType};
+use protocol::{
+    AskUserQuestion, ExitPlanModeDecision, FrameKind, SendMessagePayload, SendMessageToolResponse,
+    StreamPath, ToolRequestType,
+};
 
 /// Renders a single tool request inside an assistant message.
 ///
@@ -36,6 +39,61 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
             </div>
         }
         .into_any();
+    }
+
+    // A pending ExitPlanMode awaits the user's approval: render the plan plus
+    // Approve/Reject controls. Once the request succeeds the card renders the
+    // plan read-only (no active controls), matching the desktop card. A failed
+    // completion falls through to the generic completion body below.
+    if let ToolRequestType::ExitPlanMode { plan, plan_path } = &entry.request.tool_type {
+        let succeeded = entry.result.as_ref().map(|r| r.success);
+        match succeeded {
+            // Pending: interactive Approve/Reject card.
+            None => {
+                let plan = plan.clone();
+                let plan_path = plan_path.clone();
+                let tool_call_id = entry.request.tool_call_id.clone();
+                return view! {
+                    <div class="tool-card exit-plan" data-mobile-test="tool-card-exit-plan">
+                        <div class="tool-card-header">
+                            <span class="tool-name">{tool_name}</span>
+                        </div>
+                        <ExitPlanModeCard tool_call_id=tool_call_id plan=plan plan_path=plan_path />
+                    </div>
+                }
+                .into_any();
+            }
+            // Approved/decided: show the plan read-only, no controls.
+            Some(true) => {
+                let plan = plan.clone();
+                let plan_path = plan_path.clone();
+                return view! {
+                    <div
+                        class="tool-card completed success exit-plan"
+                        data-mobile-test="tool-card-exit-plan-done"
+                        aria-label="Plan reviewed"
+                    >
+                        <div class="tool-card-header">
+                            <span class="tool-status-icon" aria-hidden="true">"\u{2713}"</span>
+                            <span class="tool-name">{tool_name}</span>
+                        </div>
+                        <div class="exit-plan-body exit-plan-readonly" data-mobile-test="exit-plan-readonly">
+                            {plan_path.map(|path| view! {
+                                <div class="exit-plan-path">{format!("Plan: {path}")}</div>
+                            })}
+                            {plan
+                                .filter(|p| !p.trim().is_empty())
+                                .map(|plan| view! {
+                                    <div class="exit-plan-text" data-mobile-test="exit-plan-text">{plan}</div>
+                                })}
+                        </div>
+                    </div>
+                }
+                .into_any();
+            }
+            // Failed: fall through to the generic failed-completion body.
+            Some(false) => {}
+        }
     }
 
     let is_completed = entry.result.is_some();
@@ -368,6 +426,7 @@ fn send_answer(
             message,
             images: None,
             origin: None,
+            tool_response: None,
         };
         match crate::send::send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
             Ok(()) => {
@@ -380,6 +439,177 @@ fn send_answer(
             }
         }
         sending.set(false);
+    });
+}
+
+// ── ExitPlanMode ────────────────────────────────────────────────────────
+//
+// Mirrors the desktop `tool_card::exit_plan_mode` renderer. The two frontends
+// are separate crates, so the small view-model is duplicated rather than
+// shared. The decision rides the normal `SendMessage` path as a
+// `SendMessageToolResponse::ExitPlanMode` tool response — no dedicated frame.
+
+/// The reactive status signals an `ExitPlanModeCard` shares with its async send
+/// task. Bundled into one `Copy` value so the decision/result of a submit can be
+/// reported back without threading a long argument list through `send_decision`.
+#[derive(Clone, Copy)]
+struct DecisionStatus {
+    decision_sent: RwSignal<Option<ExitPlanModeDecision>>,
+    sending: RwSignal<bool>,
+    send_error: RwSignal<Option<String>>,
+}
+
+#[component]
+fn ExitPlanModeCard(
+    tool_call_id: String,
+    plan: Option<String>,
+    plan_path: Option<String>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    let decision_sent = RwSignal::new(None::<ExitPlanModeDecision>);
+    let sending = RwSignal::new(false);
+    let send_error = RwSignal::new(None::<String>);
+    let feedback = RwSignal::new(String::new());
+    let status = DecisionStatus {
+        decision_sent,
+        sending,
+        send_error,
+    };
+
+    let tool_call_id = std::sync::Arc::new(tool_call_id);
+
+    let submit = {
+        let state = state.clone();
+        let tool_call_id = tool_call_id.clone();
+        move |decision: ExitPlanModeDecision| {
+            if decision_sent.get_untracked().is_some() || sending.get_untracked() {
+                return;
+            }
+            send_error.set(None);
+            let trimmed = feedback.get_untracked().trim().to_owned();
+            let feedback = match decision {
+                ExitPlanModeDecision::Reject if !trimmed.is_empty() => Some(trimmed),
+                _ => None,
+            };
+            let (host_id, stream) = match answer_target(&state) {
+                Ok(target) => target,
+                Err(message) => {
+                    send_error.set(Some(message.to_owned()));
+                    return;
+                }
+            };
+            sending.set(true);
+            send_decision(
+                host_id,
+                stream,
+                (*tool_call_id).clone(),
+                decision,
+                feedback,
+                status,
+            );
+        }
+    };
+
+    let on_approve = {
+        let submit = submit.clone();
+        move |_| submit(ExitPlanModeDecision::Approve)
+    };
+    let on_reject = move |_| submit(ExitPlanModeDecision::Reject);
+
+    let controls_disabled = move || decision_sent.get().is_some() || sending.get();
+
+    view! {
+        <div class="exit-plan-body" data-mobile-test="exit-plan-body">
+            {plan_path.map(|path| view! {
+                <div class="exit-plan-path">{format!("Plan: {path}")}</div>
+            })}
+            {plan
+                .filter(|p| !p.trim().is_empty())
+                .map(|plan| view! {
+                    <div class="exit-plan-text" data-mobile-test="exit-plan-text">{plan}</div>
+                })}
+            <textarea
+                class="exit-plan-feedback"
+                data-mobile-test="exit-plan-feedback"
+                rows="2"
+                placeholder="Optional feedback (sent if you reject)"
+                prop:disabled=controls_disabled
+                on:input=move |ev: web_sys::Event| {
+                    if decision_sent.get_untracked().is_some() || sending.get_untracked() {
+                        return;
+                    }
+                    feedback.set(event_target_value(&ev));
+                }
+            />
+            <div class="exit-plan-actions">
+                <button
+                    class="exit-plan-approve"
+                    data-mobile-test="exit-plan-approve"
+                    prop:disabled=controls_disabled
+                    on:click=on_approve
+                >
+                    "Approve"
+                </button>
+                <button
+                    class="exit-plan-reject"
+                    data-mobile-test="exit-plan-reject"
+                    prop:disabled=controls_disabled
+                    on:click=on_reject
+                >
+                    "Reject"
+                </button>
+                <Show when=move || decision_sent.get().is_some()>
+                    <span class="exit-plan-sent-note" data-mobile-test="exit-plan-sent" role="status">
+                        {move || match decision_sent.get() {
+                            Some(ExitPlanModeDecision::Approve) => "Approved — Claude will continue.",
+                            Some(ExitPlanModeDecision::Reject) => "Rejected — Claude will revise.",
+                            None => "",
+                        }}
+                    </span>
+                </Show>
+                <Show when=move || send_error.get().is_some()>
+                    <span class="exit-plan-error-note" data-mobile-test="exit-plan-error" role="alert">
+                        {move || send_error.get().unwrap_or_default()}
+                    </span>
+                </Show>
+            </div>
+        </div>
+    }
+}
+
+fn send_decision(
+    host_id: crate::state::LocalHostId,
+    stream: StreamPath,
+    tool_call_id: String,
+    decision: ExitPlanModeDecision,
+    feedback: Option<String>,
+    status: DecisionStatus,
+) {
+    spawn_local(async move {
+        let payload = SendMessagePayload {
+            message: String::new(),
+            images: None,
+            origin: None,
+            tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                tool_call_id,
+                decision,
+                feedback,
+            }),
+        };
+        match crate::send::send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
+            Ok(()) => {
+                status.decision_sent.set(Some(decision));
+                status.send_error.set(None);
+            }
+            Err(error) => {
+                log::error!("exit_plan_mode: failed to send decision: {error}");
+                status.send_error.set(Some(format!(
+                    "Could not send decision: {error}. Try again."
+                )));
+            }
+        }
+        status.sending.set(false);
     });
 }
 
@@ -828,6 +1058,208 @@ mod wasm_tests {
         assert!(
             !submit_button(&container).disabled(),
             "answer should remain retryable after send failure"
+        );
+    }
+
+    // ── ExitPlanMode ────────────────────────────────────────────────────
+
+    fn exit_plan_entry(completed: bool) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: "toolu_plan".to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
+                tool_type: ToolRequestType::ExitPlanMode {
+                    plan: Some("Step 1: do the thing\nStep 2: verify it".to_owned()),
+                    plan_path: Some("docs/plan.md".to_owned()),
+                },
+            },
+            result: completed.then(|| ToolExecutionCompletedData {
+                tool_call_id: "toolu_plan".to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
+                tool_result: ToolExecutionResult::Other {
+                    result: serde_json::json!({ "decision": "approve" }),
+                },
+                success: true,
+                error: None,
+            }),
+        }
+    }
+
+    fn exit_approve_button(container: &HtmlElement) -> Option<HtmlButtonElement> {
+        container
+            .query_selector("[data-mobile-test='exit-plan-approve']")
+            .unwrap()
+            .and_then(|n| n.dyn_into::<HtmlButtonElement>().ok())
+    }
+
+    fn exit_reject_button(container: &HtmlElement) -> Option<HtmlButtonElement> {
+        container
+            .query_selector("[data-mobile-test='exit-plan-reject']")
+            .unwrap()
+            .and_then(|n| n.dyn_into::<HtmlButtonElement>().ok())
+    }
+
+    fn last_send_payload(calls: &js_sys::Array) -> String {
+        let len = calls.length();
+        assert!(len > 0, "expected at least one send call");
+        let entry = calls
+            .get(len - 1)
+            .dyn_into::<js_sys::Array>()
+            .expect("call entry");
+        entry.get(1).as_string().unwrap_or_default()
+    }
+
+    #[wasm_bindgen_test]
+    async fn pending_exit_plan_renders_plan_and_controls() {
+        let container = mount_card(exit_plan_entry(false));
+        next_tick().await;
+
+        let body = container.text_content().unwrap_or_default();
+        assert!(body.contains("Step 1: do the thing"), "plan text: {body}");
+        assert!(body.contains("docs/plan.md"), "plan path: {body}");
+        assert!(exit_approve_button(&container).is_some(), "approve present");
+        assert!(exit_reject_button(&container).is_some(), "reject present");
+    }
+
+    #[wasm_bindgen_test]
+    async fn completed_exit_plan_drops_controls() {
+        let container = mount_card(exit_plan_entry(true));
+        next_tick().await;
+
+        assert!(
+            exit_approve_button(&container).is_none(),
+            "completed plan must not keep active approve control"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='exit-plan-body']")
+                .unwrap()
+                .is_none(),
+            "completed plan must not render the interactive body"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn completed_exit_plan_shows_plan_readonly() {
+        let container = mount_card(exit_plan_entry(true));
+        next_tick().await;
+
+        // The plan and path remain visible, read-only, after completion.
+        let body = container.text_content().unwrap_or_default();
+        assert!(body.contains("Step 1: do the thing"), "plan text: {body}");
+        assert!(body.contains("docs/plan.md"), "plan path: {body}");
+        assert!(
+            container
+                .query_selector("[data-mobile-test='exit-plan-readonly']")
+                .unwrap()
+                .is_some(),
+            "completed plan should render the read-only summary"
+        );
+        // No interactive controls and no raw-JSON result dump.
+        assert!(
+            exit_approve_button(&container).is_none(),
+            "read-only plan must not keep an approve control"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='exit-plan-feedback']")
+                .unwrap()
+                .is_none(),
+            "read-only plan must not keep the feedback textarea"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='tool-card-result']")
+                .unwrap()
+                .is_none(),
+            "read-only plan must not dump the generic raw result"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn approve_sends_decision_and_disables() {
+        let calls = install_deferred_send_stub();
+        let container = mount_card_with_setup(exit_plan_entry(false), configure_active_agent);
+        next_tick().await;
+
+        exit_approve_button(&container).unwrap().click();
+        next_tick().await;
+
+        assert_eq!(calls.length(), 1, "one send for one click");
+        let payload = last_send_payload(&calls);
+        assert!(payload.contains("ExitPlanMode"), "payload: {payload}");
+        assert!(
+            payload.contains("approve"),
+            "payload carries approve: {payload}"
+        );
+        assert!(
+            payload.contains("toolu_plan"),
+            "payload carries id: {payload}"
+        );
+        assert!(
+            exit_approve_button(&container).unwrap().disabled(),
+            "controls disabled while sending"
+        );
+
+        resolve_deferred_send();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='exit-plan-sent']")
+                .unwrap()
+                .is_some(),
+            "sent note appears after send resolves"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn reject_includes_feedback() {
+        let calls = install_deferred_send_stub();
+        let container = mount_card_with_setup(exit_plan_entry(false), configure_active_agent);
+        next_tick().await;
+
+        let area = container
+            .query_selector("[data-mobile-test='exit-plan-feedback']")
+            .unwrap()
+            .expect("feedback area")
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        area.set_value("use a different approach");
+        area.dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        exit_reject_button(&container).unwrap().click();
+        next_tick().await;
+
+        let payload = last_send_payload(&calls);
+        assert!(
+            payload.contains("reject"),
+            "payload carries reject: {payload}"
+        );
+        assert!(
+            payload.contains("use a different approach"),
+            "reject payload carries feedback: {payload}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn decision_without_active_agent_shows_retryable_error() {
+        let container = mount_card(exit_plan_entry(false));
+        next_tick().await;
+
+        exit_approve_button(&container).unwrap().click();
+        next_tick().await;
+
+        let err = container
+            .query_selector("[data-mobile-test='exit-plan-error']")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .unwrap_or_default();
+        assert!(err.contains("No active agent"), "error note: {err}");
+        assert!(
+            !exit_approve_button(&container).unwrap().disabled(),
+            "decision should remain retryable"
         );
     }
 }

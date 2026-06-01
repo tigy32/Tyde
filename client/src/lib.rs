@@ -541,6 +541,7 @@ impl Connection {
                 message,
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await
@@ -566,6 +567,7 @@ impl Connection {
                 message,
                 images: None,
                 origin: None,
+                tool_response: None,
             },
         )
         .await

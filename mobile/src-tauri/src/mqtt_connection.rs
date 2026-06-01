@@ -18,8 +18,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::paired_hosts::{PairedHostRecord, Store, StoreError};
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::types::{
-    LocalHostId, PairedHostConnectionStatus, PairedHostConnectionStatusEvent,
-    PairedHostsChangedEvent,
+    KnownConnectionInstance, LocalHostId, PairedHostConnectionStatus,
+    PairedHostConnectionStatusEvent, PairedHostsChangedEvent,
 };
 
 const MANAGER_CHANNEL_CAPACITY: usize = 128;
@@ -129,9 +129,15 @@ impl Manager {
         .await
     }
 
-    pub async fn frontend_attached(&self) -> Result<(), ManagerError> {
-        self.request(|reply| ManagerCommand::FrontendAttached { reply })
-            .await
+    pub async fn frontend_attached(
+        &self,
+        known_connection_instance_ids: Vec<KnownConnectionInstance>,
+    ) -> Result<(), ManagerError> {
+        self.request(|reply| ManagerCommand::FrontendAttached {
+            known_connection_instance_ids,
+            reply,
+        })
+        .await
     }
 
     async fn request<T>(
@@ -194,6 +200,7 @@ enum ManagerCommand {
         actor_instance_id: u64,
     },
     FrontendAttached {
+        known_connection_instance_ids: Vec<KnownConnectionInstance>,
         reply: oneshot::Sender<Result<(), ManagerError>>,
     },
 }
@@ -227,6 +234,7 @@ struct ManagerActor {
 #[derive(Clone)]
 struct BufferedHostLine {
     delivery_id: u64,
+    connection_instance_id: u64,
     line: String,
 }
 
@@ -344,8 +352,11 @@ impl ManagerActor {
                         }
                     }
                 }
-                ManagerCommand::FrontendAttached { reply } => {
-                    let result = self.frontend_attached().await;
+                ManagerCommand::FrontendAttached {
+                    known_connection_instance_ids,
+                    reply,
+                } => {
+                    let result = self.frontend_attached(known_connection_instance_ids).await;
                     let _send_result = reply.send(result);
                 }
             }
@@ -382,11 +393,31 @@ impl ManagerActor {
         })
     }
 
-    async fn frontend_attached(&mut self) -> Result<(), ManagerError> {
+    async fn frontend_attached(
+        &mut self,
+        known_connection_instance_ids: Vec<KnownConnectionInstance>,
+    ) -> Result<(), ManagerError> {
         tracing::info!(
             active_connections = self.active.len(),
             "frontend attached; replaying paired host connection state"
         );
+        let known_connection_instance_ids = known_connection_instance_ids
+            .into_iter()
+            .map(|known| (known.local_host_id, known.connection_instance_id))
+            .collect::<HashMap<_, _>>();
+        let reconnect_ids = self
+            .active
+            .iter()
+            .filter_map(|(local_host_id, active)| {
+                let connection_instance_id = active.connection_instance_id?;
+                (known_connection_instance_ids.get(local_host_id).copied()
+                    != Some(connection_instance_id))
+                .then(|| local_host_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for local_host_id in reconnect_ids {
+            self.restart_connection(local_host_id).await?;
+        }
         for (local_host_id, stored) in self.statuses.clone() {
             self.emit_status_event(local_host_id, stored);
         }
@@ -401,6 +432,20 @@ impl ManagerActor {
             self.spawn_connection(local_host_id).await?;
         }
         Ok(())
+    }
+
+    async fn restart_connection(&mut self, local_host_id: LocalHostId) -> Result<(), ManagerError> {
+        let Some(active) = self.active.remove(&local_host_id) else {
+            return self.spawn_connection(local_host_id).await;
+        };
+        tracing::info!(
+            local_host_id = %local_host_id,
+            actor_instance_id = active.actor_instance_id,
+            connection_instance_id = ?active.connection_instance_id,
+            "restarting paired host connection for attached frontend"
+        );
+        let _ = active.tx.send(ConnectionCommand::Stop).await;
+        self.spawn_connection(local_host_id).await
     }
 
     async fn spawn_connection(&mut self, local_host_id: LocalHostId) -> Result<(), ManagerError> {
@@ -619,6 +664,7 @@ impl ManagerActor {
             .or_default()
             .push_back(BufferedHostLine {
                 delivery_id,
+                connection_instance_id,
                 line: line.clone(),
             });
 
@@ -627,6 +673,7 @@ impl ManagerActor {
             HostLineEvent {
                 host_id: local_host_id.0,
                 line,
+                connection_instance_id: Some(connection_instance_id),
                 delivery_id: Some(delivery_id),
             },
         ) {
@@ -642,6 +689,7 @@ impl ManagerActor {
                 lines.iter().map(|line| HostLineEvent {
                     host_id: local_host_id.0.clone(),
                     line: line.line.clone(),
+                    connection_instance_id: Some(line.connection_instance_id),
                     delivery_id: Some(line.delivery_id),
                 })
             })
@@ -1313,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_attach_missing_auto_connect_does_not_restart_active_hosts() {
+    fn missing_auto_connect_hosts_skips_active_hosts() {
         let active = HashSet::from([LocalHostId("active".to_owned())]);
         let records = vec![
             paired_host_record("active", true),

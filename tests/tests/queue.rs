@@ -6,8 +6,8 @@ use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload, BackendKind,
     CancelQueuedMessagePayload, ChatEvent, Envelope, FrameKind, NewAgentPayload, QueuedMessageId,
-    QueuedMessagesPayload, SendQueuedMessageNowPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath,
+    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse,
+    SendQueuedMessageNowPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, ToolRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,42 @@ async fn wait_for_typing_true(client: &mut client::Connection, agent_stream: &St
     }
 }
 
+async fn wait_for_chat_event<F>(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    context: &str,
+    mut predicate: F,
+) -> ChatEvent
+where
+    F: FnMut(&ChatEvent) -> bool,
+{
+    loop {
+        let env = raw_next(client, context).await;
+        if env.kind == FrameKind::ChatEvent && env.stream == *agent_stream {
+            let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+            if predicate(&event) {
+                return event;
+            }
+        }
+    }
+}
+
+async fn wait_for_stream_end_containing(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    needle: &str,
+    context: &str,
+) {
+    let expected = needle.to_owned();
+    wait_for_chat_event(client, agent_stream, context, |event| {
+        matches!(
+            event,
+            ChatEvent::StreamEnd(end) if end.message.content.contains(&expected)
+        )
+    })
+    .await;
+}
+
 async fn assert_queue_not_emptied_before_next_typing_true(
     client: &mut client::Connection,
     agent_stream: &StreamPath,
@@ -167,6 +203,220 @@ async fn assert_queue_not_emptied_before_next_typing_true(
             _ => {}
         }
     }
+}
+
+async fn wait_for_exit_plan_mode_pause(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+) -> ToolRequest {
+    let mut tool_request = None;
+    let mut saw_pause = false;
+    loop {
+        let event = wait_for_chat_event(client, agent_stream, "ExitPlanMode pause", |_| true).await;
+        match event {
+            ChatEvent::ToolRequest(request) => {
+                assert_eq!(request.tool_name, "ExitPlanMode");
+                assert!(matches!(
+                    &request.tool_type,
+                    protocol::ToolRequestType::ExitPlanMode { .. }
+                ));
+                tool_request = Some(request);
+            }
+            ChatEvent::TypingStatusChanged(false) => saw_pause = true,
+            _ => {}
+        }
+        if saw_pause && let Some(request) = tool_request {
+            return request;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool responses bypass the normal queue without starting a stray turn
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    let agent_stream = spawn_and_start(
+        &mut fixture.client,
+        "exit-plan-mode",
+        "__mock_exit_plan_mode__",
+    )
+    .await;
+
+    let request = wait_for_exit_plan_mode_pause(&mut fixture.client, &agent_stream).await;
+    let protocol::ToolRequestType::ExitPlanMode { plan, plan_path } = request.tool_type else {
+        panic!("expected ExitPlanMode tool request");
+    };
+    assert_eq!(plan.as_deref(), Some("# Plan\n\nApprove the mock plan."));
+    assert_eq!(
+        plan_path.as_deref(),
+        Some("/tmp/mock/.claude/plans/mock-plan.md")
+    );
+
+    fixture
+        .client
+        .send_message(
+            &agent_stream,
+            "queued while ExitPlanMode is pending".to_owned(),
+        )
+        .await
+        .expect("send queued message while waiting for ExitPlanMode");
+    let queued =
+        expect_queued_messages_with_count(&mut fixture.client, 1, "queued during ExitPlanMode")
+            .await;
+    assert_eq!(
+        queued.messages[0].message,
+        "queued while ExitPlanMode is pending"
+    );
+
+    fixture
+        .client
+        .send_message_payload(
+            &agent_stream,
+            SendMessagePayload {
+                message: String::new(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                    tool_call_id: request.tool_call_id,
+                    decision: protocol::ExitPlanModeDecision::Approve,
+                    feedback: None,
+                }),
+            },
+        )
+        .await
+        .expect("send ExitPlanMode approval");
+
+    let mut saw_completion = false;
+    let mut saw_approval = false;
+    let mut saw_queue_drained = false;
+    let mut saw_queued_response = false;
+    let mut saw_final_idle = false;
+    loop {
+        let env = raw_next(
+            &mut fixture.client,
+            "ExitPlanMode completion and queue drain",
+        )
+        .await;
+        if env.stream != agent_stream {
+            continue;
+        }
+        match env.kind {
+            FrameKind::QueuedMessages => {
+                let payload: QueuedMessagesPayload =
+                    env.parse_payload().expect("parse QueuedMessagesPayload");
+                if payload.messages.is_empty() {
+                    saw_queue_drained = true;
+                }
+            }
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                match event {
+                    ChatEvent::ToolExecutionCompleted(completion)
+                        if completion.tool_name == "ExitPlanMode" =>
+                    {
+                        assert!(completion.success);
+                        saw_completion = true;
+                    }
+                    ChatEvent::StreamEnd(end)
+                        if end.message.content.contains("mock ExitPlanMode approved") =>
+                    {
+                        saw_approval = true;
+                    }
+                    ChatEvent::StreamEnd(end)
+                        if end
+                            .message
+                            .content
+                            .contains("mock backend response to: queued while ExitPlanMode") =>
+                    {
+                        saw_queued_response = true;
+                    }
+                    ChatEvent::TypingStatusChanged(false) if saw_queued_response => {
+                        saw_final_idle = true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if saw_completion
+            && saw_approval
+            && saw_queue_drained
+            && saw_queued_response
+            && saw_final_idle
+        {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn stale_tool_response_while_idle_does_not_wedge_follow_up() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    let agent_stream = spawn_and_start(&mut fixture.client, "stale-tool-response", "initial").await;
+    wait_for_stream_end_containing(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: initial",
+        "initial mock response",
+    )
+    .await;
+    wait_for_chat_event(
+        &mut fixture.client,
+        &agent_stream,
+        "initial idle",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message_payload(
+            &agent_stream,
+            SendMessagePayload {
+                message: String::new(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                    tool_call_id: "stale-tool-call".to_owned(),
+                    decision: protocol::ExitPlanModeDecision::Approve,
+                    feedback: None,
+                }),
+            },
+        )
+        .await
+        .expect("send stale ExitPlanMode response");
+    wait_for_chat_event(
+        &mut fixture.client,
+        &agent_stream,
+        "stale response backend error",
+        |event| {
+            matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, protocol::MessageSender::Error)
+                        && message.content.contains("No matching pending tool request")
+            )
+        },
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&agent_stream, "after stale response".to_owned())
+        .await
+        .expect("send follow-up after stale tool response");
+    wait_for_stream_end_containing(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: after stale response",
+        "follow-up after stale tool response",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

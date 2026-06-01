@@ -195,6 +195,7 @@ pub fn ChatInput() -> impl IntoView {
                         message: text,
                         images: None,
                         origin: None,
+                        tool_response: None,
                     };
                     if let Err(error) = crate::send::send_frame(
                         &ar.local_host_id,
@@ -265,6 +266,7 @@ pub fn ChatInput() -> impl IntoView {
                     message: text,
                     images: None,
                     origin: None,
+                    tool_response: None,
                 };
                 if let Err(error) = crate::send::send_frame(
                     &active.local_host_id,

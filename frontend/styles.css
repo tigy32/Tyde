@@ -2641,6 +2641,87 @@ kbd {
     border-top: 1px solid var(--border-primary);
 }
 
+/* ===== ExitPlanMode card ===== */
+.exit-plan-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.exit-plan-path {
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+    color: var(--text-secondary);
+}
+
+.exit-plan-text {
+    color: var(--text-primary);
+    /* Wrap normal plan prose instead of scrolling horizontally. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+}
+
+.exit-plan-feedback-row {
+    display: flex;
+}
+
+.exit-plan-feedback {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 5px;
+    background: var(--surface-base);
+    color: var(--text-primary);
+    font-family: inherit;
+    resize: vertical;
+}
+
+.exit-plan-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.exit-plan-approve,
+.exit-plan-reject {
+    padding: 5px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.exit-plan-approve {
+    border: 1px solid var(--accent-primary);
+    background: var(--accent-subtle);
+    color: var(--text-primary);
+}
+
+.exit-plan-reject {
+    border: 1px solid var(--border-primary);
+    background: var(--surface-base);
+    color: var(--text-primary);
+}
+
+.exit-plan-approve:disabled,
+.exit-plan-reject:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
+.exit-plan-sent-note,
+.exit-plan-error-note {
+    font-size: 0.846rem;
+}
+
+.exit-plan-sent-note {
+    color: var(--success);
+}
+
+.exit-plan-error-note {
+    color: var(--error);
+}
+
 .ask-question-card {
     display: flex;
     flex-direction: column;
