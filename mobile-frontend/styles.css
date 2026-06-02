@@ -1690,6 +1690,29 @@ input, textarea, select {
     transform: scale(0.96);
 }
 
+/* Compact BTW / side-question pill — kept narrow to preserve horizontal
+   space on the composer row alongside Send and (when running) Steer. */
+.btw-button {
+    min-width: 44px;
+    height: 36px;
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-full);
+    background: var(--bg-surface-2);
+    color: var(--accent-primary);
+    border: 1px solid var(--accent-primary);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.btw-button:active {
+    transform: scale(0.96);
+}
+
 .chat-input-queued-list {
     margin-bottom: var(--space-2);
     padding: var(--space-2);

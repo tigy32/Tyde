@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -391,6 +391,8 @@ pub enum AgentOrigin {
     User,
     /// Spawned programmatically through Tyde-owned orchestration (e.g. agent-control MCP).
     AgentControl,
+    /// Spawned as a first-class fork of an existing session for a side question.
+    SideQuestion,
     /// Spawned by the backend's own native sub-agent mechanism (e.g. Claude subagents).
     BackendNative,
     /// Spawned as a persistent member of a server-owned agent team.
@@ -422,6 +424,7 @@ pub enum SpawnCostHint {
 pub enum AgentErrorCode {
     BackendFailed,
     Internal,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1058,6 +1061,23 @@ pub enum SpawnAgentParams {
         session_id: SessionId,
         prompt: Option<String>,
     },
+    Fork {
+        from_session_id: SessionId,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageData>>,
+        // Deserializing a missing field applies the side-question default
+        // (`read_only`), while serializing omits only an explicit `None`.
+        #[serde(
+            default = "default_fork_access_mode",
+            skip_serializing_if = "Option::is_none"
+        )]
+        access_mode: Option<BackendAccessMode>,
+    },
+}
+
+fn default_fork_access_mode() -> Option<BackendAccessMode> {
+    Some(BackendAccessMode::ReadOnly)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1357,6 +1377,8 @@ pub struct AgentStartPayload {
     pub team_member_id: Option<TeamMemberId>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub created_at_ms: u64,
 }
 
@@ -1386,6 +1408,8 @@ pub struct NewAgentPayload {
     pub team_member_id: Option<TeamMemberId>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
 }

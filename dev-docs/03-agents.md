@@ -289,6 +289,7 @@ pub struct AgentStartPayload {
     pub workspace_roots: Vec<String>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
     pub created_at_ms: u64,
 }
 ```
@@ -301,6 +302,9 @@ pub struct AgentStartPayload {
   runtime-mutable concerns that don't belong in a birth certificate.
 - `project_id` is included because project ownership is explicit server-owned
   state, not UI inference.
+- `session_id` is optional for backward compatibility and failed startups, but
+  is set once the live backend session is known. Clients retain this value on
+  their agent state and use it when requesting a session fork.
 
 ### ChatEvent (payload)
 
@@ -392,6 +396,7 @@ These variants match the backends currently exposed by Tyde2: `Tycode`,
 pub enum AgentErrorCode {
     BackendFailed,
     Internal,
+    Unsupported,
 }
 ```
 
@@ -472,6 +477,7 @@ pub struct AgentStartPayload {
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
     pub parent_agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
     pub created_at_ms: u64,
 }
 
@@ -1192,8 +1198,9 @@ source of truth." Only `AgentStartPayload` (the birth certificate) and
 
 ### Why `AgentErrorCode` enum?
 
-Strong typing over strings. Only `BackendFailed` and `Internal` for now.
-Add variants when error scenarios are implemented, not preemptively.
+Strong typing over strings. Variants include `BackendFailed`, `Internal`, and
+`Unsupported`; add new variants when error scenarios are implemented, not
+preemptively.
 
 ### What about `interrupt_agent` / `cancel_agent` / `terminate_agent`?
 

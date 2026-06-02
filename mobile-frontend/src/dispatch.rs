@@ -371,6 +371,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     workspace_roots: payload.workspace_roots,
                     project_id: payload.project_id,
                     parent_agent_id: payload.parent_agent_id,
+                    session_id: payload.session_id,
                     custom_agent_id: payload.custom_agent_id,
                     created_at_ms: payload.created_at_ms,
                     instance_stream: payload.instance_stream,
@@ -382,7 +383,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     agents.push(info);
                 });
 
-                if matches!(origin, AgentOrigin::User)
+                // User and SideQuestion (BTW) agents auto-open into the chat
+                // view — a side question is something the user just asked for.
+                if matches!(origin, AgentOrigin::User | AgentOrigin::SideQuestion)
                     && !has_compaction_in_progress_for_host(state, host)
                 {
                     state.active_agent.set(Some(ActiveAgentRef {
@@ -414,6 +417,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                         .find(|a| a.local_host_id == *host && a.agent_id == payload.agent_id)
                     {
                         agent.started = true;
+                        if let Some(session_id) = payload.session_id {
+                            agent.session_id = Some(session_id);
+                        }
                     } else {
                         log::error!(
                             "AgentStart referenced unknown agent host={} agent_id={} stream={}",
@@ -1501,12 +1507,16 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
             {
                 // `agent_info_from_payload` zeroes runtime-only fields
                 // (`started`, `fatal_error`) because `NewAgentPayload`
-                // doesn't carry them. Preserve whatever the live event
+                // doesn't carry them. It may also omit `session_id`
+                // before backend startup completes. Preserve whatever the live event
                 // stream had set on the existing entry so a bootstrap
                 // re-application doesn't reset an already-started agent
                 // to `started: false`.
                 info.started = existing.started;
                 info.fatal_error = existing.fatal_error.clone();
+                if info.session_id.is_none() {
+                    info.session_id = existing.session_id.clone();
+                }
                 *existing = info;
             } else {
                 agents.push(info);
@@ -1525,6 +1535,7 @@ fn agent_info_from_payload(host: &LocalHostId, payload: NewAgentPayload) -> Agen
         workspace_roots: payload.workspace_roots,
         project_id: payload.project_id,
         parent_agent_id: payload.parent_agent_id,
+        session_id: payload.session_id,
         custom_agent_id: payload.custom_agent_id,
         created_at_ms: payload.created_at_ms,
         instance_stream: payload.instance_stream,
@@ -1579,13 +1590,16 @@ fn apply_agent_bootstrap(
 
     for event in payload.events {
         match event {
-            AgentBootstrapEvent::AgentStart(_) => {
+            AgentBootstrapEvent::AgentStart(inner) => {
                 state.agents.update(|agents| {
                     if let Some(agent) = agents
                         .iter_mut()
                         .find(|a| a.local_host_id == *host && a.agent_id == agent_ref.agent_id)
                     {
                         agent.started = true;
+                        if let Some(session_id) = inner.session_id {
+                            agent.session_id = Some(session_id);
+                        }
                     }
                 });
             }
@@ -2016,6 +2030,7 @@ mod wasm_tests {
                     team_member_id: None,
                     project_id: None,
                     parent_agent_id: None,
+                    session_id: None,
                     created_at_ms: 1,
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
                 },
@@ -2070,6 +2085,7 @@ mod wasm_tests {
                     team_member_id: None,
                     project_id: None,
                     parent_agent_id: None,
+                    session_id: None,
                     created_at_ms: 2,
                     instance_stream: StreamPath("/agent/new-agent/inst".to_owned()),
                 },
@@ -2286,6 +2302,7 @@ mod wasm_tests {
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
         };
@@ -2395,6 +2412,7 @@ mod wasm_tests {
                     team_member_id: None,
                     project_id: None,
                     parent_agent_id: None,
+                    session_id: None,
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
                 },
@@ -2412,6 +2430,7 @@ mod wasm_tests {
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 1,
         };
         let chat_event = protocol::ChatEvent::MessageAdded(protocol::ChatMessage {

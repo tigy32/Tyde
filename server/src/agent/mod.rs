@@ -22,8 +22,8 @@ use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::tycode::TycodeBackend;
 use crate::backend::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpServer,
-    apply_session_settings_update, resolve_backend_session_settings,
+    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
+    StartupMcpServer, apply_session_settings_update, resolve_backend_session_settings,
     validate_session_settings_values,
 };
 use crate::host::HostSubAgentEmitter;
@@ -35,7 +35,9 @@ use crate::sub_agent::HostSubAgentSpawnTx;
 pub(crate) mod customization;
 pub(crate) mod registry;
 
-use self::registry::{InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSpawnRequest};
+use self::registry::{
+    AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSpawnRequest,
+};
 
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -44,8 +46,18 @@ pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 
 type BackendHandle = Box<dyn BackendSender>;
 type BackendSpawnResult = Result<(BackendHandle, EventStream, SessionId), String>;
+type BackendForkResult = Result<(BackendHandle, EventStream, SessionId), BackendStartupError>;
 type BackendResumeResult = Result<(BackendHandle, EventStream), String>;
 type BackendFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+impl From<BackendStartupError> for AgentStartupFailure {
+    fn from(error: BackendStartupError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+        }
+    }
+}
 
 struct TerminalFailureContext<'a> {
     accepting_input: &'a Arc<AtomicBool>,
@@ -572,6 +584,73 @@ async fn resume_backend(
     Ok((backend, events))
 }
 
+async fn fork_backend(
+    agent_id: &AgentId,
+    backend_kind: BackendKind,
+    workspace_roots: Vec<String>,
+    config: BackendSpawnConfig,
+    from_session_id: SessionId,
+    initial_input: SendMessagePayload,
+    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+) -> BackendForkResult {
+    match backend_kind {
+        BackendKind::Tycode => {
+            let (b, events) =
+                TycodeBackend::fork(workspace_roots, config, from_session_id, initial_input)
+                    .await?;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
+        BackendKind::Kiro => {
+            let (b, events) =
+                KiroBackend::fork(workspace_roots, config, from_session_id, initial_input).await?;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
+        BackendKind::Claude => {
+            let (b, events) = ClaudeBackend::fork(
+                workspace_roots.clone(),
+                config,
+                from_session_id,
+                initial_input,
+            )
+            .await?;
+            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
+                host_sub_agent_spawn_tx,
+                agent_id.clone(),
+                workspace_roots,
+            )))
+            .await;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
+        BackendKind::Codex => {
+            let (b, events) = CodexBackend::fork(
+                workspace_roots.clone(),
+                config,
+                from_session_id,
+                initial_input,
+            )
+            .await?;
+            let session_id = Backend::session_id(&b);
+            b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
+                host_sub_agent_spawn_tx,
+                agent_id.clone(),
+                workspace_roots,
+            )))
+            .await;
+            Ok((Box::new(b), events, session_id))
+        }
+        BackendKind::Gemini => {
+            let (b, events) =
+                GeminiBackend::fork(workspace_roots, config, from_session_id, initial_input)
+                    .await?;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
+    }
+}
+
 fn spawn_mock(
     agent_id: AgentId,
     workspace_roots: Vec<String>,
@@ -616,6 +695,33 @@ fn resume_mock(
     })
 }
 
+fn fork_mock(
+    agent_id: AgentId,
+    workspace_roots: Vec<String>,
+    config: BackendSpawnConfig,
+    from_session_id: SessionId,
+    initial_input: SendMessagePayload,
+    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+) -> BackendFuture<BackendForkResult> {
+    Box::pin(async move {
+        let (b, events) = MockBackend::fork(
+            workspace_roots.clone(),
+            config,
+            from_session_id,
+            initial_input,
+        )
+        .await?;
+        let sid = Backend::session_id(&b);
+        b.set_subagent_emitter(Arc::new(HostSubAgentEmitter::new(
+            host_sub_agent_spawn_tx,
+            agent_id,
+            workspace_roots,
+        )))
+        .await;
+        Ok((Box::new(b) as BackendHandle, events, sid))
+    })
+}
+
 pub(crate) fn spawn_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
@@ -643,6 +749,7 @@ pub(crate) fn spawn_agent_actor(
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id,
+            fork_from_session_id,
             startup_warning,
             startup_failure,
             initial_alias,
@@ -678,7 +785,11 @@ pub(crate) fn spawn_agent_actor(
             },
         );
         let mut queue = VecDeque::new();
-        let is_new_spawn = resume_session_id.is_none();
+        assert!(
+            resume_session_id.is_none() || fork_from_session_id.is_none(),
+            "spawn request cannot both resume and fork a session"
+        );
+        let starts_with_initial_turn = resume_session_id.is_none();
 
         let startup_result: Result<
             (
@@ -687,7 +798,7 @@ pub(crate) fn spawn_agent_actor(
                 SessionId,
                 Option<SendMessagePayload>,
             ),
-            String,
+            AgentStartupFailure,
         > = if let Some(err) = startup_failure {
             Err(err)
         } else {
@@ -712,31 +823,68 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await
                     };
-                    resumed.map(|(backend, events)| (backend, events, session_id, initial_input))
+                    resumed
+                        .map(|(backend, events)| (backend, events, session_id, initial_input))
+                        .map_err(AgentStartupFailure::backend_failed)
                 }
                 None => {
-                    let first_input = initial_input.expect("new spawn requires initial_input");
-                    let spawned = if use_mock_backend {
-                        spawn_mock(
-                            agent_id.clone(),
-                            workspace_roots.clone(),
-                            spawn_config,
-                            first_input,
-                            host_sub_agent_spawn_tx.clone(),
-                        )
-                        .await
+                    if let Some(from_session_id) = fork_from_session_id {
+                        let first_input = initial_input.expect("fork spawn requires initial_input");
+                        let forked = if use_mock_backend {
+                            fork_mock(
+                                agent_id.clone(),
+                                workspace_roots.clone(),
+                                spawn_config,
+                                from_session_id,
+                                first_input,
+                                host_sub_agent_spawn_tx.clone(),
+                            )
+                            .await
+                        } else {
+                            fork_backend(
+                                &agent_id,
+                                backend_kind,
+                                workspace_roots.clone(),
+                                spawn_config,
+                                from_session_id,
+                                first_input,
+                                host_sub_agent_spawn_tx.clone(),
+                            )
+                            .await
+                        };
+                        forked
+                            .map(|(backend, events, session_id)| {
+                                (backend, events, session_id, None)
+                            })
+                            .map_err(AgentStartupFailure::from)
                     } else {
-                        spawn_backend(
-                            &agent_id,
-                            backend_kind,
-                            workspace_roots.clone(),
-                            spawn_config,
-                            first_input,
-                            host_sub_agent_spawn_tx.clone(),
-                        )
-                        .await
-                    };
-                    spawned.map(|(backend, events, session_id)| (backend, events, session_id, None))
+                        let first_input = initial_input.expect("new spawn requires initial_input");
+                        let spawned = if use_mock_backend {
+                            spawn_mock(
+                                agent_id.clone(),
+                                workspace_roots.clone(),
+                                spawn_config,
+                                first_input,
+                                host_sub_agent_spawn_tx.clone(),
+                            )
+                            .await
+                        } else {
+                            spawn_backend(
+                                &agent_id,
+                                backend_kind,
+                                workspace_roots.clone(),
+                                spawn_config,
+                                first_input,
+                                host_sub_agent_spawn_tx.clone(),
+                            )
+                            .await
+                        };
+                        spawned
+                            .map(|(backend, events, session_id)| {
+                                (backend, events, session_id, None)
+                            })
+                            .map_err(AgentStartupFailure::backend_failed)
+                    }
                 }
             }
         };
@@ -744,11 +892,11 @@ pub(crate) fn spawn_agent_actor(
         let (backend, mut events, actor_session_id, initial_follow_up) = match startup_result {
             Ok(result) => result,
             Err(err) => {
-                let _ = startup_tx.send(Err(err.clone()));
+                let _ = startup_tx.send(Err(err.message.clone()));
                 let payload = AgentErrorPayload {
                     agent_id: current_start.agent_id.clone(),
-                    code: AgentErrorCode::BackendFailed,
-                    message: format!("failed to start agent backend: {err}"),
+                    code: err.code,
+                    message: format!("failed to start agent backend: {}", err.message),
                     fatal: true,
                 };
                 append_event(
@@ -787,7 +935,7 @@ pub(crate) fn spawn_agent_actor(
             }
         };
         let mut backend = Some(backend);
-        let mut in_turn = is_new_spawn;
+        let mut in_turn = starts_with_initial_turn;
         let mut idle_transition_armed = false;
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
@@ -795,6 +943,8 @@ pub(crate) fn spawn_agent_actor(
         let mut active_compaction: Option<ActiveCompaction> = None;
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
+        current_start.session_id = Some(actor_session_id.clone());
+        let _ = start_tx.send(current_start.clone());
         if let Err(err) = persist_agent_session(
             &session_store,
             &actor_session_id,
@@ -3823,6 +3973,7 @@ mod tests {
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 1,
         };
         let (status_handle, _rx) = AgentStatusHandle::new();

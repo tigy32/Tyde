@@ -371,6 +371,7 @@ mod wasm_tests {
             workspace_roots: Vec::new(),
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             custom_agent_id: None,
             created_at_ms: 0,
             instance_stream: StreamPath(format!("/agent/{id}")),

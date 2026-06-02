@@ -803,6 +803,26 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
         SpawnAgentParams::Resume { session_id, .. } => {
             ensure_non_empty("spawn_agent", "session_id", session_id.0.as_str())?;
         }
+        SpawnAgentParams::Fork {
+            from_session_id,
+            prompt,
+            images,
+            ..
+        } => {
+            if payload.parent_agent_id.is_none() {
+                return Err(AppError::invalid(
+                    "spawn_agent",
+                    "fork requires parent_agent_id",
+                ));
+            }
+            ensure_non_empty("spawn_agent", "from_session_id", from_session_id.0.as_str())?;
+            if prompt.trim().is_empty() && images.as_ref().is_none_or(|images| images.is_empty()) {
+                return Err(AppError::invalid(
+                    "spawn_agent",
+                    "fork prompt must not be empty unless images are attached",
+                ));
+            }
+        }
     }
 
     Ok(())

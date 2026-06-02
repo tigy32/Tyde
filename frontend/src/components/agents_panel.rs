@@ -345,6 +345,7 @@ fn agent_card(
     let agent_id = agent.agent_id.clone();
     let name = agent.name.clone();
     let backend = agent.backend_kind;
+    let is_side_question = matches!(agent.origin, protocol::AgentOrigin::SideQuestion);
     let created = agent.created_at_ms;
     let started = agent.started;
     let has_fatal = agent.fatal_error.is_some();
@@ -732,6 +733,14 @@ fn agent_card(
                         <span class="agent-card-custom-agent" title=title>{n}</span>
                     }
                 })}
+                {is_side_question.then(|| view! {
+                    <span
+                        class="agent-card-side-question-badge"
+                        title="Side question (BTW) — forked from another agent's session"
+                    >
+                        "BTW"
+                    </span>
+                })}
                 <span class={format!("{} agent-card-backend", backend_class(backend))}>{backend_label(backend)}</span>
             </div>
             {error_msg.map(|msg| view! {
@@ -765,6 +774,7 @@ mod tests {
             workspace_roots: vec![],
             project_id: project_id.map(|s| ProjectId(s.to_string())),
             parent_agent_id: parent.map(|p| AgentId(p.to_string())),
+            session_id: None,
             custom_agent_id: None,
             created_at_ms: 0,
             instance_stream: StreamPath("s".to_string()),
@@ -1159,6 +1169,7 @@ mod wasm_tests {
                 workspace_roots: Vec::new(),
                 project_id: None,
                 parent_agent_id: None,
+                session_id: None,
                 custom_agent_id: None,
                 created_at_ms: 0,
                 // Mirror the real backend format `/agent/<id>/<uuid>`.
@@ -1231,6 +1242,33 @@ mod wasm_tests {
             btn.get_attribute("aria-label").as_deref(),
             Some("Compact agent"),
             "compact button must keep a labelled affordance"
+        );
+    }
+
+    /// A side-question (BTW) agent renders a compact "BTW" badge so the user
+    /// can tell it apart from ordinary agents in the sidebar.
+    #[wasm_bindgen_test]
+    async fn side_question_agent_shows_btw_badge() {
+        let container = make_container();
+        let state = make_app_state("h");
+        push_agent(&state, "h", "a-btw", "Side question", true);
+        state.agents.update(|agents| {
+            if let Some(agent) = agents.iter_mut().find(|a| a.agent_id.0 == "a-btw") {
+                agent.origin = AgentOrigin::SideQuestion;
+            }
+        });
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let badge = container
+            .query_selector(".agent-card-side-question-badge")
+            .unwrap()
+            .expect("side-question agent must render a BTW badge");
+        assert_eq!(
+            badge.text_content().unwrap_or_default().trim(),
+            "BTW",
+            "side-question badge text must read BTW"
         );
     }
 
@@ -1497,6 +1535,7 @@ mod wasm_tests {
                 team_member_id: None,
                 project_id: None,
                 parent_agent_id: None,
+                session_id: None,
                 created_at_ms,
                 instance_stream: agent_stream(agent_id),
             },
@@ -1519,6 +1558,7 @@ mod wasm_tests {
                 team_member_id: None,
                 project_id: None,
                 parent_agent_id: None,
+                session_id: None,
                 created_at_ms,
             },
         );
@@ -1977,6 +2017,7 @@ mod wasm_tests {
                 workspace_roots: Vec::new(),
                 project_id: None,
                 parent_agent_id: None,
+                session_id: None,
                 custom_agent_id: None,
                 created_at_ms: 1,
                 instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
@@ -2001,6 +2042,7 @@ mod wasm_tests {
                 workspace_roots: Vec::new(),
                 project_id: None,
                 parent_agent_id: None,
+                session_id: None,
                 custom_agent_id: None,
                 created_at_ms: 1,
                 instance_stream: StreamPath("/agent/a-new/inst".to_owned()),

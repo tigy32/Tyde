@@ -16,8 +16,9 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpServer,
-    StartupMcpTransport, empty_session_settings_schema, render_combined_spawn_instructions,
+    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
+    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
+    empty_session_settings_schema, render_combined_spawn_instructions,
     setup::resolve_tycode_binary_path,
 };
 use crate::process_env;
@@ -610,6 +611,17 @@ impl Backend for TycodeBackend {
                 session_id: known_session_id,
             },
             EventStream::new(events_rx),
+        ))
+    }
+
+    async fn fork(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        _from_session_id: SessionId,
+        _initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        Err(BackendStartupError::unsupported(
+            backend_fork_unsupported_message(BackendKind::Tycode),
         ))
     }
 

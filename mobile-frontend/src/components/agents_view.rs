@@ -258,6 +258,7 @@ fn agent_row(
     let has_error = agent.fatal_error.is_some();
     let error_msg = agent.fatal_error.clone().unwrap_or_default();
     let is_sub = agent.parent_agent_id.is_some();
+    let is_side_question = matches!(agent.origin, protocol::AgentOrigin::SideQuestion);
     let agent_ref = AgentRef {
         local_host_id: host_id.clone(),
         agent_id: agent_id.clone(),
@@ -332,13 +333,19 @@ fn agent_row(
                     </div>
                     <div class="list-row-subtitle">
                         {backend}
-                        {is_sub.then(|| view! {
-                            <span style="margin-left: var(--space-2);">
-                                <Pill
-                                    label="Sub-agent".to_string()
-                                    tone=PillTone::Neutral
-                                />
-                            </span>
+                        {(is_side_question || is_sub).then(|| {
+                            // Prefer the compact "BTW" label for side questions
+                            // over the generic "Sub-agent" tag — it's both
+                            // shorter and more meaningful on a narrow row.
+                            let label = if is_side_question { "BTW" } else { "Sub-agent" };
+                            view! {
+                                <span style="margin-left: var(--space-2);">
+                                    <Pill
+                                        label=label.to_string()
+                                        tone=PillTone::Neutral
+                                    />
+                                </span>
+                            }
                         })}
                     </div>
                     <Show when=move || has_error>
@@ -431,6 +438,7 @@ mod wasm_tests {
             workspace_roots: Vec::new(),
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             custom_agent_id: None,
             created_at_ms: 0,
             instance_stream: StreamPath(format!("/agent/{id}")),
@@ -443,6 +451,36 @@ mod wasm_tests {
         let mut agent = fixture(host, id, name, None);
         agent.parent_agent_id = Some(AgentId(parent_id.to_owned()));
         agent
+    }
+
+    /// A side question (BTW) fork is shown with the compact "BTW" label
+    /// rather than the generic "Sub-agent" tag — both shorter and more
+    /// meaningful on a narrow phone row.
+    #[wasm_bindgen_test]
+    async fn agents_side_question_row_shows_btw_label() {
+        let host = LocalHostId("host-1".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            let parent = fixture(&host_for_mount, "parent", "Parent agent", None);
+            let mut btw = child_fixture(&host_for_mount, "btw-1", "Side question", "parent");
+            btw.origin = AgentOrigin::SideQuestion;
+            state.agents.set(vec![parent, btw]);
+            provide_context(state);
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("BTW"),
+            "side question row must surface the BTW label: {text}"
+        );
+        assert!(
+            !text.contains("Sub-agent"),
+            "side question must prefer BTW over the generic Sub-agent tag: {text}"
+        );
     }
 
     /// Empty list renders the dedicated empty state with a CTA, not a

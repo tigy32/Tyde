@@ -784,6 +784,7 @@ mod tests {
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
         };
@@ -863,6 +864,7 @@ mod tests {
                     team_member_id: new_agent.team_member_id,
                     project_id: new_agent.project_id,
                     parent_agent_id: new_agent.parent_agent_id,
+                    session_id: None,
                     created_at_ms: new_agent.created_at_ms,
                 })],
             },

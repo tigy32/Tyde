@@ -12,11 +12,11 @@ use protocol::{
     HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
     Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectGitDiffFile, ProjectId,
     ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, QueuedMessageEntry,
-    Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionSchemaEntry, SessionSettingsValues,
-    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team,
-    TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember, TeamMemberBindingPayload,
-    TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog, ToolExecutionCompletedData,
-    ToolRequest,
+    Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionId, SessionSchemaEntry,
+    SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
+    TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog,
+    ToolExecutionCompletedData, ToolRequest,
 };
 
 // ── Tool output viewing mode ───────────────────────────────────────────
@@ -212,6 +212,7 @@ pub struct AgentInfo {
     pub workspace_roots: Vec<String>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
     pub custom_agent_id: Option<CustomAgentId>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,

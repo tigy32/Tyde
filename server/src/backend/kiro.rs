@@ -15,7 +15,10 @@ use crate::acp::{
 use crate::backend::turn_emitter::{
     AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
-use crate::backend::{SessionCommand, StartupMcpServer, render_combined_spawn_instructions};
+use crate::backend::{
+    BackendStartupError, SessionCommand, StartupMcpServer, backend_fork_unsupported_message,
+    render_combined_spawn_instructions,
+};
 use crate::process_env;
 use crate::subprocess::ImageAttachment;
 
@@ -3487,6 +3490,17 @@ impl Backend for KiroBackend {
         ))
     }
 
+    async fn fork(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        _from_session_id: SessionId,
+        _initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        Err(BackendStartupError::unsupported(
+            backend_fork_unsupported_message(BackendKind::Kiro),
+        ))
+    }
+
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
         let raw_sessions = load_local_kiro_sessions().await?;
         let mut sessions = Vec::new();
@@ -3942,6 +3956,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
         };
@@ -4024,6 +4039,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                         team_member_id: None,
                         project_id: None,
                         parent_agent_id: None,
+                        session_id: None,
                         created_at_ms: 0,
                     },
                 )],

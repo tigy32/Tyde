@@ -10,11 +10,11 @@ use protocol::{
     MobileAccessStatePayload, MobilePairingOfferPayload, Project, ProjectDiffScope,
     ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus,
     ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
-    ReviewSuggestionId, ReviewSummary, SessionSchemaEntry, SessionSettingsValues, SessionSummary,
-    Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId,
-    TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
-    ToolExecutionCompletedData, ToolRequest,
+    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsValues,
+    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft,
+    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
+    TerminalId, ToolExecutionCompletedData, ToolRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,7 @@ pub struct AgentInfo {
     pub workspace_roots: Vec<String>,
     pub project_id: Option<ProjectId>,
     pub parent_agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
     pub custom_agent_id: Option<CustomAgentId>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
@@ -2672,6 +2673,7 @@ mod tests {
                 workspace_roots: Vec::new(),
                 project_id: None,
                 parent_agent_id: None,
+                session_id: None,
                 custom_agent_id: None,
                 created_at_ms: 0,
                 instance_stream: StreamPath(format!("/agents/{}", id.0)),

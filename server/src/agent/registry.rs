@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    AgentControlStatus, AgentId, AgentOrigin, AgentStartPayload, BackendAccessMode, BackendKind,
-    ChatEvent, CustomAgentId, ProjectId, SendMessagePayload, SessionId, SessionSettingsSchema,
-    SessionSettingsValues, SpawnCostHint, TeamId, TeamMemberId,
+    AgentControlStatus, AgentErrorCode, AgentId, AgentOrigin, AgentStartPayload, BackendAccessMode,
+    BackendKind, ChatEvent, CustomAgentId, ProjectId, SendMessagePayload, SessionId,
+    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint, TeamId, TeamMemberId,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -128,12 +128,42 @@ pub(crate) struct ResolvedSpawnRequest {
     pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub resolved_spawn_config: ResolvedSpawnConfig,
     pub resume_session_id: Option<SessionId>,
+    pub fork_from_session_id: Option<SessionId>,
     pub startup_warning: Option<String>,
-    pub startup_failure: Option<String>,
+    pub startup_failure: Option<AgentStartupFailure>,
     pub initial_alias: Option<InitialAgentAlias>,
     /// When true, all backend spawns use MockBackend regardless of backend_kind.
     /// Set by the test fixture.
     pub use_mock_backend: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentStartupFailure {
+    pub code: AgentErrorCode,
+    pub message: String,
+}
+
+impl AgentStartupFailure {
+    pub fn backend_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: AgentErrorCode::BackendFailed,
+            message: message.into(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: AgentErrorCode::Internal,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: AgentErrorCode::Unsupported,
+            message: message.into(),
+        }
+    }
 }
 
 pub(crate) struct RelaySpawnRequest {
@@ -203,6 +233,7 @@ impl AgentRegistry {
             team_member_id: request.team_member_id.clone(),
             project_id: request.project_id.clone(),
             parent_agent_id: request.parent_agent_id.clone(),
+            session_id: request.resume_session_id.clone(),
             created_at_ms: now_ms(),
         };
 
@@ -257,6 +288,7 @@ impl AgentRegistry {
             team_member_id: None,
             project_id: request.project_id.clone(),
             parent_agent_id: Some(request.parent_agent_id.clone()),
+            session_id: Some(request.session_id.clone()),
             created_at_ms: now_ms(),
         };
 

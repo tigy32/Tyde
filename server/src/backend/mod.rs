@@ -12,8 +12,8 @@ pub mod tycode;
 use std::collections::HashMap;
 
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId, ImageData,
-    SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
+    AgentErrorCode, AgentInput, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId,
+    ImageData, SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
     SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
@@ -139,6 +139,40 @@ impl EventStream {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendStartupError {
+    pub code: AgentErrorCode,
+    pub message: String,
+}
+
+impl BackendStartupError {
+    pub fn backend_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: AgentErrorCode::BackendFailed,
+            message: message.into(),
+        }
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: AgentErrorCode::Unsupported,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for BackendStartupError {
+    fn from(message: String) -> Self {
+        Self::backend_failed(message)
+    }
+}
+
+impl From<&str> for BackendStartupError {
+    fn from(message: &str) -> Self {
+        Self::backend_failed(message)
+    }
+}
+
 /// A coding agent backend session handle.
 ///
 /// Created via `Backend::spawn()` which returns `(Self, EventStream)`.
@@ -170,6 +204,17 @@ pub trait Backend: Send + 'static {
     where
         Self: Sized;
 
+    /// Fork an existing backend-native session into a fresh independent
+    /// backend-native session, then start it with `initial_input`.
+    fn fork(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        from_session_id: SessionId,
+        initial_input: SendMessagePayload,
+    ) -> impl std::future::Future<Output = Result<(Self, EventStream), BackendStartupError>> + Send
+    where
+        Self: Sized;
+
     /// Enumerate resumable sessions known to this backend.
     fn list_sessions()
     -> impl std::future::Future<Output = Result<Vec<BackendSession>, String>> + Send
@@ -195,6 +240,10 @@ pub trait Backend: Send + 'static {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send
     where
         Self: Sized;
+}
+
+pub(crate) fn backend_fork_unsupported_message(backend_kind: BackendKind) -> String {
+    format!("{backend_kind:?} backend does not support session fork")
 }
 
 pub(crate) fn empty_session_settings_schema(backend_kind: BackendKind) -> SessionSettingsSchema {

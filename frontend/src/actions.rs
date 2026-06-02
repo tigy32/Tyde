@@ -5,7 +5,7 @@ use crate::send::send_frame;
 use crate::state::{ActiveProjectRef, AppState, TabContent, sort_project_infos};
 
 use protocol::{
-    BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload,
+    AgentId, BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
     SpawnAgentParams, SpawnAgentPayload, StreamPath,
@@ -171,6 +171,92 @@ pub fn spawn_new_chat(
         if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
         {
             log::error!("failed to send SpawnAgent: {error}");
+        }
+    });
+}
+
+/// Build the spawn payload for a BTW / side-question fork. Kept pure (no
+/// signals, no IO) so the payload shape can be asserted directly in tests.
+///
+/// A side question is owned by the current agent (`parent_agent_id`) and
+/// forks that agent's backend session (`from_session_id`) without mutating
+/// it. `access_mode` is left `None` so the server applies its read-only
+/// default for forks (see `dev-docs/23-side-questions.md`).
+pub fn fork_payload(
+    parent_agent_id: AgentId,
+    from_session_id: SessionId,
+    project_id: Option<ProjectId>,
+    prompt: String,
+    images: Option<Vec<ImageData>>,
+) -> SpawnAgentPayload {
+    SpawnAgentPayload {
+        name: None,
+        custom_agent_id: None,
+        parent_agent_id: Some(parent_agent_id),
+        project_id,
+        params: SpawnAgentParams::Fork {
+            from_session_id,
+            prompt,
+            images,
+            access_mode: None,
+        },
+    }
+}
+
+/// Spawn a BTW / side-question fork from the currently active agent. The
+/// child is a first-class interactive agent (`AgentOrigin::SideQuestion`)
+/// whose backend session forks the parent's, so the parent transcript is
+/// left untouched. No-ops (with a logged reason) when there is no active
+/// agent or when its backend session id hasn't been reported yet.
+pub fn spawn_side_question(state: &AppState, prompt: String, images: Option<Vec<ImageData>>) {
+    let prompt = prompt.trim().to_owned();
+    if prompt.is_empty() && images.as_ref().is_none_or(|images| images.is_empty()) {
+        log::error!("spawn_side_question: prompt or images required");
+        return;
+    }
+
+    let Some(active_agent) = state.active_agent.get_untracked() else {
+        log::error!("spawn_side_question: no active agent to fork from");
+        return;
+    };
+
+    let agent_info = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+            .cloned()
+    });
+    let Some(agent_info) = agent_info else {
+        log::error!("spawn_side_question: active agent not found in registry");
+        return;
+    };
+
+    let Some(from_session_id) = agent_info.session_id.clone() else {
+        log::error!(
+            "spawn_side_question: active agent {} has no session id yet; cannot fork",
+            agent_info.agent_id
+        );
+        return;
+    };
+
+    let Some(host_stream) = state.host_stream_untracked(&active_agent.host_id) else {
+        log::error!("spawn_side_question: host stream missing for active agent host");
+        return;
+    };
+
+    let host_id = active_agent.host_id;
+    let payload = fork_payload(
+        agent_info.agent_id.clone(),
+        from_session_id,
+        agent_info.project_id.clone(),
+        prompt,
+        images,
+    );
+
+    spawn_local(async move {
+        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
+        {
+            log::error!("failed to send SpawnAgent (side question fork): {error}");
         }
     });
 }
@@ -396,4 +482,50 @@ pub fn send_set_session_settings(state: &AppState, values: SessionSettingsValues
             log::error!("failed to send SetSessionSettings: {error}");
         }
     });
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A BTW fork must be owned by the parent agent, fork the parent's
+    /// backend session, and leave `access_mode` unset so the server applies
+    /// its read-only default — otherwise a side question could mutate the
+    /// workspace or land on the wrong session.
+    #[wasm_bindgen_test]
+    fn fork_payload_targets_parent_and_source_session_read_only() {
+        let payload = fork_payload(
+            AgentId("agent-parent".to_owned()),
+            SessionId("session-parent".to_owned()),
+            Some(ProjectId("proj-1".to_owned())),
+            "why is this slow?".to_owned(),
+            None,
+        );
+
+        assert_eq!(
+            payload.parent_agent_id,
+            Some(AgentId("agent-parent".to_owned()))
+        );
+        assert_eq!(payload.project_id, Some(ProjectId("proj-1".to_owned())));
+        assert!(payload.custom_agent_id.is_none());
+
+        match payload.params {
+            SpawnAgentParams::Fork {
+                from_session_id,
+                prompt,
+                images,
+                access_mode,
+            } => {
+                assert_eq!(from_session_id, SessionId("session-parent".to_owned()));
+                assert_eq!(prompt, "why is this slow?");
+                assert!(images.is_none());
+                // Unset → server's read-only fork default applies.
+                assert!(access_mode.is_none());
+            }
+            other => panic!("expected Fork params, got {other:?}"),
+        }
+    }
 }

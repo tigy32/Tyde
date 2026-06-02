@@ -13,7 +13,10 @@ use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 use super::empty_session_settings_schema;
-use super::{Backend, BackendSession, BackendSpawnConfig, EventStream, StartupMcpTransport};
+use super::{
+    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
+    StartupMcpTransport,
+};
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
 const MOCK_MODEL: &str = "mock";
@@ -39,6 +42,7 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
+const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
 const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
 const MOCK_EXIT_PLAN_MODE_PLAN_PATH: &str = "/tmp/mock/.claude/plans/mock-plan.md";
@@ -139,103 +143,20 @@ impl Backend for MockBackend {
             );
         }
 
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<MockCommand>();
+        let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
+        let (subagent_emitter_tx, subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
 
-        tokio::spawn(async move {
-            if initial_message.contains(MOCK_DIE_AFTER_BUSY_SENTINEL) {
-                // Send TypingStatusChanged(true) so the actor sets in_turn=true,
-                // then sleep to give tests time to queue messages, then return so
-                // that events_tx is dropped and the actor detects termination.
-                let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
-                sleep(Duration::from_millis(MOCK_DIE_SLEEP_MS)).await;
-                return;
-            }
-            let mut active_subagents = Vec::new();
-            let mut pending_exit_plan_mode = None;
-            record_prompt(&session_id_for_task, &initial_message);
-            if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
-                if emit_exit_plan_mode_request(&events_tx).await.is_none() {
-                    return;
-                }
-                pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
-            } else {
-                if !emit_turn(
-                    &events_tx,
-                    &session_id_for_task,
-                    &initial_message,
-                    slow_initial_turn,
-                )
-                .await
-                {
-                    return;
-                }
-                maybe_spawn_native_child(
-                    &initial_message,
-                    &mut subagent_emitter_rx,
-                    &mut active_subagents,
-                )
-                .await;
-            }
-
-            while let Some(command) = command_rx.recv().await {
-                match command {
-                    MockCommand::Input(AgentInput::SendMessage(payload)) => {
-                        if let Some(tool_response) = payload.tool_response {
-                            handle_exit_plan_mode_tool_response(
-                                &events_tx,
-                                &session_id_for_task,
-                                &mut pending_exit_plan_mode,
-                                tool_response,
-                            )
-                            .await;
-                            continue;
-                        }
-                        if pending_exit_plan_mode.is_some() {
-                            emit_mock_error(
-                                &events_tx,
-                                "mock backend received normal input while ExitPlanMode is pending",
-                            );
-                            continue;
-                        }
-                        record_prompt(&session_id_for_task, &payload.message);
-                        if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
-                            if emit_exit_plan_mode_request(&events_tx).await.is_none() {
-                                return;
-                            }
-                            pending_exit_plan_mode =
-                                Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
-                        } else {
-                            if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
-                                .await
-                            {
-                                return;
-                            }
-                            maybe_spawn_native_child(
-                                &payload.message,
-                                &mut subagent_emitter_rx,
-                                &mut active_subagents,
-                            )
-                            .await;
-                        }
-                    }
-                    MockCommand::Input(AgentInput::UpdateSessionSettings(_)) => {}
-                    MockCommand::Input(AgentInput::EditQueuedMessage(_))
-                    | MockCommand::Input(AgentInput::CancelQueuedMessage(_))
-                    | MockCommand::Input(AgentInput::SendQueuedMessageNow(_)) => {
-                        panic!(
-                            "queued-message inputs must be handled by the agent actor before reaching the backend"
-                        );
-                    }
-                    MockCommand::Interrupt => break,
-                }
-            }
-
-            drop(active_subagents);
-        });
+        start_mock_command_loop(
+            session_id_for_task,
+            command_rx,
+            events_tx,
+            subagent_emitter_rx,
+            Some(initial_message),
+            slow_initial_turn,
+        );
 
         Ok((
             Self {
@@ -282,70 +203,94 @@ impl Backend for MockBackend {
             record.updated_at_ms = now_ms();
         }
 
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<MockCommand>();
+        let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
+        let (subagent_emitter_tx, subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
 
-        tokio::spawn(async move {
-            let mut active_subagents = Vec::new();
-            let mut pending_exit_plan_mode = None;
-            while let Some(command) = command_rx.recv().await {
-                match command {
-                    MockCommand::Input(AgentInput::SendMessage(payload)) => {
-                        if let Some(tool_response) = payload.tool_response {
-                            handle_exit_plan_mode_tool_response(
-                                &events_tx,
-                                &session_id_for_task,
-                                &mut pending_exit_plan_mode,
-                                tool_response,
-                            )
-                            .await;
-                            continue;
-                        }
-                        if pending_exit_plan_mode.is_some() {
-                            emit_mock_error(
-                                &events_tx,
-                                "mock backend received normal input while ExitPlanMode is pending",
-                            );
-                            continue;
-                        }
-                        record_prompt(&session_id_for_task, &payload.message);
-                        if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
-                            if emit_exit_plan_mode_request(&events_tx).await.is_none() {
-                                return;
-                            }
-                            pending_exit_plan_mode =
-                                Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
-                        } else {
-                            if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
-                                .await
-                            {
-                                return;
-                            }
-                            maybe_spawn_native_child(
-                                &payload.message,
-                                &mut subagent_emitter_rx,
-                                &mut active_subagents,
-                            )
-                            .await;
-                        }
-                    }
-                    MockCommand::Input(AgentInput::UpdateSessionSettings(_)) => {}
-                    MockCommand::Input(AgentInput::EditQueuedMessage(_))
-                    | MockCommand::Input(AgentInput::CancelQueuedMessage(_))
-                    | MockCommand::Input(AgentInput::SendQueuedMessageNow(_)) => {
-                        panic!(
-                            "queued-message inputs must be handled by the agent actor before reaching the backend"
-                        );
-                    }
-                    MockCommand::Interrupt => break,
-                }
-            }
+        start_mock_command_loop(
+            session_id_for_task,
+            command_rx,
+            events_tx,
+            subagent_emitter_rx,
+            None,
+            false,
+        );
 
-            drop(active_subagents);
-        });
+        Ok((
+            Self {
+                command_tx,
+                session_id,
+                subagent_emitter_tx,
+            },
+            EventStream::new(events_rx),
+        ))
+    }
+
+    async fn fork(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        from_session_id: SessionId,
+        initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        let initial_message = initial_input.message;
+        let startup_mcp_servers = config
+            .startup_mcp_servers
+            .iter()
+            .map(|server| match &server.transport {
+                StartupMcpTransport::Http { .. } => format!("{}(http)", server.name),
+                StartupMcpTransport::Stdio { .. } => format!("{}(stdio)", server.name),
+            })
+            .collect::<Vec<_>>();
+        let session_id = SessionId(Uuid::new_v4().to_string());
+        let now = now_ms();
+        let resolved_spawn_config = config.resolved_spawn_config.clone();
+
+        {
+            let mut store = session_store()
+                .lock()
+                .expect("mock backend session store mutex poisoned");
+            let Some(source) = store.get(&from_session_id.0).cloned() else {
+                return Err(BackendStartupError::backend_failed(format!(
+                    "unknown mock session {}",
+                    from_session_id.0
+                )));
+            };
+            store.insert(
+                session_id.0.clone(),
+                MockSessionRecord {
+                    workspace_roots,
+                    prompts: source.prompts,
+                    startup_mcp_servers,
+                    instructions: resolved_spawn_config.instructions,
+                    steering_body: resolved_spawn_config.steering_body,
+                    skills: resolved_spawn_config
+                        .skills
+                        .into_iter()
+                        .map(|skill| format!("{}={}", skill.name, summarize_text(&skill.body)))
+                        .collect(),
+                    tool_policy: resolved_spawn_config.tool_policy,
+                    access_mode: resolved_spawn_config.access_mode,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                },
+            );
+        }
+
+        let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (subagent_emitter_tx, subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let session_id_for_task = session_id.clone();
+        start_mock_command_loop(
+            session_id_for_task,
+            command_rx,
+            events_tx,
+            subagent_emitter_rx,
+            Some(initial_message),
+            false,
+        );
 
         Ok((
             Self {
@@ -395,6 +340,108 @@ impl Backend for MockBackend {
     }
 }
 
+fn start_mock_command_loop(
+    session_id_for_task: SessionId,
+    mut command_rx: mpsc::UnboundedReceiver<MockCommand>,
+    events_tx: mpsc::UnboundedSender<ChatEvent>,
+    mut subagent_emitter_rx: watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
+    initial_message: Option<String>,
+    slow_initial_turn: bool,
+) {
+    tokio::spawn(async move {
+        let mut active_subagents = Vec::new();
+        let mut pending_exit_plan_mode = None;
+        if let Some(initial_message) = initial_message {
+            if initial_message.contains(MOCK_DIE_AFTER_BUSY_SENTINEL) {
+                // Send TypingStatusChanged(true) so the actor sets in_turn=true,
+                // then sleep to give tests time to queue messages, then return so
+                // that events_tx is dropped and the actor detects termination.
+                let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
+                sleep(Duration::from_millis(MOCK_DIE_SLEEP_MS)).await;
+                return;
+            }
+            record_prompt(&session_id_for_task, &initial_message);
+            if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
+                if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+                    return;
+                }
+                pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+            } else {
+                if !emit_turn(
+                    &events_tx,
+                    &session_id_for_task,
+                    &initial_message,
+                    slow_initial_turn,
+                )
+                .await
+                {
+                    return;
+                }
+                maybe_spawn_native_child(
+                    &initial_message,
+                    &mut subagent_emitter_rx,
+                    &mut active_subagents,
+                )
+                .await;
+            }
+        }
+
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                MockCommand::Input(AgentInput::SendMessage(payload)) => {
+                    if let Some(tool_response) = payload.tool_response {
+                        handle_exit_plan_mode_tool_response(
+                            &events_tx,
+                            &session_id_for_task,
+                            &mut pending_exit_plan_mode,
+                            tool_response,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if pending_exit_plan_mode.is_some() {
+                        emit_mock_error(
+                            &events_tx,
+                            "mock backend received normal input while ExitPlanMode is pending",
+                        );
+                        continue;
+                    }
+                    record_prompt(&session_id_for_task, &payload.message);
+                    if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
+                        if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+                            return;
+                        }
+                        pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+                    } else {
+                        if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
+                            .await
+                        {
+                            return;
+                        }
+                        maybe_spawn_native_child(
+                            &payload.message,
+                            &mut subagent_emitter_rx,
+                            &mut active_subagents,
+                        )
+                        .await;
+                    }
+                }
+                MockCommand::Input(AgentInput::UpdateSessionSettings(_)) => {}
+                MockCommand::Input(AgentInput::EditQueuedMessage(_))
+                | MockCommand::Input(AgentInput::CancelQueuedMessage(_))
+                | MockCommand::Input(AgentInput::SendQueuedMessageNow(_)) => {
+                    panic!(
+                        "queued-message inputs must be handled by the agent actor before reaching the backend"
+                    );
+                }
+                MockCommand::Interrupt => break,
+            }
+        }
+
+        drop(active_subagents);
+    });
+}
+
 fn record_prompt(session_id: &SessionId, prompt: &str) {
     let mut store = session_store()
         .lock()
@@ -406,6 +453,16 @@ fn record_prompt(session_id: &SessionId, prompt: &str) {
     record.updated_at_ms = now_ms();
 }
 
+fn mock_prompt_history(session_id: &SessionId) -> Vec<String> {
+    let store = session_store()
+        .lock()
+        .expect("mock backend session store mutex poisoned");
+    store
+        .get(&session_id.0)
+        .map(|record| record.prompts.clone())
+        .unwrap_or_default()
+}
+
 async fn emit_turn(
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_id: &SessionId,
@@ -413,10 +470,17 @@ async fn emit_turn(
     force_slow: bool,
 ) -> bool {
     let message_id = Some(Uuid::new_v4().to_string());
-    let response_text = format!(
-        "{}mock backend response to: {user_message}",
-        startup_mcp_response_prefix(session_id)
-    );
+    let response_text = if user_message.contains(MOCK_HISTORY_SENTINEL) {
+        format!(
+            "mock history: {}",
+            mock_prompt_history(session_id).join(" | ")
+        )
+    } else {
+        format!(
+            "{}mock backend response to: {user_message}",
+            startup_mcp_response_prefix(session_id)
+        )
+    };
 
     if events_tx
         .send(ChatEvent::TypingStatusChanged(true))

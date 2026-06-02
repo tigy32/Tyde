@@ -18,7 +18,8 @@ use crate::backend::turn_emitter::{
     AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
-    SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
+    BackendStartupError, SessionCommand, StartupMcpServer, StartupMcpTransport,
+    backend_fork_unsupported_message, render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -6345,6 +6346,17 @@ impl Backend for CodexBackend {
         ))
     }
 
+    async fn fork(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        _from_session_id: protocol::SessionId,
+        _initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        Err(BackendStartupError::unsupported(
+            backend_fork_unsupported_message(protocol::BackendKind::Codex),
+        ))
+    }
+
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
         Err("CodexBackend::list_sessions requires a live Codex RPC session".to_string())
     }
@@ -6700,6 +6712,7 @@ mod tests {
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
         };
@@ -6779,6 +6792,7 @@ mod tests {
                     team_member_id: new_agent.team_member_id,
                     project_id: new_agent.project_id,
                     parent_agent_id: new_agent.parent_agent_id,
+                    session_id: None,
                     created_at_ms: new_agent.created_at_ms,
                 })],
             },

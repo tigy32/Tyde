@@ -13,7 +13,9 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use protocol::{BackendAccessMode, ExitPlanModeDecision, SendMessageToolResponse, ToolPolicy};
+use protocol::{
+    BackendAccessMode, ExitPlanModeDecision, SendMessageToolResponse, SessionId, ToolPolicy,
+};
 
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
@@ -86,6 +88,17 @@ pub struct ClaudeSession {
 
 struct ClaudeSpawnMode<'a> {
     no_session_persistence: bool,
+    fork_from_session_id: Option<String>,
+    ssh_host: Option<String>,
+    startup_mcp_servers: &'a [StartupMcpServer],
+    steering_content: Option<&'a str>,
+    agent_identity: Option<&'a AgentIdentity>,
+    tool_policy: ToolPolicy,
+    access_mode: BackendAccessMode,
+}
+
+struct ClaudeForkConfig<'a> {
+    from_session_id: &'a str,
     ssh_host: Option<String>,
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
@@ -108,6 +121,7 @@ impl ClaudeSession {
             workspace_roots,
             ClaudeSpawnMode {
                 no_session_persistence: false,
+                fork_from_session_id: None,
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
@@ -132,12 +146,35 @@ impl ClaudeSession {
             workspace_roots,
             ClaudeSpawnMode {
                 no_session_persistence: true,
+                fork_from_session_id: None,
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
                 agent_identity,
                 tool_policy,
                 access_mode,
+            },
+        )
+        .await
+    }
+
+    async fn fork(
+        workspace_roots: &[String],
+        fork_config: ClaudeForkConfig<'_>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let from_session_id = normalize_nonempty(fork_config.from_session_id)
+            .ok_or_else(|| "Claude fork requires non-empty from_session_id".to_string())?;
+        Self::spawn_with_mode(
+            workspace_roots,
+            ClaudeSpawnMode {
+                no_session_persistence: false,
+                fork_from_session_id: Some(from_session_id),
+                ssh_host: fork_config.ssh_host,
+                startup_mcp_servers: fork_config.startup_mcp_servers,
+                steering_content: fork_config.steering_content,
+                agent_identity: fork_config.agent_identity,
+                tool_policy: fork_config.tool_policy,
+                access_mode: fork_config.access_mode,
             },
         )
         .await
@@ -170,6 +207,7 @@ impl ClaudeSession {
                 workspace_root,
                 ssh_host: resolved_ssh_host,
                 session_id: None,
+                fork_from_session_id: mode.fork_from_session_id,
                 start_session_fresh: false,
                 ephemeral: mode.no_session_persistence,
                 model: None,
@@ -241,6 +279,7 @@ struct ClaudeState {
     workspace_root: String,
     ssh_host: Option<String>,
     session_id: Option<String>,
+    fork_from_session_id: Option<String>,
     start_session_fresh: bool,
     ephemeral: bool,
     model: Option<String>,
@@ -263,6 +302,7 @@ impl Default for ClaudeState {
             workspace_root: String::new(),
             ssh_host: None,
             session_id: None,
+            fork_from_session_id: None,
             start_session_fresh: false,
             ephemeral: false,
             model: None,
@@ -624,6 +664,7 @@ struct ClaudeProcessSpawnConfig {
     workspace_root: String,
     ssh_host: Option<String>,
     session_id: Option<String>,
+    fork_from_session_id: Option<String>,
     resume_existing_session: bool,
     ephemeral: bool,
     model: Option<String>,
@@ -1430,6 +1471,11 @@ impl ClaudeInner {
                 } else {
                     state.session_id.clone()
                 },
+                fork_from_session_id: if state.ephemeral {
+                    None
+                } else {
+                    state.fork_from_session_id.clone()
+                },
                 resume_existing_session: !state.start_session_fresh,
                 ephemeral: state.ephemeral,
                 model: state.model.clone(),
@@ -1748,6 +1794,7 @@ impl ClaudeInner {
         let mut state = self.state.lock().await;
         match &state.session_id {
             Some(existing) if existing == &session_id => {
+                state.fork_from_session_id = None;
                 state.start_session_fresh = false;
             }
             Some(existing) => {
@@ -1760,6 +1807,7 @@ impl ClaudeInner {
             }
             None => {
                 state.session_id = Some(session_id);
+                state.fork_from_session_id = None;
                 state.start_session_fresh = false;
             }
         }
@@ -1813,6 +1861,7 @@ impl ClaudeInner {
         let (workspace_root, ssh_host) = {
             let mut state = self.state.lock().await;
             state.session_id = Some(normalized.clone());
+            state.fork_from_session_id = None;
             state.start_session_fresh = false;
             state.last_cumulative_usage = None;
             state.conversation_bytes_total = 0;
@@ -1878,6 +1927,7 @@ impl ClaudeInner {
         {
             let mut state = self.state.lock().await;
             state.session_id = Some(session_id.to_string());
+            state.fork_from_session_id = None;
             state.start_session_fresh = true;
             state.last_cumulative_usage = None;
             state.conversation_bytes_total = 0;
@@ -1894,6 +1944,7 @@ impl ClaudeInner {
             let mut state = self.state.lock().await;
             if state.session_id.as_deref() == Some(normalized.as_str()) {
                 state.session_id = None;
+                state.fork_from_session_id = None;
                 state.start_session_fresh = false;
                 state.last_cumulative_usage = None;
                 state.conversation_bytes_total = 0;
@@ -2311,6 +2362,15 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     }
 
     if !config.ephemeral
+        && let Some(parent_session) = config
+            .fork_from_session_id
+            .as_deref()
+            .and_then(normalize_nonempty)
+    {
+        cli_args.push("--resume".to_string());
+        cli_args.push(parent_session);
+        cli_args.push("--fork-session".to_string());
+    } else if !config.ephemeral
         && let Some(existing_session) = config.session_id.as_deref().and_then(normalize_nonempty)
     {
         if config.resume_existing_session {
@@ -6923,14 +6983,15 @@ fn notify_turn_quiesced(waiters: Vec<oneshot::Sender<()>>) {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SelectOption, SessionId,
+    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SelectOption,
     SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
     SpawnCostHint,
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
-    resolve_settings as resolve_backend_settings, session_settings_to_json,
+    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
+    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 type ClaudeReadyTx = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
@@ -6978,6 +7039,40 @@ impl ClaudeBackend {
         initial_input: protocol::SendMessagePayload,
         initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, EventStream), String> {
+        Self::spawn_or_fork_with_initial_emitter(
+            workspace_roots,
+            config,
+            None,
+            initial_input,
+            initial_emitter,
+        )
+        .await
+    }
+
+    async fn fork_with_initial_emitter(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        from_session_id: SessionId,
+        initial_input: protocol::SendMessagePayload,
+        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    ) -> Result<(Self, EventStream), String> {
+        Self::spawn_or_fork_with_initial_emitter(
+            workspace_roots,
+            config,
+            Some(from_session_id),
+            initial_input,
+            initial_emitter,
+        )
+        .await
+    }
+
+    async fn spawn_or_fork_with_initial_emitter(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        fork_from_session_id: Option<SessionId>,
+        initial_input: protocol::SendMessagePayload,
+        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
+    ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -6994,17 +7089,33 @@ impl ClaudeBackend {
             };
             let steering_content = claude_steering_content(&config);
             let agent_identity = claude_agent_identity(&config);
-            let (session, mut raw_events) = match ClaudeSession::spawn(
-                &roots,
-                None,
-                &config.startup_mcp_servers,
-                steering_content.as_deref(),
-                agent_identity.as_ref(),
-                config.resolved_spawn_config.tool_policy.clone(),
-                config.resolved_spawn_config.access_mode,
-            )
-            .await
-            {
+            let session_result = if let Some(from_session_id) = fork_from_session_id.as_ref() {
+                ClaudeSession::fork(
+                    &roots,
+                    ClaudeForkConfig {
+                        from_session_id: &from_session_id.0,
+                        ssh_host: None,
+                        startup_mcp_servers: &config.startup_mcp_servers,
+                        steering_content: steering_content.as_deref(),
+                        agent_identity: agent_identity.as_ref(),
+                        tool_policy: config.resolved_spawn_config.tool_policy.clone(),
+                        access_mode: config.resolved_spawn_config.access_mode,
+                    },
+                )
+                .await
+            } else {
+                ClaudeSession::spawn(
+                    &roots,
+                    None,
+                    &config.startup_mcp_servers,
+                    steering_content.as_deref(),
+                    agent_identity.as_ref(),
+                    config.resolved_spawn_config.tool_policy.clone(),
+                    config.resolved_spawn_config.access_mode,
+                )
+                .await
+            };
+            let (session, mut raw_events) = match session_result {
                 Ok(value) => value,
                 Err(err) => {
                     tracing::error!("Failed to spawn Claude session: {err}");
@@ -7593,6 +7704,23 @@ impl Backend for ClaudeBackend {
         ))
     }
 
+    async fn fork(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        from_session_id: protocol::SessionId,
+        initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        Self::fork_with_initial_emitter(
+            workspace_roots,
+            config,
+            from_session_id,
+            initial_input,
+            None,
+        )
+        .await
+        .map_err(BackendStartupError::backend_failed)
+    }
+
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
         Err("ClaudeBackend::list_sessions is not supported without workspace context".to_string())
     }
@@ -7668,6 +7796,7 @@ mod tests {
                 workspace_root,
                 ssh_host: None,
                 session_id: None,
+                fork_from_session_id: None,
                 start_session_fresh: false,
                 ephemeral: false,
                 model: None,
@@ -7952,6 +8081,7 @@ mod tests {
             workspace_root: "/tmp/workspace".to_string(),
             ssh_host: None,
             session_id: Some("valid-session".to_string()),
+            fork_from_session_id: None,
             resume_existing_session: true,
             ephemeral: false,
             model: None,
@@ -7976,11 +8106,43 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_args_fork_uses_parent_resume_without_preseed() {
+        let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
+            workspace_root: "/tmp/workspace".to_string(),
+            ssh_host: None,
+            session_id: None,
+            fork_from_session_id: Some("parent-session".to_string()),
+            resume_existing_session: true,
+            ephemeral: false,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            startup_mcp_config_json: None,
+            steering_content: None,
+            agent_identity: None,
+            tool_policy: ToolPolicy::Unrestricted,
+        });
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--resume" && pair[1] == "parent-session")
+        );
+        assert!(args.iter().any(|arg| arg == "--fork-session"));
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == "--session-id" && pair[1] == "parent-session"),
+            "forks must not pre-seed the parent id as the child session id"
+        );
+    }
+
+    #[test]
     fn claude_cli_args_recovered_missing_session_starts_fresh() {
         let args = build_claude_cli_args(&ClaudeProcessSpawnConfig {
             workspace_root: "/tmp/workspace".to_string(),
             ssh_host: None,
             session_id: Some("stale-session".to_string()),
+            fork_from_session_id: None,
             resume_existing_session: false,
             ephemeral: false,
             model: None,
@@ -12117,6 +12279,7 @@ for raw_line in sys.stdin:
                     workspace_root,
                     ssh_host: None,
                     session_id: None,
+                    fork_from_session_id: None,
                     start_session_fresh: false,
                     ephemeral: true,
                     model: None,

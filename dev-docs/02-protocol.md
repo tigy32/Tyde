@@ -166,8 +166,8 @@ are specified in `21-bootstrap-streams.md`.
   "seq": 0,
   "payload": {
     "code": "incompatible_protocol",
-    "message": "server requires protocol version 6, client sent 3",
-    "server_protocol_version": 6,
+    "message": "server requires protocol version 7, client sent 3",
+    "server_protocol_version": 7,
     "server_tyde_version": { "major": 3, "minor": 0, "patch": 0 }
   }
 }
@@ -289,7 +289,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The current protocol version. Bump when the wire shape changes.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 // ── Primitives ──────────────────────────────────────────────────────
 

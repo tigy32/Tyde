@@ -217,6 +217,22 @@ fn active_agent_is_backend_native(state: &AppState) -> bool {
     })
 }
 
+/// True when the active agent has reported a backend session id, which is
+/// required to fork a BTW / side question off it. Tracked so the BTW button
+/// enables itself the moment the `AgentStart`/bootstrap event lands.
+fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
+    let Some(active_agent) = state.active_agent.get() else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.host_id == active_agent.host_id
+                && agent.agent_id == active_agent.agent_id
+                && agent.session_id.is_some()
+        })
+    })
+}
+
 fn pending_images_to_payload(images: &[PendingImage]) -> Option<Vec<ImageData>> {
     if images.is_empty() {
         None
@@ -303,6 +319,25 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
             log::error!("failed to send message: {e}");
         }
     });
+}
+
+/// Spawn a BTW / side question from the current draft, then clear the draft
+/// optimistically — mirroring `submit_chat_input`'s clear-on-submit. The BTW
+/// button is only enabled when there is input and the active agent has a
+/// session id, so the guard here just protects against an empty draft.
+fn submit_side_question(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
+    let text = state.chat_input.get_untracked();
+    let text = text.trim().to_owned();
+    let images = pending_images.get_untracked();
+    let payload_images = pending_images_to_payload(&images);
+    if text.is_empty() && payload_images.is_none() {
+        return;
+    }
+
+    state.chat_input.set(String::new());
+    pending_images.set(Vec::new());
+
+    crate::actions::spawn_side_question(state, text, payload_images);
 }
 
 fn interrupt_active_turn(state: &AppState) {
@@ -577,6 +612,12 @@ pub fn ChatInput() -> impl IntoView {
     let readonly_state = state.clone();
     let is_readonly = Memo::new(move |_| active_agent_is_backend_native(&readonly_state));
 
+    let btw_state = state.clone();
+    let active_has_session = Memo::new(move |_| active_agent_has_session_id_tracked(&btw_state));
+    // A BTW fork needs draft input (ui_mode.0 = connected && has_input) and a
+    // forkable backend session on the active agent.
+    let can_btw = move || ui_mode.get().0 && active_has_session.get();
+
     let can_send = move || ui_mode.get().0 && !is_readonly.get();
     let can_interrupt = move || ui_mode.get().1 && !is_readonly.get();
     let send_label = move || ui_mode.get().2;
@@ -628,6 +669,12 @@ pub fn ChatInput() -> impl IntoView {
     let on_click_images = pending_images;
     let on_click_send = move |_| {
         submit_chat_input(&on_click_state, on_click_images);
+    };
+
+    let on_click_btw_state = state.clone();
+    let on_click_btw_images = pending_images;
+    let on_click_btw = move |_| {
+        submit_side_question(&on_click_btw_state, on_click_btw_images);
     };
 
     let on_click_interrupt_state = state.clone();
@@ -924,6 +971,14 @@ pub fn ChatInput() -> impl IntoView {
                     }
                 >
                     <span>{send_label}</span>
+                </button>
+                <button
+                    class="chat-send-btn chat-btw-btn"
+                    disabled=move || !can_btw()
+                    on:click=on_click_btw
+                    title="Ask a side question (BTW) — forks this agent's session read-only without disturbing it"
+                >
+                    <span>"BTW"</span>
                 </button>
                 <button
                     class="chat-send-btn chat-interrupt-btn chat-send-btn-text"

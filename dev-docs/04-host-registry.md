@@ -300,6 +300,7 @@ pub struct NewAgentPayload {
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
     pub parent_agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
     pub created_at_ms: u64,
     /// The agent stream path for THIS subscriber.
     /// Each connection gets a unique instance_id.
@@ -437,6 +438,7 @@ pub struct NewAgentPayload {
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
     pub parent_agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
 }

@@ -95,6 +95,73 @@ pub async fn spawn_new_chat(
     Ok(())
 }
 
+/// Spawn a BTW / side question fork from the currently active agent. Mirrors
+/// the desktop `spawn_side_question`: the child is a first-class interactive
+/// `AgentOrigin::SideQuestion` agent whose backend session forks the parent's,
+/// leaving the parent transcript untouched. `access_mode` is left `None` so
+/// the server applies its read-only fork default (see
+/// `dev-docs/23-side-questions.md`).
+pub async fn spawn_side_question(
+    state: &AppState,
+    prompt: String,
+    images: Vec<protocol::ImageData>,
+) -> Result<(), String> {
+    let prompt = prompt.trim().to_owned();
+    if prompt.is_empty() && images.is_empty() {
+        return Err("prompt or images required".into());
+    }
+
+    let active = state
+        .active_agent
+        .get_untracked()
+        .ok_or("no active agent to fork from")?;
+
+    let agent_info = state
+        .agents
+        .with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
+                .cloned()
+        })
+        .ok_or("active agent not found")?;
+
+    let from_session_id = agent_info
+        .session_id
+        .clone()
+        .ok_or("active agent has no session id yet")?;
+
+    let host = active.local_host_id.clone();
+    let host_stream = state.host_stream_untracked(&host).ok_or("no host stream")?;
+
+    let payload = protocol::SpawnAgentPayload {
+        name: None,
+        custom_agent_id: None,
+        parent_agent_id: Some(agent_info.agent_id.clone()),
+        project_id: agent_info.project_id.clone(),
+        params: protocol::SpawnAgentParams::Fork {
+            from_session_id,
+            prompt,
+            images: if images.is_empty() {
+                None
+            } else {
+                Some(images)
+            },
+            access_mode: None,
+        },
+    };
+
+    send_frame(
+        &host,
+        host_stream,
+        protocol::FrameKind::SpawnAgent,
+        &payload,
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Locate the agent's `instance_stream` so an outbound frame can be sent
 /// to that stream. Returns `None` if the agent is gone (e.g. closed
 /// out from under us by the host).

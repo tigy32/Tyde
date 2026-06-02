@@ -3509,6 +3509,15 @@ kbd {
     border-color: var(--border-primary);
 }
 
+/* Compact BTW / side-question affordance: smaller than Send/Interrupt
+   since it's a secondary action that forks the current session. */
+.chat-btw-btn {
+    min-width: 40px;
+    padding: 0 8px;
+    font-size: 0.77rem;
+    letter-spacing: 0.04em;
+}
+
 /* ===== Markdown Rendering ===== */
 .chat-card-body p {
     margin: 0 0 0.5em 0;
@@ -4286,6 +4295,17 @@ kbd {
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 120px;
+}
+
+.agent-card-side-question-badge {
+    font-size: 0.69rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--accent-primary);
+    padding: 0.05rem 0.35rem;
+    border: 1px solid var(--accent-primary);
+    border-radius: 3px;
+    margin-left: 0.3rem;
 }
 
 .agent-card-error {

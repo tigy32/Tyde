@@ -529,6 +529,7 @@ fn bootstrap_payloads_round_trip() {
             team_member_id: None,
             project_id: Some(project_id()),
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/agent-1/instance-1".to_owned()),
         }],

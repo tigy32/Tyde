@@ -71,6 +71,21 @@ fn active_agent_is_running_tracked(state: &AppState) -> bool {
     })
 }
 
+/// True when the active agent has reported a backend session id, which is
+/// required to fork a BTW / side question off it.
+fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
+    let Some(active) = state.active_agent.get() else {
+        return false;
+    };
+    state.agents.with(|agents| {
+        agents.iter().any(|agent| {
+            agent.local_host_id == active.local_host_id
+                && agent.agent_id == active.agent_id
+                && agent.session_id.is_some()
+        })
+    })
+}
+
 #[component]
 fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -284,6 +299,33 @@ pub fn ChatInput() -> impl IntoView {
 
     let steer_for_view = do_steer.clone();
 
+    // BTW / side question: fork the active agent's session into a fresh
+    // read-only agent seeded with the current draft, then clear the draft
+    // optimistically (mirroring send). Enabled only when there is draft text
+    // and the active agent has a forkable backend session.
+    let do_btw = {
+        let state = state.clone();
+        move || {
+            let text = state.chat_input.get_untracked().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            state.chat_input.set(String::new());
+            if let Some(textarea) = textarea_ref.get_untracked() {
+                textarea.set_value("");
+                resize_chat_input(&textarea);
+            }
+            let state = state.clone();
+            spawn_local(async move {
+                if let Err(error) = crate::actions::spawn_side_question(&state, text, vec![]).await
+                {
+                    report_send_error(&state, format!("Failed to start side question: {error}"));
+                }
+            });
+        }
+    };
+    let btw_for_view = do_btw.clone();
+
     let s_input = state.clone();
     let textarea_ref_for_effect = textarea_ref;
     Effect::new(move |_| {
@@ -298,6 +340,11 @@ pub fn ChatInput() -> impl IntoView {
     let is_running = Memo::new(move |_| active_agent_is_running_tracked(&running_state));
     let has_text_state = state.clone();
     let has_text = Memo::new(move |_| has_text_state.chat_input.with(|t| !t.trim().is_empty()));
+    let btw_state = state.clone();
+    let can_btw = Memo::new(move |_| {
+        btw_state.chat_input.with(|t| !t.trim().is_empty())
+            && active_agent_has_session_id_tracked(&btw_state)
+    });
     let queue_state = state.clone();
     let queued_rows = Memo::new(move |_| {
         let Some(active) = queue_state.active_agent.get() else {
@@ -379,6 +426,25 @@ pub fn ChatInput() -> impl IntoView {
                     {move || if is_running.get() { "Queue" } else { "\u{2191}" }}
                 </button>
                 {move || {
+                    // Only render when forkable — keeps the row tight on
+                    // narrow screens instead of showing a dead disabled button.
+                    if !can_btw.get() {
+                        return view! { <div></div> }.into_any();
+                    }
+                    let on_btw = btw_for_view.clone();
+                    view! {
+                        <button
+                            type="button"
+                            class="btw-button"
+                            aria-label="Ask a side question (BTW) — forks this session read-only"
+                            data-mobile-test="chat-btw"
+                            on:click=move |_| on_btw()
+                        >
+                            "BTW"
+                        </button>
+                    }.into_any()
+                }}
+                {move || {
                     if !is_running.get() {
                         return view! { <div></div> }.into_any();
                     }
@@ -435,9 +501,12 @@ fn report_send_error(state: &AppState, message: String) {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AgentRef, AppState, LocalHostId};
+    use crate::state::{AgentInfo, AgentRef, AppState, LocalHostId};
     use leptos::mount::mount_to;
-    use protocol::{AgentId, QueuedMessageEntry, QueuedMessageId};
+    use protocol::{
+        AgentId, AgentOrigin, BackendKind, QueuedMessageEntry, QueuedMessageId, SessionId,
+        StreamPath,
+    };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -620,6 +689,127 @@ mod wasm_tests {
         assert!(
             steer.text_content().unwrap_or_default().contains("Steer"),
             "typed running-turn control must visibly offer Steer"
+        );
+    }
+
+    /// The BTW (side question) affordance only appears once there's draft
+    /// text AND the active agent has a forkable backend session — otherwise
+    /// a fork can't be addressed, so a dead button would just waste the tight
+    /// mobile row.
+    #[wasm_bindgen_test]
+    async fn btw_button_requires_session_and_text() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.agents.set(vec![AgentInfo {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+                name: "Agent".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: Some(SessionId("sess-1".to_owned())),
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            }]);
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        // No draft text yet → BTW hidden even with a session.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-btw']")
+                .unwrap()
+                .is_none(),
+            "BTW must stay hidden while the composer is empty"
+        );
+
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("why is this slow?");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-btw']")
+                .unwrap()
+                .is_some(),
+            "BTW must appear once there is draft text and a forkable session"
+        );
+    }
+
+    /// Without a backend session id on the active agent, the BTW affordance
+    /// stays hidden no matter what's typed — there's nothing to fork.
+    #[wasm_bindgen_test]
+    async fn btw_button_hidden_without_session() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.agents.set(vec![AgentInfo {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+                name: "Agent".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            }]);
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("anything");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-btw']")
+                .unwrap()
+                .is_none(),
+            "BTW must stay hidden when the active agent has no session id"
         );
     }
 

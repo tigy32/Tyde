@@ -327,7 +327,15 @@ impl ProtocolValidator {
                 "MobileDeviceRename",
             ),
             FrameKind::SpawnAgent => {
-                parse_host_payload::<SpawnAgentPayload>(self, envelope, "SpawnAgent")
+                let payload: SpawnAgentPayload = envelope.parse_payload().map_err(|error| {
+                    self.violation(
+                        envelope,
+                        None,
+                        format!("failed to parse SpawnAgent payload: {error}"),
+                    )
+                })?;
+                validate_spawn_agent_payload(&payload)
+                    .map_err(|message| self.violation(envelope, None, message))
             }
             FrameKind::ListSessions => {
                 parse_host_payload::<ListSessionsPayload>(self, envelope, "ListSessions")
@@ -858,19 +866,50 @@ fn validate_agent_origin(
         AgentOrigin::BackendNative if parent_agent_id.is_none() => {
             Err("backend_native agents must include parent_agent_id".to_owned())
         }
+        AgentOrigin::SideQuestion if parent_agent_id.is_none() => {
+            Err("side_question agents must include parent_agent_id".to_owned())
+        }
         AgentOrigin::TeamMember if team_id.is_none() || team_member_id.is_none() => {
             Err("team_member agents must include team_id and team_member_id".to_owned())
         }
-        AgentOrigin::User | AgentOrigin::AgentControl | AgentOrigin::BackendNative
+        AgentOrigin::User
+        | AgentOrigin::AgentControl
+        | AgentOrigin::SideQuestion
+        | AgentOrigin::BackendNative
             if team_id.is_some() || team_member_id.is_some() =>
         {
             Err("non-team_member agents must not include team_id or team_member_id".to_owned())
         }
         AgentOrigin::User
         | AgentOrigin::AgentControl
+        | AgentOrigin::SideQuestion
         | AgentOrigin::BackendNative
         | AgentOrigin::TeamMember => Ok(()),
     }
+}
+
+fn validate_spawn_agent_payload(payload: &SpawnAgentPayload) -> Result<(), String> {
+    if let crate::SpawnAgentParams::Fork {
+        from_session_id,
+        prompt,
+        images,
+        ..
+    } = &payload.params
+    {
+        if payload.parent_agent_id.is_none() {
+            return Err("fork spawn_agent must include parent_agent_id".to_owned());
+        }
+        if from_session_id.0.trim().is_empty() {
+            return Err("fork spawn_agent must include from_session_id".to_owned());
+        }
+        if prompt.trim().is_empty() && images.as_ref().is_none_or(|images| images.is_empty()) {
+            return Err(
+                "fork spawn_agent prompt must not be empty unless images are attached".to_owned(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_host_payload<T: serde::de::DeserializeOwned>(
@@ -1456,6 +1495,7 @@ mod tests {
             team_member_id,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 0,
             instance_stream: agent_stream(),
         }
@@ -1520,6 +1560,7 @@ mod tests {
             team_member_id: None,
             project_id: None,
             parent_agent_id: None,
+            session_id: None,
             created_at_ms: 0,
         }
     }
@@ -1770,6 +1811,95 @@ mod tests {
             .expect_err("user origin should not include team ids");
 
         assert!(violation.to_string().contains("non-team_member"));
+    }
+
+    #[test]
+    fn rejects_side_question_origin_without_parent() {
+        let mut validator = ProtocolValidator::new();
+        let violation = validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![new_agent_payload(
+                AgentOrigin::SideQuestion,
+                None,
+                None,
+            )]))
+            .expect_err("side_question origin should require a parent agent");
+
+        assert!(violation.to_string().contains("parent_agent_id"));
+    }
+
+    #[test]
+    fn accepts_side_question_origin_with_parent() {
+        let mut payload = new_agent_payload(AgentOrigin::SideQuestion, None, None);
+        payload.parent_agent_id = Some(crate::AgentId("parent-agent".to_owned()));
+
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![payload]))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_fork_spawn_without_parent_agent_id() {
+        let envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::SpawnAgent,
+            1,
+            &crate::SpawnAgentPayload {
+                name: None,
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: crate::SpawnAgentParams::Fork {
+                    from_session_id: crate::SessionId("parent-session".to_owned()),
+                    prompt: "side question".to_owned(),
+                    images: None,
+                    access_mode: None,
+                },
+            },
+        )
+        .expect("serialize SpawnAgent");
+
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![]))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&envelope)
+            .expect_err("fork spawn should require parent_agent_id");
+
+        assert!(violation.to_string().contains("parent_agent_id"));
+    }
+
+    #[test]
+    fn rejects_fork_spawn_without_from_session_id() {
+        let envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::SpawnAgent,
+            1,
+            &crate::SpawnAgentPayload {
+                name: None,
+                custom_agent_id: None,
+                parent_agent_id: Some(crate::AgentId("parent-agent".to_owned())),
+                project_id: None,
+                params: crate::SpawnAgentParams::Fork {
+                    from_session_id: crate::SessionId(String::new()),
+                    prompt: "side question".to_owned(),
+                    images: None,
+                    access_mode: None,
+                },
+            },
+        )
+        .expect("serialize SpawnAgent");
+
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![]))
+            .unwrap();
+        let violation = validator
+            .validate_envelope(&envelope)
+            .expect_err("fork spawn should require from_session_id");
+
+        assert!(violation.to_string().contains("from_session_id"));
     }
 
     #[test]

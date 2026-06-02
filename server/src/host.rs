@@ -45,8 +45,8 @@ use crate::agent::customization::{
     resolve_spawn_config,
 };
 use crate::agent::registry::{
-    AgentRegistry, InitialAgentAlias, InitialAgentAliasPersistence, RelaySpawnRequest,
-    ResolvedSpawnRequest,
+    AgentRegistry, AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence,
+    RelaySpawnRequest, ResolvedSpawnRequest,
 };
 use crate::agent::{
     AgentHandle, CompactionStart, CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES,
@@ -517,6 +517,7 @@ impl HostHandle {
                 team_member_id: start.team_member_id.clone(),
                 project_id: start.project_id.clone(),
                 parent_agent_id: start.parent_agent_id.clone(),
+                session_id: start.session_id.clone(),
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
             };
@@ -1448,11 +1449,29 @@ impl HostHandle {
                 state.use_mock_backend,
                 state.debug_mcp.clone(),
                 state.agent_control_mcp.clone(),
-                payload
-                    .parent_agent_id
-                    .as_ref()
-                    .and_then(|agent_id| state.agent_sessions.get(agent_id).cloned()),
+                payload.parent_agent_id.as_ref().map(|agent_id| {
+                    if let Some(session_id) = state.agent_sessions.get(agent_id).cloned() {
+                        Ok(session_id)
+                    } else if let Some(handle) = state.registry.agent_handle(agent_id) {
+                        handle.snapshot().session_id.ok_or_else(|| {
+                            AgentStartupFailure::internal(format!(
+                                "fork parent_agent_id {} has no known session_id",
+                                agent_id
+                            ))
+                        })
+                    } else {
+                        Err(AgentStartupFailure::internal(format!(
+                            "fork parent_agent_id {} is not running",
+                            agent_id
+                        )))
+                    }
+                }),
             )
+        };
+        let (parent_session_id, parent_session_lookup_failure) = match parent_session_id {
+            Some(Ok(session_id)) => (Some(session_id), None),
+            Some(Err(err)) => (None, Some(err)),
+            None => (None, None),
         };
         let mut deferred_generated_name: Option<GenerateAgentNameRequest> = None;
         let host_settings = settings_store
@@ -1504,7 +1523,7 @@ impl HostHandle {
                         requested_custom_agent_id,
                         ResolvedSpawnConfig::default(),
                         None,
-                        Some(err),
+                        Some(AgentStartupFailure::backend_failed(err)),
                     )
                 } else if let Some(resolved) = resolved_spawn_config_override.clone() {
                     (None, resolved, None, None)
@@ -1528,7 +1547,7 @@ impl HostHandle {
                             requested_custom_agent_id,
                             ResolvedSpawnConfig::default(),
                             None,
-                            Some(err),
+                            Some(AgentStartupFailure::internal(err)),
                         ),
                     }
                 };
@@ -1620,6 +1639,7 @@ impl HostHandle {
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
+                    fork_from_session_id: None,
                     startup_warning,
                     startup_failure,
                     initial_alias,
@@ -1729,7 +1749,7 @@ impl HostHandle {
                                 Some(stored_custom_agent_id.clone()),
                                 ResolvedSpawnConfig::default(),
                                 None,
-                                Some(err),
+                                Some(AgentStartupFailure::internal(err)),
                             ),
                         }
                     }
@@ -1749,7 +1769,12 @@ impl HostHandle {
                         skill_store: &skills,
                     }) {
                         Ok(resolved) => (None, resolved, None, None),
-                        Err(err) => (None, ResolvedSpawnConfig::default(), None, Some(err)),
+                        Err(err) => (
+                            None,
+                            ResolvedSpawnConfig::default(),
+                            None,
+                            Some(AgentStartupFailure::internal(err)),
+                        ),
                     }
                 };
                 let startup_mcp_servers =
@@ -1832,6 +1857,306 @@ impl HostHandle {
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: Some(session_id),
+                    fork_from_session_id: None,
+                    startup_warning: combined_startup_warning,
+                    startup_failure,
+                    initial_alias,
+                    use_mock_backend,
+                }
+            }
+            SpawnAgentParams::Fork {
+                from_session_id,
+                prompt,
+                images,
+                access_mode,
+            } => {
+                assert!(
+                    payload.parent_agent_id.is_some(),
+                    "fork spawn requires parent_agent_id"
+                );
+                let record = session_store.lock().await.get(&from_session_id);
+                let Some(record) = record else {
+                    let resolved_name = payload.name.clone().unwrap_or_else(|| {
+                        let prompt_name = derive_agent_name(&prompt);
+                        format!("BTW: {prompt_name}")
+                    });
+                    let initial_alias = Some(InitialAgentAlias {
+                        name: resolved_name.clone(),
+                        persistence: if payload.name.is_some() {
+                            InitialAgentAliasPersistence::User
+                        } else {
+                            InitialAgentAliasPersistence::GeneratedIfNoUserAlias
+                        },
+                    });
+                    let resolved_spawn_config = ResolvedSpawnConfig {
+                        access_mode: access_mode.unwrap_or(protocol::BackendAccessMode::ReadOnly),
+                        ..Default::default()
+                    };
+                    return self
+                        .spawn_resolved_agent(ResolvedSpawnRequest {
+                            name: resolved_name,
+                            origin: AgentOrigin::SideQuestion,
+                            custom_agent_id: payload.custom_agent_id,
+                            team_id: None,
+                            team_member_id: None,
+                            parent_agent_id: payload.parent_agent_id,
+                            parent_session_id: Some(from_session_id.clone()),
+                            project_id: payload.project_id,
+                            backend_kind: protocol::BackendKind::Claude,
+                            workspace_roots: Vec::new(),
+                            initial_input: Some(protocol::SendMessagePayload {
+                                message: prompt,
+                                images,
+                                origin: None,
+                                tool_response: None,
+                            }),
+                            cost_hint: None,
+                            session_settings: None,
+                            session_settings_schema: None,
+                            startup_mcp_servers: Vec::new(),
+                            resolved_spawn_config,
+                            resume_session_id: None,
+                            fork_from_session_id: None,
+                            startup_warning: None,
+                            startup_failure: Some(AgentStartupFailure::internal(format!(
+                                "cannot fork missing session {}",
+                                from_session_id
+                            ))),
+                            initial_alias,
+                            use_mock_backend,
+                        })
+                        .await;
+                };
+                if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
+                    assert_eq!(
+                        record.custom_agent_id.as_ref(),
+                        Some(requested_custom_agent_id),
+                        "fork custom_agent_id {:?} must match stored session custom_agent_id {:?}",
+                        requested_custom_agent_id,
+                        record.custom_agent_id
+                    );
+                }
+
+                let requested_project_id = record.project_id.clone();
+                let (project_id, missing_project_warning) = match requested_project_id {
+                    Some(project_id) => {
+                        if project_store.lock().await.get(&project_id).is_some() {
+                            (Some(project_id), None)
+                        } else {
+                            let warning = format!(
+                                "project {} was deleted; forking without a project",
+                                project_id
+                            );
+                            (None, Some(warning))
+                        }
+                    }
+                    None => (None, None),
+                };
+                let workspace_roots = record.workspace_roots.clone();
+                let backend_kind = record.backend_kind;
+                let startup_mcp_servers = startup_mcp_servers_for_settings(
+                    &host_settings,
+                    &workspace_roots,
+                    &debug_mcp,
+                    &agent_control_mcp,
+                );
+                let (
+                    effective_custom_agent_id,
+                    mut resolved_spawn_config,
+                    startup_warning,
+                    startup_failure,
+                ) = if let Some(stored_custom_agent_id) = record.custom_agent_id.as_ref() {
+                    if custom_agent_store
+                        .lock()
+                        .await
+                        .get(stored_custom_agent_id)
+                        .is_none()
+                    {
+                        let custom_agents = custom_agent_store.lock().await;
+                        let mcp_servers = mcp_server_store.lock().await;
+                        let steering = steering_store.lock().await;
+                        let skills = skill_store.lock().await;
+                        (
+                            None,
+                            resolve_spawn_config(ResolveSpawnConfigRequest {
+                                backend_kind,
+                                project_id: project_id.as_ref(),
+                                custom_agent_id: None,
+                                built_in_mcp_servers: &startup_mcp_servers,
+                                custom_agent_store: &custom_agents,
+                                mcp_server_store: &mcp_servers,
+                                steering_store: &steering,
+                                skill_store: &skills,
+                            })
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "failed to resolve fork customization after deleted custom agent {}: {err}",
+                                    stored_custom_agent_id
+                                )
+                            }),
+                            Some(format!(
+                                "custom agent {} was deleted; forking without custom agent configuration",
+                                stored_custom_agent_id
+                            )),
+                            None,
+                        )
+                    } else {
+                        let custom_agents = custom_agent_store.lock().await;
+                        let mcp_servers = mcp_server_store.lock().await;
+                        let steering = steering_store.lock().await;
+                        let skills = skill_store.lock().await;
+                        match resolve_spawn_config(ResolveSpawnConfigRequest {
+                            backend_kind,
+                            project_id: project_id.as_ref(),
+                            custom_agent_id: Some(stored_custom_agent_id),
+                            built_in_mcp_servers: &startup_mcp_servers,
+                            custom_agent_store: &custom_agents,
+                            mcp_server_store: &mcp_servers,
+                            steering_store: &steering,
+                            skill_store: &skills,
+                        }) {
+                            Ok(resolved) => {
+                                (Some(stored_custom_agent_id.clone()), resolved, None, None)
+                            }
+                            Err(err) => (
+                                Some(stored_custom_agent_id.clone()),
+                                ResolvedSpawnConfig::default(),
+                                None,
+                                Some(AgentStartupFailure::internal(err)),
+                            ),
+                        }
+                    }
+                } else if let Some(resolved) = resolved_spawn_config_override.clone() {
+                    (None, resolved, None, None)
+                } else {
+                    let custom_agents = custom_agent_store.lock().await;
+                    let mcp_servers = mcp_server_store.lock().await;
+                    let steering = steering_store.lock().await;
+                    let skills = skill_store.lock().await;
+                    match resolve_spawn_config(ResolveSpawnConfigRequest {
+                        backend_kind,
+                        project_id: project_id.as_ref(),
+                        custom_agent_id: None,
+                        built_in_mcp_servers: &startup_mcp_servers,
+                        custom_agent_store: &custom_agents,
+                        mcp_server_store: &mcp_servers,
+                        steering_store: &steering,
+                        skill_store: &skills,
+                    }) {
+                        Ok(resolved) => (None, resolved, None, None),
+                        Err(err) => (
+                            None,
+                            ResolvedSpawnConfig::default(),
+                            None,
+                            Some(AgentStartupFailure::internal(err)),
+                        ),
+                    }
+                };
+                resolved_spawn_config.access_mode =
+                    access_mode.unwrap_or(protocol::BackendAccessMode::ReadOnly);
+                let startup_mcp_servers =
+                    protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
+                let session_settings_schema = {
+                    let state = self.state.lock().await;
+                    session_schema_for_backend(&state, backend_kind)
+                };
+                let session_settings_schema = if backend_kind == protocol::BackendKind::Kiro
+                    && session_settings_schema.is_none()
+                {
+                    self.refresh_session_schemas().await;
+                    let state = self.state.lock().await;
+                    session_schema_for_backend(&state, backend_kind)
+                } else {
+                    session_settings_schema
+                };
+                let sanitized_settings = record.session_settings.clone().map(|stored_settings| {
+                    if stored_settings.0.is_empty() {
+                        return stored_settings;
+                    }
+                    let schema = session_settings_schema.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "session settings schema unavailable for backend {:?}",
+                            backend_kind
+                        )
+                    });
+                    sanitize_session_settings_values(schema, &stored_settings)
+                });
+                let backend_support_failure = (!use_mock_backend
+                    && backend_kind != protocol::BackendKind::Claude)
+                    .then(|| {
+                        AgentStartupFailure::unsupported(
+                            crate::backend::backend_fork_unsupported_message(backend_kind),
+                        )
+                    });
+                let non_resumable_failure = (!record.resumable).then(|| {
+                    AgentStartupFailure::unsupported(format!(
+                        "cannot fork non-resumable session {}",
+                        from_session_id
+                    ))
+                });
+                let parent_agent_mismatch_failure = match parent_session_id.as_ref() {
+                    Some(session_id) if session_id != &from_session_id => {
+                        Some(AgentStartupFailure::internal(format!(
+                            "fork parent_agent_id maps to session {}, not from_session_id {}",
+                            session_id, from_session_id
+                        )))
+                    }
+                    Some(_) => None,
+                    None => parent_session_lookup_failure.clone(),
+                };
+                let startup_failure = startup_failure
+                    .or(parent_agent_mismatch_failure)
+                    .or(non_resumable_failure)
+                    .or(backend_support_failure);
+                let combined_startup_warning = match (startup_warning, missing_project_warning) {
+                    (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let (resolved_name, initial_alias) = match payload.name.clone() {
+                    Some(name) => (
+                        name.clone(),
+                        Some(InitialAgentAlias {
+                            name,
+                            persistence: InitialAgentAliasPersistence::User,
+                        }),
+                    ),
+                    None => {
+                        let provisional = format!("BTW: {}", derive_agent_name(&prompt));
+                        (
+                            provisional.clone(),
+                            Some(InitialAgentAlias {
+                                name: provisional,
+                                persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
+                            }),
+                        )
+                    }
+                };
+                ResolvedSpawnRequest {
+                    name: resolved_name,
+                    origin: AgentOrigin::SideQuestion,
+                    custom_agent_id: effective_custom_agent_id,
+                    team_id: None,
+                    team_member_id: None,
+                    parent_agent_id: payload.parent_agent_id,
+                    parent_session_id: Some(from_session_id.clone()),
+                    project_id,
+                    backend_kind,
+                    workspace_roots,
+                    initial_input: Some(protocol::SendMessagePayload {
+                        message: prompt,
+                        images,
+                        origin: None,
+                        tool_response: None,
+                    }),
+                    cost_hint: None,
+                    session_settings: sanitized_settings,
+                    session_settings_schema,
+                    startup_mcp_servers,
+                    resolved_spawn_config,
+                    resume_session_id: None,
+                    fork_from_session_id: Some(from_session_id),
                     startup_warning: combined_startup_warning,
                     startup_failure,
                     initial_alias,
@@ -1845,6 +2170,7 @@ impl HostHandle {
             workspace_roots = ?request.workspace_roots,
             startup_mcp_servers = request.startup_mcp_servers.len(),
             resume_session_id = ?request.resume_session_id,
+            fork_from_session_id = ?request.fork_from_session_id,
             "host spawn_agent resolved request"
         );
 
@@ -1900,6 +2226,68 @@ impl HostHandle {
             self.schedule_generated_agent_name(agent_id.clone(), request);
         }
 
+        agent_id
+    }
+
+    async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AgentId {
+        tracing::info!(
+            backend_kind = ?request.backend_kind,
+            workspace_roots = ?request.workspace_roots,
+            startup_mcp_servers = request.startup_mcp_servers.len(),
+            resume_session_id = ?request.resume_session_id,
+            fork_from_session_id = ?request.fork_from_session_id,
+            "host spawn_agent resolved request"
+        );
+
+        let session_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.session_store)
+        };
+        let (start, agent_handle, startup_rx, host_streams) = {
+            let mut state = self.state.lock().await;
+            let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
+            let review_registry = state.review_registry.clone();
+            let spawned =
+                state
+                    .registry
+                    .spawn(request, session_store, sub_agent_spawn_tx, review_registry);
+            let host_streams = state
+                .host_streams
+                .iter()
+                .map(|(path, subscriber)| (path.clone(), subscriber.stream.clone()))
+                .collect::<Vec<_>>();
+            (
+                spawned.start,
+                spawned.handle,
+                spawned.startup_rx,
+                host_streams,
+            )
+        };
+
+        let mut dead_paths = Vec::new();
+        for (path, stream) in host_streams {
+            if emit_new_agent_for_stream(&start, &agent_handle, &stream)
+                .await
+                .is_err()
+            {
+                dead_paths.push(path);
+            }
+        }
+        if !dead_paths.is_empty() {
+            let mut state = self.state.lock().await;
+            for path in dead_paths {
+                state.host_streams.remove(&path);
+            }
+        }
+
+        let agent_id = start.agent_id.clone();
+        self.schedule_agent_session_registration(agent_id.clone(), startup_rx);
+        tracing::info!(
+            agent_id = %agent_id,
+            backend_kind = ?start.backend_kind,
+            name = %start.name,
+            "host spawn_agent completed"
+        );
         agent_id
     }
 
@@ -5638,6 +6026,7 @@ async fn emit_new_agent_for_stream(
         team_member_id: start.team_member_id.clone(),
         project_id: start.project_id.clone(),
         parent_agent_id: start.parent_agent_id.clone(),
+        session_id: start.session_id.clone(),
         created_at_ms: start.created_at_ms,
         instance_stream: instance_stream.clone(),
     };

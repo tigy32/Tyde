@@ -19,7 +19,8 @@ use crate::backend::turn_emitter::{
     AgentName, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
 use crate::backend::{
-    SessionCommand, StartupMcpServer, StartupMcpTransport, render_combined_spawn_instructions,
+    BackendStartupError, SessionCommand, StartupMcpServer, StartupMcpTransport,
+    backend_fork_unsupported_message, render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::remote::{
@@ -2034,6 +2035,17 @@ impl Backend for GeminiBackend {
                 session_id: backend_session_id,
             },
             EventStream::new(events_rx),
+        ))
+    }
+
+    async fn fork(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        _from_session_id: SessionId,
+        _initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        Err(BackendStartupError::unsupported(
+            backend_fork_unsupported_message(BackendKind::Gemini),
         ))
     }
 

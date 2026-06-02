@@ -14,12 +14,12 @@ use protocol::{
     ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
     QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
-    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
-    StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId,
-    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
+    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionId,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
+    SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberId, TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload,
+    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
 };
 
 use crate::state::{
@@ -582,6 +582,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     workspace_roots: payload.workspace_roots,
                     project_id: payload.project_id,
                     parent_agent_id: payload.parent_agent_id,
+                    session_id: payload.session_id,
                     custom_agent_id: payload.custom_agent_id,
                     created_at_ms: payload.created_at_ms,
                     instance_stream: payload.instance_stream,
@@ -590,10 +591,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 };
                 let project_id = info.project_id.clone();
                 let agent_name_for_upgrade = info.name.clone();
-                // Only User-origin agents auto-open a chat tab and steal focus.
+                // User-origin and SideQuestion (BTW) agents auto-open a chat
+                // tab and steal focus — a side question is something the user
+                // just asked for, so it should surface like a user agent.
                 // AgentControl and BackendNative agents appear in the sidebar
                 // but must not disrupt the user's current view.
-                let is_programmatic = !matches!(origin, AgentOrigin::User);
+                let is_programmatic =
+                    !matches!(origin, AgentOrigin::User | AgentOrigin::SideQuestion);
                 state.agents.update(|agents| {
                     agents
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
@@ -780,7 +784,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.name,
                     payload.backend_kind
                 );
-                apply_agent_started(state, host_id, &payload.agent_id);
+                apply_agent_started(state, host_id, &payload.agent_id, payload.session_id);
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -2180,13 +2184,21 @@ fn resolve_agent_id(state: &AppState, host_id: &str, stream: &StreamPath) -> Opt
     })
 }
 
-fn apply_agent_started(state: &AppState, host_id: &str, agent_id: &AgentId) {
+fn apply_agent_started(
+    state: &AppState,
+    host_id: &str,
+    agent_id: &AgentId,
+    session_id: Option<SessionId>,
+) {
     state.agents.update(|agents| {
         if let Some(agent) = agents
             .iter_mut()
             .find(|agent| agent.host_id == host_id && agent.agent_id == *agent_id)
         {
             agent.started = true;
+            if session_id.is_some() {
+                agent.session_id = session_id;
+            }
         }
     });
 }
@@ -3016,12 +3028,16 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             {
                 // `agent_info_from_payload` zeroes runtime-only fields
                 // (`started`, `fatal_error`) because `NewAgentPayload`
-                // doesn't carry them. Preserve whatever the live event
+                // doesn't carry them. It may also omit `session_id`
+                // before backend startup completes. Preserve whatever the live event
                 // stream had set on the existing entry so a bootstrap
                 // re-application doesn't reset an already-started agent
                 // to `started: false`.
                 info.started = existing.started;
                 info.fatal_error = existing.fatal_error.clone();
+                if info.session_id.is_none() {
+                    info.session_id = existing.session_id.clone();
+                }
                 *existing = info;
             } else {
                 agents.push(info);
@@ -3040,6 +3056,7 @@ fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo
         workspace_roots: payload.workspace_roots,
         project_id: payload.project_id,
         parent_agent_id: payload.parent_agent_id,
+        session_id: payload.session_id,
         custom_agent_id: payload.custom_agent_id,
         created_at_ms: payload.created_at_ms,
         instance_stream: payload.instance_stream,
@@ -3098,8 +3115,8 @@ fn apply_agent_bootstrap(
 
     for event in payload.events {
         match event {
-            AgentBootstrapEvent::AgentStart(_) => {
-                apply_agent_started(state, host_id, &agent_id);
+            AgentBootstrapEvent::AgentStart(inner) => {
+                apply_agent_started(state, host_id, &agent_id, inner.session_id);
             }
             AgentBootstrapEvent::AgentError(inner) => {
                 if inner.fatal {
