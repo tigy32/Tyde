@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode,
-    CommandErrorPayload, DiffContextMode, Envelope, FrameKind, MessageOrigin, MessageSender,
-    NewAgentPayload, Project, ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload,
-    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
-    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
-    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewCommentId,
-    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
-    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
-    ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, SessionId,
-    SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, DiffContextMode,
+    Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
+    ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review,
+    ReviewActionPayload, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor,
+    ReviewBootstrapPayload, ReviewCommentId, ReviewCommentSource, ReviewCreatePayload,
+    ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewEventPayload, ReviewId,
+    ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubmitTarget, ReviewSubscribePayload,
+    ReviewSuggestedComment, ReviewSuggestionState, SessionId, SessionListPayload, SpawnAgentParams,
+    SpawnAgentPayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -53,31 +53,6 @@ async fn expect_new_agent(client: &mut client::Connection, context: &str) -> New
         let env = next_env(client, context).await;
         if env.kind == FrameKind::NewAgent {
             return env.parse_payload().expect("new agent payload");
-        }
-    }
-}
-
-async fn expect_agent_start(
-    client: &mut client::Connection,
-    stream: &protocol::StreamPath,
-) -> AgentStartPayload {
-    loop {
-        let env = next_env(client, "agent start").await;
-        if env.stream != *stream {
-            continue;
-        }
-        match env.kind {
-            FrameKind::AgentStart => return env.parse_payload().expect("agent start payload"),
-            FrameKind::AgentBootstrap => {
-                let bootstrap: protocol::AgentBootstrapPayload =
-                    env.parse_payload().expect("agent bootstrap payload");
-                for event in bootstrap.events {
-                    if let AgentBootstrapEvent::AgentStart(start) = event {
-                        return start;
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -413,13 +388,12 @@ fn sample_stored_review(
 async fn create_review(
     client: &mut client::Connection,
     project: &Project,
-    origin: &NewAgentPayload,
+    _origin: &NewAgentPayload,
 ) -> Review {
     client
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                origin_agent_id: origin.agent_id.clone(),
                 selection: ReviewDiffSelection::AllUncommitted,
             },
         )
@@ -432,6 +406,14 @@ async fn create_review(
                 env.parse_payload().expect("review bootstrap payload");
             return bootstrap.review;
         }
+    }
+}
+
+fn submit_to(agent: &NewAgentPayload) -> ReviewActionPayload {
+    ReviewActionPayload::Submit {
+        target: ReviewSubmitTarget::ExistingAgent {
+            agent_id: agent.agent_id.clone(),
+        },
     }
 }
 
@@ -577,27 +559,18 @@ async fn create_review_add_update_delete_and_submit_live() {
 
     let _comment_id = add_comment(&mut client, &review, "Final review comment.").await;
     client
-        .review_action(&review.id, ReviewActionPayload::Submit)
+        .review_action(&review.id, submit_to(&agent))
         .await
         .expect("submit review");
-    let mut saw_submitted = false;
-    loop {
-        match expect_review_delta(&mut client, "submit status delta").await {
-            ReviewEventPayload::StatusChanged {
-                status: ReviewStatus::Submitted { .. },
-            } => saw_submitted = true,
-            ReviewEventPayload::StatusChanged {
-                status:
-                    ReviewStatus::Consumed {
-                        target_agent_id, ..
-                    },
-            } => {
-                assert!(saw_submitted);
-                assert_eq!(target_agent_id, agent.agent_id);
-                break;
-            }
-            other => panic!("unexpected review event while waiting for consumed: {other:?}"),
+    match expect_review_delta(&mut client, "submit cleared delta").await {
+        ReviewEventPayload::Cleared { review: cleared } => {
+            assert_eq!(cleared.id, review.id);
+            assert!(matches!(cleared.status, ReviewStatus::Draft));
+            assert!(cleared.comments.is_empty());
+            assert!(cleared.suggestions.is_empty());
+            assert_eq!(cleared.ai_reviewer.status, ReviewAiReviewerStatus::Idle);
         }
+        other => panic!("expected cleared review after submit, got {other:?}"),
     }
 }
 
@@ -678,6 +651,39 @@ async fn create_review_with_only_non_git_roots_succeeds_empty() {
 }
 
 #[tokio::test]
+async fn create_review_does_not_require_origin_agent() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                selection: ReviewDiffSelection::AllUncommitted,
+            },
+        )
+        .await
+        .expect("review create without origin");
+
+    let review = loop {
+        let env = next_env(&mut client, "origin-free review bootstrap").await;
+        if env.kind == FrameKind::ReviewBootstrap {
+            let bootstrap: ReviewBootstrapPayload =
+                env.parse_payload().expect("review bootstrap payload");
+            break bootstrap.review;
+        }
+    };
+    assert_eq!(review.project_id, project.id);
+    assert!(matches!(review.status, ReviewStatus::Draft));
+    assert_eq!(review.diffs.len(), 1);
+}
+
+#[tokio::test]
 async fn submitted_review_sends_rendered_markdown_to_origin() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
@@ -725,28 +731,21 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
     }
 
     client
-        .review_action(&review.id, ReviewActionPayload::Submit)
+        .review_action(&review.id, submit_to(&agent))
         .await
         .expect("submit review");
 
-    let mut saw_consumed_with_origin = false;
+    let mut saw_cleared = false;
     let mut delivered_message = None;
-    while !saw_consumed_with_origin || delivered_message.is_none() {
+    while !saw_cleared || delivered_message.is_none() {
         let env = next_env(&mut client, "rendered review delivery").await;
         match env.kind {
             FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
-                ReviewEventPayload::StatusChanged {
-                    status:
-                        ReviewStatus::Consumed {
-                            target_agent_id, ..
-                        },
-                } => {
-                    assert_eq!(target_agent_id, agent.agent_id);
-                    saw_consumed_with_origin = true;
+                ReviewEventPayload::Cleared { review: cleared } => {
+                    assert_eq!(cleared.id, review.id);
+                    assert!(cleared.comments.is_empty());
+                    saw_cleared = true;
                 }
-                ReviewEventPayload::StatusChanged {
-                    status: ReviewStatus::Submitted { .. },
-                } => {}
                 other => panic!("unexpected review event while waiting for delivery: {other:?}"),
             },
             FrameKind::ChatEvent if env.stream == agent.instance_stream => {
@@ -786,7 +785,7 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
 }
 
 #[tokio::test]
-async fn submitted_review_consumes_when_origin_session_resumes() {
+async fn submit_to_closed_existing_agent_keeps_draft_comments() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
@@ -795,50 +794,29 @@ async fn submitted_review_consumes_when_origin_session_resumes() {
     seed_repo(&repo);
 
     let project = create_project(&mut client, &repo).await;
-    let (agent, session_id) = spawn_project_agent(&mut client, &project).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
     let review = create_review(&mut client, &project, &agent).await;
-    let _comment_id = add_comment(&mut client, &review, "Offline delivery comment.").await;
+    let comment_id = add_comment(&mut client, &review, "Offline delivery comment.").await;
 
     close_agent_and_wait(&mut client, &agent.instance_stream).await;
 
     client
-        .review_action(&review.id, ReviewActionPayload::Submit)
+        .review_action(&review.id, submit_to(&agent))
         .await
-        .expect("submit offline review");
-    match expect_review_delta(&mut client, "submitted offline delta").await {
-        ReviewEventPayload::StatusChanged {
-            status: ReviewStatus::Submitted { .. },
-        } => {}
-        other => panic!("expected submitted status, got {other:?}"),
-    }
-    assert_no_trailing_review_snapshot(&mut client, "offline Submit delta").await;
+        .expect("submit to closed agent");
+    let error = expect_review_error(
+        &mut client,
+        "closed target error",
+        ReviewErrorCode::InvalidSubmitTarget,
+    )
+    .await;
+    assert!(!error.fatal);
+    assert_no_trailing_review_snapshot(&mut client, "closed target Submit error").await;
 
-    client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("Review Origin Resumed".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: Some(project.id.clone()),
-            params: SpawnAgentParams::Resume {
-                session_id: session_id.clone(),
-                prompt: None,
-            },
-        })
-        .await
-        .expect("resume origin session");
-    let resumed = expect_new_agent(&mut client, "resumed agent").await;
-    let _ = expect_agent_start(&mut client, &resumed.instance_stream).await;
-
-    match expect_review_delta(&mut client, "consumed after resume delta").await {
-        ReviewEventPayload::StatusChanged {
-            status: ReviewStatus::Consumed {
-                target_agent_id, ..
-            },
-        } => {
-            assert_eq!(target_agent_id, resumed.agent_id);
-        }
-        other => panic!("unexpected review event after resume: {other:?}"),
-    }
+    let snapshot = subscribe_review(&mut client, &review.id).await;
+    assert!(matches!(snapshot.status, ReviewStatus::Draft));
+    assert_eq!(snapshot.comments.len(), 1);
+    assert_eq!(snapshot.comments[0].id, comment_id);
 }
 
 #[tokio::test]
@@ -877,6 +855,31 @@ async fn invalid_locations_emit_typed_error_without_mutation() {
 
     let snapshot = subscribe_review(&mut client, &review.id).await;
     assert!(snapshot.comments.is_empty());
+}
+
+#[tokio::test]
+async fn review_resets_when_uncommitted_diff_becomes_clean() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+    let _comment_id = add_comment(&mut client, &review, "Clean reset comment.").await;
+
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Apply changes"]);
+
+    let snapshot = subscribe_review(&mut client, &review.id).await;
+    assert!(matches!(snapshot.status, ReviewStatus::Draft));
+    assert!(snapshot.comments.is_empty());
+    assert!(snapshot.suggestions.is_empty());
+    assert_eq!(snapshot.ai_reviewer.status, ReviewAiReviewerStatus::Idle);
+    assert!(snapshot.diffs.is_empty());
 }
 
 #[tokio::test]
@@ -1048,7 +1051,7 @@ async fn submit_without_comments_emits_invalid_status() {
     let review = create_review(&mut client, &project, &agent).await;
 
     client
-        .review_action(&review.id, ReviewActionPayload::Submit)
+        .review_action(&review.id, submit_to(&agent))
         .await
         .expect("submit empty review");
     let error = expect_review_error(
@@ -1062,62 +1065,51 @@ async fn submit_without_comments_emits_invalid_status() {
 }
 
 #[tokio::test]
-async fn submit_with_multiple_live_agents_reverts_to_draft() {
+async fn submit_rejects_existing_agent_from_another_project() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
-    let repo = root.path().join("review-root");
-    fs::create_dir_all(&repo).expect("create repo");
-    seed_repo(&repo);
+    let repo_a = root.path().join("review-root-a");
+    let repo_b = root.path().join("review-root-b");
+    fs::create_dir_all(&repo_a).expect("create repo a");
+    fs::create_dir_all(&repo_b).expect("create repo b");
+    seed_repo(&repo_a);
+    seed_repo(&repo_b);
 
-    let project = create_project(&mut client, &repo).await;
-    let (agent, session_id) = spawn_project_agent(&mut client, &project).await;
-    let review = create_review(&mut client, &project, &agent).await;
-    let _comment_id = add_comment(&mut client, &review, "Ambiguous delivery comment.").await;
+    let project_a = create_project(&mut client, &repo_a).await;
+    let project_b = create_project(&mut client, &repo_b).await;
+    let (agent_a, _session_id_a) = spawn_project_agent(&mut client, &project_a).await;
+    let (agent_b, _session_id_b) = spawn_project_agent(&mut client, &project_b).await;
+    let review = create_review(&mut client, &project_a, &agent_a).await;
+    let _comment_id = add_comment(&mut client, &review, "Wrong project target comment.").await;
 
     client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("Second Live Agent".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: Some(project.id.clone()),
-            params: SpawnAgentParams::Resume {
-                session_id,
-                prompt: None,
+        .review_action(
+            &review.id,
+            ReviewActionPayload::Submit {
+                target: ReviewSubmitTarget::ExistingAgent {
+                    agent_id: agent_b.agent_id,
+                },
             },
-        })
+        )
         .await
-        .expect("spawn second live agent");
-    let second = expect_new_agent(&mut client, "second live agent").await;
-    let _ = expect_agent_start(&mut client, &second.instance_stream).await;
-
-    client
-        .review_action(&review.id, ReviewActionPayload::Submit)
-        .await
-        .expect("submit ambiguous review");
-    match expect_review_delta(&mut client, "submitted before ambiguous delta").await {
-        ReviewEventPayload::StatusChanged {
-            status: ReviewStatus::Submitted { .. },
-        } => {}
-        other => panic!("expected submitted before ambiguous error, got {other:?}"),
-    }
+        .expect("submit to other project agent");
     let error = expect_review_error(
         &mut client,
-        "ambiguous origin session error",
-        ReviewErrorCode::AmbiguousOriginSession,
+        "wrong project target error",
+        ReviewErrorCode::InvalidSubmitTarget,
     )
     .await;
     assert!(!error.fatal);
-    match expect_review_delta(&mut client, "draft after ambiguous delta").await {
-        ReviewEventPayload::StatusChanged {
-            status: ReviewStatus::Draft,
-        } => {}
-        other => panic!("expected draft after ambiguous error, got {other:?}"),
-    }
+    assert_no_trailing_review_snapshot(&mut client, "wrong project Submit error").await;
+
+    let snapshot = subscribe_review(&mut client, &review.id).await;
+    assert!(matches!(snapshot.status, ReviewStatus::Draft));
+    assert_eq!(snapshot.comments.len(), 1);
 }
 
 #[tokio::test]
-async fn cancel_rules_for_draft_and_submitted_reviews() {
+async fn cancel_rules_for_draft_and_failed_submit_reviews() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
@@ -1139,42 +1131,37 @@ async fn cancel_rules_for_draft_and_submitted_reviews() {
         other => panic!("expected cancelled status, got {other:?}"),
     }
 
-    let submitted_review = create_review(&mut client, &project, &agent).await;
-    let _comment_id =
-        add_comment(&mut client, &submitted_review, "Submitted cancel comment.").await;
+    let retry_review = create_review(&mut client, &project, &agent).await;
+    let _comment_id = add_comment(&mut client, &retry_review, "Failed submit comment.").await;
     close_agent_and_wait(&mut client, &agent.instance_stream).await;
     client
-        .review_action(&submitted_review.id, ReviewActionPayload::Submit)
+        .review_action(&retry_review.id, submit_to(&agent))
         .await
         .expect("submit offline before cancel");
-    match expect_review_delta(&mut client, "submitted status before cancel delta").await {
-        ReviewEventPayload::StatusChanged {
-            status: ReviewStatus::Submitted { .. },
-        } => {}
-        other => panic!("expected submitted status, got {other:?}"),
-    }
-    client
-        .review_action(&submitted_review.id, ReviewActionPayload::Cancel)
-        .await
-        .expect("cancel submitted");
     let error = expect_review_error(
         &mut client,
-        "submitted cancel error",
-        ReviewErrorCode::InvalidStatus,
+        "offline submit before cancel error",
+        ReviewErrorCode::InvalidSubmitTarget,
     )
     .await;
     assert!(!error.fatal);
+    client
+        .review_action(&retry_review.id, ReviewActionPayload::Cancel)
+        .await
+        .expect("cancel draft after failed submit");
+    match expect_review_delta(&mut client, "cancel after failed submit delta").await {
+        ReviewEventPayload::StatusChanged {
+            status: ReviewStatus::Cancelled { .. },
+        } => {}
+        other => panic!("expected cancelled status after failed submit, got {other:?}"),
+    }
 }
 
-/// At-most-one Draft per project. The frontend routes the
-/// "Review changes" click to the existing Draft, but a misbehaving
-/// caller (MCP, an older client) could still ask the server for a
-/// second one — the server has to fail closed with a
-/// `Conflict` `CommandError` so the user doesn't accumulate a stack
-/// of empty drafts. Submitting or cancelling the existing Draft has
-/// to make a new create succeed again.
+/// ReviewCreate is get-or-create for the project singleton. A caller that
+/// asks again while a draft exists should be subscribed to the same review
+/// instead of accumulating duplicate drafts.
 #[tokio::test]
-async fn second_review_create_is_rejected_while_a_draft_exists() {
+async fn second_review_create_attaches_to_existing_singleton() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
@@ -1191,32 +1178,21 @@ async fn second_review_create_is_rejected_while_a_draft_exists() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                origin_agent_id: agent.agent_id.clone(),
                 selection: ReviewDiffSelection::AllUncommitted,
             },
         )
         .await
         .expect("send second review create");
-    let envelope = loop {
-        let env = next_env(&mut client, "second review_create rejection").await;
-        if env.kind == FrameKind::CommandError {
-            break env;
+    let second = loop {
+        let env = next_env(&mut client, "second review_create bootstrap").await;
+        if env.kind == FrameKind::ReviewBootstrap {
+            let bootstrap: ReviewBootstrapPayload =
+                env.parse_payload().expect("review bootstrap payload");
+            break bootstrap.review;
         }
     };
-    let error: CommandErrorPayload = envelope.parse_payload().expect("command error payload");
-    assert_eq!(error.operation, "review_create");
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(!error.fatal);
-    assert!(
-        error.message.contains("already has a draft review"),
-        "unexpected review_create error: {}",
-        error.message
-    );
-    assert!(
-        error.message.contains(&first.id.0),
-        "expected error to name the existing draft id, got: {}",
-        error.message
-    );
+    assert_eq!(second.id, first.id);
+    assert!(matches!(second.status, ReviewStatus::Draft));
 
     client
         .review_action(&first.id, ReviewActionPayload::Cancel)
@@ -1229,16 +1205,16 @@ async fn second_review_create_is_rejected_while_a_draft_exists() {
         other => panic!("expected cancelled status, got {other:?}"),
     }
 
-    let second = create_review(&mut client, &project, &agent).await;
+    let third = create_review(&mut client, &project, &agent).await;
     assert_ne!(
-        second.id, first.id,
-        "second create after cancel should yield a fresh review id"
+        third.id, first.id,
+        "create after cancel should yield a fresh singleton id"
     );
-    assert!(matches!(second.status, ReviewStatus::Draft));
+    assert!(matches!(third.status, ReviewStatus::Draft));
 }
 
 #[tokio::test]
-async fn queued_review_bundle_is_consumed_only_after_backend_send() {
+async fn queued_review_bundle_clears_after_successful_enqueue() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
@@ -1258,44 +1234,38 @@ async fn queued_review_bundle_is_consumed_only_after_backend_send() {
     let _comment_id = add_comment(&mut client, &review, "Queued delivery comment.").await;
 
     client
-        .review_action(&review.id, ReviewActionPayload::Submit)
+        .review_action(&review.id, submit_to(&agent))
         .await
         .expect("submit queued review");
-    match expect_review_delta(&mut client, "queued submitted delta").await {
-        ReviewEventPayload::StatusChanged {
-            status: ReviewStatus::Submitted { .. },
-        } => {}
-        other => panic!("expected submitted status, got {other:?}"),
-    }
 
-    let queued_id = loop {
+    let mut saw_cleared = false;
+    let mut saw_queued_origin = false;
+    while !saw_cleared || !saw_queued_origin {
         let env = next_env(&mut client, "queued review bundle").await;
-        if env.kind == FrameKind::QueuedMessages && env.stream == agent.instance_stream {
-            let payload: QueuedMessagesPayload =
-                env.parse_payload().expect("queued messages payload");
-            let entry = payload
-                .messages
-                .into_iter()
-                .find(|entry| {
+        match env.kind {
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
+                ReviewEventPayload::Cleared { review: cleared } => {
+                    assert_eq!(cleared.id, review.id);
+                    assert!(cleared.comments.is_empty());
+                    saw_cleared = true;
+                }
+                other => {
+                    panic!("unexpected review event while waiting for queued clear: {other:?}")
+                }
+            },
+            FrameKind::QueuedMessages if env.stream == agent.instance_stream => {
+                let payload: QueuedMessagesPayload =
+                    env.parse_payload().expect("queued messages payload");
+                saw_queued_origin = payload.messages.iter().any(|entry| {
                     entry.origin
                         == Some(MessageOrigin::Review {
                             review_id: review.id.clone(),
                         })
-                })
-                .expect("review bundle should be queued with origin");
-            break entry.id;
+                });
+            }
+            _ => {}
         }
-    };
-
-    client
-        .cancel_queued_message(
-            &agent.instance_stream,
-            protocol::CancelQueuedMessagePayload { id: queued_id },
-        )
-        .await
-        .expect("cancel queued review bundle");
-    let snapshot = subscribe_review(&mut client, &review.id).await;
-    assert!(matches!(snapshot.status, ReviewStatus::Submitted { .. }));
+    }
 }
 
 #[tokio::test]

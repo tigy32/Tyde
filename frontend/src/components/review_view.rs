@@ -25,15 +25,22 @@ use crate::components::diff_view::{
     GutterPointerDownFn, LineExtraClassFn,
 };
 use crate::send::send_frame;
+
+// The inline-review presentational components live in a sibling module so
+// they can be reused on any diff surface. `ThreadRegionFiltered` is the
+// one this module mounts directly (via the decoration builders); the cards
+// and composer it nests are referenced inside `inline_review` itself.
+pub(crate) use crate::components::inline_review::ThreadRegionFiltered;
 use crate::state::{
-    ActiveAgentRef, AppState, ReviewActionGate, ReviewActionTarget, TabContent, root_display_name,
+    ActiveAgentRef, AgentInfo, AppState, ReviewActionGate, ReviewActionTarget, TabContent,
+    root_display_name,
 };
 
 use protocol::{
     BackendKind, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload,
     ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus, ReviewAnchor,
-    ReviewComment, ReviewCommentSource, ReviewDiffSide, ReviewLocation, ReviewStatus,
-    ReviewSuggestedComment, ReviewSuggestionState, StreamPath,
+    ReviewCommentSource, ReviewDiffSide, ReviewLocation, ReviewStatus, ReviewSuggestionState,
+    StreamPath,
 };
 
 type ReviewAiIntervalSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalStorage>;
@@ -57,9 +64,9 @@ struct SelectedFile {
 /// save are gated on the location matching the currently rendered
 /// thread region.
 #[derive(Clone, Debug)]
-struct ComposerState {
-    location: ReviewLocation,
-    body: RwSignal<String>,
+pub(crate) struct ComposerState {
+    pub(crate) location: ReviewLocation,
+    pub(crate) body: RwSignal<String>,
 }
 
 /// Unified/SBS toggle surfaced in the review header.
@@ -300,21 +307,27 @@ fn ReviewBody(
     let header_origin = {
         let initial = initial_origin.clone();
         let agent_state = state.clone();
-        move || -> String {
+        move || -> Option<String> {
             let agent_id = live
                 .get()
                 .map(|r| r.origin_agent_id)
                 .unwrap_or_else(|| initial.clone());
+            // Project-scoped reviews carry a synthetic, non-deliverable
+            // origin (`project-review:<id>`) that is not a real agent —
+            // never surface it as an "Origin" to the user.
+            if agent_id.0.starts_with("project-review:") {
+                return None;
+            }
             let name = agent_state.agents.with(|agents| {
                 agents
                     .iter()
                     .find(|a| a.agent_id == agent_id)
                     .map(|a| a.name.clone())
             });
-            match name {
+            Some(match name {
                 Some(name) if !name.is_empty() => format!("Origin: {name}"),
                 _ => format!("Origin: {}", short_agent_id(&agent_id.0)),
-            }
+            })
         }
     };
 
@@ -348,7 +361,9 @@ fn ReviewBody(
                 >
                     {move || status_text_for_badge()}
                 </span>
-                <span class="review-origin">{move || header_origin()}</span>
+                {move || header_origin().map(|text| view! {
+                    <span class="review-origin">{text}</span>
+                })}
                 <ReviewLayoutToggle/>
             </div>
             {
@@ -444,7 +459,7 @@ pub fn review_tab_label(review_id: &protocol::ReviewId) -> String {
 /// Local copy of the `format_relative_time` pattern used by chat_message
 /// and agents_panel — kept inline here so the review surface doesn't
 /// depend on a sibling component's private helper.
-fn format_relative_time(timestamp_ms: u64) -> String {
+pub(crate) fn format_relative_time(timestamp_ms: u64) -> String {
     if timestamp_ms == 0 {
         return String::new();
     }
@@ -466,7 +481,7 @@ fn format_relative_time(timestamp_ms: u64) -> String {
 /// height is capped to keep extremely long bodies from eating the
 /// composer area entirely; users can still scroll inside the textarea
 /// past the cap.
-fn autosize_textarea(node_ref: NodeRef<leptos::html::Textarea>, body: RwSignal<String>) {
+pub(crate) fn autosize_textarea(node_ref: NodeRef<leptos::html::Textarea>, body: RwSignal<String>) {
     Effect::new(move |_| {
         let _ = body.get();
         if let Some(el) = node_ref.get() {
@@ -1199,7 +1214,7 @@ fn make_file_header_decoration(
 /// callback so off-screen lines pay no DOM cost when they have nothing
 /// to show, but the closure still re-runs when comments/suggestions/the
 /// composer change.
-fn thread_region_has_content(
+pub(crate) fn thread_region_has_content(
     state: &AppState,
     review_id: &protocol::ReviewId,
     root: &ProjectRootPath,
@@ -1235,1010 +1250,6 @@ fn thread_region_has_content(
                 && matcher(&c.location.anchor)
         })
     })
-}
-
-/// Generic thread region. Renders all comments + pending suggestions (and
-/// the inline composer when its location matches) whose `(root,
-/// relative_path)` matches and whose anchor satisfies the matcher.
-#[component]
-fn ThreadRegionFiltered(
-    review_id: protocol::ReviewId,
-    root: ProjectRootPath,
-    relative_path: String,
-    host_id: String,
-    composer: RwSignal<Option<ComposerState>>,
-    matcher: std::sync::Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync>,
-    is_draft: Memo<bool>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    let comments_review_id = review_id.clone();
-    let cm_root = root.clone();
-    let cm_path = relative_path.clone();
-    let cm_matcher = matcher.clone();
-    let comments: Memo<Vec<ReviewComment>> = Memo::new(move |_| {
-        state.reviews.with(|map| {
-            let Some(review) = map.get(&comments_review_id) else {
-                return Vec::new();
-            };
-            review
-                .comments
-                .iter()
-                .filter(|c| {
-                    c.location.root == cm_root
-                        && c.location.relative_path == cm_path
-                        && cm_matcher(&c.location.anchor)
-                })
-                .cloned()
-                .collect()
-        })
-    });
-
-    let suggestions_review_id = review_id.clone();
-    let sg_root = root.clone();
-    let sg_path = relative_path.clone();
-    let sg_matcher = matcher.clone();
-    let suggestions: Memo<Vec<ReviewSuggestedComment>> = Memo::new(move |_| {
-        state.reviews.with(|map| {
-            let Some(review) = map.get(&suggestions_review_id) else {
-                return Vec::new();
-            };
-            review
-                .suggestions
-                .iter()
-                .filter(|s| {
-                    s.location.root == sg_root
-                        && s.location.relative_path == sg_path
-                        && sg_matcher(&s.location.anchor)
-                })
-                .cloned()
-                .collect()
-        })
-    });
-
-    // Composer matcher: open ⇒ render here if the composer's location
-    // (root + relative_path + anchor) matches this thread region.
-    let composer_matcher = matcher.clone();
-    let composer_root = root.clone();
-    let composer_path = relative_path.clone();
-    let composer_visible = move || -> bool {
-        let Some(c) = composer.get() else {
-            return false;
-        };
-        c.location.root == composer_root
-            && c.location.relative_path == composer_path
-            && composer_matcher(&c.location.anchor)
-    };
-
-    let composer_host = host_id.clone();
-    let composer_review = review_id.clone();
-
-    let comment_card_review_id = review_id.clone();
-    let comment_card_host = host_id.clone();
-    let suggestion_card_review_id = review_id.clone();
-    let suggestion_card_host = host_id.clone();
-
-    // Rejected-suggestions toggle for this region.
-    let rejected_open: RwSignal<bool> = RwSignal::new(false);
-    let sg_rejected_review_id = review_id.clone();
-    let sg_rejected_root = root.clone();
-    let sg_rejected_path = relative_path.clone();
-    let sg_rejected_matcher = matcher.clone();
-    let rejected_suggestions: Memo<Vec<ReviewSuggestedComment>> = Memo::new(move |_| {
-        state.reviews.with(|map| {
-            let Some(review) = map.get(&sg_rejected_review_id) else {
-                return Vec::new();
-            };
-            review
-                .suggestions
-                .iter()
-                .filter(|s| {
-                    matches!(s.state, ReviewSuggestionState::Rejected)
-                        && s.location.root == sg_rejected_root
-                        && s.location.relative_path == sg_rejected_path
-                        && sg_rejected_matcher(&s.location.anchor)
-                })
-                .cloned()
-                .collect()
-        })
-    });
-
-    view! {
-        <div class="review-thread-region" data-rel-path={relative_path.clone()}>
-            {move || {
-                let card_review = comment_card_review_id.clone();
-                let card_host = comment_card_host.clone();
-                comments.get().into_iter().map(|c| {
-                    view! {
-                        <CommentCard
-                            comment=c
-                            host_id=card_host.clone()
-                            review_id=card_review.clone()
-                            is_draft=is_draft
-                        />
-                    }
-                }).collect::<Vec<_>>()
-            }}
-            {move || {
-                let sg_review = suggestion_card_review_id.clone();
-                let sg_host = suggestion_card_host.clone();
-                suggestions.get().into_iter()
-                    .filter(|s| matches!(s.state, ReviewSuggestionState::Pending))
-                    .map(|s| {
-                        view! {
-                            <SuggestionCard
-                                suggestion=s
-                                host_id=sg_host.clone()
-                                review_id=sg_review.clone()
-                                is_draft=is_draft
-                            />
-                        }
-                    }).collect::<Vec<_>>()
-            }}
-            {move || {
-                let rejected = rejected_suggestions.get();
-                if rejected.is_empty() {
-                    return None;
-                }
-                let count = rejected.len();
-                let open = rejected_open.get();
-                let toggle_label = if open {
-                    format!("Hide {count} rejected")
-                } else {
-                    format!("{count} rejected")
-                };
-                let rejected_clone = rejected.clone();
-                Some(view! {
-                    <div class="review-rejected-region">
-                        <button
-                            class="review-rejected-toggle"
-                            on:click=move |_| rejected_open.update(|v| *v = !*v)
-                        >
-                            {toggle_label}
-                        </button>
-                        {open.then(|| view! {
-                            <div class="review-rejected-list">
-                                {rejected_clone.into_iter().map(|s| view! {
-                                    <RejectedSuggestionCard suggestion=s />
-                                }).collect::<Vec<_>>()}
-                            </div>
-                        })}
-                    </div>
-                })
-            }}
-            {move || {
-                if !composer_visible() {
-                    return None;
-                }
-                let composer_state = composer.get()?;
-                let composer_host = composer_host.clone();
-                let composer_review = composer_review.clone();
-                Some(view! {
-                    <Composer
-                        composer=composer
-                        composer_state=composer_state
-                        host_id=composer_host
-                        review_id=composer_review
-                        is_draft=is_draft
-                    />
-                })
-            }}
-        </div>
-    }
-}
-
-#[component]
-fn CommentCard(
-    comment: ReviewComment,
-    host_id: String,
-    review_id: protocol::ReviewId,
-    is_draft: Memo<bool>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    let pill = match &comment.source {
-        ReviewCommentSource::User => view! {
-            <span class="review-source-pill user">"You"</span>
-        }
-        .into_any(),
-        ReviewCommentSource::AiSuggestion { edited, .. } => {
-            let label = if *edited { "AI (edited)" } else { "AI" };
-            view! { <span class="review-source-pill ai">{label}</span> }.into_any()
-        }
-    };
-    let body_for_view = comment.body.clone();
-    let comment_id = comment.id.clone();
-    let comment_created_at = comment.created_at_ms;
-    let comment_updated_at = comment.updated_at_ms;
-
-    let is_user = matches!(comment.source, ReviewCommentSource::User);
-
-    let edit_open = RwSignal::new(false);
-    let edit_value = RwSignal::new(comment.body.clone());
-
-    // Reactive pending flags for the per-row gates.
-    let update_pending = {
-        let rid = review_id.clone();
-        let cid = comment_id.clone();
-        let s = state.clone();
-        move || {
-            s.review_action_target_pending.with(|set| {
-                set.contains(&(rid.clone(), ReviewActionTarget::UpdateComment(cid.clone())))
-            })
-        }
-    };
-    let delete_pending = {
-        let rid = review_id.clone();
-        let cid = comment_id.clone();
-        let s = state.clone();
-        move || {
-            s.review_action_target_pending.with(|set| {
-                set.contains(&(rid.clone(), ReviewActionTarget::DeleteComment(cid.clone())))
-            })
-        }
-    };
-
-    // Effect: close the edit form when an UpdateComment echo lands —
-    // i.e. when the comment's body matches the edited value AND the
-    // gate has dropped (was set, now not). Simplest reliable detection:
-    // when the gate transitions from set → unset, snap the form shut
-    // unless body still doesn't match (Error path keeps form open).
-    {
-        let rid = review_id.clone();
-        let cid = comment_id.clone();
-        let s = state.clone();
-        let was_pending = RwSignal::new(false);
-        Effect::new(move |_| {
-            let pending_now = s.review_action_target_pending.with(|set| {
-                set.contains(&(rid.clone(), ReviewActionTarget::UpdateComment(cid.clone())))
-            });
-            let prev = was_pending.get_untracked();
-            was_pending.set(pending_now);
-            if prev && !pending_now {
-                // Gate cleared. Determine whether the server accepted
-                // the edit by comparing the typed value to the live
-                // comment body. On accept they match; on error the
-                // live body is unchanged and the typed value still
-                // differs.
-                let typed = edit_value.get_untracked();
-                let live_body = s.reviews.with_untracked(|map| {
-                    map.get(&rid).and_then(|r| {
-                        r.comments
-                            .iter()
-                            .find(|c| c.id == cid)
-                            .map(|c| c.body.clone())
-                    })
-                });
-                if live_body.as_deref() == Some(typed.as_str()) {
-                    edit_open.set(false);
-                }
-            }
-        });
-    }
-
-    let comment_id_for_save = comment_id.clone();
-    let host_id_for_save = host_id.clone();
-    let review_id_for_save = review_id.clone();
-    let state_for_save = state.clone();
-    let do_save_edit: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        let body = edit_value.get_untracked().trim().to_owned();
-        if body.is_empty() {
-            return;
-        }
-        let rid = review_id_for_save.clone();
-        let cid = comment_id_for_save.clone();
-        if !try_claim_review_action(
-            &state_for_save,
-            &rid,
-            &ReviewActionTarget::UpdateComment(cid.clone()),
-        ) {
-            return;
-        }
-        let host = host_id_for_save.clone();
-        let target_state = state_for_save.clone();
-        let target_rid = rid.clone();
-        let target_cid = cid.clone();
-        spawn_local(async move {
-            send_review_action_with_failure_clear(
-                target_state,
-                &host,
-                target_rid,
-                ReviewActionPayload::UpdateComment {
-                    comment_id: target_cid.clone(),
-                    body,
-                },
-                ReviewActionTarget::UpdateComment(target_cid),
-            )
-            .await;
-        });
-    });
-
-    let host_id_for_delete = host_id.clone();
-    let review_id_for_delete = review_id.clone();
-    let state_for_delete = state.clone();
-    let comment_id_for_del = comment_id.clone();
-    let comment_body_for_del = comment.body.clone();
-    let on_delete = move |_| {
-        let rid = review_id_for_delete.clone();
-        let cid = comment_id_for_del.clone();
-        let host = host_id_for_delete.clone();
-        let target_state = state_for_delete.clone();
-        let body_preview = {
-            let trimmed = comment_body_for_del.trim();
-            if trimmed.len() > 80 {
-                format!("{}\u{2026}", &trimmed[..80])
-            } else {
-                trimmed.to_owned()
-            }
-        };
-        spawn_local(async move {
-            let message = if body_preview.is_empty() {
-                "Delete this comment?".to_owned()
-            } else {
-                format!("Delete this comment?\n\n\u{201c}{body_preview}\u{201d}")
-            };
-            if !crate::bridge::confirm_dialog("Delete comment", &message).await {
-                return;
-            }
-            if !try_claim_review_action(
-                &target_state,
-                &rid,
-                &ReviewActionTarget::DeleteComment(cid.clone()),
-            ) {
-                return;
-            }
-            let target_rid = rid.clone();
-            let target_cid = cid.clone();
-            send_review_action_with_failure_clear(
-                target_state,
-                &host,
-                target_rid,
-                ReviewActionPayload::DeleteComment {
-                    comment_id: target_cid.clone(),
-                },
-                ReviewActionTarget::DeleteComment(target_cid),
-            )
-            .await;
-        });
-    };
-
-    let do_save_edit_for_btn = do_save_edit.clone();
-    let on_delete_for_btn = on_delete.clone();
-    let comment_body_for_edit_open = comment.body.clone();
-    // Wrap in Rc so independent view closures can each hold their own
-    // cloneable handle without moving ownership.
-    let edit_disabled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new({
-        let update_pending = update_pending.clone();
-        move || !is_draft.get() || update_pending()
-    });
-    let delete_disabled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new({
-        let delete_pending = delete_pending.clone();
-        move || !is_draft.get() || delete_pending()
-    });
-
-    let edit_disabled_for_edit_block = edit_disabled.clone();
-    let edit_disabled_for_actions = edit_disabled.clone();
-    let delete_disabled_for_actions = delete_disabled.clone();
-
-    view! {
-        <div class="review-comment-card" data-comment-id={comment.id.0.clone()}
-             data-source={match &comment.source {
-                 ReviewCommentSource::User => "user",
-                 ReviewCommentSource::AiSuggestion { .. } => "ai",
-             }}>
-            <div class="review-comment-header">
-                {pill}
-                {(comment_created_at > 0).then(|| {
-                    let edited = comment_updated_at > comment_created_at;
-                    let title = if edited {
-                        format!(
-                            "Created {}, edited {}",
-                            format_relative_time(comment_created_at),
-                            format_relative_time(comment_updated_at)
-                        )
-                    } else {
-                        format!("Created {}", format_relative_time(comment_created_at))
-                    };
-                    let stamp = format_relative_time(
-                        if edited { comment_updated_at } else { comment_created_at }
-                    );
-                    let label = if edited { format!("{stamp} (edited)") } else { stamp };
-                    view! {
-                        <span class="review-comment-time" title={title}>{label}</span>
-                    }
-                })}
-            </div>
-            {move || {
-                if edit_open.get() {
-                    let save_disabled = edit_disabled_for_edit_block.clone();
-                    let save_disabled_for_keydown = save_disabled.clone();
-                    let do_save = do_save_edit_for_btn.clone();
-                    let do_save_for_keydown = do_save.clone();
-                    let edit_textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
-                    Effect::new(move |_| {
-                        if let Some(el) = edit_textarea_ref.get() {
-                            let _ = el.focus();
-                            // Caret to end so the user can keep typing
-                            // without having to navigate manually.
-                            let len = el.value().len() as u32;
-                            let _ = el.set_selection_range(len, len);
-                        }
-                    });
-                    autosize_textarea(edit_textarea_ref, edit_value);
-                    view! {
-                        <div class="review-comment-edit">
-                            <textarea
-                                node_ref=edit_textarea_ref
-                                class="review-textarea"
-                                prop:value=move || edit_value.get()
-                                on:input=move |ev| edit_value.set(event_target_value(&ev))
-                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
-                                    if ev.key() == "Escape" {
-                                        ev.prevent_default();
-                                        edit_open.set(false);
-                                        return;
-                                    }
-                                    if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key())
-                                        && !save_disabled_for_keydown()
-                                    {
-                                        ev.prevent_default();
-                                        do_save_for_keydown();
-                                    }
-                                }
-                            />
-                            <div class="review-comment-actions">
-                                <button class="review-btn primary review-comment-edit-save"
-                                        disabled=move || save_disabled()
-                                        on:click=move |_| do_save()>
-                                    "Save"
-                                </button>
-                                <button
-                                    class="review-btn"
-                                    on:click={
-                                        let original = body_for_view.clone();
-                                        move |_| {
-                                            let typed = edit_value.get_untracked();
-                                            if typed == original {
-                                                edit_open.set(false);
-                                                return;
-                                            }
-                                            spawn_local(async move {
-                                                if crate::bridge::confirm_dialog(
-                                                    "Discard edit",
-                                                    "You have unsaved changes. Discard them?",
-                                                ).await {
-                                                    edit_open.set(false);
-                                                }
-                                            });
-                                        }
-                                    }
-                                >
-                                    "Cancel"
-                                </button>
-                            </div>
-                        </div>
-                    }.into_any()
-                } else {
-                    let body_html = body_for_view.clone();
-                    view! {
-                        <div class="review-comment-body"
-                             inner_html=crate::markdown::render_markdown(&body_html)>
-                        </div>
-                    }.into_any()
-                }
-            }}
-            {is_user.then(|| {
-                let on_delete = on_delete_for_btn.clone();
-                let edit_disabled = edit_disabled_for_actions.clone();
-                let delete_disabled = delete_disabled_for_actions.clone();
-                view! {
-                    <div class="review-comment-actions">
-                        <button class="review-btn review-edit-btn"
-                                disabled=move || edit_disabled()
-                                on:click=move |_| {
-                                    edit_value.set(comment_body_for_edit_open.clone());
-                                    edit_open.set(true);
-                                }>"Edit"</button>
-                        <button class="review-btn destructive review-delete-btn"
-                                disabled=move || delete_disabled()
-                                on:click=on_delete>"Delete"</button>
-                    </div>
-                }
-            })}
-        </div>
-    }
-}
-
-#[component]
-fn SuggestionCard(
-    suggestion: ReviewSuggestedComment,
-    host_id: String,
-    review_id: protocol::ReviewId,
-    is_draft: Memo<bool>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let edit_open = RwSignal::new(false);
-    let edit_value = RwSignal::new(suggestion.body.clone());
-    let body_for_view = suggestion.body.clone();
-    let suggestion_id = suggestion.id.clone();
-
-    let accept_pending = {
-        let rid = review_id.clone();
-        let sid = suggestion_id.clone();
-        let s = state.clone();
-        move || {
-            s.review_action_target_pending.with(|set| {
-                set.contains(&(
-                    rid.clone(),
-                    ReviewActionTarget::AcceptSuggestion(sid.clone()),
-                ))
-            })
-        }
-    };
-    let reject_pending = {
-        let rid = review_id.clone();
-        let sid = suggestion_id.clone();
-        let s = state.clone();
-        move || {
-            s.review_action_target_pending.with(|set| {
-                set.contains(&(
-                    rid.clone(),
-                    ReviewActionTarget::RejectSuggestion(sid.clone()),
-                ))
-            })
-        }
-    };
-
-    // Effect: close the edit form once AcceptSuggestion gate clears AND
-    // the suggestion has transitioned to Accepted (success path). On
-    // error the suggestion stays Pending, leaving the form open.
-    {
-        let rid = review_id.clone();
-        let sid = suggestion_id.clone();
-        let s = state.clone();
-        let was_pending = RwSignal::new(false);
-        Effect::new(move |_| {
-            let pending_now = s.review_action_target_pending.with(|set| {
-                set.contains(&(
-                    rid.clone(),
-                    ReviewActionTarget::AcceptSuggestion(sid.clone()),
-                ))
-            });
-            let prev = was_pending.get_untracked();
-            was_pending.set(pending_now);
-            if prev && !pending_now {
-                let accepted = s.reviews.with_untracked(|map| {
-                    map.get(&rid)
-                        .and_then(|r| r.suggestions.iter().find(|sg| sg.id == sid))
-                        .map(|sg| matches!(sg.state, ReviewSuggestionState::Accepted { .. }))
-                        .unwrap_or(false)
-                });
-                if accepted {
-                    edit_open.set(false);
-                }
-            }
-        });
-    }
-
-    let host_for_accept = host_id.clone();
-    let review_for_accept = review_id.clone();
-    let suggestion_for_accept = suggestion_id.clone();
-    let state_for_accept = state.clone();
-    let on_accept = move |_| {
-        let rid = review_for_accept.clone();
-        let sid = suggestion_for_accept.clone();
-        if !try_claim_review_action(
-            &state_for_accept,
-            &rid,
-            &ReviewActionTarget::AcceptSuggestion(sid.clone()),
-        ) {
-            return;
-        }
-        let host = host_for_accept.clone();
-        let target_state = state_for_accept.clone();
-        let target_rid = rid.clone();
-        let target_sid = sid.clone();
-        spawn_local(async move {
-            send_review_action_with_failure_clear(
-                target_state,
-                &host,
-                target_rid,
-                ReviewActionPayload::AcceptSuggestion {
-                    suggestion_id: target_sid.clone(),
-                    edit: None,
-                },
-                ReviewActionTarget::AcceptSuggestion(target_sid),
-            )
-            .await;
-        });
-    };
-
-    let host_for_edit_accept = host_id.clone();
-    let review_for_edit_accept = review_id.clone();
-    let suggestion_for_edit_accept = suggestion_id.clone();
-    let state_for_edit_accept = state.clone();
-    let do_edit_accept: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        let body = edit_value.get_untracked().trim().to_owned();
-        if body.is_empty() {
-            return;
-        }
-        let rid = review_for_edit_accept.clone();
-        let sid = suggestion_for_edit_accept.clone();
-        if !try_claim_review_action(
-            &state_for_edit_accept,
-            &rid,
-            &ReviewActionTarget::AcceptSuggestion(sid.clone()),
-        ) {
-            return;
-        }
-        let host = host_for_edit_accept.clone();
-        let target_state = state_for_edit_accept.clone();
-        let target_rid = rid.clone();
-        let target_sid = sid.clone();
-        spawn_local(async move {
-            send_review_action_with_failure_clear(
-                target_state,
-                &host,
-                target_rid,
-                ReviewActionPayload::AcceptSuggestion {
-                    suggestion_id: target_sid.clone(),
-                    edit: Some(body),
-                },
-                ReviewActionTarget::AcceptSuggestion(target_sid),
-            )
-            .await;
-        });
-    });
-
-    let host_for_reject = host_id.clone();
-    let review_for_reject = review_id.clone();
-    let suggestion_for_reject = suggestion_id.clone();
-    let state_for_reject = state.clone();
-    let on_reject = move |_| {
-        let rid = review_for_reject.clone();
-        let sid = suggestion_for_reject.clone();
-        if !try_claim_review_action(
-            &state_for_reject,
-            &rid,
-            &ReviewActionTarget::RejectSuggestion(sid.clone()),
-        ) {
-            return;
-        }
-        let host = host_for_reject.clone();
-        let target_state = state_for_reject.clone();
-        let target_rid = rid.clone();
-        let target_sid = sid.clone();
-        spawn_local(async move {
-            send_review_action_with_failure_clear(
-                target_state,
-                &host,
-                target_rid,
-                ReviewActionPayload::RejectSuggestion {
-                    suggestion_id: target_sid.clone(),
-                },
-                ReviewActionTarget::RejectSuggestion(target_sid),
-            )
-            .await;
-        });
-    };
-
-    let severity_class = match suggestion.severity {
-        protocol::ReviewSeverity::Info => "review-severity info",
-        protocol::ReviewSeverity::Warn => "review-severity warn",
-        protocol::ReviewSeverity::Bug => "review-severity bug",
-    };
-
-    let accept_disabled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new({
-        let accept_pending = accept_pending.clone();
-        move || !is_draft.get() || accept_pending()
-    });
-    let reject_disabled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new({
-        let reject_pending = reject_pending.clone();
-        move || !is_draft.get() || reject_pending()
-    });
-    let edit_accept_save_disabled = accept_disabled.clone();
-
-    view! {
-        <div class="review-suggestion-card pending"
-             data-suggestion-id={suggestion.id.0.clone()}
-             data-state="pending">
-            <div class="review-comment-header">
-                <span class="review-source-pill ai-pending">"AI suggestion"</span>
-                <span class={severity_class}>{format!("{:?}", suggestion.severity)}</span>
-            </div>
-            {move || {
-                if edit_open.get() {
-                    let do_save = do_edit_accept.clone();
-                    let do_save_for_keydown = do_save.clone();
-                    let save_disabled = edit_accept_save_disabled.clone();
-                    let save_disabled_for_keydown = save_disabled.clone();
-                    let edit_textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
-                    Effect::new(move |_| {
-                        if let Some(el) = edit_textarea_ref.get() {
-                            let _ = el.focus();
-                            let len = el.value().len() as u32;
-                            let _ = el.set_selection_range(len, len);
-                        }
-                    });
-                    autosize_textarea(edit_textarea_ref, edit_value);
-                    view! {
-                        <div class="review-comment-edit">
-                            <textarea
-                                node_ref=edit_textarea_ref
-                                class="review-textarea"
-                                prop:value=move || edit_value.get()
-                                on:input=move |ev| edit_value.set(event_target_value(&ev))
-                                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
-                                    if ev.key() == "Escape" {
-                                        ev.prevent_default();
-                                        edit_open.set(false);
-                                        return;
-                                    }
-                                    if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key())
-                                        && !save_disabled_for_keydown()
-                                    {
-                                        ev.prevent_default();
-                                        do_save_for_keydown();
-                                    }
-                                }
-                            />
-                            <div class="review-comment-actions">
-                                <button class="review-btn primary review-edit-accept-save"
-                                        disabled=move || save_disabled()
-                                        on:click=move |_| do_save()>
-                                    "Save & Accept"
-                                </button>
-                                <button class="review-btn" on:click={
-                                    let original = body_for_view.clone();
-                                    move |_| {
-                                        let typed = edit_value.get_untracked();
-                                        if typed == original {
-                                            edit_open.set(false);
-                                            return;
-                                        }
-                                        spawn_local(async move {
-                                            if crate::bridge::confirm_dialog(
-                                                "Discard edit",
-                                                "You have unsaved changes. Discard them?",
-                                            ).await {
-                                                edit_open.set(false);
-                                            }
-                                        });
-                                    }
-                                }>
-                                    "Cancel"
-                                </button>
-                            </div>
-                        </div>
-                    }.into_any()
-                } else {
-                    let body_html = body_for_view.clone();
-                    view! {
-                        <div class="review-comment-body"
-                             inner_html=crate::markdown::render_markdown(&body_html)>
-                        </div>
-                    }.into_any()
-                }
-            }}
-            {move || {
-                if edit_open.get() {
-                    view! { <span></span> }.into_any()
-                } else {
-                    let on_accept = on_accept.clone();
-                    let on_reject = on_reject.clone();
-                    let accept_disabled = accept_disabled.clone();
-                    let reject_disabled = reject_disabled.clone();
-                    view! {
-                        <div class="review-comment-actions">
-                            <button class="review-btn primary review-accept-btn"
-                                    disabled=move || accept_disabled()
-                                    on:click=on_accept>
-                                "Accept"
-                            </button>
-                            <button class="review-btn review-edit-accept-btn"
-                                    disabled=move || !is_draft.get()
-                                    on:click=move |_| edit_open.set(true)>
-                                "Edit & Accept"
-                            </button>
-                            <button class="review-btn destructive review-reject-btn"
-                                    disabled=move || reject_disabled()
-                                    on:click=on_reject>
-                                "Reject"
-                            </button>
-                        </div>
-                    }.into_any()
-                }
-            }}
-        </div>
-    }
-}
-
-/// Read-only card for rejected AI suggestions, displayed under the
-/// "show N rejected" toggle. No accept/reject buttons — the suggestion
-/// is already terminal.
-#[component]
-fn RejectedSuggestionCard(suggestion: ReviewSuggestedComment) -> impl IntoView {
-    let body = suggestion.body.clone();
-    let severity_class = match suggestion.severity {
-        protocol::ReviewSeverity::Info => "review-severity info",
-        protocol::ReviewSeverity::Warn => "review-severity warn",
-        protocol::ReviewSeverity::Bug => "review-severity bug",
-    };
-    view! {
-        <div class="review-suggestion-card rejected"
-             data-suggestion-id={suggestion.id.0.clone()}
-             data-state="rejected">
-            <div class="review-comment-header">
-                <span class="review-source-pill ai-rejected">"AI (rejected)"</span>
-                <span class={severity_class}>{format!("{:?}", suggestion.severity)}</span>
-            </div>
-            <div class="review-comment-body"
-                 inner_html=crate::markdown::render_markdown(&body)>
-            </div>
-        </div>
-    }
-}
-
-#[component]
-fn Composer(
-    composer: RwSignal<Option<ComposerState>>,
-    composer_state: ComposerState,
-    host_id: String,
-    review_id: protocol::ReviewId,
-    is_draft: Memo<bool>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let body = composer_state.body;
-    let location = composer_state.location.clone();
-    let host_for_send = host_id.clone();
-    let review_for_send = review_id.clone();
-    let location_for_send = location.clone();
-    let state_for_send = state.clone();
-
-    // Reactive pending flag. While set, Save button is disabled and
-    // composer stays open.
-    let rid_for_pending = review_id.clone();
-    let pending_state = state.clone();
-    let pending = move || {
-        pending_state
-            .review_action_target_pending
-            .with(|set| set.contains(&(rid_for_pending.clone(), ReviewActionTarget::AddComment)))
-    };
-
-    // Effect: when an AddComment echo lands, the dispatch handler
-    // clears the gate AND the new User comment with our location is
-    // present in the live review record. Detect that exact transition
-    // and close the composer. On error the gate clears without a
-    // matching new comment ⇒ keep composer open with body intact.
-    {
-        let rid = review_id.clone();
-        let s = state.clone();
-        let target_location = location.clone();
-        let was_pending = RwSignal::new(false);
-        Effect::new(move |_| {
-            let pending_now = s
-                .review_action_target_pending
-                .with(|set| set.contains(&(rid.clone(), ReviewActionTarget::AddComment)));
-            let prev = was_pending.get_untracked();
-            was_pending.set(pending_now);
-            if prev && !pending_now {
-                let echoed = s.reviews.with_untracked(|map| {
-                    map.get(&rid)
-                        .map(|r| {
-                            r.comments.iter().any(|c| {
-                                matches!(c.source, ReviewCommentSource::User)
-                                    && c.location == target_location
-                            })
-                        })
-                        .unwrap_or(false)
-                });
-                if echoed {
-                    composer.set(None);
-                }
-            }
-        });
-    }
-
-    let do_save: std::sync::Arc<dyn Fn() + Send + Sync> = {
-        let host_for_send = host_for_send.clone();
-        let review_for_send = review_for_send.clone();
-        let location_for_send = location_for_send.clone();
-        let state_for_send = state_for_send.clone();
-        let body_for_save = body;
-        std::sync::Arc::new(move || {
-            let body_text = body_for_save.get_untracked().trim().to_owned();
-            if body_text.is_empty() {
-                return;
-            }
-            let rid = review_for_send.clone();
-            if !try_claim_review_action(&state_for_send, &rid, &ReviewActionTarget::AddComment) {
-                return;
-            }
-            let host = host_for_send.clone();
-            let location = location_for_send.clone();
-            let target_state = state_for_send.clone();
-            let target_rid = rid.clone();
-            spawn_local(async move {
-                send_review_action_with_failure_clear(
-                    target_state,
-                    &host,
-                    target_rid,
-                    ReviewActionPayload::AddComment {
-                        location,
-                        body: body_text,
-                    },
-                    ReviewActionTarget::AddComment,
-                )
-                .await;
-            });
-        })
-    };
-    let do_save_for_btn = do_save.clone();
-    let do_save_for_keydown = do_save.clone();
-
-    let save_disabled = {
-        let pending = pending.clone();
-        move || !is_draft.get() || pending()
-    };
-    let save_disabled_for_keydown = save_disabled.clone();
-
-    let textarea_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
-    Effect::new(move |_| {
-        if let Some(el) = textarea_ref.get() {
-            let _ = el.focus();
-        }
-    });
-    autosize_textarea(textarea_ref, body);
-
-    view! {
-        <div class="review-composer">
-            <textarea
-                node_ref=textarea_ref
-                class="review-textarea"
-                placeholder="Comment\u{2026} (\u{2318}/Ctrl+Enter to save, Esc to cancel)"
-                prop:value=move || body.get()
-                on:input=move |ev| body.set(event_target_value(&ev))
-                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
-                    if ev.key() == "Escape" {
-                        ev.prevent_default();
-                        composer.set(None);
-                        return;
-                    }
-                    if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
-                        ev.prevent_default();
-                        if !save_disabled_for_keydown() {
-                            do_save_for_keydown();
-                        }
-                    }
-                }
-            />
-            <div class="review-composer-actions">
-                <button class="review-btn primary review-composer-save"
-                        disabled=save_disabled
-                        on:click=move |_| do_save_for_btn()>
-                    "Save"
-                </button>
-                <button class="review-btn review-composer-cancel"
-                        on:click=move |_| {
-                            let body_now = body.get_untracked();
-                            if body_now.trim().is_empty() {
-                                composer.set(None);
-                                return;
-                            }
-                            spawn_local(async move {
-                                if crate::bridge::confirm_dialog(
-                                    "Discard comment",
-                                    "You have unsaved text. Discard it?",
-                                ).await {
-                                    composer.set(None);
-                                }
-                            });
-                        }>
-                    "Cancel"
-                </button>
-            </div>
-        </div>
-    }
 }
 
 #[component]
@@ -2308,12 +1319,36 @@ fn ReviewSidebar(
             .with(|map| map.get(&review_id_for_pending).copied().unwrap_or_default())
     };
 
+    // ── Submit target picker. The user must choose an explicit
+    // destination for the feedback bundle: an existing same-project agent
+    // or a freshly spawned one. `None` ⇒ nothing chosen yet (Submit is
+    // gated off until a target is picked). The protocol `ReviewSubmitTarget`
+    // shape is still settling, so its construction is isolated in
+    // `parse_submit_target` — this signal only ever holds the result.
+    let submit_target: RwSignal<Option<protocol::ReviewSubmitTarget>> = RwSignal::new(None);
+    // Optional instructions for a freshly-spawned target agent. Only
+    // meaningful when the picked target is `NewAgent`; folded into the
+    // target at submit time (see `on_submit`).
+    let submit_new_instructions: RwSignal<String> = RwSignal::new(String::new());
+    let submit_new_instructions_for_submit = submit_new_instructions;
+
+    // Project whose live agents are the deliverable submit targets. The
+    // review's own origin is deliberately NOT a fallback: project-scoped
+    // reviews carry a synthetic origin that is not a live agent. Target
+    // resolution lives in the module-level `live_same_project_candidates` /
+    // `effective_submit_target` helpers (kept as fns, not closures, so the
+    // captures stay `Send` for Leptos).
+    let target_project = review.project_id.clone();
+
     // Returns either an empty string (button enabled) or a short reason
     // string suitable for binding to `title` so hovering a disabled
     // button explains why.
     let submit_reason = {
         let action_pending = action_pending.clone();
         let live = live_for_ai;
+        let reason_state = state.clone();
+        let reason_host = host_id.clone();
+        let reason_project = target_project.clone();
         move || -> &'static str {
             if !is_draft.get() {
                 return "Review is no longer Draft";
@@ -2330,6 +1365,17 @@ fn ReviewSidebar(
                     return "Accept or reject the AI suggestions first, or add a comment";
                 }
                 return "Add at least one comment first";
+            }
+            if effective_submit_target(
+                &reason_state,
+                &reason_host,
+                &reason_project,
+                submit_target,
+                true,
+            )
+            .is_none()
+            {
+                return "Choose which agent receives the review";
             }
             if action_pending().submit {
                 return "Submit in progress\u{2026}";
@@ -2366,12 +1412,34 @@ fn ReviewSidebar(
     let host_for_submit = host_id.clone();
     let review_for_submit = review_id.clone();
     let state_for_submit = state.clone();
+    let submit_project = target_project.clone();
     let user_count_for_submit = user_comment_count;
     let pending_count_for_submit = pending_suggestion_count;
     let live_for_submit = live_for_ai;
     let on_submit = move |_| {
         let host = host_for_submit.clone();
         let rid = review_for_submit.clone();
+        // Effective deliverable target: explicit picker choice, else a
+        // single auto-selected live candidate. No origin fallback — a
+        // project-scoped review's synthetic origin is not deliverable.
+        let Some(mut submit_target_value) = effective_submit_target(
+            &state_for_submit,
+            &host,
+            &submit_project,
+            submit_target,
+            false,
+        ) else {
+            log::warn!("review.submit.click review={rid} skipped=no_deliverable_target");
+            return;
+        };
+        // Fold the optional instructions into a NewAgent target.
+        if let protocol::ReviewSubmitTarget::NewAgent { instructions, .. } =
+            &mut submit_target_value
+        {
+            let text = submit_new_instructions_for_submit.get_untracked();
+            let trimmed = text.trim();
+            *instructions = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
         let gate_before = state_for_submit
             .review_action_pending
             .with_untracked(|m| m.get(&rid).copied().unwrap_or_default());
@@ -2413,8 +1481,14 @@ fn ReviewSidebar(
         let target_state = state_for_submit.clone();
         let target_rid = rid.clone();
         spawn_local(async move {
-            match send_review_action_inner(&host, target_rid.clone(), ReviewActionPayload::Submit)
-                .await
+            match send_review_action_inner(
+                &host,
+                target_rid.clone(),
+                ReviewActionPayload::Submit {
+                    target: submit_target_value.clone(),
+                },
+            )
+            .await
             {
                 Ok(()) => {
                     log::info!("review.submit.send_ok review={target_rid}");
@@ -2504,6 +1578,88 @@ fn ReviewSidebar(
                 }
             }
         });
+    };
+
+    // ── Clear: drop all comments + AI suggestions (and reset the AI
+    // reviewer) without delivering anything. Distinct from Cancel, which
+    // discards the whole review. Server echoes `Cleared` with the reset
+    // (empty) review, which dispatch folds in and which clears the gate.
+    let host_for_clear = host_id.clone();
+    let review_for_clear = review_id.clone();
+    let state_for_clear = state.clone();
+    let count_for_clear = user_comment_count;
+    let pending_for_clear = pending_suggestion_count;
+    let on_clear = move |_| {
+        let host = host_for_clear.clone();
+        let rid = review_for_clear.clone();
+        let target_state = state_for_clear.clone();
+        let total = count_for_clear.get_untracked() + pending_for_clear.get_untracked();
+        spawn_local(async move {
+            let message = format!(
+                "Clear {total} comment{} and AI suggestion{} from this review? This cannot be undone.",
+                if count_for_clear.get_untracked() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if pending_for_clear.get_untracked() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            );
+            if !crate::bridge::confirm_dialog("Clear review", &message).await {
+                log::info!("review.clear.click review={rid} dialog=declined");
+                return;
+            }
+            let mut claimed = false;
+            target_state.review_action_pending.update(|map| {
+                let gate = map.entry(rid.clone()).or_default();
+                if !gate.clear {
+                    gate.clear = true;
+                    claimed = true;
+                }
+            });
+            log::info!("review.clear.click review={rid} claimed={claimed}");
+            if !claimed {
+                return;
+            }
+            match send_review_action_inner(&host, rid.clone(), ReviewActionPayload::ClearComments)
+                .await
+            {
+                Ok(()) => log::info!("review.clear.send_ok review={rid}"),
+                Err(e) => {
+                    log::error!("review.clear.send_err review={rid} error={e}");
+                    target_state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(&rid) {
+                            gate.clear = false;
+                            if gate.is_idle() {
+                                map.remove(&rid);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    };
+    let clear_reason = {
+        let action_pending = action_pending.clone();
+        move || -> &'static str {
+            if !is_draft.get() {
+                return "Review is no longer Draft";
+            }
+            if user_comment_count.get() == 0 && pending_suggestion_count.get() == 0 {
+                return "Nothing to clear";
+            }
+            if action_pending().clear {
+                return "Clear in progress\u{2026}";
+            }
+            ""
+        }
+    };
+    let clear_disabled = {
+        let clear_reason = clear_reason.clone();
+        move || !clear_reason().is_empty()
     };
 
     let host_for_ai = host_id.clone();
@@ -2630,6 +1786,34 @@ fn ReviewSidebar(
                     .map(|s| s.enabled_backends.clone())
             })
             .unwrap_or_default()
+    };
+
+    // Independent backend reader for the submit-target picker (the AI
+    // form already consumed the `backends` closure, which isn't `Copy`).
+    let target_backends_state = state.clone();
+    let host_for_target_backends = host_id.clone();
+    let target_backends = move || -> Vec<BackendKind> {
+        target_backends_state
+            .host_settings_by_host
+            .with(|map| {
+                map.get(&host_for_target_backends)
+                    .map(|s| s.enabled_backends.clone())
+            })
+            .unwrap_or_default()
+    };
+
+    // Live same-project candidate agents for the picker's "Existing agents"
+    // group (plain closure so its captures stay `Send`).
+    let candidate_state = state.clone();
+    let host_for_candidates = host_id.clone();
+    let candidate_project = target_project.clone();
+    let candidate_agents = move || -> Vec<(protocol::AgentId, String)> {
+        live_same_project_candidates(
+            &candidate_state,
+            &host_for_candidates,
+            &candidate_project,
+            true,
+        )
     };
 
     let ai_status_kind = {
@@ -2938,6 +2122,72 @@ fn ReviewSidebar(
             </div>
 
             <div class="review-sidebar-section">
+                <label class="review-submit-target-label" for="review-submit-target">
+                    "Send feedback to"
+                </label>
+                <select
+                    id="review-submit-target"
+                    class="review-submit-target-select"
+                    data-test="review-submit-target"
+                    disabled=move || !is_draft.get()
+                    on:change=move |ev| {
+                        let val = event_target_value(&ev);
+                        submit_target.set(parse_submit_target(&val));
+                    }
+                >
+                    <option value="">"Auto (single same-project agent)"</option>
+                    {move || {
+                        let agents = candidate_agents();
+                        (!agents.is_empty()).then(|| view! {
+                            <optgroup label="Existing agents">
+                                {agents.into_iter().map(|(id, name)| {
+                                    view! {
+                                        <option value={format!("existing:{}", id.0)}>{name}</option>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </optgroup>
+                        })
+                    }}
+                    {move || {
+                        let kinds = target_backends();
+                        (!kinds.is_empty()).then(|| view! {
+                            <optgroup label="Spawn new agent">
+                                {kinds.into_iter().map(|kind| {
+                                    let label = backend_kind_label(kind);
+                                    view! {
+                                        <option value={format!("new:{label}")}>
+                                            {format!("New {label} agent")}
+                                        </option>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </optgroup>
+                        })
+                    }}
+                </select>
+                {move || {
+                    // Optional instructions only apply when spawning a new
+                    // agent — show the field only for a NewAgent selection.
+                    let is_new_agent = matches!(
+                        submit_target.get(),
+                        Some(protocol::ReviewSubmitTarget::NewAgent { .. })
+                    );
+                    is_new_agent.then(|| {
+                        let instructions_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+                        autosize_textarea(instructions_ref, submit_new_instructions);
+                        view! {
+                            <textarea
+                                node_ref=instructions_ref
+                                class="review-submit-instructions"
+                                data-test="review-submit-instructions"
+                                placeholder="Optional instructions for the new agent\u{2026}"
+                                prop:value=move || submit_new_instructions.get()
+                                on:input=move |ev| {
+                                    submit_new_instructions.set(event_target_value(&ev))
+                                }
+                            />
+                        }
+                    })
+                }}
                 <button
                     class="review-btn primary review-submit-btn"
                     disabled=submit_disabled
@@ -2945,6 +2195,15 @@ fn ReviewSidebar(
                     on:click=on_submit
                 >
                     "Submit review"
+                </button>
+                <button
+                    class="review-btn review-clear-btn"
+                    data-test="review-clear-btn"
+                    disabled=clear_disabled
+                    title=clear_reason
+                    on:click=on_clear
+                >
+                    "Clear comments"
                 </button>
                 <button
                     class="review-btn destructive review-cancel-btn"
@@ -2977,6 +2236,93 @@ fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Gemini => "Gemini",
     }
+}
+
+/// Translate a submit-target picker option value into a `ReviewSubmitTarget`.
+/// `None` ⇒ no concrete target selected ("Choose where to send…"). This is
+/// the single place that constructs the still-settling `ReviewSubmitTarget`
+/// shape, so a protocol change only has to be reconciled here.
+fn parse_submit_target(value: &str) -> Option<protocol::ReviewSubmitTarget> {
+    if let Some(id) = value.strip_prefix("existing:") {
+        Some(protocol::ReviewSubmitTarget::ExistingAgent {
+            agent_id: protocol::AgentId(id.to_owned()),
+        })
+    } else if let Some(label) = value.strip_prefix("new:") {
+        parse_backend_kind(label).map(|backend_kind| protocol::ReviewSubmitTarget::NewAgent {
+            backend_kind,
+            cost_hint: None,
+            custom_agent_id: None,
+            name: None,
+            instructions: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Live same-project agents on `host_id` for `project_id` — the deliverable
+/// review submit targets. "Live" excludes agents with a fatal error
+/// (terminated). The review's own origin is intentionally never consulted:
+/// project-scoped reviews use a synthetic, non-deliverable origin. The
+/// `tracked` flag selects reactive vs untracked signal reads so the same
+/// logic serves both the reactive submit gate and the click handler.
+fn live_same_project_candidates(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+    tracked: bool,
+) -> Vec<(protocol::AgentId, String)> {
+    let collect = |agents: &Vec<AgentInfo>| -> Vec<(protocol::AgentId, String)> {
+        agents
+            .iter()
+            .filter(|a| {
+                a.host_id == host_id
+                    && a.project_id.as_ref() == Some(project_id)
+                    && a.fatal_error.is_none()
+            })
+            .map(|a| {
+                let name = if a.name.is_empty() {
+                    let short: String = a.agent_id.0.chars().take(8).collect();
+                    format!("agent {short}")
+                } else {
+                    a.name.clone()
+                };
+                (a.agent_id.clone(), name)
+            })
+            .collect()
+    };
+    if tracked {
+        state.agents.with(collect)
+    } else {
+        state.agents.with_untracked(collect)
+    }
+}
+
+/// The deliverable submit target: an explicit picker choice if present,
+/// else the sole live same-project candidate when exactly one exists.
+/// `None` ⇒ no deliverable target (Submit is gated off; the user must pick).
+fn effective_submit_target(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+    submit_target: RwSignal<Option<protocol::ReviewSubmitTarget>>,
+    tracked: bool,
+) -> Option<protocol::ReviewSubmitTarget> {
+    let explicit = if tracked {
+        submit_target.get()
+    } else {
+        submit_target.get_untracked()
+    };
+    if explicit.is_some() {
+        return explicit;
+    }
+    let candidates = live_same_project_candidates(state, host_id, project_id, tracked);
+    if let [(agent_id, _)] = candidates.as_slice() {
+        return Some(protocol::ReviewSubmitTarget::ExistingAgent {
+            agent_id: agent_id.clone(),
+        });
+    }
+    None
 }
 
 fn parse_backend_kind(s: &str) -> Option<BackendKind> {
@@ -3030,7 +2376,7 @@ fn conn_diag(state: &AppState, host_id: &str) -> String {
 /// Fire a `ReviewAction` and clear the corresponding per-target gate on
 /// local send failure (so the buttons re-enable). On success the gate
 /// remains set until dispatch sees the matching server echo or error.
-async fn send_review_action_with_failure_clear(
+pub(crate) async fn send_review_action_with_failure_clear(
     state: AppState,
     host_id: &str,
     review_id: protocol::ReviewId,
@@ -3074,7 +2420,7 @@ fn target_label(target: &ReviewActionTarget) -> &'static str {
 /// before Leptos flushes the reactive `disabled` attribute to the DOM,
 /// so the visual disable alone does not prevent re-entry — handlers
 /// must check this guard before sending.
-fn try_claim_review_action(
+pub(crate) fn try_claim_review_action(
     state: &AppState,
     review_id: &protocol::ReviewId,
     target: &ReviewActionTarget,
@@ -3160,7 +2506,6 @@ pub fn create_review_for_active_agent(state: &AppState) {
 
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = protocol::ReviewCreatePayload {
-        origin_agent_id: agent_id,
         selection: protocol::ReviewDiffSelection::AllUncommitted,
     };
     let state_for_failure = state.clone();
@@ -3241,6 +2586,73 @@ pub fn open_review_for_active_project(state: &AppState) -> Option<(String, proto
     Some((active.host_id.clone(), latest.id))
 }
 
+/// Project-scoped entry point for the inline review flow, driven from the
+/// git panel rather than an agent's chat header. Opens the active
+/// project's existing Draft review if one exists; otherwise sends a
+/// project-scoped `ReviewCreate` (no `origin_agent_id` — the server
+/// derives the project from the `/project/<id>` stream) and tags the
+/// (host, project) pair create-pending. The `ReviewListChanged` dispatch
+/// handler pairs the new review with that pending tag and auto-opens its
+/// tab, so this function does not open the tab itself on the create path.
+pub fn create_or_open_review_for_active_project(state: &AppState) {
+    let Some(active) = state.active_project.get_untracked() else {
+        log::warn!("create_or_open_review_for_active_project: no active project");
+        return;
+    };
+    let host_id = active.host_id.clone();
+    let project_id = active.project_id.clone();
+
+    let existing_draft = state.review_summaries.with_untracked(|map| {
+        map.get(&project_id).and_then(|summaries| {
+            summaries
+                .iter()
+                .filter(|s| matches!(s.status, ReviewStatus::Draft))
+                .max_by_key(|s| s.updated_at_ms)
+                .map(|s| s.id.clone())
+        })
+    });
+    if let Some(review_id) = existing_draft {
+        let label = review_tab_label(&review_id);
+        state.open_tab(TabContent::Review { host_id, review_id }, label, true);
+        return;
+    }
+
+    let mut claimed = false;
+    state.review_create_pending.update(|map| {
+        let key = (host_id.clone(), project_id.clone());
+        let entry = map.entry(key).or_insert(0);
+        if *entry == 0 {
+            *entry = 1;
+            claimed = true;
+        }
+    });
+    if !claimed {
+        return;
+    }
+
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let payload = protocol::ReviewCreatePayload {
+        selection: protocol::ReviewDiffSelection::AllUncommitted,
+    };
+    let state_for_failure = state.clone();
+    let project_id_for_failure = project_id.clone();
+    let host_for_failure = host_id.clone();
+    spawn_local(async move {
+        if let Err(e) = send_frame(&host_id, stream, FrameKind::ReviewCreate, &payload).await {
+            log::error!("failed to send project-scoped ReviewCreate: {e}");
+            state_for_failure.review_create_pending.update(|map| {
+                let key = (host_for_failure, project_id_for_failure);
+                if let Some(count) = map.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&key);
+                    }
+                }
+            });
+        }
+    });
+}
+
 // ── BTreeMap import is referenced by tests below ───────────────────────
 #[allow(dead_code)]
 fn _btree_marker() -> BTreeMap<u32, u32> {
@@ -3257,14 +2669,15 @@ fn _gate_marker() -> ReviewActionGate {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::state::AgentInfo;
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, DiffContextMode, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffHunk,
-        ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectId,
-        ProjectRootPath, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor,
-        ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide,
-        ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSuggestedComment,
-        ReviewSuggestionId, ReviewSuggestionState, SessionId,
+        AgentId, AgentOrigin, DiffContextMode, ProjectDiffScope, ProjectGitDiffFile,
+        ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+        ProjectId, ProjectRootPath, Review, ReviewAiReviewerState, ReviewAiReviewerStatus,
+        ReviewAnchor, ReviewAnchorStatus, ReviewComment, ReviewCommentId, ReviewCommentSource,
+        ReviewDiffSelection, ReviewDiffSide, ReviewId, ReviewLocation, ReviewSeverity,
+        ReviewStatus, ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, SessionId,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -3409,6 +2822,25 @@ mod wasm_tests {
         }
     }
 
+    fn make_agent(name: &str, agent_id: &str, project: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            host_id: "h1".to_owned(),
+            agent_id: AgentId(agent_id.to_owned()),
+            name: name.to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Tycode,
+            workspace_roots: vec![],
+            project_id: project.map(|s| ProjectId(s.to_owned())),
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("s".to_owned()),
+            started: true,
+            fatal_error: None,
+        }
+    }
+
     fn comment_at_line(line: u32, body: &str) -> ReviewComment {
         ReviewComment {
             id: ReviewCommentId(format!("c-{line}-{body}")),
@@ -3421,6 +2853,7 @@ mod wasm_tests {
                     end_line: line,
                 },
             },
+            anchor_status: ReviewAnchorStatus::Current,
             body: body.to_owned(),
             source: ReviewCommentSource::User,
             created_at_ms: 1,
@@ -3440,6 +2873,7 @@ mod wasm_tests {
                     end_line: end,
                 },
             },
+            anchor_status: ReviewAnchorStatus::Current,
             body: body.to_owned(),
             source: ReviewCommentSource::User,
             created_at_ms: 1,
@@ -3459,6 +2893,7 @@ mod wasm_tests {
                     end_line: line,
                 },
             },
+            anchor_status: ReviewAnchorStatus::Current,
             body: body.to_owned(),
             rationale: None,
             severity: ReviewSeverity::Warn,
@@ -3553,9 +2988,59 @@ mod wasm_tests {
         assert!(text.contains("Reject"), "Reject button text missing");
     }
 
-    /// Submit button reflects whether the user can submit. Assert on
-    /// the `disabled` attribute (user-perceived state) by finding the
-    /// button by its visible label.
+    /// A comment or suggestion whose anchor the server flagged `Stale`
+    /// renders a visible stale marker (with the reason) so the user knows
+    /// it may point at code that has since moved. Mirrors the mobile stale
+    /// pill, which already renders this.
+    #[wasm_bindgen_test]
+    async fn stale_anchor_renders_badge() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut review = make_review();
+        let mut comment = comment_at_line(2, "this moved");
+        comment.anchor_status = ReviewAnchorStatus::Stale {
+            reason: "line shifted".to_owned(),
+        };
+        review.comments.push(comment);
+        let mut suggestion = pending_suggestion_at_line(3, "stale suggestion");
+        suggestion.anchor_status = ReviewAnchorStatus::Stale {
+            reason: "hunk changed".to_owned(),
+        };
+        review.suggestions.push(suggestion);
+        let _ = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        let badges = container
+            .query_selector_all("[data-test=\"review-anchor-stale\"]")
+            .unwrap();
+        assert_eq!(
+            badges.length(),
+            2,
+            "expected a stale badge on both the comment and the suggestion"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("line shifted"),
+            "stale comment reason must be surfaced; got: {text}"
+        );
+        assert!(
+            text.contains("hunk changed"),
+            "stale suggestion reason must be surfaced; got: {text}"
+        );
+    }
+
+    /// Submit reflects whether the user can submit AND has a deliverable
+    /// target. Under the explicit-target protocol a comment alone is not
+    /// sufficient: there must be a chosen target, or exactly one live
+    /// same-project candidate to auto-select.
+    ///
+    /// NOTE: this updates the pre-explicit-target assertion that submit
+    /// enabled on a comment alone. That behavior relied on falling back to
+    /// the review's origin agent, which is now a synthetic, non-deliverable
+    /// origin for project-scoped reviews — so the old assertion tested
+    /// behavior that would produce a failing submit and is obsolete.
     #[wasm_bindgen_test]
     async fn submit_button_disabled_until_draft_with_comments() {
         ensure_styles_loaded();
@@ -3574,8 +3059,9 @@ mod wasm_tests {
             "submit must be disabled with zero comments"
         );
 
-        // Add a comment via signal mutation — mirrors what dispatch does
-        // on `CommentUpsert`. The submit button must re-enable.
+        // Add a comment — necessary but NOT sufficient: with no live
+        // same-project agent there is no deliverable target, so submit
+        // stays disabled.
         let state = state_holder.borrow().clone().unwrap();
         state.reviews.update(|map| {
             if let Some(r) = map.get_mut(&review_id) {
@@ -3587,8 +3073,22 @@ mod wasm_tests {
         let submit =
             find_button_by_text(&container, "Submit review").expect("submit button rendered");
         assert!(
+            submit.has_attribute("disabled"),
+            "submit must stay disabled with a comment but no deliverable target"
+        );
+
+        // Seed exactly one live same-project agent — it auto-selects as the
+        // target, so submit now enables.
+        state.agents.update(|agents| {
+            agents.push(make_agent("Only Candidate", "a-only", Some("proj-1")));
+        });
+        next_tick().await;
+
+        let submit =
+            find_button_by_text(&container, "Submit review").expect("submit button rendered");
+        assert!(
             !submit.has_attribute("disabled"),
-            "submit must enable once Draft has at least one comment"
+            "submit must enable with a comment and exactly one live same-project agent"
         );
 
         // Flip the review to Submitted — submit must disable again.
@@ -3606,6 +3106,84 @@ mod wasm_tests {
         assert!(
             submit.has_attribute("disabled"),
             "submit must disable when status leaves Draft"
+        );
+    }
+
+    /// The submit-target picker offers only same-project agents as
+    /// explicit destinations — an agent belonging to a different project
+    /// must never appear, since feedback can only route within the
+    /// review's own project.
+    #[wasm_bindgen_test]
+    async fn submit_target_picker_lists_only_same_project_agents() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let review = make_review(); // project_id = "proj-1", host = "h1"
+        let state_holder = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        // Seed one same-project agent and one from a different project.
+        let state = state_holder.borrow().clone().unwrap();
+        state.agents.update(|agents| {
+            agents.push(make_agent("Backend Codex", "a-same", Some("proj-1")));
+            agents.push(make_agent("Other Project", "a-other", Some("proj-2")));
+        });
+        next_tick().await;
+
+        let select = container
+            .query_selector("[data-test=\"review-submit-target\"]")
+            .unwrap()
+            .expect("submit target picker rendered");
+        let text = select.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Auto (single same-project agent)"),
+            "default auto-target option missing; got: {text}"
+        );
+        assert!(
+            text.contains("Backend Codex"),
+            "same-project agent must be offered as a target; got: {text}"
+        );
+        assert!(
+            !text.contains("Other Project"),
+            "an agent from a different project must not be offered; got: {text}"
+        );
+    }
+
+    /// The Clear control is gated on there being something to clear: it
+    /// is disabled when the review has no comments or suggestions, and
+    /// enables once a comment exists.
+    #[wasm_bindgen_test]
+    async fn clear_button_enables_with_content() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let review = make_review();
+        let review_id = review.id.clone();
+        let state_holder = mount_review(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        let clear =
+            find_button_by_text(&container, "Clear comments").expect("clear button rendered");
+        assert!(
+            clear.has_attribute("disabled"),
+            "clear must be disabled when there is nothing to clear"
+        );
+
+        let state = state_holder.borrow().clone().unwrap();
+        state.reviews.update(|map| {
+            if let Some(r) = map.get_mut(&review_id) {
+                r.comments.push(comment_at_line(2, "please fix"));
+            }
+        });
+        next_tick().await;
+
+        let clear =
+            find_button_by_text(&container, "Clear comments").expect("clear button rendered");
+        assert!(
+            !clear.has_attribute("disabled"),
+            "clear must enable once the review has a comment"
         );
     }
 

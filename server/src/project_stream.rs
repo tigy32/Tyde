@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 
+use crate::review::ReviewRegistryHandle;
 use crate::store::project::ProjectStore;
 use crate::stream::Stream;
 
@@ -180,6 +181,7 @@ impl ProjectStreamHandle {
 pub(crate) async fn spawn_project_subscription(
     project_store: Arc<Mutex<ProjectStore>>,
     project_id: ProjectId,
+    review_registry: ReviewRegistryHandle,
 ) -> Result<ProjectStreamSubscription, String> {
     let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
@@ -200,6 +202,7 @@ pub(crate) async fn spawn_project_subscription(
             watch_tx,
             watch_rx,
             command_rx,
+            review_registry,
         )
         .await;
     });
@@ -260,6 +263,7 @@ async fn run_project_subscription(
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
+    review_registry: ReviewRegistryHandle,
 ) {
     let mut subscribers = HashMap::<StreamPath, Stream>::new();
     let mut pending_update = PendingProjectUpdate::default();
@@ -311,6 +315,7 @@ async fn run_project_subscription(
                             &mut watched_roots,
                             watch_tx.clone(),
                             &mut subscribers,
+                            &review_registry,
                         ).await;
                         let _ = reply.send(result);
                     }
@@ -363,6 +368,7 @@ async fn run_project_subscription(
                     &mut watched_roots,
                     watch_tx.clone(),
                     &mut subscribers,
+                    &review_registry,
                     refresh.files,
                     refresh.git,
                 ).await {
@@ -381,6 +387,7 @@ async fn run_project_subscription(
                     &mut watched_roots,
                     watch_tx.clone(),
                     &mut subscribers,
+                    &review_registry,
                     false,
                     true,
                 ).await {
@@ -403,6 +410,7 @@ async fn refresh_full(
     watched_roots: &mut Vec<String>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, Stream>,
+    review_registry: &ReviewRegistryHandle,
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
     ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
@@ -418,6 +426,7 @@ async fn refresh_full(
 
     fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
     fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+    reset_reviews_if_working_tree_clean(review_registry, project_id, &git_status).await;
     refresh_remembered_diffs(project, snapshot, subscribers).await;
     Ok(())
 }
@@ -432,6 +441,7 @@ async fn refresh_incremental(
     watched_roots: &mut Vec<String>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, Stream>,
+    review_registry: &ReviewRegistryHandle,
     files_changed: bool,
     git_changed: bool,
 ) -> Result<(), String> {
@@ -458,6 +468,7 @@ async fn refresh_incremental(
         if snapshot.git_status.as_ref() != Some(&git_json) {
             snapshot.git_status = Some(git_json);
             fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+            reset_reviews_if_working_tree_clean(review_registry, project_id, &git_status).await;
             refresh_remembered_diffs(project, snapshot, subscribers).await;
         }
     }
@@ -539,6 +550,30 @@ fn full_file_list_from_raw(
         incremental: false,
         roots,
     }
+}
+
+async fn reset_reviews_if_working_tree_clean(
+    review_registry: &ReviewRegistryHandle,
+    project_id: &ProjectId,
+    git_status: &ProjectGitStatusPayload,
+) {
+    if !project_git_status_is_clean(git_status) {
+        return;
+    }
+    if let Err(error) = review_registry
+        .reset_project_for_clean_working_tree(project_id.clone())
+        .await
+    {
+        tracing::warn!(
+            project_id = %project_id,
+            error = %error,
+            "failed to reset reviews after clean git status"
+        );
+    }
+}
+
+fn project_git_status_is_clean(git_status: &ProjectGitStatusPayload) -> bool {
+    git_status.roots.iter().all(|root| root.clean)
 }
 
 fn serialize_git_status(git_status: &ProjectGitStatusPayload) -> Result<Value, String> {

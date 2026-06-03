@@ -15,6 +15,7 @@ pub mod git_panel;
 pub mod header;
 pub mod home_view;
 pub mod host_browser;
+pub mod inline_review;
 pub mod project_rail;
 pub mod review_view;
 pub mod session_settings;

@@ -7611,7 +7611,8 @@ pre.tool-error-pre {
 }
 
 .review-backend-select,
-.review-cost-select {
+.review-cost-select,
+.review-submit-target-select {
     width: 100%;
     box-sizing: border-box;
     background: var(--surface-0);
@@ -7620,6 +7621,45 @@ pre.tool-error-pre {
     border-radius: 4px;
     padding: var(--space-1) var(--space-2);
     font-size: 0.846rem;
+}
+
+.review-submit-target-label {
+    display: block;
+    font-size: 0.769rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: var(--space-1);
+}
+
+.review-submit-target-select {
+    margin-bottom: var(--space-2);
+}
+
+.review-submit-instructions {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 3.2em;
+    resize: vertical;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    font-size: 0.846rem;
+    margin-bottom: var(--space-2);
+}
+
+/* Clear comments: a neutral (non-destructive) secondary action that sits
+   between Submit and the destructive Cancel. */
+.review-clear-btn {
+    background: var(--surface-0);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-primary);
+}
+
+.review-clear-btn:hover:not(:disabled) {
+    color: var(--text-primary);
+    border-color: var(--border-strong, var(--border-primary));
 }
 
 .review-ai-status {
@@ -8039,6 +8079,17 @@ pre.tool-error-pre {
 .review-source-pill.ai            { background: rgba(184, 138, 255, 0.18); color: #b88aff; }
 .review-source-pill.ai-pending    { background: rgba(224, 179, 74, 0.18); color: #e0b34a; }
 .review-source-pill.ai-rejected   { background: rgba(160, 160, 160, 0.18); color: var(--text-tertiary); }
+
+.review-stale-pill {
+    font-size: 0.692rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(224, 179, 74, 0.18);
+    color: #e0b34a;
+}
 
 .review-comment-time {
     margin-left: auto;

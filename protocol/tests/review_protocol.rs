@@ -97,6 +97,7 @@ fn comment() -> ReviewComment {
     ReviewComment {
         id: comment_id(),
         location: line_location(),
+        anchor_status: ReviewAnchorStatus::Current,
         body: "Please adjust this.".to_owned(),
         source: ReviewCommentSource::AiSuggestion {
             suggestion_id: suggestion_id(),
@@ -111,6 +112,9 @@ fn suggestion() -> ReviewSuggestedComment {
     ReviewSuggestedComment {
         id: suggestion_id(),
         location: hunk_location(),
+        anchor_status: ReviewAnchorStatus::Stale {
+            reason: "old hunk disappeared".to_owned(),
+        },
         body: "This looks risky.".to_owned(),
         rationale: Some("Potential regression.".to_owned()),
         severity: ReviewSeverity::Bug,
@@ -231,6 +235,12 @@ fn review_data_model_round_trips() {
     ]);
 
     round_trip(&vec![file_location(), hunk_location(), line_location()]);
+    round_trip(&vec![
+        ReviewAnchorStatus::Current,
+        ReviewAnchorStatus::Stale {
+            reason: "line moved".to_owned(),
+        },
+    ]);
     round_trip(&ReviewCommentSource::User);
     round_trip(&ReviewCommentSource::AiSuggestion {
         suggestion_id: suggestion_id(),
@@ -264,7 +274,6 @@ fn review_data_model_round_trips() {
 #[test]
 fn review_payload_structs_round_trip() {
     round_trip(&ReviewCreatePayload {
-        origin_agent_id: agent_id(),
         selection: ReviewDiffSelection::AllUncommitted,
     });
 
@@ -306,7 +315,21 @@ fn review_action_tagged_union_variants_round_trip() {
             cost_hint: Some(SpawnCostHint::Medium),
             instructions: Some("Focus on correctness.".to_owned()),
         },
-        ReviewActionPayload::Submit,
+        ReviewActionPayload::Submit {
+            target: ReviewSubmitTarget::ExistingAgent {
+                agent_id: agent_id(),
+            },
+        },
+        ReviewActionPayload::Submit {
+            target: ReviewSubmitTarget::NewAgent {
+                backend_kind: BackendKind::Codex,
+                cost_hint: Some(SpawnCostHint::Low),
+                custom_agent_id: Some(CustomAgentId("review-fixer".to_owned())),
+                name: Some("Review Fixer".to_owned()),
+                instructions: Some("Fix the review comments.".to_owned()),
+            },
+        },
+        ReviewActionPayload::ClearComments,
         ReviewActionPayload::Cancel,
     ];
 
@@ -314,6 +337,33 @@ fn review_action_tagged_union_variants_round_trip() {
 
     let add_comment = serde_json::to_value(&actions[0]).expect("serialize action");
     assert_eq!(add_comment["kind"], json!("add_comment"));
+}
+
+#[test]
+fn review_comment_anchor_status_defaults_for_legacy_json() {
+    let comment: ReviewComment = serde_json::from_value(json!({
+        "id": "comment-1",
+        "location": line_location(),
+        "body": "legacy comment",
+        "source": { "kind": "user" },
+        "created_at_ms": 1,
+        "updated_at_ms": 2
+    }))
+    .expect("legacy comment without anchor status");
+    assert_eq!(comment.anchor_status, ReviewAnchorStatus::Current);
+
+    let suggestion: ReviewSuggestedComment = serde_json::from_value(json!({
+        "id": "suggestion-1",
+        "location": hunk_location(),
+        "body": "legacy suggestion",
+        "rationale": null,
+        "severity": "warn",
+        "state": { "state": "pending" },
+        "reviewer_agent_id": "agent-1",
+        "created_at_ms": 1
+    }))
+    .expect("legacy suggestion without anchor status");
+    assert_eq!(suggestion.anchor_status, ReviewAnchorStatus::Current);
 }
 
 #[test]
@@ -335,6 +385,7 @@ fn review_event_tagged_union_variants_round_trip() {
                 submitted_at_ms: 300,
             },
         },
+        ReviewEventPayload::Cleared { review: review() },
         ReviewEventPayload::Error {
             error: ReviewErrorPayload {
                 code: ReviewErrorCode::UnknownSuggestion,
@@ -360,6 +411,7 @@ fn review_error_codes_and_contexts_round_trip() {
         ReviewErrorCode::InvalidLocation,
         ReviewErrorCode::UnknownComment,
         ReviewErrorCode::UnknownSuggestion,
+        ReviewErrorCode::InvalidSubmitTarget,
         ReviewErrorCode::OriginAgentNotRunning,
         ReviewErrorCode::AmbiguousOriginSession,
         ReviewErrorCode::ReviewerAlreadyRunning,
@@ -385,6 +437,7 @@ fn review_error_codes_and_contexts_round_trip() {
         },
         ReviewErrorContext::StartAiReview,
         ReviewErrorContext::Submit,
+        ReviewErrorContext::ClearComments,
         ReviewErrorContext::Cancel,
     ]);
 }

@@ -1034,6 +1034,17 @@ fn apply_review_event(
                 }
             });
         }
+        ReviewEventPayload::Cleared { review } => {
+            // Server cleared the review (after Submit, explicit ClearComments,
+            // or a clean working tree). Replace the local projection with the
+            // included review and drop any in-flight error gate for this id.
+            state.review_errors.update(|errors| {
+                errors.remove(&key);
+            });
+            state.reviews.update(|reviews| {
+                reviews.insert(key, review);
+            });
+        }
         ReviewEventPayload::Error { error } => {
             state.review_errors.update(|errors| {
                 errors.insert(key, error);
@@ -1982,6 +1993,7 @@ mod wasm_tests {
                             relative_path: "src/lib.rs".to_owned(),
                             anchor: protocol::ReviewAnchor::File,
                         },
+                        anchor_status: protocol::ReviewAnchorStatus::Current,
                         body: "Looks good".to_owned(),
                         source: ReviewCommentSource::User,
                         created_at_ms: 2,

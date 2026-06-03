@@ -901,11 +901,14 @@ pub struct ReviewActionGate {
     pub cancel: bool,
     pub start_ai: bool,
     pub add_comment: bool,
+    /// True while a `ClearComments` action is in flight, awaiting the
+    /// server's `Cleared` echo. Gates the inline "Clear" control.
+    pub clear: bool,
 }
 
 impl ReviewActionGate {
     pub fn is_idle(&self) -> bool {
-        !(self.submit || self.cancel || self.start_ai || self.add_comment)
+        !(self.submit || self.cancel || self.start_ai || self.add_comment || self.clear)
     }
 }
 

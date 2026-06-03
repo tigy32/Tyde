@@ -23,7 +23,7 @@ use protocol::{
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
     ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId,
+    ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
     RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload, SessionSchemaEntry,
     SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
@@ -118,6 +118,18 @@ pub struct HostRuntimeConfig {
 struct TeamSpawnContext {
     team_id: TeamId,
     team_member_id: TeamMemberId,
+}
+
+#[derive(Debug)]
+struct ReviewTargetAgentRequest {
+    review_id: ReviewId,
+    project_id: ProjectId,
+    backend_kind: protocol::BackendKind,
+    cost_hint: Option<protocol::SpawnCostHint>,
+    custom_agent_id: Option<protocol::CustomAgentId>,
+    name: Option<String>,
+    instructions: Option<String>,
+    payload: SendMessagePayload,
 }
 
 const COMPACTION_SUMMARY_PREVIEW_CHARS: usize = 512;
@@ -4476,75 +4488,42 @@ impl HostHandle {
         const OPERATION: &str = "review_create";
         tracing::info!(
             project_id = %project_id,
-            origin_agent_id = %payload.origin_agent_id,
             selection_kind = payload.selection.kind_name(),
             connection_stream = %connection_host_stream,
             output_stream = %project_output_stream.path(),
             "received review_create"
         );
-        let (project_store, review_registry, origin_agent, origin_session_id) = {
+        let (project_store, review_registry) = {
             let state = self.state.lock().await;
-            let Some(origin_agent) = state.registry.agent_handle(&payload.origin_agent_id) else {
-                return Err(AppError::not_found(
-                    OPERATION,
-                    format!("origin agent {} is not running", payload.origin_agent_id),
-                ));
-            };
-            let Some(origin_session_id) =
-                state.agent_sessions.get(&payload.origin_agent_id).cloned()
-            else {
-                return Err(AppError::invalid(
-                    OPERATION,
-                    format!(
-                        "origin agent {} is not bound to a session yet",
-                        payload.origin_agent_id
-                    ),
-                ));
-            };
             (
                 Arc::clone(&state.project_store),
                 state.review_registry.clone(),
-                origin_agent,
-                origin_session_id,
             )
         };
 
-        // One Draft per project. Prior implementation let callers pile
-        // up an unbounded stack of empty drafts that the user then had
-        // to cancel one at a time. The frontend already routes the
-        // "Review changes" click to the existing Draft when one
-        // exists; this check enforces the same invariant for any
-        // caller that bypasses the UI (MCP, an older client).
-        let existing = review_registry
+        if let Some(existing) = review_registry
             .summaries(project_id.clone())
             .await
-            .map_err(|error| {
-                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-            })?;
-        if let Some(draft) = existing
+            .map_err(|error| AppError::internal_message(OPERATION, error.clone(), anyhow!(error)))?
             .into_iter()
             .find(|summary| matches!(summary.status, protocol::ReviewStatus::Draft))
         {
-            return Err(AppError::conflict(
-                OPERATION,
-                format!(
-                    "project {} already has a draft review {}; submit or cancel it first",
-                    project_id, draft.id
-                ),
-            ));
+            let review_stream = project_output_stream.with_path(review_stream_path(&existing.id));
+            review_registry
+                .subscribe(
+                    existing.id.clone(),
+                    connection_host_stream.clone(),
+                    review_stream,
+                )
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?;
+            tracing::info!(review_id = %existing.id, project_id = %project_id, "attached to existing review");
+            return Ok(());
         }
 
         let project = load_project(&project_store, &project_id, OPERATION).await?;
-        let origin_start = origin_agent.snapshot();
-        if origin_start.project_id.as_ref() != Some(&project_id) {
-            return Err(AppError::invalid(
-                OPERATION,
-                format!(
-                    "origin agent {} is not bound to project {}",
-                    payload.origin_agent_id, project_id
-                ),
-            ));
-        }
 
         let diff_started = Instant::now();
         tracing::debug!(
@@ -4583,27 +4562,27 @@ impl HostHandle {
             }
         };
         let review_id = ReviewId(Uuid::new_v4().to_string());
-        let review_stream = project_output_stream.with_path(review_stream_path(&review_id));
         tracing::debug!(
             project_id = %project_id,
             review_id = %review_id,
-            review_stream = %review_stream.path(),
-            origin_session_id = %origin_session_id,
-            "creating review actor"
+            "creating or getting review actor"
         );
-        let request = build_create_request(
-            review_id.clone(),
-            project_id,
-            origin_session_id,
-            payload,
-            diffs,
-            connection_host_stream.clone(),
-            review_stream,
-        );
-        review_registry.create(request).await.map_err(|error| {
+        let request = build_create_request(review_id.clone(), project_id.clone(), payload, diffs);
+        let review_id = review_registry.create(request).await.map_err(|error| {
             AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
         })?;
-        tracing::info!(review_id = %review_id, "created review");
+        let review_stream = project_output_stream.with_path(review_stream_path(&review_id));
+        review_registry
+            .subscribe(
+                review_id.clone(),
+                connection_host_stream.clone(),
+                review_stream,
+            )
+            .await
+            .map_err(|error| {
+                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+            })?;
+        tracing::info!(review_id = %review_id, project_id = %project_id, "created or attached review");
         Ok(())
     }
 
@@ -4673,14 +4652,16 @@ impl HostHandle {
     async fn deliver_review_payload(
         &self,
         review_id: ReviewId,
-        target_session_id: SessionId,
+        project_id: ProjectId,
+        target: ReviewSubmitTarget,
         payload: SendMessagePayload,
     ) -> ReviewDeliveryOutcome {
         let message_len = payload.message.len();
         let images_count = payload.images.as_ref().map_or(0, Vec::len);
         tracing::debug!(
             review_id = %review_id,
-            target_session_id = %target_session_id,
+            project_id = %project_id,
+            target = ?target,
             message_len,
             images_count,
             "resolving review delivery"
@@ -4691,7 +4672,7 @@ impl HostHandle {
         else {
             tracing::warn!(
                 review_id = %review_id,
-                target_session_id = %target_session_id,
+                project_id = %project_id,
                 reason = "missing_origin",
                 "review delivery failed before target resolution"
             );
@@ -4703,7 +4684,7 @@ impl HostHandle {
             tracing::warn!(
                 review_id = %review_id,
                 origin_review_id = %origin_review_id,
-                target_session_id = %target_session_id,
+                project_id = %project_id,
                 reason = "origin_mismatch",
                 "review delivery failed before target resolution"
             );
@@ -4713,198 +4694,239 @@ impl HostHandle {
             ));
         }
 
-        let target_session_ids = {
-            let session_store = {
-                let state = self.state.lock().await;
-                Arc::clone(&state.session_store)
-            };
-            let mut ids = vec![target_session_id.clone()];
-            match session_store
-                .lock()
-                .await
-                .compacted_successor_chain(&target_session_id)
-            {
-                Ok(successors) => ids.extend(successors),
-                Err(error) => {
-                    tracing::warn!(
-                        target_session_id = %target_session_id,
-                        error_len = error.len(),
-                        "failed to resolve compacted review delivery target"
-                    );
-                }
-            }
-            ids
-        };
-        tracing::debug!(
-            review_id = %review_id,
-            target_session_id = %target_session_id,
-            candidate_session_count = target_session_ids.len(),
-            "resolved review delivery session candidates"
-        );
-
-        let (target_agent_id, target_agent, delivered_session_id) = {
-            let state = self.state.lock().await;
-            let matches = state
-                .agent_sessions
-                .iter()
-                .filter(|(_, session_id)| target_session_ids.contains(session_id))
-                .filter_map(|(agent_id, session_id)| {
-                    state
-                        .registry
-                        .agent_handle(agent_id)
-                        .map(|handle| (agent_id.clone(), handle, session_id.clone()))
-                })
-                .collect::<Vec<_>>();
-            match matches.len() {
-                0 => {
+        match target {
+            ReviewSubmitTarget::ExistingAgent { agent_id } => {
+                let target_agent = {
+                    let state = self.state.lock().await;
+                    let Some(handle) = state.registry.agent_handle(&agent_id) else {
+                        tracing::info!(
+                            review_id = %review_id,
+                            project_id = %project_id,
+                            target_agent_id = %agent_id,
+                            outcome = "offline",
+                            "review delivery target is offline"
+                        );
+                        return ReviewDeliveryOutcome::Offline;
+                    };
+                    let start = handle.snapshot();
+                    if start.project_id.as_ref() != Some(&project_id) {
+                        tracing::warn!(
+                            review_id = %review_id,
+                            project_id = %project_id,
+                            target_agent_id = %agent_id,
+                            target_project_id = ?start.project_id,
+                            "review delivery target is not in the review project"
+                        );
+                        return ReviewDeliveryOutcome::Failed(format!(
+                            "agent {} is not bound to project {}",
+                            agent_id, project_id
+                        ));
+                    }
+                    handle
+                };
+                if target_agent
+                    .send_input(protocol::AgentInput::SendMessage(payload))
+                    .await
+                {
                     tracing::info!(
                         review_id = %review_id,
-                        target_session_id = %target_session_id,
-                        candidate_session_count = target_session_ids.len(),
-                        outcome = "offline",
-                        "review delivery target is offline"
+                        project_id = %project_id,
+                        target_agent_id = %agent_id,
+                        message_len,
+                        images_count,
+                        "delivered review feedback bundle to live agent"
                     );
-                    return ReviewDeliveryOutcome::Offline;
-                }
-                1 => matches.into_iter().next().expect("one match must exist"),
-                _ => {
+                    ReviewDeliveryOutcome::Delivered {
+                        target_agent_id: agent_id,
+                    }
+                } else {
                     tracing::warn!(
                         review_id = %review_id,
-                        target_session_id = %target_session_id,
-                        candidate_session_count = target_session_ids.len(),
-                        match_count = matches.len(),
-                        outcome = "ambiguous",
-                        "review delivery target is ambiguous"
+                        project_id = %project_id,
+                        target_agent_id = %agent_id,
+                        outcome = "offline",
+                        "review delivery target went offline"
                     );
-                    return ReviewDeliveryOutcome::Ambiguous;
+                    ReviewDeliveryOutcome::Offline
                 }
             }
-        };
-
-        if target_agent
-            .send_input(protocol::AgentInput::SendMessage(payload))
-            .await
-        {
-            tracing::info!(
-                review_id = %review_id,
-                target_agent_id = %target_agent_id,
-                target_session_id = %delivered_session_id,
-                message_len,
-                images_count,
-                "delivered review feedback bundle to live agent"
-            );
-            ReviewDeliveryOutcome::Delivered
-        } else {
-            tracing::warn!(
-                review_id = %review_id,
-                target_agent_id = %target_agent_id,
-                target_session_id = %delivered_session_id,
-                outcome = "offline",
-                "review delivery target went offline"
-            );
-            ReviewDeliveryOutcome::Offline
+            ReviewSubmitTarget::NewAgent {
+                backend_kind,
+                cost_hint,
+                custom_agent_id,
+                name,
+                instructions,
+            } => match self
+                .spawn_review_target_agent(ReviewTargetAgentRequest {
+                    review_id: review_id.clone(),
+                    project_id: project_id.clone(),
+                    backend_kind,
+                    cost_hint,
+                    custom_agent_id,
+                    name,
+                    instructions,
+                    payload,
+                })
+                .await
+            {
+                Ok(agent_id) => ReviewDeliveryOutcome::Delivered {
+                    target_agent_id: agent_id,
+                },
+                Err(message) => ReviewDeliveryOutcome::Failed(message),
+            },
         }
     }
 
-    async fn deliver_submitted_reviews_for_session(&self, session_id: SessionId) {
-        tracing::info!(
-            session_id = %session_id,
-            "scanning for submitted reviews to redeliver"
-        );
-        let registry = {
+    async fn spawn_review_target_agent(
+        &self,
+        request: ReviewTargetAgentRequest,
+    ) -> Result<AgentId, String> {
+        let ReviewTargetAgentRequest {
+            review_id,
+            project_id,
+            backend_kind,
+            cost_hint,
+            custom_agent_id,
+            name,
+            instructions,
+            mut payload,
+        } = request;
+        let (
+            project,
+            settings_store,
+            custom_agent_store,
+            mcp_server_store,
+            steering_store,
+            skill_store,
+            use_mock_backend,
+            debug_mcp,
+            agent_control_mcp,
+        ) = {
             let state = self.state.lock().await;
-            state.review_registry.clone()
-        };
-        let session_ids = {
-            let session_store = {
-                let state = self.state.lock().await;
-                Arc::clone(&state.session_store)
-            };
-            let mut ids = vec![session_id.clone()];
-            match session_store
+            let project = state
+                .project_store
                 .lock()
                 .await
-                .compacted_ancestor_chain(&session_id)
-            {
-                Ok(ancestors) => ids.extend(ancestors),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error_len = error.len(),
-                        "failed to resolve compacted review delivery ancestors"
-                    );
-                }
-            }
-            ids
+                .get(&project_id)
+                .ok_or_else(|| {
+                    format!("cannot spawn review target in missing project {project_id}")
+                })?;
+            (
+                project,
+                Arc::clone(&state.settings_store),
+                Arc::clone(&state.custom_agent_store),
+                Arc::clone(&state.mcp_server_store),
+                Arc::clone(&state.steering_store),
+                Arc::clone(&state.skill_store),
+                state.use_mock_backend,
+                state.debug_mcp.clone(),
+                state.agent_control_mcp.clone(),
+            )
         };
+        if project.roots.is_empty() {
+            return Err(format!(
+                "project {} has no roots for review target",
+                project_id
+            ));
+        }
+
+        let host_settings =
+            settings_store.lock().await.get().map_err(|error| {
+                format!("failed to load host settings for review target: {error}")
+            })?;
+        let startup_mcp_servers = startup_mcp_servers_for_settings(
+            &host_settings,
+            &project.roots,
+            &debug_mcp,
+            &agent_control_mcp,
+        );
+        let mut resolved_spawn_config = {
+            let custom_agents = custom_agent_store.lock().await;
+            let mcp_servers = mcp_server_store.lock().await;
+            let steering = steering_store.lock().await;
+            let skills = skill_store.lock().await;
+            resolve_spawn_config(ResolveSpawnConfigRequest {
+                backend_kind,
+                project_id: Some(&project_id),
+                custom_agent_id: custom_agent_id.as_ref(),
+                built_in_mcp_servers: &startup_mcp_servers,
+                custom_agent_store: &custom_agents,
+                mcp_server_store: &mcp_servers,
+                steering_store: &steering,
+                skill_store: &skills,
+            })
+            .map_err(|error| format!("failed to resolve review target agent config: {error}"))?
+        };
+        resolved_spawn_config.access_mode = protocol::BackendAccessMode::Unrestricted;
+        let startup_mcp_servers =
+            protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
+        let session_settings_schema = {
+            let state = self.state.lock().await;
+            session_schema_for_backend(&state, backend_kind)
+        };
+        let session_settings_schema =
+            if backend_kind == protocol::BackendKind::Kiro && session_settings_schema.is_none() {
+                self.refresh_session_schemas().await;
+                let state = self.state.lock().await;
+                session_schema_for_backend(&state, backend_kind)
+            } else {
+                session_settings_schema
+            };
+        if let Some(instructions) = instructions
+            && !instructions.trim().is_empty()
+        {
+            payload.message = format!(
+                "Instructions for this new review target agent:\n{}\n\n{}",
+                instructions.trim(),
+                payload.message
+            );
+        }
+        let name = name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Review Feedback".to_owned());
+        let request = ResolvedSpawnRequest {
+            name: name.clone(),
+            origin: protocol::AgentOrigin::AgentControl,
+            custom_agent_id,
+            team_id: None,
+            team_member_id: None,
+            parent_agent_id: None,
+            parent_session_id: None,
+            project_id: Some(project_id.clone()),
+            backend_kind,
+            workspace_roots: project.roots,
+            initial_input: Some(payload),
+            cost_hint,
+            session_settings: None,
+            session_settings_schema,
+            startup_mcp_servers,
+            resolved_spawn_config,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            startup_warning: None,
+            startup_failure: None,
+            initial_alias: Some(InitialAgentAlias {
+                name,
+                persistence: InitialAgentAliasPersistence::User,
+            }),
+            use_mock_backend,
+        };
+        let agent_id = self.spawn_resolved_agent(request).await;
+        tracing::info!(
+            review_id = %review_id,
+            project_id = %project_id,
+            target_agent_id = %agent_id,
+            backend_kind = ?backend_kind,
+            "spawned review target agent"
+        );
+        Ok(agent_id)
+    }
+
+    async fn deliver_submitted_reviews_for_session(&self, session_id: SessionId) {
         tracing::debug!(
             session_id = %session_id,
-            origin_session_count = session_ids.len(),
-            "resolved review redelivery origin sessions"
+            "legacy submitted review redelivery is disabled for inline reviews"
         );
-        for origin_session_id in session_ids {
-            tracing::debug!(
-                session_id = %origin_session_id,
-                "querying submitted review bundles for redelivery"
-            );
-            let bundles = match registry
-                .submitted_bundles_for_session(origin_session_id.clone())
-                .await
-            {
-                Ok(bundles) => bundles,
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %origin_session_id,
-                        error_len = error.len(),
-                        "failed to query submitted reviews for resumed session"
-                    );
-                    continue;
-                }
-            };
-            tracing::info!(
-                session_id = %origin_session_id,
-                bundle_count = bundles.len(),
-                "queried submitted review bundles for redelivery"
-            );
-            for (review_id, payload) in bundles {
-                match self
-                    .deliver_review_payload(review_id.clone(), origin_session_id.clone(), payload)
-                    .await
-                {
-                    ReviewDeliveryOutcome::Delivered => {
-                        tracing::info!(
-                            review_id = %review_id,
-                            session_id = %origin_session_id,
-                            outcome = "delivered",
-                            "submitted review redelivery completed"
-                        );
-                    }
-                    ReviewDeliveryOutcome::Offline => {
-                        tracing::info!(
-                            review_id = %review_id,
-                            session_id = %origin_session_id,
-                            outcome = "offline",
-                            "submitted review redelivery deferred"
-                        );
-                    }
-                    ReviewDeliveryOutcome::Ambiguous => {
-                        tracing::warn!(
-                            review_id = %review_id,
-                            session_id = %origin_session_id,
-                            "submitted review delivery is ambiguous after session resume"
-                        );
-                    }
-                    ReviewDeliveryOutcome::Failed(message) => {
-                        tracing::warn!(
-                            review_id = %review_id,
-                            session_id = %origin_session_id,
-                            error_len = message.len(),
-                            "submitted review delivery failed after session resume"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     async fn emit_review_list_changed(&self, project_id: ProjectId) {
@@ -5024,7 +5046,7 @@ impl HostHandle {
         let payload = SpawnAgentPayload {
             name: Some("AI Review".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(request.review.origin_agent_id.clone()),
+            parent_agent_id: None,
             project_id: Some(request.review.project_id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: roots,
@@ -5748,12 +5770,12 @@ fn spawn_host_review_delivery_task(
     let worker = async move {
         while let Some(request) = rx.recv().await {
             let review_id = request.review_id.clone();
-            let origin_session_id = request.origin_session_id.clone();
+            let project_id = request.project_id.clone();
             let message_len = request.payload.message.len();
             let images_count = request.payload.images.as_ref().map_or(0, Vec::len);
             tracing::debug!(
                 review_id = %review_id,
-                origin_session_id = %origin_session_id,
+                project_id = %project_id,
                 message_len,
                 images_count,
                 "review delivery worker received request"
@@ -5761,13 +5783,14 @@ fn spawn_host_review_delivery_task(
             let outcome = host
                 .deliver_review_payload(
                     request.review_id,
-                    request.origin_session_id,
+                    request.project_id,
+                    request.target,
                     request.payload,
                 )
                 .await;
             tracing::debug!(
                 review_id = %review_id,
-                origin_session_id = %origin_session_id,
+                project_id = %project_id,
                 outcome = outcome.label(),
                 "review delivery worker completed request"
             );
@@ -6371,8 +6394,12 @@ async fn ensure_project_actor(
         subscription.task.abort();
     }
 
-    let subscription =
-        spawn_project_subscription(Arc::clone(&state.project_store), project_id.clone()).await?;
+    let subscription = spawn_project_subscription(
+        Arc::clone(&state.project_store),
+        project_id.clone(),
+        state.review_registry.clone(),
+    )
+    .await?;
     let handle = subscription.handle.clone();
     state.project_streams.insert(project_id, subscription);
     Ok(handle)

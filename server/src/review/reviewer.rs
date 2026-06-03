@@ -1,6 +1,6 @@
 use protocol::{
-    AgentErrorPayload, AgentId, ChatEvent, FrameKind, ReviewLocation, ReviewSeverity,
-    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, ToolPolicy,
+    AgentErrorPayload, AgentId, ChatEvent, FrameKind, ReviewAnchorStatus, ReviewLocation,
+    ReviewSeverity, ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, ToolPolicy,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -180,6 +180,7 @@ impl ReviewerToolBridge {
         Some(ReviewSuggestedComment {
             id: ReviewSuggestionId(Uuid::new_v4().to_string()),
             location: args.location,
+            anchor_status: ReviewAnchorStatus::Current,
             body: args.body,
             rationale: args.rationale,
             severity: args.severity,

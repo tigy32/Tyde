@@ -403,13 +403,11 @@ impl Connection {
             .copied()
             .expect("missing project stream sequence counter");
         let selection_kind = payload.selection.kind_name();
-        let origin_agent_id = payload.origin_agent_id.clone();
         let envelope =
             Envelope::from_payload(stream.clone(), FrameKind::ReviewCreate, seq, &payload)
                 .map_err(FrameError::Json)?;
         tracing::debug!(
             project_id = %project_id,
-            origin_agent_id = %origin_agent_id,
             selection_kind,
             stream = %stream,
             seq,

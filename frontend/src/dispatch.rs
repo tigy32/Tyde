@@ -1487,6 +1487,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         ReviewEventPayload::SuggestionUpsert { .. } => "SuggestionUpsert",
                         ReviewEventPayload::AiReviewerChanged { .. } => "AiReviewerChanged",
                         ReviewEventPayload::StatusChanged { .. } => "StatusChanged",
+                        ReviewEventPayload::Cleared { .. } => "Cleared",
                         ReviewEventPayload::Error { .. } => "Error",
                     };
                     let key = format!("review:{}", review_id.0);
@@ -1879,6 +1880,28 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 gate_before.cancel
             );
         }
+        ReviewEventPayload::Cleared { review } => {
+            // A reset of the project-scoped review: emitted after a
+            // successful Submit, an explicit ClearComments, or a clean
+            // working tree. The included `review` is the fresh
+            // (comment/suggestion-free) projection — replace our local
+            // copy wholesale and drop every in-flight gate, since nothing
+            // the user had queued still applies to the reset review.
+            let comments = review.comments.len();
+            let suggestions = review.suggestions.len();
+            state.reviews.update(|map| {
+                map.insert(review_id.clone(), review);
+            });
+            state.review_action_pending.update(|map| {
+                map.remove(review_id);
+            });
+            state.review_action_target_pending.update(|set| {
+                set.retain(|(rid, _)| rid != review_id);
+            });
+            log::info!(
+                "review.event.cleared review={review_id} comments={comments} suggestions={suggestions}"
+            );
+        }
         ReviewEventPayload::Error { error } => {
             log::error!(
                 "review {review_id} server error code={:?} fatal={} context={:?}: {}",
@@ -1901,6 +1924,7 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 ReviewErrorContext::RejectSuggestion { .. } => "reject_suggestion",
                 ReviewErrorContext::StartAiReview => "start_ai",
                 ReviewErrorContext::Submit => "submit",
+                ReviewErrorContext::ClearComments => "clear_comments",
                 ReviewErrorContext::Cancel => "cancel",
             };
             log::info!(
@@ -1960,6 +1984,16 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                     state.review_action_pending.update(|map| {
                         if let Some(gate) = map.get_mut(review_id) {
                             gate.submit = false;
+                            if gate.is_idle() {
+                                map.remove(review_id);
+                            }
+                        }
+                    });
+                }
+                ReviewErrorContext::ClearComments => {
+                    state.review_action_pending.update(|map| {
+                        if let Some(gate) = map.get_mut(review_id) {
+                            gate.clear = false;
                             if gate.is_idle() {
                                 map.remove(review_id);
                             }

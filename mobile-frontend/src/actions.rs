@@ -351,17 +351,13 @@ pub async fn request_project_diff(
 
 pub async fn create_review(
     project: &crate::state::ActiveProjectRef,
-    origin_agent_id: protocol::AgentId,
     selection: protocol::ReviewDiffSelection,
 ) -> Result<(), String> {
     send_frame(
         &project.local_host_id,
         project_stream(&project.project_id),
         protocol::FrameKind::ReviewCreate,
-        &protocol::ReviewCreatePayload {
-            origin_agent_id,
-            selection,
-        },
+        &protocol::ReviewCreatePayload { selection },
     )
     .await
 }

@@ -590,11 +590,6 @@ pub(crate) async fn route_client_envelope(
             }
             FrameKind::ReviewCreate => {
                 let payload: ReviewCreatePayload = parse_payload(&envelope, "review_create")?;
-                ensure_non_empty(
-                    "review_create",
-                    "origin_agent_id",
-                    payload.origin_agent_id.0.as_str(),
-                )?;
                 host.create_review(
                     connection_host_stream,
                     &project_output_stream,

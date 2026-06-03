@@ -69,36 +69,71 @@ pub fn GitPanel() -> impl IntoView {
     }
 }
 
-/// Display-only indicator surfacing an open (Draft/Submitted) review
-/// against the active project's working tree. Click navigates to the
-/// review tab. Creation lives in the agent header — this surface has no
-/// agent context.
+/// Primary entry point for the project-scoped inline review. When a Draft
+/// review already exists for the active project's working tree the control
+/// opens it ("Open review"); otherwise it starts one over the uncommitted
+/// changes ("Review changes"). Project-scoped — no agent context needed;
+/// the feedback target is chosen at submit time.
 #[component]
 fn ReviewIndicator() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let lookup_state = state.clone();
-    let open =
-        move || crate::components::review_view::open_review_for_active_project(&lookup_state);
+    let draft_state = state.clone();
+    let open_draft =
+        move || crate::components::review_view::open_review_for_active_project(&draft_state);
+
+    let changes_state = state.clone();
+    let has_changes = move || {
+        let Some(active) = changes_state.active_project.get() else {
+            return false;
+        };
+        changes_state.git_status.with(|map| {
+            map.get(&active.project_id)
+                .map(|roots| roots.iter().any(|r| !r.clean))
+                .unwrap_or(false)
+        })
+    };
+
+    let pending_state = state.clone();
+    let create_pending = move || {
+        let Some(active) = pending_state.active_project.get() else {
+            return false;
+        };
+        pending_state.review_create_pending.with(|m| {
+            m.get(&(active.host_id.clone(), active.project_id.clone()))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
+    };
 
     view! {
         {move || {
-            let (host_id, review_id) = open()?;
-            let short: String = review_id.0.chars().take(8).collect();
-            let click_host = host_id.clone();
-            let click_review = review_id.clone();
+            let draft = open_draft();
+            let has_draft = draft.is_some();
+            // Surface the control when there is a draft to reopen or
+            // uncommitted changes worth reviewing. A clean tree with no
+            // draft shows nothing.
+            if !has_draft && !has_changes() {
+                return None;
+            }
+            let pending = create_pending();
+            let label = if has_draft { "Open review" } else { "Review changes" };
+            let title = if has_draft {
+                "Open the draft review for this project's working tree"
+            } else {
+                "Start an inline review of the uncommitted changes"
+            };
+            let draft_id = draft.map(|(_, review_id)| review_id);
             Some(view! {
                 <button
                     class="gp-review-indicator"
-                    title="Open the existing draft review for this project's working tree"
+                    class:has-draft=has_draft
+                    disabled=pending
+                    title=title
                     on:click=move |_| {
                         let state = expect_context::<AppState>();
-                        state.open_tab(
-                            crate::state::TabContent::Review {
-                                host_id: click_host.clone(),
-                                review_id: click_review.clone(),
-                            },
-                            crate::components::review_view::review_tab_label(&click_review),
-                            true,
+                        crate::components::review_view::create_or_open_review_for_active_project(
+                            &state,
                         );
                     }
                 >
@@ -109,8 +144,11 @@ fn ReviewIndicator() -> impl IntoView {
                         <path d="M10 2.5V6h3" />
                         <path d="M5.5 9.25l1.5 1.5L11 7.5" />
                     </svg>
-                    <span class="gp-review-indicator-label">"Open draft review"</span>
-                    <span class="gp-review-indicator-id">{short}</span>
+                    <span class="gp-review-indicator-label">{label}</span>
+                    {draft_id.map(|review_id| {
+                        let short: String = review_id.0.chars().take(8).collect();
+                        view! { <span class="gp-review-indicator-id">{short}</span> }
+                    })}
                 </button>
             })
         }}

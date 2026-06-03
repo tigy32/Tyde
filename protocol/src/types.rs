@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -2330,10 +2330,22 @@ pub enum ReviewDiffSide {
 pub struct ReviewComment {
     pub id: ReviewCommentId,
     pub location: ReviewLocation,
+    #[serde(default)]
+    pub anchor_status: ReviewAnchorStatus,
     pub body: String,
     pub source: ReviewCommentSource,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReviewAnchorStatus {
+    #[default]
+    Current,
+    Stale {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2350,6 +2362,8 @@ pub enum ReviewCommentSource {
 pub struct ReviewSuggestedComment {
     pub id: ReviewSuggestionId,
     pub location: ReviewLocation,
+    #[serde(default)]
+    pub anchor_status: ReviewAnchorStatus,
     pub body: String,
     pub rationale: Option<String>,
     pub severity: ReviewSeverity,
@@ -2439,12 +2453,30 @@ impl ReviewAiReviewerStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewCreatePayload {
-    pub origin_agent_id: AgentId,
     pub selection: ReviewDiffSelection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSubscribePayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewSubmitTarget {
+    ExistingAgent {
+        agent_id: AgentId,
+    },
+    NewAgent {
+        backend_kind: BackendKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_hint: Option<SpawnCostHint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_agent_id: Option<CustomAgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2472,7 +2504,10 @@ pub enum ReviewActionPayload {
         cost_hint: Option<SpawnCostHint>,
         instructions: Option<String>,
     },
-    Submit,
+    Submit {
+        target: ReviewSubmitTarget,
+    },
+    ClearComments,
     Cancel,
 }
 
@@ -2485,7 +2520,8 @@ impl ReviewActionPayload {
             Self::AcceptSuggestion { .. } => "accept_suggestion",
             Self::RejectSuggestion { .. } => "reject_suggestion",
             Self::StartAiReview { .. } => "start_ai_review",
-            Self::Submit => "submit",
+            Self::Submit { .. } => "submit",
+            Self::ClearComments => "clear_comments",
             Self::Cancel => "cancel",
         }
     }
@@ -2500,6 +2536,7 @@ pub enum ReviewEventPayload {
     SuggestionUpsert { suggestion: ReviewSuggestedComment },
     AiReviewerChanged { state: ReviewAiReviewerState },
     StatusChanged { status: ReviewStatus },
+    Cleared { review: Review },
     Error { error: ReviewErrorPayload },
 }
 
@@ -2512,6 +2549,7 @@ impl ReviewEventPayload {
             Self::SuggestionUpsert { .. } => "suggestion_upsert",
             Self::AiReviewerChanged { .. } => "ai_reviewer_changed",
             Self::StatusChanged { .. } => "status_changed",
+            Self::Cleared { .. } => "cleared",
             Self::Error { .. } => "error",
         }
     }
@@ -2532,6 +2570,7 @@ pub enum ReviewErrorCode {
     InvalidLocation,
     UnknownComment,
     UnknownSuggestion,
+    InvalidSubmitTarget,
     OriginAgentNotRunning,
     AmbiguousOriginSession,
     ReviewerAlreadyRunning,
@@ -2548,6 +2587,7 @@ impl ReviewErrorCode {
             Self::InvalidLocation => "invalid_location",
             Self::UnknownComment => "unknown_comment",
             Self::UnknownSuggestion => "unknown_suggestion",
+            Self::InvalidSubmitTarget => "invalid_submit_target",
             Self::OriginAgentNotRunning => "origin_agent_not_running",
             Self::AmbiguousOriginSession => "ambiguous_origin_session",
             Self::ReviewerAlreadyRunning => "reviewer_already_running",
@@ -2569,6 +2609,7 @@ pub enum ReviewErrorContext {
     RejectSuggestion { suggestion_id: ReviewSuggestionId },
     StartAiReview,
     Submit,
+    ClearComments,
     Cancel,
 }
 
@@ -2582,6 +2623,7 @@ impl ReviewErrorContext {
             Self::RejectSuggestion { .. } => "reject_suggestion",
             Self::StartAiReview => "start_ai_review",
             Self::Submit => "submit",
+            Self::ClearComments => "clear_comments",
             Self::Cancel => "cancel",
         }
     }

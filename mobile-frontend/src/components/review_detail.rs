@@ -73,6 +73,32 @@ pub fn ReviewDetail(
             .with(|errors| errors.get(&key_for_error).cloned())
     };
 
+    // Number of live same-project agents that could receive this review.
+    // The legacy detail screen has no target picker, so Submit can only
+    // auto-deliver when this is exactly 1 (see `on_submit`). Reactive over
+    // both the loaded review (for its project_id) and the agent list.
+    let host_for_count = host.clone();
+    let key_for_count = key.clone();
+    let state_for_count = state.clone();
+    let candidate_count = move || {
+        let Some(project_id) = state_for_count
+            .reviews
+            .with(|r| r.get(&key_for_count).map(|rv| rv.project_id.clone()))
+        else {
+            return 0usize;
+        };
+        state_for_count.agents.with(|agents| {
+            agents
+                .iter()
+                .filter(|a| {
+                    a.local_host_id == host_for_count
+                        && a.project_id.as_ref() == Some(&project_id)
+                        && a.fatal_error.is_none()
+                })
+                .count()
+        })
+    };
+
     // Submit / Cancel actions
     let host_for_actions = host.clone();
     let review_id_for_submit = review_id.clone();
@@ -82,11 +108,54 @@ pub fn ReviewDetail(
         let review_id = review_id_for_submit.clone();
         let state = state_for_submit.clone();
         spawn_local(async move {
+            // The contract requires a deliverable target (a live
+            // same-project agent). The review's origin is NOT usable —
+            // project-scoped reviews carry a synthetic origin. This legacy
+            // detail screen has no target picker, so it can only auto-submit
+            // when there is exactly one live same-project candidate; the
+            // primary path is the diff-view picker.
+            let key = ReviewRef {
+                local_host_id: host.clone(),
+                review_id: review_id.clone(),
+            };
+            let Some(project_id) = state
+                .reviews
+                .with_untracked(|r| r.get(&key).map(|rv| rv.project_id.clone()))
+            else {
+                log::error!(
+                    "review submit: review {review_id:?} not loaded; cannot resolve target"
+                );
+                return;
+            };
+            let live: Vec<_> = state.agents.with_untracked(|agents| {
+                agents
+                    .iter()
+                    .filter(|a| {
+                        a.local_host_id == host
+                            && a.project_id.as_ref() == Some(&project_id)
+                            && a.fatal_error.is_none()
+                    })
+                    .map(|a| a.agent_id.clone())
+                    .collect()
+            });
+            let target = match live.as_slice() {
+                [only] => protocol::ReviewSubmitTarget::ExistingAgent {
+                    agent_id: only.clone(),
+                },
+                _ => {
+                    log::error!(
+                        "review submit: need exactly one live same-project agent to auto-target \
+                         (found {}); use the diff-view picker to choose",
+                        live.len()
+                    );
+                    return;
+                }
+            };
             if let Err(e) = crate::actions::send_review_action(
                 &state,
                 &host,
                 review_id,
-                protocol::ReviewActionPayload::Submit,
+                protocol::ReviewActionPayload::Submit { target },
             )
             .await
             {
@@ -193,7 +262,7 @@ pub fn ReviewDetail(
                             </div>
                         }.into_any();
                     };
-                    render_loaded(review, on_submit, on_cancel, on_accept_suggestion, on_reject_suggestion).into_any()
+                    render_loaded(review, on_submit, on_cancel, on_accept_suggestion, on_reject_suggestion, candidate_count.clone()).into_any()
                 }}
             </div>
         </div>
@@ -206,6 +275,7 @@ fn render_loaded(
     on_cancel: Callback<()>,
     on_accept_suggestion: Callback<protocol::ReviewSuggestionId>,
     on_reject_suggestion: Callback<protocol::ReviewSuggestionId>,
+    candidate_count: impl Fn() -> usize + Clone + Send + Sync + 'static,
 ) -> impl IntoView {
     let status_label = crate::components::reviews_view::status_label(&review.status);
     let status_tone = crate::components::reviews_view::status_tone(&review.status);
@@ -400,12 +470,41 @@ fn render_loaded(
 
             <Show when=move || is_draft>
                 <div class="review-footer" data-mobile-test="review-detail-footer">
-                    <Button
-                        label="Submit"
-                        variant=ButtonVariant::Primary
-                        data_mobile_test="review-detail-submit"
-                        on_click=on_submit
-                    />
+                    {
+                        // Submit can only auto-deliver to exactly one live
+                        // same-project agent (this screen has no target picker).
+                        // For zero/multiple candidates, disable Submit and point
+                        // the user at the diff-view review picker instead of
+                        // presenting an actionable button that silently no-ops.
+                        let candidate_count = candidate_count.clone();
+                        move || {
+                            let count = candidate_count();
+                            let can_submit = count == 1;
+                            view! {
+                                {(!can_submit).then(|| view! {
+                                    <p
+                                        class="review-footer-hint"
+                                        data-mobile-test="review-detail-submit-hint"
+                                    >
+                                        {if count == 0 {
+                                            "No live agent in this project to receive the review. \
+                                             Open the diff view to choose a target."
+                                        } else {
+                                            "Multiple live agents in this project. Open the diff \
+                                             view to choose which one receives the review."
+                                        }}
+                                    </p>
+                                })}
+                                <Button
+                                    label="Submit"
+                                    variant=ButtonVariant::Primary
+                                    data_mobile_test="review-detail-submit"
+                                    disabled=!can_submit
+                                    on_click=on_submit
+                                />
+                            }
+                        }
+                    }
                     <Button
                         label="Cancel review"
                         variant=ButtonVariant::Destructive
@@ -434,9 +533,9 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, ProjectId, ProjectRootPath, Review, ReviewAiReviewerState, ReviewAiReviewerStatus,
-        ReviewAnchor, ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection,
-        ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSuggestedComment,
-        ReviewSuggestionId, ReviewSuggestionState, SessionId,
+        ReviewAnchor, ReviewAnchorStatus, ReviewComment, ReviewCommentId, ReviewCommentSource,
+        ReviewDiffSelection, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
+        ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, SessionId,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -477,6 +576,7 @@ mod wasm_tests {
                     relative_path: "src/lib.rs".to_owned(),
                     anchor: ReviewAnchor::File,
                 },
+                anchor_status: ReviewAnchorStatus::Current,
                 body: "needs tests".to_owned(),
                 source: ReviewCommentSource::User,
                 created_at_ms: 0,
@@ -489,6 +589,7 @@ mod wasm_tests {
                     relative_path: "src/lib.rs".to_owned(),
                     anchor: ReviewAnchor::File,
                 },
+                anchor_status: ReviewAnchorStatus::Current,
                 body: "consider error::Error".to_owned(),
                 rationale: Some("idiomatic Rust".to_owned()),
                 severity: ReviewSeverity::Warn,
@@ -543,6 +644,145 @@ mod wasm_tests {
                 .query_selector("[data-mobile-test='review-detail-loading']")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A live same-project agent that Submit could auto-target. `fatal`
+    /// marks it dead (filtered out of the candidate count).
+    fn fixture_agent(
+        host: &LocalHostId,
+        id: &str,
+        project: &str,
+        fatal: Option<&str>,
+    ) -> crate::state::AgentInfo {
+        crate::state::AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: AgentId(id.to_owned()),
+            name: id.to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Codex,
+            workspace_roots: vec!["/x".to_owned()],
+            project_id: Some(ProjectId(project.to_owned())),
+            parent_agent_id: None,
+            session_id: Some(SessionId("s1".to_owned())),
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: protocol::StreamPath("/agent/a".to_owned()),
+            started: true,
+            fatal_error: fatal.map(|s| s.to_owned()),
+        }
+    }
+
+    fn mount_draft_with_agents(agents: Vec<crate::state::AgentInfo>) -> HtmlElement {
+        let host = LocalHostId("h1".to_owned());
+        let review_id = ReviewId("r1".to_owned());
+        let host_for_mount = host.clone();
+        let id_for_mount = review_id.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.reviews.update(|m| {
+                m.insert(
+                    ReviewRef {
+                        local_host_id: host.clone(),
+                        review_id: review_id.clone(),
+                    },
+                    fixture_review(ReviewStatus::Draft),
+                );
+            });
+            state.agents.update(|a| *a = agents.clone());
+            provide_context(state);
+            view! {
+                <ReviewDetail
+                    host=host_for_mount.clone()
+                    review_id=id_for_mount.clone()
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        // Keep the mounted view alive past this helper's return — dropping
+        // the handle would unmount before the caller queries the DOM.
+        std::mem::forget(_h);
+        container
+    }
+
+    /// Zero live same-project candidates: this screen can't pick a target,
+    /// so Submit must be disabled and visible guidance must point at the
+    /// diff-view picker. (The fixture's `project_id` is "p1".)
+    #[wasm_bindgen_test]
+    async fn review_detail_disables_submit_without_candidate() {
+        let container = mount_draft_with_agents(Vec::new());
+        next_tick().await;
+        let submit = container
+            .query_selector("[data-mobile-test='review-detail-submit']")
+            .unwrap()
+            .expect("submit button still rendered");
+        assert!(
+            submit.has_attribute("disabled"),
+            "Submit must be disabled when there is no single live same-project agent"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='review-detail-submit-hint']")
+                .unwrap()
+                .is_some(),
+            "guidance toward the diff-view picker must be visible"
+        );
+    }
+
+    /// Multiple live same-project candidates is also ambiguous: still
+    /// disabled, still guided.
+    #[wasm_bindgen_test]
+    async fn review_detail_disables_submit_with_multiple_candidates() {
+        let host = LocalHostId("h1".to_owned());
+        let container = mount_draft_with_agents(vec![
+            fixture_agent(&host, "a1", "p1", None),
+            fixture_agent(&host, "a2", "p1", None),
+        ]);
+        next_tick().await;
+        let submit = container
+            .query_selector("[data-mobile-test='review-detail-submit']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            submit.has_attribute("disabled"),
+            "Submit must be disabled when multiple live same-project agents are candidates"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='review-detail-submit-hint']")
+                .unwrap()
+                .is_some(),
+            "guidance must be visible when the target is ambiguous"
+        );
+    }
+
+    /// Exactly one live same-project candidate: Submit can auto-target it,
+    /// so it is enabled and the guidance hint is absent. A dead agent
+    /// (fatal_error) in the same project must not count toward the total.
+    #[wasm_bindgen_test]
+    async fn review_detail_enables_submit_with_single_candidate() {
+        let host = LocalHostId("h1".to_owned());
+        let container = mount_draft_with_agents(vec![
+            fixture_agent(&host, "a1", "p1", None),
+            fixture_agent(&host, "dead", "p1", Some("crashed")),
+            fixture_agent(&host, "other", "p2", None),
+        ]);
+        next_tick().await;
+        let submit = container
+            .query_selector("[data-mobile-test='review-detail-submit']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !submit.has_attribute("disabled"),
+            "Submit must be enabled when exactly one live same-project agent is a candidate"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='review-detail-submit-hint']")
+                .unwrap()
+                .is_none(),
+            "no guidance hint when Submit can auto-target"
         );
     }
 

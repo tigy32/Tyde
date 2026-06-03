@@ -6,11 +6,11 @@ use protocol::{
     AgentId, DiffContextMode, FrameKind, MessageOrigin, Project, ProjectDiffScope,
     ProjectGitDiffFile, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
     ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerState,
-    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewComment, ReviewCommentId,
-    ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewErrorContext,
-    ReviewErrorPayload, ReviewEventPayload, ReviewId, ReviewLocation, ReviewStatus,
-    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, SendMessagePayload,
-    StreamPath,
+    ReviewAiReviewerStatus, ReviewAnchor, ReviewAnchorStatus, ReviewBootstrapPayload,
+    ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide,
+    ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload, ReviewEventPayload, ReviewId,
+    ReviewLocation, ReviewStatus, ReviewSubmitTarget, ReviewSuggestedComment, ReviewSuggestionId,
+    ReviewSuggestionState, SendMessagePayload, StreamPath,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -26,18 +26,16 @@ pub(crate) type ConnectionId = StreamPath;
 
 #[derive(Debug)]
 pub(crate) enum ReviewDeliveryOutcome {
-    Delivered,
+    Delivered { target_agent_id: AgentId },
     Offline,
-    Ambiguous,
     Failed(String),
 }
 
 impl ReviewDeliveryOutcome {
     pub(crate) const fn label(&self) -> &'static str {
         match self {
-            Self::Delivered => "delivered",
+            Self::Delivered { .. } => "delivered",
             Self::Offline => "offline",
-            Self::Ambiguous => "ambiguous",
             Self::Failed(_) => "failed",
         }
     }
@@ -45,7 +43,8 @@ impl ReviewDeliveryOutcome {
 
 pub(crate) struct ReviewDeliveryRequest {
     pub review_id: ReviewId,
-    pub origin_session_id: protocol::SessionId,
+    pub project_id: protocol::ProjectId,
+    pub target: ReviewSubmitTarget,
     pub payload: SendMessagePayload,
     pub reply: oneshot::Sender<ReviewDeliveryOutcome>,
 }
@@ -86,6 +85,7 @@ pub(crate) enum ReviewCommand {
         target_agent_id: AgentId,
         at_ms: u64,
     },
+    ResetForCleanWorkingTree,
     InternalError {
         message: String,
         context: ReviewErrorContext,
@@ -95,10 +95,6 @@ pub(crate) enum ReviewCommand {
     },
     Summary {
         reply: oneshot::Sender<protocol::ReviewSummary>,
-    },
-    SubmittedBundleForSession {
-        session_id: protocol::SessionId,
-        reply: oneshot::Sender<Option<(ReviewId, SendMessagePayload)>>,
     },
 }
 
@@ -192,6 +188,9 @@ impl ReviewActor {
                 } => {
                     self.handle_bundle_consumed(target_agent_id, at_ms).await;
                 }
+                ReviewCommand::ResetForCleanWorkingTree => {
+                    self.reset_for_clean_working_tree(None).await;
+                }
                 ReviewCommand::InternalError { message, context } => {
                     self.send_error(None, ReviewErrorCode::Internal, message, false, context)
                         .await;
@@ -201,77 +200,6 @@ impl ReviewActor {
                 }
                 ReviewCommand::Summary { reply } => {
                     let _ = reply.send(summary_for_review(&self.review));
-                }
-                ReviewCommand::SubmittedBundleForSession { session_id, reply } => {
-                    tracing::debug!(
-                        review_id = %self.review.id,
-                        requested_session_id = %session_id,
-                        origin_session_id = %self.review.origin_session_id,
-                        status = self.review.status.status_label(),
-                        "checking submitted review bundle for session"
-                    );
-                    let payload = if self.review.origin_session_id == session_id
-                        && matches!(self.review.status, ReviewStatus::Submitted { .. })
-                    {
-                        match self.refresh_diffs().await {
-                            Ok(()) => {}
-                            Err(message) => {
-                                self.send_error(
-                                    None,
-                                    ReviewErrorCode::GitFailed,
-                                    message,
-                                    false,
-                                    ReviewErrorContext::Submit,
-                                )
-                                .await;
-                                let _ = reply.send(None);
-                                continue;
-                            }
-                        }
-                        match self.validate_comment_locations() {
-                            Ok(()) => {}
-                            Err(message) => {
-                                self.send_error(
-                                    None,
-                                    ReviewErrorCode::InvalidLocation,
-                                    message,
-                                    false,
-                                    ReviewErrorContext::Submit,
-                                )
-                                .await;
-                                let _ = reply.send(None);
-                                continue;
-                            }
-                        }
-                        let payload = match self.submit_payload() {
-                            Ok(payload) => Some((self.review.id.clone(), payload)),
-                            Err(message) => {
-                                tracing::warn!(
-                                    review_id = %self.review.id,
-                                    requested_session_id = %session_id,
-                                    error_len = message.len(),
-                                    "failed to rebuild submitted review bundle"
-                                );
-                                None
-                            }
-                        };
-                        tracing::debug!(
-                            review_id = %self.review.id,
-                            requested_session_id = %session_id,
-                            has_bundle = payload.is_some(),
-                            "finished submitted review bundle check"
-                        );
-                        payload
-                    } else {
-                        tracing::debug!(
-                            review_id = %self.review.id,
-                            requested_session_id = %session_id,
-                            has_bundle = false,
-                            "finished submitted review bundle check"
-                        );
-                        None
-                    };
-                    let _ = reply.send(payload);
                 }
             }
         }
@@ -340,8 +268,11 @@ impl ReviewActor {
                 self.start_ai_review(backend_kind, cost_hint, instructions, conn)
                     .await;
             }
-            ReviewActionPayload::Submit => {
-                self.submit(conn).await;
+            ReviewActionPayload::Submit { target } => {
+                self.submit(target, conn).await;
+            }
+            ReviewActionPayload::ClearComments => {
+                self.clear_comments(conn).await;
             }
             ReviewActionPayload::Cancel => {
                 self.cancel(conn).await;
@@ -377,6 +308,7 @@ impl ReviewActor {
         let comment = ReviewComment {
             id: ReviewCommentId(Uuid::new_v4().to_string()),
             location,
+            anchor_status: ReviewAnchorStatus::Current,
             body,
             source: ReviewCommentSource::User,
             created_at_ms: now,
@@ -579,6 +511,7 @@ impl ReviewActor {
         let comment = ReviewComment {
             id: ReviewCommentId(Uuid::new_v4().to_string()),
             location: suggestion.location,
+            anchor_status: ReviewAnchorStatus::Current,
             body,
             source: ReviewCommentSource::AiSuggestion {
                 suggestion_id: suggestion_id.clone(),
@@ -811,7 +744,7 @@ impl ReviewActor {
         }
     }
 
-    async fn submit(&mut self, conn: ConnectionId) {
+    async fn submit(&mut self, target: ReviewSubmitTarget, conn: ConnectionId) {
         let context = ReviewErrorContext::Submit;
         tracing::info!(
             review_id = %self.review.id,
@@ -820,6 +753,7 @@ impl ReviewActor {
             comment_count = self.review.comments.len(),
             suggestion_count = self.review.suggestions.len(),
             ai_reviewer_status = self.review.ai_reviewer.status.status_label(),
+            target = ?target,
             "submit review requested"
         );
         if !self.ensure_draft(&conn, context.clone()).await {
@@ -859,6 +793,17 @@ impl ReviewActor {
                 conn = %conn,
                 "submit review stopped after diff refresh failure"
             );
+            return;
+        }
+        if self.review.comments.is_empty() {
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::InvalidStatus,
+                "cannot submit because the review was reset for a clean working tree".to_owned(),
+                false,
+                context,
+            )
+            .await;
             return;
         }
         let diff_stats = diff_stats(&self.review.diffs);
@@ -915,54 +860,28 @@ impl ReviewActor {
             }
         };
 
-        let previous = self.review.clone();
-        let submitted_at_ms = now_ms();
-        self.review.status = ReviewStatus::Submitted { submitted_at_ms };
-        self.review.updated_at_ms = submitted_at_ms;
-        if !self
-            .persist_or_revert(previous.clone(), Some(&conn), context.clone())
-            .await
-        {
-            tracing::warn!(
-                review_id = %self.review.id,
-                submitted_at_ms,
-                "failed to persist submitted review status"
-            );
-            return;
-        }
-        tracing::info!(
-            review_id = %self.review.id,
-            submitted_at_ms,
-            status = self.review.status.status_label(),
-            "persisted submitted review"
-        );
-        self.broadcast(ReviewEventPayload::StatusChanged {
-            status: self.review.status.clone(),
-        })
-        .await;
-        self.notify_project_changed();
-
         let (reply, response) = oneshot::channel();
         let request = ReviewDeliveryRequest {
             review_id: self.review.id.clone(),
-            origin_session_id: self.review.origin_session_id.clone(),
+            project_id: self.review.project_id.clone(),
+            target,
             payload,
             reply,
         };
         tracing::info!(
             review_id = %self.review.id,
-            origin_session_id = %self.review.origin_session_id,
-            "requesting submitted review delivery"
+            project_id = %self.review.project_id,
+            "requesting review delivery"
         );
         if self.delivery_tx.send(request).await.is_err() {
             tracing::warn!(
                 review_id = %self.review.id,
-                origin_session_id = %self.review.origin_session_id,
-                "submitted review delivery channel unavailable"
+                project_id = %self.review.project_id,
+                "review delivery channel unavailable"
             );
             self.send_error(
                 Some(&conn),
-                ReviewErrorCode::OriginAgentNotRunning,
+                ReviewErrorCode::InvalidSubmitTarget,
                 "review delivery task stopped".to_owned(),
                 false,
                 context,
@@ -972,65 +891,42 @@ impl ReviewActor {
         }
 
         match response.await {
-            Ok(ReviewDeliveryOutcome::Delivered) => {
+            Ok(ReviewDeliveryOutcome::Delivered { target_agent_id }) => {
                 tracing::info!(
                     review_id = %self.review.id,
-                    origin_session_id = %self.review.origin_session_id,
+                    target_agent_id = %target_agent_id,
                     outcome = "delivered",
-                    "submitted review delivery completed"
+                    "review delivery completed"
                 );
+                self.clear_review_state(false, Some(&conn), context).await;
             }
             Ok(ReviewDeliveryOutcome::Offline) => {
                 tracing::info!(
                     review_id = %self.review.id,
-                    origin_session_id = %self.review.origin_session_id,
+                    project_id = %self.review.project_id,
                     outcome = "offline",
-                    "submitted review delivery deferred"
+                    "review delivery target is offline"
                 );
-            }
-            Ok(ReviewDeliveryOutcome::Ambiguous) => {
-                tracing::warn!(
-                    review_id = %self.review.id,
-                    origin_session_id = %self.review.origin_session_id,
-                    outcome = "ambiguous",
-                    "submitted review delivery ambiguous"
-                );
-                let submitted = self.review.clone();
-                self.review.status = ReviewStatus::Draft;
-                self.review.updated_at_ms = now_ms();
-                if self
-                    .persist_or_revert(submitted, Some(&conn), context.clone())
-                    .await
-                {
-                    self.send_error(
-                        Some(&conn),
-                        ReviewErrorCode::AmbiguousOriginSession,
-                        format!(
-                            "multiple live agents are bound to session {}",
-                            self.review.origin_session_id
-                        ),
-                        false,
-                        context.clone(),
-                    )
-                    .await;
-                    self.broadcast(ReviewEventPayload::StatusChanged {
-                        status: self.review.status.clone(),
-                    })
-                    .await;
-                    self.notify_project_changed();
-                }
+                self.send_error(
+                    Some(&conn),
+                    ReviewErrorCode::InvalidSubmitTarget,
+                    "review submit target is not running".to_owned(),
+                    false,
+                    context,
+                )
+                .await;
             }
             Ok(ReviewDeliveryOutcome::Failed(message)) => {
                 tracing::warn!(
                     review_id = %self.review.id,
-                    origin_session_id = %self.review.origin_session_id,
+                    project_id = %self.review.project_id,
                     outcome = "failed",
                     error_len = message.len(),
-                    "submitted review delivery failed"
+                    "review delivery failed"
                 );
                 self.send_error(
                     Some(&conn),
-                    ReviewErrorCode::OriginAgentNotRunning,
+                    ReviewErrorCode::InvalidSubmitTarget,
                     message,
                     false,
                     context,
@@ -1040,12 +936,12 @@ impl ReviewActor {
             Err(_) => {
                 tracing::warn!(
                     review_id = %self.review.id,
-                    origin_session_id = %self.review.origin_session_id,
-                    "submitted review delivery response dropped"
+                    project_id = %self.review.project_id,
+                    "review delivery response dropped"
                 );
                 self.send_error(
                     Some(&conn),
-                    ReviewErrorCode::OriginAgentNotRunning,
+                    ReviewErrorCode::InvalidSubmitTarget,
                     "review delivery task dropped response".to_owned(),
                     false,
                     context,
@@ -1053,6 +949,14 @@ impl ReviewActor {
                 .await;
             }
         }
+    }
+
+    async fn clear_comments(&mut self, conn: ConnectionId) {
+        let context = ReviewErrorContext::ClearComments;
+        if !self.ensure_draft(&conn, context.clone()).await {
+            return;
+        }
+        self.clear_review_state(false, Some(&conn), context).await;
     }
 
     async fn cancel(&mut self, conn: ConnectionId) {
@@ -1161,6 +1065,7 @@ impl ReviewActor {
             return Err(error);
         }
         suggestion.state = ReviewSuggestionState::Pending;
+        suggestion.anchor_status = ReviewAnchorStatus::Current;
         let suggestion_id = suggestion.id.clone();
         let previous = self.review.clone();
         match self
@@ -1264,17 +1169,12 @@ impl ReviewActor {
             "review bundle consumed notification received"
         );
         let ReviewStatus::Submitted { submitted_at_ms } = self.review.status.clone() else {
-            self.send_error(
-                None,
-                ReviewErrorCode::Internal,
-                format!(
-                    "review bundle was reported consumed while review {} was not submitted",
-                    self.review.id
-                ),
-                false,
-                ReviewErrorContext::Submit,
-            )
-            .await;
+            tracing::debug!(
+                review_id = %self.review.id,
+                target_agent_id = %target_agent_id,
+                status = self.review.status.status_label(),
+                "ignoring consumed notification for inline review delivery"
+            );
             return;
         };
         let previous = self.review.clone();
@@ -1314,6 +1214,52 @@ impl ReviewActor {
             }),
             tool_response: None,
         })
+    }
+
+    async fn reset_for_clean_working_tree(&mut self, conn: Option<&ConnectionId>) {
+        if !review_has_user_state(&self.review) && self.review.diffs.is_empty() {
+            return;
+        }
+        tracing::info!(
+            review_id = %self.review.id,
+            project_id = %self.review.project_id,
+            "resetting review for clean working tree"
+        );
+        self.clear_review_state(true, conn, ReviewErrorContext::ClearComments)
+            .await;
+    }
+
+    async fn clear_review_state(
+        &mut self,
+        clear_diffs: bool,
+        conn: Option<&ConnectionId>,
+        context: ReviewErrorContext,
+    ) -> bool {
+        let previous = self.review.clone();
+        self.review.status = ReviewStatus::Draft;
+        self.review.comments.clear();
+        self.review.suggestions.clear();
+        self.review.ai_reviewer = ReviewAiReviewerState {
+            status: ReviewAiReviewerStatus::Idle,
+            agent_id: None,
+            error: None,
+        };
+        if clear_diffs {
+            self.review.diffs.clear();
+        }
+        self.review.updated_at_ms = now_ms();
+        if !self
+            .persist_or_revert(previous, conn, context.clone())
+            .await
+        {
+            return false;
+        }
+        self.broadcast(ReviewEventPayload::Cleared {
+            review: self.review.clone(),
+        })
+        .await;
+        self.notify_project_changed();
+        true
     }
 
     async fn ensure_draft(&mut self, conn: &ConnectionId, context: ReviewErrorContext) -> bool {
@@ -1374,7 +1320,28 @@ impl ReviewActor {
         match read_review_diffs(&project, &self.review.selection) {
             Ok(diffs) => {
                 let stats = diff_stats(&diffs);
+                let previous = self.review.clone();
                 self.review.diffs = diffs;
+                if diff_is_clean(&self.review.diffs) {
+                    self.reset_for_clean_working_tree(None).await;
+                    return Ok(());
+                }
+                let anchor_updates = refresh_anchor_statuses(&mut self.review);
+                if anchor_updates.has_changes() {
+                    self.review.updated_at_ms = now_ms();
+                    self.store.upsert(self.review.clone())?;
+                    for comment in anchor_updates.comments {
+                        self.broadcast(ReviewEventPayload::CommentUpsert { comment })
+                            .await;
+                    }
+                    for suggestion in anchor_updates.suggestions {
+                        self.broadcast(ReviewEventPayload::SuggestionUpsert { suggestion })
+                            .await;
+                    }
+                    self.notify_project_changed();
+                } else {
+                    self.review.updated_at_ms = previous.updated_at_ms;
+                }
                 tracing::info!(
                     review_id = %self.review.id,
                     project_id = %self.review.project_id,
@@ -1404,6 +1371,12 @@ impl ReviewActor {
 
     fn validate_comment_locations(&self) -> Result<(), String> {
         for comment in &self.review.comments {
+            if let ReviewAnchorStatus::Stale { reason } = &comment.anchor_status {
+                return Err(format!(
+                    "review comment {} has a stale anchor: {}",
+                    comment.id, reason
+                ));
+            }
             validate_location(&self.review, &comment.location)?;
         }
         Ok(())
@@ -1608,6 +1581,67 @@ fn diff_stats(diffs: &[ProjectGitDiffPayload]) -> DiffStats {
         hunk_count,
         line_count,
     }
+}
+
+#[derive(Default)]
+struct AnchorStatusUpdates {
+    comments: Vec<ReviewComment>,
+    suggestions: Vec<ReviewSuggestedComment>,
+}
+
+impl AnchorStatusUpdates {
+    fn has_changes(&self) -> bool {
+        !self.comments.is_empty() || !self.suggestions.is_empty()
+    }
+}
+
+fn refresh_anchor_statuses(review: &mut Review) -> AnchorStatusUpdates {
+    let comment_statuses = review
+        .comments
+        .iter()
+        .map(|comment| anchor_status_for_location(review, &comment.location))
+        .collect::<Vec<_>>();
+    let suggestion_statuses = review
+        .suggestions
+        .iter()
+        .map(|suggestion| anchor_status_for_location(review, &suggestion.location))
+        .collect::<Vec<_>>();
+
+    let mut updates = AnchorStatusUpdates::default();
+    for (comment, status) in review.comments.iter_mut().zip(comment_statuses) {
+        if comment.anchor_status != status {
+            comment.anchor_status = status;
+            updates.comments.push(comment.clone());
+        }
+    }
+    for (suggestion, status) in review.suggestions.iter_mut().zip(suggestion_statuses) {
+        if suggestion.anchor_status != status {
+            suggestion.anchor_status = status;
+            updates.suggestions.push(suggestion.clone());
+        }
+    }
+    updates
+}
+
+fn anchor_status_for_location(review: &Review, location: &ReviewLocation) -> ReviewAnchorStatus {
+    match validate_location(review, location) {
+        Ok(()) => ReviewAnchorStatus::Current,
+        Err(reason) => ReviewAnchorStatus::Stale { reason },
+    }
+}
+
+fn diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {
+    diffs
+        .iter()
+        .all(|diff| diff.files.iter().all(|file| file.hunks.is_empty()))
+}
+
+fn review_has_user_state(review: &Review) -> bool {
+    !review.comments.is_empty()
+        || !review.suggestions.is_empty()
+        || !matches!(review.ai_reviewer.status, ReviewAiReviewerStatus::Idle)
+        || review.ai_reviewer.agent_id.is_some()
+        || review.ai_reviewer.error.is_some()
 }
 
 fn review_error(
@@ -1865,6 +1899,41 @@ mod tests {
     }
 
     #[test]
+    fn refresh_anchor_statuses_marks_comments_stale_without_reanchoring() {
+        let mut review = sample_review();
+        let original_location = ReviewLocation {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/lib.rs".to_owned(),
+            anchor: ReviewAnchor::LineRange {
+                side: ReviewDiffSide::New,
+                start_line: 2,
+                end_line: 2,
+            },
+        };
+        review.comments.push(ReviewComment {
+            id: ReviewCommentId("comment-1".to_owned()),
+            location: original_location.clone(),
+            anchor_status: ReviewAnchorStatus::Current,
+            body: "body".to_owned(),
+            source: ReviewCommentSource::User,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+        review.diffs[0].files[0].hunks[0]
+            .lines
+            .retain(|line| line.kind != ProjectGitDiffLineKind::Added);
+
+        let updates = refresh_anchor_statuses(&mut review);
+
+        assert_eq!(updates.comments.len(), 1);
+        assert_eq!(review.comments[0].location, original_location);
+        assert!(matches!(
+            review.comments[0].anchor_status,
+            ReviewAnchorStatus::Stale { .. }
+        ));
+    }
+
+    #[test]
     fn ai_suggestion_state_is_pending_before_insert() {
         let mut suggestion = ReviewSuggestedComment {
             id: ReviewSuggestionId("suggestion-1".to_owned()),
@@ -1873,6 +1942,7 @@ mod tests {
                 relative_path: "src/lib.rs".to_owned(),
                 anchor: ReviewAnchor::File,
             },
+            anchor_status: ReviewAnchorStatus::Current,
             body: "body".to_owned(),
             rationale: None,
             severity: ReviewSeverity::Warn,

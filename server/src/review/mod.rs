@@ -9,8 +9,8 @@ use actor::{ConnectionId, ReviewCommand, spawn_review_actor};
 use protocol::{
     AgentId, DiffContextMode, ProjectGitDiffPayload, ProjectId, Review, ReviewActionPayload,
     ReviewAiReviewerStatus, ReviewCreatePayload, ReviewDiffSelection, ReviewErrorContext,
-    ReviewErrorPayload, ReviewId, ReviewStatus, ReviewSuggestionId, ReviewSummary,
-    SendMessagePayload, SessionId, StreamPath,
+    ReviewErrorPayload, ReviewId, ReviewStatus, ReviewSuggestionId, ReviewSummary, SessionId,
+    StreamPath,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -86,6 +86,13 @@ impl ReviewHandle {
             .map_err(|_| "review actor stopped".to_owned())
     }
 
+    async fn reset_for_clean_working_tree(&self) -> Result<(), String> {
+        self.tx
+            .send(ReviewCommand::ResetForCleanWorkingTree)
+            .await
+            .map_err(|_| "review actor stopped".to_owned())
+    }
+
     async fn internal_error(
         &self,
         message: String,
@@ -118,20 +125,6 @@ impl ReviewHandle {
             .await
             .map_err(|_| "review actor dropped summary response".to_owned())
     }
-
-    async fn submitted_bundle_for_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<(ReviewId, SendMessagePayload)>, String> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(ReviewCommand::SubmittedBundleForSession { session_id, reply })
-            .await
-            .map_err(|_| "review actor stopped".to_owned())?;
-        response
-            .await
-            .map_err(|_| "review actor dropped submitted bundle response".to_owned())
-    }
 }
 
 #[derive(Clone)]
@@ -142,12 +135,8 @@ pub(crate) struct ReviewRegistryHandle {
 pub(crate) struct ReviewCreateRequest {
     pub review_id: ReviewId,
     pub project_id: ProjectId,
-    pub origin_agent_id: AgentId,
-    pub origin_session_id: SessionId,
     pub selection: ReviewDiffSelection,
     pub diffs: Vec<ProjectGitDiffPayload>,
-    pub conn: ConnectionId,
-    pub stream: Stream,
 }
 
 enum RegistryCommand {
@@ -192,9 +181,9 @@ enum RegistryCommand {
         project_id: ProjectId,
         reply: oneshot::Sender<Result<Vec<ReviewSummary>, String>>,
     },
-    SubmittedBundles {
-        session_id: SessionId,
-        reply: oneshot::Sender<Result<Vec<(ReviewId, SendMessagePayload)>, String>>,
+    ResetProjectForCleanWorkingTree {
+        project_id: ProjectId,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -397,18 +386,18 @@ impl ReviewRegistryHandle {
             .map_err(|_| "review registry dropped summaries response".to_owned())?
     }
 
-    pub(crate) async fn submitted_bundles_for_session(
+    pub(crate) async fn reset_project_for_clean_working_tree(
         &self,
-        session_id: SessionId,
-    ) -> Result<Vec<(ReviewId, SendMessagePayload)>, String> {
+        project_id: ProjectId,
+    ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
-            .send(RegistryCommand::SubmittedBundles { session_id, reply })
+            .send(RegistryCommand::ResetProjectForCleanWorkingTree { project_id, reply })
             .await
             .map_err(|_| "review registry stopped".to_owned())?;
         response
             .await
-            .map_err(|_| "review registry dropped submitted bundles response".to_owned())?
+            .map_err(|_| "review registry dropped clean reset response".to_owned())?
     }
 }
 
@@ -493,8 +482,8 @@ impl ReviewRegistryActor {
                     let result = self.summaries(project_id).await;
                     let _ = reply.send(result);
                 }
-                RegistryCommand::SubmittedBundles { session_id, reply } => {
-                    let result = self.submitted_bundles(session_id).await;
+                RegistryCommand::ResetProjectForCleanWorkingTree { project_id, reply } => {
+                    let result = self.reset_project_for_clean_working_tree(project_id).await;
                     let _ = reply.send(result);
                 }
             }
@@ -502,13 +491,18 @@ impl ReviewRegistryActor {
     }
 
     async fn create(&mut self, request: ReviewCreateRequest) -> Result<ReviewId, String> {
+        if let Some(review_id) = self.draft_review_for_project(&request.project_id).await? {
+            return Ok(review_id);
+        }
+
         let now = now_ms();
         let review_id = request.review_id;
+        let (origin_agent_id, origin_session_id) = synthetic_review_origin(&request.project_id);
         let review = Review {
             id: review_id.clone(),
             project_id: request.project_id.clone(),
-            origin_agent_id: request.origin_agent_id,
-            origin_session_id: request.origin_session_id,
+            origin_agent_id,
+            origin_session_id,
             selection: request.selection,
             status: ReviewStatus::Draft,
             diffs: request.diffs,
@@ -531,10 +525,32 @@ impl ReviewRegistryActor {
             self.ai_spawn_tx.clone(),
             self.project_update_tx.clone(),
         );
-        handle.subscribe(request.conn, request.stream).await?;
         self.handles.insert(review_id.clone(), handle);
         let _ = self.project_update_tx.send(request.project_id);
         Ok(review_id)
+    }
+
+    async fn draft_review_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<ReviewId>, String> {
+        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let mut drafts = Vec::new();
+        for handle in handles {
+            let snapshot = handle.snapshot().await?;
+            if snapshot.project_id == *project_id && matches!(snapshot.status, ReviewStatus::Draft)
+            {
+                drafts.push(snapshot);
+            }
+        }
+        drafts.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        Ok(drafts.into_iter().next().map(|review| review.id))
     }
 
     async fn subscribe(
@@ -569,10 +585,7 @@ impl ReviewRegistryActor {
         let mut summaries = Vec::new();
         for handle in self.handles.values() {
             let summary = handle.summary().await?;
-            if summary.origin_session_id.0.trim().is_empty() {
-                return Err(format!("review {} has empty origin session id", summary.id));
-            }
-            if !matches!(summary.status, ReviewStatus::Cancelled { .. }) {
+            if matches!(summary.status, ReviewStatus::Draft) {
                 let snapshot = handle.snapshot().await?;
                 if snapshot.project_id == project_id {
                     summaries.push(summary);
@@ -589,21 +602,18 @@ impl ReviewRegistryActor {
         Ok(summaries)
     }
 
-    async fn submitted_bundles(
+    async fn reset_project_for_clean_working_tree(
         &self,
-        session_id: SessionId,
-    ) -> Result<Vec<(ReviewId, SendMessagePayload)>, String> {
-        let mut bundles = Vec::new();
-        for handle in self.handles.values() {
-            if let Some(bundle) = handle
-                .submitted_bundle_for_session(session_id.clone())
-                .await?
-            {
-                bundles.push(bundle);
+        project_id: ProjectId,
+    ) -> Result<(), String> {
+        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        for handle in handles {
+            let snapshot = handle.snapshot().await?;
+            if snapshot.project_id == project_id && matches!(snapshot.status, ReviewStatus::Draft) {
+                handle.reset_for_clean_working_tree().await?;
             }
         }
-        bundles.sort_by(|left, right| left.0.0.cmp(&right.0.0));
-        Ok(bundles)
+        Ok(())
     }
 }
 
@@ -625,22 +635,20 @@ pub(crate) fn review_stream_path(review_id: &ReviewId) -> StreamPath {
 pub(crate) fn build_create_request(
     review_id: ReviewId,
     project_id: ProjectId,
-    origin_session_id: SessionId,
     payload: ReviewCreatePayload,
     diffs: Vec<ProjectGitDiffPayload>,
-    conn: ConnectionId,
-    stream: Stream,
 ) -> ReviewCreateRequest {
     ReviewCreateRequest {
         review_id,
         project_id,
-        origin_agent_id: payload.origin_agent_id,
-        origin_session_id,
         selection: normalize_selection(payload.selection),
         diffs: normalize_diff_payloads(diffs),
-        conn,
-        stream,
     }
+}
+
+fn synthetic_review_origin(project_id: &ProjectId) -> (AgentId, SessionId) {
+    let id = format!("project-review:{}", project_id.0);
+    (AgentId(id.clone()), SessionId(id))
 }
 
 fn normalize_selection(selection: ReviewDiffSelection) -> ReviewDiffSelection {
@@ -740,6 +748,7 @@ mod tests {
                     relative_path: "src/lib.rs".to_owned(),
                     anchor: protocol::ReviewAnchor::File,
                 },
+                anchor_status: protocol::ReviewAnchorStatus::Current,
                 body: "body".to_owned(),
                 source: protocol::ReviewCommentSource::User,
                 created_at_ms: 1,
@@ -752,6 +761,7 @@ mod tests {
                     relative_path: "src/lib.rs".to_owned(),
                     anchor: protocol::ReviewAnchor::File,
                 },
+                anchor_status: protocol::ReviewAnchorStatus::Current,
                 body: "body".to_owned(),
                 rationale: None,
                 severity: protocol::ReviewSeverity::Info,

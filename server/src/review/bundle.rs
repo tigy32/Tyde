@@ -255,6 +255,7 @@ mod tests {
             comments: vec![ReviewComment {
                 id: ReviewCommentId("comment-1".to_owned()),
                 location,
+                anchor_status: protocol::ReviewAnchorStatus::Current,
                 body: "Please check this.".to_owned(),
                 source: ReviewCommentSource::User,
                 created_at_ms: 1,
