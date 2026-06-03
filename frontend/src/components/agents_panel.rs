@@ -736,9 +736,9 @@ fn agent_card(
                 {is_side_question.then(|| view! {
                     <span
                         class="agent-card-side-question-badge"
-                        title="Side question (BTW) — forked from another agent's session"
+                        title="Ask aside — forked from another agent's session"
                     >
-                        "BTW"
+                        "Aside"
                     </span>
                 })}
                 <span class={format!("{} agent-card-backend", backend_class(backend))}>{backend_label(backend)}</span>
@@ -1245,10 +1245,10 @@ mod wasm_tests {
         );
     }
 
-    /// A side-question (BTW) agent renders a compact "BTW" badge so the user
+    /// A side-question agent renders a compact "Aside" badge so the user
     /// can tell it apart from ordinary agents in the sidebar.
     #[wasm_bindgen_test]
-    async fn side_question_agent_shows_btw_badge() {
+    async fn side_question_agent_shows_aside_badge() {
         let container = make_container();
         let state = make_app_state("h");
         push_agent(&state, "h", "a-btw", "Side question", true);
@@ -1264,11 +1264,11 @@ mod wasm_tests {
         let badge = container
             .query_selector(".agent-card-side-question-badge")
             .unwrap()
-            .expect("side-question agent must render a BTW badge");
+            .expect("side-question agent must render an Aside badge");
         assert_eq!(
             badge.text_content().unwrap_or_default().trim(),
-            "BTW",
-            "side-question badge text must read BTW"
+            "Aside",
+            "side-question badge text must read Aside"
         );
     }
 

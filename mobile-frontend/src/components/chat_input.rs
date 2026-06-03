@@ -72,7 +72,7 @@ fn active_agent_is_running_tracked(state: &AppState) -> bool {
 }
 
 /// True when the active agent has reported a backend session id, which is
-/// required to fork a BTW / side question off it.
+/// required to fork an "Ask aside" side question from it.
 fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
     let Some(active) = state.active_agent.get() else {
         return false;
@@ -164,12 +164,12 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
 
 /// Mobile chat composer.
 ///
-/// Sends on tap of the primary "Send" button or Enter (without Shift). Stays
-/// enabled while a turn is active so the user can queue follow-up messages,
-/// and surfaces queued-message controls above the composer. A caret next to
-/// Send opens a dropdown of the available actions (Send, BTW, Interrupt and
-/// send now, Interrupt) whenever any of them apply. Send is disabled only when
-/// the composer is empty, the standard mobile pattern users already expect.
+/// Primary button label follows the state matrix: "Send" when idle, "Queue"
+/// when a turn is running and there is draft text, "Cancel" when running with
+/// an empty composer. The caret is always rendered but disabled when the
+/// dropdown would be empty. The dropdown carries secondary actions only:
+/// "Steer" and "Cancel" when running+input; "Ask aside" when a forkable
+/// session exists and there is draft text.
 #[component]
 pub fn ChatInput() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -229,9 +229,6 @@ pub fn ChatInput() -> impl IntoView {
             });
         }
     };
-
-    let send_for_click = do_send.clone();
-    let on_send_click = move |_| send_for_click();
 
     let send_for_key = do_send.clone();
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
@@ -329,10 +326,10 @@ pub fn ChatInput() -> impl IntoView {
     };
     let interrupt_for_menu = do_interrupt;
 
-    // BTW / side question: fork the active agent's session into a fresh
-    // read-only agent seeded with the current draft, then clear the draft
-    // optimistically (mirroring send). Enabled only when there is draft text
-    // and the active agent has a forkable backend session.
+    // "Ask aside": fork the active agent's session into a fresh read-only agent
+    // seeded with the current draft, then clear the draft optimistically
+    // (mirroring send). Enabled only when there is draft text and the active
+    // agent has a forkable backend session.
     let do_btw = {
         let state = state.clone();
         move || {
@@ -376,14 +373,12 @@ pub fn ChatInput() -> impl IntoView {
         btw_state.chat_input.with(|t| !t.trim().is_empty())
             && active_agent_has_session_id_tracked(&btw_state)
     });
-    // Split-button menu state. `is_steer` (running with a draft) gates the
-    // extra "Interrupt and send now" item. The caret is shown whenever the
-    // menu would hold at least one item.
+    // Steer = thinking + draft typed.
     let is_steer = Memo::new(move |_| is_running.get() && has_text.get());
-    let menu_has_items = Memo::new(move |_| has_text.get() || can_btw.get() || is_running.get());
+    // Menu holds items only for: Ask aside (input+session) or Steer+Cancel (thinking+input).
+    let menu_has_items = Memo::new(move |_| can_btw.get() || is_steer.get());
     let menu_open = RwSignal::new(false);
-    // Auto-dismiss a stale-open menu when its items disappear (turn ends or the
-    // draft is cleared) so it can't silently re-appear when they return.
+    // Auto-dismiss a stale-open menu when its items disappear.
     Effect::new(move |_| {
         if !menu_has_items.get() {
             menu_open.set(false);
@@ -468,47 +463,59 @@ pub fn ChatInput() -> impl IntoView {
                     <button
                         type="button"
                         class="send-button chat-send-split-primary"
-                        aria-label="Send message"
+                        aria-label={move || {
+                            if is_running.get() && !has_text.get() { "Cancel current turn" }
+                            else if is_steer.get() { "Queue message" }
+                            else { "Send message" }
+                        }}
                         data-mobile-test="chat-send"
-                        on:click=on_send_click
-                        disabled=move || !has_text.get()
-                    >
-                        "Send"
-                    </button>
-                    {move || {
-                        // Hide the caret entirely when the menu would be empty,
-                        // so the composer row stays tight on narrow screens.
-                        if !menu_has_items.get() {
-                            return view! { <div></div> }.into_any();
-                        }
-                        view! {
-                            <button
-                                type="button"
-                                class="send-menu-toggle"
-                                data-mobile-test="chat-send-menu-toggle"
-                                aria-haspopup="menu"
-                                aria-expanded=move || {
-                                    if menu_open.get() { "true" } else { "false" }
+                        on:click={
+                            let do_interrupt = interrupt_for_menu.clone();
+                            let do_send = send_for_menu.clone();
+                            move |_| {
+                                if is_running.get_untracked() && !has_text.get_untracked() {
+                                    do_interrupt();
+                                } else {
+                                    do_send();
                                 }
-                                aria-label="More send actions"
-                                on:click=move |_| menu_open.update(|open| *open = !*open)
-                            >
-                                <span aria-hidden="true">"\u{2304}"</span>
-                            </button>
-                        }.into_any()
-                    }}
+                            }
+                        }
+                        disabled=move || {
+                            // Cancel (thinking+empty): always enabled.
+                            if is_running.get() && !has_text.get() { false }
+                            else { !has_text.get() }
+                        }
+                    >
+                        {move || {
+                            if is_running.get() && !has_text.get() { "Cancel" }
+                            else if is_steer.get() { "Queue" }
+                            else { "Send" }
+                        }}
+                    </button>
+                    <button
+                        type="button"
+                        class="send-menu-toggle"
+                        data-mobile-test="chat-send-menu-toggle"
+                        aria-haspopup="menu"
+                        aria-expanded=move || {
+                            if menu_open.get() { "true" } else { "false" }
+                        }
+                        aria-label="More send actions"
+                        disabled=move || !menu_has_items.get()
+                        on:click=move |_| menu_open.update(|open| *open = !*open)
+                    >
+                        <span aria-hidden="true">"\u{2304}"</span>
+                    </button>
                     {move || {
                         if !(menu_open.get() && menu_has_items.get()) {
                             return view! { <div></div> }.into_any();
                         }
-                        let on_send = send_for_menu.clone();
                         let on_btw = btw_for_menu.clone();
                         let on_steer = steer_for_menu.clone();
-                        let on_interrupt = interrupt_for_menu.clone();
-                        let show_send = has_text.get();
-                        let show_btw = can_btw.get();
+                        let on_cancel = interrupt_for_menu.clone();
                         let show_steer = is_steer.get();
-                        let show_interrupt = is_running.get();
+                        let show_btw = can_btw.get();
+                        let show_cancel = is_steer.get();
                         view! {
                             <div
                                 class="chat-send-menu-backdrop"
@@ -521,28 +528,6 @@ pub fn ChatInput() -> impl IntoView {
                                 aria-label="Send actions"
                                 data-mobile-test="chat-send-menu"
                             >
-                                {show_send.then(|| view! {
-                                    <button
-                                        type="button"
-                                        class="chat-send-menu-item"
-                                        role="menuitem"
-                                        data-mobile-test="chat-send-menu-send"
-                                        on:click=move |_| { menu_open.set(false); on_send(); }
-                                    >
-                                        "Send"
-                                    </button>
-                                })}
-                                {show_btw.then(|| view! {
-                                    <button
-                                        type="button"
-                                        class="chat-send-menu-item"
-                                        role="menuitem"
-                                        data-mobile-test="chat-send-menu-btw"
-                                        on:click=move |_| { menu_open.set(false); on_btw(); }
-                                    >
-                                        "BTW"
-                                    </button>
-                                })}
                                 {show_steer.then(|| view! {
                                     <button
                                         type="button"
@@ -551,18 +536,29 @@ pub fn ChatInput() -> impl IntoView {
                                         data-mobile-test="chat-send-menu-steer"
                                         on:click=move |_| { menu_open.set(false); on_steer(); }
                                     >
-                                        "Interrupt and send now"
+                                        "Steer"
                                     </button>
                                 })}
-                                {show_interrupt.then(|| view! {
+                                {show_btw.then(|| view! {
                                     <button
                                         type="button"
                                         class="chat-send-menu-item"
                                         role="menuitem"
-                                        data-mobile-test="chat-send-menu-interrupt"
-                                        on:click=move |_| { menu_open.set(false); on_interrupt(); }
+                                        data-mobile-test="chat-send-menu-ask-aside"
+                                        on:click=move |_| { menu_open.set(false); on_btw(); }
                                     >
-                                        "Interrupt"
+                                        "Ask aside"
+                                    </button>
+                                })}
+                                {show_cancel.then(|| view! {
+                                    <button
+                                        type="button"
+                                        class="chat-send-menu-item"
+                                        role="menuitem"
+                                        data-mobile-test="chat-send-menu-cancel"
+                                        on:click=move |_| { menu_open.set(false); on_cancel(); }
+                                    >
+                                        "Cancel"
                                     </button>
                                 })}
                             </div>
@@ -644,7 +640,20 @@ mod wasm_tests {
         next_tick().await;
     }
 
-    /// Visible text of each menu item, in DOM order.
+    fn primary(container: &HtmlElement) -> web_sys::Element {
+        container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .expect("primary button must be present")
+    }
+
+    fn caret(container: &HtmlElement) -> web_sys::Element {
+        container
+            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
+            .unwrap()
+            .expect("caret button must always be present")
+    }
+
     fn menu_item_texts(container: &HtmlElement) -> Vec<String> {
         let nodes = container.query_selector_all("[role='menuitem']").unwrap();
         (0..nodes.length())
@@ -653,11 +662,23 @@ mod wasm_tests {
             .collect()
     }
 
-    /// Send button is disabled when the composer is empty and enables
-    /// when text is typed. This is the touch-target affordance — the
-    /// user must see the button "turn on" before they tap.
+    fn type_text(container: &HtmlElement, text: &str) {
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value(text);
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+    }
+
+    // ── State matrix row 1: Idle + empty ─────────────────────────────────────
+    // Primary "Send" disabled; caret visible but disabled.
     #[wasm_bindgen_test]
-    async fn send_button_disabled_when_input_empty_and_enables_on_input() {
+    async fn idle_empty_send_disabled_caret_disabled() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -665,33 +686,18 @@ mod wasm_tests {
             view! { <ChatInput /> }
         });
         next_tick().await;
-        let btn = container
-            .query_selector("[data-mobile-test='chat-send']")
-            .unwrap()
-            .unwrap();
+
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
         assert!(
-            btn.has_attribute("disabled"),
-            "send must start disabled when input is empty"
+            p.has_attribute("disabled"),
+            "Send must be disabled when empty"
         );
 
-        // Type something and verify the disabled attribute clears.
-        let input: web_sys::HtmlTextAreaElement = container
-            .query_selector("[data-mobile-test='chat-input']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        input.set_value("hello");
-        let ev = web_sys::Event::new("input").unwrap();
-        input.dispatch_event(&ev).unwrap();
-        next_tick().await;
-        let btn = container
-            .query_selector("[data-mobile-test='chat-send']")
-            .unwrap()
-            .unwrap();
+        let c = caret(&container);
         assert!(
-            !btn.has_attribute("disabled"),
-            "send must enable after typing non-whitespace"
+            c.has_attribute("disabled"),
+            "caret must be disabled with no menu items"
         );
     }
 
@@ -760,11 +766,10 @@ mod wasm_tests {
         );
     }
 
-    /// While a turn is active with typed input, the primary stays "Send"
-    /// (never Queue/Steer) and the dropdown surfaces the interrupt actions.
-    /// The old standalone Steer button must be gone.
+    // ── State matrix row 4: Thinking + empty ─────────────────────────────────
+    // Primary "Cancel" enabled; caret disabled; no menu items.
     #[wasm_bindgen_test]
-    async fn running_turn_menu_offers_interrupt_actions() {
+    async fn thinking_empty_primary_cancel_caret_disabled() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -786,54 +791,80 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let input: web_sys::HtmlTextAreaElement = container
-            .query_selector("[data-mobile-test='chat-input']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        input.set_value("redirect this");
-        input
-            .dispatch_event(&web_sys::Event::new("input").unwrap())
-            .unwrap();
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Cancel",
+            "primary must be Cancel when thinking with empty composer"
+        );
+        assert!(
+            !p.has_attribute("disabled"),
+            "Cancel must be enabled while thinking"
+        );
+
+        let c = caret(&container);
+        assert!(
+            c.has_attribute("disabled"),
+            "caret must be disabled when thinking+empty (no menu items)"
+        );
+    }
+
+    // ── State matrix row 5: Thinking + input, no session ─────────────────────
+    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Cancel".
+    #[wasm_bindgen_test]
+    async fn thinking_input_no_session_queue_primary_steer_cancel_menu() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let agent_ref = AgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            state.agent_turn_active.update(|m| {
+                m.insert(agent_ref, true);
+            });
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
         next_tick().await;
 
-        let send = container
-            .query_selector("[data-mobile-test='chat-send']")
-            .unwrap()
-            .expect("send button");
+        type_text(&container, "redirect this");
+        next_tick().await;
+
+        let p = primary(&container);
         assert_eq!(
-            send.text_content().unwrap_or_default().trim(),
-            "Send",
-            "primary label must always be Send, never Queue"
+            p.text_content().unwrap_or_default().trim(),
+            "Queue",
+            "primary must be Queue when thinking with draft"
         );
-        // Steering now lives in the dropdown, not a standalone button.
+        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-steer']")
                 .unwrap()
                 .is_none(),
-            "the old standalone Steer button must no longer exist"
+            "no standalone Steer button — it lives in the dropdown"
         );
 
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec![
-                "Send".to_owned(),
-                "Interrupt and send now".to_owned(),
-                "Interrupt".to_owned(),
-            ],
-            "running+input menu must offer Send and both interrupt actions"
+            vec!["Steer".to_owned(), "Cancel".to_owned()],
+            "thinking+input menu must be Steer then Cancel"
         );
     }
 
-    /// The BTW (side question) menu item only appears once there's draft text
-    /// AND the active agent has a forkable backend session. With no draft the
-    /// caret itself is hidden (empty menu); once text is typed the menu exposes
-    /// BTW alongside Send.
+    // ── State matrix row 3: Idle + input + session ───────────────────────────
+    // Primary "Send" enabled; caret enabled; dropdown has "Ask aside" only.
     #[wasm_bindgen_test]
-    async fn btw_menu_item_requires_session_and_text() {
+    async fn idle_input_with_session_menu_ask_aside_only() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -864,51 +895,50 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // No draft text and an idle agent → empty menu, so the caret itself
-        // (and therefore BTW) is hidden.
+        // No draft → caret present but disabled.
+        let c = caret(&container);
         assert!(
-            container
-                .query_selector("[data-mobile-test='chat-send-menu-toggle']")
-                .unwrap()
-                .is_none(),
-            "dropdown caret must stay hidden while the menu would be empty"
+            c.has_attribute("disabled"),
+            "caret must be disabled while no menu items (idle, no draft)"
         );
 
-        let input: web_sys::HtmlTextAreaElement = container
-            .query_selector("[data-mobile-test='chat-input']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        input.set_value("why is this slow?");
-        input
-            .dispatch_event(&web_sys::Event::new("input").unwrap())
-            .unwrap();
+        type_text(&container, "why is this slow?");
         next_tick().await;
+
+        // Now has draft → caret enabled, menu has "Ask aside" only.
+        let c = caret(&container);
+        assert!(
+            !c.has_attribute("disabled"),
+            "caret must be enabled once draft + session"
+        );
 
         open_menu(&container).await;
         assert!(
             container
-                .query_selector("[data-mobile-test='chat-send-menu-btw']")
+                .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
                 .unwrap()
                 .is_some(),
-            "BTW menu item must appear once there is draft text and a forkable session"
+            "Ask aside must appear once there is draft text and a forkable session"
         );
-        // It must never be a standalone composer button anymore.
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Ask aside".to_owned()],
+            "idle+session menu must be exactly 'Ask aside'"
+        );
+        // Ask aside must only exist inside the dropdown, not as a standalone button.
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-btw']")
                 .unwrap()
                 .is_none(),
-            "BTW must only exist inside the dropdown menu, not as a standalone button"
+            "Ask aside must only exist inside the dropdown menu"
         );
     }
 
-    /// Without a backend session id on the active agent, the BTW menu item
-    /// stays hidden no matter what's typed — there's nothing to fork — even
-    /// though the dropdown still opens to offer Send.
+    // ── State matrix row 2: Idle + input, no session ─────────────────────────
+    // Primary "Send" enabled; caret disabled (no menu items).
     #[wasm_bindgen_test]
-    async fn btw_menu_item_hidden_without_session() {
+    async fn idle_input_no_session_send_enabled_caret_disabled() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -939,33 +969,95 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let input: web_sys::HtmlTextAreaElement = container
-            .query_selector("[data-mobile-test='chat-input']")
-            .unwrap()
-            .unwrap()
-            .dyn_into()
-            .unwrap();
-        input.set_value("anything");
-        input
-            .dispatch_event(&web_sys::Event::new("input").unwrap())
-            .unwrap();
+        type_text(&container, "anything");
         next_tick().await;
 
-        // The caret shows (Send is available) but the menu omits BTW.
-        open_menu(&container).await;
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
         assert!(
-            container
-                .query_selector("[data-mobile-test='chat-send-menu-send']")
-                .unwrap()
-                .is_some(),
-            "menu must still offer Send"
+            !p.has_attribute("disabled"),
+            "Send must be enabled with draft"
+        );
+
+        // No session → Ask aside absent → caret disabled.
+        let c = caret(&container);
+        assert!(
+            c.has_attribute("disabled"),
+            "caret must be disabled with no session (idle+input)"
         );
         assert!(
             container
-                .query_selector("[data-mobile-test='chat-send-menu-btw']")
+                .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
                 .unwrap()
                 .is_none(),
-            "BTW must stay hidden when the active agent has no session id"
+            "Ask aside must stay hidden when the active agent has no session id"
+        );
+    }
+
+    // ── State matrix row 6: Thinking + input + session ───────────────────────
+    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Ask aside", "Cancel".
+    #[wasm_bindgen_test]
+    async fn thinking_input_with_session_queue_primary_full_menu() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let agent_ref = AgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state.agents.set(vec![AgentInfo {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+                name: "Agent".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: Some(SessionId("sess-1".to_owned())),
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            }]);
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            state.agent_turn_active.update(|m| {
+                m.insert(agent_ref, true);
+            });
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        type_text(&container, "redirect this");
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Queue",
+            "primary must be Queue when thinking with draft"
+        );
+        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+
+        let c = caret(&container);
+        assert!(!c.has_attribute("disabled"), "caret must be enabled");
+
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec![
+                "Steer".to_owned(),
+                "Ask aside".to_owned(),
+                "Cancel".to_owned(),
+            ],
+            "thinking+session+input menu must be Steer, Ask aside, Cancel"
         );
     }
 

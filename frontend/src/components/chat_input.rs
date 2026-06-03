@@ -218,7 +218,7 @@ fn active_agent_is_backend_native(state: &AppState) -> bool {
 }
 
 /// True when the active agent has reported a backend session id, which is
-/// required to fork a BTW / side question off it. Tracked so the BTW menu
+/// required to fork an "Ask aside" from it. Tracked so the Ask aside menu
 /// item appears the moment the `AgentStart`/bootstrap event lands.
 fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
     let Some(active_agent) = state.active_agent.get() else {
@@ -321,10 +321,10 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
     });
 }
 
-/// Spawn a BTW / side question from the current draft, then clear the draft
-/// optimistically — mirroring `submit_chat_input`'s clear-on-submit. The BTW
-/// menu item only shows when there is input and the active agent has a
-/// session id, so the guard here just protects against an empty draft.
+/// Spawn an "Ask aside" side question from the current draft, then clear the
+/// draft optimistically — mirroring `submit_chat_input`'s clear-on-submit.
+/// The Ask aside menu item only shows when there is input and the active agent
+/// has a session id, so the guard here just protects against an empty draft.
 fn submit_side_question(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
     let text = state.chat_input.get_untracked();
     let text = text.trim().to_owned();
@@ -584,7 +584,7 @@ pub fn ChatInput() -> impl IntoView {
         let send_enabled = is_connected && has_input;
         let interrupt_enabled = is_connected && is_thinking;
         // (send_enabled, interrupt_enabled, is_steer). `is_steer` (running with
-        // typed input) gates the extra "Interrupt and send now" menu item.
+        // input) gates the secondary Steer and Cancel items in the dropdown.
         (send_enabled, interrupt_enabled, is_thinking && has_input)
     });
 
@@ -593,22 +593,19 @@ pub fn ChatInput() -> impl IntoView {
 
     let btw_state = state.clone();
     let active_has_session = Memo::new(move |_| active_agent_has_session_id_tracked(&btw_state));
-    // A BTW fork needs draft input (ui_mode.0 = connected && has_input) and a
-    // forkable backend session on the active agent.
+    // An "Ask aside" fork needs draft input and a forkable backend session.
     let can_btw = move || ui_mode.get().0 && active_has_session.get();
 
     let can_send = move || ui_mode.get().0 && !is_readonly.get();
     let can_interrupt = move || ui_mode.get().1 && !is_readonly.get();
     let is_steer = Memo::new(move |_| ui_mode.get().2);
 
-    // The dropdown is shown whenever it would hold at least one item. Since
-    // `(can_interrupt && is_steer) || can_interrupt` collapses to
-    // `can_interrupt`, the arrow is visible iff any primary/secondary action
-    // is available.
-    let menu_has_items = Memo::new(move |_| can_send() || can_btw() || can_interrupt());
+    // The dropdown holds items only in specific states (see state matrix):
+    // - Ask aside: idle or thinking + input + session
+    // - Steer + Cancel: thinking + input (with or without session)
+    let menu_has_items = Memo::new(move |_| can_btw() || (can_interrupt() && is_steer.get()));
     let menu_open = RwSignal::new(false);
-    // Don't let a stale-open menu silently re-appear when its items vanish
-    // (e.g. the turn ends or the draft is cleared) and later return.
+    // Auto-dismiss a stale-open menu when its items disappear.
     Effect::new(move |_| {
         if !menu_has_items.get() {
             menu_open.set(false);
@@ -655,21 +652,24 @@ pub fn ChatInput() -> impl IntoView {
         }
     };
 
-    let on_click_state = state.clone();
-    let on_click_images = pending_images;
-    let on_click_send = move |_| {
-        submit_chat_input(&on_click_state, on_click_images);
+    // Primary button handler: Cancel (interrupt) when thinking+empty, else submit.
+    // Menu handlers park non-`Copy` AppState in a StoredValue so they're `Copy`.
+    let primary_interrupt_stored = StoredValue::new_local(state.clone());
+    let primary_submit_stored = StoredValue::new_local(state.clone());
+    let primary_submit_images = pending_images;
+    let on_click_primary = move |_| {
+        let mode = ui_mode.get_untracked();
+        let is_steer_now = is_steer.get_untracked();
+        let readonly = is_readonly.get_untracked();
+        if mode.1 && !is_steer_now && !readonly {
+            primary_interrupt_stored.with_value(interrupt_active_turn);
+        } else {
+            primary_submit_stored.with_value(|s| submit_chat_input(s, primary_submit_images));
+        }
     };
 
-    // Menu handlers live inside `<Show>`, whose children closure can re-run on
-    // each open, so they must be `Copy`. Park the non-`Copy` `AppState` in a
-    // `StoredValue` so each handler captures only `Copy` state.
     let menu_state = StoredValue::new_local(state.clone());
     let menu_images = pending_images;
-    let on_menu_send = move |_| {
-        menu_open.set(false);
-        menu_state.with_value(|s| submit_chat_input(s, menu_images));
-    };
     let on_menu_btw = move |_| {
         menu_open.set(false);
         menu_state.with_value(|s| submit_side_question(s, menu_images));
@@ -678,7 +678,7 @@ pub fn ChatInput() -> impl IntoView {
         menu_open.set(false);
         menu_state.with_value(|s| steer_chat_input(s, menu_images));
     };
-    let on_menu_interrupt = move |_| {
+    let on_menu_cancel = move |_| {
         menu_open.set(false);
         menu_state.with_value(interrupt_active_turn);
     };
@@ -714,9 +714,20 @@ pub fn ChatInput() -> impl IntoView {
         leptos::prelude::request_animation_frame(move || {
             pending.set(false);
             let style = web_sys::HtmlElement::from(textarea.clone()).style();
+            // Hide overflow before measuring so a scrollbar doesn't inflate scrollHeight.
+            let _ = style.set_property("overflow-y", "hidden");
             let _ = style.set_property("height", "auto");
             let scroll_h = textarea.scroll_height();
-            let _ = style.set_property("height", &format!("{scroll_h}px"));
+            // Account for border-box: borders aren't in scrollHeight but are in offsetHeight.
+            let border_h = textarea.offset_height() - textarea.client_height();
+            let _ = style.set_property("height", &format!("{}px", scroll_h + border_h));
+            // Re-enable scrollbar only if CSS max-height is now capping the element.
+            let overflow = if textarea.scroll_height() > textarea.client_height() {
+                "auto"
+            } else {
+                "hidden"
+            };
+            let _ = style.set_property("overflow-y", overflow);
         });
     };
 
@@ -827,7 +838,9 @@ pub fn ChatInput() -> impl IntoView {
         let is_empty = reset_state.chat_input.with(|val| val.is_empty());
         if is_empty {
             let html_el: web_sys::HtmlElement = el.into();
-            let _ = html_el.style().set_property("height", "auto");
+            let style = html_el.style();
+            let _ = style.set_property("height", "auto");
+            let _ = style.set_property("overflow-y", "hidden");
         }
     });
 
@@ -969,28 +982,47 @@ pub fn ChatInput() -> impl IntoView {
                     <button
                         class="chat-send-btn chat-send-btn-text chat-send-split-primary"
                         data-test="chat-send-primary"
-                        disabled=move || !can_send()
-                        on:click=on_click_send
-                        title="Send message (Enter)"
+                        disabled=move || {
+                            let mode = ui_mode.get();
+                            let is_steer_now = is_steer.get();
+                            let readonly = is_readonly.get();
+                            // thinking+empty → Cancel, always enabled
+                            if mode.1 && !is_steer_now && !readonly { false } else { !can_send() }
+                        }
+                        on:click=on_click_primary
+                        title=move || {
+                            let mode = ui_mode.get();
+                            let is_steer_now = is_steer.get();
+                            let readonly = is_readonly.get();
+                            if mode.1 && !is_steer_now && !readonly { "Cancel current turn" }
+                            else if is_steer_now && !readonly { "Queue message (Enter)" }
+                            else { "Send message (Enter)" }
+                        }
                     >
-                        <span>"Send"</span>
+                        <span>{move || {
+                            let mode = ui_mode.get();
+                            let is_steer_now = is_steer.get();
+                            let readonly = is_readonly.get();
+                            if mode.1 && !is_steer_now && !readonly { "Cancel" }
+                            else if is_steer_now && !readonly { "Queue" }
+                            else { "Send" }
+                        }}</span>
                     </button>
-                    <Show when=move || menu_has_items.get()>
-                        <button
-                            type="button"
-                            class="chat-send-btn chat-send-split-toggle"
-                            data-test="chat-send-menu-toggle"
-                            aria-haspopup="menu"
-                            aria-expanded=move || {
-                                if menu_open.get() { "true" } else { "false" }
-                            }
-                            aria-label="More send actions"
-                            title="More send actions"
-                            on:click=move |_| menu_open.update(|open| *open = !*open)
-                        >
-                            <span aria-hidden="true">"⌄"</span>
-                        </button>
-                    </Show>
+                    <button
+                        type="button"
+                        class="chat-send-btn chat-send-split-toggle"
+                        data-test="chat-send-menu-toggle"
+                        aria-haspopup="menu"
+                        aria-expanded=move || {
+                            if menu_open.get() { "true" } else { "false" }
+                        }
+                        aria-label="More send actions"
+                        title="More send actions"
+                        disabled=move || !menu_has_items.get()
+                        on:click=move |_| menu_open.update(|open| *open = !*open)
+                    >
+                        <span aria-hidden="true">"⌄"</span>
+                    </button>
                     <Show when=move || menu_open.get() && menu_has_items.get()>
                         <div
                             class="chat-send-menu-backdrop"
@@ -1002,15 +1034,16 @@ pub fn ChatInput() -> impl IntoView {
                             aria-label="Send actions"
                             data-test="chat-send-menu"
                         >
-                            <Show when=move || can_send()>
+                            <Show when=move || can_interrupt() && is_steer.get()>
                                 <button
                                     type="button"
                                     class="chat-send-menu-item"
                                     role="menuitem"
-                                    data-test="chat-send-menu-send"
-                                    on:click=on_menu_send
+                                    data-test="chat-send-menu-steer"
+                                    title="Interrupt current turn and redirect with your message"
+                                    on:click=on_menu_steer
                                 >
-                                    "Send"
+                                    "Steer"
                                 </button>
                             </Show>
                             <Show when=move || can_btw()>
@@ -1018,11 +1051,11 @@ pub fn ChatInput() -> impl IntoView {
                                     type="button"
                                     class="chat-send-menu-item"
                                     role="menuitem"
-                                    data-test="chat-send-menu-btw"
-                                    title="Ask a side question (BTW) — forks this agent's session read-only without disturbing it"
+                                    data-test="chat-send-menu-ask-aside"
+                                    title="Ask a side question — forks this session read-only without disturbing it"
                                     on:click=on_menu_btw
                                 >
-                                    "BTW"
+                                    "Ask aside"
                                 </button>
                             </Show>
                             <Show when=move || can_interrupt() && is_steer.get()>
@@ -1030,23 +1063,11 @@ pub fn ChatInput() -> impl IntoView {
                                     type="button"
                                     class="chat-send-menu-item"
                                     role="menuitem"
-                                    data-test="chat-send-menu-steer"
-                                    title="Interrupt current turn and send the typed message now"
-                                    on:click=on_menu_steer
+                                    data-test="chat-send-menu-cancel"
+                                    title="Cancel the current turn"
+                                    on:click=on_menu_cancel
                                 >
-                                    "Interrupt and send now"
-                                </button>
-                            </Show>
-                            <Show when=move || can_interrupt()>
-                                <button
-                                    type="button"
-                                    class="chat-send-menu-item"
-                                    role="menuitem"
-                                    data-test="chat-send-menu-interrupt"
-                                    title="Interrupt current turn"
-                                    on:click=on_menu_interrupt
-                                >
-                                    "Interrupt"
+                                    "Cancel"
                                 </button>
                             </Show>
                         </div>
@@ -1144,17 +1165,22 @@ mod wasm_tests {
         container.query_selector(sel).unwrap()
     }
 
+    fn primary(container: &HtmlElement) -> web_sys::Element {
+        query(container, "[data-test='chat-send-primary']").expect("primary button must be present")
+    }
+
+    fn caret(container: &HtmlElement) -> web_sys::Element {
+        query(container, "[data-test='chat-send-menu-toggle']")
+            .expect("caret button must always be present")
+    }
+
     async fn open_menu(container: &HtmlElement) {
-        let toggle: HtmlElement = query(container, "[data-test='chat-send-menu-toggle']")
-            .expect("dropdown toggle must be present")
-            .dyn_into()
-            .unwrap();
+        let toggle: HtmlElement = caret(container).dyn_into().unwrap();
         toggle.click();
         next_tick().await;
     }
 
-    /// Text of every menu item, in DOM order — used to assert the agreed
-    /// filtered ordering (Send, BTW, Interrupt and send now, Interrupt).
+    /// Text of every menu item in DOM order.
     fn menu_item_texts(container: &HtmlElement) -> Vec<String> {
         let nodes = container.query_selector_all("[role='menuitem']").unwrap();
         (0..nodes.length())
@@ -1163,10 +1189,69 @@ mod wasm_tests {
             .collect()
     }
 
-    /// Idle agent with a draft and a forkable session: primary is an enabled
-    /// "Send"; the menu offers Send then BTW and nothing interrupt-related.
+    // ── State matrix row 1: Idle + empty ──────────────────────────────────────
+    // Primary "Send" disabled; caret visible but disabled; no dropdown items.
     #[wasm_bindgen_test]
-    async fn idle_input_with_session_shows_send_then_btw() {
+    async fn idle_empty_send_disabled_caret_disabled_no_menu() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, false, false, "");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
+        assert!(
+            p.has_attribute("disabled"),
+            "Send must be disabled when empty"
+        );
+
+        let c = caret(&container);
+        assert!(
+            c.has_attribute("disabled"),
+            "caret must be disabled when no menu items"
+        );
+
+        assert!(
+            query(&container, "[data-test='chat-send-menu']").is_none(),
+            "no menu should be open"
+        );
+    }
+
+    // ── State matrix row 2: Idle + input, no session ──────────────────────────
+    // Primary "Send" enabled; caret visible but disabled; no dropdown.
+    #[wasm_bindgen_test]
+    async fn idle_input_no_session_send_enabled_caret_disabled() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, false, false, "hello");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
+        assert!(
+            !p.has_attribute("disabled"),
+            "Send must be enabled with draft"
+        );
+
+        let c = caret(&container);
+        assert!(
+            c.has_attribute("disabled"),
+            "caret must be disabled with no menu items (no session)"
+        );
+    }
+
+    // ── State matrix row 3: Idle + input + session ────────────────────────────
+    // Primary "Send" enabled; caret enabled; dropdown has "Ask aside" only.
+    #[wasm_bindgen_test]
+    async fn idle_input_with_session_send_enabled_menu_ask_aside_only() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -1176,29 +1261,94 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let primary = query(&container, "[data-test='chat-send-primary']").expect("primary button");
-        assert_eq!(
-            primary.text_content().unwrap_or_default().trim(),
-            "Send",
-            "primary label must always be Send"
-        );
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Send");
         assert!(
-            !primary.has_attribute("disabled"),
-            "primary Send must be enabled with a draft"
+            !p.has_attribute("disabled"),
+            "Send must be enabled with draft"
+        );
+
+        let c = caret(&container);
+        assert!(
+            !c.has_attribute("disabled"),
+            "caret must be enabled with a menu item"
         );
 
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Send".to_owned(), "BTW".to_owned()],
-            "idle+session menu must be exactly Send then BTW"
+            vec!["Ask aside".to_owned()],
+            "idle+session menu must be exactly 'Ask aside'"
         );
     }
 
-    /// Running agent with a draft: primary stays "Send" (never Queue/Steer) and
-    /// the menu surfaces all four actions in the agreed order.
+    // ── State matrix row 4: Thinking + empty ─────────────────────────────────
+    // Primary "Cancel" enabled; caret visible but disabled; no dropdown.
     #[wasm_bindgen_test]
-    async fn running_input_with_session_shows_full_menu_in_order() {
+    async fn thinking_empty_primary_cancel_caret_disabled() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, false, true, "");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Cancel",
+            "primary must be Cancel when thinking with empty composer"
+        );
+        assert!(
+            !p.has_attribute("disabled"),
+            "Cancel must be enabled while thinking"
+        );
+
+        let c = caret(&container);
+        assert!(
+            c.has_attribute("disabled"),
+            "caret must be disabled when no menu items (thinking+empty)"
+        );
+    }
+
+    // ── State matrix row 5: Thinking + input, no session ─────────────────────
+    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Cancel".
+    #[wasm_bindgen_test]
+    async fn thinking_input_no_session_queue_primary_steer_cancel_menu() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, false, true, "redirect this");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let p = primary(&container);
+        assert_eq!(
+            p.text_content().unwrap_or_default().trim(),
+            "Queue",
+            "primary must be Queue when thinking with draft"
+        );
+        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
+
+        let c = caret(&container);
+        assert!(!c.has_attribute("disabled"), "caret must be enabled");
+
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Steer".to_owned(), "Cancel".to_owned()],
+            "thinking+input menu must be exactly Steer then Cancel"
+        );
+    }
+
+    // ── State matrix row 6: Thinking + input + session ───────────────────────
+    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Ask aside", "Cancel".
+    #[wasm_bindgen_test]
+    async fn thinking_input_with_session_queue_primary_full_menu() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -1208,50 +1358,110 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let primary = query(&container, "[data-test='chat-send-primary']").expect("primary button");
+        let p = primary(&container);
         assert_eq!(
-            primary.text_content().unwrap_or_default().trim(),
-            "Send",
-            "primary label must always be Send, even while running"
+            p.text_content().unwrap_or_default().trim(),
+            "Queue",
+            "primary must be Queue when thinking with draft"
         );
+        assert!(!p.has_attribute("disabled"), "Queue must be enabled");
 
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
             vec![
-                "Send".to_owned(),
-                "BTW".to_owned(),
-                "Interrupt and send now".to_owned(),
-                "Interrupt".to_owned(),
+                "Steer".to_owned(),
+                "Ask aside".to_owned(),
+                "Cancel".to_owned(),
             ],
-            "running+input menu must list all four actions in agreed order"
+            "thinking+session+input menu must be Steer, Ask aside, Cancel"
         );
     }
 
-    /// Running agent with an empty composer: primary Send is disabled and the
-    /// dropdown contains only Interrupt (no "Interrupt and send now").
+    /// Caret is always rendered in the DOM regardless of state — it just becomes
+    /// disabled when the dropdown would be empty.
     #[wasm_bindgen_test]
-    async fn running_empty_disables_send_and_menu_is_interrupt_only() {
+    async fn caret_always_in_dom() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            configure(&state, true, true, "");
+            // No agent, no connection, empty input — the most minimal state.
             provide_context(state);
             view! { <ChatInput /> }
         });
         next_tick().await;
 
-        let primary = query(&container, "[data-test='chat-send-primary']").expect("primary button");
+        let c = query(&container, "[data-test='chat-send-menu-toggle']");
         assert!(
-            primary.has_attribute("disabled"),
-            "primary Send must be disabled when the composer is empty"
+            c.is_some(),
+            "caret toggle must always be present in the DOM, even when disabled"
         );
+    }
+
+    // ── Image-only input coverage note ────────────────────────────────────────
+    // The matrix says desktop input = "text/images". Full image-only tests
+    // (e.g. idle image+session → Send enabled/caret enabled/Ask aside) are not
+    // feasible from this wasm test module because:
+    //   1. `pending_images` is a component-local RwSignal<Vec<PendingImage>>
+    //      not exposed via AppState or any injectable context — there is no
+    //      external setter.
+    //   2. Simulating a file-drop via DragEvent requires a real FileList, which
+    //      web-sys provides no constructor for in test scope.
+    // The `has_input = has_text || has_images` gate in ui_mode uses a single
+    // branch: both text and images set the same boolean, so behaviour is
+    // identical — the text-only matrix rows above already exercise every
+    // reachable code path gated on `has_input`. The attachment UI (thumbnails,
+    // drop overlay, error banner) is rendered independently of the split-button
+    // state machine and is not covered here.
+    //
+    // To add image-only tests in the future: move `pending_images` into
+    // AppState or provide it via a Leptos context, then seed it in `configure`.
+
+    /// Attachment error banner is absent in the baseline state so it does not
+    /// pollute the split-button matrix rows above.
+    #[wasm_bindgen_test]
+    async fn no_attachment_error_in_baseline() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, false, false, "");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert!(
+            query(&container, ".chat-input-error").is_none(),
+            "attachment error banner must not appear in the baseline state"
+        );
+        assert!(
+            query(&container, ".chat-attachment-bar").is_none(),
+            "attachment thumbnail bar must not appear when no images are pending"
+        );
+    }
+
+    /// Primary button never appears as a duplicate item inside the dropdown.
+    #[wasm_bindgen_test]
+    async fn primary_label_not_duplicated_in_dropdown() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // thinking+input+session → primary=Queue, menu=Steer/Ask aside/Cancel
+            configure(&state, true, true, "redirect");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
 
         open_menu(&container).await;
-        assert_eq!(
-            menu_item_texts(&container),
-            vec!["Interrupt".to_owned()],
-            "running+empty menu must contain only Interrupt"
+        let items = menu_item_texts(&container);
+        assert!(
+            !items.iter().any(|t| t == "Queue"),
+            "Queue (primary label) must not appear as a menu item: {items:?}"
+        );
+        assert!(
+            !items.iter().any(|t| t == "Send"),
+            "Send must not appear as a menu item: {items:?}"
         );
     }
 }

@@ -334,10 +334,7 @@ fn agent_row(
                     <div class="list-row-subtitle">
                         {backend}
                         {(is_side_question || is_sub).then(|| {
-                            // Prefer the compact "BTW" label for side questions
-                            // over the generic "Sub-agent" tag — it's both
-                            // shorter and more meaningful on a narrow row.
-                            let label = if is_side_question { "BTW" } else { "Sub-agent" };
+                            let label = if is_side_question { "Aside" } else { "Sub-agent" };
                             view! {
                                 <span style="margin-left: var(--space-2);">
                                     <Pill
@@ -453,11 +450,11 @@ mod wasm_tests {
         agent
     }
 
-    /// A side question (BTW) fork is shown with the compact "BTW" label
+    /// A side question fork is shown with the compact "Aside" label
     /// rather than the generic "Sub-agent" tag — both shorter and more
     /// meaningful on a narrow phone row.
     #[wasm_bindgen_test]
-    async fn agents_side_question_row_shows_btw_label() {
+    async fn agents_side_question_row_shows_aside_label() {
         let host = LocalHostId("host-1".to_owned());
         let container = make_container();
         let host_for_mount = host.clone();
@@ -474,12 +471,12 @@ mod wasm_tests {
         next_tick().await;
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("BTW"),
-            "side question row must surface the BTW label: {text}"
+            text.contains("Aside"),
+            "side question row must surface the Aside label: {text}"
         );
         assert!(
             !text.contains("Sub-agent"),
-            "side question must prefer BTW over the generic Sub-agent tag: {text}"
+            "side question must prefer Aside over the generic Sub-agent tag: {text}"
         );
     }
 

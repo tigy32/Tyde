@@ -3285,7 +3285,7 @@ kbd {
     border-radius: 4px;
     resize: none;
     outline: none;
-    overflow-y: auto;
+    overflow-y: hidden;
     transition: border-color 0.15s;
 }
 
@@ -3494,9 +3494,9 @@ kbd {
     min-width: 64px;
 }
 
-/* Split send button: a visible primary "Send" plus a caret toggle that
-   opens a menu of the available actions (Send, BTW, Interrupt and send
-   now, Interrupt). The wrapper is the positioning context for the menu. */
+/* Split send button: primary label (Send/Queue/Cancel) plus a caret toggle
+   that opens a dropdown of secondary actions (Steer, Ask aside, Cancel).
+   The wrapper is the positioning context for the menu. */
 .chat-send-split {
     position: relative;
     display: flex;
@@ -3519,6 +3519,11 @@ kbd {
     line-height: 1;
 }
 
+.chat-send-split-toggle:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
 .chat-send-menu-backdrop {
     position: fixed;
     inset: 0;
@@ -3531,30 +3536,35 @@ kbd {
     bottom: calc(100% + 6px);
     right: 0;
     z-index: 41;
-    min-width: 180px;
+    min-width: 120px;
+    width: max-content;
     display: flex;
     flex-direction: column;
-    padding: 4px;
-    background: var(--surface-1);
+    padding: 3px;
+    background: var(--surface-2);
     border: 1px solid var(--border-primary);
     border-radius: 6px;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    animation: menu-in 0.1s ease-out;
 }
 
 .chat-send-menu-item {
+    width: 100%;
     text-align: left;
-    padding: 7px 10px;
+    padding: 6px 10px;
     border-radius: 4px;
     background: transparent;
     color: var(--text-primary);
-    font-size: 0.846rem;
-    font-weight: 500;
+    font-size: 0.8rem;
+    font-weight: 400;
+    line-height: 1;
     cursor: pointer;
     white-space: nowrap;
 }
 
 .chat-send-menu-item:hover {
     background: var(--surface-hover);
+    color: var(--text-bright);
 }
 
 /* ===== Markdown Rendering ===== */
