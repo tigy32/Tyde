@@ -935,21 +935,14 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         > 0;
                     if has_pending && !new_ids.is_empty() {
                         // Pair the most recent new review with one pending
-                        // create token. The user clicks "Review changes",
-                        // server creates the review, ReviewListChanged
-                        // arrives — open/focus a tab for that review.
-                        let new_review_id = new_ids.last().cloned().expect("non-empty");
-                        let host_for_tab = pending_key.0.clone();
-                        let label =
-                            crate::components::review_view::review_tab_label(&new_review_id);
-                        state.open_tab(
-                            TabContent::Review {
-                                host_id: host_for_tab,
-                                review_id: new_review_id,
-                            },
-                            label,
-                            true,
-                        );
+                        // create token and release it. We deliberately do
+                        // NOT open a standalone `TabContent::Review`
+                        // workbench here: reviews are now integrated into
+                        // the normal diff surfaces. The click handler that
+                        // started the create (git panel hub / diff-tab
+                        // banner) is responsible for the normal changed-file
+                        // diff tab; once this draft lands, that diff tab's
+                        // review decorations resolve against it.
                         state.review_create_pending.update(|map| {
                             if let Some(count) = map.get_mut(&pending_key) {
                                 *count = count.saturating_sub(1);
@@ -1062,15 +1055,29 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         }
         FrameKind::ProjectGitDiff => match envelope.parse_payload::<ProjectGitDiffPayload>() {
             Ok(payload) => {
-                // Tabs (and their corresponding diff_contents entries) are keyed
-                // by path. A response without a path can't be matched to a
-                // specific tab, so drop it. In practice every frontend request
-                // sets `path: Some(...)`.
-                let Some(payload_path) = payload.path.clone() else {
-                    log::debug!("ignoring ProjectGitDiff payload with no path");
+                // `diff_contents` is keyed by the explicit owning project
+                // identity (this connection's host + the project the response
+                // came in on) plus (root, scope, path). The identity is
+                // essential: two projects/hosts can share a root path string,
+                // and keying on path alone would let one's response overwrite
+                // the other's tab. A `None` path is the whole-root all-files
+                // review surface, keyed by the empty string (the convention
+                // `DiffView` uses to render all files).
+                let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                    log::debug!(
+                        "ignoring ProjectGitDiff on non-project stream {}",
+                        envelope.stream
+                    );
                     return;
                 };
-                let key = (payload.root.clone(), payload.scope, payload_path.clone());
+                let payload_path = payload.path.clone().unwrap_or_default();
+                let key = crate::state::DiffKey::new(
+                    host_id,
+                    project_id,
+                    payload.root.clone(),
+                    payload.scope,
+                    payload_path.clone(),
+                );
                 let perf_key = format!("diff:{}:{payload_path}", payload.root.0);
                 let total_lines: usize = payload
                     .files

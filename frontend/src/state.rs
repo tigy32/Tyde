@@ -123,10 +123,22 @@ pub enum TabContent {
         path: ProjectPath,
     },
     Diff {
+        /// Explicit owning project identity. Carried so a review overlay
+        /// binds to the exact (host, project) the tab was opened for —
+        /// resolving the project from `root` alone is ambiguous when two
+        /// hosts/projects share the same root path string.
+        host_id: String,
+        project_id: ProjectId,
         root: ProjectRootPath,
         scope: ProjectDiffScope,
         path: String,
     },
+    /// Legacy standalone review-workbench tab. Reviews are now integrated
+    /// into the normal `Diff` tabs, so no current CTA constructs this — but
+    /// the variant and its `center_zone` render arm are retained so any tab
+    /// still carrying it (e.g. left open before the integration) keeps
+    /// rendering instead of vanishing. Intentionally never constructed.
+    #[allow(dead_code)]
     Review {
         host_id: String,
         review_id: ReviewId,
@@ -385,6 +397,38 @@ pub struct OpenFile {
     pub is_binary: bool,
 }
 
+/// Cache key for `diff_contents`. Carries the explicit owning `(host_id,
+/// project_id)` in addition to `(root, scope, path)` so two projects/hosts
+/// that share the same root path string can't overwrite each other's diff —
+/// the rendered diff body always belongs to the tab's project. `path` is the
+/// file path, or empty for the whole-root (all-uncommitted) review surface.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DiffKey {
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub root: ProjectRootPath,
+    pub scope: ProjectDiffScope,
+    pub path: String,
+}
+
+impl DiffKey {
+    pub fn new(
+        host_id: impl Into<String>,
+        project_id: ProjectId,
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_id: host_id.into(),
+            project_id,
+            root,
+            scope,
+            path: path.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DiffViewState {
     pub root: ProjectRootPath,
@@ -593,7 +637,7 @@ pub struct ProjectViewMemory {
     pub center_zone: Option<CenterZoneState>,
     pub active_terminal: Option<ActiveTerminalRef>,
     pub open_files: HashMap<ProjectPath, OpenFile>,
-    pub diff_contents: HashMap<(ProjectRootPath, ProjectDiffScope, String), DiffViewState>,
+    pub diff_contents: HashMap<DiffKey, DiffViewState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -711,8 +755,7 @@ pub struct AppState {
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
     pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
-    pub diff_contents:
-        RwSignal<HashMap<(ProjectRootPath, ProjectDiffScope, String), DiffViewState>>,
+    pub diff_contents: RwSignal<HashMap<DiffKey, DiffViewState>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
     pub transient_events: RwSignal<HashMap<AgentId, Vec<TransientEvent>>>,
@@ -1881,8 +1924,20 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope, path } => {
-                    let key = (root.clone(), *scope, path.clone());
+                TabContent::Diff {
+                    host_id,
+                    project_id,
+                    root,
+                    scope,
+                    path,
+                } => {
+                    let key = DiffKey::new(
+                        host_id.clone(),
+                        project_id.clone(),
+                        root.clone(),
+                        *scope,
+                        path.clone(),
+                    );
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1923,8 +1978,20 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope, path } => {
-                    let key = (root.clone(), *scope, path.clone());
+                TabContent::Diff {
+                    host_id,
+                    project_id,
+                    root,
+                    scope,
+                    path,
+                } => {
+                    let key = DiffKey::new(
+                        host_id.clone(),
+                        project_id.clone(),
+                        root.clone(),
+                        *scope,
+                        path.clone(),
+                    );
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1962,8 +2029,20 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope, path } => {
-                    let key = (root.clone(), *scope, path.clone());
+                TabContent::Diff {
+                    host_id,
+                    project_id,
+                    root,
+                    scope,
+                    path,
+                } => {
+                    let key = DiffKey::new(
+                        host_id.clone(),
+                        project_id.clone(),
+                        root.clone(),
+                        *scope,
+                        path.clone(),
+                    );
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -1992,8 +2071,20 @@ impl AppState {
                         files.remove(&path);
                     });
                 }
-                TabContent::Diff { root, scope, path } => {
-                    let key = (root.clone(), *scope, path.clone());
+                TabContent::Diff {
+                    host_id,
+                    project_id,
+                    root,
+                    scope,
+                    path,
+                } => {
+                    let key = DiffKey::new(
+                        host_id.clone(),
+                        project_id.clone(),
+                        root.clone(),
+                        *scope,
+                        path.clone(),
+                    );
                     self.diff_contents.update(|diffs| {
                         diffs.remove(&key);
                     });
@@ -2168,6 +2259,7 @@ mod tests {
                 .into_iter()
                 .map(|p| ProjectGitDiffFile {
                     relative_path: p.to_string(),
+                    is_binary: false,
                     hunks: vec![],
                 })
                 .collect(),
@@ -2184,6 +2276,7 @@ mod tests {
                 .into_iter()
                 .map(|p| ProjectGitDiffFile {
                     relative_path: p.to_string(),
+                    is_binary: false,
                     hunks: vec![],
                 })
                 .collect(),
@@ -2311,6 +2404,8 @@ mod tests {
             state.center_zone.update(|cz| {
                 cz.open(
                     TabContent::Diff {
+                        host_id: "h".to_string(),
+                        project_id: ProjectId("p".to_string()),
                         root: diff_root.clone(),
                         scope: diff_scope,
                         path: diff_path.clone(),
@@ -2330,9 +2425,16 @@ mod tests {
                     },
                 );
             });
+            let diff_key = DiffKey::new(
+                "h",
+                ProjectId("p".to_string()),
+                diff_root.clone(),
+                diff_scope,
+                diff_path.clone(),
+            );
             state.diff_contents.update(|m| {
                 m.insert(
-                    (diff_root.clone(), diff_scope, diff_path.clone()),
+                    diff_key.clone(),
                     test_diff_state(diff_root.clone(), diff_scope, Some(diff_path.clone())),
                 );
             });
@@ -2347,7 +2449,7 @@ mod tests {
             assert!(
                 !state
                     .diff_contents
-                    .with_untracked(|m| m.contains_key(&(diff_root, diff_scope, diff_path)))
+                    .with_untracked(|m| m.contains_key(&diff_key))
             );
             state.center_zone.with_untracked(|cz| {
                 assert_eq!(cz.tabs.len(), 2);
@@ -2374,6 +2476,8 @@ mod tests {
                 .try_update(|cz| {
                     cz.open(
                         TabContent::Diff {
+                            host_id: "h".to_string(),
+                            project_id: ProjectId("p".to_string()),
                             root: root.clone(),
                             scope,
                             path: "src/a.rs".to_string(),
@@ -2388,6 +2492,8 @@ mod tests {
                 .try_update(|cz| {
                     cz.open(
                         TabContent::Diff {
+                            host_id: "h".to_string(),
+                            project_id: ProjectId("p".to_string()),
                             root: root.clone(),
                             scope,
                             path: "src/b.rs".to_string(),
@@ -2415,6 +2521,8 @@ mod tests {
                 .try_update(|cz| {
                     cz.open(
                         TabContent::Diff {
+                            host_id: "h".to_string(),
+                            project_id: ProjectId("p".to_string()),
                             root: root.clone(),
                             scope,
                             path: "src/a.rs".to_string(),

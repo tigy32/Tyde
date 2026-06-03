@@ -148,6 +148,13 @@ pub enum ReviewEventPayload {
 tree reset. Clients should replace their local review projection with the
 included review.
 
+### Diff files
+
+Review diffs use the normal project diff payload. `ProjectGitDiffFile.is_binary`
+marks binary additions/modifications. Binary files carry no hunks, so line and
+hunk anchors are impossible, but file-level `ReviewAnchor::File` comments are
+valid.
+
 ---
 
 ## 3. Server behavior
@@ -170,6 +177,11 @@ suggestion location against the refreshed diff:
 
 The server never changes `ReviewLocation` to make an anchor fit. Submitting with
 any stale/invalid accepted comment fails with `InvalidLocation`.
+
+Untracked binary files are included in refreshed diffs as `is_binary = true`
+with empty hunks instead of failing review creation or refresh. Because binary
+and metadata-only changes can have no hunks, clean-reset logic treats the
+working tree as clean only when refreshed diffs contain no files.
 
 ### Clean reset
 

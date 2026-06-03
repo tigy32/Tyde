@@ -5042,6 +5042,71 @@ kbd {
     flex: 1;
 }
 
+/* Placeholder rendered in place of hunks for binary / no-hunk files. Sized
+ * to read as a single diff row — it counts as one row in
+ * `rendered_rows_for_file`, which keeps multi-file virtual-scroll offsets
+ * aligned. */
+.diff-binary-placeholder {
+    padding: var(--space-2) var(--space-3);
+    font-size: 0.846rem;
+    font-style: italic;
+    color: var(--text-tertiary);
+    background: var(--surface-1);
+}
+
+/* Wrapper for a normal diff tab that is also a review surface: a thin
+ * start-a-review banner above the live `.diff-view`. */
+.reviewable-diff {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+}
+
+.reviewable-diff > .diff-view {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0;
+}
+
+.reviewable-diff-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border-primary);
+    flex-shrink: 0;
+}
+
+.reviewable-diff-banner-text {
+    font-size: 0.846rem;
+    color: var(--text-secondary);
+}
+
+.reviewable-diff-banner-btn {
+    flex-shrink: 0;
+    padding: 4px 10px;
+    font-size: 0.769rem;
+    font-weight: 600;
+    color: var(--accent-primary);
+    background: rgba(0, 122, 204, 0.10);
+    border: 1px solid rgba(0, 122, 204, 0.42);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.reviewable-diff-banner-btn:hover:not(:disabled) {
+    background: rgba(0, 122, 204, 0.20);
+    color: #ffffff;
+}
+
+.reviewable-diff-banner-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
 .diff-content {
     display: flex;
     flex-direction: column;
@@ -7933,6 +7998,74 @@ pre.tool-error-pre {
     padding-left: 4px;
     border-left: 1px solid currentColor;
     margin-left: 2px;
+}
+
+/* Git-panel review hub: compact controls for the active project's draft
+ * review. It reuses `ReviewSidebar` for AI/Clear/Submit but neutralizes
+ * that component's three-pane-workbench chrome (left border, own scroll
+ * container, fixed width) so it sits flush in the narrow git panel. */
+.gp-review-hub {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+}
+
+.gp-review-hub .gp-review-indicator {
+    margin: 0;
+}
+
+.gp-review-hub-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-2);
+}
+
+.gp-review-hub-title {
+    font-size: 0.769rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-tertiary);
+}
+
+.gp-review-counts {
+    font-size: 0.769rem;
+    color: var(--text-secondary);
+}
+
+.gp-review-open-btn {
+    align-self: flex-start;
+    padding: 4px 10px;
+    font-size: 0.769rem;
+    font-weight: 600;
+    color: var(--accent-primary);
+    background: rgba(0, 122, 204, 0.10);
+    border: 1px solid rgba(0, 122, 204, 0.42);
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.gp-review-open-btn:hover {
+    background: rgba(0, 122, 204, 0.20);
+    color: #ffffff;
+}
+
+.gp-review-loading {
+    font-size: 0.769rem;
+    color: var(--text-tertiary);
+    padding: var(--space-1) 0;
+}
+
+/* Embed ReviewSidebar in the narrow panel: drop the docked-sidebar border
+ * and scroll container, tighten spacing so it reads as a panel section. */
+.gp-review-hub .review-sidebar {
+    border-left: 0;
+    background: transparent;
+    padding: 0;
+    overflow: visible;
+    gap: var(--space-2);
 }
 
 /* ────────── Inline review affordances on the reused diff renderer ──

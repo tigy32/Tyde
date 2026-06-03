@@ -2202,6 +2202,8 @@ pub struct ProjectGitDiffPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffFile {
     pub relative_path: String,
+    #[serde(default)]
+    pub is_binary: bool,
     pub hunks: Vec<ProjectGitDiffHunk>,
 }
 

@@ -684,6 +684,77 @@ async fn create_review_does_not_require_origin_agent() {
 }
 
 #[tokio::test]
+async fn create_review_with_untracked_binary_file_allows_file_comment() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "review@example.com"]);
+    git(&repo, &["config", "user.name", "Review Test"]);
+    fs::write(repo.join("README.md"), "initial\n").expect("write initial file");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Initial"]);
+    fs::write(repo.join("binary.dat"), [0xff_u8, 0xfe_u8, 0x00_u8])
+        .expect("write untracked binary file");
+
+    let project = create_project(&mut client, &repo).await;
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                selection: ReviewDiffSelection::AllUncommitted,
+            },
+        )
+        .await
+        .expect("review create with untracked binary");
+
+    let review = loop {
+        let env = next_env(&mut client, "binary review bootstrap").await;
+        if env.kind == FrameKind::ReviewBootstrap {
+            let bootstrap: ReviewBootstrapPayload =
+                env.parse_payload().expect("review bootstrap payload");
+            break bootstrap.review;
+        }
+    };
+    let diff = review.diffs.first().expect("binary review diff");
+    let binary_file = diff
+        .files
+        .iter()
+        .find(|file| file.relative_path == "binary.dat")
+        .expect("binary file diff");
+    assert!(binary_file.is_binary);
+    assert!(binary_file.hunks.is_empty());
+
+    let location = ReviewLocation {
+        root: diff.root.clone(),
+        relative_path: "binary.dat".to_owned(),
+        anchor: ReviewAnchor::File,
+    };
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::AddComment {
+                location: location.clone(),
+                body: "Please check this asset.".to_owned(),
+            },
+        )
+        .await
+        .expect("add binary file-level comment");
+
+    match expect_review_delta(&mut client, "binary file comment upsert").await {
+        ReviewEventPayload::CommentUpsert { comment } => {
+            assert_eq!(comment.location, location);
+            assert_eq!(comment.body, "Please check this asset.");
+            assert_eq!(comment.source, ReviewCommentSource::User);
+        }
+        other => panic!("expected binary file comment upsert, got {other:?}"),
+    }
+    assert_no_trailing_review_snapshot(&mut client, "binary file AddComment delta").await;
+}
+
+#[tokio::test]
 async fn submitted_review_sends_rendered_markdown_to_origin() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;

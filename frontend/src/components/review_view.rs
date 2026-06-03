@@ -13,34 +13,31 @@
 //!   on subscribe and replaces any prior partial entry.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::diff_view::{
-    DecorationFileHeaderFn, DecorationLineFn, DiffView, GutterActionFileHeaderFn,
-    GutterPointerDownFn, LineExtraClassFn,
-};
+use crate::components::diff_view::DiffView;
+// The reusable review decoration layer (drag selection, inline composer,
+// thread regions, file-level affordance) lives in `review_layer` so the
+// normal git-diff tabs can decorate themselves the same way this workbench
+// does. `ComposerState` is re-exported because `inline_review` imports it
+// from here.
+pub(crate) use crate::components::review_layer::ComposerState;
+use crate::components::review_layer::{build_review_decorations, install_drag_listeners};
 use crate::send::send_frame;
 
-// The inline-review presentational components live in a sibling module so
-// they can be reused on any diff surface. `ThreadRegionFiltered` is the
-// one this module mounts directly (via the decoration builders); the cards
-// and composer it nests are referenced inside `inline_review` itself.
-pub(crate) use crate::components::inline_review::ThreadRegionFiltered;
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, ReviewActionGate, ReviewActionTarget, TabContent,
-    root_display_name,
+    ActiveAgentRef, AgentInfo, AppState, DiffViewState, ReviewActionGate, ReviewActionTarget,
+    TabContent, root_display_name,
 };
 
 use protocol::{
     BackendKind, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload,
-    ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus, ReviewAnchor,
-    ReviewCommentSource, ReviewDiffSide, ReviewLocation, ReviewStatus, ReviewSuggestionState,
-    StreamPath,
+    ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus,
+    ReviewCommentSource, ReviewStatus, ReviewSuggestionState, StreamPath,
 };
 
 type ReviewAiIntervalSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalStorage>;
@@ -52,21 +49,6 @@ type ReviewAiIntervalSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalS
 struct SelectedFile {
     root: ProjectRootPath,
     relative_path: String,
-}
-
-/// Inline composer state. `Some` ⇒ the composer is open pinned to the
-/// given location; `None` ⇒ closed. Body text is local UI state — the
-/// committed comment is server state created via `AddComment`.
-///
-/// Storing the full `ReviewLocation` (root + relative_path + anchor)
-/// rather than only an anchor means switching files while the composer
-/// is open does not move the comment to the wrong file: render and
-/// save are gated on the location matching the currently rendered
-/// thread region.
-#[derive(Clone, Debug)]
-pub(crate) struct ComposerState {
-    pub(crate) location: ReviewLocation,
-    pub(crate) body: RwSignal<String>,
 }
 
 /// Unified/SBS toggle surfaced in the review header.
@@ -448,14 +430,6 @@ fn short_agent_id(id: &str) -> String {
     id.chars().take(8).collect::<String>()
 }
 
-/// Label used for the center-tab title when opening a review. Includes
-/// the short review id so multiple open reviews are distinguishable in
-/// the tab strip ("Review · 3751f659" vs "Review · bb8750a0").
-pub fn review_tab_label(review_id: &protocol::ReviewId) -> String {
-    let short: String = review_id.0.chars().take(8).collect();
-    format!("Review \u{00b7} {short}")
-}
-
 /// Local copy of the `format_relative_time` pattern used by chat_message
 /// and agents_panel — kept inline here so the review surface doesn't
 /// depend on a sibling component's private helper.
@@ -747,25 +721,6 @@ fn ReviewFileList(
     }
 }
 
-/// Live state of an in-progress click+drag line-range selection on the
-/// diff gutter. Pure UI state — never sent on the wire. Anchored to a
-/// specific (root, file, side) so a drag that wanders onto another file
-/// or the opposite side stays clamped to the start.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DragSelection {
-    root: ProjectRootPath,
-    relative_path: String,
-    side: ReviewDiffSide,
-    /// Where the user pressed the pointer down. Stays fixed.
-    start_line: u32,
-    /// Latest line the cursor is over. Updated on pointermove. The
-    /// rendered selection range is `min(start,end) ..= max(start,end)`.
-    end_line: u32,
-    /// Mouse still down. Cleared on pointerup or Escape so a stale
-    /// selection doesn't keep highlighting after the gesture ends.
-    is_active: bool,
-}
-
 #[component]
 fn ReviewCenter(
     review: Review,
@@ -776,7 +731,7 @@ fn ReviewCenter(
     composer: RwSignal<Option<ComposerState>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let drag_selection: RwSignal<Option<DragSelection>> = RwSignal::new(None);
+    let drag_selection = RwSignal::new(None);
 
     // Reactive Memo over `Review.diffs`. Driven by the live record so a
     // late-arriving Snapshot replaces the initial render's payload list.
@@ -834,19 +789,9 @@ fn ReviewCenter(
                 let perf_key = format!("review:{}:{}", root.0, path);
                 crate::perf::log_phase("review_file_open", "rerender_begin", &perf_key, "");
 
-                let gutter_pointer_down = make_gutter_pointer_down(drag_selection, is_draft);
-                let line_extra_class = make_line_extra_class(drag_selection);
-                let gutter_action_for_file_header = make_gutter_action_for_file_header(
-                    composer, is_draft,
-                );
-                let line_decoration = make_line_decoration(
+                let decorations = build_review_decorations(
                     composer,
-                    review_id.clone(),
-                    host_id.clone(),
-                    is_draft,
-                );
-                let file_header_decoration = make_file_header_decoration(
-                    composer,
+                    drag_selection,
                     review_id,
                     host_id,
                     is_draft,
@@ -858,11 +803,11 @@ fn ReviewCenter(
                         scope=ProjectDiffScope::Uncommitted
                         path=path
                         frozen_payload=frozen_payload
-                        on_gutter_pointer_down=gutter_pointer_down
-                        line_extra_class=line_extra_class
-                        gutter_action_for_file_header=gutter_action_for_file_header
-                        decoration_below_line=line_decoration
-                        decoration_below_file_header=file_header_decoration
+                        on_gutter_pointer_down=decorations.gutter_pointer_down
+                        line_extra_class=decorations.line_extra_class
+                        gutter_action_for_file_header=decorations.gutter_action_for_file_header
+                        decoration_below_line=decorations.decoration_below_line
+                        decoration_below_file_header=decorations.decoration_below_file_header
                     />
                 }.into_any();
                 crate::perf::log_phase("review_file_open", "rerender_done", &perf_key, "");
@@ -872,388 +817,12 @@ fn ReviewCenter(
     }
 }
 
-/// Pointer-down handler attached to the canonical line-number gutter
-/// (`.diff-gutter-new` for Added/Context, `.diff-gutter-old` for Removed).
-/// Starts a drag selection anchored at the clicked line. The diff
-/// renderer has already called `prevent_default()` on the event so the
-/// browser's native text selection doesn't fight us.
-///
-/// Disabled-while-not-draft is enforced here, not in CSS — a no-op
-/// callback in non-Draft state matches the behavior the old `+` button
-/// had (the button was rendered but disabled).
-fn make_gutter_pointer_down(
-    drag_selection: RwSignal<Option<DragSelection>>,
-    is_draft: Memo<bool>,
-) -> GutterPointerDownFn {
-    Arc::new(
-        move |root: ProjectRootPath, path: String, side: ReviewDiffSide, line: u32| {
-            if !is_draft.get_untracked() {
-                return;
-            }
-            drag_selection.set(Some(DragSelection {
-                root,
-                relative_path: path,
-                side,
-                start_line: line,
-                end_line: line,
-                is_active: true,
-            }));
-        },
-    )
-}
-
-/// Reactive class hook: returns `Some("diff-line-selected")` when the
-/// `(file, side, line)` falls within the current drag selection range.
-/// The diff renderer reads this inside the row's reactive class
-/// closure, so updates to `drag_selection` flow to the DOM each time
-/// the cursor moves.
-fn make_line_extra_class(drag_selection: RwSignal<Option<DragSelection>>) -> LineExtraClassFn {
-    Arc::new(
-        move |root: ProjectRootPath, path: String, side: ReviewDiffSide, line: u32| {
-            drag_selection.with(|sel| {
-                let sel = sel.as_ref()?;
-                if sel.root != root || sel.relative_path != path || sel.side != side {
-                    return None;
-                }
-                let (lo, hi) = if sel.start_line <= sel.end_line {
-                    (sel.start_line, sel.end_line)
-                } else {
-                    (sel.end_line, sel.start_line)
-                };
-                if line >= lo && line <= hi {
-                    Some("diff-line-selected")
-                } else {
-                    None
-                }
-            })
-        },
-    )
-}
-
-/// Install window-level pointer + keyboard listeners that drive the
-/// active drag selection. Attaches once when `ReviewCenter` mounts and
-/// removes them on cleanup so the listeners don't outlive the workbench.
-///
-/// Why window-level (not on `.diff-content`): rows mount/unmount under
-/// virtualization while the user is mid-drag. Listening on the diff
-/// container would lose events when the originating row scrolls out of
-/// view. Window listeners survive that.
-fn install_drag_listeners(
-    drag_selection: RwSignal<Option<DragSelection>>,
-    composer: RwSignal<Option<ComposerState>>,
-) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-
-    let pm_window = window.clone();
-    let pointermove =
-        Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |ev: web_sys::PointerEvent| {
-            let Some(current) = drag_selection.get_untracked() else {
-                return;
-            };
-            if !current.is_active {
-                return;
-            }
-            let Some(document) = pm_window.document() else {
-                return;
-            };
-            let Some(target) =
-                document.element_from_point(ev.client_x() as f32, ev.client_y() as f32)
-            else {
-                return;
-            };
-            let line_el: web_sys::Element = match target.closest(".diff-line") {
-                Ok(Some(el)) => el,
-                _ => return,
-            };
-            // Look up the line number on the SIDE the drag started on.
-            // Each `.diff-line` exposes `data-anchor-old-line` and
-            // `data-anchor-new-line` (each empty if that row has no
-            // counterpart on that side), so dragging from a +new gutter
-            // through a Removed line (which lacks a new-side number) is
-            // a no-op rather than the gesture freezing entirely.
-            let attr_name = match current.side {
-                ReviewDiffSide::Old => "data-anchor-old-line",
-                ReviewDiffSide::New => "data-anchor-new-line",
-            };
-            let Some(line_attr) = line_el.get_attribute(attr_name) else {
-                return;
-            };
-            if line_attr.is_empty() {
-                // Row exists but has no counterpart on the drag side
-                // (e.g. dragging on +new through a Removed row). Keep
-                // the current selection range; don't bail the gesture.
-                return;
-            }
-            let Ok(line_no) = line_attr.parse::<u32>() else {
-                return;
-            };
-            if line_no != current.end_line {
-                drag_selection.update(|slot| {
-                    if let Some(s) = slot.as_mut() {
-                        s.end_line = line_no;
-                    }
-                });
-            }
-        });
-
-    let pointerup =
-        Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |_ev: web_sys::PointerEvent| {
-            let Some(current) = drag_selection.get_untracked() else {
-                return;
-            };
-            if !current.is_active {
-                return;
-            }
-            let (start, end) = if current.start_line <= current.end_line {
-                (current.start_line, current.end_line)
-            } else {
-                (current.end_line, current.start_line)
-            };
-            composer.set(Some(ComposerState {
-                location: ReviewLocation {
-                    root: current.root.clone(),
-                    relative_path: current.relative_path.clone(),
-                    anchor: ReviewAnchor::LineRange {
-                        side: current.side,
-                        start_line: start,
-                        end_line: end,
-                    },
-                },
-                body: RwSignal::new(String::new()),
-            }));
-            drag_selection.set(None);
-        });
-
-    let keydown =
-        Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
-            if ev.key() != "Escape" {
-                return;
-            }
-            if drag_selection.get_untracked().is_some() {
-                drag_selection.set(None);
-            }
-        });
-
-    let pointercancel =
-        Closure::<dyn Fn(web_sys::PointerEvent)>::new(move |_ev: web_sys::PointerEvent| {
-            if drag_selection.get_untracked().is_some() {
-                drag_selection.set(None);
-            }
-        });
-
-    let _ = window
-        .add_event_listener_with_callback("pointermove", pointermove.as_ref().unchecked_ref());
-    let _ =
-        window.add_event_listener_with_callback("pointerup", pointerup.as_ref().unchecked_ref());
-    let _ = window
-        .add_event_listener_with_callback("pointercancel", pointercancel.as_ref().unchecked_ref());
-    let _ = window.add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref());
-
-    // The listeners hold !Send/!Sync web_sys handles; park them in a
-    // thread-local `StoredValue::new_local` so the cleanup closure can
-    // be `Send + Sync` (Leptos requires it on `on_cleanup`).
-    let slot: StoredValue<Option<DragListeners>, LocalStorage> =
-        StoredValue::new_local(Some(DragListeners {
-            window,
-            pointermove,
-            pointerup,
-            pointercancel,
-            keydown,
-        }));
-
-    on_cleanup(move || {
-        slot.update_value(|s| {
-            if let Some(h) = s.take() {
-                h.remove();
-            }
-        });
-    });
-}
-
-struct DragListeners {
-    window: web_sys::Window,
-    pointermove: Closure<dyn Fn(web_sys::PointerEvent)>,
-    pointerup: Closure<dyn Fn(web_sys::PointerEvent)>,
-    pointercancel: Closure<dyn Fn(web_sys::PointerEvent)>,
-    keydown: Closure<dyn Fn(web_sys::KeyboardEvent)>,
-}
-
-impl DragListeners {
-    fn remove(self) {
-        let _ = self.window.remove_event_listener_with_callback(
-            "pointermove",
-            self.pointermove.as_ref().unchecked_ref(),
-        );
-        let _ = self.window.remove_event_listener_with_callback(
-            "pointerup",
-            self.pointerup.as_ref().unchecked_ref(),
-        );
-        let _ = self.window.remove_event_listener_with_callback(
-            "pointercancel",
-            self.pointercancel.as_ref().unchecked_ref(),
-        );
-        let _ = self
-            .window
-            .remove_event_listener_with_callback("keydown", self.keydown.as_ref().unchecked_ref());
-    }
-}
-
-/// Inline thread region under a single line. Only emitted when there's
-/// something to show (comment, pending suggestion, rejected toggle, or
-/// the open composer is anchored here) so the diff stays compact when
-/// most rows have no annotations.
-fn make_line_decoration(
-    composer: RwSignal<Option<ComposerState>>,
-    review_id: protocol::ReviewId,
-    host_id: String,
-    is_draft: Memo<bool>,
-) -> DecorationLineFn {
-    let state = expect_context::<AppState>();
-    Arc::new(
-        move |root: ProjectRootPath, path: String, side: ReviewDiffSide, line: u32| {
-            let matcher: Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync> =
-                Arc::new(move |a: &ReviewAnchor| match a {
-                    ReviewAnchor::LineRange {
-                        side: s, end_line, ..
-                    } => *s == side && *end_line == line,
-                    _ => false,
-                });
-            if !thread_region_has_content(&state, &review_id, &root, &path, &matcher, composer) {
-                return None;
-            }
-            let review_id = review_id.clone();
-            let host_id = host_id.clone();
-            Some(
-                view! {
-                    <ThreadRegionFiltered
-                        review_id=review_id
-                        root=root
-                        relative_path=path
-                        host_id=host_id
-                        composer=composer
-                        matcher=matcher
-                        is_draft=is_draft
-                    />
-                }
-                .into_any(),
-            )
-        },
-    )
-}
-
-/// Inline `+` button rendered into the file header. The `.review-file-comment-btn`
-/// class is what the wasm tests look up to find this affordance.
-fn make_gutter_action_for_file_header(
-    composer: RwSignal<Option<ComposerState>>,
-    is_draft: Memo<bool>,
-) -> GutterActionFileHeaderFn {
-    Arc::new(move |root: ProjectRootPath, path: String| {
-        let click_root = root.clone();
-        let click_path = path.clone();
-        view! {
-            <button
-                class="review-add-comment-btn review-file-comment-btn"
-                aria-label="Comment on file"
-                disabled=move || !is_draft.get()
-                on:click=move |_| {
-                    composer.set(Some(ComposerState {
-                        location: ReviewLocation {
-                            root: click_root.clone(),
-                            relative_path: click_path.clone(),
-                            anchor: ReviewAnchor::File,
-                        },
-                        body: RwSignal::new(String::new()),
-                    }));
-                }
-            >
-                "+"
-            </button>
-        }
-        .into_any()
-    })
-}
-
-/// Thread region under the file header. Only emitted when there are
-/// file-anchored comments / suggestions or the composer is anchored here.
-fn make_file_header_decoration(
-    composer: RwSignal<Option<ComposerState>>,
-    review_id: protocol::ReviewId,
-    host_id: String,
-    is_draft: Memo<bool>,
-) -> DecorationFileHeaderFn {
-    let state = expect_context::<AppState>();
-    Arc::new(move |root: ProjectRootPath, path: String| {
-        let matcher: Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync> =
-            Arc::new(|a: &ReviewAnchor| matches!(a, ReviewAnchor::File));
-        if !thread_region_has_content(&state, &review_id, &root, &path, &matcher, composer) {
-            return None;
-        }
-        let review_id = review_id.clone();
-        let host_id = host_id.clone();
-        Some(
-            view! {
-                <ThreadRegionFiltered
-                    review_id=review_id
-                    root=root
-                    relative_path=path
-                    host_id=host_id
-                    composer=composer
-                    matcher=matcher
-                    is_draft=is_draft
-                />
-            }
-            .into_any(),
-        )
-    })
-}
-
-/// Reactive predicate: does this `(file, anchor-matcher)` thread region
-/// have any content worth rendering? Read inside the per-line decoration
-/// callback so off-screen lines pay no DOM cost when they have nothing
-/// to show, but the closure still re-runs when comments/suggestions/the
-/// composer change.
-pub(crate) fn thread_region_has_content(
-    state: &AppState,
-    review_id: &protocol::ReviewId,
-    root: &ProjectRootPath,
-    relative_path: &str,
-    matcher: &Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync>,
-    composer: RwSignal<Option<ComposerState>>,
-) -> bool {
-    let any_review = state.reviews.with(|map| {
-        let Some(review) = map.get(review_id) else {
-            return false;
-        };
-        let comment_match = review.comments.iter().any(|c| {
-            c.location.root == *root
-                && c.location.relative_path == relative_path
-                && matcher(&c.location.anchor)
-        });
-        if comment_match {
-            return true;
-        }
-        review.suggestions.iter().any(|s| {
-            s.location.root == *root
-                && s.location.relative_path == relative_path
-                && matcher(&s.location.anchor)
-        })
-    });
-    if any_review {
-        return true;
-    }
-    composer.with(|c| {
-        c.as_ref().is_some_and(|c| {
-            c.location.root == *root
-                && c.location.relative_path == relative_path
-                && matcher(&c.location.anchor)
-        })
-    })
-}
-
+/// Action sidebar for a Draft review: live counts, the AI-reviewer form,
+/// the submit-target picker (with full gating), Clear and Cancel. Public
+/// to the crate so the git-panel review hub can mount the exact same
+/// controls without re-implementing submit-target gating.
 #[component]
-fn ReviewSidebar(
+pub(crate) fn ReviewSidebar(
     review: Review,
     host_id: String,
     review_id: protocol::ReviewId,
@@ -2438,19 +2007,322 @@ pub(crate) fn try_claim_review_action(
     claimed
 }
 
-/// Public entry — used by the agent header's "Review changes" button.
+/// The most-recently-updated Draft review id for `project_id`, if any.
+/// Submitted/Consumed/Cancelled are filtered out — only an actively
+/// editable Draft is a review surface.
+fn existing_draft_for_project(
+    state: &AppState,
+    project_id: &protocol::ProjectId,
+) -> Option<protocol::ReviewId> {
+    state.review_summaries.with_untracked(|map| {
+        map.get(project_id).and_then(|summaries| {
+            summaries
+                .iter()
+                .filter(|s| matches!(s.status, ReviewStatus::Draft))
+                .max_by_key(|s| s.updated_at_ms)
+                .map(|s| s.id.clone())
+        })
+    })
+}
+
+/// Send a project-scoped `ReviewCreate` with create-pending gating, with
+/// no tab navigation — callers decide which surface to show. At most one
+/// Draft per project: callers must check `existing_draft_for_project`
+/// first. The (host, project) pair is tagged create-pending until the
+/// server's `ReviewListChanged` echoes back (cleared on send failure).
+fn send_review_create(state: &AppState, host_id: &str, project_id: &protocol::ProjectId) {
+    let mut claimed = false;
+    let key = (host_id.to_owned(), project_id.clone());
+    state.review_create_pending.update(|map| {
+        let entry = map.entry(key.clone()).or_insert(0);
+        if *entry == 0 {
+            *entry = 1;
+            claimed = true;
+        }
+    });
+    if !claimed {
+        return;
+    }
+
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let payload = protocol::ReviewCreatePayload {
+        selection: protocol::ReviewDiffSelection::AllUncommitted,
+    };
+    let state_for_failure = state.clone();
+    let host = host_id.to_owned();
+    spawn_local(async move {
+        if let Err(e) = send_frame(&host, stream, FrameKind::ReviewCreate, &payload).await {
+            log::error!("failed to send ReviewCreate: {e}");
+            state_for_failure.review_create_pending.update(|map| {
+                if let Some(count) = map.get_mut(&key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&key);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Open (or focus) the all-uncommitted diff surface for `project_id` on
+/// `host_id` — the canonical review surface for the integrated flow.
+/// Returns true when a diff tab was opened.
 ///
-/// At most one Draft review per project at a time. If one already
-/// exists for the active agent's project we just focus its tab (and
-/// open it if it isn't open yet) instead of asking the server for a
-/// new one — otherwise the user ends up with a long stack of empty
-/// drafts that have to be cancelled one at a time. The server enforces
-/// the same invariant with a `Conflict` `CommandError` for any caller
-/// that bypasses this check (MCP, an older client).
+/// A review covers *every* outstanding uncommitted change, so this opens the
+/// whole-root diff (empty `path` ⇒ all files) at
+/// [`ProjectDiffScope::Uncommitted`], not a single file: every changed file
+/// in the review must be able to display and accept comments. The empty path
+/// is the established "all files" convention `DiffView` already renders and
+/// is requested with `ProjectReadDiff { path: None }`.
 ///
-/// Otherwise sends `ReviewCreate` on `/project/<id>` and tags the
-/// (host, project) pair as create-pending so the button disables until
-/// the server's `ReviewListChanged` echoes back.
+/// The scope is deliberately `Uncommitted` (HEAD↔worktree): the server
+/// validates review anchors against HEAD↔worktree. A `Staged`/`Unstaged` tab
+/// would show index↔worktree line numbers that don't line up with the
+/// review's anchors, so `ReviewableDiffView` only binds review affordances on
+/// `Uncommitted` tabs.
+///
+/// (Multi-root projects: this opens the first root that has changes. A single
+/// diff tab is per-root; other roots' changes would need their own tab.)
+///
+/// This is what every "Review changes" / "Open changes" call routes through;
+/// reviews live on the ordinary diff surfaces now, never in a standalone
+/// `TabContent::Review` workbench.
+pub fn open_changed_diff_for_project(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+) -> bool {
+    let Some(roots) = state
+        .git_status
+        .with_untracked(|m| m.get(project_id).cloned())
+    else {
+        return false;
+    };
+    // First root with any outstanding change (staged, unstaged, or untracked).
+    let Some(root) = roots
+        .into_iter()
+        .find(|r| {
+            r.files
+                .iter()
+                .any(|f| f.unstaged.is_some() || f.untracked || f.staged.is_some())
+        })
+        .map(|r| r.root)
+    else {
+        return false;
+    };
+    let scope = ProjectDiffScope::Uncommitted;
+    // Empty path ⇒ all files in the root (the all-uncommitted diff surface).
+    let path = String::new();
+
+    let label = format!("Review: {}", root_display_name(&root));
+    state.open_tab(
+        TabContent::Diff {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            root: root.clone(),
+            scope,
+            path: path.clone(),
+        },
+        label,
+        true,
+    );
+
+    // Seed a pending DiffViewState and request the whole-root diff.
+    let context_mode = state.diff_context_mode.get_untracked();
+    let key = crate::state::DiffKey::new(host_id, project_id.clone(), root.clone(), scope, path);
+    state.diff_contents.update(|diffs| {
+        let previous = diffs.get(&key);
+        // `None` path ⇒ all files; dispatch keys the response back to the
+        // empty-path entry.
+        let next = DiffViewState::for_request(previous, root.clone(), scope, None, context_mode);
+        diffs.insert(key, next);
+    });
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let host = host_id.to_owned();
+    spawn_local(async move {
+        let payload = ProjectReadDiffPayload {
+            root,
+            scope,
+            path: None,
+            context_mode,
+        };
+        if let Err(e) = send_frame(&host, stream, FrameKind::ProjectReadDiff, &payload).await {
+            log::error!("failed to send ProjectReadDiff for review surface: {e}");
+        }
+    });
+    true
+}
+
+/// Reactively keep `/review/<id>` subscribed for a (possibly changing)
+/// target review, so a surface can render its comments/suggestions. Call
+/// once on mount.
+///
+/// `target` yields `Some((host, review_id))` for the review to track, or
+/// `None` when there's nothing to subscribe to (e.g. no draft yet).
+///
+/// It subscribes whenever the target's full record is absent from
+/// `state.reviews`, the host is connected, and no subscribe for that exact
+/// id is already in flight. Retry behavior is designed to be robust rather
+/// than tight-looping:
+/// * a **send failure** schedules a retry behind an exponential backoff
+///   timer (250ms, 500ms, 1s … capped at 30s) — never an immediate clear,
+///   which would spin on a persistent failure while connected;
+/// * a **disconnect** drops the in-flight marker (the server-side
+///   subscription is gone with the connection) so **reconnect resubscribes**
+///   — this also recovers the "subscribed OK but no bootstrap ever arrived,
+///   then reconnected" case, which an in-flight latch would otherwise wedge;
+/// * the record being **lost later** (e.g. cleared) re-runs the effect and
+///   resubscribes;
+/// * the target id **changing** re-subscribes for the new id.
+pub(crate) fn subscribe_review_reactive(
+    state: &AppState,
+    target: Memo<Option<(String, protocol::ReviewId)>>,
+) {
+    let state = state.clone();
+    // The review id we currently have an outstanding `ReviewSubscribe` for
+    // (send in flight, or sent and awaiting the bootstrap). Reactive so the
+    // backoff timer / disconnect handling can clear it and re-run the effect.
+    let in_flight: RwSignal<Option<protocol::ReviewId>> = RwSignal::new(None);
+    // Bumped by the backoff timer to re-trigger a retry after a failure.
+    let retry_tick: RwSignal<u32> = RwSignal::new(0);
+    // Consecutive send-failure count, drives the backoff delay.
+    let fail_count: StoredValue<u32, LocalStorage> = StoredValue::new_local(0);
+    // Pending backoff timer (handle + its closure), cleared on cleanup or
+    // whenever we move on.
+    let timer: SubscribeTimerSlot = StoredValue::new_local(None);
+
+    Effect::new(move |_| {
+        // Tracked so a backoff-timer fire re-runs this effect.
+        let _ = retry_tick.get();
+        let Some((host, review_id)) = target.get() else {
+            // No target right now (e.g. the owning project's draft resolved
+            // away, or `state.projects` was cleared on disconnect). Drop any
+            // outstanding subscription state so a later target — even the
+            // same review id reappearing — resubscribes cleanly instead of
+            // staying latched on a stale in-flight marker.
+            clear_subscribe_timer(timer);
+            fail_count.set_value(0);
+            if in_flight.get_untracked().is_some() {
+                in_flight.set(None);
+            }
+            return;
+        };
+        let present = state.reviews.with(|m| m.contains_key(&review_id));
+        let connected = state.connection_statuses.with(|m| {
+            matches!(
+                m.get(&host),
+                Some(crate::state::ConnectionStatus::Connected)
+            )
+        });
+
+        if present {
+            // Record in hand: reset retry state and drop the in-flight marker
+            // so a later loss (reviews change ⇒ re-run) resubscribes.
+            clear_subscribe_timer(timer);
+            fail_count.set_value(0);
+            if in_flight.get_untracked().as_ref() == Some(&review_id) {
+                in_flight.set(None);
+            }
+            return;
+        }
+        if !connected {
+            // No connection ⇒ any server-side subscription is gone. Drop the
+            // in-flight marker (and any pending retry) so reconnect — which
+            // re-runs this effect — resubscribes.
+            clear_subscribe_timer(timer);
+            fail_count.set_value(0);
+            if in_flight.get_untracked().is_some() {
+                in_flight.set(None);
+            }
+            return;
+        }
+        if in_flight.get().as_ref() == Some(&review_id) {
+            // A subscribe for this exact id is already outstanding.
+            return;
+        }
+
+        // Subscribe now.
+        clear_subscribe_timer(timer);
+        in_flight.set(Some(review_id.clone()));
+        let stream = StreamPath(format!("/review/{}", review_id.0));
+        let host_for_send = host.clone();
+        let rid = review_id.clone();
+        spawn_local(async move {
+            if let Err(e) = send_frame(
+                &host_for_send,
+                stream,
+                FrameKind::ReviewSubscribe,
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                log::error!("review.subscribe.err review={rid} error={e}");
+                // Schedule a backoff retry — only if we're still the
+                // in-flight target (a target change may have moved us on).
+                if in_flight.get_untracked().as_ref() != Some(&rid) {
+                    return;
+                }
+                let n = fail_count.get_value();
+                fail_count.set_value(n.saturating_add(1));
+                let delay = subscribe_backoff_ms(n);
+                let cb = Closure::<dyn Fn()>::new(move || {
+                    // Re-arm: drop the marker and bump the tick so the effect
+                    // re-runs and re-attempts (after the backoff, not in a
+                    // tight loop).
+                    in_flight.set(None);
+                    retry_tick.update(|t| *t = t.wrapping_add(1));
+                });
+                if let Some(window) = web_sys::window()
+                    && let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        cb.as_ref().unchecked_ref(),
+                        delay,
+                    )
+                {
+                    timer.update_value(|slot| *slot = Some((id, cb)));
+                }
+            }
+        });
+    });
+
+    on_cleanup(move || clear_subscribe_timer(timer));
+}
+
+type SubscribeTimerSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalStorage>;
+
+/// Cancel and drop a pending review-subscribe backoff timer.
+fn clear_subscribe_timer(timer: SubscribeTimerSlot) {
+    timer.update_value(|slot| {
+        if let Some((id, _cb)) = slot.take()
+            && let Some(window) = web_sys::window()
+        {
+            window.clear_timeout_with_handle(id);
+        }
+    });
+}
+
+/// Exponential backoff for review-subscribe retries: 250ms, 500ms, 1s, 2s …
+/// capped at 30s.
+fn subscribe_backoff_ms(failures: u32) -> i32 {
+    const BASE_MS: i64 = 250;
+    const CAP_MS: i64 = 30_000;
+    let delay = BASE_MS
+        .checked_shl(failures.min(20))
+        .unwrap_or(CAP_MS)
+        .min(CAP_MS);
+    delay as i32
+}
+
+/// Public entry — used by the agent chat header's "Review changes" button.
+///
+/// Always opens/focuses the project's normal changed-file diff tab (the
+/// review surface). If no Draft review exists yet, also sends a
+/// `ReviewCreate`; an existing Draft's decorations resolve on that same
+/// diff tab. We never open a standalone `TabContent::Review` workbench.
+///
+/// At most one Draft review per project: the server enforces the same
+/// invariant with a `Conflict` `CommandError` for callers that bypass
+/// this check (MCP, an older client).
 pub fn create_review_for_active_agent(state: &AppState) {
     let Some(active_agent) = state.active_agent.get_untracked() else {
         return;
@@ -2469,62 +2341,13 @@ pub fn create_review_for_active_agent(state: &AppState) {
         return;
     };
 
-    let existing_draft = state.review_summaries.with_untracked(|map| {
-        map.get(&project_id).and_then(|summaries| {
-            summaries
-                .iter()
-                .filter(|s| matches!(s.status, ReviewStatus::Draft))
-                .max_by_key(|s| s.updated_at_ms)
-                .map(|s| s.id.clone())
-        })
-    });
-    if let Some(review_id) = existing_draft {
-        let label = review_tab_label(&review_id);
-        state.open_tab(
-            TabContent::Review {
-                host_id: host_id.clone(),
-                review_id,
-            },
-            label,
-            true,
-        );
-        return;
-    }
+    // Always land the user on the changed-file diff surface.
+    open_changed_diff_for_project(state, &host_id, &project_id);
 
-    let mut claimed = false;
-    state.review_create_pending.update(|map| {
-        let key = (host_id.clone(), project_id.clone());
-        let entry = map.entry(key).or_insert(0);
-        if *entry == 0 {
-            *entry = 1;
-            claimed = true;
-        }
-    });
-    if !claimed {
-        return;
+    // Only create when there isn't already a Draft to decorate that diff.
+    if existing_draft_for_project(state, &project_id).is_none() {
+        send_review_create(state, &host_id, &project_id);
     }
-
-    let stream = StreamPath(format!("/project/{}", project_id.0));
-    let payload = protocol::ReviewCreatePayload {
-        selection: protocol::ReviewDiffSelection::AllUncommitted,
-    };
-    let state_for_failure = state.clone();
-    let project_id_for_failure = project_id.clone();
-    let host_for_failure = host_id.clone();
-    spawn_local(async move {
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ReviewCreate, &payload).await {
-            log::error!("failed to send ReviewCreate: {e}");
-            state_for_failure.review_create_pending.update(|map| {
-                let key = (host_for_failure, project_id_for_failure);
-                if let Some(count) = map.get_mut(&key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        map.remove(&key);
-                    }
-                }
-            });
-        }
-    });
 }
 
 /// Returns true when the active agent's project has uncommitted changes
@@ -2587,13 +2410,12 @@ pub fn open_review_for_active_project(state: &AppState) -> Option<(String, proto
 }
 
 /// Project-scoped entry point for the inline review flow, driven from the
-/// git panel rather than an agent's chat header. Opens the active
-/// project's existing Draft review if one exists; otherwise sends a
-/// project-scoped `ReviewCreate` (no `origin_agent_id` — the server
-/// derives the project from the `/project/<id>` stream) and tags the
-/// (host, project) pair create-pending. The `ReviewListChanged` dispatch
-/// handler pairs the new review with that pending tag and auto-opens its
-/// tab, so this function does not open the tab itself on the create path.
+/// git panel. Opens/focuses the active project's normal changed-file diff
+/// surface and, when no Draft exists yet, sends a project-scoped
+/// `ReviewCreate` (the server derives the project from the `/project/<id>`
+/// stream). Never opens a standalone `TabContent::Review` workbench — the
+/// new Draft's decorations resolve on the diff tab once `ReviewListChanged`
+/// lands.
 pub fn create_or_open_review_for_active_project(state: &AppState) {
     let Some(active) = state.active_project.get_untracked() else {
         log::warn!("create_or_open_review_for_active_project: no active project");
@@ -2602,55 +2424,26 @@ pub fn create_or_open_review_for_active_project(state: &AppState) {
     let host_id = active.host_id.clone();
     let project_id = active.project_id.clone();
 
-    let existing_draft = state.review_summaries.with_untracked(|map| {
-        map.get(&project_id).and_then(|summaries| {
-            summaries
-                .iter()
-                .filter(|s| matches!(s.status, ReviewStatus::Draft))
-                .max_by_key(|s| s.updated_at_ms)
-                .map(|s| s.id.clone())
-        })
-    });
-    if let Some(review_id) = existing_draft {
-        let label = review_tab_label(&review_id);
-        state.open_tab(TabContent::Review { host_id, review_id }, label, true);
+    open_changed_diff_for_project(state, &host_id, &project_id);
+
+    if existing_draft_for_project(state, &project_id).is_none() {
+        send_review_create(state, &host_id, &project_id);
+    }
+}
+
+/// Start a Draft review for a specific (host, project) without any tab
+/// navigation — used by the diff-tab "Start a review" banner, where the
+/// user is already on the review surface. No-op when a Draft already
+/// exists; its decorations resolve on the current diff tab.
+pub fn create_review_for_project(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+) {
+    if existing_draft_for_project(state, project_id).is_some() {
         return;
     }
-
-    let mut claimed = false;
-    state.review_create_pending.update(|map| {
-        let key = (host_id.clone(), project_id.clone());
-        let entry = map.entry(key).or_insert(0);
-        if *entry == 0 {
-            *entry = 1;
-            claimed = true;
-        }
-    });
-    if !claimed {
-        return;
-    }
-
-    let stream = StreamPath(format!("/project/{}", project_id.0));
-    let payload = protocol::ReviewCreatePayload {
-        selection: protocol::ReviewDiffSelection::AllUncommitted,
-    };
-    let state_for_failure = state.clone();
-    let project_id_for_failure = project_id.clone();
-    let host_for_failure = host_id.clone();
-    spawn_local(async move {
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ReviewCreate, &payload).await {
-            log::error!("failed to send project-scoped ReviewCreate: {e}");
-            state_for_failure.review_create_pending.update(|map| {
-                let key = (host_for_failure, project_id_for_failure);
-                if let Some(count) = map.get_mut(&key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        map.remove(&key);
-                    }
-                }
-            });
-        }
-    });
+    send_review_create(state, host_id, project_id);
 }
 
 // ── BTreeMap import is referenced by tests below ───────────────────────
@@ -2733,6 +2526,7 @@ mod wasm_tests {
             files: vec![
                 ProjectGitDiffFile {
                     relative_path: "src/foo.rs".to_owned(),
+                    is_binary: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/foo.rs:1".to_owned(),
                         old_start: 1,
@@ -2775,6 +2569,7 @@ mod wasm_tests {
                 },
                 ProjectGitDiffFile {
                     relative_path: "src/bar.rs".to_owned(),
+                    is_binary: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/bar.rs:1".to_owned(),
                         old_start: 1,
@@ -3575,6 +3370,7 @@ mod wasm_tests {
             context_mode: DiffContextMode::FullFile,
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/foo.rs".to_owned(),
+                is_binary: false,
                 hunks: vec![ProjectGitDiffHunk {
                     hunk_id: "src/foo.rs:1".to_owned(),
                     old_start: 1,
@@ -3607,6 +3403,7 @@ mod wasm_tests {
             context_mode: DiffContextMode::FullFile,
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/foo.rs".to_owned(),
+                is_binary: false,
                 hunks: vec![ProjectGitDiffHunk {
                     hunk_id: "src/foo.rs:1".to_owned(),
                     old_start: 1,

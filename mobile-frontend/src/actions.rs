@@ -368,22 +368,26 @@ pub async fn subscribe_review(
     review_id: protocol::ReviewId,
 ) -> Result<(), String> {
     let stream = review_stream(&review_id);
+    // Send first; only record the stream once the subscribe actually went
+    // out. Registering before the send would latch "already subscribed" even
+    // on a send failure, blocking the subscribe Effect from ever retrying.
+    send_frame(
+        host,
+        stream.clone(),
+        protocol::FrameKind::ReviewSubscribe,
+        &protocol::ReviewSubscribePayload::default(),
+    )
+    .await?;
     state.review_streams.update(|streams| {
         streams.insert(
             crate::state::ReviewRef {
                 local_host_id: host.clone(),
                 review_id,
             },
-            stream.clone(),
+            stream,
         );
     });
-    send_frame(
-        host,
-        stream,
-        protocol::FrameKind::ReviewSubscribe,
-        &protocol::ReviewSubscribePayload::default(),
-    )
-    .await
+    Ok(())
 }
 
 pub async fn send_review_action(

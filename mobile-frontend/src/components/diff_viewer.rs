@@ -51,9 +51,12 @@ pub fn DiffViewer(
     // on the uncommitted working tree, so only enable for that scope.
     let review_enabled = scope == protocol::ProjectDiffScope::Uncommitted;
 
-    // Resolve the active review id for this project (singleton). Prefer a
-    // Draft review; fall back to the most-recently-updated non-cancelled
-    // one. Reactive over `review_summaries`.
+    // Resolve the active review id for this project. The inline diff surface
+    // is only for the *editable* review, so it binds to a Draft only —
+    // Submitted/Consumed/Cancelled reviews are terminal and must not overlay
+    // the live uncommitted diff or expose comment/AI/Clear/Submit controls
+    // (matching the desktop integrated diff surface). Reactive over
+    // `review_summaries`.
     let project_for_review = project.clone();
     let active_review_id = Memo::new(move |_| {
         if !review_enabled {
@@ -63,22 +66,32 @@ pub fn DiffViewer(
             project_for_review.local_host_id.clone(),
             project_for_review.project_id.clone(),
         );
-        state.review_summaries.with(|map| {
-            let summaries = map.get(&key)?;
-            // Prefer a Draft; else most recent non-cancelled.
-            let mut candidates: Vec<&protocol::ReviewSummary> = summaries
+        let id = state.review_summaries.with(|map| {
+            map.get(&key)?
                 .iter()
-                .filter(|s| !matches!(s.status, protocol::ReviewStatus::Cancelled { .. }))
-                .collect();
-            candidates.sort_by(|a, b| {
-                let a_draft = matches!(a.status, protocol::ReviewStatus::Draft);
-                let b_draft = matches!(b.status, protocol::ReviewStatus::Draft);
-                b_draft
-                    .cmp(&a_draft)
-                    .then(b.updated_at_ms.cmp(&a.updated_at_ms))
-            });
-            candidates.first().map(|s| s.id.clone())
-        })
+                .filter(|s| matches!(s.status, protocol::ReviewStatus::Draft))
+                .max_by_key(|s| s.updated_at_ms)
+                .map(|s| s.id.clone())
+        })?;
+        // A live `StatusChanged` updates `state.reviews` before
+        // `review_summaries` refreshes. If we already hold the full record,
+        // require *it* to still be Draft so the inline surface drops a
+        // just-submitted/consumed review immediately rather than trusting a
+        // stale Draft summary. (Record absent ⇒ keep the id so the first
+        // subscribe can fetch it.)
+        let rkey = ReviewRef {
+            local_host_id: key.0.clone(),
+            review_id: id.clone(),
+        };
+        let live_non_draft = state.reviews.with(|r| {
+            r.get(&rkey)
+                .map(|rev| !matches!(rev.status, protocol::ReviewStatus::Draft))
+                .unwrap_or(false)
+        });
+        if live_non_draft {
+            return None;
+        }
+        Some(id)
     });
 
     // Subscribe to the active review when one appears so the overlay has
@@ -86,6 +99,9 @@ pub fn DiffViewer(
     {
         let project = project.clone();
         let state = state.clone();
+        // Guards against duplicate concurrent subscribes when the effect
+        // re-runs while one is still in flight.
+        let in_flight: StoredValue<bool, LocalStorage> = StoredValue::new_local(false);
         Effect::new(move |_| {
             let Some(review_id) = active_review_id.get() else {
                 return;
@@ -95,24 +111,31 @@ pub fn DiffViewer(
                 local_host_id: host.clone(),
                 review_id: review_id.clone(),
             };
-            let already_known = state.reviews.with_untracked(|r| r.contains_key(&rkey))
-                || state
-                    .review_streams
-                    .with_untracked(|s| s.contains_key(&rkey));
-            if already_known {
+            // Tracked reads: a record/stream arrival or a (re)connection
+            // re-runs this effect, so a previously-failed subscribe can
+            // retry. `subscribe_review` only records the stream after the
+            // send succeeds, so a failed send does NOT latch "already known".
+            let has_review = state.reviews.with(|r| r.contains_key(&rkey));
+            let has_stream = state.review_streams.with(|s| s.contains_key(&rkey));
+            if has_review || has_stream {
                 return;
             }
             let connected = state
                 .host_streams
-                .with_untracked(|streams| streams.contains_key(&host));
+                .with(|streams| streams.contains_key(&host));
             if !connected {
                 return;
             }
+            if in_flight.get_value() {
+                return;
+            }
+            in_flight.set_value(true);
             let state = state.clone();
             spawn_local(async move {
                 if let Err(e) = crate::actions::subscribe_review(&state, &host, review_id).await {
                     log::error!("subscribe_review failed: {e}");
                 }
+                in_flight.set_value(false);
             });
         });
     }
@@ -372,6 +395,17 @@ fn DiffFileBlock(
     let root_for_btn = root.clone();
     let root_for_thread = root.clone();
 
+    // Binary / no-hunk files have no lines to anchor line comments to —
+    // render a clear placeholder and skip the hunk list. The file-level
+    // comment affordance + thread region above still work.
+    let is_binary = file.is_binary;
+    let show_placeholder = is_binary || file.hunks.is_empty();
+    let placeholder_text = if is_binary {
+        "Binary file changed"
+    } else {
+        "No textual changes"
+    };
+
     // File-level comment affordance + thread region, only with a review.
     let file_comment_btn = {
         let ctx = review_ctx.clone();
@@ -435,18 +469,31 @@ fn DiffFileBlock(
             </summary>
             {file_comment_btn}
             {file_thread}
-            <div class="project-diff-hunks">
-                {file.hunks.into_iter().map(|hunk| {
-                    view! {
-                        <DiffHunkBlock
-                            hunk=hunk
-                            root=root.clone()
-                            relative_path=file.relative_path.clone()
-                            review_ctx=review_ctx.clone()
-                        />
-                    }
-                }).collect::<Vec<_>>()}
-            </div>
+            {if show_placeholder {
+                view! {
+                    <div
+                        class="project-diff-binary-placeholder"
+                        data-mobile-test="diff-binary-placeholder"
+                    >
+                        {placeholder_text}
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div class="project-diff-hunks">
+                        {file.hunks.into_iter().map(|hunk| {
+                            view! {
+                                <DiffHunkBlock
+                                    hunk=hunk
+                                    root=root.clone()
+                                    relative_path=file.relative_path.clone()
+                                    review_ctx=review_ctx.clone()
+                                />
+                            }
+                        }).collect::<Vec<_>>()}
+                    </div>
+                }.into_any()
+            }}
         </details>
     }
 }
@@ -894,33 +941,60 @@ fn Composer(ctx: ReviewCtx) -> impl IntoView {
 fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl IntoView {
     let Some(ctx) = ctx else {
         // No active review: offer to create one over the uncommitted diff.
+        // A `creating` gate prevents repeated taps from firing multiple
+        // create requests (analogous to the desktop create-pending gate).
         let project = project.clone();
+        let creating = RwSignal::new(false);
         let on_start = Callback::new(move |_: ()| {
+            if creating.get_untracked() {
+                return;
+            }
+            creating.set(true);
             let project = project.clone();
             spawn_local(async move {
                 let project_ref = crate::state::ActiveProjectRef {
                     local_host_id: project.local_host_id.clone(),
                     project_id: project.project_id.clone(),
                 };
-                if let Err(e) = crate::actions::create_review(
+                match crate::actions::create_review(
                     &project_ref,
                     protocol::ReviewDiffSelection::AllUncommitted,
                 )
                 .await
                 {
-                    log::error!("create_review failed: {e}");
+                    // `create_review` only *sends* the request — the review
+                    // projection arrives later via `ReviewListChanged`. We
+                    // deliberately keep the gate engaged: this no-active-
+                    // review branch remounts (ctx becomes `Some`) once the
+                    // draft lands, which is the real "done" signal. Resetting
+                    // here would briefly re-enable the button and let a fast-
+                    // resolving send admit a duplicate create before the
+                    // draft is known. (Mirrors the desktop create-pending
+                    // gate, which is only cleared by `ReviewListChanged`.)
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::error!("create_review failed: {e}");
+                        // Real send failure: re-enable so the user can retry.
+                        creating.set(false);
+                    }
                 }
             });
         });
         return view! {
             <div class="project-diff-review-controls" data-mobile-test="diff-review-controls">
-                <Button
-                    label="Start review"
-                    variant=ButtonVariant::Secondary
-                    size=ButtonSize::Compact
-                    data_mobile_test="diff-review-start"
-                    on_click=on_start
-                />
+                {move || {
+                    let creating_now = creating.get();
+                    view! {
+                        <Button
+                            label=if creating_now { "Starting\u{2026}" } else { "Start review" }
+                            variant=ButtonVariant::Secondary
+                            size=ButtonSize::Compact
+                            data_mobile_test="diff-review-start"
+                            disabled=creating_now
+                            on_click=on_start
+                        />
+                    }
+                }}
             </div>
         }
         .into_any();
@@ -1281,6 +1355,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/main.rs".to_owned(),
+                is_binary: false,
                 hunks: vec![ProjectGitDiffHunk {
                     hunk_id: "h-1".to_owned(),
                     old_start: 1,
@@ -1710,6 +1785,497 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "new-agent fallback must be offered"
+        );
+    }
+
+    fn fixture_binary_diff_state() -> ProjectDiffState {
+        ProjectDiffState {
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "assets/logo.png".to_owned(),
+                is_binary: true,
+                hunks: vec![],
+            }],
+        }
+    }
+
+    /// A binary file renders the placeholder and no diff lines, while still
+    /// exposing the file-level comment affordance when a review is active.
+    #[wasm_bindgen_test]
+    async fn diff_viewer_binary_file_shows_placeholder() {
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let review_id = ReviewId("rev-1".to_owned());
+        let key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+        };
+        let project_for_mount = project.clone();
+        let review_for_mount = review_id.clone();
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(key.clone(), fixture_binary_diff_state());
+            });
+            // A draft review so the file-level comment affordance shows.
+            state.review_summaries.update(|m| {
+                m.insert(
+                    (host_for_mount.clone(), ProjectId("p-1".to_owned())),
+                    vec![fixture_summary(&review_for_mount)],
+                );
+            });
+            state.reviews.update(|m| {
+                m.insert(
+                    ReviewRef {
+                        local_host_id: host_for_mount.clone(),
+                        review_id: review_for_mount.clone(),
+                    },
+                    fixture_review(&review_for_mount, "p-1"),
+                );
+            });
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project_for_mount.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Uncommitted
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-binary-placeholder']")
+                .unwrap()
+                .is_some(),
+            "binary file must render a placeholder"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("[data-mobile-test='diff-line-added']")
+                .unwrap()
+                .length(),
+            0,
+            "binary file must not render diff lines"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-file-comment-btn']")
+                .unwrap()
+                .is_some(),
+            "binary file must still expose a file-level comment affordance"
+        );
+    }
+
+    /// Stub the Tauri bridge so `create_review`'s `send_frame` resolves
+    /// quickly (Ok) instead of throwing on the missing global. We use a
+    /// *resolving* stub deliberately: the gate must hold even though the
+    /// send completes immediately, because a successful send does not mean
+    /// the review projection has arrived.
+    fn stub_tauri_invoke_ok() {
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(){ return Promise.resolve(); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(null); }; \
+             })();",
+        );
+    }
+
+    /// The mobile "Start review" gate must survive a fast-resolving send: a
+    /// second tap can't fire a duplicate create while the draft is still on
+    /// its way. The gate releases (the control remounts into the active-
+    /// review state) only when the review projection actually arrives.
+    #[wasm_bindgen_test]
+    async fn start_review_gate_holds_until_review_arrives() {
+        stub_tauri_invoke_ok();
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+        };
+        let project_for_mount = project.clone();
+        let container = make_container();
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(key.clone(), fixture_diff_state());
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project_for_mount.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Uncommitted
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let btn: HtmlElement = container
+            .query_selector("[data-mobile-test='diff-review-start']")
+            .unwrap()
+            .expect("start review button")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !btn.has_attribute("disabled"),
+            "start button must be enabled initially"
+        );
+
+        btn.click();
+        // Let the (fast, resolving) send complete.
+        next_tick().await;
+        next_tick().await;
+
+        // The gate must still hold: the draft has not arrived yet, so a
+        // second tap must not be able to fire another create.
+        let btn_after: HtmlElement = container
+            .query_selector("[data-mobile-test='diff-review-start']")
+            .unwrap()
+            .expect("start review button still present while create is pending")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            btn_after.has_attribute("disabled"),
+            "start button must stay disabled after a fast-resolving send, until the review arrives"
+        );
+
+        // The review projection arrives → the control remounts into its
+        // active-review state and the "Start review" affordance is gone.
+        let state = holder.borrow().clone().unwrap();
+        let review_id = ReviewId("rev-1".to_owned());
+        state.review_summaries.update(|m| {
+            m.insert(
+                (host.clone(), ProjectId("p-1".to_owned())),
+                vec![fixture_summary(&review_id)],
+            );
+        });
+        state.reviews.update(|m| {
+            m.insert(
+                ReviewRef {
+                    local_host_id: host.clone(),
+                    review_id: review_id.clone(),
+                },
+                fixture_review(&review_id, "p-1"),
+            );
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-start']")
+                .unwrap()
+                .is_none(),
+            "once the review arrives the Start-review affordance must be replaced by the active controls"
+        );
+    }
+
+    fn invoke_count() -> i32 {
+        js_sys::eval("window.__invoke_count")
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as i32
+    }
+
+    /// A failed `ReviewSubscribe` must NOT latch a stream registration (which
+    /// would block any retry), and the subscribe Effect must retry when a
+    /// later reactive change re-runs it.
+    #[wasm_bindgen_test]
+    async fn subscribe_failure_does_not_latch_and_retries() {
+        // Rejecting recording bridge: every send fails; count invokes.
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__invoke_count = 0; \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(){ \
+                 window.__invoke_count++; return Promise.reject('boom'); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(null); }; \
+             })();",
+        );
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let diff_key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+        };
+        let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
+        let review_id = ReviewId("rev-1".to_owned());
+        let review_key = ReviewRef {
+            local_host_id: host.clone(),
+            review_id: review_id.clone(),
+        };
+        let project_for_mount = project.clone();
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(diff_key.clone(), fixture_diff_state());
+            });
+            // A draft summary so a review id resolves...
+            state.review_summaries.update(|m| {
+                m.insert(summary_key.clone(), vec![fixture_summary(&review_id)]);
+            });
+            // ...and a connected host so the subscribe Effect proceeds. No
+            // review record and no review_streams entry, so it must subscribe.
+            state.host_streams.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    StreamPath("/host/host-1".to_owned()),
+                );
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project_for_mount.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Uncommitted
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        let state = holder.borrow().clone().unwrap();
+        // The failed subscribe must not have registered the stream.
+        assert!(
+            !state
+                .review_streams
+                .with_untracked(|s| s.contains_key(&review_key)),
+            "a failed subscribe must not register the review stream (it would block retry)"
+        );
+        let after_first = invoke_count();
+        assert!(after_first >= 1, "a subscribe must have been attempted");
+
+        // A reactive change re-runs the effect ⇒ it retries (not latched).
+        state.reviews.update(|_| {});
+        next_tick().await;
+        assert!(
+            invoke_count() > after_first,
+            "the subscribe must retry after a reactive change (was {after_first}, now {})",
+            invoke_count()
+        );
+    }
+
+    /// The inline diff surface binds only to a Draft review. A Submitted
+    /// (terminal) review must NOT become the inline ctx: it must not overlay
+    /// comments or expose comment/submit controls, and the Start-review
+    /// affordance should be shown instead.
+    #[wasm_bindgen_test]
+    async fn submitted_review_does_not_bind_inline_diff() {
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let diff_key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+        };
+        let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
+        let review_id = ReviewId("rev-1".to_owned());
+        let project_for_mount = project.clone();
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(diff_key.clone(), fixture_diff_state());
+            });
+            // A SUBMITTED (terminal) review — not a Draft.
+            let mut summary = fixture_summary(&review_id);
+            summary.status = protocol::ReviewStatus::Submitted { submitted_at_ms: 1 };
+            state.review_summaries.update(|m| {
+                m.insert(summary_key.clone(), vec![summary]);
+            });
+            // Even with the full record present, it must not bind inline.
+            let mut review = fixture_review(&review_id, "p-1");
+            review.status = protocol::ReviewStatus::Submitted { submitted_at_ms: 1 };
+            state.reviews.update(|m| {
+                m.insert(
+                    ReviewRef {
+                        local_host_id: host_for_mount.clone(),
+                        review_id: review_id.clone(),
+                    },
+                    review,
+                );
+            });
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project_for_mount.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Uncommitted
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        // No active Draft ⇒ the Start-review affordance shows.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-start']")
+                .unwrap()
+                .is_some(),
+            "with only a submitted review, the Start-review affordance must show"
+        );
+        // The submitted review must not overlay its comment...
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-comment-body']")
+                .unwrap()
+                .is_none(),
+            "a submitted (non-draft) review must not overlay inline comments"
+        );
+        // ...nor expose any comment affordance (those are ctx-only).
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-file-comment-btn']")
+                .unwrap()
+                .is_none(),
+            "a submitted review must not expose inline comment controls"
+        );
+    }
+
+    /// A live `StatusChanged` to Submitted must drop the inline ctx even while
+    /// the Draft summary is still stale: comments/controls disappear and the
+    /// Start-review affordance returns.
+    #[wasm_bindgen_test]
+    async fn live_status_change_drops_inline_ctx_with_stale_summary() {
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let diff_key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+        };
+        let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
+        let review_id = ReviewId("rev-1".to_owned());
+        let review_key = ReviewRef {
+            local_host_id: host.clone(),
+            review_id: review_id.clone(),
+        };
+        let project_for_mount = project.clone();
+        let review_key_for_mount = review_key.clone();
+        let container = make_container();
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(diff_key.clone(), fixture_diff_state());
+            });
+            // Draft summary + Draft full record.
+            state.review_summaries.update(|m| {
+                m.insert(summary_key.clone(), vec![fixture_summary(&review_id)]);
+            });
+            state.reviews.update(|m| {
+                m.insert(
+                    review_key_for_mount.clone(),
+                    fixture_review(&review_id, "p-1"),
+                );
+            });
+            // Pre-register the stream so the subscribe Effect short-circuits.
+            state.review_streams.update(|m| {
+                m.insert(
+                    review_key_for_mount.clone(),
+                    StreamPath("/review/rev-1".to_owned()),
+                );
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project_for_mount.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Uncommitted
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        // Draft: the inline comment is shown and no Start-review affordance.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-comment-body']")
+                .unwrap()
+                .is_some(),
+            "draft review must overlay its comment inline"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-start']")
+                .unwrap()
+                .is_none(),
+            "no Start-review affordance while a draft is active"
+        );
+
+        // Live status flips to Submitted; the Draft *summary* stays stale.
+        let state = holder.borrow().clone().unwrap();
+        state.reviews.update(|m| {
+            if let Some(r) = m.get_mut(&review_key) {
+                r.status = protocol::ReviewStatus::Submitted { submitted_at_ms: 1 };
+            }
+        });
+        next_tick().await;
+
+        // ctx drops: comment gone, Start-review returns.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-comment-body']")
+                .unwrap()
+                .is_none(),
+            "inline comment must disappear once the live review is non-draft"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-start']")
+                .unwrap()
+                .is_some(),
+            "the Start-review affordance must return once the live review is non-draft"
         );
     }
 }

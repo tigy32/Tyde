@@ -312,6 +312,7 @@ mod tests {
                 context_mode: DiffContextMode::Hunks,
                 files: vec![ProjectGitDiffFile {
                     relative_path: "src/lib.rs".to_owned(),
+                    is_binary: false,
                     hunks: Vec::new(),
                 }],
             }],

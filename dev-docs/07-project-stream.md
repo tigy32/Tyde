@@ -361,11 +361,13 @@ pub struct ProjectGitDiffPayload {
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
     pub path: Option<String>,
+    pub context_mode: DiffContextMode,
     pub files: Vec<ProjectGitDiffFile>,
 }
 
 pub struct ProjectGitDiffFile {
     pub relative_path: String,
+    pub is_binary: bool,
     pub hunks: Vec<ProjectGitDiffHunk>,
 }
 
@@ -394,6 +396,11 @@ Important:
 - the UI renders this diff directly
 - the UI does not parse raw patch text to discover hunk boundaries
 - `hunk_id` is the stable server-issued handle used by `project_stage_hunk`
+- `is_binary: true` means the file changed but has no textual hunks; binary
+  files support file-level review/comment anchors only
+- files can also have `is_binary: false` and an empty hunk list for
+  metadata-only changes such as mode changes, or for empty untracked text files;
+  an empty hunk list does not mean the file is clean
 
 ### 6.5 `project_error`
 

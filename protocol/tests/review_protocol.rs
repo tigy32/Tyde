@@ -142,6 +142,7 @@ fn diff_payload() -> ProjectGitDiffPayload {
         context_mode: DiffContextMode::FullFile,
         files: vec![ProjectGitDiffFile {
             relative_path: "src/lib.rs".to_owned(),
+            is_binary: false,
             hunks: vec![ProjectGitDiffHunk {
                 hunk_id: "src/lib.rs:1".to_owned(),
                 old_start: 1,
@@ -364,6 +365,32 @@ fn review_comment_anchor_status_defaults_for_legacy_json() {
     }))
     .expect("legacy suggestion without anchor status");
     assert_eq!(suggestion.anchor_status, ReviewAnchorStatus::Current);
+}
+
+#[test]
+fn project_git_diff_file_binary_flag_defaults_for_legacy_json() {
+    let file: ProjectGitDiffFile = serde_json::from_value(json!({
+        "relative_path": "src/lib.rs",
+        "hunks": []
+    }))
+    .expect("legacy diff file without binary flag");
+
+    assert!(!file.is_binary);
+}
+
+#[test]
+fn project_git_diff_file_binary_flag_round_trips() {
+    let file = ProjectGitDiffFile {
+        relative_path: "assets/logo.png".to_owned(),
+        is_binary: true,
+        hunks: Vec::new(),
+    };
+
+    round_trip(&file);
+    assert_eq!(
+        serde_json::to_value(&file).expect("serialize binary diff file")["is_binary"],
+        json!(true)
+    );
 }
 
 #[test]

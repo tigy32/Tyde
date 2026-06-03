@@ -1073,16 +1073,23 @@ fn build_untracked_diff_file(
 ) -> Result<ProjectGitDiffFile, String> {
     validate_relative_path(relative_path)?;
     let absolute_path = Path::new(root).join(relative_path);
-    let contents = match fs::read_to_string(&absolute_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return Err(format!("binary file: {}", relative_path));
-        }
+    let bytes = match fs::read(&absolute_path) {
+        Ok(bytes) => bytes,
         Err(error) => {
             return Err(format!(
                 "Failed to read untracked file '{}' from '{}': {error}",
                 relative_path, root
             ));
+        }
+    };
+    let contents = match String::from_utf8(bytes) {
+        Ok(contents) if !contents.contains('\0') => contents,
+        Ok(_) | Err(_) => {
+            return Ok(ProjectGitDiffFile {
+                relative_path: relative_path.to_owned(),
+                is_binary: true,
+                hunks: Vec::new(),
+            });
         }
     };
 
@@ -1111,6 +1118,7 @@ fn build_untracked_diff_file(
 
     Ok(ProjectGitDiffFile {
         relative_path: relative_path.to_owned(),
+        is_binary: false,
         hunks,
     })
 }
@@ -1525,6 +1533,7 @@ fn git_command(
     access_mode: GitAccessMode,
 ) -> Command {
     let mut command = Command::new(git_binary);
+    command.env("LC_ALL", "C");
     if matches!(access_mode, GitAccessMode::ReadOnly) {
         command.arg("--no-optional-locks");
     }
@@ -1569,6 +1578,7 @@ fn parse_git_diff(raw: &str) -> Result<Vec<ProjectGitDiffFile>, String> {
             let relative_path = file.relative_path.clone();
             Ok(ProjectGitDiffFile {
                 relative_path: relative_path.clone(),
+                is_binary: parsed_git_diff_file_is_binary(&file),
                 hunks: file
                     .hunks
                     .into_iter()
@@ -1588,6 +1598,16 @@ fn parse_git_diff(raw: &str) -> Result<Vec<ProjectGitDiffFile>, String> {
             })
         })
         .collect()
+}
+
+fn parsed_git_diff_file_is_binary(file: &ParsedGitDiffFile) -> bool {
+    file.header_lines
+        .iter()
+        .any(|line| is_git_binary_diff_marker(line))
+}
+
+fn is_git_binary_diff_marker(line: &str) -> bool {
+    line.starts_with("Binary files ") || line == "GIT binary patch"
 }
 
 fn parse_raw_git_diff(raw: &str) -> Result<Vec<ParsedGitDiffFile>, String> {
@@ -1939,6 +1959,7 @@ mod tests {
         .expect("build_untracked_diff_file should succeed");
 
         assert_eq!(diff.relative_path, "src/new.rs");
+        assert!(!diff.is_binary);
         assert_eq!(diff.hunks.len(), 1);
         let hunk = &diff.hunks[0];
         assert_eq!(hunk.hunk_id, "src/new.rs::0");
@@ -1971,18 +1992,50 @@ mod tests {
     }
 
     #[test]
-    fn build_untracked_diff_file_binary_returns_err() {
+    fn build_untracked_diff_file_binary_returns_binary_file_without_hunks() {
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let path = temp_dir.path().join("binary.dat");
         fs::write(&path, [0xff_u8, 0xfe_u8, 0x00_u8]).expect("write binary file");
 
-        let error = build_untracked_diff_file(
+        let diff = build_untracked_diff_file(
             temp_dir.path().to_str().expect("tempdir path utf8"),
             "binary.dat",
         )
-        .expect_err("binary file should error");
+        .expect("binary file should produce diff metadata");
 
-        assert_eq!(error, "binary file: binary.dat");
+        assert_eq!(diff.relative_path, "binary.dat");
+        assert!(diff.is_binary);
+        assert!(diff.hunks.is_empty());
+    }
+
+    #[test]
+    fn read_diff_includes_untracked_binary_file_without_hunks() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let root = temp_dir.path().to_str().expect("tempdir path utf8");
+        let path = temp_dir.path().join("binary.dat");
+        fs::write(&path, [0xff_u8, 0xfe_u8, 0x00_u8]).expect("write binary file");
+        let project = test_project(root);
+
+        let diff = read_diff_with_runner(
+            &project,
+            ProjectReadDiffPayload {
+                root: ProjectRootPath(root.to_owned()),
+                scope: ProjectDiffScope::Uncommitted,
+                path: None,
+                context_mode: DiffContextMode::FullFile,
+            },
+            |_root, args, _access_mode| match args {
+                ["diff", "-U9999999", "HEAD"] => Ok(String::new()),
+                ["ls-files", "--others", "--exclude-standard"] => Ok("binary.dat\n".to_owned()),
+                other => panic!("unexpected git args: {other:?}"),
+            },
+        )
+        .expect("read_diff should include untracked binary files");
+
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].relative_path, "binary.dat");
+        assert!(diff.files[0].is_binary);
+        assert!(diff.files[0].hunks.is_empty());
     }
 
     #[test]
@@ -2003,6 +2056,7 @@ index 83db48f..f735c2b 100644\n\
         assert_eq!(files.len(), 1);
         let file = &files[0];
         assert_eq!(file.relative_path, "src/lib.rs");
+        assert!(!file.is_binary);
         assert_eq!(file.hunks.len(), 1);
         let hunk = &file.hunks[0];
         assert_eq!(hunk.old_start, 1);
@@ -2032,11 +2086,40 @@ index 83db48f..f735c2b 100644\n\
         assert_eq!(hunk.lines[4].new_line_number, Some(4));
     }
 
+    #[test]
+    fn parse_git_diff_marks_tracked_binary_sections() {
+        let raw = "\
+diff --git a/assets/logo.png b/assets/logo.png\n\
+index 1234567..89abcde 100644\n\
+Binary files a/assets/logo.png and b/assets/logo.png differ\n";
+
+        let files = parse_git_diff(raw).expect("parse_git_diff should succeed");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "assets/logo.png");
+        assert!(files[0].is_binary);
+        assert!(files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn parse_git_diff_keeps_mode_only_sections_as_no_hunk_files() {
+        let raw = "\
+diff --git a/scripts/run.sh b/scripts/run.sh\n\
+old mode 100644\n\
+new mode 100755\n";
+
+        let files = parse_git_diff(raw).expect("parse_git_diff should succeed");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, "scripts/run.sh");
+        assert!(!files[0].is_binary);
+        assert!(files[0].hunks.is_empty());
+    }
+
     #[cfg(unix)]
     struct FakeGitBinary {
         dir: PathBuf,
         binary: PathBuf,
         log_path: PathBuf,
+        env_path: PathBuf,
     }
 
     #[cfg(unix)]
@@ -2049,13 +2132,15 @@ index 83db48f..f735c2b 100644\n\
             let binary = dir.join("git");
             let stdout_path = dir.join("stdout.txt");
             let log_path = dir.join("args.log");
+            let env_path = dir.join("env.log");
 
             fs::write(&stdout_path, stdout).expect("write fake git stdout");
             fs::write(
                 &binary,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' \"${{LC_ALL:-}}\" > '{}'\ncat '{}'\n",
                     log_path.display(),
+                    env_path.display(),
                     stdout_path.display()
                 ),
             )
@@ -2071,6 +2156,7 @@ index 83db48f..f735c2b 100644\n\
                 dir,
                 binary,
                 log_path,
+                env_path,
             }
         }
 
@@ -2084,6 +2170,13 @@ index 83db48f..f735c2b 100644\n\
                 .lines()
                 .map(|line| line.to_owned())
                 .collect()
+        }
+
+        fn logged_lc_all(&self) -> String {
+            fs::read_to_string(&self.env_path)
+                .expect("read fake git env log")
+                .trim_end()
+                .to_owned()
         }
     }
 
@@ -2119,6 +2212,22 @@ index 83db48f..f735c2b 100644\n\
                 "--branch".to_owned(),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_commands_force_c_locale_for_parseable_output() {
+        let fake_git = FakeGitBinary::new("");
+
+        run_git_mode_with_binary(
+            fake_git.binary_path(),
+            "/repo",
+            &["diff", "-U3"],
+            GitAccessMode::ReadOnly,
+        )
+        .expect("git command should succeed");
+
+        assert_eq!(fake_git.logged_lc_all(), "C");
     }
 
     #[cfg(unix)]

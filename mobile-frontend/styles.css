@@ -2963,6 +2963,14 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
 }
+/* Shown instead of hunks for binary / no-hunk files. */
+.project-diff-binary-placeholder {
+    padding: var(--space-3, 12px);
+    border-top: 1px solid var(--border-default);
+    color: var(--text-tertiary);
+    font-size: 13px;
+    font-style: italic;
+}
 .project-diff-hunk {
     border-top: 1px solid var(--border-default);
 }

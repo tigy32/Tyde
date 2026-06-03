@@ -229,6 +229,7 @@ mod tests {
                 context_mode: DiffContextMode::FullFile,
                 files: vec![ProjectGitDiffFile {
                     relative_path: "src/lib.rs".to_owned(),
+                    is_binary: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/lib.rs::0".to_owned(),
                         old_start: 1,

@@ -6,7 +6,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
 use crate::components::chat_view::ChatView;
-use crate::components::diff_view::DiffView;
+use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
 use crate::components::review_view::ReviewView;
@@ -500,15 +500,25 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                 .iter()
                                 .find(|t| t.id == tab_id)
                                 .and_then(|t| match &t.content {
-                                    TabContent::Diff { root, scope, path } => {
-                                        Some((root.clone(), *scope, path.clone()))
-                                    }
+                                    TabContent::Diff {
+                                        host_id,
+                                        project_id,
+                                        root,
+                                        scope,
+                                        path,
+                                    } => Some((
+                                        host_id.clone(),
+                                        project_id.clone(),
+                                        root.clone(),
+                                        *scope,
+                                        path.clone(),
+                                    )),
                                     _ => None,
                                 })
                         });
                         match resolved {
-                            Some((root, scope, path)) => {
-                                view! { <DiffView tab_id=tab_id root=root scope=scope path=path /> }.into_any()
+                            Some((host_id, project_id, root, scope, path)) => {
+                                view! { <ReviewableDiffView tab_id=tab_id host_id=host_id project_id=project_id root=root scope=scope path=path /> }.into_any()
                             }
                             None => view! { <div></div> }.into_any(),
                         }

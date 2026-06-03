@@ -6,6 +6,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::find_bar::{FindBar, FindState, render_text_with_highlights};
+use crate::components::review_layer::{build_review_decorations, install_drag_listeners};
 use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, DiffViewState, TabId, TabScrollState};
 use crate::syntax_highlight::{
@@ -223,6 +224,16 @@ struct DiffScroll {
 #[component]
 pub fn DiffView(
     #[prop(optional)] tab_id: Option<TabId>,
+    /// Explicit owning project identity for live (non-frozen) diffs. Keys
+    /// `diff_contents` and addresses context-mode refetches to the tab's own
+    /// project/host — not whatever project happens to be active — so a diff
+    /// tab keeps showing/refetching its own project even after the active
+    /// project changes, and two same-root projects never collide. Omitted
+    /// only for frozen-payload (review-snapshot) diffs, which never touch
+    /// `diff_contents` or refetch.
+    #[prop(optional)]
+    host_id: Option<String>,
+    #[prop(optional)] project_id: Option<protocol::ProjectId>,
     root: ProjectRootPath,
     scope: ProjectDiffScope,
     path: String,
@@ -253,11 +264,23 @@ pub fn DiffView(
         decoration_below_file_header,
     };
 
-    let key = (root.clone(), scope, path.clone());
-    let diff_key = key.clone();
+    // Live diffs are keyed by the tab's explicit project identity (+ root,
+    // scope, path). `None` only in frozen-payload mode, which reads the
+    // snapshot memo instead of `diff_contents`.
+    let diff_key: Option<crate::state::DiffKey> = match (host_id.clone(), project_id.clone()) {
+        (Some(h), Some(p)) => Some(crate::state::DiffKey::new(
+            h,
+            p,
+            root.clone(),
+            scope,
+            path.clone(),
+        )),
+        _ => None,
+    };
     let frozen_for_diff = frozen_payload;
     let diff_root = root.clone();
     let diff_path = path.clone();
+    let diff_key_for_diff = diff_key.clone();
     let diff = move || -> Option<DiffViewState> {
         if let Some(memo) = frozen_for_diff {
             let payloads = memo.get()?;
@@ -286,45 +309,49 @@ pub fn DiffView(
                 files,
             });
         }
-        state
-            .diff_contents
-            .with(|diffs| diffs.get(&diff_key).cloned())
+        let key = diff_key_for_diff.as_ref()?;
+        state.diff_contents.with(|diffs| diffs.get(key).cloned())
     };
 
     // Reactive effect: when the context-mode signal differs from the stored
-    // entry's requested mode, dispatch a fresh ProjectReadDiff. Disabled in
-    // frozen-payload mode because the snapshot does not refetch.
+    // entry's requested mode, dispatch a fresh ProjectReadDiff to the tab's
+    // OWN project/host (not the active project). Disabled in frozen-payload
+    // mode because the snapshot does not refetch.
     let frozen_for_effect = frozen_payload.is_some();
     let effect_state = state.clone();
-    let effect_key = key.clone();
+    let effect_key = diff_key.clone();
+    let effect_host = host_id.clone();
+    let effect_project = project_id.clone();
     Effect::new(move |_| {
         if frozen_for_effect {
             return;
         }
+        let (Some(key), Some(host_id), Some(project_id)) = (
+            effect_key.clone(),
+            effect_host.clone(),
+            effect_project.clone(),
+        ) else {
+            return;
+        };
         let signal_mode = effect_state.diff_context_mode.get();
         let Some(current) = effect_state
             .diff_contents
-            .with(|diffs| diffs.get(&effect_key).cloned())
+            .with(|diffs| diffs.get(&key).cloned())
         else {
             return;
         };
         if current.context_mode == signal_mode {
             return;
         }
-        let Some(active_project) = effect_state.active_project_ref_untracked() else {
-            return;
-        };
-        let project_id = active_project.project_id.clone();
         let stream = StreamPath(format!("/project/{}", project_id.0));
         let root = current.root.clone();
         let scope = current.scope;
         let path = current.path.clone();
 
-        let update_key = effect_key.clone();
-        let root_for_update = root.clone();
         let path_for_update = path.clone();
+        let root_for_update = root.clone();
         effect_state.diff_contents.update(|diffs| {
-            let previous = diffs.get(&update_key);
+            let previous = diffs.get(&key);
             let next = DiffViewState::for_request(
                 previous,
                 root_for_update,
@@ -332,7 +359,7 @@ pub fn DiffView(
                 path_for_update,
                 signal_mode,
             );
-            diffs.insert(update_key, next);
+            diffs.insert(key.clone(), next);
         });
 
         let payload = ProjectReadDiffPayload {
@@ -341,7 +368,6 @@ pub fn DiffView(
             path,
             context_mode: signal_mode,
         };
-        let host_id = active_project.host_id.clone();
         spawn_local(async move {
             if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await
             {
@@ -378,6 +404,204 @@ pub fn DiffView(
             }}
         </div>
     }
+}
+
+/// A normal git-diff tab that is also a review surface. It mounts a plain
+/// `DiffView` over the *live* (non-frozen) diff payload and, when the
+/// project that owns this tab's root has a Draft review, layers the same
+/// review decorations the standalone workbench uses on top of it —
+/// drag-to-comment gutters, inline thread regions, and a file-level comment
+/// affordance. This is how reviews are reached from the normal diff
+/// surfaces instead of routing the user into a separate `ReviewView`
+/// workbench.
+///
+/// The review is bound to the tab's *explicit* `(host_id, project_id)` —
+/// carried in `TabContent::Diff`, not guessed from `root` — so switching the
+/// active project can't change which review decorates an already-open tab,
+/// and two projects/hosts that happen to share a root path string still bind
+/// to their own review.
+///
+/// When there is no Draft review, a thin banner offers to start one; we do
+/// not fabricate an optimistic review or show comment affordances until a
+/// real Draft exists (server-confirmed via `ReviewListChanged`).
+#[component]
+pub fn ReviewableDiffView(
+    tab_id: TabId,
+    host_id: String,
+    project_id: protocol::ProjectId,
+    root: ProjectRootPath,
+    scope: ProjectDiffScope,
+    path: String,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    // Review affordances bind only to the all-uncommitted diff: that is the
+    // scope a review covers and the one its anchors validate against
+    // (HEAD↔worktree). A Staged/Unstaged diff tab (opened from a git-panel
+    // file row) shows index↔worktree line numbers that would not line up
+    // with review anchors, so render it as a plain diff with no overlay.
+    if scope != ProjectDiffScope::Uncommitted {
+        return view! {
+            <DiffView
+                tab_id=tab_id
+                host_id=host_id
+                project_id=project_id
+                root=root
+                scope=scope
+                path=path
+            />
+        }
+        .into_any();
+    }
+
+    // Composer + drag-selection signals are owned here so the decorations
+    // and the window-level drag listeners share them. Listeners install
+    // once for the lifetime of the tab.
+    let composer = RwSignal::new(None);
+    let drag_selection = RwSignal::new(None);
+    install_drag_listeners(drag_selection, composer);
+
+    // Reactively resolve this project's Draft review. `(host, id)` when one
+    // exists, `None` otherwise. Only changes when the draft id changes
+    // (create / submit / cancel) — adding a comment does not flip it, so the
+    // diff below does not remount on every comment.
+    //
+    // We start from the Draft summary (cheap, arrives first), but if we hold
+    // the full record we require *its* live status to still be Draft: a live
+    // `StatusChanged` updates `state.reviews` before `review_summaries`
+    // refreshes, so trusting a stale Draft summary alone would keep inline
+    // comment affordances enabled on an already-submitted review. When the
+    // full record is absent we keep the summary's Draft id so the first
+    // subscribe can fetch it.
+    let draft_state = state.clone();
+    let draft_host = host_id.clone();
+    let draft_project = project_id.clone();
+    let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
+        let id = draft_state.review_summaries.with(|m| {
+            m.get(&draft_project).and_then(|sums| {
+                sums.iter()
+                    .filter(|s| matches!(s.status, protocol::ReviewStatus::Draft))
+                    .max_by_key(|s| s.updated_at_ms)
+                    .map(|s| s.id.clone())
+            })
+        })?;
+        let live_non_draft = draft_state.reviews.with(|r| {
+            r.get(&id)
+                .map(|rev| !matches!(rev.status, protocol::ReviewStatus::Draft))
+                .unwrap_or(false)
+        });
+        if live_non_draft {
+            return None;
+        }
+        Some((draft_host.clone(), id))
+    });
+    let is_draft: Memo<bool> = Memo::new(move |_| draft.get().is_some());
+
+    // Reactively keep the draft review subscribed so the diff can render its
+    // comments and suggestions. The shared helper tracks the draft target,
+    // resubscribes when the draft id changes, and retries on send failure /
+    // record loss / reconnect.
+    crate::components::review_view::subscribe_review_reactive(&state, draft);
+
+    let pending_state = state.clone();
+    let pending_host = host_id.clone();
+    let pending_project = project_id.clone();
+    let create_pending = move || {
+        pending_state.review_create_pending.with(|m| {
+            m.get(&(pending_host.clone(), pending_project.clone()))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
+    };
+
+    let banner_host = host_id.clone();
+    let banner_project = project_id.clone();
+    // The tab's own identity, forwarded to `DiffView` so the live diff body
+    // and any context-mode refetch stay bound to this project (not the review
+    // host, and not the active project).
+    let dv_host = host_id.clone();
+    let dv_project = project_id.clone();
+    view! {
+        <div class="reviewable-diff">
+            {move || {
+                if draft.get().is_some() {
+                    return None;
+                }
+                let pending = create_pending();
+                let host = banner_host.clone();
+                let project_id = banner_project.clone();
+                Some(view! {
+                    <div class="reviewable-diff-banner" data-test="reviewable-diff-banner">
+                        <span class="reviewable-diff-banner-text">
+                            "Start a review to comment on these changes"
+                        </span>
+                        <button
+                            class="reviewable-diff-banner-btn"
+                            data-test="reviewable-diff-start"
+                            disabled=pending
+                            on:click=move |_| {
+                                let state = expect_context::<AppState>();
+                                crate::components::review_view::create_review_for_project(
+                                    &state, &host, &project_id,
+                                );
+                            }
+                        >
+                            "Review changes"
+                        </button>
+                    </div>
+                })
+            }}
+            {move || {
+                let root = root.clone();
+                let path = path.clone();
+                let dv_host = dv_host.clone();
+                let dv_project = dv_project.clone();
+                match draft.get() {
+                    // `review_host` is the *review's* host (used for comment
+                    // actions); the DiffView still keys off the *tab's*
+                    // `dv_host`/`dv_project` identity.
+                    Some((review_host, review_id)) => {
+                        let decorations = build_review_decorations(
+                            composer,
+                            drag_selection,
+                            review_id,
+                            review_host,
+                            is_draft,
+                        );
+                        view! {
+                            <DiffView
+                                tab_id=tab_id
+                                host_id=dv_host
+                                project_id=dv_project
+                                root=root
+                                scope=scope
+                                path=path
+                                on_gutter_pointer_down=decorations.gutter_pointer_down
+                                line_extra_class=decorations.line_extra_class
+                                gutter_action_for_file_header=decorations.gutter_action_for_file_header
+                                decoration_below_line=decorations.decoration_below_line
+                                decoration_below_file_header=decorations.decoration_below_file_header
+                            />
+                        }
+                        .into_any()
+                    }
+                    None => view! {
+                        <DiffView
+                            tab_id=tab_id
+                            host_id=dv_host
+                            project_id=dv_project
+                            root=root
+                            scope=scope
+                            path=path
+                        />
+                    }
+                    .into_any(),
+                }
+            }}
+        </div>
+    }
+    .into_any()
 }
 
 #[component]
@@ -741,6 +965,13 @@ fn DiffContent(
 /// for now; fix is to make this mode-aware (run `pair_lines_side_by_side`
 /// per hunk to count) and recompute when view_mode toggles.
 fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMode) -> usize {
+    // Binary / no-hunk files render the file header (1 row) plus a single
+    // "Binary file changed" placeholder row instead of hunks — see
+    // `DiffFileView`'s `show_placeholder` branch. Counting it keeps the
+    // per-file virtual-scroll offsets aligned in multi-file diffs.
+    if file.is_binary || file.hunks.is_empty() {
+        return 2;
+    }
     let mut total = 1; // file header
     for hunk in &file.hunks {
         if context_mode == DiffContextMode::Hunks {
@@ -792,6 +1023,20 @@ fn DiffFileView(
     let header_action_path = relative_path.clone();
     let header_action_cb = decorations.gutter_action_for_file_header.clone();
 
+    // Binary files (and files git reports with no textual hunks, e.g. a
+    // pure mode change) have no lines to render line-anchored comments on.
+    // We render a clear placeholder instead of an empty diff body and skip
+    // the hunk renderer entirely. The file header still carries the
+    // file-level comment affordance + thread region, so the user can leave
+    // a file-scoped comment on a binary change.
+    let is_binary = file.is_binary;
+    let show_placeholder = is_binary || file.hunks.is_empty();
+    let placeholder_text = if is_binary {
+        "Binary file changed"
+    } else {
+        "No textual changes"
+    };
+
     view! {
         <div class="diff-file">
             <div class="diff-file-header">
@@ -804,35 +1049,50 @@ fn DiffFileView(
             {move || header_decoration_cb.as_ref().and_then(|cb| {
                 cb(header_decoration_root.clone(), header_decoration_path.clone())
             })}
-            {move || {
-                // Subscribe to syntax_theme so changing the active theme
-                // re-renders the diff with re-tokenized colors. Tokens are
-                // computed eagerly inside render_*_virtualized; reading
-                // the signal here causes that work to re-run on change.
-                let _ = syntax_theme.get();
-                match view_mode_sig.get() {
-                    DiffViewMode::Unified => render_unified_virtualized(UnifiedVirtualizedArgs {
-                        file: file_for_view.clone(),
-                        hunk_offsets: offsets_for_view.clone(),
-                        context_mode,
-                        scope,
-                        root: root_for_view.clone(),
-                        relative_path: path_for_view.clone(),
-                        rendered_offset,
-                        decorations: decorations_for_view.clone(),
-                    }),
-                    DiffViewMode::SideBySide => render_sbs_virtualized(
-                        file_for_view.clone(),
-                        offsets_for_view.clone(),
-                        context_mode,
-                        scope,
-                        root_for_view.clone(),
-                        path_for_view.clone(),
-                        split,
-                        rendered_offset,
-                        decorations_for_view.clone(),
-                    ),
-                }
+            {if show_placeholder {
+                view! {
+                    <div class="diff-binary-placeholder" data-test="diff-binary-placeholder">
+                        {placeholder_text}
+                    </div>
+                }.into_any()
+            } else {
+                let file_for_view = file_for_view.clone();
+                let offsets_for_view = offsets_for_view.clone();
+                let root_for_view = root_for_view.clone();
+                let path_for_view = path_for_view.clone();
+                let decorations_for_view = decorations_for_view.clone();
+                view! {
+                    {move || {
+                        // Subscribe to syntax_theme so changing the active theme
+                        // re-renders the diff with re-tokenized colors. Tokens are
+                        // computed eagerly inside render_*_virtualized; reading
+                        // the signal here causes that work to re-run on change.
+                        let _ = syntax_theme.get();
+                        match view_mode_sig.get() {
+                            DiffViewMode::Unified => render_unified_virtualized(UnifiedVirtualizedArgs {
+                                file: file_for_view.clone(),
+                                hunk_offsets: offsets_for_view.clone(),
+                                context_mode,
+                                scope,
+                                root: root_for_view.clone(),
+                                relative_path: path_for_view.clone(),
+                                rendered_offset,
+                                decorations: decorations_for_view.clone(),
+                            }),
+                            DiffViewMode::SideBySide => render_sbs_virtualized(
+                                file_for_view.clone(),
+                                offsets_for_view.clone(),
+                                context_mode,
+                                scope,
+                                root_for_view.clone(),
+                                path_for_view.clone(),
+                                split,
+                                rendered_offset,
+                                decorations_for_view.clone(),
+                            ),
+                        }
+                    }}
+                }.into_any()
             }}
         </div>
     }
@@ -3150,6 +3410,49 @@ mod tests {
         assert_eq!(rows[0].left.as_ref().unwrap().text, "a");
     }
 
+    /// Binary / no-hunk files render header + a single placeholder row, so
+    /// the virtual-scroll row count must be 2 (not 1) to keep multi-file
+    /// offsets aligned. Normal files are unaffected.
+    #[test]
+    fn rendered_rows_counts_binary_placeholder() {
+        let binary = ProjectGitDiffFile {
+            relative_path: "img.png".to_owned(),
+            is_binary: true,
+            hunks: vec![],
+        };
+        assert_eq!(rendered_rows_for_file(&binary, DiffContextMode::Hunks), 2);
+        assert_eq!(
+            rendered_rows_for_file(&binary, DiffContextMode::FullFile),
+            2
+        );
+
+        let no_hunks = ProjectGitDiffFile {
+            relative_path: "x.rs".to_owned(),
+            is_binary: false,
+            hunks: vec![],
+        };
+        assert_eq!(rendered_rows_for_file(&no_hunks, DiffContextMode::Hunks), 2);
+
+        // header + hunk-header + 1 line = 3 (Hunks); header + 1 line = 2 (FullFile).
+        let normal = ProjectGitDiffFile {
+            relative_path: "x.rs".to_owned(),
+            is_binary: false,
+            hunks: vec![ProjectGitDiffHunk {
+                hunk_id: "h".to_owned(),
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(ProjectGitDiffLineKind::Added, None, Some(1), "a")],
+            }],
+        };
+        assert_eq!(rendered_rows_for_file(&normal, DiffContextMode::Hunks), 3);
+        assert_eq!(
+            rendered_rows_for_file(&normal, DiffContextMode::FullFile),
+            2
+        );
+    }
+
     #[test]
     fn pair_only_added() {
         let rows = pair_lines_side_by_side(vec![
@@ -3420,6 +3723,7 @@ mod wasm_tests {
         };
         let file = ProjectGitDiffFile {
             relative_path: "big.rs".to_owned(),
+            is_binary: false,
             hunks: vec![hunk],
         };
         DiffViewState {
@@ -3512,12 +3816,26 @@ mod wasm_tests {
             let state = AppState::new();
             state.diff_contents.update(|d| {
                 d.insert(
-                    (mount_root.clone(), scope, mount_path.clone()),
+                    crate::state::DiffKey::new(
+                        "h",
+                        protocol::ProjectId("p".to_owned()),
+                        mount_root.clone(),
+                        scope,
+                        mount_path.clone(),
+                    ),
                     diff.clone(),
                 );
             });
             provide_context(state);
-            view! { <DiffView root=mount_root.clone() scope=scope path=mount_path.clone() /> }
+            view! {
+                <DiffView
+                    host_id="h".to_owned()
+                    project_id=protocol::ProjectId("p".to_owned())
+                    root=mount_root.clone()
+                    scope=scope
+                    path=mount_path.clone()
+                />
+            }
         });
         // First tick mounts; a second lets the measurement Effect refine
         // viewport_height/line_height from real DOM measurements.
@@ -3586,13 +3904,21 @@ mod wasm_tests {
             let state = AppState::new();
             state.diff_contents.update(|d| {
                 d.insert(
-                    (mount_root.clone(), scope, mount_path.clone()),
+                    crate::state::DiffKey::new(
+                        "h",
+                        protocol::ProjectId("p".to_owned()),
+                        mount_root.clone(),
+                        scope,
+                        mount_path.clone(),
+                    ),
                     diff.clone(),
                 );
             });
             provide_context(state);
             view! {
                 <DiffView
+                    host_id="h".to_owned()
+                    project_id=protocol::ProjectId("p".to_owned())
                     root=mount_root.clone()
                     scope=scope
                     path=mount_path.clone()
@@ -3686,6 +4012,7 @@ mod wasm_tests {
         };
         let file = ProjectGitDiffFile {
             relative_path: path.clone(),
+            is_binary: false,
             hunks: vec![mk_hunk(431, 431, "h1"), mk_hunk(459, 458, "h2")],
         };
         let diff = DiffViewState {
@@ -3705,12 +4032,26 @@ mod wasm_tests {
             state.diff_view_mode.set(DiffViewMode::SideBySide);
             state.diff_contents.update(|d| {
                 d.insert(
-                    (mount_root.clone(), scope, mount_path.clone()),
+                    crate::state::DiffKey::new(
+                        "h",
+                        protocol::ProjectId("p".to_owned()),
+                        mount_root.clone(),
+                        scope,
+                        mount_path.clone(),
+                    ),
                     diff.clone(),
                 );
             });
             provide_context(state);
-            view! { <DiffView root=mount_root.clone() scope=scope path=mount_path.clone() /> }
+            view! {
+                <DiffView
+                    host_id="h".to_owned()
+                    project_id=protocol::ProjectId("p".to_owned())
+                    root=mount_root.clone()
+                    scope=scope
+                    path=mount_path.clone()
+                />
+            }
         });
         next_tick().await;
         next_tick().await;
@@ -3753,6 +4094,857 @@ mod wasm_tests {
             "first hunk inflated to {}px (content should be ~62px); \
              grid rows are stretching when they shouldn't",
             h0.height(),
+        );
+    }
+
+    // ── Review-integrated normal diff tab + binary placeholder ──────────
+
+    fn review_root() -> ProjectRootPath {
+        ProjectRootPath("/repo".to_owned())
+    }
+
+    fn small_foo_diff() -> DiffViewState {
+        let hunk = ProjectGitDiffHunk {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 3,
+            hunk_id: "src/foo.rs:1".to_owned(),
+            lines: vec![
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Context,
+                    text: "fn handle()".to_owned(),
+                    old_line_number: Some(1),
+                    new_line_number: Some(1),
+                },
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Added,
+                    text: "    let x = 1;".to_owned(),
+                    old_line_number: None,
+                    new_line_number: Some(2),
+                },
+                ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Added,
+                    text: "    let y = 2;".to_owned(),
+                    old_line_number: None,
+                    new_line_number: Some(3),
+                },
+            ],
+        };
+        DiffViewState {
+            root: review_root(),
+            // The review surface is the all-uncommitted diff; review
+            // affordances only bind on this scope.
+            scope: ProjectDiffScope::Uncommitted,
+            path: Some("src/foo.rs".to_owned()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "src/foo.rs".to_owned(),
+                is_binary: false,
+                hunks: vec![hunk],
+            }],
+        }
+    }
+
+    fn binary_diff(path: &str) -> DiffViewState {
+        DiffViewState {
+            root: review_root(),
+            scope: ProjectDiffScope::Uncommitted,
+            path: Some(path.to_owned()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![ProjectGitDiffFile {
+                relative_path: path.to_owned(),
+                is_binary: true,
+                hunks: vec![],
+            }],
+        }
+    }
+
+    fn one_added_line_file(path: &str, text: &str) -> ProjectGitDiffFile {
+        ProjectGitDiffFile {
+            relative_path: path.to_owned(),
+            is_binary: false,
+            hunks: vec![ProjectGitDiffHunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                hunk_id: format!("{path}:1"),
+                lines: vec![
+                    ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Context,
+                        text: "fn x()".to_owned(),
+                        old_line_number: Some(1),
+                        new_line_number: Some(1),
+                    },
+                    ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Added,
+                        text: text.to_owned(),
+                        old_line_number: None,
+                        new_line_number: Some(2),
+                    },
+                ],
+            }],
+        }
+    }
+
+    /// The all-uncommitted review surface: empty `path` (all files in the
+    /// root) with two changed files.
+    fn all_files_diff() -> DiffViewState {
+        DiffViewState {
+            root: review_root(),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![
+                one_added_line_file("src/foo.rs", "    let a = 1;"),
+                one_added_line_file("src/bar.rs", "    let b = 2;"),
+            ],
+        }
+    }
+
+    fn draft_review(path: &str, line: u32, body: &str) -> protocol::Review {
+        use protocol::*;
+        Review {
+            id: ReviewId("rev-1".to_owned()),
+            project_id: ProjectId("proj-1".to_owned()),
+            origin_agent_id: AgentId("project-review:rev-1".to_owned()),
+            origin_session_id: SessionId("s".to_owned()),
+            selection: ReviewDiffSelection::AllUncommitted,
+            status: ReviewStatus::Draft,
+            diffs: vec![],
+            comments: vec![ReviewComment {
+                id: ReviewCommentId("c1".to_owned()),
+                location: ReviewLocation {
+                    root: review_root(),
+                    relative_path: path.to_owned(),
+                    anchor: ReviewAnchor::LineRange {
+                        side: ReviewDiffSide::New,
+                        start_line: line,
+                        end_line: line,
+                    },
+                },
+                anchor_status: ReviewAnchorStatus::Current,
+                body: body.to_owned(),
+                source: ReviewCommentSource::User,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+            suggestions: vec![],
+            ai_reviewer: ReviewAiReviewerState {
+                status: ReviewAiReviewerStatus::Idle,
+                agent_id: None,
+                error: None,
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    fn draft_review_for(
+        id: &str,
+        project: &str,
+        path: &str,
+        line: u32,
+        body: &str,
+    ) -> protocol::Review {
+        use protocol::*;
+        let mut r = draft_review(path, line, body);
+        r.id = ReviewId(id.to_owned());
+        r.project_id = ProjectId(project.to_owned());
+        if let Some(c) = r.comments.first_mut() {
+            c.id = ReviewCommentId(format!("c-{id}"));
+        }
+        r
+    }
+
+    fn summary_for(review: &protocol::Review) -> protocol::ReviewSummary {
+        protocol::ReviewSummary {
+            id: review.id.clone(),
+            status: review.status.clone(),
+            origin_session_id: review.origin_session_id.clone(),
+            origin_agent_id: review.origin_agent_id.clone(),
+            created_at_ms: 0,
+            updated_at_ms: 1,
+            user_comment_count: review.comments.len() as u32,
+            pending_suggestion_count: 0,
+        }
+    }
+
+    fn project_info(host: &str, project: &str, root: &str) -> crate::state::ProjectInfo {
+        crate::state::ProjectInfo {
+            host_id: host.to_owned(),
+            project: protocol::Project {
+                id: protocol::ProjectId(project.to_owned()),
+                name: project.to_owned(),
+                roots: vec![root.to_owned()],
+                sort_order: 0,
+            },
+        }
+    }
+
+    fn mount_reviewable(
+        container: HtmlElement,
+        diff: DiffViewState,
+        review: Option<protocol::Review>,
+    ) {
+        let scope = diff.scope;
+        let path = diff.path.clone().unwrap_or_default();
+        let root = diff.root.clone();
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: protocol::ProjectId("proj-1".to_owned()),
+                }));
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "h1",
+                        protocol::ProjectId("proj-1".to_owned()),
+                        root.clone(),
+                        scope,
+                        path.clone(),
+                    ),
+                    diff.clone(),
+                );
+            });
+            if let Some(review) = review.clone() {
+                state.review_summaries.update(|m| {
+                    m.insert(
+                        protocol::ProjectId("proj-1".to_owned()),
+                        vec![protocol::ReviewSummary {
+                            id: review.id.clone(),
+                            status: review.status.clone(),
+                            origin_session_id: review.origin_session_id.clone(),
+                            origin_agent_id: review.origin_agent_id.clone(),
+                            created_at_ms: 0,
+                            updated_at_ms: 0,
+                            user_comment_count: review.comments.len() as u32,
+                            pending_suggestion_count: 0,
+                        }],
+                    );
+                });
+                state.reviews.update(|m| {
+                    m.insert(review.id.clone(), review.clone());
+                });
+            }
+            provide_context(state);
+            view! {
+                <ReviewableDiffView
+                    tab_id=crate::state::TabId(1)
+                    host_id="h1".to_owned()
+                    project_id=protocol::ProjectId("proj-1".to_owned())
+                    root=root.clone()
+                    scope=scope
+                    path=path.clone()
+                />
+            }
+        });
+        std::mem::forget(handle);
+    }
+
+    /// A normal diff tab whose project has a Draft review renders that
+    /// review's comments inline — without ever mounting the standalone
+    /// `ReviewView` workbench. This is the core of the integration: review
+    /// happens on the ordinary diff surface.
+    #[wasm_bindgen_test]
+    async fn reviewable_diff_renders_draft_comment_without_review_view() {
+        ensure_styles_loaded();
+        let container = make_container();
+        mount_reviewable(
+            container.clone(),
+            small_foo_diff(),
+            Some(draft_review("src/foo.rs", 2, "please fix this")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("please fix this"),
+            "expected the draft review comment to render on the normal diff tab; got: {text}"
+        );
+        // No standalone review workbench is mounted on this surface.
+        assert!(
+            container.query_selector(".review-view").unwrap().is_none(),
+            "ReviewView workbench must not be mounted by the normal diff tab"
+        );
+        // The create-review banner is hidden once a draft exists.
+        assert!(
+            container
+                .query_selector("[data-test=\"reviewable-diff-banner\"]")
+                .unwrap()
+                .is_none(),
+            "the start-a-review banner must be hidden when a draft already exists"
+        );
+        // The line-level comment affordance exists (gutter is clickable).
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_some(),
+            "expected clickable comment gutters on a reviewable diff"
+        );
+    }
+
+    /// With no Draft review, the normal diff tab shows a clear affordance to
+    /// start one rather than fabricating optimistic review state.
+    #[wasm_bindgen_test]
+    async fn reviewable_diff_shows_start_banner_without_draft() {
+        ensure_styles_loaded();
+        let container = make_container();
+        mount_reviewable(container.clone(), small_foo_diff(), None);
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-test=\"reviewable-diff-banner\"]")
+                .unwrap()
+                .is_some(),
+            "expected the start-a-review banner when there is no draft review"
+        );
+        // No comment composer gutters when there's no review to comment on.
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_none(),
+            "comment gutters must not appear without a draft review"
+        );
+    }
+
+    /// A non-`Uncommitted` diff tab (e.g. a Staged/Unstaged tab opened from a
+    /// git-panel file row) gets NO review overlay even when a draft exists —
+    /// its index↔worktree line numbers don't match the review's HEAD↔worktree
+    /// anchors, so binding comment affordances there would route comments to
+    /// the wrong lines.
+    #[wasm_bindgen_test]
+    async fn non_uncommitted_scope_has_no_review_overlay() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut diff = small_foo_diff();
+        diff.scope = ProjectDiffScope::Unstaged;
+        mount_reviewable(
+            container.clone(),
+            diff,
+            Some(draft_review("src/foo.rs", 2, "please fix this")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        // The file still renders as a plain diff...
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("let x = 1;"),
+            "the diff itself should still render; got: {text}"
+        );
+        // ...but with no review overlay: no banner, no comment gutters, and
+        // the draft's comment body must not appear.
+        assert!(
+            container
+                .query_selector("[data-test=\"reviewable-diff-banner\"]")
+                .unwrap()
+                .is_none(),
+            "no start-a-review banner on a non-uncommitted diff tab"
+        );
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_none(),
+            "no comment gutters on a non-uncommitted diff tab"
+        );
+        assert!(
+            !text.contains("please fix this"),
+            "review comments must not overlay a non-uncommitted diff; got: {text}"
+        );
+    }
+
+    /// The review overlay binds to the project that owns the tab's root, not
+    /// the globally active project. With proj-2 active but the tab rooted in
+    /// proj-1's `/repo`, proj-1's review must decorate the diff — proj-2's
+    /// review must never leak onto it (or comments would route to the wrong
+    /// review).
+    #[wasm_bindgen_test]
+    async fn overlay_binds_to_root_project_not_active_project() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Active project is the OTHER project on purpose.
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: protocol::ProjectId("proj-2".to_owned()),
+                }));
+            state.projects.update(|p| {
+                p.push(project_info("h1", "proj-1", "/repo"));
+                p.push(project_info("h1", "proj-2", "/other"));
+            });
+            let diff = small_foo_diff();
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "h1",
+                        protocol::ProjectId("proj-1".to_owned()),
+                        diff.root.clone(),
+                        diff.scope,
+                        "src/foo.rs",
+                    ),
+                    diff,
+                );
+            });
+            let r1 = draft_review_for("rev-1", "proj-1", "src/foo.rs", 2, "from project one");
+            let r2 = draft_review_for("rev-2", "proj-2", "src/foo.rs", 2, "from project two");
+            state.review_summaries.update(|m| {
+                m.insert(
+                    protocol::ProjectId("proj-1".to_owned()),
+                    vec![summary_for(&r1)],
+                );
+                m.insert(
+                    protocol::ProjectId("proj-2".to_owned()),
+                    vec![summary_for(&r2)],
+                );
+            });
+            state.reviews.update(|m| {
+                m.insert(r1.id.clone(), r1.clone());
+                m.insert(r2.id.clone(), r2.clone());
+            });
+            provide_context(state);
+            // Tab is explicitly for proj-1, even though proj-2 is active.
+            view! {
+                <ReviewableDiffView
+                    tab_id=crate::state::TabId(1)
+                    host_id="h1".to_owned()
+                    project_id=protocol::ProjectId("proj-1".to_owned())
+                    root=review_root()
+                    scope=ProjectDiffScope::Uncommitted
+                    path="src/foo.rs".to_owned()
+                />
+            }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("from project one"),
+            "overlay must show the tab's project review; got: {text}"
+        );
+        assert!(
+            !text.contains("from project two"),
+            "overlay must NOT show the active (different) project's review; got: {text}"
+        );
+    }
+
+    /// Two projects that share the same root path string must each bind to
+    /// their OWN review — the diff tab carries explicit project identity, so
+    /// the overlay can't be confused by a duplicate root.
+    #[wasm_bindgen_test]
+    async fn duplicate_root_binds_to_explicit_project() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Both projects use the SAME root string "/repo".
+            state.projects.update(|p| {
+                p.push(project_info("h1", "proj-1", "/repo"));
+                p.push(project_info("h2", "proj-2", "/repo"));
+            });
+            let diff = small_foo_diff();
+            // The diff body belongs to proj-2 (the tab's project), keyed by
+            // its explicit identity even though proj-1 shares the same root.
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "h2",
+                        protocol::ProjectId("proj-2".to_owned()),
+                        diff.root.clone(),
+                        diff.scope,
+                        "src/foo.rs",
+                    ),
+                    diff,
+                );
+            });
+            let r1 = draft_review_for("rev-1", "proj-1", "src/foo.rs", 2, "review for project one");
+            let r2 = draft_review_for("rev-2", "proj-2", "src/foo.rs", 2, "review for project two");
+            state.review_summaries.update(|m| {
+                m.insert(
+                    protocol::ProjectId("proj-1".to_owned()),
+                    vec![summary_for(&r1)],
+                );
+                m.insert(
+                    protocol::ProjectId("proj-2".to_owned()),
+                    vec![summary_for(&r2)],
+                );
+            });
+            state.reviews.update(|m| {
+                m.insert(r1.id.clone(), r1.clone());
+                m.insert(r2.id.clone(), r2.clone());
+            });
+            provide_context(state);
+            // This tab is for proj-2 (host h2), same root as proj-1.
+            view! {
+                <ReviewableDiffView
+                    tab_id=crate::state::TabId(1)
+                    host_id="h2".to_owned()
+                    project_id=protocol::ProjectId("proj-2".to_owned())
+                    root=review_root()
+                    scope=ProjectDiffScope::Uncommitted
+                    path="src/foo.rs".to_owned()
+                />
+            }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("review for project two"),
+            "overlay must bind to the tab's explicit project (proj-2); got: {text}"
+        );
+        assert!(
+            !text.contains("review for project one"),
+            "overlay must NOT bind to the other same-root project (proj-1); got: {text}"
+        );
+    }
+
+    /// The integrated review surface is the *all-uncommitted* diff (empty
+    /// path), so every changed file renders and a comment on a non-first
+    /// file shows — not just the first changed file.
+    #[wasm_bindgen_test]
+    async fn all_files_surface_shows_comment_on_non_first_file() {
+        ensure_styles_loaded();
+        let container = make_container();
+        mount_reviewable(
+            container.clone(),
+            all_files_diff(),
+            // Comment anchored to the SECOND file (src/bar.rs), new line 2.
+            Some(draft_review("src/bar.rs", 2, "comment on the second file")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        // Both files render on the all-files surface...
+        assert!(
+            text.contains("src/foo.rs") && text.contains("src/bar.rs"),
+            "both changed files must render on the all-uncommitted surface; got: {text}"
+        );
+        // ...and the comment on the non-first file is visible.
+        assert!(
+            text.contains("comment on the second file"),
+            "a comment on a non-first changed file must render; got: {text}"
+        );
+        // The comment thread renders under bar.rs's region, not foo.rs's.
+        let bar_region = container
+            .query_selector("[data-rel-path=\"src/bar.rs\"]")
+            .unwrap();
+        assert!(
+            bar_region.is_some(),
+            "the second file's thread region must be present"
+        );
+    }
+
+    /// A stale Draft *summary* must not keep the overlay alive once the full
+    /// record has gone non-Draft (a live `StatusChanged` updates `reviews`
+    /// before `review_summaries` refreshes). With a Draft summary but a
+    /// Submitted full record, the integrated diff drops its comments/affordances
+    /// and shows the start-a-review banner.
+    #[wasm_bindgen_test]
+    async fn submitted_record_with_stale_draft_summary_drops_overlay() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: protocol::ProjectId("proj-1".to_owned()),
+                }));
+            let diff = small_foo_diff();
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "h1",
+                        protocol::ProjectId("proj-1".to_owned()),
+                        diff.root.clone(),
+                        diff.scope,
+                        "src/foo.rs",
+                    ),
+                    diff,
+                );
+            });
+            // Stale Draft summary built while the review is still Draft...
+            let mut review = draft_review("src/foo.rs", 2, "should be hidden");
+            state.review_summaries.update(|m| {
+                m.insert(
+                    protocol::ProjectId("proj-1".to_owned()),
+                    vec![summary_for(&review)],
+                );
+            });
+            // ...but the live full record has already been Submitted.
+            review.status = protocol::ReviewStatus::Submitted { submitted_at_ms: 1 };
+            state.reviews.update(|m| {
+                m.insert(review.id.clone(), review);
+            });
+            provide_context(state);
+            view! {
+                <ReviewableDiffView
+                    tab_id=crate::state::TabId(1)
+                    host_id="h1".to_owned()
+                    project_id=protocol::ProjectId("proj-1".to_owned())
+                    root=review_root()
+                    scope=ProjectDiffScope::Uncommitted
+                    path="src/foo.rs".to_owned()
+                />
+            }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("should be hidden"),
+            "a submitted (live) review must not overlay comments; got: {text}"
+        );
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_none(),
+            "no comment gutters once the live review is non-draft"
+        );
+        assert!(
+            container
+                .query_selector("[data-test=\"reviewable-diff-banner\"]")
+                .unwrap()
+                .is_some(),
+            "the start-a-review banner must show once the live review is non-draft"
+        );
+    }
+
+    /// Binary (and no-hunk) files render a clear placeholder, no diff lines,
+    /// and — when a draft review exists — still expose the file-level
+    /// comment affordance so a file-scoped comment can be left.
+    #[wasm_bindgen_test]
+    async fn binary_file_renders_placeholder_with_file_comment_affordance() {
+        ensure_styles_loaded();
+        let container = make_container();
+        mount_reviewable(
+            container.clone(),
+            binary_diff("assets/logo.png"),
+            Some(draft_review("assets/logo.png", 1, "file note")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let placeholder = container
+            .query_selector("[data-test=\"diff-binary-placeholder\"]")
+            .unwrap();
+        assert!(placeholder.is_some(), "expected a binary-file placeholder");
+        assert_eq!(
+            placeholder.unwrap().text_content().unwrap_or_default(),
+            "Binary file changed",
+            "placeholder should name the binary change"
+        );
+        // No line rows for a binary file.
+        assert_eq!(
+            container.query_selector_all(".diff-line").unwrap().length(),
+            0,
+            "binary files must not render diff lines"
+        );
+        // File-level comment affordance is still present.
+        assert!(
+            container
+                .query_selector(".review-file-comment-btn")
+                .unwrap()
+                .is_some(),
+            "expected a file-level comment affordance on the binary file header"
+        );
+    }
+
+    fn diff_state_with_file(file_name: &str) -> DiffViewState {
+        DiffViewState {
+            root: review_root(),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![one_added_line_file(file_name, "    let z = 0;")],
+        }
+    }
+
+    /// Two projects/hosts that share the same root path string must keep
+    /// separate diff bodies — keying `diff_contents` by explicit identity
+    /// means one's response can't overwrite the other's tab.
+    #[wasm_bindgen_test]
+    async fn same_root_two_projects_render_distinct_diffs() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Same root "/repo", different (host, project), different files.
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "hostA",
+                        protocol::ProjectId("projA".to_owned()),
+                        review_root(),
+                        ProjectDiffScope::Uncommitted,
+                        "",
+                    ),
+                    diff_state_with_file("alpha.rs"),
+                );
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "hostB",
+                        protocol::ProjectId("projB".to_owned()),
+                        review_root(),
+                        ProjectDiffScope::Uncommitted,
+                        "",
+                    ),
+                    diff_state_with_file("beta.rs"),
+                );
+            });
+            provide_context(state);
+            view! {
+                <div>
+                    <DiffView
+                        host_id="hostA".to_owned()
+                        project_id=protocol::ProjectId("projA".to_owned())
+                        root=review_root()
+                        scope=ProjectDiffScope::Uncommitted
+                        path=String::new()
+                    />
+                    <DiffView
+                        host_id="hostB".to_owned()
+                        project_id=protocol::ProjectId("projB".to_owned())
+                        root=review_root()
+                        scope=ProjectDiffScope::Uncommitted
+                        path=String::new()
+                    />
+                </div>
+            }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("alpha.rs"),
+            "project A's diff must render its own file; got: {text}"
+        );
+        assert!(
+            text.contains("beta.rs"),
+            "project B's diff must render its own file (not overwritten); got: {text}"
+        );
+    }
+
+    fn recorded_sends() -> String {
+        js_sys::eval("(window.__sends || []).join('\\n')")
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    }
+
+    /// A context-mode refetch must address the *tab's* project/host, not the
+    /// globally active project — even after the user switches the active
+    /// project to a different one.
+    #[wasm_bindgen_test]
+    async fn context_mode_refetch_uses_tabs_project_not_active() {
+        // Recording bridge: capture every send's args.
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__sends = []; \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(cmd, args){ \
+                 window.__sends.push(JSON.stringify(args || {})); return Promise.resolve(); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
+             })();",
+        );
+        let container = make_container();
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Tab belongs to projA on hostA.
+            state.diff_context_mode.set(DiffContextMode::Hunks);
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::new(
+                        "hostA",
+                        protocol::ProjectId("projA".to_owned()),
+                        review_root(),
+                        ProjectDiffScope::Unstaged,
+                        "foo.rs",
+                    ),
+                    DiffViewState {
+                        root: review_root(),
+                        scope: ProjectDiffScope::Unstaged,
+                        path: Some("foo.rs".to_owned()),
+                        context_mode: DiffContextMode::Hunks,
+                        pending: false,
+                        files: vec![one_added_line_file("foo.rs", "    let q = 1;")],
+                    },
+                );
+            });
+            // ...but the ACTIVE project is a different one (projB on hostB).
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "hostB".to_owned(),
+                    project_id: protocol::ProjectId("projB".to_owned()),
+                }));
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <DiffView
+                    host_id="hostA".to_owned()
+                    project_id=protocol::ProjectId("projA".to_owned())
+                    root=review_root()
+                    scope=ProjectDiffScope::Unstaged
+                    path="foo.rs".to_owned()
+                />
+            }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+
+        // Toggle the context mode ⇒ refetch.
+        let state = holder.borrow().clone().unwrap();
+        state.diff_context_mode.set(DiffContextMode::FullFile);
+        next_tick().await;
+        next_tick().await;
+
+        let sends = recorded_sends();
+        assert!(
+            sends.contains("/project/projA"),
+            "refetch must target the tab's project (projA); sends: {sends}"
+        );
+        assert!(
+            !sends.contains("/project/projB"),
+            "refetch must NOT target the active project (projB); sends: {sends}"
+        );
+        assert!(
+            sends.contains("hostA"),
+            "refetch must go to the tab's host (hostA); sends: {sends}"
         );
     }
 }

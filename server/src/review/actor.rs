@@ -1631,9 +1631,7 @@ fn anchor_status_for_location(review: &Review, location: &ReviewLocation) -> Rev
 }
 
 fn diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {
-    diffs
-        .iter()
-        .all(|diff| diff.files.iter().all(|file| file.hunks.is_empty()))
+    diffs.iter().all(|diff| diff.files.is_empty())
 }
 
 fn review_has_user_state(review: &Review) -> bool {
@@ -1800,6 +1798,7 @@ mod tests {
                 context_mode: DiffContextMode::FullFile,
                 files: vec![ProjectGitDiffFile {
                     relative_path: "src/lib.rs".to_owned(),
+                    is_binary: false,
                     hunks: vec![ProjectGitDiffHunk {
                         hunk_id: "src/lib.rs::0".to_owned(),
                         old_start: 1,
@@ -1896,6 +1895,84 @@ mod tests {
             },
         };
         assert!(validate_location(&review, &reversed).is_err());
+    }
+
+    #[test]
+    fn validate_location_accepts_file_anchor_for_binary_file() {
+        let mut review = sample_review();
+        review.diffs[0].files = vec![ProjectGitDiffFile {
+            relative_path: "assets/logo.png".to_owned(),
+            is_binary: true,
+            hunks: Vec::new(),
+        }];
+
+        validate_location(
+            &review,
+            &ReviewLocation {
+                root: ProjectRootPath("/repo".to_owned()),
+                relative_path: "assets/logo.png".to_owned(),
+                anchor: ReviewAnchor::File,
+            },
+        )
+        .expect("binary file-level anchor valid");
+
+        let line_anchor = ReviewLocation {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "assets/logo.png".to_owned(),
+            anchor: ReviewAnchor::LineRange {
+                side: ReviewDiffSide::New,
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        assert!(validate_location(&review, &line_anchor).is_err());
+    }
+
+    #[test]
+    fn diff_is_clean_treats_binary_file_as_dirty() {
+        let diffs = vec![ProjectGitDiffPayload {
+            root: ProjectRootPath("/repo".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::FullFile,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "assets/logo.png".to_owned(),
+                is_binary: true,
+                hunks: Vec::new(),
+            }],
+        }];
+
+        assert!(!diff_is_clean(&diffs));
+    }
+
+    #[test]
+    fn diff_is_clean_treats_metadata_only_file_as_dirty() {
+        let diffs = vec![ProjectGitDiffPayload {
+            root: ProjectRootPath("/repo".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::FullFile,
+            files: vec![ProjectGitDiffFile {
+                relative_path: "scripts/run.sh".to_owned(),
+                is_binary: false,
+                hunks: Vec::new(),
+            }],
+        }];
+
+        assert!(!diff_is_clean(&diffs));
+    }
+
+    #[test]
+    fn diff_is_clean_accepts_only_empty_file_lists() {
+        let diffs = vec![ProjectGitDiffPayload {
+            root: ProjectRootPath("/repo".to_owned()),
+            scope: ProjectDiffScope::Uncommitted,
+            path: None,
+            context_mode: DiffContextMode::FullFile,
+            files: Vec::new(),
+        }];
+
+        assert!(diff_is_clean(&diffs));
     }
 
     #[test]

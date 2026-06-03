@@ -58,6 +58,7 @@ pub struct ProjectGitDiffPayload {
 
 pub struct ProjectGitDiffFile {
     pub relative_path: String,
+    pub is_binary: bool,
     pub hunks: Vec<ProjectGitDiffHunk>,
 }
 
@@ -113,11 +114,18 @@ discardable.
 
 `parse_git_diff()` (`project_stream.rs:874`) is extended to emit:
 
+- `is_binary` per file. Binary files emit no textual hunks.
 - `old_start`, `old_count`, `new_start`, `new_count` per hunk (already parsed
   from `@@` headers — propagate instead of re-stringifying).
 - `old_line_number` / `new_line_number` per line: walk hunk lines,
   incrementing the appropriate counter based on `kind`.
 - `text` with the leading `+`/`-`/` ` prefix stripped.
+
+Files with empty `hunks` are still changed files when they appear in
+`ProjectGitDiffPayload.files`. This covers binary files (`is_binary = true`) and
+metadata-only changes such as mode changes (`is_binary = false`). Diff/review
+clean-state checks must key off an empty `files` list, not off every file having
+an empty hunk list.
 
 `server/src/host.rs:2091 read_project_diff` threads `context_mode` through and
 echoes it on the emitted payload.
