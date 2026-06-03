@@ -218,8 +218,8 @@ fn active_agent_is_backend_native(state: &AppState) -> bool {
 }
 
 /// True when the active agent has reported a backend session id, which is
-/// required to fork a BTW / side question off it. Tracked so the BTW button
-/// enables itself the moment the `AgentStart`/bootstrap event lands.
+/// required to fork a BTW / side question off it. Tracked so the BTW menu
+/// item appears the moment the `AgentStart`/bootstrap event lands.
 fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
     let Some(active_agent) = state.active_agent.get() else {
         return false;
@@ -323,7 +323,7 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
 
 /// Spawn a BTW / side question from the current draft, then clear the draft
 /// optimistically — mirroring `submit_chat_input`'s clear-on-submit. The BTW
-/// button is only enabled when there is input and the active agent has a
+/// menu item only shows when there is input and the active agent has a
 /// session id, so the guard here just protects against an empty draft.
 fn submit_side_question(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
     let text = state.chat_input.get_untracked();
@@ -583,30 +583,9 @@ pub fn ChatInput() -> impl IntoView {
 
         let send_enabled = is_connected && has_input;
         let interrupt_enabled = is_connected && is_thinking;
-        let send_label = if is_thinking && has_input {
-            "Queue"
-        } else {
-            "Send"
-        };
-        let interrupt_label = if is_thinking && has_input {
-            "Steer"
-        } else {
-            "Interrupt"
-        };
-        let interrupt_title = if is_thinking && has_input {
-            "Interrupt current turn and steer with typed input"
-        } else {
-            "Interrupt current turn"
-        };
-
-        (
-            send_enabled,
-            interrupt_enabled,
-            send_label,
-            interrupt_label,
-            interrupt_title,
-            is_thinking && has_input,
-        )
+        // (send_enabled, interrupt_enabled, is_steer). `is_steer` (running with
+        // typed input) gates the extra "Interrupt and send now" menu item.
+        (send_enabled, interrupt_enabled, is_thinking && has_input)
     });
 
     let readonly_state = state.clone();
@@ -620,10 +599,21 @@ pub fn ChatInput() -> impl IntoView {
 
     let can_send = move || ui_mode.get().0 && !is_readonly.get();
     let can_interrupt = move || ui_mode.get().1 && !is_readonly.get();
-    let send_label = move || ui_mode.get().2;
-    let interrupt_label = move || ui_mode.get().3;
-    let interrupt_title = move || ui_mode.get().4;
-    let is_steer = Memo::new(move |_| ui_mode.get().5);
+    let is_steer = Memo::new(move |_| ui_mode.get().2);
+
+    // The dropdown is shown whenever it would hold at least one item. Since
+    // `(can_interrupt && is_steer) || can_interrupt` collapses to
+    // `can_interrupt`, the arrow is visible iff any primary/secondary action
+    // is available.
+    let menu_has_items = Memo::new(move |_| can_send() || can_btw() || can_interrupt());
+    let menu_open = RwSignal::new(false);
+    // Don't let a stale-open menu silently re-appear when its items vanish
+    // (e.g. the turn ends or the draft is cleared) and later return.
+    Effect::new(move |_| {
+        if !menu_has_items.get() {
+            menu_open.set(false);
+        }
+    });
 
     let thinking_state = state.clone();
     let is_thinking = move || {
@@ -671,20 +661,32 @@ pub fn ChatInput() -> impl IntoView {
         submit_chat_input(&on_click_state, on_click_images);
     };
 
-    let on_click_btw_state = state.clone();
-    let on_click_btw_images = pending_images;
-    let on_click_btw = move |_| {
-        submit_side_question(&on_click_btw_state, on_click_btw_images);
+    // Menu handlers live inside `<Show>`, whose children closure can re-run on
+    // each open, so they must be `Copy`. Park the non-`Copy` `AppState` in a
+    // `StoredValue` so each handler captures only `Copy` state.
+    let menu_state = StoredValue::new_local(state.clone());
+    let menu_images = pending_images;
+    let on_menu_send = move |_| {
+        menu_open.set(false);
+        menu_state.with_value(|s| submit_chat_input(s, menu_images));
+    };
+    let on_menu_btw = move |_| {
+        menu_open.set(false);
+        menu_state.with_value(|s| submit_side_question(s, menu_images));
+    };
+    let on_menu_steer = move |_| {
+        menu_open.set(false);
+        menu_state.with_value(|s| steer_chat_input(s, menu_images));
+    };
+    let on_menu_interrupt = move |_| {
+        menu_open.set(false);
+        menu_state.with_value(interrupt_active_turn);
     };
 
-    let on_click_interrupt_state = state.clone();
-    let on_click_interrupt_images = pending_images;
-    let is_steer_for_click = is_steer;
-    let on_click_interrupt = move |_| {
-        if is_steer_for_click.get() {
-            steer_chat_input(&on_click_interrupt_state, on_click_interrupt_images);
-        } else {
-            interrupt_active_turn(&on_click_interrupt_state);
+    let on_split_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        if ev.key() == "Escape" && menu_open.get() {
+            ev.prevent_default();
+            menu_open.set(false);
         }
     };
 
@@ -958,38 +960,298 @@ pub fn ChatInput() -> impl IntoView {
                     autocapitalize="none"
                     autocomplete="off"
                 />
-                <button
-                    class="chat-send-btn chat-send-btn-text"
-                    disabled=move || !can_send()
-                    on:click=on_click_send
-                    title=move || {
-                        if is_steer.get() {
-                            "Queue message"
-                        } else {
-                            "Send message (Enter)"
-                        }
-                    }
+                <div
+                    class="chat-send-split"
+                    role="group"
+                    aria-label="Send actions"
+                    on:keydown=on_split_keydown
                 >
-                    <span>{send_label}</span>
-                </button>
-                <button
-                    class="chat-send-btn chat-btw-btn"
-                    disabled=move || !can_btw()
-                    on:click=on_click_btw
-                    title="Ask a side question (BTW) — forks this agent's session read-only without disturbing it"
-                >
-                    <span>"BTW"</span>
-                </button>
-                <button
-                    class="chat-send-btn chat-interrupt-btn chat-send-btn-text"
-                    disabled=move || !can_interrupt()
-                    on:click=on_click_interrupt
-                    title=interrupt_title
-                >
-                    <span>{interrupt_label}</span>
-                </button>
+                    <button
+                        class="chat-send-btn chat-send-btn-text chat-send-split-primary"
+                        data-test="chat-send-primary"
+                        disabled=move || !can_send()
+                        on:click=on_click_send
+                        title="Send message (Enter)"
+                    >
+                        <span>"Send"</span>
+                    </button>
+                    <Show when=move || menu_has_items.get()>
+                        <button
+                            type="button"
+                            class="chat-send-btn chat-send-split-toggle"
+                            data-test="chat-send-menu-toggle"
+                            aria-haspopup="menu"
+                            aria-expanded=move || {
+                                if menu_open.get() { "true" } else { "false" }
+                            }
+                            aria-label="More send actions"
+                            title="More send actions"
+                            on:click=move |_| menu_open.update(|open| *open = !*open)
+                        >
+                            <span aria-hidden="true">"⌄"</span>
+                        </button>
+                    </Show>
+                    <Show when=move || menu_open.get() && menu_has_items.get()>
+                        <div
+                            class="chat-send-menu-backdrop"
+                            on:click=move |_| menu_open.set(false)
+                        ></div>
+                        <div
+                            class="chat-send-menu"
+                            role="menu"
+                            aria-label="Send actions"
+                            data-test="chat-send-menu"
+                        >
+                            <Show when=move || can_send()>
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
+                                    data-test="chat-send-menu-send"
+                                    on:click=on_menu_send
+                                >
+                                    "Send"
+                                </button>
+                            </Show>
+                            <Show when=move || can_btw()>
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
+                                    data-test="chat-send-menu-btw"
+                                    title="Ask a side question (BTW) — forks this agent's session read-only without disturbing it"
+                                    on:click=on_menu_btw
+                                >
+                                    "BTW"
+                                </button>
+                            </Show>
+                            <Show when=move || can_interrupt() && is_steer.get()>
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
+                                    data-test="chat-send-menu-steer"
+                                    title="Interrupt current turn and send the typed message now"
+                                    on:click=on_menu_steer
+                                >
+                                    "Interrupt and send now"
+                                </button>
+                            </Show>
+                            <Show when=move || can_interrupt()>
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
+                                    data-test="chat-send-menu-interrupt"
+                                    title="Interrupt current turn"
+                                    on:click=on_menu_interrupt
+                                >
+                                    "Interrupt"
+                                </button>
+                            </Show>
+                        </div>
+                    </Show>
+                </div>
             </div>
             <SessionSettingsBar />
         </div>
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, Tab, TabContent};
+    use leptos::mount::mount_to;
+    use protocol::{AgentId, AgentOrigin, BackendKind, SessionId, StreamPath};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    const HOST: &str = "host-1";
+    const AGENT: &str = "agent-1";
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Connect the active chat tab to a single live agent and optionally seed a
+    /// draft / running turn / forkable session, mirroring how the dispatcher
+    /// populates state when a chat is open.
+    fn configure(state: &AppState, session: bool, running: bool, input: &str) {
+        let agent_id = AgentId(AGENT.to_owned());
+        state.agents.set(vec![AgentInfo {
+            host_id: HOST.to_owned(),
+            agent_id: agent_id.clone(),
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: session.then(|| SessionId("sess-1".to_owned())),
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.connection_statuses.update(|m| {
+            m.insert(HOST.to_owned(), ConnectionStatus::Connected);
+        });
+        if running {
+            state.agent_turn_active.update(|m| {
+                m.insert(agent_id.clone(), true);
+            });
+        }
+        if !input.is_empty() {
+            state.chat_input.set(input.to_owned());
+        }
+        state.center_zone.update(|cz| {
+            let id = crate::state::next_tab_id();
+            cz.tabs.push(Tab {
+                id,
+                content: TabContent::Chat {
+                    agent_ref: Some(ActiveAgentRef {
+                        host_id: HOST.to_owned(),
+                        agent_id: agent_id.clone(),
+                    }),
+                    pending_team_member: None,
+                },
+                label: "Chat".to_owned(),
+                closeable: true,
+            });
+            cz.active_tab_id = Some(id);
+        });
+    }
+
+    fn query(container: &HtmlElement, sel: &str) -> Option<web_sys::Element> {
+        container.query_selector(sel).unwrap()
+    }
+
+    async fn open_menu(container: &HtmlElement) {
+        let toggle: HtmlElement = query(container, "[data-test='chat-send-menu-toggle']")
+            .expect("dropdown toggle must be present")
+            .dyn_into()
+            .unwrap();
+        toggle.click();
+        next_tick().await;
+    }
+
+    /// Text of every menu item, in DOM order — used to assert the agreed
+    /// filtered ordering (Send, BTW, Interrupt and send now, Interrupt).
+    fn menu_item_texts(container: &HtmlElement) -> Vec<String> {
+        let nodes = container.query_selector_all("[role='menuitem']").unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i))
+            .map(|n| n.text_content().unwrap_or_default().trim().to_owned())
+            .collect()
+    }
+
+    /// Idle agent with a draft and a forkable session: primary is an enabled
+    /// "Send"; the menu offers Send then BTW and nothing interrupt-related.
+    #[wasm_bindgen_test]
+    async fn idle_input_with_session_shows_send_then_btw() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, true, false, "hello");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let primary = query(&container, "[data-test='chat-send-primary']").expect("primary button");
+        assert_eq!(
+            primary.text_content().unwrap_or_default().trim(),
+            "Send",
+            "primary label must always be Send"
+        );
+        assert!(
+            !primary.has_attribute("disabled"),
+            "primary Send must be enabled with a draft"
+        );
+
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Send".to_owned(), "BTW".to_owned()],
+            "idle+session menu must be exactly Send then BTW"
+        );
+    }
+
+    /// Running agent with a draft: primary stays "Send" (never Queue/Steer) and
+    /// the menu surfaces all four actions in the agreed order.
+    #[wasm_bindgen_test]
+    async fn running_input_with_session_shows_full_menu_in_order() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, true, true, "redirect this");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let primary = query(&container, "[data-test='chat-send-primary']").expect("primary button");
+        assert_eq!(
+            primary.text_content().unwrap_or_default().trim(),
+            "Send",
+            "primary label must always be Send, even while running"
+        );
+
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec![
+                "Send".to_owned(),
+                "BTW".to_owned(),
+                "Interrupt and send now".to_owned(),
+                "Interrupt".to_owned(),
+            ],
+            "running+input menu must list all four actions in agreed order"
+        );
+    }
+
+    /// Running agent with an empty composer: primary Send is disabled and the
+    /// dropdown contains only Interrupt (no "Interrupt and send now").
+    #[wasm_bindgen_test]
+    async fn running_empty_disables_send_and_menu_is_interrupt_only() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, true, true, "");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let primary = query(&container, "[data-test='chat-send-primary']").expect("primary button");
+        assert!(
+            primary.has_attribute("disabled"),
+            "primary Send must be disabled when the composer is empty"
+        );
+
+        open_menu(&container).await;
+        assert_eq!(
+            menu_item_texts(&container),
+            vec!["Interrupt".to_owned()],
+            "running+empty menu must contain only Interrupt"
+        );
     }
 }

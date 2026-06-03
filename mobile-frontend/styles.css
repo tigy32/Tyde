@@ -1670,47 +1670,77 @@ input, textarea, select {
     transform: scale(0.92);
 }
 
-.steer-button {
-    min-width: 58px;
+/* Split send button: a visible primary "Send" plus a caret toggle that opens
+   the menu of available actions (Send, BTW, Interrupt and send now,
+   Interrupt). The wrapper is the positioning context for the popup menu. */
+.chat-send-split {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+    flex-shrink: 0;
+}
+
+.chat-send-split-primary {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.send-menu-toggle {
+    min-width: 30px;
     height: 36px;
-    padding: 0 var(--space-3);
-    border-radius: var(--radius-full);
+    padding: 0 var(--space-2);
+    margin-left: -1px;
+    border-radius: 0 var(--radius-full) var(--radius-full) 0;
     background: var(--bg-surface-2);
     color: var(--text-primary);
     border: 1px solid var(--border-default);
-    font-size: 14px;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-}
-
-.steer-button:active {
-    transform: scale(0.96);
-}
-
-/* Compact BTW / side-question pill — kept narrow to preserve horizontal
-   space on the composer row alongside Send and (when running) Steer. */
-.btw-button {
-    min-width: 44px;
-    height: 36px;
-    padding: 0 var(--space-2);
-    border-radius: var(--radius-full);
-    background: var(--bg-surface-2);
-    color: var(--accent-primary);
-    border: 1px solid var(--accent-primary);
     font-size: 13px;
     font-weight: 700;
-    letter-spacing: 0.03em;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
 }
 
-.btw-button:active {
+.send-menu-toggle:active {
     transform: scale(0.96);
+}
+
+.chat-send-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: transparent;
+}
+
+.chat-send-menu {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    z-index: 41;
+    min-width: 200px;
+    display: flex;
+    flex-direction: column;
+    padding: var(--space-1);
+    background: var(--bg-surface-3);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.chat-send-menu-item {
+    text-align: left;
+    padding: var(--space-3);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 15px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.chat-send-menu-item:active {
+    background: var(--bg-hover);
 }
 
 .chat-input-queued-list {
