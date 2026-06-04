@@ -19,7 +19,7 @@ use crate::backend::turn_emitter::{
 };
 use crate::backend::{
     BackendStartupError, SessionCommand, StartupMcpServer, StartupMcpTransport,
-    backend_fork_unsupported_message, render_combined_spawn_instructions,
+    render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -39,6 +39,31 @@ const CODEX_READ_ONLY_SANDBOX: &str = "read-only";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 static DISCOVERED_MODELS: OnceLock<Vec<protocol::SelectOption>> = OnceLock::new();
+
+#[cfg(test)]
+static CODEX_TEST_APP_SERVER_BINARY: OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn codex_test_app_server_binary_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>>
+{
+    CODEX_TEST_APP_SERVER_BINARY.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn codex_command() -> Command {
+    #[cfg(test)]
+    {
+        let override_path = codex_test_app_server_binary_override()
+            .lock()
+            .expect("codex test app-server binary mutex poisoned")
+            .clone();
+        if let Some(path) = override_path {
+            return Command::new(path);
+        }
+    }
+
+    Command::new("codex")
+}
 
 #[derive(Clone)]
 pub struct CodexCommandHandle {
@@ -124,13 +149,20 @@ impl CodexSession {
             }
             _ => None,
         };
-        let (rpc, inbound_rx) = CodexRpc::spawn(
+        let (rpc, inbound_rx) = match CodexRpc::spawn(
             ssh_host.as_deref(),
             startup_mcp_servers,
             steering_tempfile.as_deref(),
             access_mode,
         )
-        .await?;
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                remove_codex_steering_tempfile(&steering_tempfile);
+                return Err(err);
+            }
+        };
 
         rpc.request(
             "initialize",
@@ -174,14 +206,152 @@ impl CodexSession {
             )
             .await?;
 
-        let thread_id = thread_started
+        Self::from_thread_response(
+            rpc,
+            inbound_rx,
+            steering_tempfile,
+            startup_mcp_servers,
+            access_mode,
+            thread_started,
+            "thread/start",
+        )
+        .await
+    }
+
+    pub async fn fork(
+        workspace_roots: &[String],
+        ssh_host: Option<String>,
+        startup_mcp_servers: &[StartupMcpServer],
+        steering_content: Option<&str>,
+        access_mode: BackendAccessMode,
+        from_thread_id: &str,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let steering_tempfile = match steering_content {
+            Some(content) if !content.trim().is_empty() => {
+                Some(crate::steering::write_codex_steering_tempfile(content)?)
+            }
+            _ => None,
+        };
+        let (rpc, inbound_rx) = match CodexRpc::spawn(
+            ssh_host.as_deref(),
+            startup_mcp_servers,
+            steering_tempfile.as_deref(),
+            access_mode,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                remove_codex_steering_tempfile(&steering_tempfile);
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = rpc
+            .request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "tyde",
+                        "title": Value::Null,
+                        "version": "0.1"
+                    },
+                    "capabilities": {
+                        "experimentalApi": true
+                    }
+                }),
+            )
+            .await
+        {
+            cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+            return Err(err);
+        }
+
+        let cwd = if ssh_host.is_some() {
+            let parsed = match crate::remote::parse_remote_workspace_roots(workspace_roots) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+                    return Err(err);
+                }
+            };
+            let Some((_, paths)) = parsed else {
+                cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+                return Err("Expected remote workspace roots for SSH session".to_string());
+            };
+            let Some(path) = paths.into_iter().next() else {
+                cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+                return Err("No remote workspace root found".to_string());
+            };
+            path
+        } else {
+            match pick_workspace_root(workspace_roots) {
+                Ok(root) => root,
+                Err(err) => {
+                    cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+                    return Err(err);
+                }
+            }
+        };
+
+        let mut fork_params = json!({
+            "threadId": from_thread_id,
+            "cwd": cwd.clone(),
+            "sandbox": codex_sandbox_mode(access_mode),
+            "approvalPolicy": CODEX_FORCED_APPROVAL_POLICY,
+            "ephemeral": false,
+            "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
+            "persistExtendedHistory": false
+        });
+        fork_params["runtimeWorkspaceRoots"] =
+            json!(codex_runtime_workspace_roots(workspace_roots, &cwd));
+
+        let thread_forked = match rpc.request("thread/fork", fork_params).await {
+            Ok(value) => value,
+            Err(err) => {
+                cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+                return Err(format!("Codex thread/fork failed: {err}"));
+            }
+        };
+        if thread_forked
             .get("thread")
             .and_then(|t| t.get("id"))
             .and_then(Value::as_str)
-            .ok_or("Codex thread/start response missing thread.id")?
+            .is_none()
+        {
+            cleanup_codex_startup_failure(rpc, &steering_tempfile).await;
+            return Err("Codex thread/fork response missing thread.id".to_string());
+        }
+
+        Self::from_thread_response(
+            rpc,
+            inbound_rx,
+            steering_tempfile,
+            startup_mcp_servers,
+            access_mode,
+            thread_forked,
+            "thread/fork",
+        )
+        .await
+    }
+
+    async fn from_thread_response(
+        rpc: CodexRpc,
+        inbound_rx: mpsc::UnboundedReceiver<CodexInbound>,
+        steering_tempfile: Option<std::path::PathBuf>,
+        startup_mcp_servers: &[StartupMcpServer],
+        access_mode: BackendAccessMode,
+        thread_response: Value,
+        method: &str,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        let thread_id = thread_response
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Codex {method} response missing thread.id"))?
             .to_string();
 
-        let model = thread_started
+        let model = thread_response
             .get("model")
             .and_then(Value::as_str)
             .map(|s| s.to_string());
@@ -228,6 +398,11 @@ impl CodexSession {
         });
 
         Ok((Self { inner }, event_rx))
+    }
+
+    pub(crate) async fn session_id(&self) -> SessionId {
+        let state = self.inner.state.lock().await;
+        SessionId(state.thread_id.clone())
     }
 
     pub fn command_handle(&self) -> CodexCommandHandle {
@@ -284,14 +459,26 @@ impl CodexSession {
 
     pub async fn shutdown(self) {
         self.inner.rpc.shutdown().await;
-        if let Some(path) = &self.inner.steering_tempfile
-            && let Err(e) = std::fs::remove_file(path)
-        {
-            tracing::warn!(
-                "Failed to remove steering temp file {}: {e}",
-                path.display()
-            );
-        }
+        remove_codex_steering_tempfile(&self.inner.steering_tempfile);
+    }
+}
+
+async fn cleanup_codex_startup_failure(
+    rpc: CodexRpc,
+    steering_tempfile: &Option<std::path::PathBuf>,
+) {
+    rpc.shutdown().await;
+    remove_codex_steering_tempfile(steering_tempfile);
+}
+
+fn remove_codex_steering_tempfile(steering_tempfile: &Option<std::path::PathBuf>) {
+    if let Some(path) = steering_tempfile
+        && let Err(e) = std::fs::remove_file(path)
+    {
+        tracing::warn!(
+            "Failed to remove steering temp file {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -4330,6 +4517,24 @@ fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
         .ok_or("Codex backend requires at least one local workspace root".to_string())
 }
 
+fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<String> {
+    let mut roots = workspace_roots
+        .iter()
+        .filter_map(|root| {
+            let trimmed = root.trim();
+            (!trimmed.is_empty() && !trimmed.starts_with("ssh://")).then(|| root.clone())
+        })
+        .collect::<Vec<_>>();
+
+    if roots.is_empty() {
+        roots.push(cwd.to_string());
+    } else if !roots.iter().any(|root| root == cwd) {
+        roots.insert(0, cwd.to_string());
+    }
+
+    roots
+}
+
 async fn persist_temp_image(image: &ImageAttachment) -> Result<String, String> {
     static IMAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -4480,6 +4685,19 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
 
 type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
+fn codex_rpc_error_message(err_obj: &Value) -> String {
+    let message = err_obj
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match (err_obj.get("code").and_then(Value::as_i64), message) {
+        (Some(code), Some(message)) => format!("Codex JSON-RPC error {code}: {message}"),
+        (Some(code), None) => format!("Codex JSON-RPC error {code}: {err_obj}"),
+        (None, Some(message)) => message,
+        (None, None) => format!("Codex JSON-RPC error: {err_obj}"),
+    }
+}
+
 struct CodexRpc {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingRpcMap,
@@ -4505,7 +4723,7 @@ impl CodexRpc {
             let remote_args = codex_app_server_args(access_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
-            let mut cmd = Command::new("codex");
+            let mut cmd = codex_command();
             for arg in codex_app_server_args(access_mode, &config_overrides) {
                 cmd.arg(arg);
             }
@@ -4562,12 +4780,7 @@ impl CodexRpc {
                             Ok(result.clone())
                         } else {
                             let err_obj = parsed.get("error").cloned().unwrap_or(Value::Null);
-                            let msg = err_obj
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| format!("Codex JSON-RPC error: {err_obj}"));
-                            Err(msg)
+                            Err(codex_rpc_error_message(&err_obj))
                         };
                         if let Some(tx) = stdout_pending.lock().await.remove(&id) {
                             let _ = tx.send(response);
@@ -4775,6 +4988,39 @@ fn backend_error_message(content: String) -> ChatEvent {
         context_breakdown: None,
         images: None,
     })
+}
+
+fn is_codex_thread_fork_unsupported_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("-32601")
+        || (normalized.contains("thread/fork")
+            && (normalized.contains("method not found")
+                || normalized.contains("unknown method")
+                || normalized.contains("unknown request")
+                || normalized.contains("unsupported method")))
+}
+
+fn codex_thread_fork_unsupported_message() -> String {
+    "Installed Codex CLI does not support session fork (app-server method `thread/fork`). Update Codex CLI to 0.136.0 or newer and try again."
+        .to_string()
+}
+
+fn codex_ssh_fork_unsupported_error(workspace_roots: &[String]) -> Option<BackendStartupError> {
+    if !workspace_roots
+        .iter()
+        .any(|root| root.trim_start().starts_with("ssh://"))
+    {
+        return None;
+    }
+
+    let detail = match crate::remote::parse_remote_workspace_roots(workspace_roots) {
+        Ok(Some((host, _))) => format!(" for SSH host '{host}'"),
+        Ok(None) => " for SSH workspace roots".to_string(),
+        Err(err) => format!(" for SSH workspace roots ({err})"),
+    };
+    Some(BackendStartupError::unsupported(format!(
+        "Codex backend does not support session fork{detail} yet"
+    )))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5120,7 +5366,7 @@ impl Backend for CodexBackend {
             }
             let turn_network_access = codex_has_http_mcp_servers(&config.startup_mcp_servers);
             // --- spawn codex CLI ------------------------------------------------
-            let mut command = Command::new("codex");
+            let mut command = codex_command();
             for arg in codex_app_server_args(access_mode, &startup_mcp_config_overrides) {
                 command.arg(arg);
             }
@@ -5174,14 +5420,7 @@ impl Backend for CodexBackend {
                                 } else {
                                     let err_obj =
                                         parsed.get("error").cloned().unwrap_or(Value::Null);
-                                    let msg = err_obj
-                                        .get("message")
-                                        .and_then(Value::as_str)
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| {
-                                            format!("Codex JSON-RPC error: {err_obj}")
-                                        });
-                                    Err(msg)
+                                    Err(codex_rpc_error_message(&err_obj))
                                 };
                                 if let Some(tx) = pending.lock().await.remove(&id) {
                                     let _ = tx.send(response);
@@ -6203,7 +6442,7 @@ impl Backend for CodexBackend {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let (subagent_emitter_tx, _subagent_emitter_rx) =
+        let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
         let roots = if workspace_roots.is_empty() {
@@ -6235,6 +6474,10 @@ impl Backend for CodexBackend {
             };
 
             let handle = session.command_handle();
+            let maybe_emitter = subagent_emitter_rx.borrow().clone();
+            if let Some(emitter) = maybe_emitter {
+                session.set_subagent_emitter(emitter).await;
+            }
             let resolved_settings = resolve_session_settings(&config);
             let model_override = match resolved_settings.0.get("model") {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
@@ -6329,6 +6572,15 @@ impl Backend for CodexBackend {
                             break;
                         }
                     }
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
+                        if let Some(emitter) = maybe_emitter {
+                            session.set_subagent_emitter(emitter).await;
+                        }
+                    }
                 }
             }
 
@@ -6347,13 +6599,211 @@ impl Backend for CodexBackend {
     }
 
     async fn fork(
-        _workspace_roots: Vec<String>,
-        _config: BackendSpawnConfig,
-        _from_session_id: protocol::SessionId,
-        _initial_input: protocol::SendMessagePayload,
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        from_session_id: protocol::SessionId,
+        initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
-        Err(BackendStartupError::unsupported(
-            backend_fork_unsupported_message(protocol::BackendKind::Codex),
+        if let Some(error) = codex_ssh_fork_unsupported_error(&workspace_roots) {
+            return Err(error);
+        }
+
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (subagent_emitter_tx, mut subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+
+        let roots = if workspace_roots.is_empty() {
+            vec!["/tmp".to_string()]
+        } else {
+            workspace_roots
+        };
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
+
+        tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            let combined_instructions =
+                render_combined_spawn_instructions(&config.resolved_spawn_config);
+            let (session, mut raw_events) = match CodexSession::fork(
+                &roots,
+                None,
+                &config.startup_mcp_servers,
+                combined_instructions.as_deref(),
+                config.resolved_spawn_config.access_mode,
+                &from_session_id.0,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    let startup_error = if is_codex_thread_fork_unsupported_error(&err) {
+                        BackendStartupError::unsupported(codex_thread_fork_unsupported_message())
+                    } else {
+                        BackendStartupError::backend_failed(format!(
+                            "Failed to fork Codex session: {err}"
+                        ))
+                    };
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(startup_error));
+                    }
+                    return;
+                }
+            };
+
+            let child_session_id = session.session_id().await;
+            let handle = session.command_handle();
+            let maybe_emitter = subagent_emitter_rx.borrow().clone();
+            if let Some(emitter) = maybe_emitter {
+                session.set_subagent_emitter(emitter).await;
+            }
+
+            let resolved_settings = resolve_session_settings(&config);
+            let model_override = match resolved_settings.0.get("model") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            let effort_override = match resolved_settings.0.get("reasoning_effort") {
+                Some(SessionSettingValue::String(value)) => Some(value.clone()),
+                _ => None,
+            };
+            if model_override.is_some() || effort_override.is_some() {
+                let settings = json!({
+                    "model": model_override,
+                    "reasoning_effort": effort_override,
+                    "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
+                });
+                if let Err(err) = handle
+                    .execute(SessionCommand::UpdateSettings {
+                        settings,
+                        persist: false,
+                    })
+                    .await
+                {
+                    session.shutdown().await;
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(BackendStartupError::backend_failed(format!(
+                            "Failed to configure forked Codex session: {err}"
+                        ))));
+                    }
+                    return;
+                }
+            }
+
+            let images = protocol_images_to_attachments(initial_input.images);
+            if let Err(err) = handle
+                .execute(SessionCommand::SendMessage {
+                    message: initial_input.message,
+                    images,
+                })
+                .await
+            {
+                session.shutdown().await;
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(BackendStartupError::backend_failed(format!(
+                        "Failed to send initial Codex fork prompt: {err}"
+                    ))));
+                }
+                return;
+            }
+
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Ok(child_session_id));
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = raw_events.recv() => {
+                        let Some(raw) = incoming else {
+                            break;
+                        };
+                        if let Some(event) = raw_chat_event(&raw)
+                            && events_tx.send(event).is_err() {
+                                break;
+                            }
+                    }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else {
+                            break;
+                        };
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let images = protocol_images_to_attachments(payload.images);
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::SendMessage {
+                                        message: payload.message,
+                                        images,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!("Failed to send Codex fork follow-up: {err}");
+                                    break;
+                                }
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                if let Err(err) = handle
+                                    .execute(SessionCommand::UpdateSettings {
+                                        settings: session_settings_to_json(&payload.values),
+                                        persist: false,
+                                    })
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Failed to update forked Codex session settings: {err}"
+                                    );
+                                    break;
+                                }
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break };
+                        if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
+                            tracing::error!("Failed to interrupt forked Codex turn: {err}");
+                            break;
+                        }
+                    }
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
+                        if let Some(emitter) = maybe_emitter {
+                            session.set_subagent_emitter(emitter).await;
+                        }
+                    }
+                }
+            }
+
+            session.shutdown().await;
+        });
+
+        let child_session_id = match ready_rx.await {
+            Ok(Ok(session_id)) => session_id,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Err(BackendStartupError::backend_failed(
+                    "Codex fork initialization task ended early",
+                ));
+            }
+        };
+        let backend_session_id = Arc::new(std::sync::Mutex::new(Some(child_session_id)));
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id: backend_session_id,
+                subagent_emitter_tx,
+            },
+            EventStream::new(events_rx),
         ))
     }
 
@@ -6387,16 +6837,282 @@ mod tests {
     use super::*;
     use crate::sub_agent::SubAgentHandle;
     use protocol::{
-        AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, AgentStartPayload,
-        BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind, HostBootstrapPayload,
-        HostSettings, MobileAccessStatePayload, MobileBrokerStatus, MobilePairingState,
-        NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath, TeamPresetCatalog,
-        Version, WelcomePayload,
+        AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentId, AgentOrigin,
+        AgentStartPayload, BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind,
+        HostBootstrapPayload, HostSettings, MobileAccessStatePayload, MobileBrokerStatus,
+        MobilePairingState, NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath,
+        TeamPresetCatalog, Version, WelcomePayload,
     };
     use std::collections::HashSet;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, MutexGuard, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static CODEX_FAKE_APP_SERVER_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    struct CodexFakeAppServer {
+        _dir: tempfile::TempDir,
+        binary: std::path::PathBuf,
+        capture: std::path::PathBuf,
+        argv_capture: std::path::PathBuf,
+    }
+
+    #[derive(Clone)]
+    struct CapturedCodexRequest {
+        pid: u64,
+        request: Value,
+    }
+
+    struct CapturedCodexArgv {
+        pid: u64,
+        argv: Vec<String>,
+    }
+
+    struct CodexTestAppServerBinaryGuard {
+        _serial: MutexGuard<'static, ()>,
+        previous: Option<std::path::PathBuf>,
+    }
+
+    impl CodexTestAppServerBinaryGuard {
+        fn set(binary: std::path::PathBuf) -> Self {
+            let serial = CODEX_FAKE_APP_SERVER_SERIAL
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = codex_test_app_server_binary_override()
+                .lock()
+                .expect("codex test app-server binary mutex poisoned")
+                .replace(binary);
+            Self {
+                _serial: serial,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for CodexTestAppServerBinaryGuard {
+        fn drop(&mut self) {
+            *codex_test_app_server_binary_override()
+                .lock()
+                .expect("codex test app-server binary mutex poisoned") = self.previous.take();
+        }
+    }
+
+    impl CodexFakeAppServer {
+        fn new(mode: &str, child_thread_id: &str) -> Self {
+            let dir = tempfile::tempdir().expect("fake codex app-server tempdir");
+            let binary = dir.path().join("codex-fake-app-server.py");
+            let capture = dir.path().join("requests.jsonl");
+            let argv_capture = dir.path().join("argv.json");
+            let mut script = String::new();
+            script.push_str("#!/usr/bin/env python3\n");
+            script.push_str("import json, os, sys\n");
+            script.push_str(&format!(
+                "CAPTURE = {}\n",
+                serde_json::to_string(&capture.to_string_lossy()).expect("capture path JSON")
+            ));
+            script.push_str(&format!(
+                "ARGV_CAPTURE = {}\n",
+                serde_json::to_string(&argv_capture.to_string_lossy())
+                    .expect("argv capture path JSON")
+            ));
+            script.push_str(&format!(
+                "MODE = {}\n",
+                serde_json::to_string(mode).expect("mode JSON")
+            ));
+            script.push_str(&format!(
+                "CHILD_THREAD_ID = {}\n",
+                serde_json::to_string(child_thread_id).expect("child thread id JSON")
+            ));
+            script.push_str(
+                r#"
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+with open(ARGV_CAPTURE, "a", encoding="utf-8") as argv_capture:
+    argv_capture.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:]}, separators=(",", ":")) + "\n")
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except Exception:
+        continue
+    with open(CAPTURE, "a", encoding="utf-8") as capture:
+        capture.write(json.dumps({"pid": os.getpid(), "request": request}, separators=(",", ":")) + "\n")
+    request_id = request.get("id")
+    method = request.get("method")
+    params = request.get("params") or {}
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "userAgent": "fake-codex/0",
+                "codexHome": "/tmp/fake-codex-home",
+                "platformFamily": "unix",
+                "platformOs": "test"
+            }
+        })
+    elif method == "thread/fork":
+        if MODE == "unsupported":
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found: thread/fork"
+                }
+            })
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "thread": {
+                        "id": CHILD_THREAD_ID,
+                        "sessionId": CHILD_THREAD_ID,
+                        "forkedFromId": params.get("threadId"),
+                        "turns": []
+                    },
+                    "model": "fake-codex-model"
+                }
+            })
+    elif method == "turn/start":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"turn": {"id": "turn-fake"}}
+        })
+    elif method == "turn/interrupt":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "thread/update":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    else:
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": "Method not found: " + str(method)
+            }
+        })
+"#,
+            );
+            std::fs::write(&binary, script).expect("write fake codex app-server");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&binary)
+                    .expect("fake codex app-server metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&binary, permissions)
+                    .expect("chmod fake codex app-server");
+            }
+            Self {
+                _dir: dir,
+                binary,
+                capture,
+                argv_capture,
+            }
+        }
+
+        fn requests(&self) -> Vec<Value> {
+            self.captured_requests()
+                .into_iter()
+                .map(|captured| captured.request)
+                .collect()
+        }
+
+        fn captured_requests(&self) -> Vec<CapturedCodexRequest> {
+            let contents = std::fs::read_to_string(&self.capture).unwrap_or_default();
+            contents
+                .lines()
+                .map(|line| {
+                    let value: Value = serde_json::from_str(line).expect("captured request JSON");
+                    match value.get("request") {
+                        Some(request) => CapturedCodexRequest {
+                            pid: value.get("pid").and_then(Value::as_u64).unwrap_or_default(),
+                            request: request.clone(),
+                        },
+                        None => CapturedCodexRequest {
+                            pid: 0,
+                            request: value,
+                        },
+                    }
+                })
+                .collect()
+        }
+
+        fn captured_fork_process(&self, parent_thread_id: &str) -> (u64, Vec<Value>) {
+            let captured = self.captured_requests();
+            let fork_pid = captured
+                .iter()
+                .find(|captured| {
+                    captured.request.get("method").and_then(Value::as_str) == Some("thread/fork")
+                        && captured
+                            .request
+                            .pointer("/params/threadId")
+                            .and_then(Value::as_str)
+                            == Some(parent_thread_id)
+                })
+                .map(|captured| captured.pid)
+                .expect("captured thread/fork request");
+            let requests = captured
+                .into_iter()
+                .filter(|captured| captured.pid == fork_pid)
+                .map(|captured| captured.request)
+                .collect::<Vec<_>>();
+            (fork_pid, requests)
+        }
+
+        fn captured_argv(&self) -> Vec<CapturedCodexArgv> {
+            let contents = std::fs::read_to_string(&self.argv_capture).unwrap_or_default();
+            contents
+                .lines()
+                .map(|line| {
+                    let value: Value =
+                        serde_json::from_str(line).expect("fake app-server argv JSON");
+                    match value.get("argv") {
+                        Some(argv) => CapturedCodexArgv {
+                            pid: value.get("pid").and_then(Value::as_u64).unwrap_or_default(),
+                            argv: serde_json::from_value(argv.clone())
+                                .expect("fake app-server argv array"),
+                        },
+                        None => CapturedCodexArgv {
+                            pid: 0,
+                            argv: serde_json::from_value(value)
+                                .expect("fake app-server argv array"),
+                        },
+                    }
+                })
+                .collect()
+        }
+
+        fn argv_for_pid(&self, pid: u64) -> Vec<String> {
+            self.captured_argv()
+                .into_iter()
+                .find(|captured| captured.pid == pid)
+                .map(|captured| captured.argv)
+                .expect("fake app-server argv for pid")
+        }
+    }
+
+    fn codex_steering_tempfiles() -> HashSet<std::path::PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("tyde-codex-steering-") && name.ends_with(".md")
+                    })
+            })
+            .collect()
+    }
 
     fn live_test_verbose() -> bool {
         std::env::var("TYDE_LIVE_CODEX_TEST_VERBOSE")
@@ -6537,6 +7253,272 @@ mod tests {
         assert_eq!(
             values,
             vec!["gpt-5.10", "gpt-5.10-mini", "gpt-5.9", "gpt-5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_backend_fork_uses_thread_fork_child_id_and_child_turn() {
+        let fake = CodexFakeAppServer::new("ok", "child-thread-id");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_string_lossy().to_string();
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String("gpt-test".to_string()),
+        );
+        settings.0.insert(
+            "reasoning_effort".to_string(),
+            SessionSettingValue::String("medium".to_string()),
+        );
+        let config = BackendSpawnConfig {
+            session_settings: Some(settings),
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                instructions: Some("Use the fork-specific instructions.".to_string()),
+                access_mode: BackendAccessMode::ReadOnly,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (backend, _events) = <CodexBackend as Backend>::fork(
+            vec![workspace_root.clone(), "/tmp".to_string()],
+            config,
+            SessionId("parent-thread-id".to_string()),
+            protocol::SendMessagePayload {
+                message: "child prompt".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("Codex fork should start against fake app-server");
+
+        assert_eq!(
+            Backend::session_id(&backend),
+            SessionId("child-thread-id".to_string())
+        );
+        backend.shutdown().await;
+
+        let (_fork_pid, requests) = fake.captured_fork_process("parent-thread-id");
+        let methods = requests
+            .iter()
+            .filter_map(|request| request.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(methods, vec!["initialize", "thread/fork", "turn/start"]);
+
+        let fork_params = requests[1].get("params").expect("thread/fork params");
+        assert_eq!(
+            fork_params.get("threadId").and_then(Value::as_str),
+            Some("parent-thread-id")
+        );
+        assert_eq!(
+            fork_params.get("cwd").and_then(Value::as_str),
+            Some(workspace_root.as_str())
+        );
+        assert_eq!(
+            fork_params.get("sandbox").and_then(Value::as_str),
+            Some(CODEX_READ_ONLY_SANDBOX)
+        );
+        assert_eq!(
+            fork_params.get("approvalPolicy").and_then(Value::as_str),
+            Some(CODEX_FORCED_APPROVAL_POLICY)
+        );
+        assert_eq!(
+            fork_params
+                .get("experimentalRawEvents")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            fork_params
+                .get("persistExtendedHistory")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            fork_params
+                .get("runtimeWorkspaceRoots")
+                .and_then(Value::as_array)
+                .expect("runtimeWorkspaceRoots")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec![workspace_root.as_str(), "/tmp"]
+        );
+
+        // Other tests may trigger short-lived model discovery while this fake
+        // app-server override is installed; this exact sequence is for the
+        // process that handled thread/fork. CodexSession::execute(UpdateSettings)
+        // only updates local state used by subsequent turn/start calls, so
+        // configuring model/effort above should not add a thread/update RPC.
+        let turn_params = requests[2].get("params").expect("turn/start params");
+        assert_eq!(
+            turn_params.get("threadId").and_then(Value::as_str),
+            Some("child-thread-id"),
+            "the initial turn must be sent to the returned child thread, not the parent"
+        );
+        assert_eq!(
+            turn_params.pointer("/input/0/text").and_then(Value::as_str),
+            Some("child prompt")
+        );
+        assert_eq!(
+            turn_params.get("model").and_then(Value::as_str),
+            Some("gpt-test")
+        );
+        assert_eq!(
+            turn_params.get("effort").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            turn_params
+                .pointer("/sandboxPolicy/type")
+                .and_then(Value::as_str),
+            Some("readOnly")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_backend_fork_cleans_steering_tempfile_when_app_server_spawn_fails() {
+        let missing_binary_dir = tempfile::tempdir().expect("missing binary tempdir");
+        let _guard = CodexTestAppServerBinaryGuard::set(
+            missing_binary_dir.path().join("missing-codex-app-server"),
+        );
+        let before = codex_steering_tempfiles();
+
+        let result = CodexSession::fork(
+            &["/tmp".to_string()],
+            None,
+            &[],
+            Some("Temporary fork instructions."),
+            BackendAccessMode::ReadOnly,
+            "parent-thread-id",
+        )
+        .await;
+
+        let err = match result {
+            Ok((session, _)) => {
+                session.shutdown().await;
+                panic!("missing app-server binary should fail fork")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("Failed to spawn Codex app-server"),
+            "unexpected fork spawn error: {err}"
+        );
+        let after = codex_steering_tempfiles();
+        let leaked = after.difference(&before).collect::<Vec<_>>();
+        assert!(
+            leaked.is_empty(),
+            "CodexSession::fork should remove steering tempfiles when app-server spawn fails; leaked={leaked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_backend_fork_method_not_found_is_unsupported() {
+        let fake = CodexFakeAppServer::new("unsupported", "unused-child-thread-id");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let config = BackendSpawnConfig {
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                instructions: Some("Temporary fork instructions.".to_string()),
+                access_mode: BackendAccessMode::ReadOnly,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = <CodexBackend as Backend>::fork(
+            vec!["/tmp".to_string()],
+            config,
+            SessionId("parent-thread-id".to_string()),
+            protocol::SendMessagePayload {
+                message: "child prompt".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await;
+        let err = match result {
+            Ok((backend, _)) => {
+                backend.shutdown().await;
+                panic!("Codex fork should fail when app-server lacks thread/fork")
+            }
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code, AgentErrorCode::Unsupported);
+        assert!(err.message.contains("thread/fork"));
+        assert!(err.message.contains("Update Codex CLI"));
+
+        let (fork_pid, requests) = fake.captured_fork_process("parent-thread-id");
+        let methods = requests
+            .iter()
+            .filter_map(|request| request.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec!["initialize", "thread/fork"],
+            "unsupported fork must not fall back to thread/start, resume, or session-file copying"
+        );
+
+        let steering_path = fake
+            .argv_for_pid(fork_pid)
+            .windows(2)
+            .find_map(|args| {
+                if args[0] == "-c" {
+                    args[1].strip_prefix("model_instructions_file=")
+                } else {
+                    None
+                }
+            })
+            .map(|quoted| {
+                serde_json::from_str::<String>(quoted)
+                    .expect("model_instructions_file should be TOML/JSON quoted")
+            })
+            .expect("fake Codex app-server should receive a steering tempfile override");
+        assert!(
+            !std::path::Path::new(&steering_path).exists(),
+            "Codex fork startup failure should remove steering tempfile {steering_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_backend_fork_rejects_ssh_roots_without_local_app_server() {
+        let fake = CodexFakeAppServer::new("ok", "unused-child-thread-id");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+
+        let result = <CodexBackend as Backend>::fork(
+            vec!["ssh://devbox.example.com/workspace".to_string()],
+            BackendSpawnConfig::default(),
+            SessionId("parent-thread-id".to_string()),
+            protocol::SendMessagePayload {
+                message: "child prompt".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await;
+
+        let err = match result {
+            Ok((backend, _)) => {
+                backend.shutdown().await;
+                panic!("SSH-backed Codex fork should fail before app-server startup")
+            }
+            Err(err) => err,
+        };
+        assert_eq!(err.code, AgentErrorCode::Unsupported);
+        assert!(err.message.contains("SSH host 'devbox.example.com'"));
+        assert!(
+            fake.requests().iter().all(|request| {
+                request.get("method").and_then(Value::as_str) != Some("thread/fork")
+                    || request.pointer("/params/threadId").and_then(Value::as_str)
+                        != Some("parent-thread-id")
+            }),
+            "SSH fork must not silently try a local Codex thread/fork"
         );
     }
 

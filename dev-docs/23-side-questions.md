@@ -78,9 +78,17 @@ Tyde reports unsupported behavior instead.
 - **Tycode**: unsupported for now. Tycode source lives outside this repo and the
   currently consumed `tycode-subprocess` protocol exposes `UserInput`, image
   input, cancel, and resume but no `ForkSession` command in Tyde2's write scope.
-- **Codex**: unsupported for now. A local source search did not confirm a safe
-  `thread/fork` app-server RPC shape in the code Tyde2 consumes. Do not ship a
-  rollout-file or session-file copy fallback.
+- **Codex**: supported through the Codex app-server `thread/fork` JSON-RPC
+  method. Verified against the current Codex CLI schema (`ThreadForkParams`,
+  `ThreadForkResponse`, and `Thread.forkedFromId`). Tyde sends the parent
+  `threadId` and stores the returned `result.thread.id` as the child
+  `SessionId`. `runtimeWorkspaceRoots` is a valid `ThreadForkParams` field and
+  Tyde sends it with the forked thread's roots. `persistExtendedHistory` is
+  accepted but deprecated/ignored by current app-server builds; Tyde sends
+  `false` to preserve limited-history persistence semantics. Older Codex CLI
+  builds that do not expose `thread/fork` must fail gracefully as unsupported
+  with an update-Codex message. Do not ship a rollout-file or session-file copy
+  fallback.
 - **Gemini**: unsupported for now. Tyde does not have a native Gemini fork or ACP
   transport path wired up.
 
@@ -99,3 +107,8 @@ Real-AI backend tests are only needed when changing that backend's fork behavior
 For Claude, target only the Claude-specific tests needed to verify the
 `--fork-session` command path and child session-id capture; do not run the full
 expensive `backend.rs` suite unless AGENTS.md requires it for the backend change.
+For Codex, target deterministic fake app-server tests that verify the
+`thread/fork` JSON-RPC request is called with the correct parent thread id, the
+returned child thread id is stored, the initial turn targets the child thread,
+and JSON-RPC method-not-found errors surface as `AgentErrorCode::Unsupported`
+without touching the parent session.

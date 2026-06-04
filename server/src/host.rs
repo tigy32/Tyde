@@ -2094,12 +2094,15 @@ impl HostHandle {
                     sanitize_session_settings_values(schema, &stored_settings)
                 });
                 let backend_support_failure = (!use_mock_backend
-                    && backend_kind != protocol::BackendKind::Claude)
-                    .then(|| {
-                        AgentStartupFailure::unsupported(
-                            crate::backend::backend_fork_unsupported_message(backend_kind),
-                        )
-                    });
+                    && !matches!(
+                        backend_kind,
+                        protocol::BackendKind::Claude | protocol::BackendKind::Codex
+                    ))
+                .then(|| {
+                    AgentStartupFailure::unsupported(
+                        crate::backend::backend_fork_unsupported_message(backend_kind),
+                    )
+                });
                 let non_resumable_failure = (!record.resumable).then(|| {
                     AgentStartupFailure::unsupported(format!(
                         "cannot fork non-resumable session {}",
