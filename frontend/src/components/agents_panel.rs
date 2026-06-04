@@ -736,7 +736,7 @@ fn agent_card(
                 {is_side_question.then(|| view! {
                     <span
                         class="agent-card-side-question-badge"
-                        title="Ask aside — forked from another agent's session"
+                        title="Fork + send — forked from another agent's session"
                     >
                         "Aside"
                     </span>

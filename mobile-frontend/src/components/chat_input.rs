@@ -72,7 +72,7 @@ fn active_agent_is_running_tracked(state: &AppState) -> bool {
 }
 
 /// True when the active agent has reported a backend session id, which is
-/// required to fork an "Ask aside" side question from it.
+/// required to fork via "Fork + send".
 fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
     let Some(active) = state.active_agent.get() else {
         return false;
@@ -168,7 +168,7 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
 /// when a turn is running and there is draft text, "Cancel" when running with
 /// an empty composer. The caret is always rendered but disabled when the
 /// dropdown would be empty. The dropdown carries secondary actions only:
-/// "Steer" and "Cancel" when running+input; "Ask aside" when a forkable
+/// "Steer" and "Cancel" when running+input; "Fork + send" when a forkable
 /// session exists and there is draft text.
 #[component]
 pub fn ChatInput() -> impl IntoView {
@@ -326,10 +326,9 @@ pub fn ChatInput() -> impl IntoView {
     };
     let interrupt_for_menu = do_interrupt;
 
-    // "Ask aside": fork the active agent's session into a fresh read-only agent
-    // seeded with the current draft, then clear the draft optimistically
-    // (mirroring send). Enabled only when there is draft text and the active
-    // agent has a forkable backend session.
+    // "Fork + send": fork the active agent's session and send the draft to the fork,
+    // then clear the draft optimistically (mirroring send). Enabled only when
+    // there is draft text and the active agent has a forkable backend session.
     let do_btw = {
         let state = state.clone();
         move || {
@@ -375,7 +374,7 @@ pub fn ChatInput() -> impl IntoView {
     });
     // Steer = thinking + draft typed.
     let is_steer = Memo::new(move |_| is_running.get() && has_text.get());
-    // Menu holds items only for: Ask aside (input+session) or Steer+Cancel (thinking+input).
+    // Menu holds items only for: Fork + send (input+session) or Steer+Cancel (thinking+input).
     let menu_has_items = Memo::new(move |_| can_btw.get() || is_steer.get());
     let menu_open = RwSignal::new(false);
     // Auto-dismiss a stale-open menu when its items disappear.
@@ -547,7 +546,7 @@ pub fn ChatInput() -> impl IntoView {
                                         data-mobile-test="chat-send-menu-ask-aside"
                                         on:click=move |_| { menu_open.set(false); on_btw(); }
                                     >
-                                        "Ask aside"
+                                        "Fork + send"
                                     </button>
                                 })}
                                 {show_cancel.then(|| view! {
@@ -862,9 +861,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 3: Idle + input + session ───────────────────────────
-    // Primary "Send" enabled; caret enabled; dropdown has "Ask aside" only.
+    // Primary "Send" enabled; caret enabled; dropdown has "Fork + send" only.
     #[wasm_bindgen_test]
-    async fn idle_input_with_session_menu_ask_aside_only() {
+    async fn idle_input_with_session_menu_fork_send_only() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -905,7 +904,7 @@ mod wasm_tests {
         type_text(&container, "why is this slow?");
         next_tick().await;
 
-        // Now has draft → caret enabled, menu has "Ask aside" only.
+        // Now has draft → caret enabled, menu has "Fork + send" only.
         let c = caret(&container);
         assert!(
             !c.has_attribute("disabled"),
@@ -918,20 +917,20 @@ mod wasm_tests {
                 .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
                 .unwrap()
                 .is_some(),
-            "Ask aside must appear once there is draft text and a forkable session"
+            "Fork + send must appear once there is draft text and a forkable session"
         );
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Ask aside".to_owned()],
-            "idle+session menu must be exactly 'Ask aside'"
+            vec!["Fork + send".to_owned()],
+            "idle+session menu must be exactly 'Fork + send'"
         );
-        // Ask aside must only exist inside the dropdown, not as a standalone button.
+        // Fork + send must only exist inside the dropdown, not as a standalone button.
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-btw']")
                 .unwrap()
                 .is_none(),
-            "Ask aside must only exist inside the dropdown menu"
+            "Fork + send must only exist inside the dropdown menu"
         );
     }
 
@@ -979,7 +978,7 @@ mod wasm_tests {
             "Send must be enabled with draft"
         );
 
-        // No session → Ask aside absent → caret disabled.
+        // No session → Fork + send absent → caret disabled.
         let c = caret(&container);
         assert!(
             c.has_attribute("disabled"),
@@ -990,12 +989,12 @@ mod wasm_tests {
                 .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
                 .unwrap()
                 .is_none(),
-            "Ask aside must stay hidden when the active agent has no session id"
+            "Fork + send must stay hidden when the active agent has no session id"
         );
     }
 
     // ── State matrix row 6: Thinking + input + session ───────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Ask aside", "Cancel".
+    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_with_session_queue_primary_full_menu() {
         let host = LocalHostId("host-1".to_owned());
@@ -1054,10 +1053,10 @@ mod wasm_tests {
             menu_item_texts(&container),
             vec![
                 "Steer".to_owned(),
-                "Ask aside".to_owned(),
+                "Fork + send".to_owned(),
                 "Cancel".to_owned(),
             ],
-            "thinking+session+input menu must be Steer, Ask aside, Cancel"
+            "thinking+session+input menu must be Steer, Fork + send, Cancel"
         );
     }
 

@@ -218,7 +218,7 @@ fn active_agent_is_backend_native(state: &AppState) -> bool {
 }
 
 /// True when the active agent has reported a backend session id, which is
-/// required to fork an "Ask aside" from it. Tracked so the Ask aside menu
+/// required to fork via "Fork + send". Tracked so the Fork + send menu
 /// item appears the moment the `AgentStart`/bootstrap event lands.
 fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
     let Some(active_agent) = state.active_agent.get() else {
@@ -321,9 +321,9 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
     });
 }
 
-/// Spawn an "Ask aside" side question from the current draft, then clear the
+/// Fork the session and send the draft as a new side question, then clear the
 /// draft optimistically — mirroring `submit_chat_input`'s clear-on-submit.
-/// The Ask aside menu item only shows when there is input and the active agent
+/// The Fork + send menu item only shows when there is input and the active agent
 /// has a session id, so the guard here just protects against an empty draft.
 fn submit_side_question(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
     let text = state.chat_input.get_untracked();
@@ -593,7 +593,7 @@ pub fn ChatInput() -> impl IntoView {
 
     let btw_state = state.clone();
     let active_has_session = Memo::new(move |_| active_agent_has_session_id_tracked(&btw_state));
-    // An "Ask aside" fork needs draft input and a forkable backend session.
+    // A "Fork + send" needs draft input and a forkable backend session.
     let can_btw = move || ui_mode.get().0 && active_has_session.get();
 
     let can_send = move || ui_mode.get().0 && !is_readonly.get();
@@ -601,7 +601,7 @@ pub fn ChatInput() -> impl IntoView {
     let is_steer = Memo::new(move |_| ui_mode.get().2);
 
     // The dropdown holds items only in specific states (see state matrix):
-    // - Ask aside: idle or thinking + input + session
+    // - Fork + send: idle or thinking + input + session
     // - Steer + Cancel: thinking + input (with or without session)
     let menu_has_items = Memo::new(move |_| can_btw() || (can_interrupt() && is_steer.get()));
     let menu_open = RwSignal::new(false);
@@ -1052,10 +1052,10 @@ pub fn ChatInput() -> impl IntoView {
                                     class="chat-send-menu-item"
                                     role="menuitem"
                                     data-test="chat-send-menu-ask-aside"
-                                    title="Ask a side question — forks this session read-only without disturbing it"
+                                    title="Fork + send — forks this session and sends the draft to the fork"
                                     on:click=on_menu_btw
                                 >
-                                    "Ask aside"
+                                    "Fork + send"
                                 </button>
                             </Show>
                             <Show when=move || can_interrupt() && is_steer.get()>
@@ -1249,9 +1249,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 3: Idle + input + session ────────────────────────────
-    // Primary "Send" enabled; caret enabled; dropdown has "Ask aside" only.
+    // Primary "Send" enabled; caret enabled; dropdown has "Fork + send" only.
     #[wasm_bindgen_test]
-    async fn idle_input_with_session_send_enabled_menu_ask_aside_only() {
+    async fn idle_input_with_session_send_enabled_menu_fork_send_only() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -1277,8 +1277,8 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Ask aside".to_owned()],
-            "idle+session menu must be exactly 'Ask aside'"
+            vec!["Fork + send".to_owned()],
+            "idle+session menu must be exactly 'Fork + send'"
         );
     }
 
@@ -1346,7 +1346,7 @@ mod wasm_tests {
     }
 
     // ── State matrix row 6: Thinking + input + session ───────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Ask aside", "Cancel".
+    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_with_session_queue_primary_full_menu() {
         let container = make_container();
@@ -1371,10 +1371,10 @@ mod wasm_tests {
             menu_item_texts(&container),
             vec![
                 "Steer".to_owned(),
-                "Ask aside".to_owned(),
+                "Fork + send".to_owned(),
                 "Cancel".to_owned(),
             ],
-            "thinking+session+input menu must be Steer, Ask aside, Cancel"
+            "thinking+session+input menu must be Steer, Fork + send, Cancel"
         );
     }
 
@@ -1400,7 +1400,7 @@ mod wasm_tests {
 
     // ── Image-only input coverage note ────────────────────────────────────────
     // The matrix says desktop input = "text/images". Full image-only tests
-    // (e.g. idle image+session → Send enabled/caret enabled/Ask aside) are not
+    // (e.g. idle image+session → Send enabled/caret enabled/Fork + send) are not
     // feasible from this wasm test module because:
     //   1. `pending_images` is a component-local RwSignal<Vec<PendingImage>>
     //      not exposed via AppState or any injectable context — there is no
@@ -1446,7 +1446,7 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            // thinking+input+session → primary=Queue, menu=Steer/Ask aside/Cancel
+            // thinking+input+session → primary=Queue, menu=Steer/Fork + send/Cancel
             configure(&state, true, true, "redirect");
             provide_context(state);
             view! { <ChatInput /> }

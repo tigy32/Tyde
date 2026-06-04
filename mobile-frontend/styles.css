@@ -1671,7 +1671,7 @@ input, textarea, select {
 }
 
 /* Split send button: primary label (Send/Queue/Cancel) plus a caret toggle
-   that opens a dropdown of secondary actions (Steer, Ask aside, Cancel).
+   that opens a dropdown of secondary actions (Steer, Fork + send, Cancel).
    The wrapper is the positioning context for the popup menu. */
 .chat-send-split {
     position: relative;
