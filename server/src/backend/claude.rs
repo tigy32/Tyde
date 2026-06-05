@@ -6633,11 +6633,13 @@ fn estimate_message_history_bytes(text: &str, images: &[Value]) -> u64 {
 }
 
 fn claude_known_models() -> Vec<Value> {
+    // Use the CLI's family aliases rather than pinned model IDs so we always
+    // resolve to whatever the installed CLI considers the latest opus/sonnet/
+    // haiku. The concrete model is reported back in the stream-start event, and
+    // the context-window lookup keys off the family hint, so no pinned IDs are
+    // needed here.
     let models = [
-        ("claude-opus-4-6", "Claude Opus 4.6", true),
-        ("claude-sonnet-4-6", "Claude Sonnet 4.6", false),
-        ("claude-haiku-4-5-20251001", "Claude Haiku 4.5", false),
-        ("opus", "Opus (latest)", false),
+        ("opus", "Opus (latest)", true),
         ("sonnet", "Sonnet (latest)", false),
         ("haiku", "Haiku (latest)", false),
     ];
