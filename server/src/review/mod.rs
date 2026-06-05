@@ -2,17 +2,19 @@ pub(crate) mod actor;
 pub(crate) mod bundle;
 pub(crate) mod reviewer;
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use actor::{ConnectionId, ReviewCommand, spawn_review_actor};
 use protocol::{
-    AgentId, DiffContextMode, ProjectGitDiffPayload, ProjectId, Review, ReviewActionPayload,
-    ReviewAiReviewerStatus, ReviewCreatePayload, ReviewDiffSelection, ReviewErrorContext,
-    ReviewErrorPayload, ReviewId, ReviewStatus, ReviewSuggestionId, ReviewSummary, SessionId,
-    StreamPath,
+    AgentId, DiffContextMode, Project, ProjectDiffScope, ProjectGitDiffPayload, ProjectId,
+    ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus, ReviewCreatePayload,
+    ReviewDiffSelection, ReviewErrorContext, ReviewErrorPayload, ReviewId, ReviewStatus,
+    ReviewSuggestionId, ReviewSummary, SessionId, StreamPath,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
+use uuid::Uuid;
 
 use crate::agent::now_ms;
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryRequest};
@@ -114,17 +116,6 @@ impl ReviewHandle {
             .await
             .map_err(|_| "review actor dropped snapshot response".to_owned())
     }
-
-    async fn summary(&self) -> Result<ReviewSummary, String> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(ReviewCommand::Summary { reply })
-            .await
-            .map_err(|_| "review actor stopped".to_owned())?;
-        response
-            .await
-            .map_err(|_| "review actor dropped summary response".to_owned())
-    }
 }
 
 #[derive(Clone)]
@@ -135,6 +126,7 @@ pub(crate) struct ReviewRegistryHandle {
 pub(crate) struct ReviewCreateRequest {
     pub review_id: ReviewId,
     pub project_id: ProjectId,
+    pub root: ProjectRootPath,
     pub selection: ReviewDiffSelection,
     pub diffs: Vec<ProjectGitDiffPayload>,
 }
@@ -181,8 +173,9 @@ enum RegistryCommand {
         project_id: ProjectId,
         reply: oneshot::Sender<Result<Vec<ReviewSummary>, String>>,
     },
-    ResetProjectForCleanWorkingTree {
+    ResetProjectRootsForCleanUnstaged {
         project_id: ProjectId,
+        roots: Vec<ProjectRootPath>,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -200,7 +193,9 @@ impl ReviewRegistry {
         let mut handles = HashMap::new();
         let mut rehydrated = Vec::new();
         for mut review in store.list()? {
-            if reset_running_ai_reviewer(&mut review) {
+            let mut changed = reset_running_ai_reviewer(&mut review);
+            changed |= normalize_rehydrated_active_review(&mut review);
+            if changed {
                 store.upsert(review.clone())?;
             }
             let handle = spawn_review_actor(
@@ -386,13 +381,18 @@ impl ReviewRegistryHandle {
             .map_err(|_| "review registry dropped summaries response".to_owned())?
     }
 
-    pub(crate) async fn reset_project_for_clean_working_tree(
+    pub(crate) async fn reset_project_roots_for_clean_unstaged(
         &self,
         project_id: ProjectId,
+        roots: Vec<ProjectRootPath>,
     ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
-            .send(RegistryCommand::ResetProjectForCleanWorkingTree { project_id, reply })
+            .send(RegistryCommand::ResetProjectRootsForCleanUnstaged {
+                project_id,
+                roots,
+                reply,
+            })
             .await
             .map_err(|_| "review registry stopped".to_owned())?;
         response
@@ -482,8 +482,14 @@ impl ReviewRegistryActor {
                     let result = self.summaries(project_id).await;
                     let _ = reply.send(result);
                 }
-                RegistryCommand::ResetProjectForCleanWorkingTree { project_id, reply } => {
-                    let result = self.reset_project_for_clean_working_tree(project_id).await;
+                RegistryCommand::ResetProjectRootsForCleanUnstaged {
+                    project_id,
+                    roots,
+                    reply,
+                } => {
+                    let result = self
+                        .reset_project_roots_for_clean_unstaged(project_id, roots)
+                        .await;
                     let _ = reply.send(result);
                 }
             }
@@ -491,7 +497,11 @@ impl ReviewRegistryActor {
     }
 
     async fn create(&mut self, request: ReviewCreateRequest) -> Result<ReviewId, String> {
-        if let Some(review_id) = self.draft_review_for_project(&request.project_id).await? {
+        if let Some(review_id) = self
+            .draft_review_for_project_root(&request.project_id, &request.root)
+            .await?
+        {
+            let _ = self.project_update_tx.send(request.project_id);
             return Ok(review_id);
         }
 
@@ -503,7 +513,7 @@ impl ReviewRegistryActor {
             project_id: request.project_id.clone(),
             origin_agent_id,
             origin_session_id,
-            selection: request.selection,
+            selection: normalize_root_selection(request.root.clone(), request.selection),
             status: ReviewStatus::Draft,
             diffs: request.diffs,
             comments: Vec::new(),
@@ -530,26 +540,23 @@ impl ReviewRegistryActor {
         Ok(review_id)
     }
 
-    async fn draft_review_for_project(
+    async fn draft_review_for_project_root(
         &self,
         project_id: &ProjectId,
+        root: &ProjectRootPath,
     ) -> Result<Option<ReviewId>, String> {
         let handles = self.handles.values().cloned().collect::<Vec<_>>();
         let mut drafts = Vec::new();
         for handle in handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == *project_id && matches!(snapshot.status, ReviewStatus::Draft)
+            if snapshot.project_id == *project_id
+                && matches!(snapshot.status, ReviewStatus::Draft)
+                && active_review_root(&snapshot).as_ref() == Some(root)
             {
                 drafts.push(snapshot);
             }
         }
-        drafts.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-                .then_with(|| left.id.0.cmp(&right.id.0))
-        });
+        drafts.sort_by(active_review_sort);
         Ok(drafts.into_iter().next().map(|review| review.id))
     }
 
@@ -581,39 +588,87 @@ impl ReviewRegistryActor {
         handle.action(action, conn).await
     }
 
-    async fn summaries(&self, project_id: ProjectId) -> Result<Vec<ReviewSummary>, String> {
+    async fn summaries(&mut self, project_id: ProjectId) -> Result<Vec<ReviewSummary>, String> {
+        let project = self.load_project(&project_id).await?;
+        self.ensure_active_reviews_for_project(&project).await?;
+
+        let mut roots = project
+            .roots
+            .iter()
+            .map(|root| ProjectRootPath(root.clone()))
+            .collect::<Vec<_>>();
+        roots.sort();
+
+        let handles = self.handles.values().cloned().collect::<Vec<_>>();
         let mut summaries = Vec::new();
-        for handle in self.handles.values() {
-            let summary = handle.summary().await?;
-            if matches!(summary.status, ReviewStatus::Draft) {
+        for root in roots {
+            let mut drafts = Vec::new();
+            for handle in &handles {
                 let snapshot = handle.snapshot().await?;
-                if snapshot.project_id == project_id {
-                    summaries.push(summary);
+                if snapshot.project_id == project_id
+                    && matches!(snapshot.status, ReviewStatus::Draft)
+                    && active_review_root(&snapshot).as_ref() == Some(&root)
+                {
+                    drafts.push(snapshot);
                 }
             }
+            drafts.sort_by(active_review_sort);
+            if let Some(review) = drafts.into_iter().next() {
+                summaries.push(actor::summary_for_review(&review));
+            }
         }
-        summaries.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-                .then_with(|| left.id.0.cmp(&right.id.0))
-        });
+        summaries.sort_by(|left, right| left.root.cmp(&right.root));
         Ok(summaries)
     }
 
-    async fn reset_project_for_clean_working_tree(
+    async fn reset_project_roots_for_clean_unstaged(
         &self,
         project_id: ProjectId,
+        roots: Vec<ProjectRootPath>,
     ) -> Result<(), String> {
         let handles = self.handles.values().cloned().collect::<Vec<_>>();
         for handle in handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == project_id && matches!(snapshot.status, ReviewStatus::Draft) {
+            if snapshot.project_id == project_id
+                && matches!(snapshot.status, ReviewStatus::Draft)
+                && active_review_root(&snapshot)
+                    .as_ref()
+                    .is_some_and(|root| roots.contains(root))
+            {
                 handle.reset_for_clean_working_tree().await?;
             }
         }
         Ok(())
+    }
+
+    async fn ensure_active_reviews_for_project(&mut self, project: &Project) -> Result<(), String> {
+        for root in &project.roots {
+            let root = ProjectRootPath(root.clone());
+            if self
+                .draft_review_for_project_root(&project.id, &root)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            let review_id = ReviewId(Uuid::new_v4().to_string());
+            let request = ReviewCreateRequest {
+                review_id,
+                project_id: project.id.clone(),
+                root: root.clone(),
+                selection: active_root_selection(root),
+                diffs: Vec::new(),
+            };
+            self.create(request).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_project(&self, project_id: &ProjectId) -> Result<Project, String> {
+        let store = self.project_store.lock().await;
+        store
+            .get(project_id)
+            .ok_or_else(|| format!("unknown project {}", project_id))
     }
 }
 
@@ -628,6 +683,22 @@ fn reset_running_ai_reviewer(review: &mut Review) -> bool {
     false
 }
 
+fn normalize_rehydrated_active_review(review: &mut Review) -> bool {
+    if !matches!(review.status, ReviewStatus::Draft) {
+        return false;
+    }
+    let ReviewDiffSelection::Root { root, .. } = review.selection.clone() else {
+        return false;
+    };
+    let normalized = active_root_selection(root);
+    if review.selection == normalized {
+        return false;
+    }
+    review.selection = normalized;
+    review.updated_at_ms = now_ms();
+    true
+}
+
 pub(crate) fn review_stream_path(review_id: &ReviewId) -> StreamPath {
     StreamPath(format!("/review/{}", review_id.0))
 }
@@ -635,13 +706,15 @@ pub(crate) fn review_stream_path(review_id: &ReviewId) -> StreamPath {
 pub(crate) fn build_create_request(
     review_id: ReviewId,
     project_id: ProjectId,
+    root: ProjectRootPath,
     payload: ReviewCreatePayload,
     diffs: Vec<ProjectGitDiffPayload>,
 ) -> ReviewCreateRequest {
     ReviewCreateRequest {
         review_id,
         project_id,
-        selection: normalize_selection(payload.selection),
+        root: root.clone(),
+        selection: normalize_root_selection(root, payload.selection),
         diffs: normalize_diff_payloads(diffs),
     }
 }
@@ -651,15 +724,78 @@ fn synthetic_review_origin(project_id: &ProjectId) -> (AgentId, SessionId) {
     (AgentId(id.clone()), SessionId(id))
 }
 
-fn normalize_selection(selection: ReviewDiffSelection) -> ReviewDiffSelection {
-    selection
+pub(crate) fn review_create_root(
+    project: &Project,
+    selection: &ReviewDiffSelection,
+) -> Result<ProjectRootPath, String> {
+    match selection {
+        ReviewDiffSelection::Root { root, .. } => {
+            if project.roots.iter().any(|candidate| candidate == &root.0) {
+                Ok(root.clone())
+            } else {
+                Err(format!(
+                    "project {} does not contain review root {}",
+                    project.id, root
+                ))
+            }
+        }
+        ReviewDiffSelection::AllUncommitted => match project.roots.as_slice() {
+            [root] => Ok(ProjectRootPath(root.clone())),
+            [] => Err(format!("project {} has no review roots", project.id)),
+            _ => Err(format!(
+                "ReviewCreate AllUncommitted is ambiguous for multi-root project {}; use Root",
+                project.id
+            )),
+        },
+    }
+}
+
+fn normalize_root_selection(
+    root: ProjectRootPath,
+    selection: ReviewDiffSelection,
+) -> ReviewDiffSelection {
+    match selection {
+        ReviewDiffSelection::Root { .. } => ReviewDiffSelection::Root {
+            root,
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        },
+        ReviewDiffSelection::AllUncommitted => active_root_selection(root),
+    }
+}
+
+fn active_root_selection(root: ProjectRootPath) -> ReviewDiffSelection {
+    ReviewDiffSelection::Root {
+        root,
+        scope: ProjectDiffScope::Unstaged,
+        path: None,
+    }
+}
+
+fn active_review_root(review: &Review) -> Option<ProjectRootPath> {
+    match &review.selection {
+        ReviewDiffSelection::Root {
+            root, path: None, ..
+        } => Some(root.clone()),
+        ReviewDiffSelection::Root { .. } => None,
+        ReviewDiffSelection::AllUncommitted => None,
+    }
 }
 
 fn normalize_diff_payloads(mut diffs: Vec<ProjectGitDiffPayload>) -> Vec<ProjectGitDiffPayload> {
     for diff in &mut diffs {
+        diff.scope = ProjectDiffScope::Unstaged;
         diff.context_mode = DiffContextMode::FullFile;
     }
     diffs
+}
+
+fn active_review_sort(left: &Review, right: &Review) -> Ordering {
+    right
+        .updated_at_ms
+        .cmp(&left.updated_at_ms)
+        .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+        .then_with(|| left.id.0.cmp(&right.id.0))
 }
 
 #[cfg(test)]

@@ -13,8 +13,6 @@ mod onboarding_view;
 mod paired_hosts_picker;
 mod pairing_flow;
 mod projects_view;
-mod review_detail;
-mod reviews_view;
 mod sessions_view;
 pub mod settings_view;
 mod teams_view;

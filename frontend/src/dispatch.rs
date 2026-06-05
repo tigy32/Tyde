@@ -925,6 +925,19 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .filter(|s| !prev_ids.contains(&s.id))
                         .map(|s| s.id.clone())
                         .collect();
+                    // A successful get-or-create `ReviewCreate` always leaves a
+                    // Draft in the project's review list. Release the pending
+                    // token whenever this echo shows a draft is present, not
+                    // only when it carries a *new* id: a `ProjectBootstrap`
+                    // (reconnect / re-subscribe) can fold the existing draft
+                    // summary into `review_summaries` before this echo lands,
+                    // leaving `new_ids` empty even though the create the user
+                    // fired is exactly why a draft now exists. Without this the
+                    // "Review changes" button would wedge forever — a
+                    // successful create emits no `CommandError` to fall back on.
+                    let list_has_draft = reviews
+                        .iter()
+                        .any(|s| matches!(s.status, protocol::ReviewStatus::Draft));
                     state.review_summaries.update(|map| {
                         map.insert(project_id.clone(), reviews);
                     });
@@ -933,7 +946,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .review_create_pending
                         .with_untracked(|m| m.get(&pending_key).copied().unwrap_or(0))
                         > 0;
-                    if has_pending && !new_ids.is_empty() {
+                    if has_pending && (!new_ids.is_empty() || list_has_draft) {
                         // Pair the most recent new review with one pending
                         // create token and release it. We deliberately do
                         // NOT open a standalone `TabContent::Review`

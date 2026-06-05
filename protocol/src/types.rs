@@ -2028,7 +2028,7 @@ pub enum ProjectEventPayload {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(transparent)]
 pub struct ProjectRootPath(pub String);
@@ -2055,7 +2055,9 @@ pub struct ProjectReadFilePayload {
 pub enum ProjectDiffScope {
     Unstaged,
     Staged,
-    /// `git diff HEAD` — staged + unstaged combined. Used by Review.
+    /// `git diff HEAD` — staged + unstaged combined. Legacy Review records
+    /// may still deserialize with this scope, but active inline reviews use
+    /// `Unstaged`.
     Uncommitted,
 }
 
@@ -2267,9 +2269,10 @@ impl ReviewStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewDiffSelection {
-    /// v1 default. All uncommitted changes across all roots in the project.
+    /// Legacy v1 default. New inline reviews are root-scoped and normalize to
+    /// `Root { scope: Unstaged }`.
     AllUncommitted,
-    /// v2. One root, optionally narrowed to a path.
+    /// One project root, optionally narrowed to a path.
     Root {
         root: ProjectRootPath,
         scope: ProjectDiffScope,
@@ -2634,6 +2637,8 @@ impl ReviewErrorContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSummary {
     pub id: ReviewId,
+    #[serde(default)]
+    pub root: ProjectRootPath,
     pub status: ReviewStatus,
     pub origin_session_id: SessionId,
     pub origin_agent_id: AgentId,

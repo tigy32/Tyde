@@ -435,12 +435,13 @@ pub fn ReviewableDiffView(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Review affordances bind only to the all-uncommitted diff: that is the
-    // scope a review covers and the one its anchors validate against
-    // (HEAD↔worktree). A Staged/Unstaged diff tab (opened from a git-panel
-    // file row) shows index↔worktree line numbers that would not line up
-    // with review anchors, so render it as a plain diff with no overlay.
-    if scope != ProjectDiffScope::Uncommitted {
+    // Active inline reviews are anchored server-side to `Unstaged`
+    // (index↔worktree). Overlaying comments on any other scope risks
+    // mis-anchoring: a `Staged` tab shows different line numbers, and an
+    // `Uncommitted` tab (HEAD↔worktree) drifts from the review's anchors as
+    // soon as staged changes exist. So only `Unstaged` carries review
+    // decorations; every other scope renders a plain diff.
+    if scope != ProjectDiffScope::Unstaged {
         return view! {
             <DiffView
                 tab_id=tab_id
@@ -476,11 +477,14 @@ pub fn ReviewableDiffView(
     let draft_state = state.clone();
     let draft_host = host_id.clone();
     let draft_project = project_id.clone();
+    let draft_root = root.clone();
     let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
         let id = draft_state.review_summaries.with(|m| {
             m.get(&draft_project).and_then(|sums| {
                 sums.iter()
-                    .filter(|s| matches!(s.status, protocol::ReviewStatus::Draft))
+                    .filter(|s| {
+                        matches!(s.status, protocol::ReviewStatus::Draft) && s.root == draft_root
+                    })
                     .max_by_key(|s| s.updated_at_ms)
                     .map(|s| s.id.clone())
             })
@@ -503,20 +507,6 @@ pub fn ReviewableDiffView(
     // record loss / reconnect.
     crate::components::review_view::subscribe_review_reactive(&state, draft);
 
-    let pending_state = state.clone();
-    let pending_host = host_id.clone();
-    let pending_project = project_id.clone();
-    let create_pending = move || {
-        pending_state.review_create_pending.with(|m| {
-            m.get(&(pending_host.clone(), pending_project.clone()))
-                .copied()
-                .unwrap_or(0)
-                > 0
-        })
-    };
-
-    let banner_host = host_id.clone();
-    let banner_project = project_id.clone();
     // The tab's own identity, forwarded to `DiffView` so the live diff body
     // and any context-mode refetch stay bound to this project (not the review
     // host, and not the active project).
@@ -524,34 +514,6 @@ pub fn ReviewableDiffView(
     let dv_project = project_id.clone();
     view! {
         <div class="reviewable-diff">
-            {move || {
-                if draft.get().is_some() {
-                    return None;
-                }
-                let pending = create_pending();
-                let host = banner_host.clone();
-                let project_id = banner_project.clone();
-                Some(view! {
-                    <div class="reviewable-diff-banner" data-test="reviewable-diff-banner">
-                        <span class="reviewable-diff-banner-text">
-                            "Start a review to comment on these changes"
-                        </span>
-                        <button
-                            class="reviewable-diff-banner-btn"
-                            data-test="reviewable-diff-start"
-                            disabled=pending
-                            on:click=move |_| {
-                                let state = expect_context::<AppState>();
-                                crate::components::review_view::create_review_for_project(
-                                    &state, &host, &project_id,
-                                );
-                            }
-                        >
-                            "Review changes"
-                        </button>
-                    </div>
-                })
-            }}
             {move || {
                 let root = root.clone();
                 let path = path.clone();
@@ -4133,9 +4095,9 @@ mod wasm_tests {
         };
         DiffViewState {
             root: review_root(),
-            // The review surface is the all-uncommitted diff; review
-            // affordances only bind on this scope.
-            scope: ProjectDiffScope::Uncommitted,
+            // The canonical review surface is the whole-root unstaged diff;
+            // review affordances only bind on this scope.
+            scope: ProjectDiffScope::Unstaged,
             path: Some("src/foo.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
             pending: false,
@@ -4150,7 +4112,7 @@ mod wasm_tests {
     fn binary_diff(path: &str) -> DiffViewState {
         DiffViewState {
             root: review_root(),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: Some(path.to_owned()),
             context_mode: DiffContextMode::Hunks,
             pending: false,
@@ -4190,12 +4152,12 @@ mod wasm_tests {
         }
     }
 
-    /// The all-uncommitted review surface: empty `path` (all files in the
-    /// root) with two changed files.
+    /// The whole-root review surface: empty `path` (all unstaged files in
+    /// the root) with two changed files.
     fn all_files_diff() -> DiffViewState {
         DiffViewState {
             root: review_root(),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
             context_mode: DiffContextMode::Hunks,
             pending: false,
@@ -4264,6 +4226,7 @@ mod wasm_tests {
     fn summary_for(review: &protocol::Review) -> protocol::ReviewSummary {
         protocol::ReviewSummary {
             id: review.id.clone(),
+            root: review_root(),
             status: review.status.clone(),
             origin_session_id: review.origin_session_id.clone(),
             origin_agent_id: review.origin_agent_id.clone(),
@@ -4320,6 +4283,7 @@ mod wasm_tests {
                         protocol::ProjectId("proj-1".to_owned()),
                         vec![protocol::ReviewSummary {
                             id: review.id.clone(),
+                            root: review_root(),
                             status: review.status.clone(),
                             origin_session_id: review.origin_session_id.clone(),
                             origin_agent_id: review.origin_agent_id.clone(),
@@ -4393,22 +4357,23 @@ mod wasm_tests {
         );
     }
 
-    /// With no Draft review, the normal diff tab shows a clear affordance to
-    /// start one rather than fabricating optimistic review state.
+    /// With no Draft review the diff renders as a plain diff — no start-review
+    /// banner (reviews are always-on server-side), no comment gutters.
     #[wasm_bindgen_test]
-    async fn reviewable_diff_shows_start_banner_without_draft() {
+    async fn reviewable_diff_no_banner_without_draft() {
         ensure_styles_loaded();
         let container = make_container();
         mount_reviewable(container.clone(), small_foo_diff(), None);
         next_tick().await;
         next_tick().await;
 
+        // No start-a-review banner in the always-on model.
         assert!(
             container
                 .query_selector("[data-test=\"reviewable-diff-banner\"]")
                 .unwrap()
-                .is_some(),
-            "expected the start-a-review banner when there is no draft review"
+                .is_none(),
+            "no start-a-review banner must show (reviews are always-on)"
         );
         // No comment composer gutters when there's no review to comment on.
         assert!(
@@ -4420,13 +4385,10 @@ mod wasm_tests {
         );
     }
 
-    /// A non-`Uncommitted` diff tab (e.g. a Staged/Unstaged tab opened from a
-    /// git-panel file row) gets NO review overlay even when a draft exists —
-    /// its index↔worktree line numbers don't match the review's HEAD↔worktree
-    /// anchors, so binding comment affordances there would route comments to
-    /// the wrong lines.
+    /// An `Unstaged` diff tab now IS a valid review surface (reviews track
+    /// unstaged diffs). Verify comments and gutters appear.
     #[wasm_bindgen_test]
-    async fn non_uncommitted_scope_has_no_review_overlay() {
+    async fn unstaged_scope_shows_review_overlay() {
         ensure_styles_loaded();
         let container = make_container();
         let mut diff = small_foo_diff();
@@ -4439,31 +4401,118 @@ mod wasm_tests {
         next_tick().await;
         next_tick().await;
 
-        // The file still renders as a plain diff...
         let text = container.text_content().unwrap_or_default();
         assert!(
             text.contains("let x = 1;"),
             "the diff itself should still render; got: {text}"
         );
-        // ...but with no review overlay: no banner, no comment gutters, and
-        // the draft's comment body must not appear.
+        // Unstaged scope gets review overlay (reviews track unstaged).
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_some(),
+            "Unstaged scope must get comment gutters (reviews track unstaged diffs)"
+        );
+        assert!(
+            text.contains("please fix this"),
+            "review comments must overlay Unstaged diff; got: {text}"
+        );
+        // Never a start-a-review banner in the always-on model.
         assert!(
             container
                 .query_selector("[data-test=\"reviewable-diff-banner\"]")
                 .unwrap()
                 .is_none(),
-            "no start-a-review banner on a non-uncommitted diff tab"
+            "no start-a-review banner (always-on model)"
+        );
+    }
+
+    /// A `Staged` diff tab gets NO review overlay even when a draft exists —
+    /// staged-only changes are excluded from the active unstaged review.
+    #[wasm_bindgen_test]
+    async fn staged_scope_has_no_review_overlay() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut diff = small_foo_diff();
+        diff.scope = ProjectDiffScope::Staged;
+        mount_reviewable(
+            container.clone(),
+            diff,
+            Some(draft_review("src/foo.rs", 2, "please fix this")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("let x = 1;"),
+            "the diff itself should still render; got: {text}"
+        );
+        // Staged scope: no overlay, no banner, no comment gutters.
+        assert!(
+            container
+                .query_selector("[data-test=\"reviewable-diff-banner\"]")
+                .unwrap()
+                .is_none(),
+            "no banner on a staged diff tab"
         );
         assert!(
             container
                 .query_selector(".diff-gutter-clickable")
                 .unwrap()
                 .is_none(),
-            "no comment gutters on a non-uncommitted diff tab"
+            "no comment gutters on a staged diff tab"
         );
         assert!(
             !text.contains("please fix this"),
-            "review comments must not overlay a non-uncommitted diff; got: {text}"
+            "review comments must not overlay a staged diff; got: {text}"
+        );
+    }
+
+    /// An `Uncommitted` (HEAD↔worktree) diff tab gets NO review overlay even
+    /// when a draft exists. Active reviews are anchored to `Unstaged`
+    /// (index↔worktree); once staged changes exist the two scopes' line
+    /// numbers diverge, so overlaying a draft's comments here would
+    /// mis-anchor them. Regression for the old model that decorated
+    /// `Uncommitted` surfaces.
+    #[wasm_bindgen_test]
+    async fn uncommitted_scope_has_no_review_overlay() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut diff = small_foo_diff();
+        diff.scope = ProjectDiffScope::Uncommitted;
+        mount_reviewable(
+            container.clone(),
+            diff,
+            Some(draft_review("src/foo.rs", 2, "please fix this")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("let x = 1;"),
+            "the diff itself should still render; got: {text}"
+        );
+        // Uncommitted scope: no overlay, no banner, no comment gutters.
+        assert!(
+            container
+                .query_selector("[data-test=\"reviewable-diff-banner\"]")
+                .unwrap()
+                .is_none(),
+            "no banner on an uncommitted diff tab"
+        );
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_none(),
+            "no comment gutters on an uncommitted diff tab"
+        );
+        assert!(
+            !text.contains("please fix this"),
+            "review comments must not overlay an uncommitted diff; got: {text}"
         );
     }
 
@@ -4526,7 +4575,7 @@ mod wasm_tests {
                     host_id="h1".to_owned()
                     project_id=protocol::ProjectId("proj-1".to_owned())
                     root=review_root()
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path="src/foo.rs".to_owned()
                 />
             }
@@ -4599,7 +4648,7 @@ mod wasm_tests {
                     host_id="h2".to_owned()
                     project_id=protocol::ProjectId("proj-2".to_owned())
                     root=review_root()
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path="src/foo.rs".to_owned()
                 />
             }
@@ -4619,7 +4668,7 @@ mod wasm_tests {
         );
     }
 
-    /// The integrated review surface is the *all-uncommitted* diff (empty
+    /// The integrated review surface is the whole-root unstaged diff (empty
     /// path), so every changed file renders and a comment on a non-first
     /// file shows — not just the first changed file.
     #[wasm_bindgen_test]
@@ -4639,7 +4688,7 @@ mod wasm_tests {
         // Both files render on the all-files surface...
         assert!(
             text.contains("src/foo.rs") && text.contains("src/bar.rs"),
-            "both changed files must render on the all-uncommitted surface; got: {text}"
+            "both changed files must render on the whole-root unstaged surface; got: {text}"
         );
         // ...and the comment on the non-first file is visible.
         assert!(
@@ -4706,7 +4755,7 @@ mod wasm_tests {
                     host_id="h1".to_owned()
                     project_id=protocol::ProjectId("proj-1".to_owned())
                     root=review_root()
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path="src/foo.rs".to_owned()
                 />
             }
@@ -4727,12 +4776,13 @@ mod wasm_tests {
                 .is_none(),
             "no comment gutters once the live review is non-draft"
         );
+        // No start-a-review banner in the always-on model, even when non-draft.
         assert!(
             container
                 .query_selector("[data-test=\"reviewable-diff-banner\"]")
                 .unwrap()
-                .is_some(),
-            "the start-a-review banner must show once the live review is non-draft"
+                .is_none(),
+            "no start-a-review banner (always-on model, even after non-draft transition)"
         );
     }
 

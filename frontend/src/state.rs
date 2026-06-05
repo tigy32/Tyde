@@ -133,16 +133,6 @@ pub enum TabContent {
         scope: ProjectDiffScope,
         path: String,
     },
-    /// Legacy standalone review-workbench tab. Reviews are now integrated
-    /// into the normal `Diff` tabs, so no current CTA constructs this — but
-    /// the variant and its `center_zone` render arm are retained so any tab
-    /// still carrying it (e.g. left open before the integration) keeps
-    /// rendering instead of vanishing. Intentionally never constructed.
-    #[allow(dead_code)]
-    Review {
-        host_id: String,
-        review_id: ReviewId,
-    },
 }
 
 impl TabContent {

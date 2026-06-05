@@ -7,9 +7,9 @@ use crate::state::{AppState, DiffViewState, root_display_name};
 
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectDiscardFilePayload, ProjectGitChangeKind,
-    ProjectGitCommitPayload, ProjectGitFileStatus, ProjectPath, ProjectReadDiffPayload,
+    ProjectGitCommitPayload, ProjectGitFileStatus, ProjectId, ProjectPath, ProjectReadDiffPayload,
     ProjectRootGitStatus, ProjectRootPath, ProjectStageFilePayload, ProjectUnstageFilePayload,
-    StreamPath,
+    ReviewId, ReviewStatus, StreamPath,
 };
 
 #[component]
@@ -43,7 +43,6 @@ pub fn GitPanel() -> impl IntoView {
                     }}
                 </span>
             </div>
-            <ReviewIndicator />
             <div class="gp-content">
                 {move || {
                     match git_roots.get() {
@@ -70,113 +69,84 @@ pub fn GitPanel() -> impl IntoView {
     }
 }
 
-/// Compact review hub for the git panel. With no Draft review it offers a
-/// "Review changes" control that starts a project-scoped review AND opens a
-/// normal changed-file diff tab to comment on (it does NOT open a separate
-/// `ReviewView` workbench). With a Draft it surfaces the live counts plus
-/// the full review controls (AI reviewer, Clear, Submit) by reusing
-/// `ReviewSidebar`, so submit-target gating stays exactly correct.
+/// Per-root always-on review controls. Finds the Draft review for
+/// `(project_id, root)` in `review_summaries`, subscribes to it, and
+/// surfaces compact hub controls (AI Review button, live counts, Submit).
+/// No "Start review" or "Cancel" buttons — reviews are always-on and
+/// managed by the server.
 #[component]
-fn ReviewIndicator() -> impl IntoView {
+fn RootReviewControls(
+    host_id: String,
+    project_id: ProjectId,
+    root: ProjectRootPath,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let draft_state = state.clone();
-    let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
-        crate::components::review_view::open_review_for_active_project(&draft_state)
-    });
 
-    let changes_state = state.clone();
-    let has_changes = move || {
-        let Some(active) = changes_state.active_project.get() else {
-            return false;
-        };
-        changes_state.git_status.with(|map| {
-            map.get(&active.project_id)
-                .map(|roots| roots.iter().any(|r| !r.clean))
-                .unwrap_or(false)
+    // Find the Draft review for this (project_id, root).
+    let find_state = state.clone();
+    let find_root = root.clone();
+    let find_pid = project_id.clone();
+    let draft: Memo<Option<(String, ReviewId)>> = {
+        let host = host_id.clone();
+        Memo::new(move |_| {
+            find_state.review_summaries.with(|map| {
+                map.get(&find_pid).and_then(|summaries| {
+                    summaries
+                        .iter()
+                        .filter(|s| s.root == find_root && matches!(s.status, ReviewStatus::Draft))
+                        .max_by_key(|s| s.updated_at_ms)
+                        .map(|s| (host.clone(), s.id.clone()))
+                })
+            })
         })
     };
 
-    let pending_state = state.clone();
-    let create_pending = move || {
-        let Some(active) = pending_state.active_project.get() else {
-            return false;
-        };
-        pending_state.review_create_pending.with(|m| {
-            m.get(&(active.host_id.clone(), active.project_id.clone()))
-                .copied()
-                .unwrap_or(0)
-                > 0
-        })
-    };
-
+    let hub_pid = project_id.clone();
+    let hub_root = root.clone();
     view! {
-        {move || match draft.get() {
-            None => {
-                // No draft: only surface the control when there are
-                // uncommitted changes worth reviewing.
-                if !has_changes() {
-                    return None;
-                }
-                let pending = create_pending();
-                Some(view! {
-                    <div class="gp-review-hub">
-                        <button
-                            class="gp-review-indicator"
-                            data-test="gp-review-changes"
-                            disabled=pending
-                            title="Start an inline review of the uncommitted changes"
-                            on:click=move |_| {
-                                // Opens the changed-file diff surface and
-                                // creates the review (never a Review tab).
-                                let state = expect_context::<AppState>();
-                                crate::components::review_view::create_or_open_review_for_active_project(
-                                    &state,
-                                );
-                            }
-                        >
-                            <svg class="gp-review-indicator-icon" viewBox="0 0 16 16" fill="none"
-                                 stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
-                                 stroke-linejoin="round" aria-hidden="true">
-                                <path d="M3 2.5h7l3 3V13a.5.5 0 0 1-.5.5h-9.5A.5.5 0 0 1 2.5 13V3a.5.5 0 0 1 .5-.5z" />
-                                <path d="M10 2.5V6h3" />
-                                <path d="M5.5 9.25l1.5 1.5L11 7.5" />
-                            </svg>
-                            <span class="gp-review-indicator-label">"Review changes"</span>
-                        </button>
-                    </div>
-                }.into_any())
-            }
-            Some((host_id, review_id)) => Some(view! {
-                <GitReviewHub host_id=host_id review_id=review_id />
-            }.into_any()),
-        }}
+        {move || draft.get().map(|(h, rid)| view! {
+            <RootReviewHub
+                host_id=h
+                project_id=hub_pid.clone()
+                root=hub_root.clone()
+                review_id=rid
+            />
+        })}
     }
 }
 
-/// Draft-review controls for the git panel. Subscribes to the review so the
-/// full record loads, shows the live summary counts, an "Open changes"
-/// button that jumps to the changed-file diff surface, and the shared
-/// `ReviewSidebar` (AI reviewer / Clear / Submit) once the record arrives.
+/// Draft-review hub for a single root inside the git panel. Subscribes to
+/// the review, shows live counts, an "Open changes" button, and the shared
+/// `ReviewSidebar` (AI reviewer / Submit) once the record arrives.
 #[component]
-fn GitReviewHub(host_id: String, review_id: protocol::ReviewId) -> impl IntoView {
+fn RootReviewHub(
+    host_id: String,
+    project_id: ProjectId,
+    root: ProjectRootPath,
+    review_id: ReviewId,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Reactively keep the review subscribed so `ReviewSidebar` can mount
-    // with the full record. The shared helper retries on send failure /
-    // record loss / reconnect (see `subscribe_review_reactive`).
+    // The "Open changes" button opens *this* root's unstaged diff, not the
+    // project's first dirty root — multi-root projects must land on the root
+    // whose hub was clicked.
+    let open_state = state.clone();
+    let open_host = host_id.clone();
+    let open_pid = project_id.clone();
+    let open_root = root.clone();
+
+    // Keep the review subscribed so `ReviewSidebar` can mount with the
+    // full record. The shared helper retries on send failure / record
+    // loss / reconnect.
     {
         let host = host_id.clone();
         let rid = review_id.clone();
-        let target: Memo<Option<(String, protocol::ReviewId)>> =
+        let target: Memo<Option<(String, ReviewId)>> =
             Memo::new(move |_| Some((host.clone(), rid.clone())));
         crate::components::review_view::subscribe_review_reactive(&state, target);
     }
 
-    // Live counts: prefer the full record, fall back to the summary list so
-    // counts show before the snapshot lands. The fallback searches summaries
-    // by `review_id` across all projects rather than keying off the globally
-    // active project, so the hub's counts stay correct regardless of which
-    // project is active.
+    // Live counts: prefer the full record, fall back to the summary list.
     let counts_state = state.clone();
     let counts_rid = review_id.clone();
     let counts: Memo<(u32, u32)> = Memo::new(move |_| {
@@ -225,10 +195,10 @@ fn GitReviewHub(host_id: String, review_id: protocol::ReviewId) -> impl IntoView
     let sidebar_rid = review_id.clone();
 
     view! {
-        <div class="gp-review-hub" data-test="gp-review-hub">
+        <div class="gp-review-hub" data-test="gp-root-review-hub">
             <div class="gp-review-hub-header">
                 <span class="gp-review-hub-title">"Review"</span>
-                <span class="gp-review-counts" data-test="gp-review-counts">
+                <span class="gp-review-counts" data-test="gp-root-review-counts">
                     {move || {
                         let (c, s) = counts.get();
                         format!(
@@ -240,9 +210,16 @@ fn GitReviewHub(host_id: String, review_id: protocol::ReviewId) -> impl IntoView
             </div>
             <button
                 class="gp-review-open-btn"
-                data-test="gp-review-open"
+                data-test="gp-root-review-open"
                 title="Open the changed files to review"
-                on:click=move |_| open_first_changed_diff()
+                on:click=move |_| {
+                    crate::components::review_view::open_changed_diff_for_root(
+                        &open_state,
+                        &open_host,
+                        &open_pid,
+                        &open_root,
+                    )
+                }
             >
                 "Open changes"
             </button>
@@ -267,22 +244,6 @@ fn GitReviewHub(host_id: String, review_id: protocol::ReviewId) -> impl IntoView
             }}
         </div>
     }
-}
-
-/// Open a normal diff tab for the first changed file in the active
-/// project — the review comment surface. Delegates to the shared
-/// `open_changed_diff_for_project` so the git panel, the chat header CTA,
-/// and the diff-tab banner all land on the same surface.
-fn open_first_changed_diff() {
-    let state = expect_context::<AppState>();
-    let Some(active) = state.active_project.get_untracked() else {
-        return;
-    };
-    crate::components::review_view::open_changed_diff_for_project(
-        &state,
-        &active.host_id,
-        &active.project_id,
-    );
 }
 
 #[component]
@@ -317,7 +278,7 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
     let root_for_staged = root_path.clone();
     let root_for_unstaged = root_path.clone();
     let root_for_untracked = root_path.clone();
-    let root_for_commit = root_path;
+    let root_for_commit = root_path.clone();
     let root_label = root_display_name(&root.root);
     let root_title = root.root.0.clone();
     let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
@@ -337,6 +298,20 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
 
     let commit_message = RwSignal::new(String::new());
 
+    // Per-root review controls: binds to (project_id, root) from the active project.
+    let state = expect_context::<AppState>();
+    let review_root = root_path.clone();
+    let review_project_signal: Memo<Option<(String, ProjectId, ProjectRootPath)>> =
+        Memo::new(move |_| {
+            state.active_project.get().map(|ap| {
+                (
+                    ap.host_id.clone(),
+                    ap.project_id.clone(),
+                    review_root.clone(),
+                )
+            })
+        });
+
     view! {
         <div class="gp-root-section">
             <div class="gp-root-header" title=root_title>
@@ -346,6 +321,9 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     <span class="gp-root-ahead-behind">{ab}</span>
                 })}
             </div>
+            {move || review_project_signal.get().map(|(host_id, project_id, root)| view! {
+                <RootReviewControls host_id=host_id project_id=project_id root=root />
+            })}
             <Show when=move || has_staged>
                 <div class="gp-commit-area">
                     <textarea
@@ -833,9 +811,26 @@ mod wasm_tests {
         }
     }
 
+    fn root_with_unstaged(path: &str) -> ProjectRootGitStatus {
+        ProjectRootGitStatus {
+            root: ProjectRootPath(path.to_owned()),
+            branch: Some("main".to_owned()),
+            ahead: 0,
+            behind: 0,
+            clean: false,
+            files: vec![ProjectGitFileStatus {
+                relative_path: "src/foo.rs".to_owned(),
+                staged: None,
+                unstaged: Some(ProjectGitChangeKind::Modified),
+                untracked: false,
+            }],
+        }
+    }
+
     fn draft_summary() -> ReviewSummary {
         ReviewSummary {
             id: ReviewId("rev-1".to_owned()),
+            root: ProjectRootPath("/repo".to_owned()),
             status: ReviewStatus::Draft,
             origin_session_id: SessionId("s".to_owned()),
             origin_agent_id: AgentId("project-review:rev-1".to_owned()),
@@ -910,8 +905,8 @@ mod wasm_tests {
         holder
     }
 
-    /// No draft review + uncommitted changes ⇒ the git panel surfaces the
-    /// "Review changes" control (and not the draft hub).
+    /// No draft review + uncommitted changes ⇒ the git panel does NOT show a
+    /// per-root review hub (there is no draft to bind to).
     #[wasm_bindgen_test]
     async fn no_draft_shows_review_changes_control() {
         let container = make_container();
@@ -920,21 +915,14 @@ mod wasm_tests {
 
         assert!(
             container
-                .query_selector("[data-test=\"gp-review-changes\"]")
-                .unwrap()
-                .is_some(),
-            "expected a 'Review changes' control with uncommitted changes"
-        );
-        assert!(
-            container
-                .query_selector("[data-test=\"gp-review-hub\"]")
+                .query_selector("[data-test=\"gp-root-review-hub\"]")
                 .unwrap()
                 .is_none(),
-            "draft hub must not show without a draft review"
+            "per-root review hub must not show without a draft review"
         );
     }
 
-    /// A Draft review ⇒ the git panel shows the review hub with live counts.
+    /// A Draft review ⇒ the git panel shows a per-root review hub with live counts.
     #[wasm_bindgen_test]
     async fn draft_shows_review_hub_with_counts() {
         let container = make_container();
@@ -943,13 +931,13 @@ mod wasm_tests {
 
         assert!(
             container
-                .query_selector("[data-test=\"gp-review-hub\"]")
+                .query_selector("[data-test=\"gp-root-review-hub\"]")
                 .unwrap()
                 .is_some(),
-            "expected the review hub with a draft review present"
+            "expected the per-root review hub with a draft review present"
         );
         let counts = container
-            .query_selector("[data-test=\"gp-review-counts\"]")
+            .query_selector("[data-test=\"gp-root-review-counts\"]")
             .unwrap()
             .expect("counts element present");
         let text = counts.text_content().unwrap_or_default();
@@ -959,11 +947,88 @@ mod wasm_tests {
         );
     }
 
+    /// Multi-root: clicking root B's "Open changes" opens root B's `Unstaged`
+    /// diff, not the project's first dirty root (A). Regression for the hub
+    /// dropping the root and falling back to a project-first-root opener.
+    #[wasm_bindgen_test]
+    async fn root_hub_open_changes_opens_clicked_root_diff() {
+        // The diff surface fires a fire-and-forget `ProjectReadDiff`; stub the
+        // bridge so it resolves instead of rejecting in headless Chrome.
+        stub_recording_bridge();
+        let container = make_container();
+        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h1".to_owned(),
+                project_id: ProjectId("proj-1".to_owned()),
+            }));
+            // Two dirty roots; A is first, so a first-root opener would pick A.
+            state.git_status.update(|m| {
+                m.insert(
+                    ProjectId("proj-1".to_owned()),
+                    vec![root_with_unstaged("/repo-a"), root_with_unstaged("/repo-b")],
+                );
+            });
+            // A Draft review only for root B ⇒ only B's hub (and button) render.
+            let mut summary = draft_summary();
+            summary.id = ReviewId("rev-b".to_owned());
+            summary.root = ProjectRootPath("/repo-b".to_owned());
+            state.review_summaries.update(|m| {
+                m.insert(ProjectId("proj-1".to_owned()), vec![summary]);
+            });
+            // Seed the full record so the hub doesn't network-subscribe.
+            let mut review = full_review();
+            review.id = ReviewId("rev-b".to_owned());
+            review.selection = protocol::ReviewDiffSelection::Root {
+                root: ProjectRootPath("/repo-b".to_owned()),
+                scope: protocol::ProjectDiffScope::Unstaged,
+                path: None,
+            };
+            state.reviews.update(|m| {
+                m.insert(ReviewId("rev-b".to_owned()), review);
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <GitPanel /> }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+
+        // Only root B has a draft, so there is exactly one Open-changes button.
+        let open_btn = container
+            .query_selector("[data-test=\"gp-root-review-open\"]")
+            .unwrap()
+            .expect("root B's Open changes button must render");
+        open_btn.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+
+        let state = holder.borrow().clone().unwrap();
+        let opened = state.center_zone.with_untracked(|cz| {
+            cz.tabs.iter().find_map(|t| match &t.content {
+                TabContent::Diff { root, scope, .. } => Some((root.clone(), *scope)),
+                _ => None,
+            })
+        });
+        let (root, scope) = opened.expect("a diff tab must open on Open changes");
+        assert_eq!(
+            root,
+            ProjectRootPath("/repo-b".to_owned()),
+            "Open changes must open the clicked root (B), not the first dirty root (A)"
+        );
+        assert_eq!(
+            scope,
+            protocol::ProjectDiffScope::Unstaged,
+            "the review surface must open at Unstaged"
+        );
+    }
+
     /// The create flow (server echoes `ReviewListChanged` for a pending
-    /// create) must NOT open a standalone `TabContent::Review` workbench —
-    /// it only releases the pending token. Reviews live on the normal diff
-    /// surfaces now. Driven through `dispatch_envelope` so no network is
-    /// touched.
+    /// create) must NOT auto-open any review surface tab — it only releases
+    /// the pending token. Reviews live on the normal diff surfaces now, and
+    /// the standalone review-workbench tab has been removed entirely. Driven
+    /// through `dispatch_envelope` so no network is touched.
     #[wasm_bindgen_test]
     async fn create_flow_does_not_open_review_tab() {
         let container = make_container();
@@ -1026,15 +1091,17 @@ mod wasm_tests {
             .review_create_pending
             .with_untracked(|m| m.get(&key).copied().unwrap_or(0));
         assert_eq!(pending, 0, "create-pending token must be released");
-        // … and no standalone review workbench tab was opened.
-        let has_review = state.center_zone.with_untracked(|cz| {
+        // … and dispatch did not auto-open any diff surface tab (only an
+        // explicit click handler opens the changed-file diff; the standalone
+        // review-workbench tab no longer exists at all).
+        let opened_surface = state.center_zone.with_untracked(|cz| {
             cz.tabs
                 .iter()
-                .any(|t| matches!(t.content, TabContent::Review { .. }))
+                .any(|t| matches!(t.content, TabContent::Diff { .. }))
         });
         assert!(
-            !has_review,
-            "ReviewListChanged must not open a standalone Review tab"
+            !opened_surface,
+            "ReviewListChanged must not auto-open a diff surface tab"
         );
         // The summary list was still folded in.
         let known = state
@@ -1044,101 +1111,88 @@ mod wasm_tests {
         assert_eq!(known, 1, "the review summary should be recorded");
     }
 
-    /// Stub the Tauri bridge global so `send_frame` resolves `Ok` instead
-    /// of throwing on the missing `window.__TAURI__` (which would abort the
-    /// headless test). Resolving (not rejecting) keeps the create-pending
-    /// gate set — a rejection would trip the send-failure path that clears
-    /// it. Lets us exercise CTAs that dispatch frames without a backend.
-    fn stub_tauri_bridge() {
-        let _ = js_sys::eval(
-            "(function(){ \
-               window.__TAURI__ = window.__TAURI__ || {}; \
-               window.__TAURI__.core = window.__TAURI__.core || {}; \
-               window.__TAURI__.core.invoke = function(){ return Promise.resolve(); }; \
-               window.__TAURI__.event = window.__TAURI__.event || {}; \
-               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
-             })();",
-        );
-    }
-
-    /// The "Review changes" CTA opens a normal changed-file Diff tab (the
-    /// comment surface) and starts a review — never a standalone Review tab.
+    /// Regression: a fallback `ReviewCreate` resolves to an *existing* draft,
+    /// and a `ProjectBootstrap` (reconnect / re-subscribe) folds that draft
+    /// summary into `review_summaries` before the server's `ReviewListChanged`
+    /// echo is handled. The echo then carries no *new* id, but the pending
+    /// create token must still be released — otherwise the "Review changes"
+    /// button wedges forever (a successful create emits no `CommandError`).
     #[wasm_bindgen_test]
-    async fn cta_opens_diff_surface_and_starts_review() {
-        stub_tauri_bridge();
+    async fn create_flow_releases_pending_without_new_id() {
         let container = make_container();
-        let holder = mount_git_panel(container.clone(), false);
+        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <div></div> }
+        });
+        std::mem::forget(handle);
         next_tick().await;
 
         let state = holder.borrow().clone().unwrap();
-        crate::components::review_view::create_or_open_review_for_active_project(&state);
-        next_tick().await;
+        crate::dispatch::prime_host_for_tests(&state, "h1");
+        let project_stream = StreamPath("/project/proj-1".to_owned());
+        // Bootstrap already carries the existing draft summary — this models
+        // the race where the draft is folded into state before the echo lands.
+        let bootstrap_env = Envelope::from_payload(
+            project_stream.clone(),
+            FrameKind::ProjectBootstrap,
+            0,
+            &ProjectBootstrapPayload {
+                project: Project {
+                    id: ProjectId("proj-1".to_owned()),
+                    name: "proj".to_owned(),
+                    roots: vec!["/repo".to_owned()],
+                    sort_order: 0,
+                },
+                file_list: ProjectFileListPayload {
+                    incremental: false,
+                    roots: vec![],
+                },
+                git_status: ProjectGitStatusPayload { roots: vec![] },
+                review_summaries: vec![draft_summary()],
+            },
+        )
+        .expect("synthetic ProjectBootstrap");
+        crate::dispatch::dispatch_envelope(&state, "h1", bootstrap_env);
 
-        let (all_uncommitted_diff, has_review) = state.center_zone.with_untracked(|cz| {
-            (
-                cz.tabs.iter().any(|t| {
-                    matches!(
-                        &t.content,
-                        TabContent::Diff { scope, path, .. }
-                            // Uncommitted scope + empty path = the whole-root
-                            // all-files surface (every changed file in the
-                            // review can display and accept comments).
-                            if *scope == ProjectDiffScope::Uncommitted && path.is_empty()
-                    )
-                }),
-                cz.tabs
-                    .iter()
-                    .any(|t| matches!(t.content, TabContent::Review { .. })),
-            )
+        // The user fired a fallback create (state lacked the draft at click
+        // time); its token is in flight.
+        let key = ("h1".to_owned(), ProjectId("proj-1".to_owned()));
+        state.review_create_pending.update(|m| {
+            m.insert(key.clone(), 1);
         });
-        assert!(
-            all_uncommitted_diff,
-            "CTA must open the all-uncommitted (empty-path) Diff surface for review"
-        );
-        assert!(!has_review, "CTA must not open a standalone Review tab");
 
-        let pending = state.review_create_pending.with_untracked(|m| {
-            m.get(&("h1".to_owned(), ProjectId("proj-1".to_owned())))
-                .copied()
-                .unwrap_or(0)
-        });
-        assert!(pending > 0, "a ReviewCreate should be in flight");
-    }
+        // The echo confirms the same already-known draft — `new_ids` is empty.
+        let env = Envelope::from_payload(
+            project_stream,
+            FrameKind::ProjectEvent,
+            1,
+            &ProjectEventPayload::ReviewListChanged {
+                reviews: vec![draft_summary()],
+            },
+        )
+        .expect("synthetic ReviewListChanged");
+        crate::dispatch::dispatch_envelope(&state, "h1", env);
 
-    /// With an existing Draft, the CTA still opens the diff surface but does
-    /// NOT open a Review tab and does NOT fire a duplicate create.
-    #[wasm_bindgen_test]
-    async fn cta_with_existing_draft_opens_diff_without_recreate() {
-        stub_tauri_bridge();
-        let container = make_container();
-        let holder = mount_git_panel(container.clone(), true);
-        next_tick().await;
-
-        let state = holder.borrow().clone().unwrap();
-        crate::components::review_view::create_or_open_review_for_active_project(&state);
-        next_tick().await;
-
-        let (has_diff, has_review) = state.center_zone.with_untracked(|cz| {
-            (
-                cz.tabs
-                    .iter()
-                    .any(|t| matches!(t.content, TabContent::Diff { .. })),
-                cz.tabs
-                    .iter()
-                    .any(|t| matches!(t.content, TabContent::Review { .. })),
-            )
-        });
-        assert!(has_diff, "CTA must open the diff surface even with a draft");
-        assert!(!has_review, "CTA must not open a standalone Review tab");
-
-        let pending = state.review_create_pending.with_untracked(|m| {
-            m.get(&("h1".to_owned(), ProjectId("proj-1".to_owned())))
-                .copied()
-                .unwrap_or(0)
-        });
+        let pending = state
+            .review_create_pending
+            .with_untracked(|m| m.get(&key).copied().unwrap_or(0));
         assert_eq!(
             pending, 0,
-            "an existing draft must not trigger a new create"
+            "create-pending token must release even with no new id"
+        );
+        // Still no auto-opened diff surface tab — behavior is unchanged.
+        let opened_surface = state.center_zone.with_untracked(|cz| {
+            cz.tabs
+                .iter()
+                .any(|t| matches!(t.content, TabContent::Diff { .. }))
+        });
+        assert!(
+            !opened_surface,
+            "ReviewListChanged must not auto-open a diff surface tab"
         );
     }
 
@@ -1185,7 +1239,12 @@ mod wasm_tests {
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! {
-                <GitReviewHub host_id="h1".to_owned() review_id=review_for_mount.clone() />
+                <RootReviewHub
+                    host_id="h1".to_owned()
+                    project_id=ProjectId("proj-1".to_owned())
+                    root=ProjectRootPath("/repo".to_owned())
+                    review_id=review_for_mount.clone()
+                />
             }
         });
         std::mem::forget(handle);
@@ -1259,7 +1318,12 @@ mod wasm_tests {
             });
             provide_context(state);
             view! {
-                <GitReviewHub host_id="h1".to_owned() review_id=ReviewId("rev-1".to_owned()) />
+                <RootReviewHub
+                    host_id="h1".to_owned()
+                    project_id=ProjectId("proj-1".to_owned())
+                    root=ProjectRootPath("/repo".to_owned())
+                    review_id=ReviewId("rev-1".to_owned())
+                />
             }
         });
         std::mem::forget(handle);
@@ -1303,7 +1367,12 @@ mod wasm_tests {
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
             view! {
-                <GitReviewHub host_id="h1".to_owned() review_id=ReviewId("rev-1".to_owned()) />
+                <RootReviewHub
+                    host_id="h1".to_owned()
+                    project_id=ProjectId("proj-1".to_owned())
+                    root=ProjectRootPath("/repo".to_owned())
+                    review_id=ReviewId("rev-1".to_owned())
+                />
             }
         });
         std::mem::forget(handle);

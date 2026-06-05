@@ -315,7 +315,15 @@ async fn project_subscription_starts_with_project_bootstrap() {
     let bootstrap: ProjectBootstrapPayload =
         env.parse_payload().expect("project bootstrap payload");
     assert_eq!(bootstrap.project.id, project.id);
-    assert!(bootstrap.review_summaries.is_empty());
+    assert_eq!(bootstrap.review_summaries.len(), 1);
+    assert_eq!(
+        bootstrap.review_summaries[0].root.0,
+        root.path().to_string_lossy().to_string()
+    );
+    assert!(matches!(
+        bootstrap.review_summaries[0].status,
+        protocol::ReviewStatus::Draft
+    ));
 }
 
 #[tokio::test]

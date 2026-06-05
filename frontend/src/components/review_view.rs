@@ -1,8 +1,11 @@
-//! Three-pane review workbench: file list (left), diff for the selected
-//! file (center), action sidebar (right). All state derives from
-//! `AppState::reviews` keyed by `ReviewId` — the review is mounted lazily
-//! on first display (server pushes the `Snapshot` over `/review/<id>` on
-//! subscribe).
+//! Shared review controls and helpers for the always-on inline review flow.
+//!
+//! The standalone three-pane workbench has been retired: reviews are now an
+//! always-on, root-scoped layer over the normal git diff surfaces
+//! (`ReviewableDiffView` in `diff_view.rs`). What remains here is the shared
+//! action sidebar (`ReviewSidebar` — live counts, AI-reviewer form,
+//! submit-target picker, Clear) that the git-panel per-root hub mounts, plus
+//! the subscribe/diff-open/feedback helpers used across the integrated flow.
 //!
 //! Reactivity rules (`dev-docs/01-philosophy.md`):
 //! * No optimistic UI: action buttons disable on click and re-enable when
@@ -19,14 +22,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::diff_view::DiffView;
-// The reusable review decoration layer (drag selection, inline composer,
-// thread regions, file-level affordance) lives in `review_layer` so the
-// normal git-diff tabs can decorate themselves the same way this workbench
-// does. `ComposerState` is re-exported because `inline_review` imports it
-// from here.
+// `ComposerState` is re-exported because `inline_review` imports it from here.
 pub(crate) use crate::components::review_layer::ComposerState;
-use crate::components::review_layer::{build_review_decorations, install_drag_listeners};
 use crate::send::send_frame;
 
 use crate::state::{
@@ -35,400 +32,11 @@ use crate::state::{
 };
 
 use protocol::{
-    BackendKind, FrameKind, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload,
-    ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus,
-    ReviewCommentSource, ReviewStatus, ReviewSuggestionState, StreamPath,
+    BackendKind, FrameKind, ProjectDiffScope, ProjectReadDiffPayload, Review, ReviewActionPayload,
+    ReviewAiReviewerStatus, ReviewCommentSource, ReviewStatus, ReviewSuggestionState, StreamPath,
 };
 
 type ReviewAiIntervalSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalStorage>;
-
-/// Identifier for the file currently selected in the left rail. Combining
-/// root + relative_path picks a single (root, file) tuple inside the
-/// review's flattened file list.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SelectedFile {
-    root: ProjectRootPath,
-    relative_path: String,
-}
-
-/// Unified/SBS toggle surfaced in the review header.
-///
-/// We intentionally don't surface the Hunks/FullFile toggle here:
-/// review snapshots are always read with `DiffContextMode::FullFile`
-/// (`server::host::read_review_diffs`), so flipping to Hunks would
-/// silently misrepresent what's actually being reviewed.
-#[component]
-fn ReviewLayoutToggle() -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let view_mode = state.diff_view_mode;
-    view! {
-        <div class="review-layout-toggle">
-            <div class="settings-segmented-control">
-                <button
-                    class=move || if view_mode.get() == crate::state::DiffViewMode::Unified {
-                        "segment active"
-                    } else {
-                        "segment"
-                    }
-                    on:click=move |_| {
-                        view_mode.set(crate::state::DiffViewMode::Unified);
-                        crate::components::settings_panel::persist_diff_view_mode(
-                            crate::state::DiffViewMode::Unified,
-                        );
-                    }
-                >"Unified"</button>
-                <button
-                    class=move || if view_mode.get() == crate::state::DiffViewMode::SideBySide {
-                        "segment active"
-                    } else {
-                        "segment"
-                    }
-                    on:click=move |_| {
-                        view_mode.set(crate::state::DiffViewMode::SideBySide);
-                        crate::components::settings_panel::persist_diff_view_mode(
-                            crate::state::DiffViewMode::SideBySide,
-                        );
-                    }
-                >"Side by Side"</button>
-            </div>
-        </div>
-    }
-}
-
-#[component]
-pub fn ReviewView(host_id: String, review_id: protocol::ReviewId) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    // Reactive lookup of the review record. Returns None until the
-    // server's `Snapshot` arrives on `/review/<id>`.
-    let review_signal: Memo<Option<Review>> = {
-        let id = review_id.clone();
-        Memo::new(move |_| state.reviews.with(|map| map.get(&id).cloned()))
-    };
-
-    // Subscribe to /review/<id> on first mount when we don't already
-    // have a full Review record. The summary list (which seeds the
-    // tab-open from project surface) does not include the full diff
-    // snapshot, so without this subscribe the view would be stuck on
-    // "Loading review…" after a reload.
-    {
-        let host_for_sub = host_id.clone();
-        let review_for_sub = review_id.clone();
-        let already_present = review_signal.get_untracked().is_some();
-        log::info!(
-            "review.subscribe.consider host={} review={} already_present={}",
-            host_for_sub,
-            review_for_sub,
-            already_present
-        );
-        if !already_present {
-            spawn_local(async move {
-                let stream = StreamPath(format!("/review/{}", review_for_sub.0));
-                log::info!(
-                    "review.subscribe.send host={} review={}",
-                    host_for_sub,
-                    review_for_sub
-                );
-                if let Err(e) = send_frame(
-                    &host_for_sub,
-                    stream,
-                    FrameKind::ReviewSubscribe,
-                    &serde_json::json!({}),
-                )
-                .await
-                {
-                    log::error!(
-                        "review.subscribe.send_err host={} review={} error={}",
-                        host_for_sub,
-                        review_for_sub,
-                        e
-                    );
-                }
-            });
-        }
-    }
-
-    // Selected file in the left rail. None until the first render with a
-    // non-empty diff list — an Effect picks the first file when the
-    // snapshot arrives.
-    let selected: RwSignal<Option<SelectedFile>> = RwSignal::new(None);
-    {
-        Effect::new(move |_| {
-            if selected.get_untracked().is_some() {
-                return;
-            }
-            let Some(review) = review_signal.get() else {
-                return;
-            };
-            for diff in &review.diffs {
-                if let Some(file) = diff.files.first() {
-                    selected.set(Some(SelectedFile {
-                        root: diff.root.clone(),
-                        relative_path: file.relative_path.clone(),
-                    }));
-                    break;
-                }
-            }
-        });
-    }
-
-    let host_id_for_view = host_id.clone();
-    let review_id_for_view = review_id.clone();
-
-    // Gate: tracks only whether a Review record exists for this id, not
-    // the record itself. The `<ReviewBody>` thus mounts exactly once per
-    // review id — subsequent `ReviewEvent` deltas (CommentUpsert,
-    // Suggestion, StatusChanged) flip individual sub-signals inside the
-    // body rather than remounting the whole diff scrollport, so the
-    // user's scroll position survives a comment add.
-    let loaded: Memo<bool> = {
-        let id = review_id.clone();
-        Memo::new(move |_| state.reviews.with(|map| map.contains_key(&id)))
-    };
-
-    view! {
-        <div class="review-view" data-review-id={review_id.0.clone()}>
-            {move || {
-                if !loaded.get() {
-                    return view! {
-                        <div class="review-loading">
-                            <p class="placeholder-text">"Loading review\u{2026}"</p>
-                        </div>
-                    }.into_any();
-                }
-                // Seed `<ReviewBody>` with the snapshot at mount time
-                // via `get_untracked` so the closure doesn't subscribe
-                // to subsequent record changes — those flow through
-                // `live` inside the body.
-                let Some(seed) = review_signal.get_untracked() else {
-                    return view! {
-                        <div class="review-loading">
-                            <p class="placeholder-text">"Loading review\u{2026}"</p>
-                        </div>
-                    }.into_any();
-                };
-                view! {
-                    <ReviewBody
-                        review=seed
-                        selected=selected
-                        host_id=host_id_for_view.clone()
-                        review_id=review_id_for_view.clone()
-                    />
-                }.into_any()
-            }}
-        </div>
-    }
-}
-
-#[component]
-fn ReviewBody(
-    review: Review,
-    selected: RwSignal<Option<SelectedFile>>,
-    host_id: String,
-    review_id: protocol::ReviewId,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    // Live re-derivation of the review record — `review` is the snapshot
-    // at first render; subsequent updates flow through the AppState
-    // signal. Each closure that depends on review fields reads via this
-    // memo so it tracks updates instead of freezing the snapshot.
-    let live: Memo<Option<Review>> = {
-        let id = review_id.clone();
-        Memo::new(move |_| state.reviews.with(|map| map.get(&id).cloned()))
-    };
-
-    // Single source of truth for "this review is mutable". Every
-    // mutation control derives `disabled` from this Memo so a status
-    // flip out of Draft (e.g. Submitted via the sidebar button) hides
-    // the affordance everywhere at once.
-    let is_draft: Memo<bool> = {
-        let initial = review.status.clone();
-        Memo::new(move |_| {
-            matches!(
-                live.get()
-                    .map(|r| r.status)
-                    .unwrap_or_else(|| initial.clone()),
-                ReviewStatus::Draft
-            )
-        })
-    };
-
-    let initial_status = review.status.clone();
-    let initial_origin = review.origin_agent_id.clone();
-    let status_text = {
-        let initial = initial_status.clone();
-        move || -> String {
-            let s = live
-                .get()
-                .map(|r| r.status)
-                .unwrap_or_else(|| initial.clone());
-            match s {
-                ReviewStatus::Draft => "Draft".to_string(),
-                ReviewStatus::Submitted { .. } => "Submitted".to_string(),
-                ReviewStatus::Consumed { .. } => "Consumed".to_string(),
-                ReviewStatus::Cancelled { .. } => "Cancelled".to_string(),
-            }
-        }
-    };
-    let status_kind = {
-        let initial = initial_status.clone();
-        move || -> &'static str {
-            match live
-                .get()
-                .map(|r| r.status)
-                .unwrap_or_else(|| initial.clone())
-            {
-                ReviewStatus::Draft => "draft",
-                ReviewStatus::Submitted { .. } => "submitted",
-                ReviewStatus::Consumed { .. } => "consumed",
-                ReviewStatus::Cancelled { .. } => "cancelled",
-            }
-        }
-    };
-    let header_origin = {
-        let initial = initial_origin.clone();
-        let agent_state = state.clone();
-        move || -> Option<String> {
-            let agent_id = live
-                .get()
-                .map(|r| r.origin_agent_id)
-                .unwrap_or_else(|| initial.clone());
-            // Project-scoped reviews carry a synthetic, non-deliverable
-            // origin (`project-review:<id>`) that is not a real agent —
-            // never surface it as an "Origin" to the user.
-            if agent_id.0.starts_with("project-review:") {
-                return None;
-            }
-            let name = agent_state.agents.with(|agents| {
-                agents
-                    .iter()
-                    .find(|a| a.agent_id == agent_id)
-                    .map(|a| a.name.clone())
-            });
-            Some(match name {
-                Some(name) if !name.is_empty() => format!("Origin: {name}"),
-                _ => format!("Origin: {}", short_agent_id(&agent_id.0)),
-            })
-        }
-    };
-
-    let status_text_for_badge = status_text.clone();
-    let status_kind_for_attr = status_kind.clone();
-    let status_kind_for_class = status_kind;
-
-    // Full-width banner that surfaces the non-Draft lifecycle states. Per
-    // dev-doc §5: "Submitted (waiting for delivery), Consumed (delivered),
-    // Cancelled (terminal)" should be prominent, not buried in the sidebar.
-    let banner_status = {
-        let initial = initial_status.clone();
-        Memo::new(move |_| {
-            live.get()
-                .map(|r| r.status)
-                .unwrap_or_else(|| initial.clone())
-        })
-    };
-
-    // Composer state lives at this level so both `ReviewFileList`
-    // (which decorates rows for files with an open draft composer) and
-    // `ReviewCenter` (which mounts the composer) read the same signal.
-    let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
-
-    view! {
-        <div class="review-body">
-            <div class="review-header">
-                <span
-                    class=move || format!("review-status-badge {}", status_kind_for_class())
-                    data-status={move || status_kind_for_attr()}
-                >
-                    {move || status_text_for_badge()}
-                </span>
-                {move || header_origin().map(|text| view! {
-                    <span class="review-origin">{text}</span>
-                })}
-                <ReviewLayoutToggle/>
-            </div>
-            {
-                let banner_state = state.clone();
-                move || render_status_banner(banner_status.get(), &banner_state)
-            }
-            <div class="review-three-pane">
-                <ReviewFileList review=review.clone() selected=selected composer=composer />
-                <ReviewCenter
-                    review=review.clone()
-                    selected=selected
-                    host_id=host_id.clone()
-                    review_id=review_id.clone()
-                    is_draft=is_draft
-                    composer=composer
-                />
-                <ReviewSidebar
-                    review=review
-                    host_id=host_id
-                    review_id=review_id
-                    is_draft=is_draft
-                />
-            </div>
-        </div>
-    }
-}
-
-/// Renders the full-width status banner for non-Draft reviews. Returns
-/// `None` while in Draft so the three-pane workspace fills the surface.
-fn render_status_banner(status: ReviewStatus, state: &AppState) -> Option<AnyView> {
-    let (kind, message) = match status {
-        ReviewStatus::Draft => return None,
-        ReviewStatus::Submitted { submitted_at_ms } => (
-            "submitted",
-            format!(
-                "Submitted {} — waiting for delivery to originating agent.",
-                format_relative_time(submitted_at_ms)
-            ),
-        ),
-        ReviewStatus::Consumed {
-            target_agent_id,
-            consumed_at_ms,
-            ..
-        } => {
-            let target_label = state.agents.with_untracked(|agents| {
-                agents
-                    .iter()
-                    .find(|a| a.agent_id == target_agent_id)
-                    .map(|a| a.name.clone())
-            });
-            let agent_label = match target_label {
-                Some(name) if !name.is_empty() => name,
-                _ => short_agent_id(&target_agent_id.0),
-            };
-            (
-                "consumed",
-                format!(
-                    "Consumed {} — delivered to {agent_label}.",
-                    format_relative_time(consumed_at_ms)
-                ),
-            )
-        }
-        ReviewStatus::Cancelled { cancelled_at_ms } => (
-            "cancelled",
-            format!("Cancelled {}.", format_relative_time(cancelled_at_ms)),
-        ),
-    };
-    Some(
-        view! {
-            <div class={format!("review-status-banner {kind}")} data-status={kind}>
-                {message}
-            </div>
-        }
-        .into_any(),
-    )
-}
-
-/// Lower-case 8-char prefix of an agent UUID — only used as a fallback
-/// label when the agent record isn't in the registry. Real names are
-/// preferred everywhere.
-fn short_agent_id(id: &str) -> String {
-    id.chars().take(8).collect::<String>()
-}
 
 /// Local copy of the `format_relative_time` pattern used by chat_message
 /// and agents_panel — kept inline here so the review surface doesn't
@@ -486,341 +94,11 @@ fn format_elapsed(start_ms: u64) -> String {
     }
 }
 
-/// Reactive flattened file list for the left rail. Groups files by root,
-/// preserving the order they appear in `Review.diffs`. Counts derive via
-/// `Memo` from the live review's comments + suggestions — never cached.
-#[component]
-fn ReviewFileList(
-    review: Review,
-    selected: RwSignal<Option<SelectedFile>>,
-    composer: RwSignal<Option<ComposerState>>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    // Flat list of (root, files in that root) preserving diff order. The
-    // diff snapshot is frozen once a review is created, so the file
-    // structure itself is non-reactive — only the count badges are.
-    let mut roots: Vec<(ProjectRootPath, Vec<ProjectGitDiffFile>)> = Vec::new();
-    for diff in &review.diffs {
-        roots.push((diff.root.clone(), diff.files.clone()));
-    }
-
-    let review_id_for_counts = review.id.clone();
-
-    // Flat (root, path) sequence for arrow-key navigation. Matches the
-    // visual order of the rendered rows.
-    let flat_order: Vec<(ProjectRootPath, String)> = roots
-        .iter()
-        .flat_map(|(root, files)| {
-            files
-                .iter()
-                .map(move |f| (root.clone(), f.relative_path.clone()))
-        })
-        .collect();
-    let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
-        let key = ev.key();
-        let direction: i32 = match key.as_str() {
-            "ArrowDown" | "j" => 1,
-            "ArrowUp" | "k" => -1,
-            "Home" => -2,
-            "End" => 2,
-            _ => return,
-        };
-        if flat_order.is_empty() {
-            return;
-        }
-        ev.prevent_default();
-        let current_idx = selected
-            .get_untracked()
-            .and_then(|s| {
-                flat_order
-                    .iter()
-                    .position(|(r, p)| *r == s.root && *p == s.relative_path)
-            })
-            .unwrap_or(0);
-        let new_idx = match direction {
-            -2 => 0,
-            2 => flat_order.len() - 1,
-            _ => {
-                let len = flat_order.len() as i32;
-                let next = (current_idx as i32 + direction).rem_euclid(len);
-                next as usize
-            }
-        };
-        let (root, path) = flat_order[new_idx].clone();
-        selected.set(Some(SelectedFile {
-            root,
-            relative_path: path,
-        }));
-        // Move keyboard focus to the newly-selected row so the next
-        // keydown event continues to land on this list. Without this the
-        // focus would stay on the previous button (which still works
-        // because the keydown is on the list container, but rows that
-        // scroll out of view feel broken).
-        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-            let selector = format!(".review-file-row[data-flat-idx=\"{new_idx}\"]");
-            if let Ok(Some(el)) = document.query_selector(&selector)
-                && let Ok(html_el) = el.dyn_into::<web_sys::HtmlElement>()
-            {
-                let _ = html_el.focus();
-                html_el.scroll_into_view_with_bool(false);
-            }
-        }
-    };
-
-    let mut flat_idx = 0usize;
-    view! {
-        <div
-            class="review-file-list"
-            role="listbox"
-            tabindex="0"
-            on:keydown=on_keydown
-        >
-            {roots.into_iter().map(|(root, files)| {
-                let root_label = root_display_name(&root);
-                let root_for_files = root.clone();
-                view! {
-                    <div class="review-file-list-root">
-                        <div class="review-file-list-root-label">{root_label}</div>
-                        {files.into_iter().map(|file| {
-                            let row_root = root_for_files.clone();
-                            let row_path = file.relative_path.clone();
-                            let click_root = row_root.clone();
-                            let click_path = row_path.clone();
-
-                            // Derived selection state for this row.
-                            let is_selected = {
-                                let row_root = row_root.clone();
-                                let row_path = row_path.clone();
-                                move || selected.get().is_some_and(|s|
-                                    s.root == row_root && s.relative_path == row_path
-                                )
-                            };
-
-                            // Per-row reactive counts derived from the
-                            // live review record. No cached count fields;
-                            // a `Memo` recomputes whenever comments or
-                            // suggestions change.
-                            let counts_review_id = review_id_for_counts.clone();
-                            let counts_root = row_root.clone();
-                            let counts_path = row_path.clone();
-                            let counts: Memo<(usize, usize)> = Memo::new(move |_| {
-                                state.reviews.with(|map| {
-                                    let Some(review) = map.get(&counts_review_id) else {
-                                        return (0, 0);
-                                    };
-                                    let user = review.comments.iter().filter(|c| {
-                                        c.location.root == counts_root
-                                            && c.location.relative_path == counts_path
-                                    }).count();
-                                    let pending_ai = review.suggestions.iter().filter(|s| {
-                                        s.location.root == counts_root
-                                            && s.location.relative_path == counts_path
-                                            && matches!(s.state, ReviewSuggestionState::Pending)
-                                    }).count();
-                                    (user, pending_ai)
-                                })
-                            });
-
-                            // Compact path display: parent dir + basename.
-                            // Full path remains in `title` for hover tooltip
-                            // and concatenated text content for keyboard /
-                            // selection-by-text affordances.
-                            let (parent_dir, basename) = split_path_for_display(&row_path);
-                            let title_path = row_path.clone();
-                            let is_selected_for_class = is_selected.clone();
-                            let is_selected_for_aria = is_selected.clone();
-                            let is_selected_for_aria_sel = is_selected;
-                            let row_idx = flat_idx;
-                            flat_idx += 1;
-                            view! {
-                                <button
-                                    class=move || if is_selected_for_class() {
-                                        "review-file-row active"
-                                    } else {
-                                        "review-file-row"
-                                    }
-                                    role="option"
-                                    aria-current=move || if is_selected_for_aria() { "true" } else { "false" }
-                                    aria-selected=move || if is_selected_for_aria_sel() { "true" } else { "false" }
-                                    data-flat-idx=row_idx.to_string()
-                                    title={title_path}
-                                    on:click=move |_| {
-                                        let perf_key = format!(
-                                            "review:{}:{}",
-                                            click_root.0, click_path
-                                        );
-                                        crate::perf::mark_start(&perf_key);
-                                        crate::perf::log_phase(
-                                            "review_file_open",
-                                            "click",
-                                            &perf_key,
-                                            "",
-                                        );
-                                        selected.set(Some(SelectedFile {
-                                            root: click_root.clone(),
-                                            relative_path: click_path.clone(),
-                                        }));
-                                    }
-                                >
-                                    {(!parent_dir.is_empty()).then(|| view! {
-                                        <span class="review-file-row-dir">{parent_dir}</span>
-                                    })}
-                                    <span class="review-file-row-name">{basename}</span>
-                                    {
-                                        let draft_root = row_root.clone();
-                                        let draft_path = row_path.clone();
-                                        move || {
-                                            let (u, a) = counts.get();
-                                            let has_draft = composer.with(|c| {
-                                                c.as_ref().is_some_and(|c| {
-                                                    c.location.root == draft_root
-                                                        && c.location.relative_path == draft_path
-                                                        && !c.body.get().trim().is_empty()
-                                                })
-                                            });
-                                            let mut badges = Vec::new();
-                                            if has_draft {
-                                                badges.push(view! {
-                                                    <span class="review-count-badge draft"
-                                                          title="Unsaved draft comment on this file">
-                                                        "draft"
-                                                    </span>
-                                                }.into_any());
-                                            }
-                                            if u > 0 {
-                                                badges.push(view! {
-                                                    <span class="review-count-badge user"
-                                                          data-count-user=u.to_string()
-                                                          title=format!("{u} comment{}",
-                                                              if u == 1 { "" } else { "s" })>
-                                                        {u.to_string()}
-                                                    </span>
-                                                }.into_any());
-                                            }
-                                            if a > 0 {
-                                                badges.push(view! {
-                                                    <span class="review-count-badge ai"
-                                                          data-count-ai=a.to_string()
-                                                          title=format!("{a} pending AI suggestion{}",
-                                                              if a == 1 { "" } else { "s" })>
-                                                        {a.to_string()}
-                                                    </span>
-                                                }.into_any());
-                                            }
-                                            badges
-                                        }
-                                    }
-                                </button>
-                            }
-                        }).collect::<Vec<_>>()}
-                    </div>
-                }
-            }).collect::<Vec<_>>()}
-        </div>
-    }
-}
-
-#[component]
-fn ReviewCenter(
-    review: Review,
-    selected: RwSignal<Option<SelectedFile>>,
-    host_id: String,
-    review_id: protocol::ReviewId,
-    is_draft: Memo<bool>,
-    composer: RwSignal<Option<ComposerState>>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let drag_selection = RwSignal::new(None);
-
-    // Reactive Memo over `Review.diffs`. Driven by the live record so a
-    // late-arriving Snapshot replaces the initial render's payload list.
-    let frozen_review_id = review.id.clone();
-    let initial_diffs = review.diffs.clone();
-    let frozen_state = state.clone();
-    let frozen_payload: Memo<Option<Vec<ProjectGitDiffPayload>>> = Memo::new(move |_| {
-        Some(frozen_state.reviews.with(|map| {
-            map.get(&frozen_review_id)
-                .map(|r| r.diffs.clone())
-                .unwrap_or_else(|| initial_diffs.clone())
-        }))
-    });
-
-    install_drag_listeners(drag_selection, composer);
-
-    view! {
-        <div class="review-center">
-            {move || {
-                let Some(sel) = selected.get() else {
-                    return view! {
-                        <div class="review-empty">
-                            <p class="placeholder-text">"Select a file"</p>
-                        </div>
-                    }.into_any();
-                };
-                // Validate the selected file still exists in the (live) snapshot.
-                // `with_untracked` is critical: a tracking read would
-                // subscribe this closure to every reviews-map update
-                // (CommentUpsert, Suggestion, StatusChanged), remounting
-                // `DiffView` -> `DiffContent` on each delta and silently
-                // resetting the user's scroll position. The file list
-                // inside a review is frozen at snapshot time, so we don't
-                // need to re-validate when comments change.
-                let exists = state.reviews.with_untracked(|map| {
-                    map.get(&review_id).is_some_and(|r| {
-                        r.diffs.iter().any(|d| {
-                            d.root == sel.root
-                                && d.files.iter().any(|f| f.relative_path == sel.relative_path)
-                        })
-                    })
-                });
-                if !exists {
-                    return view! {
-                        <div class="review-empty">
-                            <p class="placeholder-text">"File not found in review snapshot"</p>
-                        </div>
-                    }.into_any();
-                }
-
-                let host_id = host_id.clone();
-                let review_id = review_id.clone();
-                let root = sel.root.clone();
-                let path = sel.relative_path.clone();
-                let perf_key = format!("review:{}:{}", root.0, path);
-                crate::perf::log_phase("review_file_open", "rerender_begin", &perf_key, "");
-
-                let decorations = build_review_decorations(
-                    composer,
-                    drag_selection,
-                    review_id,
-                    host_id,
-                    is_draft,
-                );
-
-                let view = view! {
-                    <DiffView
-                        root=root
-                        scope=ProjectDiffScope::Uncommitted
-                        path=path
-                        frozen_payload=frozen_payload
-                        on_gutter_pointer_down=decorations.gutter_pointer_down
-                        line_extra_class=decorations.line_extra_class
-                        gutter_action_for_file_header=decorations.gutter_action_for_file_header
-                        decoration_below_line=decorations.decoration_below_line
-                        decoration_below_file_header=decorations.decoration_below_file_header
-                    />
-                }.into_any();
-                crate::perf::log_phase("review_file_open", "rerender_done", &perf_key, "");
-                view
-            }}
-        </div>
-    }
-}
-
 /// Action sidebar for a Draft review: live counts, the AI-reviewer form,
-/// the submit-target picker (with full gating), Clear and Cancel. Public
-/// to the crate so the git-panel review hub can mount the exact same
-/// controls without re-implementing submit-target gating.
+/// the submit-target picker (with full gating), and Clear. Public to the
+/// crate so the git-panel review hub can mount the exact same controls
+/// without re-implementing submit-target gating. Reviews are always-on, so
+/// there is no Cancel/discard-review affordance here.
 #[component]
 pub(crate) fn ReviewSidebar(
     review: Review,
@@ -952,25 +230,9 @@ pub(crate) fn ReviewSidebar(
             ""
         }
     };
-    let cancel_reason = {
-        let action_pending = action_pending.clone();
-        move || -> &'static str {
-            if !is_draft.get() {
-                return "Review is no longer Draft";
-            }
-            if action_pending().cancel {
-                return "Cancel in progress\u{2026}";
-            }
-            ""
-        }
-    };
     let submit_disabled = {
         let submit_reason = submit_reason.clone();
         move || !submit_reason().is_empty()
-    };
-    let cancel_disabled = {
-        let cancel_reason = cancel_reason.clone();
-        move || !cancel_reason().is_empty()
     };
 
     // ── Run AI reviewer form
@@ -1074,75 +336,6 @@ pub(crate) fn ReviewSidebar(
                     });
                     log::info!(
                         "review.submit.local_gate_clear review={target_rid} reason=send_err"
-                    );
-                }
-            }
-        });
-    };
-
-    let host_for_cancel = host_id.clone();
-    let review_for_cancel = review_id.clone();
-    let state_for_cancel = state.clone();
-    let user_count_for_cancel = user_comment_count;
-    let on_cancel = move |_| {
-        let host = host_for_cancel.clone();
-        let rid = review_for_cancel.clone();
-        let target_state = state_for_cancel.clone();
-        let comment_count = user_count_for_cancel.get_untracked();
-        spawn_local(async move {
-            let message = if comment_count == 0 {
-                "Cancel this review and discard it? This cannot be undone.".to_owned()
-            } else {
-                format!(
-                    "Cancel this review and discard {comment_count} comment{}? This cannot be undone.",
-                    if comment_count == 1 { "" } else { "s" }
-                )
-            };
-            if !crate::bridge::confirm_dialog("Cancel review", &message).await {
-                log::info!("review.cancel.click review={rid} dialog=declined");
-                return;
-            }
-            let gate_before = target_state
-                .review_action_pending
-                .with_untracked(|m| m.get(&rid).copied().unwrap_or_default());
-            let mut claimed = false;
-            target_state.review_action_pending.update(|map| {
-                let gate = map.entry(rid.clone()).or_default();
-                if !gate.cancel {
-                    gate.cancel = true;
-                    claimed = true;
-                }
-            });
-            log::info!(
-                "review.cancel.click review={} claimed={} gate_before_cancel={} comments={} {}",
-                rid,
-                claimed,
-                gate_before.cancel,
-                comment_count,
-                conn_diag(&target_state, &host)
-            );
-            if !claimed {
-                return;
-            }
-            let target_rid = rid.clone();
-            match send_review_action_inner(&host, target_rid.clone(), ReviewActionPayload::Cancel)
-                .await
-            {
-                Ok(()) => {
-                    log::info!("review.cancel.send_ok review={target_rid}");
-                }
-                Err(e) => {
-                    log::error!("review.cancel.send_err review={target_rid} error={e}");
-                    target_state.review_action_pending.update(|map| {
-                        if let Some(gate) = map.get_mut(&target_rid) {
-                            gate.cancel = false;
-                            if gate.is_idle() {
-                                map.remove(&target_rid);
-                            }
-                        }
-                    });
-                    log::info!(
-                        "review.cancel.local_gate_clear review={target_rid} reason=send_err"
                     );
                 }
             }
@@ -1774,26 +967,8 @@ pub(crate) fn ReviewSidebar(
                 >
                     "Clear comments"
                 </button>
-                <button
-                    class="review-btn destructive review-cancel-btn"
-                    disabled=cancel_disabled
-                    title=cancel_reason
-                    on:click=on_cancel
-                >
-                    "Cancel review"
-                </button>
             </div>
         </div>
-    }
-}
-
-/// Split a relative path into `(parent_dir_with_trailing_slash, basename)`
-/// for the file-list rail. Concatenated text content equals the original
-/// path so callers (and tests) can still find the row by full-path text.
-fn split_path_for_display(path: &str) -> (String, String) {
-    match path.rfind('/') {
-        Some(idx) => (path[..=idx].to_owned(), path[idx + 1..].to_owned()),
-        None => (String::new(), path.to_owned()),
     }
 }
 
@@ -2007,30 +1182,51 @@ pub(crate) fn try_claim_review_action(
     claimed
 }
 
-/// The most-recently-updated Draft review id for `project_id`, if any.
-/// Submitted/Consumed/Cancelled are filtered out — only an actively
-/// editable Draft is a review surface.
-fn existing_draft_for_project(
+/// The most-recently-updated Draft review id for `(project_id, root)`, if
+/// any. Submitted/Consumed/Cancelled are filtered out — only an actively
+/// editable Draft is a review surface. Active reviews are per
+/// `(project, root)`, so a Draft on a *different* root of the same project
+/// must not be returned here (it would wrongly suppress creating one for
+/// this root).
+fn existing_draft_for_root(
     state: &AppState,
     project_id: &protocol::ProjectId,
+    root: &protocol::ProjectRootPath,
 ) -> Option<protocol::ReviewId> {
     state.review_summaries.with_untracked(|map| {
         map.get(project_id).and_then(|summaries| {
             summaries
                 .iter()
-                .filter(|s| matches!(s.status, ReviewStatus::Draft))
+                .filter(|s| s.root == *root && matches!(s.status, ReviewStatus::Draft))
                 .max_by_key(|s| s.updated_at_ms)
                 .map(|s| s.id.clone())
         })
     })
 }
 
-/// Send a project-scoped `ReviewCreate` with create-pending gating, with
+/// Send a root-scoped `ReviewCreate` with create-pending gating, with
 /// no tab navigation — callers decide which surface to show. At most one
-/// Draft per project: callers must check `existing_draft_for_project`
-/// first. The (host, project) pair is tagged create-pending until the
-/// server's `ReviewListChanged` echoes back (cleared on send failure).
-fn send_review_create(state: &AppState, host_id: &str, project_id: &protocol::ProjectId) {
+/// Draft per `(project, root)`: callers must check `existing_draft_for_root`
+/// first.
+///
+/// The selection is root-scoped `Unstaged` to match the active-review
+/// model: a project-wide `AllUncommitted` create is ambiguous on multi-root
+/// projects and the server now normalizes every active review to
+/// `Root { scope: Unstaged }`.
+///
+/// The create-pending gate is keyed by `(host, project)`, not the root: the
+/// only create path ([`create_review_for_active_agent`]) resolves a single
+/// root per project (the first unstaged one), and the `CommandError` clear
+/// path in dispatch only recovers `(host, project)` from the `/project/{id}`
+/// stream — it has no root — so a per-root key could not be released on
+/// error. The gate is a transient debounce, not lifecycle state, so
+/// project-keying is sufficient.
+fn send_review_create(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+    root: &protocol::ProjectRootPath,
+) {
     let mut claimed = false;
     let key = (host_id.to_owned(), project_id.clone());
     state.review_create_pending.update(|map| {
@@ -2046,7 +1242,11 @@ fn send_review_create(state: &AppState, host_id: &str, project_id: &protocol::Pr
 
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = protocol::ReviewCreatePayload {
-        selection: protocol::ReviewDiffSelection::AllUncommitted,
+        selection: protocol::ReviewDiffSelection::Root {
+            root: root.clone(),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        },
     };
     let state_for_failure = state.clone();
     let host = host_id.to_owned();
@@ -2065,57 +1265,61 @@ fn send_review_create(state: &AppState, host_id: &str, project_id: &protocol::Pr
     });
 }
 
-/// Open (or focus) the all-uncommitted diff surface for `project_id` on
-/// `host_id` — the canonical review surface for the integrated flow.
-/// Returns true when a diff tab was opened.
+/// First root with an unstaged change (modified-but-unstaged or untracked)
+/// for `project_id`, or `None` when nothing is reviewable. Reviews track
+/// `Unstaged`, so a staged-only root is skipped — it would open an empty
+/// review surface. Shared by the diff-surface opener and the legacy
+/// `ReviewCreate` fallback so both agree on which root a review covers.
+fn review_root_for_project(
+    state: &AppState,
+    project_id: &protocol::ProjectId,
+) -> Option<protocol::ProjectRootPath> {
+    state.git_status.with_untracked(|m| {
+        m.get(project_id)?
+            .iter()
+            .find_map(|r| root_has_reviewable_changes(r).then(|| r.root.clone()))
+    })
+}
+
+/// Whether a root carries changes an always-on (`Unstaged`) review would
+/// cover: any file that is modified-but-unstaged or untracked. Staged-only
+/// files do not count — they are not part of the active inline review.
+fn root_has_reviewable_changes(root: &protocol::ProjectRootGitStatus) -> bool {
+    root.files
+        .iter()
+        .any(|f| f.unstaged.is_some() || f.untracked)
+}
+
+/// Open (or focus) the whole-root unstaged diff surface for an explicit
+/// `(host, project, root)` — the review surface for *that exact* root.
 ///
-/// A review covers *every* outstanding uncommitted change, so this opens the
+/// An active review covers a root's unstaged changes, so this opens the
 /// whole-root diff (empty `path` ⇒ all files) at
-/// [`ProjectDiffScope::Uncommitted`], not a single file: every changed file
+/// [`ProjectDiffScope::Unstaged`], not a single file: every changed file
 /// in the review must be able to display and accept comments. The empty path
 /// is the established "all files" convention `DiffView` already renders and
 /// is requested with `ProjectReadDiff { path: None }`.
 ///
-/// The scope is deliberately `Uncommitted` (HEAD↔worktree): the server
-/// validates review anchors against HEAD↔worktree. A `Staged`/`Unstaged` tab
-/// would show index↔worktree line numbers that don't line up with the
-/// review's anchors, so `ReviewableDiffView` only binds review affordances on
-/// `Uncommitted` tabs.
+/// The scope is deliberately `Unstaged` (index↔worktree): the server anchors
+/// active review diffs and validates comment anchors against `Unstaged`. A
+/// `Staged` or `Uncommitted` tab would show line numbers that don't line up
+/// with the review's anchors, so `ReviewableDiffView` only binds review
+/// affordances on `Unstaged` tabs.
 ///
-/// (Multi-root projects: this opens the first root that has changes. A single
-/// diff tab is per-root; other roots' changes would need their own tab.)
-///
-/// This is what every "Review changes" / "Open changes" call routes through;
-/// reviews live on the ordinary diff surfaces now, never in a standalone
-/// `TabContent::Review` workbench.
-pub fn open_changed_diff_for_project(
+/// Unlike [`open_changed_diff_for_project`], the caller picks the root, so a
+/// multi-root project opens the clicked root (e.g. the git panel's per-root
+/// review hub) rather than the first dirty one.
+pub fn open_changed_diff_for_root(
     state: &AppState,
     host_id: &str,
     project_id: &protocol::ProjectId,
-) -> bool {
-    let Some(roots) = state
-        .git_status
-        .with_untracked(|m| m.get(project_id).cloned())
-    else {
-        return false;
-    };
-    // First root with any outstanding change (staged, unstaged, or untracked).
-    let Some(root) = roots
-        .into_iter()
-        .find(|r| {
-            r.files
-                .iter()
-                .any(|f| f.unstaged.is_some() || f.untracked || f.staged.is_some())
-        })
-        .map(|r| r.root)
-    else {
-        return false;
-    };
-    let scope = ProjectDiffScope::Uncommitted;
-    // Empty path ⇒ all files in the root (the all-uncommitted diff surface).
+    root: &protocol::ProjectRootPath,
+) {
+    let scope = ProjectDiffScope::Unstaged;
+    // Empty path ⇒ all files in the root (the whole-root unstaged surface).
     let path = String::new();
 
-    let label = format!("Review: {}", root_display_name(&root));
+    let label = format!("Review: {}", root_display_name(root));
     state.open_tab(
         TabContent::Diff {
             host_id: host_id.to_owned(),
@@ -2140,6 +1344,7 @@ pub fn open_changed_diff_for_project(
     });
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let host = host_id.to_owned();
+    let root = root.clone();
     spawn_local(async move {
         let payload = ProjectReadDiffPayload {
             root,
@@ -2151,6 +1356,28 @@ pub fn open_changed_diff_for_project(
             log::error!("failed to send ProjectReadDiff for review surface: {e}");
         }
     });
+}
+
+/// Open (or focus) the whole-root unstaged diff surface for `project_id`'s
+/// first root with reviewable changes — the canonical review surface for the
+/// integrated flow. Returns true when a diff tab was opened.
+///
+/// (Multi-root projects: this opens the first root that has unstaged changes.
+/// A single diff tab is per-root; other roots' changes need their own tab —
+/// see [`open_changed_diff_for_root`].)
+///
+/// This is what the chat "Review changes" CTA routes through; reviews live on
+/// the ordinary diff surfaces now, never in a standalone `TabContent::Review`
+/// workbench.
+pub fn open_changed_diff_for_project(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+) -> bool {
+    let Some(root) = review_root_for_project(state, project_id) else {
+        return false;
+    };
+    open_changed_diff_for_root(state, host_id, project_id, &root);
     true
 }
 
@@ -2315,14 +1542,14 @@ fn subscribe_backoff_ms(failures: u32) -> i32 {
 
 /// Public entry — used by the agent chat header's "Review changes" button.
 ///
-/// Always opens/focuses the project's normal changed-file diff tab (the
-/// review surface). If no Draft review exists yet, also sends a
-/// `ReviewCreate`; an existing Draft's decorations resolve on that same
-/// diff tab. We never open a standalone `TabContent::Review` workbench.
-///
-/// At most one Draft review per project: the server enforces the same
-/// invariant with a `Conflict` `CommandError` for callers that bypass
-/// this check (MCP, an older client).
+/// Reviews are always-on and root-scoped server-side, so this is primarily
+/// navigation: it opens/focuses the project's normal changed-file diff tab
+/// (the canonical inline review surface). The active root review's
+/// decorations resolve on that diff tab from the bootstrap/summary stream.
+/// If no Draft summary has arrived yet, it also fires a legacy
+/// get-or-create `ReviewCreate` as a fallback so the surface is never blank
+/// against an older server. We never open a standalone `TabContent::Review`
+/// workbench — that surface has been retired.
 pub fn create_review_for_active_agent(state: &AppState) {
     let Some(active_agent) = state.active_agent.get_untracked() else {
         return;
@@ -2344,15 +1571,25 @@ pub fn create_review_for_active_agent(state: &AppState) {
     // Always land the user on the changed-file diff surface.
     open_changed_diff_for_project(state, &host_id, &project_id);
 
-    // Only create when there isn't already a Draft to decorate that diff.
-    if existing_draft_for_project(state, &project_id).is_none() {
-        send_review_create(state, &host_id, &project_id);
+    // Create only when there's an unstaged root to anchor the review to, and
+    // only when *that root* has no Draft yet. Active reviews are per
+    // `(project, root)`, so a Draft on a different root must not suppress
+    // creating one for the root we just opened.
+    if let Some(root) = review_root_for_project(state, &project_id)
+        && existing_draft_for_root(state, &project_id, &root).is_none()
+    {
+        send_review_create(state, &host_id, &project_id, &root);
     }
 }
 
-/// Returns true when the active agent's project has uncommitted changes
-/// (driving the visibility of the "Review changes" header button).
-pub fn active_agent_has_uncommitted_changes(state: &AppState) -> bool {
+/// Returns true when the active agent's project has changes an always-on
+/// review would cover — any modified-but-unstaged or untracked file in any
+/// root (driving the visibility of the "Review changes" header button).
+///
+/// Staged-only roots are excluded: reviews track `Unstaged`, and
+/// [`review_root_for_project`] (which the click handler uses to pick a root)
+/// would skip them, so showing the button there would do nothing.
+pub fn active_agent_has_reviewable_changes(state: &AppState) -> bool {
     let Some(active_agent) = state.active_agent.get() else {
         return false;
     };
@@ -2367,7 +1604,7 @@ pub fn active_agent_has_uncommitted_changes(state: &AppState) -> bool {
     };
     state.git_status.with(|map| {
         map.get(&project_id)
-            .is_some_and(|roots| roots.iter().any(|r| !r.clean))
+            .is_some_and(|roots| roots.iter().any(root_has_reviewable_changes))
     })
 }
 
@@ -2390,60 +1627,6 @@ pub fn active_agent_review_create_pending(state: &AppState) -> bool {
     state
         .review_create_pending
         .with(|map| map.contains_key(&(active_agent.host_id, project_id)))
-}
-
-/// Compute, by project, the Draft review the git panel pill links to.
-/// When multiple drafts exist for the same project we surface the most
-/// recently-updated one — that's the one the user is most likely to be
-/// actively editing. Submitted/Consumed/Cancelled are filtered out — the
-/// pill is for actively-editable reviews only.
-pub fn open_review_for_active_project(state: &AppState) -> Option<(String, protocol::ReviewId)> {
-    let active = state.active_project.get()?;
-    let summaries = state
-        .review_summaries
-        .with(|map| map.get(&active.project_id).cloned())?;
-    let latest = summaries
-        .into_iter()
-        .filter(|s| matches!(s.status, ReviewStatus::Draft))
-        .max_by_key(|s| s.updated_at_ms)?;
-    Some((active.host_id.clone(), latest.id))
-}
-
-/// Project-scoped entry point for the inline review flow, driven from the
-/// git panel. Opens/focuses the active project's normal changed-file diff
-/// surface and, when no Draft exists yet, sends a project-scoped
-/// `ReviewCreate` (the server derives the project from the `/project/<id>`
-/// stream). Never opens a standalone `TabContent::Review` workbench — the
-/// new Draft's decorations resolve on the diff tab once `ReviewListChanged`
-/// lands.
-pub fn create_or_open_review_for_active_project(state: &AppState) {
-    let Some(active) = state.active_project.get_untracked() else {
-        log::warn!("create_or_open_review_for_active_project: no active project");
-        return;
-    };
-    let host_id = active.host_id.clone();
-    let project_id = active.project_id.clone();
-
-    open_changed_diff_for_project(state, &host_id, &project_id);
-
-    if existing_draft_for_project(state, &project_id).is_none() {
-        send_review_create(state, &host_id, &project_id);
-    }
-}
-
-/// Start a Draft review for a specific (host, project) without any tab
-/// navigation — used by the diff-tab "Start a review" banner, where the
-/// user is already on the review surface. No-op when a Draft already
-/// exists; its decorations resolve on the current diff tab.
-pub fn create_review_for_project(
-    state: &AppState,
-    host_id: &str,
-    project_id: &protocol::ProjectId,
-) {
-    if existing_draft_for_project(state, project_id).is_some() {
-        return;
-    }
-    send_review_create(state, host_id, project_id);
 }
 
 // ── BTreeMap import is referenced by tests below ───────────────────────
@@ -2656,26 +1839,6 @@ mod wasm_tests {
         }
     }
 
-    fn comment_range(start: u32, end: u32, body: &str) -> ReviewComment {
-        ReviewComment {
-            id: ReviewCommentId(format!("c-{start}-{end}-{body}")),
-            location: ReviewLocation {
-                root: root_path(),
-                relative_path: "src/foo.rs".to_owned(),
-                anchor: ReviewAnchor::LineRange {
-                    side: ReviewDiffSide::New,
-                    start_line: start,
-                    end_line: end,
-                },
-            },
-            anchor_status: ReviewAnchorStatus::Current,
-            body: body.to_owned(),
-            source: ReviewCommentSource::User,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-        }
-    }
-
     fn pending_suggestion_at_line(line: u32, body: &str) -> ReviewSuggestedComment {
         ReviewSuggestedComment {
             id: ReviewSuggestionId(format!("s-{line}")),
@@ -2698,12 +1861,14 @@ mod wasm_tests {
         }
     }
 
-    /// Mounts the review view with the given review pre-seeded.
-    /// Returns the captured `AppState` so the test can drive signal
-    /// updates that mirror dispatch events. The mount handle is leaked
-    /// so the view stays alive for the duration of the test (otherwise
-    /// dropping the handle unmounts the view immediately).
-    fn mount_review(
+    /// Mounts the shared `ReviewSidebar` (the surviving review-controls
+    /// surface — the standalone three-pane workbench has been retired) with
+    /// the given review pre-seeded. Returns the captured `AppState` so the
+    /// test can drive signal updates that mirror dispatch events. `is_draft`
+    /// derives reactively from the live review status, exactly as the
+    /// git-panel per-root hub wires it. The mount handle is leaked so the
+    /// view stays alive for the duration of the test.
+    fn mount_sidebar(
         container: HtmlElement,
         review: Review,
     ) -> std::rc::Rc<std::cell::RefCell<Option<AppState>>> {
@@ -2717,132 +1882,40 @@ mod wasm_tests {
                 map.insert(review.id.clone(), review.clone());
             });
             *state_holder_for_mount.borrow_mut() = Some(state.clone());
-            provide_context(state);
-            view! { <ReviewView host_id=host_id.clone() review_id=review.id.clone() /> }
+            provide_context(state.clone());
+            let rid = review.id.clone();
+            let st = state.clone();
+            let is_draft = Memo::new(move |_| {
+                st.reviews.with(|m| {
+                    m.get(&rid)
+                        .map(|r| matches!(r.status, ReviewStatus::Draft))
+                        .unwrap_or(false)
+                })
+            });
+            view! {
+                <ReviewSidebar
+                    review=review.clone()
+                    host_id=host_id.clone()
+                    review_id=review.id.clone()
+                    is_draft=is_draft
+                />
+            }
         });
         std::mem::forget(handle);
         state_holder
     }
 
-    /// A user-anchored comment renders as visible body text under the
-    /// row that displays its target line. We assert on the
-    /// user-perceived effect: the comment body appears in the DOM,
-    /// and the file containing it shows exactly one user-comment
-    /// count badge.
-    #[wasm_bindgen_test]
-    async fn renders_thread_at_correct_line() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let mut review = make_review();
-        review.comments.push(comment_at_line(2, "explain"));
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("explain"),
-            "expected comment body 'explain' in DOM; got: {text}"
-        );
-        // One user-count badge rendered (the file has one comment).
-        let badges = container.query_selector_all("[data-count-user]").unwrap();
-        assert_eq!(
-            badges.length(),
-            1,
-            "expected exactly one user count badge in file list"
-        );
-    }
-
-    /// Pending AI suggestions render Accept / Edit & Accept / Reject
-    /// affordances. We assert by looking up buttons by their visible
-    /// text instead of class names — text is what the user reads.
-    #[wasm_bindgen_test]
-    async fn pending_suggestion_shows_affordances() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let mut review = make_review();
-        review
-            .suggestions
-            .push(pending_suggestion_at_line(2, "consider an enum"));
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("consider an enum"),
-            "suggestion body missing; got: {text}"
-        );
-        assert!(text.contains("Accept"), "Accept button text missing");
-        assert!(
-            text.contains("Edit & Accept"),
-            "Edit & Accept button text missing"
-        );
-        assert!(text.contains("Reject"), "Reject button text missing");
-    }
-
-    /// A comment or suggestion whose anchor the server flagged `Stale`
-    /// renders a visible stale marker (with the reason) so the user knows
-    /// it may point at code that has since moved. Mirrors the mobile stale
-    /// pill, which already renders this.
-    #[wasm_bindgen_test]
-    async fn stale_anchor_renders_badge() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let mut review = make_review();
-        let mut comment = comment_at_line(2, "this moved");
-        comment.anchor_status = ReviewAnchorStatus::Stale {
-            reason: "line shifted".to_owned(),
-        };
-        review.comments.push(comment);
-        let mut suggestion = pending_suggestion_at_line(3, "stale suggestion");
-        suggestion.anchor_status = ReviewAnchorStatus::Stale {
-            reason: "hunk changed".to_owned(),
-        };
-        review.suggestions.push(suggestion);
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        let badges = container
-            .query_selector_all("[data-test=\"review-anchor-stale\"]")
-            .unwrap();
-        assert_eq!(
-            badges.length(),
-            2,
-            "expected a stale badge on both the comment and the suggestion"
-        );
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("line shifted"),
-            "stale comment reason must be surfaced; got: {text}"
-        );
-        assert!(
-            text.contains("hunk changed"),
-            "stale suggestion reason must be surfaced; got: {text}"
-        );
-    }
-
-    /// Submit reflects whether the user can submit AND has a deliverable
-    /// target. Under the explicit-target protocol a comment alone is not
-    /// sufficient: there must be a chosen target, or exactly one live
-    /// same-project candidate to auto-select.
-    ///
-    /// NOTE: this updates the pre-explicit-target assertion that submit
-    /// enabled on a comment alone. That behavior relied on falling back to
-    /// the review's origin agent, which is now a synthetic, non-deliverable
-    /// origin for project-scoped reviews — so the old assertion tested
-    /// behavior that would produce a failing submit and is obsolete.
+    /// Submit gating: disabled with zero comments, stays disabled with a
+    /// comment but no deliverable target, enables with a comment and exactly
+    /// one live same-project agent, and disables again once the review
+    /// leaves Draft.
     #[wasm_bindgen_test]
     async fn submit_button_disabled_until_draft_with_comments() {
         ensure_styles_loaded();
         let container = make_container();
         let review = make_review();
         let review_id = review.id.clone();
-        let state_holder = mount_review(container.clone(), review);
+        let state_holder = mount_sidebar(container.clone(), review);
 
         next_tick().await;
         next_tick().await;
@@ -2913,7 +1986,7 @@ mod wasm_tests {
         ensure_styles_loaded();
         let container = make_container();
         let review = make_review(); // project_id = "proj-1", host = "h1"
-        let state_holder = mount_review(container.clone(), review);
+        let state_holder = mount_sidebar(container.clone(), review);
 
         next_tick().await;
         next_tick().await;
@@ -2954,7 +2027,7 @@ mod wasm_tests {
         let container = make_container();
         let review = make_review();
         let review_id = review.id.clone();
-        let state_holder = mount_review(container.clone(), review);
+        let state_holder = mount_sidebar(container.clone(), review);
 
         next_tick().await;
         next_tick().await;
@@ -2990,7 +2063,7 @@ mod wasm_tests {
         let container = make_container();
         let review = make_review();
         let review_id = review.id.clone();
-        let state_holder = mount_review(container.clone(), review);
+        let state_holder = mount_sidebar(container.clone(), review);
 
         next_tick().await;
         next_tick().await;
@@ -3035,198 +2108,14 @@ mod wasm_tests {
         );
     }
 
-    /// CRITICAL #4: Composer captures the file at click time. If the
-    /// user opens the composer on src/foo.rs, then switches the visible
-    /// file to src/bar.rs, the composer must NOT render under the new
-    /// file (its location stays anchored to the originally clicked
-    /// file). This is the regression we're guarding against — without
-    /// the location-aware filter, the composer textarea would attach to
-    /// whatever file the user happened to be viewing when they clicked
-    /// Save, and the comment would be saved against the wrong file.
-    #[wasm_bindgen_test]
-    async fn composer_anchors_to_originally_clicked_file() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = make_review();
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        // Click the file-level "+" button on the visible file (src/foo.rs).
-        let foo_plus = container
-            .query_selector(".review-file-comment-btn")
-            .unwrap()
-            .expect("file-level + button rendered");
-        let foo_plus: HtmlElement = foo_plus.dyn_into().unwrap();
-        foo_plus.click();
-        next_tick().await;
-
-        // Composer textarea is present (currently anchored to foo.rs).
-        assert!(
-            container
-                .query_selector(".review-composer textarea")
-                .unwrap()
-                .is_some(),
-            "composer textarea should render after clicking + on foo.rs"
-        );
-
-        // Switch file to src/bar.rs by clicking its row in the file list.
-        let bar_row =
-            find_button_by_text(&container, "src/bar.rs").expect("bar.rs file row rendered");
-        bar_row.click();
-        next_tick().await;
-        next_tick().await;
-
-        // The composer must NOT render under the bar.rs view — its
-        // location stayed anchored to foo.rs.
-        let center = container
-            .query_selector(".review-center")
-            .unwrap()
-            .expect("center pane rendered");
-        let center_el: HtmlElement = center.dyn_into().unwrap();
-        assert!(
-            center_el
-                .query_selector(".review-composer")
-                .unwrap()
-                .is_none(),
-            "composer must not render under bar.rs after switching files"
-        );
-    }
-
-    /// CRITICAL #5: Mutation controls become disabled when the review's
-    /// status flips from Draft to Submitted. Drive the flip via signal
-    /// mutation (mirroring what dispatch does on StatusChanged) and
-    /// assert that user-perceived button states change.
-    #[wasm_bindgen_test]
-    async fn mutation_controls_disable_when_not_draft() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let mut review = make_review();
-        review.comments.push(comment_at_line(2, "fix this"));
-        review
-            .suggestions
-            .push(pending_suggestion_at_line(3, "use enum"));
-        let review_id = review.id.clone();
-        let state_holder = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        // While Draft: composer-trigger + button is enabled, Edit /
-        // Delete / Accept / Reject are enabled.
-        let plus_btn = container
-            .query_selector(".review-file-comment-btn")
-            .unwrap()
-            .expect("file + button rendered");
-        let plus_btn: HtmlElement = plus_btn.dyn_into().unwrap();
-        assert!(
-            !plus_btn.has_attribute("disabled"),
-            "+ button should be enabled in Draft"
-        );
-        let edit_btn = find_button_by_text(&container, "Edit").expect("edit button rendered");
-        assert!(
-            !edit_btn.has_attribute("disabled"),
-            "Edit must be enabled in Draft"
-        );
-        let delete_btn = find_button_by_text(&container, "Delete").expect("delete button rendered");
-        assert!(
-            !delete_btn.has_attribute("disabled"),
-            "Delete must be enabled in Draft"
-        );
-        let accept_btn = find_button_by_text(&container, "Accept").expect("accept button rendered");
-        assert!(
-            !accept_btn.has_attribute("disabled"),
-            "Accept must be enabled in Draft"
-        );
-        let reject_btn = find_button_by_text(&container, "Reject").expect("reject button rendered");
-        assert!(
-            !reject_btn.has_attribute("disabled"),
-            "Reject must be enabled in Draft"
-        );
-
-        // Flip to Submitted via signal mutation.
-        let state = state_holder.borrow().clone().unwrap();
-        state.reviews.update(|map| {
-            if let Some(r) = map.get_mut(&review_id) {
-                r.status = ReviewStatus::Submitted { submitted_at_ms: 1 };
-            }
-        });
-        next_tick().await;
-
-        // All mutation controls are now disabled.
-        let plus_btn = container
-            .query_selector(".review-file-comment-btn")
-            .unwrap()
-            .expect("file + button rendered");
-        let plus_btn: HtmlElement = plus_btn.dyn_into().unwrap();
-        assert!(
-            plus_btn.has_attribute("disabled"),
-            "+ button must disable when status leaves Draft"
-        );
-        let edit_btn = find_button_by_text(&container, "Edit").expect("edit button rendered");
-        assert!(
-            edit_btn.has_attribute("disabled"),
-            "Edit must disable when status leaves Draft"
-        );
-        let delete_btn = find_button_by_text(&container, "Delete").expect("delete button rendered");
-        assert!(
-            delete_btn.has_attribute("disabled"),
-            "Delete must disable when status leaves Draft"
-        );
-        let accept_btn = find_button_by_text(&container, "Accept").expect("accept button rendered");
-        assert!(
-            accept_btn.has_attribute("disabled"),
-            "Accept must disable when status leaves Draft"
-        );
-        let reject_btn = find_button_by_text(&container, "Reject").expect("reject button rendered");
-        assert!(
-            reject_btn.has_attribute("disabled"),
-            "Reject must disable when status leaves Draft"
-        );
-    }
-
-    /// IMPORTANT #6: A multi-line LineRange comment renders exactly
-    /// once — anchored at the bottom (end_line) of the range, not
-    /// duplicated under every line in between.
-    #[wasm_bindgen_test]
-    async fn multiline_linerange_renders_once() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let mut review = make_review();
-        // Range spans new-side lines 2..=4 inclusive.
-        review.comments.push(comment_range(2, 4, "range note"));
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-        next_tick().await;
-        next_tick().await;
-
-        // Sanity: the diff itself rendered (we should see the file path
-        // in the file-list rail and the diff text in the center).
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("let z = 3"),
-            "diff content not rendered yet — got: {}",
-            &text[..text.len().min(400)]
-        );
-        let occurrences = text.matches("range note").count();
-        assert_eq!(
-            occurrences, 1,
-            "multi-line comment 'range note' should render exactly once, found {occurrences}"
-        );
-    }
-
-    /// IMPORTANT #7: Run AI button is disabled until a backend is
-    /// chosen. We assert via the `disabled` attribute, which is
-    /// user-perceived.
+    /// Run AI button is disabled until a backend is chosen. We assert via
+    /// the `disabled` attribute, which is user-perceived.
     #[wasm_bindgen_test]
     async fn run_ai_disabled_until_backend_chosen() {
         ensure_styles_loaded();
         let container = make_container();
         let review = make_review();
-        let _ = mount_review(container.clone(), review);
+        let _ = mount_sidebar(container.clone(), review);
 
         next_tick().await;
         next_tick().await;
@@ -3239,486 +2128,154 @@ mod wasm_tests {
         );
     }
 
-    /// VISUAL LAYOUT: The review workbench is a three-pane surface. This
-    /// geometry guard catches regressions where the side rails stack,
-    /// overlap the diff, or stop filling the available height.
-    #[wasm_bindgen_test]
-    async fn lays_out_file_diff_and_sidebar_as_three_panes() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = make_review();
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        let root = container.get_bounding_client_rect();
-        let header = element_by_selector(&container, ".review-header").get_bounding_client_rect();
-        let panes =
-            element_by_selector(&container, ".review-three-pane").get_bounding_client_rect();
-        let file_list =
-            element_by_selector(&container, ".review-file-list").get_bounding_client_rect();
-        let center = element_by_selector(&container, ".review-center").get_bounding_client_rect();
-        let sidebar = element_by_selector(&container, ".review-sidebar").get_bounding_client_rect();
-
-        assert_close(
-            header.top(),
-            root.top(),
-            1.0,
-            "review header should start at the top of the mounted surface",
-        );
-        assert_close(
-            panes.top(),
-            header.bottom(),
-            1.0,
-            "pane grid should sit immediately below the review header",
-        );
-        assert_close(
-            panes.bottom(),
-            root.bottom(),
-            1.0,
-            "pane grid should fill the remaining vertical space",
-        );
-
-        for (name, rect) in [
-            ("file list", &file_list),
-            ("center diff", &center),
-            ("sidebar", &sidebar),
-        ] {
-            assert_close(
-                rect.top(),
-                panes.top(),
-                1.0,
-                &format!("{name} pane should align with the grid top"),
-            );
-            assert_close(
-                rect.bottom(),
-                panes.bottom(),
-                1.0,
-                &format!("{name} pane should fill the grid height"),
-            );
+    fn root_status(
+        path: &str,
+        staged: Option<protocol::ProjectGitChangeKind>,
+        unstaged: Option<protocol::ProjectGitChangeKind>,
+        untracked: bool,
+    ) -> protocol::ProjectRootGitStatus {
+        protocol::ProjectRootGitStatus {
+            root: ProjectRootPath(path.to_owned()),
+            branch: Some("main".to_owned()),
+            ahead: 0,
+            behind: 0,
+            clean: staged.is_none() && unstaged.is_none() && !untracked,
+            files: vec![protocol::ProjectGitFileStatus {
+                relative_path: "src/foo.rs".to_owned(),
+                staged,
+                unstaged,
+                untracked,
+            }],
         }
-
-        assert_close(
-            file_list.left(),
-            panes.left(),
-            1.0,
-            "file list should be the leftmost pane",
-        );
-        assert_close(
-            center.left(),
-            file_list.right(),
-            1.0,
-            "center diff should start where the file list ends",
-        );
-        assert_close(
-            sidebar.left(),
-            center.right(),
-            1.0,
-            "sidebar should start where the center diff ends",
-        );
-        assert_close(
-            sidebar.right(),
-            panes.right(),
-            1.0,
-            "sidebar should end at the right edge of the pane grid",
-        );
-
-        assert!(
-            (130.0..=190.0).contains(&file_list.width()),
-            "file list should render as a compact left rail, got {:.2}px",
-            file_list.width()
-        );
-        assert!(
-            (170.0..=230.0).contains(&sidebar.width()),
-            "sidebar should render as a compact right rail, got {:.2}px",
-            sidebar.width()
-        );
-        assert!(
-            center.width() > file_list.width() * 2.0 && center.width() > sidebar.width() * 2.0,
-            "center diff pane should get the primary width; file={:.2}px center={:.2}px \
-             sidebar={:.2}px",
-            file_list.width(),
-            center.width(),
-            sidebar.width()
-        );
     }
 
-    /// A diff payload with enough rendered lines to require vertical
-    /// scrolling inside `.diff-content` (container is 800px tall in
-    /// `make_container`, so 100 lines × ~16px easily overflows).
-    fn large_diff_payload() -> ProjectGitDiffPayload {
-        let mut lines = vec![ProjectGitDiffLine {
-            kind: ProjectGitDiffLineKind::Context,
-            text: "fn handle()".to_owned(),
-            old_line_number: Some(1),
-            new_line_number: Some(1),
-        }];
-        for i in 0..150 {
-            lines.push(ProjectGitDiffLine {
-                kind: ProjectGitDiffLineKind::Added,
-                text: format!("    let var_{i} = {i};"),
-                old_line_number: None,
-                new_line_number: Some((i as u32) + 2),
+    /// Fix 2: the chat "Review changes" button (gated on
+    /// `active_agent_has_reviewable_changes`) must stay hidden for a
+    /// staged-only root — reviews track `Unstaged`, so there'd be nothing to
+    /// open — and appear once an unstaged change exists.
+    #[wasm_bindgen_test]
+    async fn reviewable_changes_excludes_staged_only() {
+        let container = make_container();
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .agents
+                .update(|a| a.push(make_agent("Agent", "a1", Some("proj-1"))));
+            // `active_agent` is a Memo derived from the active Chat tab.
+            state.open_tab(
+                TabContent::chat_with_agent(ActiveAgentRef {
+                    host_id: "h1".to_owned(),
+                    agent_id: AgentId("a1".to_owned()),
+                }),
+                "chat".to_owned(),
+                true,
+            );
+            // Staged-only root: not reviewable.
+            state.git_status.update(|m| {
+                m.insert(
+                    ProjectId("proj-1".to_owned()),
+                    vec![root_status(
+                        "/repo",
+                        Some(protocol::ProjectGitChangeKind::Modified),
+                        None,
+                        false,
+                    )],
+                );
             });
-        }
-        let new_count = lines.len() as u32;
-        ProjectGitDiffPayload {
-            root: root_path(),
-            scope: ProjectDiffScope::Uncommitted,
-            path: None,
-            context_mode: DiffContextMode::FullFile,
-            files: vec![ProjectGitDiffFile {
-                relative_path: "src/foo.rs".to_owned(),
-                is_binary: false,
-                hunks: vec![ProjectGitDiffHunk {
-                    hunk_id: "src/foo.rs:1".to_owned(),
-                    old_start: 1,
-                    old_count: 1,
-                    new_start: 1,
-                    new_count,
-                    lines,
-                }],
-            }],
-        }
-    }
-
-    fn review_with_large_diff() -> Review {
-        let mut review = make_review();
-        review.diffs = vec![large_diff_payload()];
-        review
-    }
-
-    /// A diff payload whose one Added line is wider than the visible
-    /// review-center pane, so the diff forces horizontal overflow
-    /// inside `.diff-content`. Used for the comment-width-bound test —
-    /// without the scrollport-width clamp, the sticky thread region
-    /// would inherit the wider intrinsic width and overflow the pane.
-    fn wide_line_diff_payload() -> ProjectGitDiffPayload {
-        let very_long = "x".repeat(800);
-        ProjectGitDiffPayload {
-            root: root_path(),
-            scope: ProjectDiffScope::Uncommitted,
-            path: None,
-            context_mode: DiffContextMode::FullFile,
-            files: vec![ProjectGitDiffFile {
-                relative_path: "src/foo.rs".to_owned(),
-                is_binary: false,
-                hunks: vec![ProjectGitDiffHunk {
-                    hunk_id: "src/foo.rs:1".to_owned(),
-                    old_start: 1,
-                    old_count: 1,
-                    new_start: 1,
-                    new_count: 2,
-                    lines: vec![
-                        ProjectGitDiffLine {
-                            kind: ProjectGitDiffLineKind::Context,
-                            text: "fn handle()".to_owned(),
-                            old_line_number: Some(1),
-                            new_line_number: Some(1),
-                        },
-                        ProjectGitDiffLine {
-                            kind: ProjectGitDiffLineKind::Added,
-                            text: format!("    let very_long_var = \"{very_long}\";"),
-                            old_line_number: None,
-                            new_line_number: Some(2),
-                        },
-                    ],
-                }],
-            }],
-        }
-    }
-
-    /// BUG #1 GUARD: Adding a review comment must not remount the diff
-    /// scrollport. We assert two user-perceived invariants:
-    ///   * `.diff-content` keeps the same DOM node identity across the
-    ///     comment add (a remount would replace the element).
-    ///   * `scrollTop` is preserved.
-    ///
-    /// We drive the new comment by mutating the live AppState review
-    /// signal — that's the same code path dispatch hits when it
-    /// receives a `ReviewEvent::CommentUpsert` envelope, so this
-    /// matches what production wiring does. Before the fix the
-    /// top-level `match review_signal.get()` rebuilt `<ReviewBody>` on
-    /// every record change, which dropped the diff scroll position.
-    #[wasm_bindgen_test]
-    async fn adding_comment_preserves_scroll_and_node_identity() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = review_with_large_diff();
-        let review_id = review.id.clone();
-        let state_holder = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        // Capture the diff scroll container, scroll it, and remember
-        // both its DOM node identity and its scroll offset.
-        let diff_before = container
-            .query_selector(".diff-content")
-            .unwrap()
-            .expect("diff-content scroll container present");
-        let diff_html_before: HtmlElement = diff_before.clone().dyn_into().unwrap();
-        diff_html_before.set_scroll_top(500);
-        // Sanity: container actually scrolled (the diff is tall enough
-        // — if this asserts false the fixture's diff isn't large
-        // enough to scroll past 500px and the test is meaningless).
-        assert!(
-            diff_html_before.scroll_top() > 0,
-            "diff-content failed to scroll; layout did not produce a scrollable height"
-        );
-        let scroll_top_before = diff_html_before.scroll_top();
-
-        // Drive a CommentUpsert through the live AppState signal —
-        // mirrors what `dispatch_review_event` does on the wire.
-        let state = state_holder.borrow().clone().unwrap();
-        state.reviews.update(|map| {
-            if let Some(r) = map.get_mut(&review_id) {
-                r.comments.push(comment_at_line(2, "preserve scroll"));
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            let s = state.clone();
+            provide_context(state);
+            view! {
+                <div data-test="rc">
+                    {move || if active_agent_has_reviewable_changes(&s) { "yes" } else { "no" }}
+                </div>
             }
         });
-        next_tick().await;
-        next_tick().await;
-
-        // Same DOM node, scroll position not lost.
-        let diff_after = container
-            .query_selector(".diff-content")
-            .unwrap()
-            .expect("diff-content still present after comment upsert");
-        let diff_node_before: &web_sys::Node = diff_before.as_ref();
-        let diff_node_after: &web_sys::Node = diff_after.as_ref();
-        assert!(
-            diff_node_before.is_same_node(Some(diff_node_after)),
-            ".diff-content was remounted by the CommentUpsert — \
-             scroll position would be lost on every comment add"
-        );
-        let diff_html_after: HtmlElement = diff_after.dyn_into().unwrap();
-        let scroll_top_after = diff_html_after.scroll_top();
-        // The regression we're guarding against is a remount that
-        // resets scrollTop to 0. Browser scroll-anchoring may shift
-        // scrollTop slightly when virtualized rows above the viewport
-        // grow (e.g. a freshly rendered comment card under an
-        // upstream line), but it must not lose the user's place.
-        // Allow a generous downward tolerance — anything close to
-        // zero (i.e., a full remount) is the bug.
-        assert!(
-            scroll_top_after >= scroll_top_before - 50,
-            ".diff-content scroll position was lost after comment upsert; \
-             expected ≥ {} (within tolerance of {scroll_top_before}), got {scroll_top_after}",
-            scroll_top_before - 50
-        );
-        assert!(
-            scroll_top_after > 0,
-            ".diff-content scrollTop reset to top after comment upsert — \
-             the diff scrollport was remounted, dropping the user's place"
-        );
-    }
-
-    /// BUG #2 GUARD: a comment's rendered card must not require
-    /// horizontal scrolling beyond the visible review center pane.
-    /// Even when a diff line is wider than the pane and forces
-    /// horizontal overflow inside `.diff-content`, the sticky thread
-    /// region's width must be clamped to the visible scrollport.
-    #[wasm_bindgen_test]
-    async fn comment_width_bounded_by_visible_pane() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let mut review = make_review();
-        review.diffs = vec![wide_line_diff_payload()];
-        review.comments.push(comment_at_line(
-            2,
-            &format!(
-                "{} long comment body that would, absent the width \
-                 clamp, stretch to match the diff line below it.",
-                "extremely ".repeat(40)
-            ),
-        ));
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
+        std::mem::forget(handle);
         next_tick().await;
 
-        let diff_content = container
-            .query_selector(".diff-content")
-            .unwrap()
-            .expect("diff-content scroll container present");
-        let diff_html: HtmlElement = diff_content.clone().dyn_into().unwrap();
-        let viewport_width = diff_html.client_width() as f64;
-        assert!(
-            viewport_width > 0.0,
-            "diff-content has zero client_width; layout did not run"
+        let read = || {
+            container
+                .query_selector("[data-test=\"rc\"]")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            read(),
+            "no",
+            "staged-only changes must not make the project reviewable"
         );
 
-        let card = container
-            .query_selector(".review-comment-card")
-            .unwrap()
-            .expect("comment card rendered");
-        let card_rect = card.get_bounding_client_rect();
-        let diff_rect = diff_html.get_bounding_client_rect();
-
-        // Card width must be inside the visible viewport (give a 1px
-        // rounding tolerance — sub-pixel layout can produce a ~0.5px
-        // delta on some headless renderers).
-        assert!(
-            card_rect.width() <= viewport_width + 1.0,
-            "review comment card width {:.2}px exceeds diff viewport \
-             {:.2}px — the comment will require horizontal scrolling",
-            card_rect.width(),
-            viewport_width
-        );
-        // And its right edge must not extend past the diff pane's
-        // visible right edge (i.e., the comment is on-screen, not
-        // hidden behind the horizontal-scroll overflow).
-        assert!(
-            card_rect.right() <= diff_rect.right() + 1.0,
-            "comment right edge {:.2}px exceeds diff right edge {:.2}px \
-             — comment is hidden off-screen until user scrolls right",
-            card_rect.right(),
-            diff_rect.right()
+        // Flip the same root to an unstaged change ⇒ now reviewable.
+        let state = holder.borrow().clone().unwrap();
+        state.git_status.update(|m| {
+            m.insert(
+                ProjectId("proj-1".to_owned()),
+                vec![root_status(
+                    "/repo",
+                    None,
+                    Some(protocol::ProjectGitChangeKind::Modified),
+                    false,
+                )],
+            );
+        });
+        next_tick().await;
+        assert_eq!(
+            read(),
+            "yes",
+            "an unstaged change must make the project reviewable"
         );
     }
 
-    /// BUG #2 GUARD (SBS): in side-by-side mode, review comment
-    /// decorations render *inside* one of the `.diff-pane` columns.
-    /// Without a per-pane scrollport observer, the comment card
-    /// inherits `--diff-scrollport-width` from `.diff-content`, which
-    /// is wider than the pane, and the comment overflows the visible
-    /// pane. The fix attaches a `ResizeObserver` to each `.diff-pane`
-    /// that publishes its own `client_width` into the same CSS var —
-    /// the cascade then picks the pane's narrower value for elements
-    /// inside the pane.
+    /// Fix 3: `existing_draft_for_root` is per `(project, root)`. A Draft on
+    /// root A must NOT be reported for root B — otherwise the fallback create
+    /// would wrongly skip creating a review for B.
     #[wasm_bindgen_test]
-    async fn sbs_comment_width_bounded_by_pane() {
-        ensure_styles_loaded();
+    async fn existing_draft_lookup_is_root_scoped() {
         let container = make_container();
-        let mut review = make_review();
-        review.diffs = vec![wide_line_diff_payload()];
-        // New-side comment, so the thread region renders inside the
-        // right pane in SBS.
-        review.comments.push(comment_at_line(
-            2,
-            &format!(
-                "{} long comment body that would, without the pane \
-                 clamp, stretch to the diff-content scrollport width.",
-                "extremely ".repeat(40)
-            ),
-        ));
-        let state_holder = mount_review(container.clone(), review);
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // A single Draft summary anchored to root A only.
+            let summary = protocol::ReviewSummary {
+                id: ReviewId("rev-a".to_owned()),
+                root: ProjectRootPath("/repo-a".to_owned()),
+                status: ReviewStatus::Draft,
+                origin_session_id: SessionId("s".to_owned()),
+                origin_agent_id: AgentId("project-review:rev-a".to_owned()),
+                created_at_ms: 0,
+                updated_at_ms: 1,
+                user_comment_count: 0,
+                pending_suggestion_count: 0,
+            };
+            state.review_summaries.update(|m| {
+                m.insert(ProjectId("proj-1".to_owned()), vec![summary]);
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <div></div> }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
 
-        next_tick().await;
-        next_tick().await;
-
-        // Flip to side-by-side mode through the AppState signal —
-        // mirrors what the `ReviewLayoutToggle` button does on click.
-        let state = state_holder.borrow().clone().unwrap();
-        state
-            .diff_view_mode
-            .set(crate::state::DiffViewMode::SideBySide);
-
-        next_tick().await;
-        next_tick().await;
-        next_tick().await;
-
-        // Right pane is the New-side column where the comment lands.
-        let right_pane = container
-            .query_selector(".diff-pane-right")
-            .unwrap()
-            .expect("right pane present after switching to SBS");
-        let right_pane_html: HtmlElement = right_pane.clone().dyn_into().unwrap();
-        let pane_width = right_pane_html.client_width() as f64;
-        assert!(
-            pane_width > 0.0,
-            "right pane has zero client width; SBS layout did not run"
+        let state = holder.borrow().clone().unwrap();
+        let pid = ProjectId("proj-1".to_owned());
+        assert_eq!(
+            existing_draft_for_root(&state, &pid, &ProjectRootPath("/repo-a".to_owned())),
+            Some(ReviewId("rev-a".to_owned())),
+            "root A's own draft must be found"
         );
-
-        // The per-pane ResizeObserver must publish the pane's width
-        // — otherwise the CSS clamp falls through to whatever the
-        // outer `.diff-content` published (which is too wide).
-        let pane_var = right_pane_html
-            .style()
-            .get_property_value("--diff-scrollport-width")
-            .unwrap_or_default();
-        assert!(
-            !pane_var.is_empty() && pane_var.ends_with("px"),
-            "right pane missing --diff-scrollport-width inline style; \
-             got '{pane_var}'"
-        );
-
-        // Diff content is wider than the pane (the wide diff line
-        // forces it that way), so this comparison really exercises
-        // the pane-vs-content distinction. If diff_width <= pane_width
-        // the test is meaningless.
-        let diff_content = container
-            .query_selector(".diff-content")
-            .unwrap()
-            .expect("diff-content present");
-        let diff_content_html: HtmlElement = diff_content.dyn_into().unwrap();
-        let diff_width = diff_content_html.client_width() as f64;
-        assert!(
-            diff_width >= pane_width,
-            "diff content width {diff_width:.2}px should be at least \
-             the pane width {pane_width:.2}px"
-        );
-
-        let card = right_pane
-            .query_selector(".review-comment-card")
-            .unwrap()
-            .expect("comment card rendered inside right SBS pane");
-        let card_rect = card.get_bounding_client_rect();
-        let pane_rect = right_pane_html.get_bounding_client_rect();
-
-        assert!(
-            card_rect.width() <= pane_width + 1.0,
-            "SBS comment card width {:.2}px exceeds right-pane width \
-             {:.2}px — comment overflows the visible pane",
-            card_rect.width(),
-            pane_width
-        );
-        assert!(
-            card_rect.right() <= pane_rect.right() + 1.0,
-            "SBS comment right edge {:.2}px exceeds right-pane right \
-             edge {:.2}px — comment is hidden past the pane boundary",
-            card_rect.right(),
-            pane_rect.right()
-        );
-    }
-
-    /// BUG #2 GUARD (wiring): the `ResizeObserver` in `DiffContent`
-    /// must publish `--diff-scrollport-width` as an inline style on
-    /// `.diff-content` after mount. The CSS rules for the sticky
-    /// thread region depend on this var being set, so an unset var
-    /// would silently regress the comment width clamp.
-    #[wasm_bindgen_test]
-    async fn diff_content_publishes_scrollport_width_css_var() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let review = make_review();
-        let _ = mount_review(container.clone(), review);
-
-        next_tick().await;
-        next_tick().await;
-
-        let diff_content = container
-            .query_selector(".diff-content")
-            .unwrap()
-            .expect("diff-content present");
-        let diff_html: HtmlElement = diff_content.dyn_into().unwrap();
-        let var_value = diff_html
-            .style()
-            .get_property_value("--diff-scrollport-width")
-            .unwrap_or_default();
-        assert!(
-            !var_value.is_empty(),
-            "--diff-scrollport-width inline style is empty; ResizeObserver \
-             in DiffContent did not seed the CSS var. Got style.cssText='{}'",
-            diff_html.style().css_text()
-        );
-        // Value should be a px length matching client_width — sanity
-        // check that we're publishing a width, not some other unit.
-        assert!(
-            var_value.ends_with("px"),
-            "--diff-scrollport-width should be a px length, got '{var_value}'"
+        assert_eq!(
+            existing_draft_for_root(&state, &pid, &ProjectRootPath("/repo-b".to_owned())),
+            None,
+            "root A's draft must NOT satisfy a lookup for root B"
         );
     }
 
@@ -3735,21 +2292,6 @@ mod wasm_tests {
             }
         }
         None
-    }
-
-    fn element_by_selector(root: &HtmlElement, selector: &str) -> HtmlElement {
-        root.query_selector(selector)
-            .unwrap()
-            .unwrap_or_else(|| panic!("expected selector {selector} to match"))
-            .dyn_into()
-            .unwrap()
-    }
-
-    fn assert_close(actual: f64, expected: f64, tolerance: f64, message: &str) {
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "{message}: expected {expected:.2}px, got {actual:.2}px"
-        );
     }
 
     #[allow(dead_code)]

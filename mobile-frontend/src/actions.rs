@@ -349,19 +349,6 @@ pub async fn request_project_diff(
     .await
 }
 
-pub async fn create_review(
-    project: &crate::state::ActiveProjectRef,
-    selection: protocol::ReviewDiffSelection,
-) -> Result<(), String> {
-    send_frame(
-        &project.local_host_id,
-        project_stream(&project.project_id),
-        protocol::FrameKind::ReviewCreate,
-        &protocol::ReviewCreatePayload { selection },
-    )
-    .await
-}
-
 pub async fn subscribe_review(
     state: &AppState,
     host: &LocalHostId,

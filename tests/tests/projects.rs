@@ -8,7 +8,7 @@ use protocol::{
     ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload,
     ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
     ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload,
-    ProjectStageHunkPayload,
+    ProjectStageHunkPayload, ReviewStatus,
 };
 use std::fs;
 use std::path::Path;
@@ -35,6 +35,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::ProjectEvent
         ) {
             continue;
         }
@@ -58,6 +59,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionList
+                            | FrameKind::ProjectEvent
                     ) =>
             {
                 continue;
@@ -550,6 +552,7 @@ async fn create_project_pushes_file_list_and_git_status() {
     let ProjectBootstrapPayload {
         file_list,
         git_status,
+        review_summaries,
         ..
     } = expect_project_bootstrap(
         &mut fixture.client,
@@ -567,6 +570,10 @@ async fn create_project_pushes_file_list_and_git_status() {
 
     assert_eq!(git_status.roots.len(), 1);
     assert!(git_status.roots[0].clean);
+
+    assert_eq!(review_summaries.len(), 1);
+    assert_eq!(review_summaries[0].root.0, project.roots[0]);
+    assert!(matches!(review_summaries[0].status, ReviewStatus::Draft));
 }
 
 #[tokio::test]
@@ -588,6 +595,7 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     let ProjectBootstrapPayload {
         file_list,
         git_status,
+        review_summaries,
         ..
     } = expect_project_bootstrap(&mut fixture.client, "server-pushed project bootstrap").await;
     assert_eq!(file_list.roots.len(), 2);
@@ -609,6 +617,19 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     assert_eq!(git_status.roots.len(), 2);
     assert!(git_status.roots.iter().all(|root| root.clean));
     assert!(git_status.roots.iter().all(|root| root.files.is_empty()));
+
+    assert_eq!(review_summaries.len(), 2);
+    let summary_roots = review_summaries
+        .iter()
+        .map(|summary| summary.root.0.as_str())
+        .collect::<Vec<_>>();
+    assert!(summary_roots.contains(&project.roots[0].as_str()));
+    assert!(summary_roots.contains(&project.roots[1].as_str()));
+    assert!(
+        review_summaries
+            .iter()
+            .all(|summary| matches!(summary.status, ReviewStatus::Draft))
+    );
 }
 
 #[tokio::test]

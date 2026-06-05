@@ -76,7 +76,8 @@ use crate::review::reviewer::{
     reviewer_tool_policy,
 };
 use crate::review::{
-    ReviewRegistry, ReviewRegistryHandle, build_create_request, review_stream_path,
+    ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_root,
+    review_stream_path,
 };
 use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
@@ -4504,42 +4505,36 @@ impl HostHandle {
             )
         };
 
-        if let Some(existing) = review_registry
-            .summaries(project_id.clone())
-            .await
-            .map_err(|error| AppError::internal_message(OPERATION, error.clone(), anyhow!(error)))?
-            .into_iter()
-            .find(|summary| matches!(summary.status, protocol::ReviewStatus::Draft))
-        {
-            let review_stream = project_output_stream.with_path(review_stream_path(&existing.id));
-            review_registry
-                .subscribe(
-                    existing.id.clone(),
-                    connection_host_stream.clone(),
-                    review_stream,
-                )
-                .await
-                .map_err(|error| {
-                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-                })?;
-            tracing::info!(review_id = %existing.id, project_id = %project_id, "attached to existing review");
-            return Ok(());
-        }
-
         let project = load_project(&project_store, &project_id, OPERATION).await?;
+        let root = review_create_root(&project, &payload.selection)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        let normalized_selection = match &payload.selection {
+            ReviewDiffSelection::Root { .. } => ReviewDiffSelection::Root {
+                root: root.clone(),
+                scope: protocol::ProjectDiffScope::Unstaged,
+                path: None,
+            },
+            ReviewDiffSelection::AllUncommitted => ReviewDiffSelection::Root {
+                root: root.clone(),
+                scope: protocol::ProjectDiffScope::Unstaged,
+                path: None,
+            },
+        };
 
         let diff_started = Instant::now();
         tracing::debug!(
             project_id = %project_id,
             selection_kind = payload.selection.kind_name(),
+            root = %root,
             "reading initial review diffs"
         );
-        let diffs = match read_review_diffs(&project, &payload.selection) {
+        let diffs = match read_review_diffs(&project, &normalized_selection) {
             Ok(diffs) => {
                 let stats = host_diff_stats(&diffs);
                 tracing::info!(
                     project_id = %project_id,
                     selection_kind = payload.selection.kind_name(),
+                    root = %root,
                     diff_count = stats.diff_count,
                     file_count = stats.file_count,
                     hunk_count = stats.hunk_count,
@@ -4553,6 +4548,7 @@ impl HostHandle {
                 tracing::warn!(
                     project_id = %project_id,
                     selection_kind = payload.selection.kind_name(),
+                    root = %root,
                     elapsed_ms = diff_started.elapsed().as_millis() as u64,
                     error_len = error.len(),
                     "failed to read initial review diffs"
@@ -4568,9 +4564,11 @@ impl HostHandle {
         tracing::debug!(
             project_id = %project_id,
             review_id = %review_id,
+            root = %root,
             "creating or getting review actor"
         );
-        let request = build_create_request(review_id.clone(), project_id.clone(), payload, diffs);
+        let request =
+            build_create_request(review_id.clone(), project_id.clone(), root, payload, diffs);
         let review_id = review_registry.create(request).await.map_err(|error| {
             AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
         })?;
@@ -5127,7 +5125,7 @@ fn read_review_diffs(
             for root in &project.roots {
                 let payload = ProjectReadDiffPayload {
                     root: ProjectRootPath(root.clone()),
-                    scope: protocol::ProjectDiffScope::Uncommitted,
+                    scope: protocol::ProjectDiffScope::Unstaged,
                     path: None,
                     context_mode: protocol::DiffContextMode::FullFile,
                 };
@@ -5139,16 +5137,19 @@ fn read_review_diffs(
             }
             Ok(diffs)
         }
-        ReviewDiffSelection::Root { root, scope, path } => read_diff(
-            project,
-            ProjectReadDiffPayload {
+        ReviewDiffSelection::Root { root, path, .. } => {
+            let payload = ProjectReadDiffPayload {
                 root: root.clone(),
-                scope: *scope,
+                scope: protocol::ProjectDiffScope::Unstaged,
                 path: path.clone(),
                 context_mode: protocol::DiffContextMode::FullFile,
-            },
-        )
-        .map(|diff| vec![diff]),
+            };
+            match read_diff(project, payload) {
+                Ok(diff) => Ok(vec![diff]),
+                Err(error) if is_not_git_repository_error(&error) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        }
     }
 }
 
@@ -6431,9 +6432,6 @@ async fn emit_review_list_changed_for_project(
     project_id: ProjectId,
 ) -> Result<(), String> {
     let summaries = state.review_registry.summaries(project_id.clone()).await?;
-    if summaries.is_empty() {
-        return Ok(());
-    }
     let handle = ensure_project_actor(state, project_id).await?;
     handle
         .emit_project_event(protocol::ProjectEventPayload::ReviewListChanged { reviews: summaries })

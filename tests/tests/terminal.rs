@@ -37,6 +37,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
                 | FrameKind::ProjectBootstrap
+                | FrameKind::ProjectEvent
         ) {
             continue;
         }
@@ -62,6 +63,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionList
                             | FrameKind::ProjectBootstrap
+                            | FrameKind::ProjectEvent
                     ) =>
             {
                 continue;

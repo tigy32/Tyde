@@ -426,7 +426,7 @@ async fn refresh_full(
 
     fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
     fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
-    reset_reviews_if_working_tree_clean(review_registry, project_id, &git_status).await;
+    reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
     refresh_remembered_diffs(project, snapshot, subscribers).await;
     Ok(())
 }
@@ -468,7 +468,7 @@ async fn refresh_incremental(
         if snapshot.git_status.as_ref() != Some(&git_json) {
             snapshot.git_status = Some(git_json);
             fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
-            reset_reviews_if_working_tree_clean(review_registry, project_id, &git_status).await;
+            reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
             refresh_remembered_diffs(project, snapshot, subscribers).await;
         }
     }
@@ -552,28 +552,36 @@ fn full_file_list_from_raw(
     }
 }
 
-async fn reset_reviews_if_working_tree_clean(
+async fn reset_reviews_for_clean_unstaged_roots(
     review_registry: &ReviewRegistryHandle,
     project_id: &ProjectId,
     git_status: &ProjectGitStatusPayload,
 ) {
-    if !project_git_status_is_clean(git_status) {
+    let roots = git_status
+        .roots
+        .iter()
+        .filter(|root| root_unstaged_changes_are_clean(root))
+        .map(|root| root.root.clone())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
         return;
     }
     if let Err(error) = review_registry
-        .reset_project_for_clean_working_tree(project_id.clone())
+        .reset_project_roots_for_clean_unstaged(project_id.clone(), roots)
         .await
     {
         tracing::warn!(
             project_id = %project_id,
             error = %error,
-            "failed to reset reviews after clean git status"
+            "failed to reset reviews after clean unstaged git status"
         );
     }
 }
 
-fn project_git_status_is_clean(git_status: &ProjectGitStatusPayload) -> bool {
-    git_status.roots.iter().all(|root| root.clean)
+fn root_unstaged_changes_are_clean(root: &ProjectRootGitStatus) -> bool {
+    root.files
+        .iter()
+        .all(|file| file.unstaged.is_none() && !file.untracked)
 }
 
 fn serialize_git_status(git_status: &ProjectGitStatusPayload) -> Result<Value, String> {

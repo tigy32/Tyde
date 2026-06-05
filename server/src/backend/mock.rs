@@ -31,10 +31,11 @@ pub(crate) const SPAWN_NATIVE_CHILD_AND_DROP_SENTINEL: &str =
     "__mock_spawn_native_child_and_drop__";
 const MOCK_CANCEL_TURN_SENTINEL: &str = "__mock_cancel__";
 const MOCK_COMPACT_SENTINEL: &str = "/compact";
-/// Causes `emit_turn` to sleep 2 s before emitting `TypingStatusChanged(false)`.
-/// This gives tests a reliable window to send queued messages while the agent
-/// is still in-turn, without relying on wall-clock races.  The long window also
-/// gives replay tests enough time to connect a second client and verify state.
+/// Causes `emit_turn` to sleep (see `MOCK_SLOW_SLEEP_MS`) before emitting
+/// `TypingStatusChanged(false)`.  This gives tests a reliable window to send
+/// queued messages while the agent is still in-turn, without relying on
+/// wall-clock races.  The window also gives replay tests enough time to
+/// connect a second client and verify state.
 pub(crate) const MOCK_SLOW_TURN_SENTINEL: &str = "__mock_slow__";
 pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// Causes the mock backend task to emit `TypingStatusChanged(true)`, sleep 300 ms,
@@ -48,7 +49,13 @@ const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
 const MOCK_EXIT_PLAN_MODE_PLAN_PATH: &str = "/tmp/mock/.claude/plans/mock-plan.md";
 /// Sleep for __mock_slow__ turns — long enough for replay tests to connect a
 /// second client and see the queued-message snapshot before the turn ends.
-const MOCK_SLOW_SLEEP_MS: u64 = 2_000;
+///
+/// Sized against two bounds: it must exceed the time for a second client to
+/// connect and replay the agent bootstrap (~1 s, and higher under load), yet
+/// stay under the 5 s per-event `next_event` timeout used by tests that wait
+/// for the slow turn to finish — the trailing `TypingStatusChanged(false)` is
+/// emitted only after this sleep. 4 s sits comfortably between the two.
+const MOCK_SLOW_SLEEP_MS: u64 = 4_000;
 /// Sleep for __mock_die_after_busy__ — just enough for tests to queue messages.
 const MOCK_DIE_SLEEP_MS: u64 = 300;
 

@@ -9,14 +9,14 @@ use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, DiffContextMode,
     Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
-    ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review,
-    ReviewActionPayload, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor,
-    ReviewBootstrapPayload, ReviewCommentId, ReviewCommentSource, ReviewCreatePayload,
-    ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewEventPayload, ReviewId,
-    ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubmitTarget, ReviewSubscribePayload,
-    ReviewSuggestedComment, ReviewSuggestionState, SessionId, SessionListPayload, SpawnAgentParams,
-    SpawnAgentPayload,
+    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload,
+    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
+    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
+    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewCommentId,
+    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
+    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubmitTarget,
+    ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, SessionId,
+    SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -44,6 +44,55 @@ async fn expect_project(client: &mut client::Connection, context: &str) -> Proje
         {
             ProjectNotifyPayload::Upsert { project } => return project,
             ProjectNotifyPayload::Delete { .. } => continue,
+        }
+    }
+}
+
+async fn expect_project_bootstrap(
+    client: &mut client::Connection,
+    project: &Project,
+) -> ProjectBootstrapPayload {
+    loop {
+        let env = next_env(client, "project bootstrap").await;
+        if env.kind == FrameKind::ProjectBootstrap
+            && env.stream.0 == format!("/project/{}", project.id.0)
+        {
+            return env.parse_payload().expect("project bootstrap payload");
+        }
+    }
+}
+
+async fn expect_existing_review_create_echo(
+    client: &mut client::Connection,
+    project: &Project,
+    review_id: &ReviewId,
+) {
+    let mut saw_bootstrap = false;
+    let mut saw_list_changed = false;
+    while !saw_bootstrap || !saw_list_changed {
+        let env = next_env(client, "existing review_create echo").await;
+        match env.kind {
+            FrameKind::ReviewBootstrap => {
+                let bootstrap: ReviewBootstrapPayload =
+                    env.parse_payload().expect("review bootstrap payload");
+                if bootstrap.review.id == *review_id {
+                    saw_bootstrap = true;
+                }
+            }
+            FrameKind::ProjectEvent if env.stream.0 == format!("/project/{}", project.id.0) => {
+                match env
+                    .parse_payload::<ProjectEventPayload>()
+                    .expect("project event payload")
+                {
+                    ProjectEventPayload::ReviewListChanged { reviews }
+                        if reviews.iter().any(|summary| summary.id == *review_id) =>
+                    {
+                        saw_list_changed = true;
+                    }
+                    ProjectEventPayload::ReviewListChanged { .. } => {}
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -128,33 +177,6 @@ async fn expect_review_error(
             error
         }
         other => panic!("expected review error {code:?}, got {other:?}"),
-    }
-}
-
-async fn expect_review_list_changed(
-    client: &mut client::Connection,
-    project: &Project,
-    review: &Review,
-) {
-    loop {
-        let env = next_env(client, "review list changed").await;
-        if env.kind != FrameKind::ProjectEvent {
-            continue;
-        }
-        if env.stream.0 != format!("/project/{}", project.id.0) {
-            continue;
-        }
-        match env
-            .parse_payload::<ProjectEventPayload>()
-            .expect("project event payload")
-        {
-            ProjectEventPayload::ReviewListChanged { reviews }
-                if reviews.iter().any(|summary| summary.id == review.id) =>
-            {
-                return;
-            }
-            ProjectEventPayload::ReviewListChanged { .. } => {}
-        }
     }
 }
 
@@ -362,11 +384,15 @@ fn sample_stored_review(
         project_id: project.id.clone(),
         origin_agent_id: AgentId("550e8400-e29b-41d4-a716-446655440001".to_owned()),
         origin_session_id: SessionId("stored-session".to_owned()),
-        selection: ReviewDiffSelection::AllUncommitted,
+        selection: ReviewDiffSelection::Root {
+            root: ProjectRootPath(root.to_string_lossy().to_string()),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        },
         status,
         diffs: vec![ProjectGitDiffPayload {
             root: ProjectRootPath(root.to_string_lossy().to_string()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
             context_mode: DiffContextMode::FullFile,
             files: Vec::new(),
@@ -390,11 +416,23 @@ async fn create_review(
     project: &Project,
     _origin: &NewAgentPayload,
 ) -> Review {
+    create_review_for_root(client, project, &project.roots[0]).await
+}
+
+async fn create_review_for_root(
+    client: &mut client::Connection,
+    project: &Project,
+    root: &str,
+) -> Review {
     client
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::AllUncommitted,
+                selection: ReviewDiffSelection::Root {
+                    root: ProjectRootPath(root.to_owned()),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: None,
+                },
             },
         )
         .await
@@ -506,6 +544,59 @@ fn tyde_review_json(markdown: &str) -> &str {
 }
 
 #[tokio::test]
+async fn project_bootstrap_exposes_one_active_review_per_root() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo_a = root.path().join("review-root-a");
+    let repo_b = root.path().join("review-root-b");
+    fs::create_dir_all(&repo_a).expect("create repo a");
+    fs::create_dir_all(&repo_b).expect("create repo b");
+    seed_repo(&repo_a);
+    seed_repo(&repo_b);
+
+    let project = create_project_with_roots(
+        &mut client,
+        vec![
+            repo_a.to_string_lossy().to_string(),
+            repo_b.to_string_lossy().to_string(),
+        ],
+    )
+    .await;
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+
+    assert_eq!(bootstrap.review_summaries.len(), 2);
+    let roots = bootstrap
+        .review_summaries
+        .iter()
+        .map(|summary| summary.root.0.as_str())
+        .collect::<Vec<_>>();
+    assert!(roots.contains(&project.roots[0].as_str()));
+    assert!(roots.contains(&project.roots[1].as_str()));
+    assert!(
+        bootstrap
+            .review_summaries
+            .iter()
+            .all(|summary| matches!(summary.status, ReviewStatus::Draft))
+    );
+
+    let first = &bootstrap.review_summaries[0];
+    let review = subscribe_review(&mut client, &first.id).await;
+    assert_eq!(review.project_id, project.id);
+    assert_eq!(
+        review.selection,
+        ReviewDiffSelection::Root {
+            root: first.root.clone(),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        }
+    );
+    assert_eq!(review.diffs.len(), 1);
+    assert_eq!(review.diffs[0].root, first.root);
+    assert_eq!(review.diffs[0].scope, ProjectDiffScope::Unstaged);
+}
+
+#[tokio::test]
 async fn create_review_add_update_delete_and_submit_live() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
@@ -519,7 +610,7 @@ async fn create_review_add_update_delete_and_submit_live() {
     let review = create_review(&mut client, &project, &agent).await;
 
     assert_eq!(review.diffs.len(), 1);
-    assert_eq!(review.diffs[0].scope, ProjectDiffScope::Uncommitted);
+    assert_eq!(review.diffs[0].scope, ProjectDiffScope::Unstaged);
     assert_eq!(review.diffs[0].context_mode, DiffContextMode::FullFile);
 
     let comment_id = add_comment(&mut client, &review, "Please handle this change.").await;
@@ -575,7 +666,7 @@ async fn create_review_add_update_delete_and_submit_live() {
 }
 
 #[tokio::test]
-async fn create_review_skips_non_git_roots_in_multi_root_project() {
+async fn root_scoped_review_create_uses_selected_project_root() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
@@ -600,19 +691,18 @@ async fn create_review_skips_non_git_roots_in_multi_root_project() {
     ];
 
     let project = create_project_with_roots(&mut client, project_roots).await;
-    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
-    let review = create_review(&mut client, &project, &agent).await;
+    let (_agent, _session_id) = spawn_project_agent(&mut client, &project).await;
 
-    assert_eq!(review.diffs.len(), 4);
-    assert!(review.diffs.iter().all(|diff| diff.root.0 != plain_root));
     for git_root in &git_roots {
         let git_root = git_root.to_string_lossy();
+        let review = create_review_for_root(&mut client, &project, &git_root).await;
+        assert_eq!(review.diffs.len(), 1);
         let diff = review
             .diffs
             .iter()
             .find(|diff| diff.root.0 == git_root)
             .unwrap_or_else(|| panic!("missing review diff for {git_root}"));
-        assert_eq!(diff.scope, ProjectDiffScope::Uncommitted);
+        assert_eq!(diff.scope, ProjectDiffScope::Unstaged);
         assert_eq!(diff.context_mode, DiffContextMode::FullFile);
         assert!(
             diff.files
@@ -621,7 +711,17 @@ async fn create_review_skips_non_git_roots_in_multi_root_project() {
             "missing src/lib.rs diff for {git_root}"
         );
     }
-    expect_review_list_changed(&mut client, &project, &review).await;
+
+    let review = create_review_for_root(&mut client, &project, &plain_root).await;
+    assert!(review.diffs.is_empty());
+    assert_eq!(
+        review.selection,
+        ReviewDiffSelection::Root {
+            root: ProjectRootPath(plain_root),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        }
+    );
 }
 
 #[tokio::test]
@@ -647,7 +747,6 @@ async fn create_review_with_only_non_git_roots_succeeds_empty() {
     let review = create_review(&mut client, &project, &agent).await;
 
     assert!(review.diffs.is_empty());
-    expect_review_list_changed(&mut client, &project, &review).await;
 }
 
 #[tokio::test]
@@ -664,7 +763,11 @@ async fn create_review_does_not_require_origin_agent() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::AllUncommitted,
+                selection: ReviewDiffSelection::Root {
+                    root: ProjectRootPath(project.roots[0].clone()),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: None,
+                },
             },
         )
         .await
@@ -704,7 +807,11 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::AllUncommitted,
+                selection: ReviewDiffSelection::Root {
+                    root: ProjectRootPath(project.roots[0].clone()),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: None,
+                },
             },
         )
         .await
@@ -944,6 +1051,30 @@ async fn review_resets_when_uncommitted_diff_becomes_clean() {
 
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "Apply changes"]);
+
+    let snapshot = subscribe_review(&mut client, &review.id).await;
+    assert!(matches!(snapshot.status, ReviewStatus::Draft));
+    assert!(snapshot.comments.is_empty());
+    assert!(snapshot.suggestions.is_empty());
+    assert_eq!(snapshot.ai_reviewer.status, ReviewAiReviewerStatus::Idle);
+    assert!(snapshot.diffs.is_empty());
+}
+
+#[tokio::test]
+async fn review_resets_when_unstaged_diff_becomes_clean_with_staged_changes() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+    let _comment_id = add_comment(&mut client, &review, "Staged reset comment.").await;
+
+    git(&repo, &["add", "."]);
 
     let snapshot = subscribe_review(&mut client, &review.id).await;
     assert!(matches!(snapshot.status, ReviewStatus::Draft));
@@ -1249,7 +1380,11 @@ async fn second_review_create_attaches_to_existing_singleton() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::AllUncommitted,
+                selection: ReviewDiffSelection::Root {
+                    root: ProjectRootPath(project.roots[0].clone()),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: None,
+                },
             },
         )
         .await
@@ -1282,6 +1417,42 @@ async fn second_review_create_attaches_to_existing_singleton() {
         "create after cancel should yield a fresh singleton id"
     );
     assert!(matches!(third.status, ReviewStatus::Draft));
+}
+
+#[tokio::test]
+async fn fallback_review_create_for_existing_draft_echoes_review_list() {
+    let fixture = Fixture::new().await;
+    let mut owner = fixture.connect().await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut owner, &repo).await;
+    let mut client = fixture.connect().await;
+
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                selection: ReviewDiffSelection::Root {
+                    root: ProjectRootPath(project.roots[0].clone()),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: None,
+                },
+            },
+        )
+        .await
+        .expect("fallback review create");
+
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    let summary = bootstrap
+        .review_summaries
+        .iter()
+        .find(|summary| summary.root.0 == project.roots[0])
+        .expect("active draft summary for project root");
+
+    expect_existing_review_create_echo(&mut client, &project, &summary.id).await;
 }
 
 #[tokio::test]
@@ -1440,4 +1611,57 @@ async fn rehydrate_status_variants_and_subscribe_terminal_reviews() {
             other => panic!("unexpected review id {other}"),
         }
     }
+}
+
+#[tokio::test]
+async fn legacy_project_only_drafts_do_not_surface_as_active_summaries() {
+    let fixture = Fixture::new().await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+    let mut setup_client = fixture.connect().await;
+    let project = create_project(&mut setup_client, &repo).await;
+
+    let reviews_path = fixture.store_dir().join("reviews.json");
+    let mut first = sample_stored_review(
+        "550e8400-e29b-41d4-a716-446655440201",
+        &project,
+        &repo,
+        ReviewStatus::Draft,
+        ReviewAiReviewerStatus::Idle,
+    );
+    first.selection = ReviewDiffSelection::AllUncommitted;
+    let mut second = sample_stored_review(
+        "550e8400-e29b-41d4-a716-446655440202",
+        &project,
+        &repo,
+        ReviewStatus::Draft,
+        ReviewAiReviewerStatus::Idle,
+    );
+    second.selection = ReviewDiffSelection::AllUncommitted;
+    second.updated_at_ms = 3;
+    let records = [&first, &second]
+        .into_iter()
+        .map(|review| {
+            (
+                review.id.0.clone(),
+                serde_json::to_value(review).expect("review JSON"),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    fs::write(
+        &reviews_path,
+        serde_json::to_vec_pretty(&json!({ "records": records })).expect("reviews store JSON"),
+    )
+    .expect("write reviews store");
+
+    let mut client = fixture.connect_fresh_host().await;
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    assert_eq!(bootstrap.review_summaries.len(), 1);
+    let summary = &bootstrap.review_summaries[0];
+    assert_eq!(summary.root.0, repo.to_string_lossy().to_string());
+    assert_ne!(summary.id, first.id);
+    assert_ne!(summary.id, second.id);
+    assert!(matches!(summary.status, ReviewStatus::Draft));
 }

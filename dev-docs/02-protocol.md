@@ -369,6 +369,9 @@ pub enum RejectCode {
   adds explicit bootstrap frame kinds; see `21-bootstrap-streams.md`.
 - `WelcomePayload` has no bootstrap field. Initial state is sent as typed
   stream bootstrap frames after the handshake.
+- `ProjectBootstrapPayload.review_summaries` and
+  `ProjectEventPayload::ReviewListChanged` carry `ReviewSummary.root` so
+  clients can bind the implicit active review to the exact project root diff.
 - `StreamPath` wraps `String` for type safety. It will gain validation
   (must start with `/`, valid segments) when we add stream creation logic.
 

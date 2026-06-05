@@ -93,9 +93,6 @@ pub(crate) enum ReviewCommand {
     Snapshot {
         reply: oneshot::Sender<Review>,
     },
-    Summary {
-        reply: oneshot::Sender<protocol::ReviewSummary>,
-    },
 }
 
 pub(crate) fn spawn_review_actor(
@@ -197,9 +194,6 @@ impl ReviewActor {
                 }
                 ReviewCommand::Snapshot { reply } => {
                     let _ = reply.send(self.review.clone());
-                }
-                ReviewCommand::Summary { reply } => {
-                    let _ = reply.send(summary_for_review(&self.review));
                 }
             }
         }
@@ -1529,7 +1523,7 @@ fn read_review_diffs(
             for root in &project.roots {
                 let payload = ProjectReadDiffPayload {
                     root: ProjectRootPath(root.clone()),
-                    scope: ProjectDiffScope::Uncommitted,
+                    scope: ProjectDiffScope::Unstaged,
                     path: None,
                     context_mode: DiffContextMode::FullFile,
                 };
@@ -1541,16 +1535,19 @@ fn read_review_diffs(
             }
             Ok(diffs)
         }
-        ReviewDiffSelection::Root { root, scope, path } => read_diff(
-            project,
-            ProjectReadDiffPayload {
+        ReviewDiffSelection::Root { root, path, .. } => {
+            let payload = ProjectReadDiffPayload {
                 root: root.clone(),
-                scope: *scope,
+                scope: ProjectDiffScope::Unstaged,
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
-            },
-        )
-        .map(|diff| vec![diff]),
+            };
+            match read_diff(project, payload) {
+                Ok(diff) => Ok(vec![diff]),
+                Err(error) if is_not_git_repository_error(&error) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        }
     }
 }
 
@@ -1665,6 +1662,7 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
         .count() as u32;
     protocol::ReviewSummary {
         id: review.id.clone(),
+        root: review_summary_root(review).unwrap_or_default(),
         status: review.status.clone(),
         origin_session_id: review.origin_session_id.clone(),
         origin_agent_id: review.origin_agent_id.clone(),
@@ -1672,6 +1670,16 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
         updated_at_ms: review.updated_at_ms,
         user_comment_count,
         pending_suggestion_count,
+    }
+}
+
+pub(crate) fn review_summary_root(review: &Review) -> Option<ProjectRootPath> {
+    match &review.selection {
+        ReviewDiffSelection::Root { root, .. } => Some(root.clone()),
+        ReviewDiffSelection::AllUncommitted => match review.diffs.as_slice() {
+            [diff] => Some(diff.root.clone()),
+            _ => None,
+        },
     }
 }
 

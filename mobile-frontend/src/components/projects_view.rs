@@ -2,11 +2,7 @@ use leptos::prelude::*;
 
 use crate::components::diff_viewer::DiffViewer;
 use crate::components::file_viewer::FileViewer;
-use crate::components::review_detail::ReviewDetail;
-use crate::components::reviews_view::ReviewsView;
-use crate::components::ui::{
-    Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, StatusDot, StatusTone,
-};
+use crate::components::ui::{Card, EmptyState, Pill, PillTone, StatusDot, StatusTone};
 use crate::state::{ActiveProjectRef, AppState};
 
 /// Per-host project list with read-only file tree once a project is
@@ -31,16 +27,6 @@ enum ProjectDetail {
     },
 }
 
-/// Review-pane local UI state. Reviews live inside Projects: the user
-/// can be looking at the list of reviews for the active project, the
-/// detail for a specific review, or neither.
-#[derive(Clone, Debug, PartialEq)]
-enum ReviewPane {
-    None,
-    List,
-    Detail(protocol::ReviewId),
-}
-
 #[component]
 pub fn ProjectsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -49,14 +35,12 @@ pub fn ProjectsView() -> impl IntoView {
     // Cleared when the active project changes via the `Effect` below
     // so a stale path from a previous project doesn't linger.
     let detail: RwSignal<ProjectDetail> = RwSignal::new(ProjectDetail::None);
-    let review_pane: RwSignal<ReviewPane> = RwSignal::new(ReviewPane::None);
 
     {
         let state = state.clone();
         Effect::new(move |_| {
             let _ = state.active_project.get();
             detail.set(ProjectDetail::None);
-            review_pane.set(ReviewPane::None);
         });
     }
 
@@ -66,55 +50,7 @@ pub fn ProjectsView() -> impl IntoView {
                 <h1 class="view-title">"Projects"</h1>
             </header>
             <div class="view-body">
-                {
-                    // Review overlays. When a review is open the rest of
-                    // the projects view yields to it so phone-sized
-                    // screens don't stack two scrollers.
-                    let state_for_review = state.clone();
-                    move || {
-                        match review_pane.get() {
-                            ReviewPane::None => view! { <div></div> }.into_any(),
-                            ReviewPane::List => {
-                                let Some(project) = state_for_review.active_project.get() else {
-                                    return view! { <div></div> }.into_any();
-                                };
-                                let on_open = Callback::new(move |id: protocol::ReviewId| {
-                                    review_pane.set(ReviewPane::Detail(id));
-                                });
-                                let on_close = Callback::new(move |_: ()| {
-                                    review_pane.set(ReviewPane::None);
-                                });
-                                view! {
-                                    <ReviewsView
-                                        project=project
-                                        on_open=on_open
-                                        on_close=on_close
-                                    />
-                                }.into_any()
-                            }
-                            ReviewPane::Detail(review_id) => {
-                                let Some(project) = state_for_review.active_project.get() else {
-                                    return view! { <div></div> }.into_any();
-                                };
-                                let host = project.local_host_id.clone();
-                                let on_close = Callback::new(move |_: ()| {
-                                    review_pane.set(ReviewPane::List);
-                                });
-                                view! {
-                                    <ReviewDetail
-                                        host=host
-                                        review_id=review_id
-                                        on_close=on_close
-                                    />
-                                }.into_any()
-                            }
-                        }
-                    }
-                }
                 {move || {
-                    if review_pane.get() != ReviewPane::None {
-                        return view! { <div></div> }.into_any();
-                    }
                     let active_host = state.active_local_host_id.get();
                     let projects: Vec<_> = state
                         .projects
@@ -265,29 +201,11 @@ pub fn ProjectsView() -> impl IntoView {
                                 }.into_any();
                             }
                             let active_for_rows = active.clone();
-                            let review_summary_count = state.review_summaries.with(|m| {
-                                m.get(&key).map(|v| v.len()).unwrap_or(0)
-                            });
+                            // Reviews are always-on and root-scoped: comment,
+                            // count, and submit controls live inline on the
+                            // per-root "View diff" surface (`DiffViewer`),
+                            // not in a separate reviews modal.
                             view! {
-                                <Show when=move || { review_summary_count > 0 } fallback=|| ()>
-                                    <div class="project-reviews-row" data-mobile-test="projects-reviews-row">
-                                        <Pill
-                                            label=format!("{review_summary_count} review{}",
-                                                if review_summary_count == 1 { "" } else { "s" })
-                                            tone=PillTone::Accent
-                                            data_mobile_test="projects-reviews-pill"
-                                        />
-                                        <Button
-                                            label="Open reviews"
-                                            variant=ButtonVariant::Primary
-                                            size=ButtonSize::Compact
-                                            data_mobile_test="projects-open-reviews"
-                                            on_click=Callback::new(move |_: ()| {
-                                                review_pane.set(ReviewPane::List);
-                                            })
-                                        />
-                                    </div>
-                                </Show>
                                 <div class="project-detail" data-mobile-test="project-file-tree">
                                     {listings.into_iter().map(|listing| {
                                         let root_path = listing.root.clone();
@@ -310,7 +228,7 @@ pub fn ProjectsView() -> impl IntoView {
                                         let on_view_diff = Callback::new(move |_: ()| {
                                             detail.set(ProjectDetail::Diff {
                                                 root: diff_root.clone(),
-                                                scope: protocol::ProjectDiffScope::Uncommitted,
+                                                scope: protocol::ProjectDiffScope::Unstaged,
                                                 path: None,
                                             });
                                         });
@@ -329,7 +247,7 @@ pub fn ProjectsView() -> impl IntoView {
                                                             variant=crate::components::ui::ButtonVariant::Ghost
                                                             size=crate::components::ui::ButtonSize::Compact
                                                             data_mobile_test="project-view-diff"
-                                                            aria_label=format!("View uncommitted diff for {root_label}")
+                                                            aria_label=format!("View unstaged diff for {root_label}")
                                                             on_click=on_view_diff
                                                         />
                                                     </span>

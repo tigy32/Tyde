@@ -83,6 +83,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
+                | FrameKind::ProjectEvent
         ) {
             continue;
         }
@@ -234,6 +235,7 @@ async fn expect_session_list(
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
+                | FrameKind::ProjectEvent
         ) {
             continue;
         }

@@ -273,10 +273,8 @@ async fn runtime_preserves_project_bootstrap_until_project_endpoint_is_opened() 
         ProjectEvent::Bootstrap(payload) => {
             assert_eq!(payload.project.id, project.id);
             assert_eq!(payload.project.name, project.name);
-            assert!(
-                payload.review_summaries.is_empty(),
-                "new project should not have review summaries"
-            );
+            assert_eq!(payload.review_summaries.len(), 1);
+            assert_eq!(payload.review_summaries[0].root.0, project.roots[0]);
         }
         _ => panic!("expected ProjectBootstrap"),
     }

@@ -194,6 +194,7 @@ fn review() -> Review {
 fn review_summary() -> ReviewSummary {
     ReviewSummary {
         id: review_id(),
+        root: root_path(),
         status: ReviewStatus::Submitted {
             submitted_at_ms: 300,
         },
@@ -376,6 +377,23 @@ fn project_git_diff_file_binary_flag_defaults_for_legacy_json() {
     .expect("legacy diff file without binary flag");
 
     assert!(!file.is_binary);
+}
+
+#[test]
+fn review_summary_root_defaults_for_legacy_json() {
+    let summary: ReviewSummary = serde_json::from_value(json!({
+        "id": "review-1",
+        "status": { "state": "draft" },
+        "origin_session_id": "session-1",
+        "origin_agent_id": "agent-1",
+        "created_at_ms": 1,
+        "updated_at_ms": 2,
+        "user_comment_count": 0,
+        "pending_suggestion_count": 0
+    }))
+    .expect("legacy summary without root should deserialize");
+
+    assert_eq!(summary.root, ProjectRootPath(String::new()));
 }
 
 #[test]

@@ -1008,20 +1008,19 @@ fn ToolOutputModeToggle() -> impl IntoView {
     }
 }
 
-/// "Review changes" header button. Visible whenever the active agent
-/// owns a project that has uncommitted changes. Disabled while a
-/// `ReviewCreate` for that project is in flight (until the server
-/// `ProjectEventPayload::ReviewListChanged` echoes back).
-///
-/// Click → `FrameKind::ReviewCreate` with `selection: AllUncommitted`,
-/// then opens (or focuses) a tab for the most recently-created review on
-/// that project once the summary list lands.
+/// "Review changes" header button. A navigation shortcut: visible whenever
+/// the active agent owns a project that has uncommitted changes, it opens
+/// (or focuses) the project's changed-file diff tab — the canonical
+/// always-on inline review surface. Reviews are always-on and root-scoped
+/// server-side, so this does not start a lifecycle; it only jumps to the
+/// surface (with a legacy get-or-create fallback if no draft summary has
+/// arrived yet). Disabled only while that fallback create is in flight.
 #[component]
 fn ReviewChangesButton() -> impl IntoView {
     let state = expect_context::<AppState>();
     let visibility_state = state.clone();
     let visible = move || {
-        crate::components::review_view::active_agent_has_uncommitted_changes(&visibility_state)
+        crate::components::review_view::active_agent_has_reviewable_changes(&visibility_state)
     };
     let pending_state = state.clone();
     let pending =
@@ -1035,7 +1034,7 @@ fn ReviewChangesButton() -> impl IntoView {
             <button
                 class="chat-review-btn"
                 disabled=pending.clone()
-                title="Freeze the project's uncommitted changes into a Review you can comment on"
+                title="Open the project's changed files to review and comment inline"
                 on:click=on_click.clone()
             >
                 <svg class="chat-review-btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"

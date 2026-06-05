@@ -16,7 +16,7 @@ use protocol::{
 /// Renders the diff inline below the file tree (Projects view) or
 /// inside a review-detail diff tab.
 ///
-/// When `scope == Uncommitted` this is also the primary inline-review
+/// When `scope == Unstaged` this is also the primary inline-review
 /// surface: it locates the active project's singleton review, overlays
 /// its comments and AI suggestions on the matching diff lines/files,
 /// and exposes tap-to-comment plus review controls (AI review, clear,
@@ -47,17 +47,20 @@ pub fn DiffViewer(
         path: path.clone(),
     };
 
-    // Whether inline review is enabled for this surface. Reviews operate
-    // on the uncommitted working tree, so only enable for that scope.
-    let review_enabled = scope == protocol::ProjectDiffScope::Uncommitted;
+    // Whether inline review is enabled for this surface. Active reviews are
+    // anchored server-side to `Unstaged` (index↔worktree), so only that scope
+    // overlays comments — a `Staged` or `Uncommitted` surface would mismatch
+    // the review's anchors.
+    let review_enabled = scope == protocol::ProjectDiffScope::Unstaged;
 
     // Resolve the active review id for this project. The inline diff surface
     // is only for the *editable* review, so it binds to a Draft only —
     // Submitted/Consumed/Cancelled reviews are terminal and must not overlay
-    // the live uncommitted diff or expose comment/AI/Clear/Submit controls
+    // the live unstaged diff or expose comment/AI/Clear/Submit controls
     // (matching the desktop integrated diff surface). Reactive over
     // `review_summaries`.
     let project_for_review = project.clone();
+    let root_for_review = root.clone();
     let active_review_id = Memo::new(move |_| {
         if !review_enabled {
             return None;
@@ -69,7 +72,9 @@ pub fn DiffViewer(
         let id = state.review_summaries.with(|map| {
             map.get(&key)?
                 .iter()
-                .filter(|s| matches!(s.status, protocol::ReviewStatus::Draft))
+                .filter(|s| {
+                    matches!(s.status, protocol::ReviewStatus::Draft) && s.root == root_for_review
+                })
                 .max_by_key(|s| s.updated_at_ms)
                 .map(|s| s.id.clone())
         })?;
@@ -936,66 +941,17 @@ fn Composer(ctx: ReviewCtx) -> impl IntoView {
 
 /// Review controls bar: counts + AI review + clear + submit (with a
 /// target picker). Rendered above the diff body when review is enabled.
-/// When there's no active review yet, exposes a "Start review" affordance.
+/// Reviews are always-on server-side; the client simply waits for the
+/// Draft summary to arrive. When no active review is present yet, render
+/// nothing — no "Start review" button.
 #[component]
 fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl IntoView {
     let Some(ctx) = ctx else {
-        // No active review: offer to create one over the uncommitted diff.
-        // A `creating` gate prevents repeated taps from firing multiple
-        // create requests (analogous to the desktop create-pending gate).
-        let project = project.clone();
-        let creating = RwSignal::new(false);
-        let on_start = Callback::new(move |_: ()| {
-            if creating.get_untracked() {
-                return;
-            }
-            creating.set(true);
-            let project = project.clone();
-            spawn_local(async move {
-                let project_ref = crate::state::ActiveProjectRef {
-                    local_host_id: project.local_host_id.clone(),
-                    project_id: project.project_id.clone(),
-                };
-                match crate::actions::create_review(
-                    &project_ref,
-                    protocol::ReviewDiffSelection::AllUncommitted,
-                )
-                .await
-                {
-                    // `create_review` only *sends* the request — the review
-                    // projection arrives later via `ReviewListChanged`. We
-                    // deliberately keep the gate engaged: this no-active-
-                    // review branch remounts (ctx becomes `Some`) once the
-                    // draft lands, which is the real "done" signal. Resetting
-                    // here would briefly re-enable the button and let a fast-
-                    // resolving send admit a duplicate create before the
-                    // draft is known. (Mirrors the desktop create-pending
-                    // gate, which is only cleared by `ReviewListChanged`.)
-                    Ok(()) => {}
-                    Err(e) => {
-                        log::error!("create_review failed: {e}");
-                        // Real send failure: re-enable so the user can retry.
-                        creating.set(false);
-                    }
-                }
-            });
-        });
+        // No active Draft review visible yet. The server manages review
+        // lifecycle automatically (always-on). Render a silent placeholder
+        // so tests can assert the absence of controls.
         return view! {
-            <div class="project-diff-review-controls" data-mobile-test="diff-review-controls">
-                {move || {
-                    let creating_now = creating.get();
-                    view! {
-                        <Button
-                            label=if creating_now { "Starting\u{2026}" } else { "Start review" }
-                            variant=ButtonVariant::Secondary
-                            size=ButtonSize::Compact
-                            data_mobile_test="diff-review-start"
-                            disabled=creating_now
-                            on_click=on_start
-                        />
-                    }
-                }}
-            </div>
+            <span data-mobile-test="diff-review-controls-none"></span>
         }
         .into_any();
     };
@@ -1349,7 +1305,7 @@ mod wasm_tests {
     fn fixture_diff_state() -> ProjectDiffState {
         ProjectDiffState {
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
             context_mode: DiffContextMode::Hunks,
             pending: false,
@@ -1428,6 +1384,7 @@ mod wasm_tests {
     fn fixture_summary(review_id: &ReviewId) -> ReviewSummary {
         ReviewSummary {
             id: review_id.clone(),
+            root: ProjectRootPath("/x".to_owned()),
             status: ReviewStatus::Draft,
             origin_session_id: SessionId("s1".to_owned()),
             origin_agent_id: AgentId("a1".to_owned()),
@@ -1476,7 +1433,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1501,7 +1458,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let project_for_mount = project.clone();
@@ -1516,7 +1473,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1563,12 +1520,12 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let empty = ProjectDiffState {
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
             context_mode: DiffContextMode::Hunks,
             pending: false,
@@ -1586,7 +1543,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1615,7 +1572,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let review_key = ReviewRef {
@@ -1646,7 +1603,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1694,7 +1651,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let review_key = ReviewRef {
@@ -1740,7 +1697,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1791,7 +1748,7 @@ mod wasm_tests {
     fn fixture_binary_diff_state() -> ProjectDiffState {
         ProjectDiffState {
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
             context_mode: DiffContextMode::Hunks,
             pending: false,
@@ -1814,7 +1771,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let project_for_mount = project.clone();
@@ -1847,7 +1804,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1879,37 +1836,18 @@ mod wasm_tests {
         );
     }
 
-    /// Stub the Tauri bridge so `create_review`'s `send_frame` resolves
-    /// quickly (Ok) instead of throwing on the missing global. We use a
-    /// *resolving* stub deliberately: the gate must hold even though the
-    /// send completes immediately, because a successful send does not mean
-    /// the review projection has arrived.
-    fn stub_tauri_invoke_ok() {
-        let _ = js_sys::eval(
-            "(function(){ \
-               window.__TAURI__ = window.__TAURI__ || {}; \
-               window.__TAURI__.core = window.__TAURI__.core || {}; \
-               window.__TAURI__.core.invoke = function(){ return Promise.resolve(); }; \
-               window.__TAURI__.event = window.__TAURI__.event || {}; \
-               window.__TAURI__.event.listen = function(){ return Promise.resolve(null); }; \
-             })();",
-        );
-    }
-
-    /// The mobile "Start review" gate must survive a fast-resolving send: a
-    /// second tap can't fire a duplicate create while the draft is still on
-    /// its way. The gate releases (the control remounts into the active-
-    /// review state) only when the review projection actually arrives.
+    /// Reviews are always-on: there is no "Start review" button. Before a
+    /// Draft summary arrives, the controls area is empty (diff-review-controls-
+    /// none). Once the summary arrives, the full review controls render.
     #[wasm_bindgen_test]
-    async fn start_review_gate_holds_until_review_arrives() {
-        stub_tauri_invoke_ok();
+    async fn always_on_review_no_start_button() {
         let host = LocalHostId("host-1".to_owned());
         let project = make_project(&host, "p-1");
         let key = ProjectDiffRef {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let project_for_mount = project.clone();
@@ -1928,7 +1866,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -1936,37 +1874,24 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let btn: HtmlElement = container
-            .query_selector("[data-mobile-test='diff-review-start']")
-            .unwrap()
-            .expect("start review button")
-            .dyn_into()
-            .unwrap();
+        // No "Start review" button — reviews are always-on.
         assert!(
-            !btn.has_attribute("disabled"),
-            "start button must be enabled initially"
+            container
+                .query_selector("[data-mobile-test='diff-review-start']")
+                .unwrap()
+                .is_none(),
+            "diff-review-start button must NOT exist (reviews are always-on)"
+        );
+        // Before a review arrives the placeholder is shown.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-controls-none']")
+                .unwrap()
+                .is_some(),
+            "diff-review-controls-none placeholder must be shown before a review arrives"
         );
 
-        btn.click();
-        // Let the (fast, resolving) send complete.
-        next_tick().await;
-        next_tick().await;
-
-        // The gate must still hold: the draft has not arrived yet, so a
-        // second tap must not be able to fire another create.
-        let btn_after: HtmlElement = container
-            .query_selector("[data-mobile-test='diff-review-start']")
-            .unwrap()
-            .expect("start review button still present while create is pending")
-            .dyn_into()
-            .unwrap();
-        assert!(
-            btn_after.has_attribute("disabled"),
-            "start button must stay disabled after a fast-resolving send, until the review arrives"
-        );
-
-        // The review projection arrives → the control remounts into its
-        // active-review state and the "Start review" affordance is gone.
+        // The review projection arrives → the full controls appear.
         let state = holder.borrow().clone().unwrap();
         let review_id = ReviewId("rev-1".to_owned());
         state.review_summaries.update(|m| {
@@ -1984,14 +1909,32 @@ mod wasm_tests {
                 fixture_review(&review_id, "p-1"),
             );
         });
+        // Pre-register the stream so the subscribe Effect short-circuits.
+        state.review_streams.update(|m| {
+            m.insert(
+                ReviewRef {
+                    local_host_id: host.clone(),
+                    review_id: review_id.clone(),
+                },
+                StreamPath("/review/rev-1".to_owned()),
+            );
+        });
         next_tick().await;
 
+        // Full review controls are now visible; no start button, no placeholder.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-controls']")
+                .unwrap()
+                .is_some(),
+            "full review controls must appear once the review summary arrives"
+        );
         assert!(
             container
                 .query_selector("[data-mobile-test='diff-review-start']")
                 .unwrap()
                 .is_none(),
-            "once the review arrives the Start-review affordance must be replaced by the active controls"
+            "diff-review-start must never exist"
         );
     }
 
@@ -2025,7 +1968,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
@@ -2063,7 +2006,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -2105,7 +2048,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
@@ -2141,7 +2084,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -2149,13 +2092,20 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // No active Draft ⇒ the Start-review affordance shows.
+        // No active Draft ⇒ the controls-none placeholder shows, no start button.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-controls-none']")
+                .unwrap()
+                .is_some(),
+            "with only a submitted review, the diff-review-controls-none placeholder must show"
+        );
         assert!(
             container
                 .query_selector("[data-mobile-test='diff-review-start']")
                 .unwrap()
-                .is_some(),
-            "with only a submitted review, the Start-review affordance must show"
+                .is_none(),
+            "diff-review-start button must never exist (reviews are always-on)"
         );
         // The submitted review must not overlay its comment...
         assert!(
@@ -2186,7 +2136,7 @@ mod wasm_tests {
             local_host_id: host.clone(),
             project_id: ProjectId("p-1".to_owned()),
             root: ProjectRootPath("/x".to_owned()),
-            scope: ProjectDiffScope::Uncommitted,
+            scope: ProjectDiffScope::Unstaged,
             path: None,
         };
         let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
@@ -2229,7 +2179,7 @@ mod wasm_tests {
                 <DiffViewer
                     project=project_for_mount.clone()
                     root=ProjectRootPath("/x".to_owned())
-                    scope=ProjectDiffScope::Uncommitted
+                    scope=ProjectDiffScope::Unstaged
                     path=None
                     on_close=Callback::new(|_| {})
                 />
@@ -2237,7 +2187,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // Draft: the inline comment is shown and no Start-review affordance.
+        // Draft: the inline comment is shown and no controls-none placeholder.
         assert!(
             container
                 .query_selector("[data-mobile-test='diff-comment-body']")
@@ -2247,10 +2197,17 @@ mod wasm_tests {
         );
         assert!(
             container
+                .query_selector("[data-mobile-test='diff-review-controls-none']")
+                .unwrap()
+                .is_none(),
+            "diff-review-controls-none must not show while a draft is active"
+        );
+        assert!(
+            container
                 .query_selector("[data-mobile-test='diff-review-start']")
                 .unwrap()
                 .is_none(),
-            "no Start-review affordance while a draft is active"
+            "diff-review-start must never exist (reviews are always-on)"
         );
 
         // Live status flips to Submitted; the Draft *summary* stays stale.
@@ -2262,7 +2219,7 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // ctx drops: comment gone, Start-review returns.
+        // ctx drops: comment gone, controls-none placeholder returns.
         assert!(
             container
                 .query_selector("[data-mobile-test='diff-comment-body']")
@@ -2272,10 +2229,106 @@ mod wasm_tests {
         );
         assert!(
             container
-                .query_selector("[data-mobile-test='diff-review-start']")
+                .query_selector("[data-mobile-test='diff-review-controls-none']")
                 .unwrap()
                 .is_some(),
-            "the Start-review affordance must return once the live review is non-draft"
+            "diff-review-controls-none placeholder must return once the live review is non-draft"
         );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='diff-review-start']")
+                .unwrap()
+                .is_none(),
+            "diff-review-start must never exist (reviews are always-on)"
+        );
+    }
+
+    /// Regression: only an `Unstaged` surface is a review surface. Active
+    /// reviews are anchored server-side to `Unstaged` (index↔worktree), so a
+    /// `Staged` or `Uncommitted` tab must NOT overlay a draft's comments or
+    /// expose review controls — even with a live Draft review present. (The
+    /// `Unstaged` positive is covered by `inline_comment_renders_under_anchored_line`.)
+    #[wasm_bindgen_test]
+    async fn non_unstaged_scopes_do_not_expose_review_overlay() {
+        for scope in [ProjectDiffScope::Uncommitted, ProjectDiffScope::Staged] {
+            let host = LocalHostId("host-1".to_owned());
+            let project = make_project(&host, "p-1");
+            let review_id = ReviewId("rev-1".to_owned());
+            let diff_key = ProjectDiffRef {
+                local_host_id: host.clone(),
+                project_id: ProjectId("p-1".to_owned()),
+                root: ProjectRootPath("/x".to_owned()),
+                scope,
+                path: None,
+            };
+            let review_key = ReviewRef {
+                local_host_id: host.clone(),
+                review_id: review_id.clone(),
+            };
+            let summary_key = (host.clone(), ProjectId("p-1".to_owned()));
+            let project_for_mount = project.clone();
+            let container = make_container();
+            let _h = mount_to(container.clone(), move || {
+                let state = AppState::new();
+                // Diff content keyed at the (non-unstaged) surface's scope...
+                let mut diff = fixture_diff_state();
+                diff.scope = scope;
+                state.project_diffs.update(|m| {
+                    m.insert(diff_key.clone(), diff);
+                });
+                // ...and a live Draft review that WOULD overlay on Unstaged.
+                state.review_summaries.update(|m| {
+                    m.insert(summary_key.clone(), vec![fixture_summary(&review_id)]);
+                });
+                state.reviews.update(|m| {
+                    m.insert(review_key.clone(), fixture_review(&review_id, "p-1"));
+                });
+                state.review_streams.update(|m| {
+                    m.insert(review_key.clone(), StreamPath("/review/rev-1".to_owned()));
+                });
+                provide_context(state);
+                view! {
+                    <DiffViewer
+                        project=project_for_mount.clone()
+                        root=ProjectRootPath("/x".to_owned())
+                        scope=scope
+                        path=None
+                        on_close=Callback::new(|_| {})
+                    />
+                }
+            });
+            next_tick().await;
+
+            // The diff body still renders...
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='diff-line-added']")
+                    .unwrap()
+                    .is_some(),
+                "the diff itself must still render on a {scope:?} surface"
+            );
+            // ...but no review overlay or controls.
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='diff-comment-body']")
+                    .unwrap()
+                    .is_none(),
+                "a {scope:?} surface must not overlay review comments (anchored to Unstaged)"
+            );
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='diff-review-controls']")
+                    .unwrap()
+                    .is_none(),
+                "a {scope:?} surface must not render review controls"
+            );
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='diff-file-comment-btn']")
+                    .unwrap()
+                    .is_none(),
+                "a {scope:?} surface must not expose inline comment affordances"
+            );
+        }
     }
 }
