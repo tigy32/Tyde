@@ -189,6 +189,8 @@ details summary:focus:not(:focus-visible) {
     display: flex;
     align-items: center;
     gap: var(--space-3);
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .header-title {
@@ -202,6 +204,8 @@ details summary:focus:not(:focus-visible) {
     display: flex;
     align-items: center;
     gap: var(--space-1);
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .status-dot {
@@ -238,7 +242,8 @@ details summary:focus:not(:focus-visible) {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 40ch;
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .header-right {

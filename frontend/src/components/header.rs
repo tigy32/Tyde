@@ -81,7 +81,7 @@ pub fn Header() -> impl IntoView {
                 <span class="header-title">"Tyde"</span>
                 <div class="header-status">
                     <span class={status_class}></span>
-                    <span class="status-text">{status_text}</span>
+                    <span class="status-text" title={status_text}>{status_text}</span>
                 </div>
             </div>
             <div class="header-right">
