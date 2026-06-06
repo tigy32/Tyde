@@ -51,8 +51,8 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.8.15
-        CFBundleVersion: "0.8.15"
+        CFBundleShortVersionString: 0.8.16
+        CFBundleVersion: "0.8.16"
     entitlements:
       path: tyde-mobile-shell_iOS/tyde-mobile-shell_iOS.entitlements
     scheme:
