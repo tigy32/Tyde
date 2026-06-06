@@ -133,6 +133,15 @@ pub enum TabContent {
         scope: ProjectDiffScope,
         path: String,
     },
+    /// Compact review-comments surface for a single root's draft review:
+    /// snippets around each human comment, accepted AI comment, and pending
+    /// AI suggestion — not the full root diff. Binds to the explicit
+    /// `(host_id, project_id, root)` the same way `Diff` does.
+    Comments {
+        host_id: String,
+        project_id: ProjectId,
+        root: ProjectRootPath,
+    },
 }
 
 impl TabContent {

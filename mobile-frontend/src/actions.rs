@@ -362,7 +362,12 @@ pub async fn subscribe_review(
         host,
         stream.clone(),
         protocol::FrameKind::ReviewSubscribe,
-        &protocol::ReviewSubscribePayload::default(),
+        // Mobile renders diffs from the project diff pipeline, never from
+        // `review.diffs`, so subscribe lightweight (redacts bootstrap +
+        // later Snapshot/Cleared diffs; comment/suggestion state is kept).
+        &protocol::ReviewSubscribePayload {
+            include_diffs: false,
+        },
     )
     .await?;
     state.review_streams.update(|streams| {

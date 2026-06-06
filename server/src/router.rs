@@ -737,9 +737,14 @@ pub(crate) async fn route_client_envelope(
                 .await?;
             }
             FrameKind::ReviewSubscribe => {
-                let _: ReviewSubscribePayload = parse_payload(&envelope, "review_subscribe")?;
-                host.review_subscribe(connection_host_stream, review_output_stream, review_id)
-                    .await?;
+                let payload: ReviewSubscribePayload = parse_payload(&envelope, "review_subscribe")?;
+                host.review_subscribe(
+                    connection_host_stream,
+                    review_output_stream,
+                    review_id,
+                    payload.include_diffs,
+                )
+                .await?;
             }
             other => {
                 return Err(AppError::protocol(

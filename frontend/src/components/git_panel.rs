@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
@@ -211,9 +213,9 @@ fn RootReviewHub(
             <button
                 class="gp-review-open-btn"
                 data-test="gp-root-review-open"
-                title="Open the changed files to review"
+                title="Open the review comments for this root"
                 on:click=move |_| {
-                    crate::components::review_view::open_changed_diff_for_root(
+                    crate::components::review_view::open_comments_for_root(
                         &open_state,
                         &open_host,
                         &open_pid,
@@ -221,7 +223,7 @@ fn RootReviewHub(
                     )
                 }
             >
-                "Open changes"
+                "Comments"
             </button>
             {move || {
                 if !loaded.get() {
@@ -312,6 +314,42 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
             })
         });
 
+    // Per-file review-comment counts for this root's draft review. Drives the
+    // "(N)" badges on the file rows. Prefers the server-computed per-file
+    // counts on the draft `ReviewSummary` (available without a full review
+    // subscribe); falls back to computing from the loaded `Review` when no
+    // summary is present yet.
+    let counts_state = state.clone();
+    let counts_root = root_path.clone();
+    let file_counts: Memo<HashMap<String, u32>> = Memo::new(move |_| {
+        let Some(ap) = counts_state.active_project.get() else {
+            return HashMap::new();
+        };
+        let summary = counts_state.review_summaries.with(|map| {
+            map.get(&ap.project_id).and_then(|summaries| {
+                summaries
+                    .iter()
+                    .filter(|s| s.root == counts_root && matches!(s.status, ReviewStatus::Draft))
+                    .max_by_key(|s| s.updated_at_ms)
+                    .map(|s| (s.id.clone(), s.file_comment_counts.clone()))
+            })
+        });
+        let Some((rid, file_comment_counts)) = summary else {
+            return HashMap::new();
+        };
+        if !file_comment_counts.is_empty() {
+            return file_comment_counts
+                .iter()
+                .map(|f| (f.relative_path.clone(), f.total_count()))
+                .collect();
+        }
+        // Summary carries no per-file counts (older server, or counts not yet
+        // populated) — fall back to the loaded review record if present.
+        counts_state
+            .reviews
+            .with(|m| m.get(&rid).map(per_file_comment_counts).unwrap_or_default())
+    });
+
     view! {
         <div class="gp-root-section">
             <div class="gp-root-header" title=root_title>
@@ -361,6 +399,7 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     show_stage_btn=false
                     show_unstage_btn=true
                     show_discard_btn=false
+                    file_counts=file_counts
                 />
             </Show>
             <Show when=move || has_unstaged>
@@ -373,6 +412,7 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     show_stage_btn=true
                     show_unstage_btn=false
                     show_discard_btn=true
+                    file_counts=file_counts
                 />
             </Show>
             <Show when=move || has_untracked>
@@ -385,6 +425,7 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     show_stage_btn=true
                     show_unstage_btn=false
                     show_discard_btn=true
+                    file_counts=file_counts
                 />
             </Show>
         </div>
@@ -401,6 +442,7 @@ fn GitFileSection(
     show_stage_btn: bool,
     show_unstage_btn: bool,
     show_discard_btn: bool,
+    file_counts: Memo<HashMap<String, u32>>,
 ) -> impl IntoView {
     let toggle = move |_| expanded.update(|v| *v = !*v);
 
@@ -477,6 +519,7 @@ fn GitFileSection(
 
                         let root_for_click = root_path.clone();
                         let path_for_click = path.clone();
+                        let path_for_badge = path.clone();
                         let root_for_stage = root_path.clone();
                         let path_for_stage = path.clone();
                         let root_for_unstage = root_path.clone();
@@ -494,6 +537,22 @@ fn GitFileSection(
                                 >
                                     <span class=icon_class>{icon}</span>
                                     <span class="gp-file-path">{path.clone()}</span>
+                                    {move || {
+                                        let n = file_counts
+                                            .get()
+                                            .get(&path_for_badge)
+                                            .copied()
+                                            .unwrap_or(0);
+                                        (n > 0).then(|| view! {
+                                            <span
+                                                class="gp-file-comment-count"
+                                                data-test="gp-file-comment-count"
+                                                title="Review comments"
+                                            >
+                                                {format!("({n})")}
+                                            </span>
+                                        })
+                                    }}
                                 </button>
                                 <div class="gp-file-actions">
                                     {show_discard_btn.then(|| {
@@ -549,6 +608,28 @@ fn GitFileSection(
             </Show>
         </div>
     }
+}
+
+/// Per-file review-comment counts keyed by `relative_path`. Counts every
+/// comment (human comments and accepted AI suggestions, which the server
+/// promotes into `comments`) plus pending AI suggestions. Rejected
+/// suggestions are excluded — they are neither `Pending` nor promoted to a
+/// comment.
+///
+/// Computed from the loaded `Review` as a fallback until `ReviewSummary`
+/// carries per-file counts directly; swapping to the summary field is a
+/// single change at the call site in `GitRootSection`.
+fn per_file_comment_counts(review: &protocol::Review) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for c in &review.comments {
+        *counts.entry(c.location.relative_path.clone()).or_insert(0) += 1;
+    }
+    for s in &review.suggestions {
+        if matches!(s.state, protocol::ReviewSuggestionState::Pending) {
+            *counts.entry(s.location.relative_path.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn change_kind_icon(kind: Option<ProjectGitChangeKind>) -> &'static str {
@@ -838,6 +919,7 @@ mod wasm_tests {
             updated_at_ms: 1,
             user_comment_count: 1,
             pending_suggestion_count: 0,
+            file_comment_counts: vec![],
         }
     }
 
@@ -947,13 +1029,53 @@ mod wasm_tests {
         );
     }
 
-    /// Multi-root: clicking root B's "Open changes" opens root B's `Unstaged`
-    /// diff, not the project's first dirty root (A). Regression for the hub
+    /// A file with review comments shows a per-file "(N)" badge in the file
+    /// list. `mount_git_panel` seeds one User comment on `src/foo.rs`; with
+    /// the draft summary carrying no per-file counts, the badge derives from
+    /// the loaded review record (the fallback path).
+    #[wasm_bindgen_test]
+    async fn file_row_shows_comment_count_badge() {
+        let container = make_container();
+        let _ = mount_git_panel(container.clone(), true);
+        next_tick().await;
+        next_tick().await;
+
+        let badge = container
+            .query_selector("[data-test=\"gp-file-comment-count\"]")
+            .unwrap()
+            .expect("a comment-count badge must render for a file with comments");
+        let text = badge.text_content().unwrap_or_default();
+        assert!(
+            text.contains("(1)"),
+            "badge must show the per-file comment count; got: {text}"
+        );
+    }
+
+    /// No draft review ⇒ no per-file badges at all.
+    #[wasm_bindgen_test]
+    async fn file_row_has_no_badge_without_review() {
+        let container = make_container();
+        let _ = mount_git_panel(container.clone(), false);
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-test=\"gp-file-comment-count\"]")
+                .unwrap()
+                .is_none(),
+            "no comment-count badge without a draft review"
+        );
+    }
+
+    /// Multi-root: clicking root B's "Comments" opens root B's comments
+    /// surface, not the project's first dirty root (A). Regression for the hub
     /// dropping the root and falling back to a project-first-root opener.
     #[wasm_bindgen_test]
-    async fn root_hub_open_changes_opens_clicked_root_diff() {
-        // The diff surface fires a fire-and-forget `ProjectReadDiff`; stub the
-        // bridge so it resolves instead of rejecting in headless Chrome.
+    async fn root_hub_comments_opens_clicked_root() {
+        // Opening the comments surface only pushes a tab (no diff fetch), but
+        // keep the recording bridge so any incidental invoke resolves cleanly
+        // in headless Chrome.
         stub_recording_bridge();
         let container = make_container();
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
@@ -996,31 +1118,26 @@ mod wasm_tests {
         std::mem::forget(handle);
         next_tick().await;
 
-        // Only root B has a draft, so there is exactly one Open-changes button.
+        // Only root B has a draft, so there is exactly one Comments button.
         let open_btn = container
             .query_selector("[data-test=\"gp-root-review-open\"]")
             .unwrap()
-            .expect("root B's Open changes button must render");
+            .expect("root B's Comments button must render");
         open_btn.dyn_ref::<HtmlElement>().unwrap().click();
         next_tick().await;
 
         let state = holder.borrow().clone().unwrap();
         let opened = state.center_zone.with_untracked(|cz| {
             cz.tabs.iter().find_map(|t| match &t.content {
-                TabContent::Diff { root, scope, .. } => Some((root.clone(), *scope)),
+                TabContent::Comments { root, .. } => Some(root.clone()),
                 _ => None,
             })
         });
-        let (root, scope) = opened.expect("a diff tab must open on Open changes");
+        let root = opened.expect("a comments tab must open on Comments");
         assert_eq!(
             root,
             ProjectRootPath("/repo-b".to_owned()),
-            "Open changes must open the clicked root (B), not the first dirty root (A)"
-        );
-        assert_eq!(
-            scope,
-            protocol::ProjectDiffScope::Unstaged,
-            "the review surface must open at Unstaged"
+            "Comments must open the clicked root (B), not the first dirty root (A)"
         );
     }
 

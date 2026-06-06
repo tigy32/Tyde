@@ -6,9 +6,42 @@ use crate::components::ui::{
 };
 use crate::state::{ActiveProjectRef, AppState, ProjectDiffRef, ReviewRef};
 use protocol::{
-    ReviewAnchor, ReviewAnchorStatus, ReviewComment, ReviewDiffSide, ReviewLocation,
-    ReviewSuggestedComment,
+    ReviewAnchor, ReviewAnchorStatus, ReviewComment, ReviewCommentId, ReviewCommentSource,
+    ReviewDiffSide, ReviewLocation, ReviewSuggestedComment,
 };
+
+/// Inline composer state for the mobile review overlay. Mirrors the desktop
+/// `ComposerState`: the body text and a post-save baseline live on this
+/// parent-owned, persistent value (not on the `Composer` component, which the
+/// thread subtree remounts whenever the review's comment list changes). That
+/// persistence is what makes confirmed-echo close remount-safe and keeps the
+/// user's text intact on send failure.
+#[derive(Clone, Debug)]
+struct MobileComposerState {
+    location: ReviewLocation,
+    body: RwSignal<String>,
+    /// Snapshot of the User-comment ids already at `location` when a save is
+    /// dispatched. `None` until the first save. The composer closes (and the
+    /// text clears) only once a User comment at `location` appears whose id is
+    /// not in this snapshot — i.e. the server `CommentUpsert` echo landed.
+    submitted_baseline: RwSignal<Option<Vec<ReviewCommentId>>>,
+    /// Set while an `AddComment` send is in flight. Disables the Comment button
+    /// so a double-tap before the echo can't dispatch duplicate comments.
+    /// Cleared on send failure (to allow retry); on success the composer closes
+    /// from the echo effect, discarding this state.
+    submitting: RwSignal<bool>,
+}
+
+impl MobileComposerState {
+    fn open(location: ReviewLocation) -> Self {
+        Self {
+            location,
+            body: RwSignal::new(String::new()),
+            submitted_baseline: RwSignal::new(None),
+            submitting: RwSignal::new(false),
+        }
+    }
+}
 
 /// Unified git diff viewer for an active project's root.
 ///
@@ -34,10 +67,10 @@ pub fn DiffViewer(
     let context_mode: RwSignal<protocol::DiffContextMode> =
         RwSignal::new(protocol::DiffContextMode::Hunks);
 
-    // The inline composer's anchor location, if any. `None` means no
-    // composer is open. Comments are project-scoped, so the location
-    // (root + relative_path + anchor) fully identifies the thread.
-    let composer: RwSignal<Option<ReviewLocation>> = RwSignal::new(None);
+    // The inline composer, if open (`None` ⇒ closed). The state carries the
+    // anchor location plus persistent body/baseline so confirmed-echo close
+    // survives the thread subtree's remounts.
+    let composer: RwSignal<Option<MobileComposerState>> = RwSignal::new(None);
 
     let key = ProjectDiffRef {
         local_host_id: project.local_host_id.clone(),
@@ -283,7 +316,7 @@ pub fn DiffViewer(
 struct ReviewCtx {
     host: crate::state::LocalHostId,
     review_id: protocol::ReviewId,
-    composer: RwSignal<Option<ReviewLocation>>,
+    composer: RwSignal<Option<MobileComposerState>>,
     state: AppState,
 }
 
@@ -298,6 +331,19 @@ impl ReviewCtx {
     fn review(&self) -> Option<protocol::Review> {
         let key = self.review_ref();
         self.state.reviews.with(|r| r.get(&key).cloned())
+    }
+
+    /// Effective backend for review actions on this host: the host's
+    /// `default_backend`, else its first enabled backend. `None` only when
+    /// the host has no enabled backends. Mobile has no explicit reviewer
+    /// backend picker, so this is the whole precedence.
+    fn effective_backend(&self) -> Option<protocol::BackendKind> {
+        self.state.host_settings_by_host.with_untracked(|m| {
+            m.get(&self.host).and_then(|s| {
+                s.default_backend
+                    .or_else(|| s.enabled_backends.first().copied())
+            })
+        })
     }
 }
 
@@ -427,11 +473,11 @@ fn DiffFileBlock(
                         data-mobile-test="diff-file-comment-btn"
                         aria-label="Comment on file"
                         on:click=move |_| {
-                            composer.set(Some(ReviewLocation {
+                            composer.set(Some(MobileComposerState::open(ReviewLocation {
                                 root: click_root.clone(),
                                 relative_path: click_path.clone(),
                                 anchor: ReviewAnchor::File,
-                            }));
+                            })));
                         }
                     >
                         "+ Comment"
@@ -570,15 +616,16 @@ fn DiffLineRow(
             let Some((side, line_no)) = anchor_side_line else {
                 return;
             };
-            ctx.composer.set(Some(ReviewLocation {
-                root: root.clone(),
-                relative_path: relative_path.clone(),
-                anchor: ReviewAnchor::LineRange {
-                    side,
-                    start_line: line_no,
-                    end_line: line_no,
-                },
-            }));
+            ctx.composer
+                .set(Some(MobileComposerState::open(ReviewLocation {
+                    root: root.clone(),
+                    relative_path: relative_path.clone(),
+                    anchor: ReviewAnchor::LineRange {
+                        side,
+                        start_line: line_no,
+                        end_line: line_no,
+                    },
+                })));
         }
     };
 
@@ -713,10 +760,10 @@ fn ThreadRegion(
     let composer_matcher = matcher.clone();
     let composer_open = Memo::new(move |_| {
         composer.with(|c| {
-            c.as_ref().is_some_and(|loc| {
-                loc.root == composer_root
-                    && loc.relative_path == composer_path
-                    && composer_matcher(&loc.anchor)
+            c.as_ref().is_some_and(|cs| {
+                cs.location.root == composer_root
+                    && cs.location.relative_path == composer_path
+                    && composer_matcher(&cs.location.anchor)
             })
         })
     });
@@ -873,19 +920,84 @@ fn SuggestionRow(ctx: ReviewCtx, suggestion: ReviewSuggestedComment) -> impl Int
 
 #[component]
 fn Composer(ctx: ReviewCtx) -> impl IntoView {
-    let body = RwSignal::new(String::new());
     let composer = ctx.composer;
+    // Body + baseline live on the persistent composer state, not here: this
+    // component remounts whenever the thread's comment list changes.
+    let Some(state) = composer.get_untracked() else {
+        return view! { <span></span> }.into_any();
+    };
+    let body = state.body;
+    let submitted_baseline = state.submitted_baseline;
+    let submitting = state.submitting;
+    let location = state.location.clone();
+
+    // Level-triggered confirmed-echo close. Once a save is dispatched,
+    // `submitted_baseline` holds the User-comment ids that already existed at
+    // `location`. When a User comment at `location` appears whose id is not in
+    // that snapshot — the server `CommentUpsert` echo — close the composer.
+    // Tracks `submitted_baseline` and `reviews`, so it re-fires on the echo
+    // regardless of ordering and survives a mid-flight remount (it re-reads
+    // the persistent baseline). On send failure the gate never matches, so the
+    // composer stays open with its text intact.
+    {
+        let echo_ctx = ctx.clone();
+        let echo_location = location.clone();
+        Effect::new(move |_| {
+            let Some(baseline) = submitted_baseline.get() else {
+                return;
+            };
+            let key = echo_ctx.review_ref();
+            let confirmed = echo_ctx.state.reviews.with(|map| {
+                map.get(&key)
+                    .map(|review| {
+                        review.comments.iter().any(|c| {
+                            matches!(c.source, ReviewCommentSource::User)
+                                && c.location == echo_location
+                                && !baseline.contains(&c.id)
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if confirmed {
+                composer.set(None);
+            }
+        });
+    }
 
     let ctx_submit = ctx.clone();
+    let submit_location = location.clone();
     let on_submit = Callback::new(move |_: ()| {
+        // Pending gate: ignore taps while a send is in flight so a double-tap
+        // before the echo can't dispatch duplicate AddComment actions.
+        if submitting.get_untracked() {
+            return;
+        }
         let text = body.get_untracked();
         if text.trim().is_empty() {
             return;
         }
-        let Some(location) = composer.get_untracked() else {
-            return;
-        };
         let ctx = ctx_submit.clone();
+        let location = submit_location.clone();
+        // Snapshot the User comments already at this location so the echo
+        // effect can recognize the newly added one. Do NOT close optimistically
+        // — the composer closes from the effect once the echo lands.
+        let key = ctx.review_ref();
+        let baseline: Vec<ReviewCommentId> = ctx.state.reviews.with_untracked(|map| {
+            map.get(&key)
+                .map(|review| {
+                    review
+                        .comments
+                        .iter()
+                        .filter(|c| {
+                            matches!(c.source, ReviewCommentSource::User) && c.location == location
+                        })
+                        .map(|c| c.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        submitted_baseline.set(Some(baseline));
+        submitting.set(true);
         spawn_local(async move {
             if let Err(e) = crate::actions::send_review_action(
                 &ctx.state,
@@ -899,15 +1011,15 @@ fn Composer(ctx: ReviewCtx) -> impl IntoView {
             .await
             {
                 log::error!("add comment failed: {e}");
+                // Re-enable the button so the user can retry. On success the
+                // composer closes from the echo effect, discarding this state.
+                submitting.set(false);
             }
         });
-        composer.set(None);
-        body.set(String::new());
     });
 
     let on_cancel = Callback::new(move |_: ()| {
         composer.set(None);
-        body.set(String::new());
     });
 
     view! {
@@ -920,13 +1032,21 @@ fn Composer(ctx: ReviewCtx) -> impl IntoView {
                 on:input=move |ev| body.set(event_target_value(&ev))
             ></textarea>
             <div class="project-diff-composer-actions">
-                <Button
-                    label="Comment"
-                    variant=ButtonVariant::Primary
-                    size=ButtonSize::Compact
-                    data_mobile_test="diff-composer-submit"
-                    on_click=on_submit
-                />
+                {move || {
+                    // Re-rendered when `submitting` flips so the disabled state
+                    // (and the Button's own on_click guard) tracks it.
+                    let pending = submitting.get();
+                    view! {
+                        <Button
+                            label="Comment"
+                            variant=ButtonVariant::Primary
+                            size=ButtonSize::Compact
+                            data_mobile_test="diff-composer-submit"
+                            disabled=pending
+                            on_click=on_submit
+                        />
+                    }
+                }}
                 <Button
                     label="Cancel"
                     variant=ButtonVariant::Ghost
@@ -937,6 +1057,7 @@ fn Composer(ctx: ReviewCtx) -> impl IntoView {
             </div>
         </div>
     }
+    .into_any()
 }
 
 /// Review controls bar: counts + AI review + clear + submit (with a
@@ -962,11 +1083,11 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
         counts_ctx
             .review()
             .map(|r| {
-                let comments = r
-                    .comments
-                    .iter()
-                    .filter(|c| matches!(c.source, protocol::ReviewCommentSource::User))
-                    .count();
+                // Count every comment record — human comments AND accepted AI
+                // comments (the server promotes accepted suggestions into
+                // `comments`) — matching desktop/server semantics. Pending AI
+                // suggestions stay a separate count.
+                let comments = r.comments.len();
                 let pending = r
                     .suggestions
                     .iter()
@@ -975,6 +1096,18 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                 (comments, pending)
             })
             .unwrap_or((0, 0))
+    });
+
+    // Whether the host has any backend the AI reviewer could run on (default
+    // or first enabled). When false the AI review button is disabled, matching
+    // desktop — there's nothing to run.
+    let backend_ctx = ctx.clone();
+    let ai_backend_available = Memo::new(move |_| {
+        backend_ctx.state.host_settings_by_host.with(|m| {
+            m.get(&backend_ctx.host)
+                .map(|s| s.default_backend.is_some() || !s.enabled_backends.is_empty())
+                .unwrap_or(false)
+        })
     });
 
     // Whether the AI reviewer is currently running.
@@ -994,17 +1127,24 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
     // Submit target picker open state.
     let picker_open = RwSignal::new(false);
 
-    // AI review: spawn a Codex reviewer (sensible default backend).
+    // AI review: the host resolves the backend. Mobile has no reviewer
+    // backend picker, so always send `None` ⇒ server uses its
+    // `default_backend` (else first enabled). Gate on there being some
+    // runnable backend so we don't fire a request the host can't satisfy.
     let ctx_ai = ctx.clone();
     let on_ai = Callback::new(move |_: ()| {
         let ctx = ctx_ai.clone();
         spawn_local(async move {
+            if ctx.effective_backend().is_none() {
+                log::error!("start ai review skipped: host has no enabled backend");
+                return;
+            }
             if let Err(e) = crate::actions::send_review_action(
                 &ctx.state,
                 &ctx.host,
                 ctx.review_id.clone(),
                 protocol::ReviewActionPayload::StartAiReview {
-                    backend_kind: protocol::BackendKind::Codex,
+                    backend_kind: None,
                     cost_hint: None,
                     instructions: None,
                 },
@@ -1068,7 +1208,7 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                             label=label
                             variant=ButtonVariant::Ghost
                             size=ButtonSize::Compact
-                            disabled=ai_running.get()
+                            disabled=ai_running.get() || !ai_backend_available.get()
                             data_mobile_test="diff-review-ai"
                             on_click=on_ai
                         />
@@ -1158,9 +1298,13 @@ fn SubmitTargetPicker(
         let text = new_instructions.get_untracked();
         let trimmed = text.trim();
         let instructions = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        let Some(backend_kind) = ctx_new.effective_backend() else {
+            log::error!("submit to new agent skipped: host has no enabled backend");
+            return;
+        };
         submit_new(
             protocol::ReviewSubmitTarget::NewAgent {
-                backend_kind: protocol::BackendKind::Codex,
+                backend_kind,
                 cost_hint: None,
                 custom_agent_id: None,
                 name: None,
@@ -1266,11 +1410,11 @@ mod wasm_tests {
     use crate::state::{AppState, LocalHostId, ProjectDiffState};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, BackendKind, DiffContextMode, ProjectDiffScope, ProjectGitDiffFile,
-        ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectId, ProjectRootPath,
-        Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewCommentId,
-        ReviewCommentSource, ReviewDiffSelection, ReviewId, ReviewLocation, ReviewStatus,
-        ReviewSummary, SessionId, StreamPath,
+        AgentId, AgentOrigin, BackendKind, DiffContextMode, HostSettings, ProjectDiffScope,
+        ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+        ProjectId, ProjectRootPath, Review, ReviewAiReviewerState, ReviewAiReviewerStatus,
+        ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewId, ReviewLocation,
+        ReviewStatus, ReviewSummary, SessionId, StreamPath,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1392,6 +1536,7 @@ mod wasm_tests {
             updated_at_ms: 1,
             user_comment_count: 1,
             pending_suggestion_count: 0,
+            file_comment_counts: vec![],
         }
     }
 
@@ -1935,6 +2080,401 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "diff-review-start must never exist"
+        );
+    }
+
+    fn host_settings(default: Option<BackendKind>, enabled: Vec<BackendKind>) -> HostSettings {
+        HostSettings {
+            enabled_backends: enabled,
+            default_backend: default,
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: false,
+        }
+    }
+
+    /// Mobile AI review no longer hard-codes Codex: `ReviewCtx::effective_backend`
+    /// resolves the host `default_backend`, falling back to the first enabled
+    /// backend, and is `None` only when no backend is enabled.
+    #[wasm_bindgen_test]
+    async fn ai_review_resolves_default_backend() {
+        let container = make_container();
+        let host = LocalHostId("host-1".to_owned());
+        let observed: std::rc::Rc<std::cell::RefCell<Vec<Option<BackendKind>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_for_mount = observed.clone();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container, move || {
+            let state = AppState::new();
+            let ctx = ReviewCtx {
+                host: host_for_mount.clone(),
+                review_id: ReviewId("rev-1".to_owned()),
+                composer: RwSignal::new(None),
+                state: state.clone(),
+            };
+
+            // default_backend present ⇒ it wins over the first enabled backend.
+            state.host_settings_by_host.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    host_settings(
+                        Some(BackendKind::Gemini),
+                        vec![BackendKind::Codex, BackendKind::Gemini],
+                    ),
+                );
+            });
+            observed_for_mount
+                .borrow_mut()
+                .push(ctx.effective_backend());
+
+            // No default ⇒ first enabled backend.
+            state.host_settings_by_host.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    host_settings(None, vec![BackendKind::Codex, BackendKind::Gemini]),
+                );
+            });
+            observed_for_mount
+                .borrow_mut()
+                .push(ctx.effective_backend());
+
+            // No enabled backends ⇒ nothing to run.
+            state.host_settings_by_host.update(|m| {
+                m.insert(host_for_mount.clone(), host_settings(None, vec![]));
+            });
+            observed_for_mount
+                .borrow_mut()
+                .push(ctx.effective_backend());
+
+            view! { <div></div> }
+        });
+        next_tick().await;
+
+        let got = observed.borrow();
+        assert_eq!(
+            got.as_slice(),
+            &[Some(BackendKind::Gemini), Some(BackendKind::Codex), None],
+            "effective backend must be default → first-enabled → none"
+        );
+    }
+
+    fn record_bridge() {
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__sent_lines = []; \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(cmd, args){ \
+                 try { \
+                   if (cmd === 'send_host_line' && args) { \
+                     var line = (args.line !== undefined) ? args.line \
+                       : (args.get ? args.get('line') : undefined); \
+                     if (line !== undefined) { window.__sent_lines.push(line); } \
+                   } \
+                 } catch (e) {} \
+                 return Promise.resolve(); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
+             })();",
+        );
+    }
+
+    fn sent_lines_joined() -> String {
+        js_sys::eval("(window.__sent_lines||[]).join('\\n')")
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    }
+
+    /// Mobile "AI review" delegates the backend to the server: it sends
+    /// `StartAiReview.backend_kind = null` (no hard-coded Codex, no
+    /// client-side default resolution).
+    #[wasm_bindgen_test]
+    async fn mobile_ai_review_sends_none_backend() {
+        record_bridge();
+        let host = LocalHostId("host-1".to_owned());
+        let project = make_project(&host, "p-1");
+        let key = ProjectDiffRef {
+            local_host_id: host.clone(),
+            project_id: ProjectId("p-1".to_owned()),
+            root: ProjectRootPath("/x".to_owned()),
+            scope: ProjectDiffScope::Unstaged,
+            path: None,
+        };
+        let project_for_mount = project.clone();
+        let container = make_container();
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.project_diffs.update(|m| {
+                m.insert(key.clone(), fixture_diff_state());
+            });
+            let review_id = ReviewId("rev-1".to_owned());
+            state.review_summaries.update(|m| {
+                m.insert(
+                    (host_for_mount.clone(), ProjectId("p-1".to_owned())),
+                    vec![fixture_summary(&review_id)],
+                );
+            });
+            state.reviews.update(|m| {
+                m.insert(
+                    ReviewRef {
+                        local_host_id: host_for_mount.clone(),
+                        review_id: review_id.clone(),
+                    },
+                    fixture_review(&review_id, "p-1"),
+                );
+            });
+            // Pre-register the stream so the subscribe Effect short-circuits
+            // (no incidental ReviewSubscribe frame).
+            state.review_streams.update(|m| {
+                m.insert(
+                    ReviewRef {
+                        local_host_id: host_for_mount.clone(),
+                        review_id: review_id.clone(),
+                    },
+                    StreamPath("/review/rev-1".to_owned()),
+                );
+            });
+            // A backend exists so the zero-backend gate passes.
+            state.host_settings_by_host.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    host_settings(Some(BackendKind::Codex), vec![BackendKind::Codex]),
+                );
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <DiffViewer
+                    project=project_for_mount.clone()
+                    root=ProjectRootPath("/x".to_owned())
+                    scope=ProjectDiffScope::Unstaged
+                    path=None
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        let ai_btn = container
+            .query_selector("[data-mobile-test='diff-review-ai']")
+            .unwrap()
+            .expect("AI review button present");
+        ai_btn.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("start_ai_review"),
+            "a StartAiReview frame must be sent; sent: {sent}"
+        );
+        // `backend_kind: None` is omitted on the wire (skip_serializing_if),
+        // so mobile's default AI review carries no concrete backend.
+        assert!(
+            !sent.contains("\"backend_kind\""),
+            "mobile AI review must omit backend_kind (server resolves the \
+             default); sent: {sent}"
+        );
+    }
+
+    /// Rejecting bridge: every `invoke` fails, so `send_review_action`
+    /// returns an error (simulating a send failure).
+    fn reject_bridge() {
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(){ return Promise.reject('boom'); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
+             })();",
+        );
+    }
+
+    fn review_without_comments(review_id: &ReviewId) -> Review {
+        let mut r = fixture_review(review_id, "p-1");
+        r.comments.clear();
+        r
+    }
+
+    fn composer_at(line: u32) -> (ReviewLocation, MobileComposerState) {
+        let location = ReviewLocation {
+            root: ProjectRootPath("/x".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+            anchor: ReviewAnchor::LineRange {
+                side: ReviewDiffSide::New,
+                start_line: line,
+                end_line: line,
+            },
+        };
+        let state = MobileComposerState {
+            location: location.clone(),
+            body: RwSignal::new("needs a test".to_owned()),
+            submitted_baseline: RwSignal::new(None),
+            submitting: RwSignal::new(false),
+        };
+        (location, state)
+    }
+
+    /// Mounts a bare `Composer` over an empty Draft review and returns the
+    /// (composer signal, app state, anchor location) so a test can drive the
+    /// save and the confirmed echo.
+    fn mount_composer(
+        container: HtmlElement,
+        line: u32,
+    ) -> (
+        RwSignal<Option<MobileComposerState>>,
+        AppState,
+        ReviewLocation,
+    ) {
+        let host = LocalHostId("host-1".to_owned());
+        let review_id = ReviewId("rev-1".to_owned());
+        let (location, composer_state) = composer_at(line);
+        let holder: std::rc::Rc<
+            std::cell::RefCell<Option<(RwSignal<Option<MobileComposerState>>, AppState)>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let host_for_mount = host.clone();
+        let review_for_mount = review_id.clone();
+        let _h = mount_to(container, move || {
+            let state = AppState::new();
+            state.reviews.update(|m| {
+                m.insert(
+                    ReviewRef {
+                        local_host_id: host_for_mount.clone(),
+                        review_id: review_for_mount.clone(),
+                    },
+                    review_without_comments(&review_for_mount),
+                );
+            });
+            let composer: RwSignal<Option<MobileComposerState>> =
+                RwSignal::new(Some(composer_state.clone()));
+            let ctx = ReviewCtx {
+                host: host_for_mount.clone(),
+                review_id: review_for_mount.clone(),
+                composer,
+                state: state.clone(),
+            };
+            *holder_for_mount.borrow_mut() = Some((composer, state.clone()));
+            provide_context(state);
+            view! { <Composer ctx=ctx /> }
+        });
+        std::mem::forget(_h);
+        let (composer, state) = holder.borrow().clone().unwrap();
+        (composer, state, location)
+    }
+
+    /// The mobile composer does NOT close optimistically on save: it stays
+    /// open until the server's confirmed `CommentUpsert` echo (a new User
+    /// comment at the anchor) lands.
+    #[wasm_bindgen_test]
+    async fn mobile_composer_closes_only_on_confirmed_echo() {
+        record_bridge();
+        let container = make_container();
+        let (composer, state, location) = mount_composer(container.clone(), 2);
+
+        next_tick().await;
+        let submit = container
+            .query_selector("[data-mobile-test='diff-composer-submit']")
+            .unwrap()
+            .expect("composer submit button present");
+        submit.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+
+        // Send succeeded at transport, but no echo yet ⇒ composer stays open.
+        assert!(
+            composer.get_untracked().is_some(),
+            "composer must stay open until the confirmed echo lands"
+        );
+
+        // Server echo: a new User comment at the anchor appears.
+        state.reviews.update(|m| {
+            let key = ReviewRef {
+                local_host_id: LocalHostId("host-1".to_owned()),
+                review_id: ReviewId("rev-1".to_owned()),
+            };
+            if let Some(review) = m.get_mut(&key) {
+                review.comments.push(ReviewComment {
+                    id: ReviewCommentId("c-new".to_owned()),
+                    location: location.clone(),
+                    anchor_status: ReviewAnchorStatus::Current,
+                    body: "needs a test".to_owned(),
+                    source: ReviewCommentSource::User,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                });
+            }
+        });
+        next_tick().await;
+
+        assert!(
+            composer.get_untracked().is_none(),
+            "composer must close once the confirmed echo (new User comment) lands"
+        );
+    }
+
+    /// On send failure the composer stays open and the typed text is retained
+    /// (no optimistic close/clear).
+    #[wasm_bindgen_test]
+    async fn mobile_composer_retains_text_on_send_failure() {
+        reject_bridge();
+        let container = make_container();
+        let (composer, _state, _location) = mount_composer(container.clone(), 2);
+
+        next_tick().await;
+        let submit = container
+            .query_selector("[data-mobile-test='diff-composer-submit']")
+            .unwrap()
+            .expect("composer submit button present");
+        submit.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        next_tick().await;
+
+        let still_open = composer.get_untracked();
+        assert!(
+            still_open.is_some(),
+            "composer must stay open when the send fails"
+        );
+        assert_eq!(
+            still_open.unwrap().body.get_untracked(),
+            "needs a test",
+            "the typed text must be retained on send failure"
+        );
+    }
+
+    /// A double-tap of Comment before the server echo must dispatch only one
+    /// `AddComment` — the pending gate blocks the second tap.
+    #[wasm_bindgen_test]
+    async fn mobile_composer_prevents_duplicate_sends() {
+        record_bridge();
+        let container = make_container();
+        let (_composer, _state, _location) = mount_composer(container.clone(), 2);
+
+        next_tick().await;
+        let submit = container
+            .query_selector("[data-mobile-test='diff-composer-submit']")
+            .unwrap()
+            .expect("composer submit button present");
+        let btn = submit.dyn_ref::<HtmlElement>().unwrap();
+        // Two synchronous taps before any re-render/echo: the second must be
+        // blocked by the in-flight gate (`submitting`), not by a later DOM
+        // disabled re-render.
+        btn.click();
+        btn.click();
+        next_tick().await;
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        let add_comments = sent.matches("add_comment").count();
+        assert_eq!(
+            add_comments, 1,
+            "a double-tap must dispatch exactly one AddComment; sent: {sent}"
         );
     }
 

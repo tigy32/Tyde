@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,9 +8,10 @@ use protocol::{
     ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerState,
     ReviewAiReviewerStatus, ReviewAnchor, ReviewAnchorStatus, ReviewBootstrapPayload,
     ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide,
-    ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload, ReviewEventPayload, ReviewId,
-    ReviewLocation, ReviewStatus, ReviewSubmitTarget, ReviewSuggestedComment, ReviewSuggestionId,
-    ReviewSuggestionState, SendMessagePayload, StreamPath,
+    ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload, ReviewEventPayload,
+    ReviewFileCommentCount, ReviewId, ReviewLocation, ReviewStatus, ReviewSubmitTarget,
+    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, SendMessagePayload,
+    StreamPath,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -52,7 +53,7 @@ pub(crate) struct ReviewDeliveryRequest {
 pub(crate) struct ReviewAiSpawnRequest {
     pub review_id: ReviewId,
     pub review: Review,
-    pub backend_kind: protocol::BackendKind,
+    pub backend_kind: Option<protocol::BackendKind>,
     pub cost_hint: Option<protocol::SpawnCostHint>,
     pub instructions: Option<String>,
     pub review_handle: crate::review::ReviewHandle,
@@ -65,6 +66,7 @@ pub(crate) enum ReviewCommand {
     Subscribe {
         conn: ConnectionId,
         stream: Stream,
+        include_diffs: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Unsubscribe {
@@ -147,11 +149,17 @@ struct ReviewActor {
     review: Review,
     store: ReviewStore,
     project_store: Arc<Mutex<ProjectStore>>,
-    subscribers: HashMap<ConnectionId, Stream>,
+    subscribers: HashMap<ConnectionId, ReviewSubscriber>,
     delivery_tx: mpsc::Sender<ReviewDeliveryRequest>,
     ai_spawn_tx: mpsc::Sender<ReviewAiSpawnRequest>,
     project_update_tx: mpsc::UnboundedSender<protocol::ProjectId>,
     handle: crate::review::ReviewHandle,
+}
+
+#[derive(Clone)]
+struct ReviewSubscriber {
+    stream: Stream,
+    include_diffs: bool,
 }
 
 impl ReviewActor {
@@ -161,9 +169,10 @@ impl ReviewActor {
                 ReviewCommand::Subscribe {
                     conn,
                     stream,
+                    include_diffs,
                     reply,
                 } => {
-                    let result = self.subscribe(conn, stream).await;
+                    let result = self.subscribe(conn, stream, include_diffs).await;
                     let _ = reply.send(result);
                 }
                 ReviewCommand::Unsubscribe { conn } => {
@@ -199,26 +208,48 @@ impl ReviewActor {
         }
     }
 
-    async fn subscribe(&mut self, conn: ConnectionId, stream: Stream) -> Result<(), String> {
+    async fn subscribe(
+        &mut self,
+        conn: ConnectionId,
+        stream: Stream,
+        include_diffs: bool,
+    ) -> Result<(), String> {
+        let effective_include_diffs = include_diffs
+            || self
+                .subscribers
+                .get(&conn)
+                .is_some_and(|subscriber| subscriber.include_diffs);
         tracing::debug!(
             review_id = %self.review.id,
             conn = %conn,
             stream = %stream.path(),
             subscriber_count = self.subscribers.len(),
+            include_diffs,
+            effective_include_diffs,
             "subscribing review stream"
         );
-        self.refresh_diffs().await?;
+        if effective_include_diffs {
+            self.refresh_diffs().await?;
+        }
         let payload = serde_json::to_value(ReviewBootstrapPayload {
-            review: self.review.clone(),
+            review: review_for_subscriber(&self.review, effective_include_diffs),
         })
         .map_err(|error| format!("failed to serialize ReviewBootstrap payload: {error}"))?;
         stream
             .send_value(FrameKind::ReviewBootstrap, payload)
             .map_err(|_| "review stream closed".to_owned())?;
-        self.subscribers.insert(conn, stream);
+        self.subscribers.insert(
+            conn,
+            ReviewSubscriber {
+                stream,
+                include_diffs: effective_include_diffs,
+            },
+        );
         tracing::debug!(
             review_id = %self.review.id,
             subscriber_count = self.subscribers.len(),
+            include_diffs,
+            effective_include_diffs,
             "subscribed review stream"
         );
         Ok(())
@@ -587,7 +618,7 @@ impl ReviewActor {
 
     async fn start_ai_review(
         &mut self,
-        backend_kind: protocol::BackendKind,
+        backend_kind: Option<protocol::BackendKind>,
         cost_hint: Option<protocol::SpawnCostHint>,
         instructions: Option<String>,
         conn: ConnectionId,
@@ -1427,19 +1458,26 @@ impl ReviewActor {
     async fn broadcast(&mut self, payload: ReviewEventPayload) {
         let mut dead = Vec::new();
         let event_kind = payload.kind_name();
-        let streams = self
+        let subscribers = self
             .subscribers
             .iter()
-            .map(|(conn, stream)| (conn.clone(), stream.clone()))
+            .map(|(conn, subscriber)| {
+                (
+                    conn.clone(),
+                    subscriber.stream.clone(),
+                    subscriber.include_diffs,
+                )
+            })
             .collect::<Vec<_>>();
         tracing::debug!(
             review_id = %self.review.id,
             event_kind,
-            subscriber_count = streams.len(),
+            subscriber_count = subscribers.len(),
             "broadcasting review event"
         );
-        for (conn, stream) in streams {
-            if self.send_to_stream(&stream, payload.clone()).await.is_err() {
+        for (conn, stream, include_diffs) in subscribers {
+            let payload = event_for_subscriber(&payload, include_diffs);
+            if self.send_to_stream(&stream, payload).await.is_err() {
                 tracing::warn!(
                     review_id = %self.review.id,
                     conn = %conn,
@@ -1457,7 +1495,7 @@ impl ReviewActor {
 
     async fn send_to_conn(&mut self, conn: &ConnectionId, payload: ReviewEventPayload) {
         let event_kind = payload.kind_name();
-        let Some(stream) = self.subscribers.get(conn).cloned() else {
+        let Some(subscriber) = self.subscribers.get(conn).cloned() else {
             tracing::warn!(
                 review_id = %self.review.id,
                 conn = %conn,
@@ -1467,11 +1505,16 @@ impl ReviewActor {
             );
             return;
         };
-        if self.send_to_stream(&stream, payload).await.is_err() {
+        let payload = event_for_subscriber(&payload, subscriber.include_diffs);
+        if self
+            .send_to_stream(&subscriber.stream, payload)
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 review_id = %self.review.id,
                 conn = %conn,
-                stream = %stream.path(),
+                stream = %subscriber.stream.path(),
                 event_kind,
                 "targeted review event subscriber closed"
             );
@@ -1653,6 +1696,30 @@ fn review_error(
     }
 }
 
+pub(crate) fn review_for_subscriber(review: &Review, include_diffs: bool) -> Review {
+    if include_diffs {
+        return review.clone();
+    }
+    let mut review = review.clone();
+    review.diffs.clear();
+    review
+}
+
+pub(crate) fn event_for_subscriber(
+    payload: &ReviewEventPayload,
+    include_diffs: bool,
+) -> ReviewEventPayload {
+    match payload {
+        ReviewEventPayload::Snapshot { review } => ReviewEventPayload::Snapshot {
+            review: review_for_subscriber(review, include_diffs),
+        },
+        ReviewEventPayload::Cleared { review } => ReviewEventPayload::Cleared {
+            review: review_for_subscriber(review, include_diffs),
+        },
+        _ => payload.clone(),
+    }
+}
+
 pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
     let user_comment_count = review.comments.len() as u32;
     let pending_suggestion_count = review
@@ -1660,6 +1727,7 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
         .iter()
         .filter(|suggestion| matches!(suggestion.state, ReviewSuggestionState::Pending))
         .count() as u32;
+    let file_comment_counts = review_file_comment_counts(review);
     protocol::ReviewSummary {
         id: review.id.clone(),
         root: review_summary_root(review).unwrap_or_default(),
@@ -1670,7 +1738,41 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
         updated_at_ms: review.updated_at_ms,
         user_comment_count,
         pending_suggestion_count,
+        file_comment_counts,
     }
+}
+
+pub(crate) fn review_file_comment_counts(review: &Review) -> Vec<ReviewFileCommentCount> {
+    let mut counts = BTreeMap::<String, ReviewFileCommentCount>::new();
+    for comment in &review.comments {
+        let count = counts
+            .entry(comment.location.relative_path.clone())
+            .or_insert_with(|| ReviewFileCommentCount {
+                relative_path: comment.location.relative_path.clone(),
+                ..ReviewFileCommentCount::default()
+            });
+        match &comment.source {
+            ReviewCommentSource::User => {
+                count.user_comment_count = count.user_comment_count.saturating_add(1);
+            }
+            ReviewCommentSource::AiSuggestion { .. } => {
+                count.ai_comment_count = count.ai_comment_count.saturating_add(1);
+            }
+        }
+    }
+    for suggestion in &review.suggestions {
+        if !matches!(suggestion.state, ReviewSuggestionState::Pending) {
+            continue;
+        }
+        let count = counts
+            .entry(suggestion.location.relative_path.clone())
+            .or_insert_with(|| ReviewFileCommentCount {
+                relative_path: suggestion.location.relative_path.clone(),
+                ..ReviewFileCommentCount::default()
+            });
+        count.pending_suggestion_count = count.pending_suggestion_count.saturating_add(1);
+    }
+    counts.into_values().collect()
 }
 
 pub(crate) fn review_summary_root(review: &Review) -> Option<ProjectRootPath> {

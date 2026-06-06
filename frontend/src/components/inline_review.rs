@@ -13,7 +13,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     ProjectRootPath, ReviewActionPayload, ReviewAnchor, ReviewAnchorStatus, ReviewComment,
-    ReviewCommentSource, ReviewSuggestedComment, ReviewSuggestionState,
+    ReviewCommentId, ReviewCommentSource, ReviewSuggestedComment, ReviewSuggestionState,
 };
 
 use crate::components::review_view::{
@@ -898,6 +898,7 @@ pub(crate) fn Composer(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let body = composer_state.body;
+    let submitted_baseline = composer_state.submitted_baseline;
     let location = composer_state.location.clone();
     let host_for_send = host_id.clone();
     let review_for_send = review_id.clone();
@@ -914,36 +915,43 @@ pub(crate) fn Composer(
             .with(|set| set.contains(&(rid_for_pending.clone(), ReviewActionTarget::AddComment)))
     };
 
-    // Effect: when an AddComment echo lands, the dispatch handler
-    // clears the gate AND the new User comment with our location is
-    // present in the live review record. Detect that exact transition
-    // and close the composer. On error the gate clears without a
-    // matching new comment ⇒ keep composer open with body intact.
+    // Level-triggered close. Once a save is dispatched, `do_save` records a
+    // snapshot of the User-comment ids already at this location in the
+    // persistent `submitted_baseline`. This effect closes the composer the
+    // instant a User comment at the location appears whose id is *not* in
+    // that snapshot — i.e. the AddComment echo landed.
+    //
+    // It tracks both `submitted_baseline` and `reviews`, so it re-evaluates
+    // on the `CommentUpsert` that adds the comment regardless of ordering,
+    // and it is purely level-based: a Composer that remounts mid-flight (the
+    // same upsert can re-render the surrounding thread region) re-reads the
+    // persistent baseline and the live comment and still closes. The old
+    // edge-triggered approach watched a Composer-local pending flag and a
+    // remount could miss the gate's falling edge, leaving the composer stuck
+    // open with its body text intact. On error the gate clears but no new
+    // comment lands ⇒ the snapshot stays unmatched and the composer stays
+    // open with its body intact.
     {
         let rid = review_id.clone();
         let s = state.clone();
         let target_location = location.clone();
-        let was_pending = RwSignal::new(false);
         Effect::new(move |_| {
-            let pending_now = s
-                .review_action_target_pending
-                .with(|set| set.contains(&(rid.clone(), ReviewActionTarget::AddComment)));
-            let prev = was_pending.get_untracked();
-            was_pending.set(pending_now);
-            if prev && !pending_now {
-                let echoed = s.reviews.with_untracked(|map| {
-                    map.get(&rid)
-                        .map(|r| {
-                            r.comments.iter().any(|c| {
-                                matches!(c.source, ReviewCommentSource::User)
-                                    && c.location == target_location
-                            })
+            let Some(baseline) = submitted_baseline.get() else {
+                return;
+            };
+            let confirmed = s.reviews.with(|map| {
+                map.get(&rid)
+                    .map(|r| {
+                        r.comments.iter().any(|c| {
+                            matches!(c.source, ReviewCommentSource::User)
+                                && c.location == target_location
+                                && !baseline.contains(&c.id)
                         })
-                        .unwrap_or(false)
-                });
-                if echoed {
-                    composer.set(None);
-                }
+                    })
+                    .unwrap_or(false)
+            });
+            if confirmed {
+                composer.set(None);
             }
         });
     }
@@ -963,6 +971,25 @@ pub(crate) fn Composer(
             if !try_claim_review_action(&state_for_send, &rid, &ReviewActionTarget::AddComment) {
                 return;
             }
+            // Snapshot the User comments already at this location so the
+            // level-triggered close effect can recognize the newly added
+            // one. Set on the persistent ComposerState so a mid-flight
+            // remount preserves it.
+            let baseline: Vec<ReviewCommentId> = state_for_send.reviews.with_untracked(|map| {
+                map.get(&rid)
+                    .map(|r| {
+                        r.comments
+                            .iter()
+                            .filter(|c| {
+                                matches!(c.source, ReviewCommentSource::User)
+                                    && c.location == location_for_send
+                            })
+                            .map(|c| c.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            submitted_baseline.set(Some(baseline));
             let host = host_for_send.clone();
             let location = location_for_send.clone();
             let target_state = state_for_send.clone();
@@ -1047,5 +1074,169 @@ pub(crate) fn Composer(
                 </button>
             </div>
         </div>
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use protocol::{
+        AgentId, ProjectId, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewComment,
+        ReviewCommentId, ReviewDiffSelection, ReviewDiffSide, ReviewId, ReviewLocation,
+        ReviewStatus, SessionId,
+    };
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        wasm_bindgen::JsCast::dyn_into::<HtmlElement>(container).unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn location() -> ReviewLocation {
+        ReviewLocation {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/foo.rs".to_owned(),
+            anchor: ReviewAnchor::LineRange {
+                side: ReviewDiffSide::New,
+                start_line: 2,
+                end_line: 2,
+            },
+        }
+    }
+
+    fn user_comment(id: &str) -> ReviewComment {
+        ReviewComment {
+            id: ReviewCommentId(id.to_owned()),
+            location: location(),
+            anchor_status: ReviewAnchorStatus::Current,
+            body: "echoed".to_owned(),
+            source: ReviewCommentSource::User,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn review_with(comments: Vec<ReviewComment>) -> Review {
+        Review {
+            id: ReviewId("rev-1".to_owned()),
+            project_id: ProjectId("proj-1".to_owned()),
+            origin_agent_id: AgentId("agent-1".to_owned()),
+            origin_session_id: SessionId("sess-1".to_owned()),
+            selection: ReviewDiffSelection::AllUncommitted,
+            status: ReviewStatus::Draft,
+            diffs: vec![],
+            comments,
+            suggestions: vec![],
+            ai_reviewer: ReviewAiReviewerState {
+                status: ReviewAiReviewerStatus::Idle,
+                agent_id: None,
+                error: None,
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    /// Mount a `Composer` whose `submitted_baseline` is already set (a save
+    /// was dispatched), with `seed_comments` pre-loaded into the review.
+    /// Returns the parent `composer` signal so the test can observe close.
+    fn mount_composer_post_save(
+        container: HtmlElement,
+        seed_comments: Vec<ReviewComment>,
+        baseline: Vec<ReviewCommentId>,
+    ) -> RwSignal<Option<ComposerState>> {
+        let review = review_with(seed_comments);
+        let rid = review.id.clone();
+        let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            state.reviews.update(|m| {
+                m.insert(rid.clone(), review.clone());
+            });
+            provide_context(state.clone());
+            let composer_state = ComposerState {
+                location: location(),
+                body: RwSignal::new("draft text".to_owned()),
+                submitted_baseline: RwSignal::new(Some(baseline.clone())),
+            };
+            composer.set(Some(composer_state.clone()));
+            let is_draft = Memo::new(move |_| true);
+            view! {
+                <Composer
+                    composer=composer
+                    composer_state=composer_state
+                    host_id="h1".to_owned()
+                    review_id=rid.clone()
+                    is_draft=is_draft
+                />
+            }
+        });
+        std::mem::forget(handle);
+        composer
+    }
+
+    /// Regression: the close is level-triggered, not edge-triggered. When the
+    /// confirming `CommentUpsert` has *already* landed before the composer's
+    /// effect first runs — exactly what a mid-flight remount produces, since
+    /// the same upsert that clears the pending gate also re-renders the
+    /// thread region — the composer must still close. The old edge-triggered
+    /// code watched a Composer-local pending flag and missed this transition,
+    /// leaving the composer stuck open with its body text.
+    #[wasm_bindgen_test]
+    async fn composer_closes_when_echo_already_present_on_mount() {
+        let container = make_container();
+        // The new User comment at our location is already in the review, and
+        // it is not in the save-time baseline.
+        let composer = mount_composer_post_save(container, vec![user_comment("new")], Vec::new());
+
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            composer.get_untracked().is_none(),
+            "composer must close once its comment is confirmed, even if the \
+             echo landed before the effect first ran (remount-safe)"
+        );
+    }
+
+    /// The confirmed-echo gate is preserved: if the pending action clears
+    /// without a *new* comment at the location (the AddComment failed), the
+    /// composer stays open with its body intact. Here a comment matching the
+    /// baseline already exists, but no comment outside the baseline appears.
+    #[wasm_bindgen_test]
+    async fn composer_stays_open_without_new_comment() {
+        let container = make_container();
+        // The only comment at the location is the baseline one (it existed
+        // before the save), so nothing new was confirmed.
+        let composer = mount_composer_post_save(
+            container,
+            vec![user_comment("pre-existing")],
+            vec![ReviewCommentId("pre-existing".to_owned())],
+        );
+
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            composer.get_untracked().is_some(),
+            "composer must stay open when no comment outside the baseline \
+             appears (e.g. the AddComment failed)"
+        );
     }
 }

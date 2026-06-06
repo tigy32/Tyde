@@ -2461,8 +2461,30 @@ pub struct ReviewCreatePayload {
     pub selection: ReviewDiffSelection,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewSubscribePayload {}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSubscribePayload {
+    #[serde(
+        default = "default_review_subscribe_include_diffs",
+        skip_serializing_if = "is_default_review_subscribe_include_diffs"
+    )]
+    pub include_diffs: bool,
+}
+
+impl Default for ReviewSubscribePayload {
+    fn default() -> Self {
+        Self {
+            include_diffs: true,
+        }
+    }
+}
+
+const fn default_review_subscribe_include_diffs() -> bool {
+    true
+}
+
+const fn is_default_review_subscribe_include_diffs(value: &bool) -> bool {
+    *value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2505,7 +2527,8 @@ pub enum ReviewActionPayload {
         suggestion_id: ReviewSuggestionId,
     },
     StartAiReview {
-        backend_kind: BackendKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_kind: Option<BackendKind>,
         cost_hint: Option<SpawnCostHint>,
         instructions: Option<String>,
     },
@@ -2646,6 +2669,27 @@ pub struct ReviewSummary {
     pub updated_at_ms: u64,
     pub user_comment_count: u32,
     pub pending_suggestion_count: u32,
+    #[serde(default)]
+    pub file_comment_counts: Vec<ReviewFileCommentCount>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFileCommentCount {
+    pub relative_path: String,
+    #[serde(default)]
+    pub user_comment_count: u32,
+    #[serde(default)]
+    pub ai_comment_count: u32,
+    #[serde(default)]
+    pub pending_suggestion_count: u32,
+}
+
+impl ReviewFileCommentCount {
+    pub const fn total_count(&self) -> u32 {
+        self.user_comment_count
+            .saturating_add(self.ai_comment_count)
+            .saturating_add(self.pending_suggestion_count)
+    }
 }
 
 /// Absolute host-native path. Server-owned semantics: interpretation is up to

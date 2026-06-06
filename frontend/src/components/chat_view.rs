@@ -282,14 +282,15 @@ pub fn ChatView(
     // Two listeners, with separate responsibilities:
     //
     //   1. The `scroll` listener (always fires, including on
-    //      programmatic `set_scroll_top` calls). It only updates
+    //      programmatic `set_scroll_top` calls). It updates
     //      `scroll_top_sig` — the windowing Memo needs current scroll
-    //      position. It does NOT touch `user_scrolled_up`. Otherwise,
-    //      content growing below the user (e.g. during a session
-    //      restore where messages stream in over seconds) would trip
-    //      the near-bottom check, set `user_scrolled_up = true`, and
-    //      permanently disable sticky-bottom. That was the visible
-    //      "stuck at top after restore" bug.
+    //      position. When `scrollTop` actually moves, it also updates
+    //      `user_scrolled_up`; this catches scrollbar/page-script
+    //      scrolls that do not emit wheel/touch/key events. Scroll
+    //      events without `scrollTop` movement still leave sticky-bottom
+    //      alone, so content growing below the user (e.g. during a
+    //      session restore where messages stream in over seconds)
+    //      cannot masquerade as user intent and disable sticky-bottom.
     //
     //   2. The user-input listeners (`wheel`, `touchstart`, `keydown`)
     //      fire only on real user actions. Those re-evaluate distance-
@@ -311,8 +312,14 @@ pub fn ChatView(
         let listener_mounted = view_mounted_for_listeners.clone();
         let scroll_handler = Closure::<dyn Fn()>::new(move || {
             let scroll_top = el_clone.scroll_top() as f64;
-            if (scroll_top_sig.get_untracked() - scroll_top).abs() >= 1.0 {
+            let scroll_changed = (scroll_top_sig.get_untracked() - scroll_top).abs() >= 1.0;
+            if scroll_changed {
                 scroll_top_sig.set(scroll_top);
+                let distance_from_bottom =
+                    el_clone.scroll_height() - el_clone.scroll_top() - el_clone.client_height();
+                let is_near_bottom = distance_from_bottom < 80;
+                user_scrolled_up.set(!is_near_bottom);
+                show_scroll_btn.set(!is_near_bottom);
             }
             if listener_pending.get() {
                 return;

@@ -372,6 +372,10 @@ pub enum RejectCode {
 - `ProjectBootstrapPayload.review_summaries` and
   `ProjectEventPayload::ReviewListChanged` carry `ReviewSummary.root` so
   clients can bind the implicit active review to the exact project root diff.
+  Summaries also carry per-file review comment counts for git file-list badges.
+- `ReviewSubscribePayload.include_diffs` defaults to `true`; clients can set it
+  to `false` for lightweight review/comment surfaces that do not need full diff
+  payloads in `ReviewBootstrap`.
 - `StreamPath` wraps `String` for type safety. It will gain validation
   (must start with `/`, valid segments) when we add stream creation logic.
 

@@ -4578,6 +4578,7 @@ impl HostHandle {
                 review_id.clone(),
                 connection_host_stream.clone(),
                 review_stream,
+                true,
             )
             .await
             .map_err(|error| {
@@ -4625,12 +4626,14 @@ impl HostHandle {
         connection_host_stream: &StreamPath,
         review_output_stream: Stream,
         review_id: ReviewId,
+        include_diffs: bool,
     ) -> AppResult<()> {
         const OPERATION: &str = "review_subscribe";
         tracing::info!(
             review_id = %review_id,
             connection_stream = %connection_host_stream,
             output_stream = %review_output_stream.path(),
+            include_diffs,
             "received review_subscribe"
         );
         let review_registry = {
@@ -4642,6 +4645,7 @@ impl HostHandle {
                 review_id,
                 connection_host_stream.clone(),
                 review_output_stream,
+                include_diffs,
             )
             .await
             .map_err(|error| {
@@ -4980,6 +4984,14 @@ impl HostHandle {
         Result<AgentId, String>,
     ) {
         let reply = request.reply;
+        let requested_backend_kind = request.backend_kind;
+        let backend_kind = match self
+            .resolve_ai_reviewer_backend_kind(requested_backend_kind)
+            .await
+        {
+            Ok(backend_kind) => backend_kind,
+            Err(message) => return (reply, Err(message)),
+        };
         let instructions_len = request.instructions.as_ref().map_or(0, String::len);
         let roots = request
             .review
@@ -4991,7 +5003,8 @@ impl HostHandle {
         let stats = host_diff_stats(&request.review.diffs);
         tracing::info!(
             review_id = %request.review_id,
-            backend_kind = ?request.backend_kind,
+            backend_kind = ?backend_kind,
+            requested_backend_kind = ?requested_backend_kind,
             roots_count,
             diff_count = stats.diff_count,
             file_count = stats.file_count,
@@ -5003,7 +5016,7 @@ impl HostHandle {
         if roots_count == 0 {
             tracing::warn!(
                 review_id = %request.review_id,
-                backend_kind = ?request.backend_kind,
+                backend_kind = ?backend_kind,
                 "AI reviewer spawn rejected without diff roots"
             );
             return (reply, Err("review has no frozen diff roots".to_owned()));
@@ -5015,7 +5028,7 @@ impl HostHandle {
         if review_mcp_url.trim().is_empty() {
             tracing::warn!(
                 review_id = %request.review_id,
-                backend_kind = ?request.backend_kind,
+                backend_kind = ?backend_kind,
                 "AI reviewer spawn rejected without review MCP URL"
             );
             return (
@@ -5053,7 +5066,7 @@ impl HostHandle {
                 workspace_roots: roots,
                 prompt,
                 images: None,
-                backend_kind: request.backend_kind,
+                backend_kind,
                 cost_hint: request.cost_hint,
                 access_mode: protocol::BackendAccessMode::ReadOnly,
                 session_settings: None,
@@ -5061,7 +5074,7 @@ impl HostHandle {
         };
         tracing::debug!(
             review_id = %request.review_id,
-            backend_kind = ?request.backend_kind,
+            backend_kind = ?backend_kind,
             roots_count,
             reviewer_system_prompt_len,
             prompt_len,
@@ -5096,6 +5109,31 @@ impl HostHandle {
                 )),
             )
         }
+    }
+
+    async fn resolve_ai_reviewer_backend_kind(
+        &self,
+        requested: Option<protocol::BackendKind>,
+    ) -> Result<protocol::BackendKind, String> {
+        if let Some(backend_kind) = requested {
+            return Ok(backend_kind);
+        }
+        let settings_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.settings_store)
+        };
+        let settings = settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| format!("failed to load host settings for AI review: {error}"))?;
+        settings
+            .default_backend
+            .or_else(|| settings.enabled_backends.first().copied())
+            .ok_or_else(|| {
+                "backend_kind is required because the host has no default_backend or enabled backends"
+                    .to_owned()
+            })
     }
 }
 
@@ -8765,6 +8803,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai_reviewer_backend_resolution_uses_host_defaults() {
+        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp host dir");
+        let host = spawn_host_with_store_paths_and_runtime_config(
+            dir.join("sessions.json"),
+            dir.join("projects.json"),
+            dir.join("settings.json"),
+            HostRuntimeConfig::default(),
+        )
+        .expect("spawn host");
+
+        let err = host
+            .resolve_ai_reviewer_backend_kind(None)
+            .await
+            .expect_err("missing host backend should fail");
+        assert!(
+            err.contains("no default_backend or enabled backends"),
+            "unexpected error: {err}"
+        );
+
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable backends");
+        assert_eq!(
+            host.resolve_ai_reviewer_backend_kind(None)
+                .await
+                .expect("first enabled backend"),
+            BackendKind::Claude
+        );
+
+        host.set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(BackendKind::Codex),
+            },
+        })
+        .await
+        .expect("set default backend");
+        assert_eq!(
+            host.resolve_ai_reviewer_backend_kind(None)
+                .await
+                .expect("default backend"),
+            BackendKind::Codex
+        );
+        assert_eq!(
+            host.resolve_ai_reviewer_backend_kind(Some(BackendKind::Gemini))
+                .await
+                .expect("explicit backend override"),
+            BackendKind::Gemini
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn ai_reviewer_non_claude_reaches_read_only_spawn_preconditions() {
         let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp host dir");
@@ -8808,7 +8904,7 @@ mod tests {
             .spawn_ai_reviewer(crate::review::actor::ReviewAiSpawnRequest {
                 review_id: review.id.clone(),
                 review,
-                backend_kind: BackendKind::Codex,
+                backend_kind: Some(BackendKind::Codex),
                 cost_hint: None,
                 instructions: None,
                 review_handle: ReviewHandle { tx: review_tx },

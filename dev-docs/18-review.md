@@ -62,13 +62,51 @@ pub struct ReviewSummary {
     pub id: ReviewId,
     pub root: ProjectRootPath,
     pub status: ReviewStatus, // Draft for active reviews
-    // counts and legacy origin fields...
+    pub user_comment_count: u32,
+    pub pending_suggestion_count: u32,
+    pub file_comment_counts: Vec<ReviewFileCommentCount>,
+    // legacy origin fields...
+}
+
+pub struct ReviewFileCommentCount {
+    pub relative_path: String,
+    pub user_comment_count: u32,
+    pub ai_comment_count: u32,
+    pub pending_suggestion_count: u32,
 }
 ```
 
 For a project with multiple roots, the summary list contains one active draft
 summary per root. Clients bind inline review state by `(project_id, root)`, not
 by project alone.
+
+`file_comment_counts` lets the normal git file list show comment badges without
+subscribing to the full review diff. Per-file totals are
+`user_comment_count + ai_comment_count + pending_suggestion_count`. Human
+comments, accepted AI comments, and pending AI suggestions count even when
+their anchors are stale; rejected suggestions do not count.
+The legacy aggregate `ReviewSummary.user_comment_count` remains the total
+accepted comment-record count for summary hubs, including human comments and
+accepted AI comments.
+
+### Subscribe
+
+```rust
+pub struct ReviewSubscribePayload {
+    pub include_diffs: bool, // defaults to true; default serializes as {}
+}
+```
+
+Older `{}` subscribe payloads receive the full `ReviewBootstrap.review.diffs`.
+Clients that only need comment/suggestion state for a lightweight Comments
+surface may send `{ "include_diffs": false }`; the server then clears `diffs`
+from `ReviewBootstrap` and any later `Snapshot`/`Cleared` review payload sent
+to that subscriber. Other review events are unchanged. Lightweight subscribe
+does not refresh the root's full-file diff; mutation, submit, AI review, and
+full subscribe paths still refresh diffs before they need them.
+If the same connection has already subscribed to that review with
+`include_diffs = true`, the full mode is sticky for that connection/review so a
+later lightweight subscribe cannot downgrade full diff payloads.
 
 ### Create
 
@@ -132,7 +170,7 @@ pub enum ReviewActionPayload {
     DeleteComment { comment_id: ReviewCommentId },
     AcceptSuggestion { suggestion_id: ReviewSuggestionId, edit: Option<String> },
     RejectSuggestion { suggestion_id: ReviewSuggestionId },
-    StartAiReview { backend_kind: BackendKind, cost_hint: Option<SpawnCostHint>, instructions: Option<String> },
+    StartAiReview { backend_kind: Option<BackendKind>, cost_hint: Option<SpawnCostHint>, instructions: Option<String> },
     Submit { target: ReviewSubmitTarget },
     ClearComments,
     Cancel, // Legacy/discard path; not used by the always-on inline UX.
@@ -143,6 +181,9 @@ pub enum ReviewActionPayload {
 review on success. `ClearComments` explicitly resets comments/suggestions/AI
 state without delivering anything. `Cancel` remains deserializable for
 backcompat but new server/UI paths should not depend on it for lifecycle.
+`StartAiReview.backend_kind = None` asks the host to use
+`HostSettings.default_backend`, or the first enabled backend if no default is
+configured; `Some(kind)` remains an explicit override.
 
 ### Anchor status
 
@@ -266,8 +307,14 @@ target or retry.
 
 - `ReviewSummary.root` is required on new summary payloads and defaults to an
   empty `ProjectRootPath` only for legacy JSON deserialization.
+- `ReviewSummary.file_comment_counts` defaults to an empty list for legacy
+  summary JSON.
 - `ReviewCreatePayload.origin_agent_id` is removed from the protocol payload.
   Older JSON with that extra field is ignored.
+- `ReviewSubscribePayload.include_diffs` defaults to `true`, so legacy
+  subscribe payloads keep receiving full diffs.
+- `ReviewActionPayload::StartAiReview.backend_kind` is optional. Missing values
+  use the host default backend, then the first enabled backend.
 - `ReviewActionPayload::Submit` requires an explicit `target`.
 - Active reviews normalize to `ReviewDiffSelection::Root { scope: Unstaged,
   path: None }`.
@@ -287,8 +334,14 @@ Frontend/mobile should:
 - Treat `ProjectBootstrap.review_summaries` and
   `ProjectEventPayload::ReviewListChanged` as the source of active review ids.
 - Bind active review state by `(project_id, summary.root)`.
+- Render per-file comment badges in the normal git diff/file list from
+  `ReviewSummary.file_comment_counts` when available.
 - Subscribe to `/review/<summary.id>` when the diff surface for that root needs
   full review state; do not create a review just to make one exist.
+- For a lightweight Comments surface, subscribe with `include_diffs = false`
+  and render small snippets around comments/suggestions from already-loaded
+  project diff data instead of treating the all-root full diff as the primary
+  entrypoint.
 - Render `anchor_status = Stale` distinctly and avoid silently changing the
   anchor location.
 - Use `ClearComments` for an explicit user reset.

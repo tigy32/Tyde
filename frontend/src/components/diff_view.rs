@@ -4234,6 +4234,7 @@ mod wasm_tests {
             updated_at_ms: 1,
             user_comment_count: review.comments.len() as u32,
             pending_suggestion_count: 0,
+            file_comment_counts: vec![],
         }
     }
 
@@ -4291,6 +4292,7 @@ mod wasm_tests {
                             updated_at_ms: 0,
                             user_comment_count: review.comments.len() as u32,
                             pending_suggestion_count: 0,
+                            file_comment_counts: vec![],
                         }],
                     );
                 });

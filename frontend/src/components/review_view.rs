@@ -23,17 +23,20 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
 // `ComposerState` is re-exported because `inline_review` imports it from here.
+use crate::components::inline_review::ThreadRegionFiltered;
 pub(crate) use crate::components::review_layer::ComposerState;
 use crate::send::send_frame;
 
 use crate::state::{
-    ActiveAgentRef, AgentInfo, AppState, DiffViewState, ReviewActionGate, ReviewActionTarget,
-    TabContent, root_display_name,
+    ActiveAgentRef, AgentInfo, AppState, DiffKey, DiffViewState, ReviewActionGate,
+    ReviewActionTarget, TabContent, root_display_name,
 };
 
 use protocol::{
-    BackendKind, FrameKind, ProjectDiffScope, ProjectReadDiffPayload, Review, ReviewActionPayload,
-    ReviewAiReviewerStatus, ReviewCommentSource, ReviewStatus, ReviewSuggestionState, StreamPath,
+    BackendKind, DiffContextMode, FrameKind, ProjectDiffScope, ProjectGitDiffLineKind, ProjectId,
+    ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus,
+    ReviewAnchor, ReviewCommentSource, ReviewDiffSide, ReviewId, ReviewLocation, ReviewStatus,
+    ReviewSuggestionState, StreamPath,
 };
 
 type ReviewAiIntervalSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalStorage>;
@@ -236,9 +239,28 @@ pub(crate) fn ReviewSidebar(
     };
 
     // ── Run AI reviewer form
+    //
+    // `backend_pick` is an *explicit override*. The AI reviewer otherwise
+    // runs against the effective default backend so the user never has to
+    // pick: explicit override → `host_settings.default_backend` → first
+    // enabled backend. Only when the host has no enabled backends at all is
+    // there nothing to run.
     let backend_pick: RwSignal<Option<BackendKind>> = RwSignal::new(None);
     let cost_pick: RwSignal<Option<protocol::SpawnCostHint>> = RwSignal::new(None);
     let instructions: RwSignal<String> = RwSignal::new(String::new());
+
+    let eff_backend_state = state.clone();
+    let eff_backend_host = host_id.clone();
+    let effective_backend: Memo<Option<BackendKind>> = Memo::new(move |_| {
+        backend_pick.get().or_else(|| {
+            eff_backend_state.host_settings_by_host.with(|map| {
+                map.get(&eff_backend_host).and_then(|s| {
+                    s.default_backend
+                        .or_else(|| s.enabled_backends.first().copied())
+                })
+            })
+        })
+    });
 
     let host_for_submit = host_id.clone();
     let review_for_submit = review_id.clone();
@@ -434,8 +456,8 @@ pub(crate) fn ReviewSidebar(
             if !is_draft.get() {
                 return "Review is no longer Draft";
             }
-            if backend_pick.get().is_none() {
-                return "Choose an AI backend first";
+            if effective_backend.get().is_none() {
+                return "No AI backend available";
             }
             if action_pending().start_ai {
                 return "AI reviewer starting\u{2026}";
@@ -457,10 +479,15 @@ pub(crate) fn ReviewSidebar(
     let live_for_run_ai = live_for_ai;
     let on_run_ai = move |_| {
         let rid = review_for_ai.clone();
-        let Some(backend) = backend_pick.get_untracked() else {
+        // Gate on there being *some* runnable backend (else nothing to do),
+        // but resolve the default server-side: send the explicit picker
+        // override when chosen, else `None` so the host applies its
+        // `default_backend` (or first enabled).
+        if effective_backend.get_untracked().is_none() {
             log::info!("review.start_ai.skipped review={rid} reason=no_backend");
             return;
-        };
+        }
+        let backend_override = backend_pick.get_untracked();
         let host = host_for_ai.clone();
         let cost = cost_pick.get_untracked();
         let inst = {
@@ -494,11 +521,11 @@ pub(crate) fn ReviewSidebar(
             }
         });
         log::info!(
-            "review.start_ai.click review={} claimed={} gate_before_start_ai={} backend={:?} cost={:?} instructions_len={} ai_status={} {}",
+            "review.start_ai.click review={} claimed={} gate_before_start_ai={} backend_override={:?} cost={:?} instructions_len={} ai_status={} {}",
             rid,
             claimed,
             gate_before.start_ai,
-            backend,
+            backend_override,
             cost,
             inst_len,
             ai_status,
@@ -511,7 +538,7 @@ pub(crate) fn ReviewSidebar(
         let target_rid = rid.clone();
         spawn_local(async move {
             let payload = ReviewActionPayload::StartAiReview {
-                backend_kind: backend,
+                backend_kind: backend_override,
                 cost_hint: cost,
                 instructions: inst,
             };
@@ -788,7 +815,12 @@ pub(crate) fn ReviewSidebar(
                             }
                         >
                             <option value="" selected=move || backend_pick.get().is_none()>
-                                "Choose backend"
+                                {move || match effective_backend.get() {
+                                    Some(kind) if backend_pick.get().is_none() => {
+                                        format!("Default ({})", backend_kind_label(kind))
+                                    }
+                                    _ => "Use default backend".to_owned(),
+                                }}
                             </option>
                             {move || backends().into_iter().map(|kind| {
                                 let label = backend_kind_label(kind);
@@ -1358,6 +1390,589 @@ pub fn open_changed_diff_for_root(
     });
 }
 
+/// Open (or focus) the compact review-comments surface for `(project_id,
+/// root)`: snippets around each human comment, accepted AI comment, and
+/// pending AI suggestion — not the full root diff. The full diff stays one
+/// click away via the surface's "Open full diff" button (which routes
+/// through [`open_changed_diff_for_root`]).
+pub fn open_comments_for_root(
+    state: &AppState,
+    host_id: &str,
+    project_id: &protocol::ProjectId,
+    root: &protocol::ProjectRootPath,
+) {
+    let label = format!("Comments: {}", root_display_name(root));
+    state.open_tab(
+        TabContent::Comments {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            root: root.clone(),
+        },
+        label,
+        true,
+    );
+}
+
+/// One reviewable entry in the comments surface: a distinct anchored
+/// location that has at least one comment or pending suggestion, with a
+/// human-readable label. The diff snippet is computed *reactively in the row*
+/// from `state.diff_contents`, not captured here — the path-scoped diff fetch
+/// is async, so a captured snippet would render stale (empty) and never update
+/// when the response lands under the same `<For>` key.
+#[derive(Clone, Debug, PartialEq)]
+struct CommentSurfaceEntry {
+    location: ReviewLocation,
+    /// Stable `<For>` key. Includes the review id so a different draft for the
+    /// same path/anchor forces a fresh row instead of reusing one bound to the
+    /// old review; the snippet itself updates reactively without a key change.
+    key: String,
+    label: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SnippetLine {
+    marker: char,
+    /// New-side line number when present, else old-side — for display only.
+    number: Option<u32>,
+    text: String,
+}
+
+const SNIPPET_CONTEXT: u32 = 2;
+const SNIPPET_MAX_LINES: usize = 14;
+
+fn anchor_label(relative_path: &str, anchor: &ReviewAnchor) -> String {
+    match anchor {
+        ReviewAnchor::File => format!("{relative_path} \u{00b7} file"),
+        ReviewAnchor::Hunk { .. } => format!("{relative_path} \u{00b7} hunk"),
+        ReviewAnchor::LineRange {
+            side,
+            start_line,
+            end_line,
+        } => {
+            let side = match side {
+                ReviewDiffSide::Old => "old",
+                ReviewDiffSide::New => "new",
+            };
+            if start_line == end_line {
+                format!("{relative_path} \u{00b7} {side} L{start_line}")
+            } else {
+                format!("{relative_path} \u{00b7} {side} L{start_line}\u{2013}{end_line}")
+            }
+        }
+    }
+}
+
+/// Pull the small snippet of diff lines around `anchor` from already-loaded
+/// project diff files (`state.diff_contents`), NOT from `review.diffs` — the
+/// comments surface subscribes lightweight, so the review record carries no
+/// diffs. Empty when the file isn't loaded yet, the anchor is file-level, the
+/// file is binary, or the anchored range no longer maps to any diff line.
+fn snippet_for_anchor(
+    files: &[protocol::ProjectGitDiffFile],
+    relative_path: &str,
+    anchor: &ReviewAnchor,
+) -> Vec<SnippetLine> {
+    let Some(file) = files.iter().find(|f| f.relative_path == relative_path) else {
+        return Vec::new();
+    };
+
+    let to_snippet = |line: &protocol::ProjectGitDiffLine| SnippetLine {
+        marker: match line.kind {
+            ProjectGitDiffLineKind::Added => '+',
+            ProjectGitDiffLineKind::Removed => '-',
+            ProjectGitDiffLineKind::Context => ' ',
+        },
+        number: line.new_line_number.or(line.old_line_number),
+        text: line.text.clone(),
+    };
+
+    match anchor {
+        ReviewAnchor::File => Vec::new(),
+        // Bound the allocation: take at most `SNIPPET_MAX_LINES` before
+        // collecting rather than collecting a whole hunk then truncating.
+        ReviewAnchor::Hunk { hunk_id, .. } => file
+            .hunks
+            .iter()
+            .find(|h| &h.hunk_id == hunk_id)
+            .map(|h| {
+                h.lines
+                    .iter()
+                    .take(SNIPPET_MAX_LINES)
+                    .map(to_snippet)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ReviewAnchor::LineRange {
+            side,
+            start_line,
+            end_line,
+        } => {
+            let lo = start_line.saturating_sub(SNIPPET_CONTEXT);
+            let hi = end_line.saturating_add(SNIPPET_CONTEXT);
+            let selected_number = |line: &protocol::ProjectGitDiffLine| match side {
+                ReviewDiffSide::Old => line.old_line_number,
+                ReviewDiffSide::New => line.new_line_number,
+            };
+            let in_window = |line: &protocol::ProjectGitDiffLine| matches!(selected_number(line), Some(n) if n >= lo && n <= hi);
+            // A change line that carries no selected-side number — i.e. the
+            // opposite side of a replacement (a `-` line when anchoring on New,
+            // a `+` line when anchoring on Old). These have no selected-side
+            // number to fall in the window, so they must be pulled in by
+            // adjacency rather than by number.
+            let opposite_change = |line: &protocol::ProjectGitDiffLine| {
+                selected_number(line).is_none()
+                    && !matches!(line.kind, ProjectGitDiffLineKind::Context)
+            };
+            // Include the positional span between the first and last in-window
+            // line in each hunk, then extend it over directly-adjacent
+            // opposite-side change lines so a top-of-hunk replacement like
+            // `-old` / `+new` anchored on New L1 keeps its `-old` line even
+            // with no preceding context. Bounded to `SNIPPET_MAX_LINES`.
+            let mut out: Vec<SnippetLine> = Vec::new();
+            for hunk in &file.hunks {
+                let Some(mut first) = hunk.lines.iter().position(&in_window) else {
+                    continue;
+                };
+                let mut last = hunk.lines.iter().rposition(&in_window).unwrap_or(first);
+                while first > 0 && opposite_change(&hunk.lines[first - 1]) {
+                    first -= 1;
+                }
+                while last + 1 < hunk.lines.len() && opposite_change(&hunk.lines[last + 1]) {
+                    last += 1;
+                }
+                for line in &hunk.lines[first..=last] {
+                    out.push(to_snippet(line));
+                    if out.len() >= SNIPPET_MAX_LINES {
+                        return out;
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Numeric sort key for a comment-surface entry: group by file, then by
+/// anchor side, then by line range. Avoids the lexicographic ordering of the
+/// Debug-string entry key (which would sort line 10 before line 2).
+fn anchor_sort_key(location: &ReviewLocation) -> (String, u8, u32, u32) {
+    let (rank, start, end) = match &location.anchor {
+        ReviewAnchor::File => (0u8, 0u32, 0u32),
+        ReviewAnchor::Hunk {
+            new_start,
+            old_start,
+            ..
+        } => (1, *new_start, *old_start),
+        ReviewAnchor::LineRange {
+            side,
+            start_line,
+            end_line,
+        } => {
+            let rank = match side {
+                ReviewDiffSide::Old => 2,
+                ReviewDiffSide::New => 3,
+            };
+            (rank, *start_line, *end_line)
+        }
+    };
+    (location.relative_path.clone(), rank, start, end)
+}
+
+/// Resolve the project diff files that cover `relative_path` from the project
+/// diff cache: prefer a per-file entry, else fall back to the whole-root entry
+/// (which the full diff view shares). Empty when neither is loaded yet.
+fn resolve_diff_files(
+    diffs: &std::collections::HashMap<DiffKey, DiffViewState>,
+    host_id: &str,
+    project_id: &ProjectId,
+    root: &ProjectRootPath,
+    relative_path: &str,
+) -> Vec<protocol::ProjectGitDiffFile> {
+    let per_file = DiffKey::new(
+        host_id,
+        project_id.clone(),
+        root.clone(),
+        ProjectDiffScope::Unstaged,
+        relative_path,
+    );
+    if let Some(entry) = diffs.get(&per_file) {
+        return entry.files.clone();
+    }
+    let whole_root = DiffKey::new(
+        host_id,
+        project_id.clone(),
+        root.clone(),
+        ProjectDiffScope::Unstaged,
+        "",
+    );
+    diffs
+        .get(&whole_root)
+        .map(|entry| entry.files.clone())
+        .unwrap_or_default()
+}
+
+/// Whether the unstaged diff for `relative_path` is already represented in the
+/// project diff cache — either a per-file entry or the shared whole-root entry.
+/// Used to avoid re-fetching a file the diff view already loaded.
+fn file_diff_cached(
+    diffs: &std::collections::HashMap<DiffKey, DiffViewState>,
+    host_id: &str,
+    project_id: &ProjectId,
+    root: &ProjectRootPath,
+    relative_path: &str,
+) -> bool {
+    let per_file = DiffKey::new(
+        host_id,
+        project_id.clone(),
+        root.clone(),
+        ProjectDiffScope::Unstaged,
+        relative_path,
+    );
+    let whole_root = DiffKey::new(
+        host_id,
+        project_id.clone(),
+        root.clone(),
+        ProjectDiffScope::Unstaged,
+        "",
+    );
+    diffs.contains_key(&per_file) || diffs.contains_key(&whole_root)
+}
+
+/// Compact, comments-first review surface for one root's draft review.
+///
+/// Shows only the regions that carry feedback — each human comment, accepted
+/// AI comment, and pending AI suggestion — as a small snippet plus its
+/// thread, instead of the whole root diff. Rejected suggestions are excluded
+/// from the entry list (they stay reachable under each thread's existing
+/// "N rejected" toggle). An empty state covers the no-feedback case, and an
+/// "Open full diff" button is the escape hatch to the full reviewable diff.
+#[component]
+pub fn ReviewCommentsSurface(
+    host_id: String,
+    project_id: ProjectId,
+    root: ProjectRootPath,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+
+    // Resolve the draft review id for this (project_id, root). Start from the
+    // Draft summary (cheap, arrives first), but if we hold the full record
+    // require *its* live status to still be Draft: a live `StatusChanged`
+    // updates `state.reviews` before `review_summaries` refreshes, so trusting
+    // a stale Draft summary alone would keep the comments surface bound to an
+    // already-submitted review. Mirrors `ReviewableDiffView`'s guard.
+    let draft_state = state.clone();
+    let draft_host = host_id.clone();
+    let draft_root = root.clone();
+    let draft_project = project_id.clone();
+    let draft: Memo<Option<(String, ReviewId)>> = Memo::new(move |_| {
+        let id = draft_state.review_summaries.with(|m| {
+            m.get(&draft_project).and_then(|sums| {
+                sums.iter()
+                    .filter(|s| s.root == draft_root && matches!(s.status, ReviewStatus::Draft))
+                    .max_by_key(|s| s.updated_at_ms)
+                    .map(|s| s.id.clone())
+            })
+        })?;
+        let live_non_draft = draft_state.reviews.with(|r| {
+            r.get(&id)
+                .map(|rev| !matches!(rev.status, ReviewStatus::Draft))
+                .unwrap_or(false)
+        });
+        if live_non_draft {
+            return None;
+        }
+        Some((draft_host.clone(), id))
+    });
+
+    // Keep the draft subscribed so comments/suggestions/diffs are available.
+    subscribe_review_reactive(&state, draft);
+
+    let is_draft: Memo<bool> = Memo::new(move |_| draft.get().is_some());
+
+    // A composer signal is required by `ThreadRegionFiltered`, but this
+    // surface has no drag-to-comment gutter, so it never opens.
+    let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
+
+    // Distinct files that carry feedback (comments or pending suggestions).
+    // Drives the per-file diff fetch below.
+    let files_state = state.clone();
+    let files_root = root.clone();
+    let commented_files: Memo<Vec<String>> = Memo::new(move |_| {
+        let Some((_, rid)) = draft.get() else {
+            return Vec::new();
+        };
+        files_state.reviews.with(|map| {
+            let Some(review) = map.get(&rid) else {
+                return Vec::new();
+            };
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut files = Vec::new();
+            let comment_files = review
+                .comments
+                .iter()
+                .filter(|c| c.location.root == files_root)
+                .map(|c| &c.location.relative_path);
+            let suggestion_files = review
+                .suggestions
+                .iter()
+                .filter(|s| {
+                    matches!(s.state, ReviewSuggestionState::Pending)
+                        && s.location.root == files_root
+                })
+                .map(|s| &s.location.relative_path);
+            for path in comment_files.chain(suggestion_files) {
+                if seen.insert(path.clone()) {
+                    files.push(path.clone());
+                }
+            }
+            files
+        })
+    });
+
+    // Fetch the unstaged diff for each commented file not already in the
+    // project diff cache (per-file or shared whole-root). Lightweight: only
+    // commented files, Hunks context. Snippets render reactively from
+    // `state.diff_contents` once these responses land. `requested` dedupes so
+    // a file is fetched at most once per surface mount.
+    {
+        let fetch_state = state.clone();
+        let fetch_host = host_id.clone();
+        let fetch_pid = project_id.clone();
+        let fetch_root = root.clone();
+        let requested: StoredValue<std::collections::HashSet<String>, LocalStorage> =
+            StoredValue::new_local(std::collections::HashSet::new());
+        Effect::new(move |_| {
+            for path in commented_files.get() {
+                let cached = fetch_state.diff_contents.with_untracked(|diffs| {
+                    file_diff_cached(diffs, &fetch_host, &fetch_pid, &fetch_root, &path)
+                });
+                if cached || requested.with_value(|set| set.contains(&path)) {
+                    continue;
+                }
+                requested.update_value(|set| {
+                    set.insert(path.clone());
+                });
+                let key = DiffKey::new(
+                    fetch_host.clone(),
+                    fetch_pid.clone(),
+                    fetch_root.clone(),
+                    ProjectDiffScope::Unstaged,
+                    path.clone(),
+                );
+                fetch_state.diff_contents.update(|diffs| {
+                    let previous = diffs.get(&key);
+                    let next = DiffViewState::for_request(
+                        previous,
+                        fetch_root.clone(),
+                        ProjectDiffScope::Unstaged,
+                        Some(path.clone()),
+                        DiffContextMode::Hunks,
+                    );
+                    diffs.insert(key, next);
+                });
+                let stream = StreamPath(format!("/project/{}", fetch_pid.0));
+                let host = fetch_host.clone();
+                let payload = ProjectReadDiffPayload {
+                    root: fetch_root.clone(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: Some(path.clone()),
+                    context_mode: DiffContextMode::Hunks,
+                };
+                spawn_local(async move {
+                    if let Err(e) =
+                        send_frame(&host, stream, FrameKind::ProjectReadDiff, &payload).await
+                    {
+                        log::error!("review.comments.read_diff.err path={path} error={e}");
+                    }
+                });
+            }
+        });
+    }
+
+    // Distinct anchored locations carrying feedback. Depends only on
+    // `state.reviews` + the draft id: the entry *set* changes when comments or
+    // pending suggestions are added/removed, not when diffs arrive. Each row
+    // then computes its snippet reactively from `state.diff_contents`, so the
+    // async path-scoped diff fetch fills the snippet in without changing the
+    // entry set or the `<For>` key. Comments (human + accepted-AI) and pending
+    // suggestions define the set; rejected suggestions are excluded.
+    let entries_state = state.clone();
+    let entries_root = root.clone();
+    let entries: Memo<Vec<CommentSurfaceEntry>> = Memo::new(move |_| {
+        let Some((_, rid)) = draft.get() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<CommentSurfaceEntry> = entries_state.reviews.with(|map| {
+            let Some(review) = map.get(&rid) else {
+                return Vec::new();
+            };
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut entries = Vec::new();
+            let comment_locs = review
+                .comments
+                .iter()
+                .filter(|c| c.location.root == entries_root)
+                .map(|c| &c.location);
+            let suggestion_locs = review
+                .suggestions
+                .iter()
+                .filter(|s| {
+                    matches!(s.state, ReviewSuggestionState::Pending)
+                        && s.location.root == entries_root
+                })
+                .map(|s| &s.location);
+            for loc in comment_locs.chain(suggestion_locs) {
+                // Key includes the review id so a different draft for the same
+                // path/anchor forces a fresh row rather than reusing one bound
+                // to the old review.
+                let key = format!("{}|{}|{:?}", rid.0, loc.relative_path, loc.anchor);
+                if seen.insert(key.clone()) {
+                    entries.push(CommentSurfaceEntry {
+                        label: anchor_label(&loc.relative_path, &loc.anchor),
+                        key,
+                        location: loc.clone(),
+                    });
+                }
+            }
+            entries
+        });
+        entries.sort_by(|a, b| anchor_sort_key(&a.location).cmp(&anchor_sort_key(&b.location)));
+        entries
+    });
+
+    let has_entries = Memo::new(move |_| !entries.get().is_empty());
+
+    let open_state = state.clone();
+    let open_host = host_id.clone();
+    let open_pid = project_id.clone();
+    let open_root = root.clone();
+    let open_full_diff = move |_| {
+        open_changed_diff_for_root(&open_state, &open_host, &open_pid, &open_root);
+    };
+
+    let region_host = host_id.clone();
+    let region_root = root.clone();
+    // Captured for the per-row reactive snippet computation.
+    let snippet_state = state.clone();
+    let snippet_pid = project_id.clone();
+
+    view! {
+        <div class="review-comments-surface" data-test="review-comments-surface">
+            <div class="review-comments-toolbar">
+                <span class="review-comments-title">"Review comments"</span>
+                <button
+                    class="review-btn review-comments-open-full"
+                    data-test="review-comments-open-full"
+                    title="Open the full root diff"
+                    on:click=open_full_diff
+                >
+                    "Open full diff"
+                </button>
+            </div>
+            <Show
+                when=move || has_entries.get()
+                fallback=move || view! {
+                    <div class="review-comments-empty" data-test="review-comments-empty">
+                        "No review comments yet. Comments, accepted AI suggestions, and "
+                        "pending suggestions show up here as you review."
+                    </div>
+                }
+            >
+                <div class="review-comments-list">
+                    <For
+                        each=move || entries.get()
+                        key=|e| e.key.clone()
+                        children={
+                            let region_host = region_host.clone();
+                            let region_root = region_root.clone();
+                            let snippet_state = snippet_state.clone();
+                            let snippet_pid = snippet_pid.clone();
+                            move |entry: CommentSurfaceEntry| {
+                                let Some((_, rid)) = draft.get_untracked() else {
+                                    return view! { <div></div> }.into_any();
+                                };
+                                let anchor = entry.location.anchor.clone();
+                                let matcher: std::sync::Arc<
+                                    dyn Fn(&ReviewAnchor) -> bool + Send + Sync,
+                                > = std::sync::Arc::new(move |a: &ReviewAnchor| *a == anchor);
+                                // Reactive snippet: recomputed from the live
+                                // project diff cache, so the async path-scoped
+                                // fetch fills it in without remounting the row.
+                                let snip_state = snippet_state.clone();
+                                let snip_pid = snippet_pid.clone();
+                                let snip_host = region_host.clone();
+                                let snip_root = region_root.clone();
+                                let snip_path = entry.location.relative_path.clone();
+                                let snip_anchor = entry.location.anchor.clone();
+                                let snippet = move || {
+                                    snip_state.diff_contents.with(|diffs| {
+                                        let files = resolve_diff_files(
+                                            diffs,
+                                            &snip_host,
+                                            &snip_pid,
+                                            &snip_root,
+                                            &snip_path,
+                                        );
+                                        snippet_for_anchor(&files, &snip_path, &snip_anchor)
+                                    })
+                                };
+                                view! {
+                                    <div
+                                        class="review-comments-entry"
+                                        data-test="review-comments-entry"
+                                    >
+                                        <div class="review-comments-entry-label">
+                                            {entry.label.clone()}
+                                        </div>
+                                        {move || {
+                                            let lines = snippet();
+                                            (!lines.is_empty()).then(|| view! {
+                                            <pre class="review-comments-snippet">
+                                                {lines.into_iter().map(|line| {
+                                                    let cls = match line.marker {
+                                                        '+' => "review-snippet-line added",
+                                                        '-' => "review-snippet-line removed",
+                                                        _ => "review-snippet-line context",
+                                                    };
+                                                    let num = line
+                                                        .number
+                                                        .map(|n| n.to_string())
+                                                        .unwrap_or_default();
+                                                    view! {
+                                                        <div class=cls>
+                                                            <span class="review-snippet-num">{num}</span>
+                                                            <span class="review-snippet-marker">
+                                                                {line.marker.to_string()}
+                                                            </span>
+                                                            <span class="review-snippet-text">
+                                                                {line.text}
+                                                            </span>
+                                                        </div>
+                                                    }
+                                                }).collect::<Vec<_>>()}
+                                            </pre>
+                                            })
+                                        }}
+                                        <ThreadRegionFiltered
+                                            review_id=rid
+                                            root=region_root.clone()
+                                            relative_path=entry.location.relative_path.clone()
+                                            host_id=region_host.clone()
+                                            composer=composer
+                                            matcher=matcher
+                                            is_draft=is_draft
+                                        />
+                                    </div>
+                                }.into_any()
+                            }
+                        }
+                    />
+                </div>
+            </Show>
+        </div>
+    }
+}
+
 /// Open (or focus) the whole-root unstaged diff surface for `project_id`'s
 /// first root with reviewable changes — the canonical review surface for the
 /// integrated flow. Returns true when a diff tab was opened.
@@ -1480,7 +2095,14 @@ pub(crate) fn subscribe_review_reactive(
                 &host_for_send,
                 stream,
                 FrameKind::ReviewSubscribe,
-                &serde_json::json!({}),
+                // The frontend never renders from `review.diffs` — diffs come
+                // from the project diff pipeline (`state.diff_contents`), and
+                // inline comments anchor off per-comment line numbers, not the
+                // review's diff copy. Subscribe lightweight so bootstrap and
+                // later Snapshot/Cleared payloads omit the redundant diffs.
+                &protocol::ReviewSubscribePayload {
+                    include_diffs: false,
+                },
             )
             .await
             {
@@ -2108,23 +2730,51 @@ mod wasm_tests {
         );
     }
 
-    /// Run AI button is disabled until a backend is chosen. We assert via
+    /// AI review uses the host's default backend automatically — the user no
+    /// longer has to choose one first. Run AI is disabled only when the host
+    /// has *no* enabled backend (nothing to run); once a default backend
+    /// exists it enables without any explicit picker choice. We assert via
     /// the `disabled` attribute, which is user-perceived.
     #[wasm_bindgen_test]
-    async fn run_ai_disabled_until_backend_chosen() {
+    async fn run_ai_uses_default_backend_without_explicit_pick() {
         ensure_styles_loaded();
         let container = make_container();
         let review = make_review();
-        let _ = mount_sidebar(container.clone(), review);
+        let holder = mount_sidebar(container.clone(), review);
 
         next_tick().await;
+        next_tick().await;
+
+        // No enabled backends yet ⇒ nothing to run, button disabled.
+        let run_btn =
+            find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
+        assert!(
+            run_btn.has_attribute("disabled"),
+            "Run AI must be disabled when the host has no enabled backend"
+        );
+
+        // Seed host settings with a default backend. No explicit picker choice.
+        let state = holder.borrow().clone().unwrap();
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                "h1".to_owned(),
+                protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Codex],
+                    default_backend: Some(BackendKind::Codex),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: false,
+                },
+            );
+        });
         next_tick().await;
 
         let run_btn =
             find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
         assert!(
-            run_btn.has_attribute("disabled"),
-            "Run AI must be disabled before any backend is chosen"
+            !run_btn.has_attribute("disabled"),
+            "Run AI must enable using the host default backend without an explicit pick"
         );
     }
 
@@ -2254,6 +2904,7 @@ mod wasm_tests {
                 updated_at_ms: 1,
                 user_comment_count: 0,
                 pending_suggestion_count: 0,
+                file_comment_counts: vec![],
             };
             state.review_summaries.update(|m| {
                 m.insert(ProjectId("proj-1".to_owned()), vec![summary]);
@@ -2276,6 +2927,559 @@ mod wasm_tests {
             existing_draft_for_root(&state, &pid, &ProjectRootPath("/repo-b".to_owned())),
             None,
             "root A's draft must NOT satisfy a lookup for root B"
+        );
+    }
+
+    /// Mounts the `ReviewCommentsSurface` for `review`, seeding both the full
+    /// review record and a matching Draft `ReviewSummary` so the surface
+    /// resolves its draft id. Returns the captured `AppState`.
+    fn mount_comments_surface(
+        container: HtmlElement,
+        review: Review,
+        seed_diff: bool,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<AppState>>> {
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            let rid = review.id.clone();
+            let pid = review.project_id.clone();
+            let root = root_path();
+            state.reviews.update(|m| {
+                m.insert(rid.clone(), review.clone());
+            });
+            // Snippets source from the project diff cache, not review.diffs.
+            // Seed a whole-root unstaged entry the surface can read from.
+            if seed_diff {
+                let key = DiffKey::new(
+                    "h1",
+                    pid.clone(),
+                    root.clone(),
+                    ProjectDiffScope::Unstaged,
+                    "",
+                );
+                state.diff_contents.update(|m| {
+                    m.insert(
+                        key,
+                        DiffViewState {
+                            root: root.clone(),
+                            scope: ProjectDiffScope::Unstaged,
+                            path: None,
+                            context_mode: DiffContextMode::Hunks,
+                            pending: false,
+                            files: diff_payload().files,
+                        },
+                    );
+                });
+            }
+            state.review_summaries.update(|m| {
+                m.insert(
+                    pid.clone(),
+                    vec![protocol::ReviewSummary {
+                        id: rid.clone(),
+                        root: root.clone(),
+                        status: ReviewStatus::Draft,
+                        origin_session_id: SessionId("s".to_owned()),
+                        origin_agent_id: AgentId("a".to_owned()),
+                        created_at_ms: 0,
+                        updated_at_ms: 1,
+                        user_comment_count: 0,
+                        pending_suggestion_count: 0,
+                        file_comment_counts: vec![],
+                    }],
+                );
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state.clone());
+            view! {
+                <ReviewCommentsSurface
+                    host_id="h1".to_owned()
+                    project_id=pid.clone()
+                    root=root.clone()
+                />
+            }
+        });
+        std::mem::forget(handle);
+        holder
+    }
+
+    fn rejected_suggestion_at_line(line: u32, body: &str) -> ReviewSuggestedComment {
+        ReviewSuggestedComment {
+            state: ReviewSuggestionState::Rejected,
+            ..pending_suggestion_at_line(line, body)
+        }
+    }
+
+    /// Comments surface with no feedback shows the empty state and zero
+    /// entries, while still offering the "Open full diff" escape hatch.
+    #[wasm_bindgen_test]
+    async fn comments_surface_shows_empty_state() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _ = mount_comments_surface(container.clone(), make_review(), true);
+
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-test=\"review-comments-empty\"]")
+                .unwrap()
+                .is_some(),
+            "empty state must render when there is no feedback"
+        );
+        let entries = container
+            .query_selector_all("[data-test=\"review-comments-entry\"]")
+            .unwrap();
+        assert_eq!(entries.length(), 0, "no entries when there is no feedback");
+        assert!(
+            find_button_by_text(&container, "Open full diff").is_some(),
+            "the full-diff escape hatch must always be available"
+        );
+    }
+
+    /// The surface renders exactly one bounded entry per distinct anchored
+    /// location that carries a comment or a *pending* suggestion. Rejected
+    /// suggestions do not create their own entry, and the entry shows a small
+    /// diff snippet pulled from the project diff cache — not from review.diffs,
+    /// and not the whole file.
+    #[wasm_bindgen_test]
+    async fn comments_surface_one_entry_per_location_excludes_rejected() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut review = make_review();
+        review.comments.push(comment_at_line(2, "a"));
+        review.comments.push(comment_at_line(3, "b"));
+        review
+            .suggestions
+            .push(pending_suggestion_at_line(4, "pending"));
+        // A rejected suggestion at a location with no other feedback must not
+        // produce an entry.
+        review
+            .suggestions
+            .push(rejected_suggestion_at_line(5, "rejected"));
+        let _ = mount_comments_surface(container.clone(), review, true);
+
+        next_tick().await;
+        next_tick().await;
+
+        let entries = container
+            .query_selector_all("[data-test=\"review-comments-entry\"]")
+            .unwrap();
+        assert_eq!(
+            entries.length(),
+            3,
+            "one entry per distinct location for the two comments and the \
+             pending suggestion; the rejected-only location is excluded"
+        );
+
+        // The snippet around the L2 comment is present and bounded to the
+        // anchored region (not the unrelated src/bar.rs file).
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("let x = 1;"),
+            "snippet around the comment anchor must render; got: {text}"
+        );
+        assert!(
+            !text.contains("bar();"),
+            "an unrelated file's diff must not appear in the comments surface; got: {text}"
+        );
+    }
+
+    /// Recording bridge: captures the serialized envelope `line` of every
+    /// `send_host_line` invoke into `window.__sent_lines` so a test can assert
+    /// on the exact frame payloads that went out.
+    fn record_bridge() {
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__sent_lines = []; \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(cmd, args){ \
+                 try { \
+                   if (cmd === 'send_host_line' && args) { \
+                     var line = (args.line !== undefined) ? args.line \
+                       : (args.get ? args.get('line') : undefined); \
+                     if (line !== undefined) { window.__sent_lines.push(line); } \
+                   } \
+                 } catch (e) {} \
+                 return Promise.resolve(); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
+             })();",
+        );
+    }
+
+    fn sent_lines_joined() -> String {
+        js_sys::eval("(window.__sent_lines||[]).join('\\n')")
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    }
+
+    fn seed_host_settings(
+        state: &AppState,
+        default: Option<BackendKind>,
+        enabled: Vec<BackendKind>,
+    ) {
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                "h1".to_owned(),
+                protocol::HostSettings {
+                    enabled_backends: enabled,
+                    default_backend: default,
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: false,
+                },
+            );
+        });
+    }
+
+    /// The comments surface subscribes lightweight: the `ReviewSubscribe`
+    /// frame carries `include_diffs:false` so bootstrap/snapshots omit the
+    /// redundant review diffs.
+    #[wasm_bindgen_test]
+    async fn comments_surface_subscribes_lightweight() {
+        record_bridge();
+        let container = make_container();
+        // Summary only (no full record yet) + connected host ⇒ the surface
+        // actually sends a ReviewSubscribe.
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.connection_statuses.update(|m| {
+                m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
+            });
+            state.review_summaries.update(|m| {
+                m.insert(
+                    ProjectId("proj-1".to_owned()),
+                    vec![protocol::ReviewSummary {
+                        id: ReviewId("rev-1".to_owned()),
+                        root: root_path(),
+                        status: ReviewStatus::Draft,
+                        origin_session_id: SessionId("s".to_owned()),
+                        origin_agent_id: AgentId("a".to_owned()),
+                        created_at_ms: 0,
+                        updated_at_ms: 1,
+                        user_comment_count: 0,
+                        pending_suggestion_count: 0,
+                        file_comment_counts: vec![],
+                    }],
+                );
+            });
+            provide_context(state);
+            view! {
+                <ReviewCommentsSurface
+                    host_id="h1".to_owned()
+                    project_id=ProjectId("proj-1".to_owned())
+                    root=root_path()
+                />
+            }
+        });
+
+        next_tick().await;
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("\"include_diffs\":false"),
+            "ReviewSubscribe must request include_diffs:false; sent: {sent}"
+        );
+    }
+
+    /// When a commented file's diff is not cached, the surface fetches just
+    /// that file's unstaged diff (path-scoped), not the whole root.
+    #[wasm_bindgen_test]
+    async fn comments_surface_fetches_missing_commented_file_diff() {
+        record_bridge();
+        let container = make_container();
+        let mut review = make_review();
+        review.comments.push(comment_at_line(2, "a"));
+        // seed_diff = false ⇒ no cached project diff, so a fetch must fire.
+        let _ = mount_comments_surface(container.clone(), review, false);
+
+        next_tick().await;
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("\"path\":\"src/foo.rs\""),
+            "a path-scoped ProjectReadDiff for the commented file must be sent; \
+             sent: {sent}"
+        );
+        // The lightweight surface must never request the whole-root diff
+        // (path=None serializes as `\"path\":null`); only the missing
+        // commented files are fetched.
+        assert!(
+            !sent.contains("\"path\":null"),
+            "comments surface must not request a whole-root diff; sent: {sent}"
+        );
+    }
+
+    /// Regression: a row created before its path-scoped diff arrives must show
+    /// the snippet once the response lands — the snippet is reactive, not
+    /// captured at row-creation time under a stable `<For>` key.
+    #[wasm_bindgen_test]
+    async fn comments_surface_snippet_appears_after_path_diff_response() {
+        ensure_styles_loaded();
+        record_bridge();
+        let container = make_container();
+        let mut review = make_review();
+        review.comments.push(comment_at_line(2, "a"));
+        // seed_diff = false ⇒ the row is created with no cached diff yet.
+        let holder = mount_comments_surface(container.clone(), review, false);
+
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-test=\"review-comments-entry\"]")
+                .unwrap()
+                .is_some(),
+            "the entry row must render even before its diff loads"
+        );
+        assert!(
+            container
+                .query_selector(".review-comments-snippet")
+                .unwrap()
+                .is_none(),
+            "no snippet should render before the path diff response lands"
+        );
+
+        // Inject the path-scoped diff response exactly as dispatch would store
+        // it, under the per-file cache key.
+        let state = holder.borrow().clone().unwrap();
+        let key = DiffKey::new(
+            "h1",
+            ProjectId("proj-1".to_owned()),
+            root_path(),
+            ProjectDiffScope::Unstaged,
+            "src/foo.rs",
+        );
+        state.diff_contents.update(|m| {
+            m.insert(
+                key,
+                DiffViewState {
+                    root: root_path(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: Some("src/foo.rs".to_owned()),
+                    context_mode: DiffContextMode::Hunks,
+                    pending: false,
+                    files: diff_payload().files,
+                },
+            );
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("let x = 1;"),
+            "snippet must appear once the path diff response lands; got: {text}"
+        );
+    }
+
+    /// Boundary case for blocker #2: a top-of-hunk replacement (`-old` / `+new`)
+    /// with no preceding context, anchored on New L1, must keep the `-old`
+    /// line. The selected-side span starts at the `+new` line, so the adjacent
+    /// removed line is pulled in by the opposite-side adjacency extension.
+    #[wasm_bindgen_test]
+    fn snippet_keeps_removed_line_at_hunk_top() {
+        let files = vec![protocol::ProjectGitDiffFile {
+            relative_path: "src/foo.rs".to_owned(),
+            is_binary: false,
+            hunks: vec![protocol::ProjectGitDiffHunk {
+                hunk_id: "h1".to_owned(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    // No preceding context: the removed line is the very first.
+                    protocol::ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Removed,
+                        text: "old top".to_owned(),
+                        old_line_number: Some(1),
+                        new_line_number: None,
+                    },
+                    protocol::ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Added,
+                        text: "new top".to_owned(),
+                        old_line_number: None,
+                        new_line_number: Some(1),
+                    },
+                ],
+            }],
+        }];
+        let anchor = ReviewAnchor::LineRange {
+            side: ReviewDiffSide::New,
+            start_line: 1,
+            end_line: 1,
+        };
+        let snippet = snippet_for_anchor(&files, "src/foo.rs", &anchor);
+        assert!(
+            snippet
+                .iter()
+                .any(|l| l.marker == '-' && l.text == "old top"),
+            "the top-of-hunk removed line must be kept; got: {snippet:?}"
+        );
+        assert!(
+            snippet
+                .iter()
+                .any(|l| l.marker == '+' && l.text == "new top"),
+            "the added line at the anchor must be present; got: {snippet:?}"
+        );
+    }
+
+    /// A New-side LineRange snippet keeps interleaved removed (`-`) lines in
+    /// the window — they carry no new line number but sit positionally inside
+    /// the anchored region, so dropping them would lose context.
+    #[wasm_bindgen_test]
+    fn snippet_keeps_removed_lines_around_new_anchor() {
+        let files = vec![protocol::ProjectGitDiffFile {
+            relative_path: "src/foo.rs".to_owned(),
+            is_binary: false,
+            hunks: vec![protocol::ProjectGitDiffHunk {
+                hunk_id: "h1".to_owned(),
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    protocol::ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Context,
+                        text: "fn f()".to_owned(),
+                        old_line_number: Some(1),
+                        new_line_number: Some(1),
+                    },
+                    protocol::ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Removed,
+                        text: "old body".to_owned(),
+                        old_line_number: Some(2),
+                        new_line_number: None,
+                    },
+                    protocol::ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Added,
+                        text: "new body".to_owned(),
+                        old_line_number: None,
+                        new_line_number: Some(2),
+                    },
+                ],
+            }],
+        }];
+        let anchor = ReviewAnchor::LineRange {
+            side: ReviewDiffSide::New,
+            start_line: 2,
+            end_line: 2,
+        };
+        let snippet = snippet_for_anchor(&files, "src/foo.rs", &anchor);
+        assert!(
+            snippet.iter().any(|l| l.marker == '-'),
+            "the removed line interleaved at the anchor must be kept"
+        );
+        assert!(
+            snippet
+                .iter()
+                .any(|l| l.marker == '+' && l.text == "new body"),
+            "the added line at the anchor must be present"
+        );
+    }
+
+    /// Entry ordering is numeric by line, not lexicographic over the Debug
+    /// string (which would sort L10 before L2).
+    #[wasm_bindgen_test]
+    fn anchor_sort_key_orders_numerically() {
+        let loc = |line: u32| ReviewLocation {
+            root: root_path(),
+            relative_path: "src/foo.rs".to_owned(),
+            anchor: ReviewAnchor::LineRange {
+                side: ReviewDiffSide::New,
+                start_line: line,
+                end_line: line,
+            },
+        };
+        assert!(
+            anchor_sort_key(&loc(2)) < anchor_sort_key(&loc(10)),
+            "line 2 must sort before line 10"
+        );
+    }
+
+    /// Default AI review delegates backend choice to the server: with no
+    /// explicit picker selection, `StartAiReview.backend_kind` is `null`.
+    #[wasm_bindgen_test]
+    async fn run_ai_sends_none_backend_by_default() {
+        ensure_styles_loaded();
+        record_bridge();
+        let container = make_container();
+        let holder = mount_sidebar(container.clone(), make_review());
+        // A default backend exists so Run AI is enabled, but the user makes
+        // no explicit pick.
+        seed_host_settings(
+            &holder.borrow().clone().unwrap(),
+            Some(BackendKind::Codex),
+            vec![BackendKind::Codex],
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let run_btn =
+            find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
+        run_btn.click();
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("start_ai_review"),
+            "a StartAiReview frame must be sent; sent: {sent}"
+        );
+        // `backend_kind: None` is omitted from the wire (skip_serializing_if),
+        // so the default path carries no concrete backend — the server picks.
+        assert!(
+            !sent.contains("\"backend_kind\""),
+            "default AI review must omit backend_kind (server resolves the \
+             default); sent: {sent}"
+        );
+    }
+
+    /// An explicit picker selection overrides the default: the chosen backend
+    /// is sent as `Some(kind)` even when it differs from the host default.
+    #[wasm_bindgen_test]
+    async fn run_ai_sends_some_backend_when_explicitly_picked() {
+        ensure_styles_loaded();
+        record_bridge();
+        let container = make_container();
+        let holder = mount_sidebar(container.clone(), make_review());
+        // Host default is Gemini; the user explicitly picks Codex.
+        seed_host_settings(
+            &holder.borrow().clone().unwrap(),
+            Some(BackendKind::Gemini),
+            vec![BackendKind::Codex, BackendKind::Gemini],
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let select = container
+            .query_selector(".review-backend-select")
+            .unwrap()
+            .expect("backend select rendered");
+        let select: web_sys::HtmlSelectElement = select.dyn_into().unwrap();
+        select.set_value("Codex");
+        let ev = web_sys::Event::new("change").unwrap();
+        select.dispatch_event(&ev).unwrap();
+        next_tick().await;
+
+        let run_btn =
+            find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
+        run_btn.click();
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("\"backend_kind\":\"codex\""),
+            "an explicit pick must send the chosen backend as Some(kind); \
+             sent: {sent}"
         );
     }
 

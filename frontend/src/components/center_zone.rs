@@ -9,6 +9,7 @@ use crate::components::chat_view::ChatView;
 use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
+use crate::components::review_view::ReviewCommentsSurface;
 use crate::components::settings_panel::SettingsPanel;
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus, TabContent, TabId};
@@ -385,6 +386,7 @@ enum TabKind {
     Chat,
     File,
     Diff,
+    Comments,
     Missing,
 }
 
@@ -416,6 +418,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                 Some(TabContent::Chat { .. }) => TabKind::Chat,
                 Some(TabContent::File { .. }) => TabKind::File,
                 Some(TabContent::Diff { .. }) => TabKind::Diff,
+                Some(TabContent::Comments { .. }) => TabKind::Comments,
                 None => TabKind::Missing,
             }
         })
@@ -516,6 +519,31 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                         match resolved {
                             Some((host_id, project_id, root, scope, path)) => {
                                 view! { <ReviewableDiffView tab_id=tab_id host_id=host_id project_id=project_id root=root scope=scope path=path /> }.into_any()
+                            }
+                            None => view! { <div></div> }.into_any(),
+                        }
+                    }
+                    TabKind::Comments => {
+                        let resolved = state.center_zone.with_untracked(|cz| {
+                            cz.tabs
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                                .and_then(|t| match &t.content {
+                                    TabContent::Comments {
+                                        host_id,
+                                        project_id,
+                                        root,
+                                    } => Some((
+                                        host_id.clone(),
+                                        project_id.clone(),
+                                        root.clone(),
+                                    )),
+                                    _ => None,
+                                })
+                        });
+                        match resolved {
+                            Some((host_id, project_id, root)) => {
+                                view! { <ReviewCommentsSurface host_id=host_id project_id=project_id root=root /> }.into_any()
                             }
                             None => view! { <div></div> }.into_any(),
                         }

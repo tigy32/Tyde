@@ -26,7 +26,7 @@ use crate::components::diff_view::{
 use crate::components::inline_review::ThreadRegionFiltered;
 use crate::state::AppState;
 
-use protocol::{ProjectRootPath, ReviewAnchor, ReviewDiffSide, ReviewLocation};
+use protocol::{ProjectRootPath, ReviewAnchor, ReviewCommentId, ReviewDiffSide, ReviewLocation};
 
 /// Inline composer state. `Some` ⇒ the composer is open pinned to the
 /// given location; `None` ⇒ closed. Body text is local UI state — the
@@ -41,6 +41,18 @@ use protocol::{ProjectRootPath, ReviewAnchor, ReviewDiffSide, ReviewLocation};
 pub(crate) struct ComposerState {
     pub(crate) location: ReviewLocation,
     pub(crate) body: RwSignal<String>,
+    /// Snapshot of the User-comment ids already at `location` captured the
+    /// moment a save is dispatched. `None` until the first save.
+    ///
+    /// Close is *level-triggered* off this snapshot: once a save is in
+    /// flight, the composer closes as soon as a User comment at `location`
+    /// appears whose id is not in the snapshot. This marker lives on the
+    /// persistent `ComposerState` (not on Composer-local signals) so the
+    /// confirmation survives a remount — a remount triggered by the same
+    /// `CommentUpsert` that clears the pending gate would otherwise miss the
+    /// gate's falling edge and leave the composer stuck open with its body
+    /// text intact.
+    pub(crate) submitted_baseline: RwSignal<Option<Vec<ReviewCommentId>>>,
 }
 
 /// Live state of an in-progress click+drag line-range selection on the
@@ -253,6 +265,7 @@ pub(crate) fn install_drag_listeners(
                     },
                 },
                 body: RwSignal::new(String::new()),
+                submitted_baseline: RwSignal::new(None),
             }));
             drag_selection.set(None);
         });
@@ -396,6 +409,7 @@ pub(crate) fn make_gutter_action_for_file_header(
                             anchor: ReviewAnchor::File,
                         },
                         body: RwSignal::new(String::new()),
+                        submitted_baseline: RwSignal::new(None),
                     }));
                 }
             >

@@ -204,6 +204,12 @@ fn review_summary() -> ReviewSummary {
         updated_at_ms: 300,
         user_comment_count: 2,
         pending_suggestion_count: 1,
+        file_comment_counts: vec![ReviewFileCommentCount {
+            relative_path: "src/lib.rs".to_owned(),
+            user_comment_count: 1,
+            ai_comment_count: 1,
+            pending_suggestion_count: 1,
+        }],
     }
 }
 
@@ -313,7 +319,7 @@ fn review_action_tagged_union_variants_round_trip() {
             suggestion_id: suggestion_id(),
         },
         ReviewActionPayload::StartAiReview {
-            backend_kind: BackendKind::Claude,
+            backend_kind: Some(BackendKind::Claude),
             cost_hint: Some(SpawnCostHint::Medium),
             instructions: Some("Focus on correctness.".to_owned()),
         },
@@ -394,6 +400,72 @@ fn review_summary_root_defaults_for_legacy_json() {
     .expect("legacy summary without root should deserialize");
 
     assert_eq!(summary.root, ProjectRootPath(String::new()));
+    assert!(summary.file_comment_counts.is_empty());
+}
+
+#[test]
+fn review_file_comment_count_round_trips_and_totals() {
+    let count = ReviewFileCommentCount {
+        relative_path: "src/lib.rs".to_owned(),
+        user_comment_count: 2,
+        ai_comment_count: 3,
+        pending_suggestion_count: 5,
+    };
+
+    round_trip(&count);
+    assert_eq!(count.total_count(), 10);
+
+    let decoded: ReviewFileCommentCount = serde_json::from_value(json!({
+        "relative_path": "src/main.rs"
+    }))
+    .expect("missing per-file count fields should default");
+    assert_eq!(decoded.total_count(), 0);
+}
+
+#[test]
+fn review_start_ai_backend_kind_is_optional() {
+    let action: ReviewActionPayload = serde_json::from_value(json!({
+        "kind": "start_ai_review",
+        "cost_hint": null,
+        "instructions": "Use the host default backend."
+    }))
+    .expect("start_ai_review without backend_kind should deserialize");
+
+    assert_eq!(
+        action,
+        ReviewActionPayload::StartAiReview {
+            backend_kind: None,
+            cost_hint: None,
+            instructions: Some("Use the host default backend.".to_owned()),
+        }
+    );
+    let json = serde_json::to_value(&action).expect("serialize start_ai_review");
+    assert_eq!(json["kind"], json!("start_ai_review"));
+    assert!(
+        json.get("backend_kind").is_none(),
+        "None backend_kind should be omitted from JSON: {json:?}"
+    );
+}
+
+#[test]
+fn review_subscribe_payload_defaults_to_include_diffs() {
+    let payload: ReviewSubscribePayload =
+        serde_json::from_value(json!({})).expect("empty subscribe payload should deserialize");
+
+    assert!(payload.include_diffs);
+    assert_eq!(
+        serde_json::to_value(ReviewSubscribePayload::default()).expect("serialize default"),
+        json!({})
+    );
+
+    let lightweight = ReviewSubscribePayload {
+        include_diffs: false,
+    };
+    round_trip(&lightweight);
+    assert_eq!(
+        serde_json::to_value(lightweight).expect("serialize lightweight subscribe"),
+        json!({ "include_diffs": false })
+    );
 }
 
 #[test]

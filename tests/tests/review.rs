@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, DiffContextMode,
-    Envelope, FrameKind, MessageOrigin, MessageSender, NewAgentPayload, Project,
-    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDiffScope, ProjectEventPayload,
-    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectNotifyPayload, ProjectRootPath,
-    QueuedMessagesPayload, Review, ReviewActionPayload, ReviewAiReviewerState,
-    ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload, ReviewCommentId,
-    ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode,
-    ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus, ReviewSubmitTarget,
-    ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState, SessionId,
-    SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, AgentId, AgentStartPayload, BackendKind, ChatEvent, CommandErrorPayload,
+    DiffContextMode, Envelope, FrameKind, HostSettingValue, HostSettingsPayload, MessageOrigin,
+    MessageSender, NewAgentPayload, Project, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDiffScope, ProjectEventPayload, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectNotifyPayload, ProjectRootPath, QueuedMessagesPayload, Review, ReviewActionPayload,
+    ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor, ReviewBootstrapPayload,
+    ReviewCommentId, ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide,
+    ReviewErrorCode, ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
+    ReviewSubmitTarget, ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState,
+    SessionId, SessionListPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -180,9 +180,49 @@ async fn expect_review_error(
     }
 }
 
-async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId) -> Review {
+async fn expect_host_settings(
+    client: &mut client::Connection,
+    context: &str,
+) -> HostSettingsPayload {
+    loop {
+        let env = next_env(client, context).await;
+        if env.kind == FrameKind::HostSettings {
+            return env.parse_payload().expect("host settings payload");
+        }
+    }
+}
+
+async fn set_default_backend(client: &mut client::Connection, backend_kind: BackendKind) {
     client
-        .review_subscribe(review_id, ReviewSubscribePayload::default())
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![backend_kind],
+            },
+        })
+        .await
+        .expect("enable backend");
+    let settings = expect_host_settings(client, "enabled backend host settings").await;
+    assert!(settings.settings.enabled_backends.contains(&backend_kind));
+
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::DefaultBackend {
+                default_backend: Some(backend_kind),
+            },
+        })
+        .await
+        .expect("set default backend");
+    let settings = expect_host_settings(client, "default backend host settings").await;
+    assert_eq!(settings.settings.default_backend, Some(backend_kind));
+}
+
+async fn subscribe_review_with_payload(
+    client: &mut client::Connection,
+    review_id: &ReviewId,
+    payload: ReviewSubscribePayload,
+) -> Review {
+    client
+        .review_subscribe(review_id, payload)
         .await
         .expect("review subscribe");
     loop {
@@ -192,7 +232,15 @@ async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId)
                 env.parse_payload().expect("review bootstrap payload");
             return bootstrap.review;
         }
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("command error payload");
+            panic!("review subscribe command error: {error:?}");
+        }
     }
+}
+
+async fn subscribe_review(client: &mut client::Connection, review_id: &ReviewId) -> Review {
+    subscribe_review_with_payload(client, review_id, ReviewSubscribePayload::default()).await
 }
 
 async fn create_project(client: &mut client::Connection, root: &Path) -> Project {
@@ -666,6 +714,142 @@ async fn create_review_add_update_delete_and_submit_live() {
 }
 
 #[tokio::test]
+async fn review_subscribe_include_diffs_controls_bootstrap_and_cleared_payloads() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.connect().await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+    assert_eq!(
+        review.diffs.len(),
+        1,
+        "review_create remains a full subscriber"
+    );
+
+    let mut lightweight = fixture.connect().await;
+    let redacted = subscribe_review_with_payload(
+        &mut lightweight,
+        &review.id,
+        ReviewSubscribePayload {
+            include_diffs: false,
+        },
+    )
+    .await;
+    assert_eq!(redacted.id, review.id);
+    assert!(
+        redacted.diffs.is_empty(),
+        "include_diffs=false must redact ReviewBootstrap diffs"
+    );
+
+    lightweight
+        .review_action(&review.id, ReviewActionPayload::ClearComments)
+        .await
+        .expect("clear comments");
+    match expect_review_event(&mut lightweight, "lightweight cleared event").await {
+        ReviewEventPayload::Cleared { review } => {
+            assert_eq!(review.id, redacted.id);
+            assert!(
+                review.diffs.is_empty(),
+                "include_diffs=false must redact Cleared review diffs"
+            );
+        }
+        other => panic!("expected cleared review, got {other:?}"),
+    }
+
+    let mut legacy = fixture.connect().await;
+    let full = subscribe_review(&mut legacy, &review.id).await;
+    assert_eq!(
+        full.diffs.len(),
+        1,
+        "default legacy {{}} subscribe must keep full diffs"
+    );
+}
+
+#[tokio::test]
+async fn review_subscribe_can_upgrade_to_full_but_not_downgrade() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.connect().await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+
+    let mut subscriber = fixture.connect().await;
+    let redacted = subscribe_review_with_payload(
+        &mut subscriber,
+        &review.id,
+        ReviewSubscribePayload {
+            include_diffs: false,
+        },
+    )
+    .await;
+    assert!(redacted.diffs.is_empty());
+
+    let upgraded = subscribe_review(&mut subscriber, &review.id).await;
+    assert_eq!(
+        upgraded.diffs.len(),
+        1,
+        "default subscribe should upgrade a lightweight subscriber to full"
+    );
+
+    let still_full = subscribe_review_with_payload(
+        &mut subscriber,
+        &review.id,
+        ReviewSubscribePayload {
+            include_diffs: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        still_full.diffs.len(),
+        1,
+        "a full subscriber should not be downgraded by a later lightweight subscribe"
+    );
+}
+
+#[tokio::test]
+async fn lightweight_review_subscribe_skips_full_root_diff_refresh() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.connect().await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+    assert_eq!(review.diffs.len(), 1);
+
+    let moved_repo = root.path().join("review-root-moved");
+    fs::rename(&repo, &moved_repo).expect("move repo out from under project root");
+
+    let mut lightweight = fixture.connect().await;
+    let redacted = subscribe_review_with_payload(
+        &mut lightweight,
+        &review.id,
+        ReviewSubscribePayload {
+            include_diffs: false,
+        },
+    )
+    .await;
+    assert_eq!(redacted.id, review.id);
+    assert!(
+        redacted.diffs.is_empty(),
+        "lightweight subscribe should bootstrap without refreshing missing root diffs"
+    );
+}
+
+#[tokio::test]
 async fn root_scoped_review_create_uses_selected_project_root() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
@@ -1088,6 +1272,7 @@ async fn review_resets_when_unstaged_diff_becomes_clean_with_staged_changes() {
 async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
     let fixture = Fixture::new().await;
     let mut client = fixture.connect().await;
+    set_default_backend(&mut client, BackendKind::Claude).await;
     let root = tempfile::tempdir().expect("temp root");
     let repo = root.path().join("review-root");
     fs::create_dir_all(&repo).expect("create repo");
@@ -1102,7 +1287,7 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         .review_action(
             &review.id,
             ReviewActionPayload::StartAiReview {
-                backend_kind: BackendKind::Claude,
+                backend_kind: None,
                 cost_hint: None,
                 instructions: Some("__mock_slow__ Look for changed return values.".to_owned()),
             },
@@ -1118,6 +1303,11 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
             FrameKind::NewAgent => {
                 let new_agent: NewAgentPayload = env.parse_payload().expect("new AI reviewer");
                 if new_agent.name == "AI Review" {
+                    assert_eq!(
+                        new_agent.backend_kind,
+                        BackendKind::Claude,
+                        "backend_kind=None should resolve through the host default backend"
+                    );
                     reviewer_stream = Some(new_agent.instance_stream);
                 }
             }

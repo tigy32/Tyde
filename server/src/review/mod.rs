@@ -28,12 +28,18 @@ pub(crate) struct ReviewHandle {
 }
 
 impl ReviewHandle {
-    async fn subscribe(&self, conn: ConnectionId, stream: Stream) -> Result<(), String> {
+    async fn subscribe(
+        &self,
+        conn: ConnectionId,
+        stream: Stream,
+        include_diffs: bool,
+    ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ReviewCommand::Subscribe {
                 conn,
                 stream,
+                include_diffs,
                 reply,
             })
             .await
@@ -150,6 +156,7 @@ enum RegistryCommand {
         review_id: ReviewId,
         conn: ConnectionId,
         stream: Stream,
+        include_diffs: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     AiSuggestion {
@@ -290,6 +297,7 @@ impl ReviewRegistryHandle {
         review_id: ReviewId,
         conn: ConnectionId,
         stream: Stream,
+        include_diffs: bool,
     ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -297,6 +305,7 @@ impl ReviewRegistryHandle {
                 review_id,
                 conn,
                 stream,
+                include_diffs,
                 reply,
             })
             .await
@@ -438,9 +447,10 @@ impl ReviewRegistryActor {
                     review_id,
                     conn,
                     stream,
+                    include_diffs,
                     reply,
                 } => {
-                    let result = self.subscribe(review_id, conn, stream).await;
+                    let result = self.subscribe(review_id, conn, stream, include_diffs).await;
                     let _ = reply.send(result);
                 }
                 RegistryCommand::AiSuggestion {
@@ -565,12 +575,13 @@ impl ReviewRegistryActor {
         review_id: ReviewId,
         conn: ConnectionId,
         stream: Stream,
+        include_diffs: bool,
     ) -> Result<(), String> {
         let handle = self
             .handles
             .get(&review_id)
             .ok_or_else(|| format!("unknown review {}", review_id))?;
-        handle.subscribe(conn, stream).await
+        handle.subscribe(conn, stream, include_diffs).await
     }
 
     async fn action(
@@ -806,7 +817,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::review::actor::summary_for_review;
+    use crate::review::actor::{event_for_subscriber, review_for_subscriber, summary_for_review};
 
     #[test]
     fn running_ai_reviewer_resets_to_idle_on_rehydrate() {
@@ -868,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_counts_user_comments_and_pending_suggestions() {
+    fn summary_counts_file_comment_semantics() {
         let review = Review {
             id: ReviewId("review-1".to_owned()),
             project_id: ProjectId("project-1".to_owned()),
@@ -877,34 +888,105 @@ mod tests {
             selection: ReviewDiffSelection::AllUncommitted,
             status: ReviewStatus::Draft,
             diffs: Vec::new(),
-            comments: vec![protocol::ReviewComment {
-                id: protocol::ReviewCommentId("comment-1".to_owned()),
-                location: protocol::ReviewLocation {
-                    root: ProjectRootPath("/repo".to_owned()),
-                    relative_path: "src/lib.rs".to_owned(),
-                    anchor: protocol::ReviewAnchor::File,
+            comments: vec![
+                protocol::ReviewComment {
+                    id: protocol::ReviewCommentId("comment-1".to_owned()),
+                    location: protocol::ReviewLocation {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "src/lib.rs".to_owned(),
+                        anchor: protocol::ReviewAnchor::File,
+                    },
+                    anchor_status: protocol::ReviewAnchorStatus::Current,
+                    body: "human".to_owned(),
+                    source: protocol::ReviewCommentSource::User,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
                 },
-                anchor_status: protocol::ReviewAnchorStatus::Current,
-                body: "body".to_owned(),
-                source: protocol::ReviewCommentSource::User,
-                created_at_ms: 1,
-                updated_at_ms: 1,
-            }],
-            suggestions: vec![protocol::ReviewSuggestedComment {
-                id: protocol::ReviewSuggestionId("suggestion-1".to_owned()),
-                location: protocol::ReviewLocation {
-                    root: ProjectRootPath("/repo".to_owned()),
-                    relative_path: "src/lib.rs".to_owned(),
-                    anchor: protocol::ReviewAnchor::File,
+                protocol::ReviewComment {
+                    id: protocol::ReviewCommentId("comment-2".to_owned()),
+                    location: protocol::ReviewLocation {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "src/lib.rs".to_owned(),
+                        anchor: protocol::ReviewAnchor::File,
+                    },
+                    anchor_status: protocol::ReviewAnchorStatus::Stale {
+                        reason: "file moved".to_owned(),
+                    },
+                    body: "accepted AI".to_owned(),
+                    source: protocol::ReviewCommentSource::AiSuggestion {
+                        suggestion_id: protocol::ReviewSuggestionId(
+                            "suggestion-accepted".to_owned(),
+                        ),
+                        edited: false,
+                    },
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
                 },
-                anchor_status: protocol::ReviewAnchorStatus::Current,
-                body: "body".to_owned(),
-                rationale: None,
-                severity: protocol::ReviewSeverity::Info,
-                state: protocol::ReviewSuggestionState::Pending,
-                reviewer_agent_id: AgentId("agent-2".to_owned()),
-                created_at_ms: 1,
-            }],
+                protocol::ReviewComment {
+                    id: protocol::ReviewCommentId("comment-3".to_owned()),
+                    location: protocol::ReviewLocation {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "src/other.rs".to_owned(),
+                        anchor: protocol::ReviewAnchor::File,
+                    },
+                    anchor_status: protocol::ReviewAnchorStatus::Current,
+                    body: "other".to_owned(),
+                    source: protocol::ReviewCommentSource::User,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+            ],
+            suggestions: vec![
+                protocol::ReviewSuggestedComment {
+                    id: protocol::ReviewSuggestionId("suggestion-1".to_owned()),
+                    location: protocol::ReviewLocation {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "src/lib.rs".to_owned(),
+                        anchor: protocol::ReviewAnchor::File,
+                    },
+                    anchor_status: protocol::ReviewAnchorStatus::Stale {
+                        reason: "line moved".to_owned(),
+                    },
+                    body: "pending".to_owned(),
+                    rationale: None,
+                    severity: protocol::ReviewSeverity::Info,
+                    state: protocol::ReviewSuggestionState::Pending,
+                    reviewer_agent_id: AgentId("agent-2".to_owned()),
+                    created_at_ms: 1,
+                },
+                protocol::ReviewSuggestedComment {
+                    id: protocol::ReviewSuggestionId("suggestion-2".to_owned()),
+                    location: protocol::ReviewLocation {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "src/lib.rs".to_owned(),
+                        anchor: protocol::ReviewAnchor::File,
+                    },
+                    anchor_status: protocol::ReviewAnchorStatus::Current,
+                    body: "rejected".to_owned(),
+                    rationale: None,
+                    severity: protocol::ReviewSeverity::Info,
+                    state: protocol::ReviewSuggestionState::Rejected,
+                    reviewer_agent_id: AgentId("agent-2".to_owned()),
+                    created_at_ms: 1,
+                },
+                protocol::ReviewSuggestedComment {
+                    id: protocol::ReviewSuggestionId("suggestion-accepted".to_owned()),
+                    location: protocol::ReviewLocation {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: "src/lib.rs".to_owned(),
+                        anchor: protocol::ReviewAnchor::File,
+                    },
+                    anchor_status: protocol::ReviewAnchorStatus::Current,
+                    body: "accepted".to_owned(),
+                    rationale: None,
+                    severity: protocol::ReviewSeverity::Info,
+                    state: protocol::ReviewSuggestionState::Accepted {
+                        comment_id: protocol::ReviewCommentId("comment-2".to_owned()),
+                    },
+                    reviewer_agent_id: AgentId("agent-2".to_owned()),
+                    created_at_ms: 1,
+                },
+            ],
             ai_reviewer: ReviewAiReviewerState {
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
@@ -915,7 +997,72 @@ mod tests {
         };
 
         let summary = summary_for_review(&review);
-        assert_eq!(summary.user_comment_count, 1);
+        assert_eq!(summary.user_comment_count, 3);
         assert_eq!(summary.pending_suggestion_count, 1);
+        assert_eq!(summary.file_comment_counts.len(), 2);
+        assert_eq!(summary.file_comment_counts[0].relative_path, "src/lib.rs");
+        assert_eq!(summary.file_comment_counts[0].user_comment_count, 1);
+        assert_eq!(summary.file_comment_counts[0].ai_comment_count, 1);
+        assert_eq!(summary.file_comment_counts[0].pending_suggestion_count, 1);
+        assert_eq!(summary.file_comment_counts[0].total_count(), 3);
+        assert_eq!(summary.file_comment_counts[1].relative_path, "src/other.rs");
+        assert_eq!(summary.file_comment_counts[1].user_comment_count, 1);
+        assert_eq!(summary.file_comment_counts[1].ai_comment_count, 0);
+        assert_eq!(summary.file_comment_counts[1].pending_suggestion_count, 0);
+    }
+
+    #[test]
+    fn lightweight_review_subscriber_payloads_redact_diffs() {
+        let review = Review {
+            id: ReviewId("review-1".to_owned()),
+            project_id: ProjectId("project-1".to_owned()),
+            origin_agent_id: AgentId("agent-1".to_owned()),
+            origin_session_id: SessionId("session-1".to_owned()),
+            selection: ReviewDiffSelection::AllUncommitted,
+            status: ReviewStatus::Draft,
+            diffs: vec![ProjectGitDiffPayload {
+                root: ProjectRootPath("/repo".to_owned()),
+                scope: ProjectDiffScope::Unstaged,
+                path: None,
+                context_mode: DiffContextMode::FullFile,
+                files: Vec::new(),
+            }],
+            comments: Vec::new(),
+            suggestions: Vec::new(),
+            ai_reviewer: ReviewAiReviewerState {
+                status: ReviewAiReviewerStatus::Idle,
+                agent_id: None,
+                error: None,
+            },
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        assert_eq!(review_for_subscriber(&review, true).diffs.len(), 1);
+        let lightweight = review_for_subscriber(&review, false);
+        assert!(lightweight.diffs.is_empty());
+        assert_eq!(lightweight.id, review.id);
+
+        let event = event_for_subscriber(
+            &protocol::ReviewEventPayload::Cleared {
+                review: review.clone(),
+            },
+            false,
+        );
+        let protocol::ReviewEventPayload::Cleared { review } = event else {
+            panic!("expected cleared event");
+        };
+        assert!(review.diffs.is_empty());
+
+        let event = event_for_subscriber(
+            &protocol::ReviewEventPayload::Snapshot {
+                review: review.clone(),
+            },
+            false,
+        );
+        let protocol::ReviewEventPayload::Snapshot { review } = event else {
+            panic!("expected snapshot event");
+        };
+        assert!(review.diffs.is_empty());
     }
 }
