@@ -8,11 +8,12 @@ use crate::types::{
 };
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
-    ChatEvent, ChatMessage, ChatMessageId, CommandErrorPayload, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
-    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseClosePayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseListPayload,
+    HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
     MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
     NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
@@ -326,6 +327,9 @@ impl ProtocolValidator {
                 envelope,
                 "MobileDeviceRename",
             ),
+            FrameKind::ClientError => {
+                parse_host_payload::<ClientErrorPayload>(self, envelope, "ClientError")
+            }
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = envelope.parse_payload().map_err(|error| {
                     self.violation(

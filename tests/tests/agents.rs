@@ -4,11 +4,12 @@ use fixture::Fixture;
 use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorPayload, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent, CommandErrorCode,
-    CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload, ListSessionsPayload,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectId, ProjectNotifyPayload, ProjectRenamePayload, SessionListPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath,
+    AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent, ClientErrorCode,
+    ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
+    HostBootstrapPayload, ListSessionsPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectId, ProjectNotifyPayload,
+    ProjectRenamePayload, SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    write_envelope,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -176,6 +177,38 @@ async fn expect_command_error(
     let env = expect_kind(client, FrameKind::CommandError, context).await;
     env.parse_payload()
         .expect("failed to parse CommandErrorPayload")
+}
+
+async fn send_client_error_report(client: &mut client::Connection, payload: &ClientErrorPayload) {
+    let host_stream = single_host_stream(client);
+    let seq = client
+        .outgoing_seq
+        .get(&host_stream)
+        .copied()
+        .expect("missing host stream sequence counter");
+    let envelope =
+        Envelope::from_payload(host_stream.clone(), FrameKind::ClientError, seq, payload)
+            .expect("serialize ClientErrorPayload");
+    client.outgoing_seq.insert(host_stream, seq + 1);
+    write_envelope(&mut client.writer, &envelope)
+        .await
+        .expect("send ClientError frame");
+}
+
+fn single_host_stream(client: &client::Connection) -> StreamPath {
+    let mut host_streams = client
+        .outgoing_seq
+        .keys()
+        .filter(|stream| stream.0.starts_with("/host/"));
+    let host_stream = host_streams
+        .next()
+        .cloned()
+        .expect("client should have a host stream");
+    assert!(
+        host_streams.next().is_none(),
+        "client should have exactly one host stream"
+    );
+    host_stream
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
@@ -800,6 +833,58 @@ async fn agent_lifecycle() {
 
     // 6. Receive follow-up turn: StreamStart → StreamDelta → StreamEnd
     expect_turn(&mut fixture.client, "mock backend response to: follow up").await;
+}
+
+#[tokio::test]
+async fn client_error_report_is_accepted_before_agent_flow() {
+    let mut fixture = Fixture::new().await;
+
+    send_client_error_report(
+        &mut fixture.client,
+        &ClientErrorPayload {
+            code: ClientErrorCode::ProtocolParse,
+            message: "failed to parse host frame".to_owned(),
+            raw_context: Some("{not valid protocol json".to_owned()),
+        },
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("after-client-error-report".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/client-error-report".to_owned()],
+                prompt: "hello after client error report".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent after client error report failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent after client error report").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env
+        .parse_payload()
+        .expect("parse NewAgent after client error report");
+    assert_eq!(new_agent.name, "after-client-error-report");
+
+    let env = expect_next_event(&mut fixture.client, "AgentStart after client error report").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, new_agent.instance_stream);
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: hello after client error report",
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -4,12 +4,12 @@ use anyhow::anyhow;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
-    CustomAgentDeletePayload, CustomAgentUpsertPayload, DeleteSessionPayload,
-    EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload, HostBrowseListPayload,
-    HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerUpsertPayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, MobilePairingStartPayload, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ClientErrorCode, ClientErrorPayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload,
+    HostBrowseListPayload, HostBrowseStartPayload, InterruptPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
@@ -79,6 +79,11 @@ pub(crate) async fn route_client_envelope(
                 )?;
                 ensure_non_empty("mobile_device_rename", "label", payload.label.as_str())?;
                 host.rename_mobile_device(payload).await?;
+            }
+            FrameKind::ClientError => {
+                let payload: ClientErrorPayload = parse_payload(&envelope, "client_error")?;
+                ensure_non_empty("client_error", "message", payload.message.as_str())?;
+                log_client_error_report(connection_host_stream, &envelope, &payload);
             }
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;
@@ -776,6 +781,30 @@ fn parse_payload<T: DeserializeOwned>(
             error,
         )
     })
+}
+
+fn log_client_error_report(
+    connection_host_stream: &StreamPath,
+    envelope: &Envelope,
+    payload: &ClientErrorPayload,
+) {
+    match payload.code {
+        ClientErrorCode::ProtocolParse
+        | ClientErrorCode::ProtocolValidation
+        | ClientErrorCode::Transport
+        | ClientErrorCode::Internal => {
+            tracing::error!(
+                connection_host_stream = %connection_host_stream,
+                report_stream = %envelope.stream,
+                seq = envelope.seq,
+                kind = %envelope.kind,
+                code = ?payload.code,
+                message = %payload.message,
+                raw_context = ?payload.raw_context,
+                "client reported error"
+            );
+        }
+    }
 }
 
 fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {

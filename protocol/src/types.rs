@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -429,6 +429,15 @@ pub enum AgentErrorCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ClientErrorCode {
+    ProtocolParse,
+    ProtocolValidation,
+    Transport,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FrameKind {
     // Handshake
     Hello,
@@ -497,6 +506,7 @@ pub enum FrameKind {
     MobilePairingCancel,
     MobileDeviceRevoke,
     MobileDeviceRename,
+    ClientError,
 
     SetSessionSettings,
 
@@ -622,6 +632,7 @@ impl fmt::Display for FrameKind {
             Self::MobilePairingCancel => f.write_str("mobile_pairing_cancel"),
             Self::MobileDeviceRevoke => f.write_str("mobile_device_revoke"),
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
+            Self::ClientError => f.write_str("client_error"),
             Self::HostBootstrap => f.write_str("host_bootstrap"),
             Self::AgentBootstrap => f.write_str("agent_bootstrap"),
             Self::ProjectBootstrap => f.write_str("project_bootstrap"),
@@ -853,6 +864,14 @@ pub enum HostSettingValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSettingsPayload {
     pub settings: HostSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientErrorPayload {
+    pub code: ClientErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

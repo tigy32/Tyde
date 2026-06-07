@@ -322,6 +322,13 @@ fn handle_host_line_event(state: &AppState, event: bridge::HostLineEvent) {
             state.connection_statuses.update(|map| {
                 map.insert(host.clone(), ConnectionStatus::Error(message.clone()));
             });
+            // Report the failure back to the host so the server logs it with
+            // the raw offending frame — invisible otherwise (it only reached
+            // the WKWebView console + a clipped banner). The outgoing
+            // ClientError frame travels on the same host stream and shares
+            // the same per-stream seq counter as Hello/SendMessage, so it
+            // cannot itself be re-parsed inbound and trigger another report.
+            emit_client_parse_error(state, &host, message.clone(), event.line.clone());
             report_shell_error(state, MobileAccessErrorCode::BrokerProtocol, message);
         }
     }
@@ -329,6 +336,37 @@ fn handle_host_line_event(state: &AppState, event: bridge::HostLineEvent) {
     if let Some(delivery_id) = delivery_id {
         ack_host_line_delivery(host, delivery_id);
     }
+}
+
+/// Emits a `ClientError` frame back to the host on its stream so the server
+/// can log the parse failure together with the raw offending frame line.
+/// Uses the existing per-(host, stream) outgoing seq counter via `send_frame`
+/// — no parallel send path or seq counter. If no host stream is allocated yet
+/// (failure arrived before the connection finished bootstrapping) or the send
+/// itself fails, the error is logged locally and not retried.
+fn emit_client_parse_error(
+    state: &AppState,
+    host: &LocalHostId,
+    message: String,
+    raw_line: String,
+) {
+    let Some(stream) = state.host_stream_untracked(host) else {
+        log::error!("cannot report client parse error to {host}: no host stream allocated yet");
+        return;
+    };
+    let host = host.clone();
+    spawn_local(async move {
+        let payload = protocol::ClientErrorPayload {
+            code: protocol::ClientErrorCode::ProtocolParse,
+            message,
+            raw_context: Some(raw_line),
+        };
+        if let Err(error) =
+            send_frame(&host, stream, protocol::FrameKind::ClientError, &payload).await
+        {
+            log::error!("failed to report client parse error to {host}: {error}");
+        }
+    });
 }
 
 fn drain_pending_host_lines(state: AppState) {

@@ -8,17 +8,18 @@ use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
     AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload,
-    NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
-    ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
-    StreamPath, TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, ClientErrorCode,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId,
+    SeqMismatch, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamCompactNotifyPayload,
+    TeamCompactStatus, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload,
 };
 
 use crate::state::MobileShellError;
@@ -866,10 +867,41 @@ fn report_protocol_error(state: &AppState, host: &LocalHostId, message: String) 
     state.connection_statuses.update(|map| {
         map.insert(host.clone(), ConnectionStatus::Error(message.clone()));
     });
+    // Report the seq/protocol violation back to the host so the server logs
+    // it. The frame that triggered this already parsed cleanly, so there is no
+    // raw offending line to forward — the structured message carries the
+    // detail. Sent on the host stream via the shared outbound seq counter, so
+    // it cannot itself re-enter inbound validation and loop.
+    emit_client_protocol_error(state, host, message.clone());
     state.mobile_shell_error.set(Some(MobileShellError {
         code: MobileAccessErrorCode::BrokerProtocol,
         message,
     }));
+}
+
+/// Emits a `ClientError { code: ProtocolValidation }` frame to the host on its
+/// stream so seq/protocol-validation failures are visible server-side. Reuses
+/// `send_frame` (and thus the existing per-(host, stream) outgoing seq
+/// counter); no parallel send path. If no host stream is allocated yet, or the
+/// send fails, the error is logged locally and not retried.
+fn emit_client_protocol_error(state: &AppState, host: &LocalHostId, message: String) {
+    let Some(stream) = state.host_stream_untracked(host) else {
+        log::error!("cannot report client protocol error to {host}: no host stream allocated yet");
+        return;
+    };
+    let host = host.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let payload = protocol::ClientErrorPayload {
+            code: ClientErrorCode::ProtocolValidation,
+            message,
+            raw_context: None,
+        };
+        if let Err(error) =
+            crate::send::send_frame(&host, stream, FrameKind::ClientError, &payload).await
+        {
+            log::error!("failed to report client protocol error to {host}: {error}");
+        }
+    });
 }
 
 fn has_compaction_in_progress_for_host(state: &AppState, host: &LocalHostId) -> bool {
