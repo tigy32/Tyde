@@ -3461,7 +3461,7 @@ kbd {
 }
 
 .chat-send-btn {
-    height: 28px;
+    height: 32px;
     padding: 0 10px;
     display: flex;
     align-items: center;
@@ -3515,6 +3515,9 @@ kbd {
     margin-left: -1px;
     border-top-left-radius: 0;
     border-bottom-left-radius: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     font-size: 0.7rem;
     line-height: 1;
 }
