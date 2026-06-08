@@ -12,7 +12,7 @@ use mqtt_transport::{
 use protocol::MobileAccessErrorCode;
 use tauri::Emitter;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::paired_hosts::{PairedHostRecord, Store, StoreError};
@@ -998,19 +998,41 @@ async fn run_connected_loop(
     rx: &mut mpsc::Receiver<ConnectionCommand>,
 ) -> ConnectedOutcome {
     let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    run_connected_io_loop(
+        manager_tx,
+        local_host_id,
+        actor_instance_id,
+        connection_instance_id,
+        read_half,
+        &mut write_half,
+        rx,
+    )
+    .await
+}
+
+async fn run_connected_io_loop<R, W>(
+    manager_tx: &mpsc::Sender<ManagerCommand>,
+    local_host_id: &LocalHostId,
+    actor_instance_id: u64,
+    connection_instance_id: u64,
+    read_half: R,
+    write_half: &mut W,
+    rx: &mut mpsc::Receiver<ConnectionCommand>,
+) -> ConnectedOutcome
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = BufReader::new(read_half).lines();
 
     loop {
-        line.clear();
         tokio::select! {
-            read_result = reader.read_line(&mut line) => {
+            read_result = lines.next_line() => {
                 match read_result {
-                    Ok(0) => return ConnectedOutcome::Disconnected(ConnectionError::Io(
+                    Ok(None) => return ConnectedOutcome::Disconnected(ConnectionError::Io(
                         std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "MQTT Tyde byte stream closed")
                     )),
-                    Ok(_) => {
-                        trim_line_endings(&mut line);
+                    Ok(Some(line)) => {
                         if line.is_empty() {
                             continue;
                         }
@@ -1020,7 +1042,7 @@ async fn run_connected_loop(
                                 local_host_id,
                                 actor_instance_id,
                                 connection_instance_id,
-                                line.clone(),
+                                line,
                             ).await
                         {
                             return ConnectedOutcome::Disconnected(error);
@@ -1033,7 +1055,7 @@ async fn run_connected_loop(
                 match command {
                     Some(ConnectionCommand::Stop) | None => return ConnectedOutcome::StopRequested,
                     Some(ConnectionCommand::SendLine { line, reply }) => {
-                        let send_result = write_host_line(&mut write_half, &line).await;
+                        let send_result = write_host_line(write_half, &line).await;
                         let failed = send_result.is_err();
                         let reply_result = send_result.map_err(|error| error.to_string());
                         let _send_result = reply.send(reply_result);
@@ -1076,15 +1098,6 @@ async fn wait_backoff_or_stop(
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(false),
         command = rx.recv() => Ok(handle_command_while_not_connected(command).await),
-    }
-}
-
-fn trim_line_endings(line: &mut String) {
-    if line.ends_with('\n') {
-        line.pop();
-    }
-    if line.ends_with('\r') {
-        line.pop();
     }
 }
 
@@ -1314,22 +1327,16 @@ mod tests {
     use std::time::Duration;
 
     use mqtt_transport::{BrokerAuth, BrokerEndpoint, RoomId};
-    use protocol::BrokerUrl;
+    use protocol::{
+        BackendKind, BrokerUrl, Envelope, FrameKind, SeqValidator, SessionId, SessionListPayload,
+        SessionSummary, StreamPath,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
 
     use crate::types::KeychainSecretId;
 
     use super::*;
-
-    #[test]
-    fn trim_line_endings_removes_lf_and_crlf() {
-        let mut line = "hello\r\n".to_owned();
-        trim_line_endings(&mut line);
-        assert_eq!(line, "hello");
-
-        let mut line = "hello\n".to_owned();
-        trim_line_endings(&mut line);
-        assert_eq!(line, "hello");
-    }
 
     #[test]
     fn reconnect_backoff_caps_at_max() {
@@ -1358,6 +1365,114 @@ mod tests {
             error_code(&error),
             MobileAccessErrorCode::BrokerConnectionFailed
         );
+    }
+
+    #[tokio::test]
+    async fn connected_loop_preserves_large_line_when_command_branch_wins() {
+        const MQTT_CHUNK_BOUNDARY: usize = 64 * 1024;
+
+        let (mobile_stream, mut host_stream) = tokio::io::duplex(1024);
+        let (read_half, mut write_half) = tokio::io::split(mobile_stream);
+        let (manager_tx, mut manager_rx) = mpsc::channel(CONNECTION_CHANNEL_CAPACITY);
+        let (command_tx, mut command_rx) = mpsc::channel(CONNECTION_CHANNEL_CAPACITY);
+        let local_host_id = LocalHostId("host".to_owned());
+        let loop_host_id = local_host_id.clone();
+        let loop_task = tokio::spawn(async move {
+            run_connected_io_loop(
+                &manager_tx,
+                &loop_host_id,
+                7,
+                11,
+                read_half,
+                &mut write_half,
+                &mut command_rx,
+            )
+            .await
+        });
+
+        let first_line = session_list_envelope_line(0, 70 * 1024);
+        assert!(first_line.len() > MQTT_CHUNK_BOUNDARY);
+        host_stream
+            .write_all(&first_line.as_bytes()[..MQTT_CHUNK_BOUNDARY])
+            .await
+            .expect("write first MQTT-sized plaintext chunk");
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(ConnectionCommand::SendLine {
+                line: "client-command".to_owned(),
+                reply: reply_tx,
+            })
+            .await
+            .expect("send command while host line is incomplete");
+        timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("command reply timed out")
+            .expect("command reply channel closed")
+            .expect("command write failed");
+        let mut command_line = vec![0_u8; b"client-command\n".len()];
+        timeout(
+            Duration::from_secs(5),
+            host_stream.read_exact(&mut command_line),
+        )
+        .await
+        .expect("client command read timed out")
+        .expect("read client command");
+        assert_eq!(command_line, b"client-command\n");
+
+        host_stream
+            .write_all(&first_line.as_bytes()[MQTT_CHUNK_BOUNDARY..])
+            .await
+            .expect("write remainder of large host line");
+        host_stream.write_all(b"\n").await.expect("write newline");
+
+        let mut seq = SeqValidator::new();
+        let received_first = receive_host_line(&mut manager_rx).await;
+        assert_eq!(received_first, first_line);
+        let parsed_first: Envelope =
+            serde_json::from_str(&received_first).expect("large host line is parseable envelope");
+        seq.validate(&parsed_first.stream, parsed_first.seq, parsed_first.kind)
+            .expect("first sequence is accepted");
+        let parsed_payload: SessionListPayload = parsed_first
+            .parse_payload()
+            .expect("large session_list payload parses");
+        assert_eq!(
+            parsed_payload.sessions[0]
+                .compaction_summary_preview
+                .as_ref()
+                .expect("large preview present")
+                .len(),
+            70 * 1024
+        );
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let second_line = session_list_envelope_line(1, 0);
+        host_stream
+            .write_all(second_line.as_bytes())
+            .await
+            .expect("write second host line");
+        host_stream.write_all(b"\n").await.expect("write newline");
+        let received_second = receive_host_line(&mut manager_rx).await;
+        assert_eq!(received_second, second_line);
+        let parsed_second: Envelope =
+            serde_json::from_str(&received_second).expect("second host line is parseable envelope");
+        seq.validate(&parsed_second.stream, parsed_second.seq, parsed_second.kind)
+            .expect("second sequence is gap-free");
+
+        command_tx
+            .send(ConnectionCommand::Stop)
+            .await
+            .expect("send stop command");
+        assert!(matches!(
+            timeout(Duration::from_secs(5), loop_task)
+                .await
+                .expect("connected loop timed out")
+                .expect("connected loop panicked"),
+            ConnectedOutcome::StopRequested
+        ));
     }
 
     #[test]
@@ -1424,6 +1539,64 @@ mod tests {
         let events = connection_status_events(&statuses);
 
         assert_eq!(events[0].connection_instance_id, None);
+    }
+
+    async fn receive_host_line(rx: &mut mpsc::Receiver<ManagerCommand>) -> String {
+        match timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("host line receive timed out")
+            .expect("manager channel closed")
+        {
+            ManagerCommand::HostLineReceived { line, .. } => line,
+            other => panic!("expected host line, got {}", manager_command_name(&other)),
+        }
+    }
+
+    fn manager_command_name(command: &ManagerCommand) -> &'static str {
+        match command {
+            ManagerCommand::Connect { .. } => "Connect",
+            ManagerCommand::Disconnect { .. } => "Disconnect",
+            ManagerCommand::SendLine { .. } => "SendLine",
+            ManagerCommand::ListConnectionStatuses { .. } => "ListConnectionStatuses",
+            ManagerCommand::ConnectionStatusChanged { .. } => "ConnectionStatusChanged",
+            ManagerCommand::HostLineReceived { .. } => "HostLineReceived",
+            ManagerCommand::HostError { .. } => "HostError",
+            ManagerCommand::ListPendingHostLines { .. } => "ListPendingHostLines",
+            ManagerCommand::AckHostLine { .. } => "AckHostLine",
+            ManagerCommand::ActorEnded { .. } => "ActorEnded",
+            ManagerCommand::FrontendAttached { .. } => "FrontendAttached",
+        }
+    }
+
+    fn session_list_envelope_line(seq: u64, preview_len: usize) -> String {
+        let payload = SessionListPayload {
+            sessions: vec![SessionSummary {
+                id: SessionId(format!("session-{seq}")),
+                backend_kind: BackendKind::Claude,
+                workspace_roots: vec!["/workspace".to_owned()],
+                project_id: None,
+                alias: None,
+                user_alias: None,
+                parent_id: None,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                message_count: 3,
+                token_count: Some(4),
+                resumable: true,
+                compacted_from_session_id: None,
+                compacted_to_session_id: None,
+                compacted_at_ms: None,
+                compaction_summary_preview: Some("x".repeat(preview_len)),
+            }],
+        };
+        let envelope = Envelope::from_payload(
+            StreamPath("host/session-list".to_owned()),
+            FrameKind::SessionList,
+            seq,
+            &payload,
+        )
+        .expect("serialize session_list envelope");
+        serde_json::to_string(&envelope).expect("serialize envelope line")
     }
 
     fn paired_host_record(id: &str, auto_connect: bool) -> PairedHostRecord {
