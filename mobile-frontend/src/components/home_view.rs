@@ -309,7 +309,7 @@ pub fn HomeView() -> impl IntoView {
                                         on_click=on_click
                                         aria_label=format!("Open chat with {name}")
                                     >
-                                        <div class="list-row" style="border-bottom: none; padding: 0;">
+                                        <div class="list-row list-row-flush">
                                             <StatusDot
                                                 label="Active".to_string()
                                                 tone=StatusTone::Active

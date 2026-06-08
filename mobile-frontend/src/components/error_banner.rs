@@ -27,7 +27,7 @@ pub fn MobileShellErrorBanner() -> impl IntoView {
                         <span class="mobile-shell-error-message">{message}</span>
                         <button
                             type="button"
-                            class="mobile-shell-error-close error-banner-dismiss"
+                            class="error-banner-dismiss"
                             data-mobile-test="mobile-shell-error-dismiss"
                             aria-label="Dismiss error"
                             on:click=move |_| dismiss_state.mobile_shell_error.set(None)

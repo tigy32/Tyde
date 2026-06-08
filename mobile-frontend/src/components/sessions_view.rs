@@ -156,7 +156,7 @@ pub fn SessionsView() -> impl IntoView {
                                         data_mobile_test="session-row"
                                         dense=true
                                     >
-                                        <div class="list-row" style="border-bottom: none; padding: 0; align-items: flex-start;">
+                                        <div class="list-row list-row-flush list-row-flush-top">
                                             <div class="list-row-primary">
                                                 <div class="list-row-title">{title}</div>
                                                 <div class="list-row-subtitle">

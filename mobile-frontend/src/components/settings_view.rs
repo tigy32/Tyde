@@ -351,7 +351,7 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
     });
 
     view! {
-        <div class="paired-host-detail">
+        <div>
             <div class="settings-row">
                 <span class="settings-label">"Label"</span>
                 <span class="settings-value">{host_label}</span>
@@ -381,7 +381,7 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
                     on:change=on_toggle_auto
                 />
             </div>
-            <div class="settings-row paired-host-forget-row">
+            <div class="settings-row">
                 <Button
                     label="Forget host"
                     variant=ButtonVariant::Destructive

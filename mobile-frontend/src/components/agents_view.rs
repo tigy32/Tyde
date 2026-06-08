@@ -308,9 +308,9 @@ fn agent_row(
     });
 
     let row_class = if indent {
-        "list-row agent-child-row"
+        "list-row list-row-flush agent-child-row"
     } else {
-        "list-row"
+        "list-row list-row-flush"
     };
 
     view! {
@@ -321,7 +321,7 @@ fn agent_row(
             on_click=on_click
             aria_label=format!("Open chat with {name}")
         >
-            <div class=row_class style="border-bottom: none; padding: 0;">
+            <div class=row_class>
                 <StatusDot
                     label=status_label.to_string()
                     tone=tone

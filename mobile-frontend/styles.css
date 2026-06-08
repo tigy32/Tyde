@@ -362,10 +362,20 @@ input, textarea, select {
 }
 
 .header-action {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--button-height);
+    padding: 0 var(--button-pad-x-compact);
+    border-radius: var(--radius-button);
     font-size: 15px;
     font-weight: 500;
     color: var(--accent-primary);
-    padding: var(--space-1) var(--space-3);
+}
+
+.header-action:disabled,
+.header-action[aria-disabled="true"] {
+    opacity: var(--button-disabled-opacity);
+    cursor: not-allowed;
 }
 
 .view-body {
@@ -431,53 +441,6 @@ input, textarea, select {
 
 .home-actions {
     margin-bottom: var(--space-5);
-}
-
-.action-button {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-2);
-    width: 100%;
-    padding: var(--space-3) var(--space-4);
-    border-radius: var(--radius-md);
-    font-size: 16px;
-    font-weight: 600;
-    transition: background 0.15s;
-}
-
-.action-button.primary {
-    background: var(--accent-primary);
-    color: white;
-}
-
-.action-button.primary:hover {
-    background: var(--accent-primary-hover);
-}
-
-.action-button.primary:active {
-    transform: scale(0.98);
-}
-
-.action-button.secondary {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    color: var(--text-primary);
-}
-
-.action-button.secondary:active {
-    background: var(--bg-active);
-    transform: scale(0.98);
-}
-
-.action-button.danger {
-    background: var(--accent-error-bg);
-    border: 1px solid var(--accent-error);
-    color: var(--accent-error);
-}
-
-.action-button:disabled {
-    opacity: 0.55;
 }
 
 .picker-view .view-body,
@@ -554,28 +517,6 @@ input, textarea, select {
 
 .paired-host-actions-confirm {
     grid-template-columns: 1fr 1fr;
-}
-
-.paired-host-action-btn,
-.paired-host-select-btn {
-    min-height: 44px;
-    padding: 0 var(--space-3);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface-2);
-    color: var(--text-primary);
-    font-weight: 600;
-}
-
-.paired-host-action-btn.primary,
-.paired-host-select-btn {
-    background: var(--accent-primary);
-    color: white;
-}
-
-.paired-host-action-btn.danger {
-    color: var(--accent-error);
-    border: 1px solid var(--accent-error);
-    background: var(--accent-error-bg);
 }
 
 .picker-pair-another {
@@ -719,10 +660,6 @@ input, textarea, select {
     max-width: 28ch;
 }
 
-.pairing-scanner-overlay .action-button.primary {
-    min-width: 140px;
-}
-
 .pairing-paste-input {
     width: 100%;
     min-height: 96px;
@@ -781,22 +718,6 @@ input, textarea, select {
     gap: var(--space-2);
 }
 
-.quick-nav-button {
-    display: block;
-    width: 100%;
-    padding: var(--space-3) var(--space-4);
-    text-align: left;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    font-size: 15px;
-    transition: background 0.1s;
-}
-
-.quick-nav-button:active {
-    background: var(--bg-hover);
-}
-
 /* ── Empty State ────────────────────────────────────────────────────── */
 
 .empty-state {
@@ -842,9 +763,9 @@ input, textarea, select {
 }
 
 .agents-filter-toggle {
-    min-height: 34px;
+    min-height: var(--button-height-compact);
     padding: 0 var(--space-3);
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-button);
     border: 1px solid var(--border-default);
     background: var(--bg-surface);
     color: var(--text-primary);
@@ -895,7 +816,7 @@ input, textarea, select {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-button);
     background: var(--bg-surface-2);
     border: 1px solid var(--border-default);
     color: var(--text-secondary);
@@ -1052,8 +973,8 @@ input, textarea, select {
 }
 
 .chat-header-action-spacer {
-    width: 36px;
-    height: 36px;
+    width: var(--button-height-icon);
+    height: var(--button-height-icon);
 }
 
 .chat-more-menu-wrap {
@@ -1061,9 +982,9 @@ input, textarea, select {
 }
 
 .chat-more-button {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
+    width: var(--button-height-icon);
+    height: var(--button-height-icon);
+    border-radius: var(--radius-button);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1120,15 +1041,6 @@ input, textarea, select {
 .chat-rename-actions {
     display: flex;
     gap: var(--space-1);
-}
-
-.interrupt-button {
-    padding: var(--space-1) var(--space-3);
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--accent-error);
-    border: 1px solid var(--accent-error);
-    border-radius: var(--radius-full);
 }
 
 .chat-messages {
@@ -1425,32 +1337,6 @@ input, textarea, select {
     gap: var(--space-2);
 }
 
-.exit-plan-approve,
-.exit-plan-reject {
-    padding: var(--space-1) var(--space-3);
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    font-weight: 600;
-}
-
-.exit-plan-approve {
-    border: 1px solid var(--accent-primary);
-    background: var(--bg-surface);
-    color: var(--accent-primary);
-}
-
-.exit-plan-reject {
-    border: 1px solid var(--border-default);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-}
-
-.exit-plan-approve:disabled,
-.exit-plan-reject:disabled {
-    cursor: default;
-    opacity: 0.6;
-}
-
 .exit-plan-sent-note,
 .exit-plan-error-note {
     font-size: 12px;
@@ -1536,17 +1422,6 @@ input, textarea, select {
     align-items: center;
     flex-wrap: wrap;
     gap: var(--space-2);
-}
-
-.ask-question-submit {
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-sm);
-    background: var(--accent-primary);
-    color: var(--text-bright);
-}
-
-.ask-question-submit:disabled {
-    opacity: 0.55;
 }
 
 .ask-question-sent-note,
@@ -1647,10 +1522,10 @@ input, textarea, select {
 }
 
 .send-button {
-    min-width: 36px;
-    height: 36px;
+    min-width: var(--button-height);
+    height: var(--button-height);
     padding: 0 var(--space-3);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-button);
     background: var(--accent-primary);
     color: white;
     font-size: 14px;
@@ -1663,7 +1538,7 @@ input, textarea, select {
 }
 
 .send-button:disabled {
-    opacity: 0.3;
+    opacity: var(--button-disabled-opacity);
 }
 
 .send-button:active:not(:disabled) {
@@ -1686,11 +1561,11 @@ input, textarea, select {
 }
 
 .send-menu-toggle {
-    min-width: 30px;
-    height: 36px;
+    min-width: var(--button-height);
+    height: var(--button-height);
     padding: 0 var(--space-2);
     margin-left: -1px;
-    border-radius: 0 var(--radius-md) var(--radius-md) 0;
+    border-radius: 0 var(--radius-button) var(--radius-button) 0;
     background: var(--bg-surface-2);
     color: var(--text-primary);
     border: 1px solid var(--border-default);
@@ -1745,7 +1620,7 @@ input, textarea, select {
 }
 
 .send-menu-toggle:disabled {
-    opacity: 0.35;
+    opacity: var(--button-disabled-opacity);
     cursor: not-allowed;
 }
 
@@ -1785,7 +1660,7 @@ input, textarea, select {
 .chat-input-queued-action {
     min-height: 32px;
     padding: 0 var(--space-2);
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-button);
     border: 1px solid var(--border-default);
     background: var(--bg-surface);
     color: var(--text-primary);
@@ -1845,41 +1720,6 @@ input, textarea, select {
     margin-top: var(--space-1);
     font-size: 12px;
     color: var(--text-tertiary);
-}
-
-.session-card-actions {
-    display: flex;
-    gap: var(--space-2);
-    margin-top: var(--space-3);
-}
-
-.session-resume-btn, .session-delete-btn {
-    padding: var(--space-1) var(--space-3);
-    font-size: 13px;
-    font-weight: 500;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border-default);
-    transition: background 0.1s;
-}
-
-.session-resume-btn {
-    color: var(--accent-primary);
-    border-color: var(--accent-primary);
-}
-
-.session-resume-btn:active {
-    background: var(--accent-primary);
-    color: white;
-}
-
-.session-delete-btn {
-    color: var(--accent-error);
-    border-color: var(--accent-error);
-}
-
-.session-delete-btn:active {
-    background: var(--accent-error);
-    color: white;
 }
 
 /* ── Project Cards ──────────────────────────────────────────────────── */
@@ -2103,6 +1943,14 @@ input, textarea, select {
     --ease-exit: cubic-bezier(0.4, 0, 1, 1);
     /* Touch targets */
     --hit-area: 44px;
+    /* Buttons */
+    --radius-button: 4px;            /* sharp; single source for button corners */
+    --button-disabled-opacity: 0.5;
+    --button-height: 44px;           /* standard tap target (Apple HIG 44pt / Material 48dp) */
+    --button-height-compact: 40px;
+    --button-height-icon: 44px;
+    --button-pad-x: var(--space-4);          /* 16px */
+    --button-pad-x-compact: var(--space-3);  /* 12px */
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2121,10 +1969,10 @@ input, textarea, select {
     align-items: center;
     justify-content: center;
     gap: var(--space-2);
-    min-height: var(--hit-area);
-    min-width: var(--hit-area);
-    padding: 0 var(--space-4);
-    border-radius: var(--radius-md);
+    min-height: var(--button-height);
+    min-width: var(--button-height);
+    padding: 0 var(--button-pad-x);
+    border-radius: var(--radius-button);
     border: 1px solid transparent;
     font-family: var(--font-sans);
     font-size: var(--text-base);
@@ -2146,7 +1994,7 @@ input, textarea, select {
 
 .ui-button[disabled],
 .ui-button[aria-disabled="true"] {
-    opacity: 0.5;
+    opacity: var(--button-disabled-opacity);
     cursor: not-allowed;
 }
 
@@ -2190,8 +2038,8 @@ input, textarea, select {
 }
 
 .ui-button-compact {
-    min-height: 36px;
-    padding: 0 var(--space-3);
+    min-height: var(--button-height-compact);
+    padding: 0 var(--button-pad-x-compact);
     font-size: var(--text-sm);
 }
 
@@ -2203,6 +2051,14 @@ input, textarea, select {
 
 .ui-button-full {
     width: 100%;
+}
+
+/* Square icon button: 44×44 tap target with no horizontal padding. */
+.ui-button-icon {
+    min-width: var(--button-height-icon);
+    width: var(--button-height-icon);
+    height: var(--button-height-icon);
+    padding: 0;
 }
 
 .ui-button-label {
@@ -2531,6 +2387,18 @@ input, textarea, select {
 
 .list-row:active {
     background: var(--bg-active);
+}
+
+/* Flush variant: a `.list-row` rendered inside a `.ui-card` already has the
+   card's padding and border, so drop its own. `-top` aligns multi-line rows
+   to the top instead of centering. */
+.list-row-flush {
+    padding: 0;
+    border-bottom: none;
+}
+
+.list-row-flush-top {
+    align-items: flex-start;
 }
 
 .list-row-primary {
@@ -3054,16 +2922,11 @@ input, textarea, select {
     opacity: 0.45;
     font-weight: 600;
 }
+/* Layout-only passthrough: the `+ Comment` button is a `.ui-button`
+   (Ghost/Compact); this just positions it and tints the label accent. */
 .project-diff-file-comment-btn {
-    display: inline-flex;
-    align-items: center;
     margin: var(--space-1) var(--space-2);
-    padding: 2px var(--space-2);
-    font-size: 12px;
-    color: var(--accent-primary, var(--text-secondary));
-    background: transparent;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
+    color: var(--accent-primary);
 }
 .project-diff-thread {
     display: flex;
@@ -3339,10 +3202,11 @@ input, textarea, select {
 }
 .agents-segmented-button {
     flex: 1;
+    min-height: var(--button-height-compact);
     background: var(--bg-surface-2);
     color: var(--text-secondary);
     padding: var(--space-2);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-button);
     font-weight: 600;
     font-size: var(--text-sm);
 }

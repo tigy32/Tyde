@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use crate::components::ui::{Button, ButtonVariant};
 use crate::state::{AppMode, AppState, PairingScreen};
 
 /// Shown when the user has no paired hosts yet. Walks them through opening
@@ -10,18 +11,18 @@ pub fn OnboardingView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
 
     let state_for_scan = state.clone();
-    let on_scan = move |_| {
+    let on_scan = Callback::new(move |_: ()| {
         state_for_scan
             .app_mode
             .set(AppMode::Pairing(PairingScreen::Scanner));
-    };
+    });
 
     let state_for_paste = state.clone();
-    let on_paste = move |_| {
+    let on_paste = Callback::new(move |_: ()| {
         state_for_paste
             .app_mode
             .set(AppMode::Pairing(PairingScreen::ManualPaste));
-    };
+    });
 
     view! {
         <div class="view onboarding-view">
@@ -36,12 +37,18 @@ pub fn OnboardingView() -> impl IntoView {
                     <h2 class="onboarding-step">"4. Scan the QR code below"</h2>
                 </div>
                 <div class="onboarding-actions">
-                    <button class="action-button primary" on:click=on_scan>
-                        "Scan QR"
-                    </button>
-                    <button class="action-button secondary" on:click=on_paste>
-                        "Paste pairing URI"
-                    </button>
+                    <Button
+                        label="Scan QR"
+                        variant=ButtonVariant::Primary
+                        full_width=true
+                        on_click=on_scan
+                    />
+                    <Button
+                        label="Paste pairing URI"
+                        variant=ButtonVariant::Secondary
+                        full_width=true
+                        on_click=on_paste
+                    />
                 </div>
             </div>
         </div>

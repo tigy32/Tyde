@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
+use crate::components::ui::{Button, ButtonVariant};
 use crate::state::{AppMode, AppState, PairingScreen};
 
 /// Top-level dispatcher for the pairing experience. The current step lives in
@@ -73,10 +74,15 @@ fn ScannerScreen() -> impl IntoView {
         });
     }
 
-    let on_rescan = move |_| {
+    let on_rescan = Callback::new(move |_: ()| {
         error.set(None);
         scan_nonce.update(|nonce| *nonce += 1);
-    };
+    });
+    let on_paste = Callback::new(move |_: ()| {
+        state_for_paste
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::ManualPaste))
+    });
 
     view! {
         <div class="view pairing-view">
@@ -99,11 +105,13 @@ fn ScannerScreen() -> impl IntoView {
                             view! {
                                 <div class="pairing-scanner-overlay" role="alert" data-mobile-test="pairing-scanner-error">
                                     <p class="pairing-error">{err}</p>
-                                    <button
-                                        class="action-button primary"
-                                        data-mobile-test="pairing-scanner-rescan"
-                                        on:click=on_rescan
-                                    >"Try again"</button>
+                                    <Button
+                                        label="Try again"
+                                        variant=ButtonVariant::Primary
+                                        full_width=true
+                                        data_mobile_test="pairing-scanner-rescan"
+                                        on_click=on_rescan
+                                    />
                                 </div>
                             }.into_any()
                         } else {
@@ -113,11 +121,13 @@ fn ScannerScreen() -> impl IntoView {
                         }
                     }}
                 </div>
-                <button
-                    class="action-button secondary"
-                    data-mobile-test="pairing-scanner-paste"
-                    on:click=move |_| state_for_paste.app_mode.set(AppMode::Pairing(PairingScreen::ManualPaste))
-                >"Paste pairing URI instead"</button>
+                <Button
+                    label="Paste pairing URI instead"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    data_mobile_test="pairing-scanner-paste"
+                    on_click=on_paste
+                />
             </div>
         </div>
     }
@@ -177,8 +187,15 @@ fn ManualPasteScreen() -> impl IntoView {
                 {move || error.get().map(|msg| view! {
                     <p class="pairing-error">{msg}</p>
                 })}
-                <button class="action-button primary" disabled=move || pending.get() on:click=on_continue>
-                    {move || if pending.get() { "Checking…" } else { "Continue" }}
+                <button
+                    type="button"
+                    class="ui-button ui-button-primary ui-button-full"
+                    disabled=move || pending.get()
+                    on:click=on_continue
+                >
+                    <span class="ui-button-label">
+                        {move || if pending.get() { "Checking…" } else { "Continue" }}
+                    </span>
                 </button>
             </div>
         </div>
@@ -198,14 +215,14 @@ fn ConfirmScreen(qr_uri: String, preview: crate::state::MobilePairingPreview) ->
     let qr_uri_for_pair = qr_uri.clone();
     let preview_for_pair = preview.clone();
 
-    let on_pair = move |_| {
+    let on_pair = Callback::new(move |_: ()| {
         state_for_pair
             .app_mode
             .set(AppMode::Pairing(PairingScreen::InProgress {
                 qr_uri: qr_uri_for_pair.clone(),
                 preview: preview_for_pair.clone(),
             }));
-    };
+    });
 
     view! {
         <div class="view pairing-view">
@@ -220,9 +237,12 @@ fn ConfirmScreen(qr_uri: String, preview: crate::state::MobilePairingPreview) ->
                 <p class="pairing-instruction">
                     {format!("Pairing stores an encrypted MQTT credential for \"{host_label}\" in this device's Keychain.")}
                 </p>
-                <button class="action-button primary" on:click=on_pair>
-                    "Pair"
-                </button>
+                <Button
+                    label="Pair"
+                    variant=ButtonVariant::Primary
+                    full_width=true
+                    on_click=on_pair
+                />
             </div>
         </div>
     }
@@ -285,6 +305,12 @@ fn FailedScreen(message: String) -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState context");
     let state_for_retry = state.clone();
     let state_for_back = state.clone();
+    let on_retry = Callback::new(move |_: ()| {
+        state_for_retry
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::Scanner))
+    });
+    let on_cancel = Callback::new(move |_: ()| state_for_back.app_mode.set(AppMode::Workspace));
     view! {
         <div class="view pairing-view">
             <div class="view-header">
@@ -292,14 +318,18 @@ fn FailedScreen(message: String) -> impl IntoView {
             </div>
             <div class="view-body">
                 <p class="pairing-error">{message}</p>
-                <button
-                    class="action-button primary"
-                    on:click=move |_| state_for_retry.app_mode.set(AppMode::Pairing(PairingScreen::Scanner))
-                >"Try again"</button>
-                <button
-                    class="action-button secondary"
-                    on:click=move |_| state_for_back.app_mode.set(AppMode::Workspace)
-                >"Cancel"</button>
+                <Button
+                    label="Try again"
+                    variant=ButtonVariant::Primary
+                    full_width=true
+                    on_click=on_retry
+                />
+                <Button
+                    label="Cancel"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    on_click=on_cancel
+                />
             </div>
         </div>
     }

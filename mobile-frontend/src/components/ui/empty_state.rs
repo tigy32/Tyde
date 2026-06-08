@@ -1,5 +1,7 @@
 use leptos::prelude::*;
 
+use super::{Button, ButtonVariant};
+
 /// Standard mobile empty state: icon glyph, headline, body, optional
 /// CTA. Used by every list view so absence-of-data is informative
 /// rather than blank.
@@ -24,18 +26,17 @@ pub fn EmptyState(
             <h2 class="ui-empty-state-title">{title}</h2>
             <p class="ui-empty-state-body">{body}</p>
             {cta_label.map(|label| view! {
-                <button
-                    type="button"
-                    class="ui-button ui-button-primary ui-empty-state-cta"
-                    data-mobile-test=cta_test
-                    on:click=move |_| {
+                <Button
+                    label=label
+                    variant=ButtonVariant::Primary
+                    class="ui-empty-state-cta"
+                    data_mobile_test=cta_test
+                    on_click=Callback::new(move |_: ()| {
                         if let Some(cb) = on_cta_for_btn.as_ref() {
                             cb.run(());
                         }
-                    }
-                >
-                    <span class="ui-button-label">{label}</span>
-                </button>
+                    })
+                />
             })}
         </div>
     }

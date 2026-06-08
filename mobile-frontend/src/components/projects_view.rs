@@ -126,7 +126,7 @@ pub fn ProjectsView() -> impl IntoView {
                                         aria_label=aria_label
                                         on_click=on_select
                                     >
-                                        <div class="list-row" style="border-bottom: none; padding: 0; align-items: flex-start;">
+                                        <div class="list-row list-row-flush list-row-flush-top">
                                             <div class="list-row-primary">
                                                 <div class="list-row-title">
                                                     {name.clone()}

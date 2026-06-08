@@ -40,33 +40,48 @@ impl ButtonSize {
 /// `data_mobile_test` is the structural test selector — wasm tests
 /// look for `[data-mobile-test="<value>"]` rather than CSS classes,
 /// so visual refactors don't break tests.
+///
+/// `disabled` is a [`MaybeProp`] so callers can pass either a static
+/// `bool` or a reactive closure/signal — the disabled state stays a
+/// pure projection of state without re-mounting the button. `icon`
+/// renders a square 44×44 tap target (no label padding) for glyph-only
+/// actions. `class` appends caller layout classes (margins, spacing)
+/// on top of the shared `.ui-button` styling.
 #[component]
 pub fn Button(
     #[prop(into)] label: String,
     #[prop(optional)] variant: Option<ButtonVariant>,
     #[prop(optional)] size: Option<ButtonSize>,
     #[prop(optional)] data_mobile_test: Option<&'static str>,
-    #[prop(optional)] disabled: Option<bool>,
+    #[prop(optional, into)] disabled: MaybeProp<bool>,
     #[prop(optional)] full_width: Option<bool>,
+    #[prop(optional)] icon: Option<bool>,
+    #[prop(optional, into)] class: Option<String>,
     #[prop(optional)] aria_label: Option<String>,
     #[prop(optional)] on_click: Option<Callback<()>>,
 ) -> impl IntoView {
     let variant = variant.unwrap_or(ButtonVariant::Primary);
     let size = size.unwrap_or(ButtonSize::Default);
-    let disabled = disabled.unwrap_or(false);
     let full_width = full_width.unwrap_or(false);
+    let icon = icon.unwrap_or(false);
 
     let class = format!(
-        "{} {} {}",
+        "{} {} {} {} {}",
         variant.class(),
         size.class(),
         if full_width { "ui-button-full" } else { "" },
+        if icon { "ui-button-icon" } else { "" },
+        class.as_deref().unwrap_or(""),
     );
     let test = data_mobile_test.unwrap_or("button");
     let aria_label_value = aria_label.unwrap_or_else(|| label.clone());
 
+    let is_disabled = move || disabled.get().unwrap_or(false);
+
     let on_click_handler = move |_| {
-        if !disabled && let Some(cb) = on_click.as_ref() {
+        if !is_disabled()
+            && let Some(cb) = on_click.as_ref()
+        {
             cb.run(());
         }
     };
@@ -76,8 +91,8 @@ pub fn Button(
             type="button"
             class=class
             data-mobile-test=test
-            disabled=disabled
-            aria-disabled=move || if disabled { "true" } else { "false" }
+            disabled=is_disabled
+            aria-disabled=move || if is_disabled() { "true" } else { "false" }
             aria-label=aria_label_value
             on:click=on_click_handler
         >

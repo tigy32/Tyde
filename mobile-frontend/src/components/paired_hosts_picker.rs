@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
+use crate::components::ui::{Button, ButtonVariant};
 use crate::state::{AppMode, AppState, ConnectionStatus, LocalHostId, PairingScreen};
 
 /// Shown when the user has at least one paired host but hasn't picked which
@@ -14,11 +15,11 @@ pub fn PairedHostsPicker() -> impl IntoView {
     let confirming_forget: RwSignal<Option<LocalHostId>> = RwSignal::new(None);
 
     let state_for_pair = state.clone();
-    let on_pair_another = move |_| {
+    let on_pair_another = Callback::new(move |_: ()| {
         state_for_pair
             .app_mode
             .set(AppMode::Pairing(PairingScreen::Scanner));
-    };
+    });
 
     let state_for_rows = state.clone();
 
@@ -72,18 +73,20 @@ pub fn PairedHostsPicker() -> impl IntoView {
                                                 let state = state_for_forget.clone();
                                                 view! {
                                                     <div class="paired-host-actions paired-host-actions-confirm">
-                                                        <button
-                                                            class="paired-host-action-btn"
-                                                            data-mobile-test="paired-host-forget-cancel"
-                                                            on:click=move |_| confirming_forget.set(None)
-                                                        >
-                                                            "Cancel"
-                                                        </button>
-                                                        <button
-                                                            class="paired-host-action-btn danger"
-                                                            data-mobile-test="paired-host-forget-confirm"
-                                                            aria-label=format!("Delete pairing for {}", label_for_confirm)
-                                                            on:click=move |_| {
+                                                        <Button
+                                                            label="Cancel"
+                                                            variant=ButtonVariant::Secondary
+                                                            full_width=true
+                                                            data_mobile_test="paired-host-forget-cancel"
+                                                            on_click=Callback::new(move |_: ()| confirming_forget.set(None))
+                                                        />
+                                                        <Button
+                                                            label="Delete"
+                                                            variant=ButtonVariant::Destructive
+                                                            full_width=true
+                                                            data_mobile_test="paired-host-forget-confirm"
+                                                            aria_label=format!("Delete pairing for {}", label_for_confirm)
+                                                            on_click=Callback::new(move |_: ()| {
                                                                 let id = id_for_delete.clone();
                                                                 let state = state.clone();
                                                                 spawn_local(async move {
@@ -97,10 +100,8 @@ pub fn PairedHostsPicker() -> impl IntoView {
                                                                     }
                                                                     state.clear_host_runtime(&id);
                                                                 });
-                                                            }
-                                                        >
-                                                            "Delete"
-                                                        </button>
+                                                            })
+                                                        />
                                                     </div>
                                                 }.into_any()
                                             } else {
@@ -112,26 +113,28 @@ pub fn PairedHostsPicker() -> impl IntoView {
                                                             local_host_id_for_connect=id_for_connect.clone()
                                                             local_host_id_for_disconnect=id_for_disconnect.clone()
                                                         />
-                                                        <button
-                                                            class="paired-host-select-btn"
-                                                            on:click={
+                                                        <Button
+                                                            label="Open"
+                                                            variant=ButtonVariant::Primary
+                                                            full_width=true
+                                                            on_click=Callback::new({
                                                                 let state_for_select = state_for_select.clone();
                                                                 let id_for_select = id_for_select.clone();
-                                                                move |_| {
+                                                                move |_: ()| {
                                                                     state_for_select
                                                                         .active_local_host_id
                                                                         .set(Some(id_for_select.clone()));
                                                                 }
-                                                            }
-                                                        >"Open"</button>
-                                                        <button
-                                                            class="paired-host-action-btn danger"
-                                                            data-mobile-test="paired-host-forget"
-                                                            aria-label=format!("Delete pairing for {}", label)
-                                                            on:click=move |_| confirming_forget.set(Some(id_for_confirm_set.clone()))
-                                                        >
-                                                            "Delete"
-                                                        </button>
+                                                            })
+                                                        />
+                                                        <Button
+                                                            label="Delete"
+                                                            variant=ButtonVariant::Destructive
+                                                            full_width=true
+                                                            data_mobile_test="paired-host-forget"
+                                                            aria_label=format!("Delete pairing for {}", label)
+                                                            on_click=Callback::new(move |_: ()| confirming_forget.set(Some(id_for_confirm_set.clone())))
+                                                        />
                                                     </div>
                                                 }.into_any()
                                             }
@@ -143,9 +146,13 @@ pub fn PairedHostsPicker() -> impl IntoView {
                     }
                     .into_any()
                 }}
-                <button class="action-button secondary picker-pair-another" on:click=on_pair_another>
-                    "Pair another host"
-                </button>
+                <Button
+                    label="Pair another host"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    class="picker-pair-another"
+                    on_click=on_pair_another
+                />
             </div>
         </div>
     }
@@ -205,7 +212,7 @@ fn ConnectDisconnectButton(
     let pending_invoke: RwSignal<Option<LocalHostId>> = RwSignal::new(None);
 
     let state_connect = state.clone();
-    let on_connect = move |_| {
+    let on_connect = Callback::new(move |_: ()| {
         let id_typed = local_host_id_for_connect.clone();
         let state = state_connect.clone();
         pending_invoke.set(Some(id_typed.clone()));
@@ -224,16 +231,16 @@ fn ConnectDisconnectButton(
                     }));
             }
         });
-    };
+    });
 
-    let on_disconnect = move |_| {
+    let on_disconnect = Callback::new(move |_: ()| {
         let id_typed = local_host_id_for_disconnect.clone();
         spawn_local(async move {
             if let Err(error) = bridge::disconnect_paired_host(&id_typed).await {
                 log::error!("disconnect_paired_host({id_typed}) failed: {error}");
             }
         });
-    };
+    });
     // `state` is also held inside the closures above via clones; this binding
     // anchors the prop without compiler warnings.
     let _ = state;
@@ -242,15 +249,21 @@ fn ConnectDisconnectButton(
     view! {
         {move || if is_connected() {
             view! {
-                <button class="paired-host-action-btn" on:click=on_disconnect.clone()>
-                    "Disconnect"
-                </button>
+                <Button
+                    label="Disconnect"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    on_click=on_disconnect
+                />
             }.into_any()
         } else {
             view! {
-                <button class="paired-host-action-btn primary" on:click=on_connect.clone()>
-                    "Connect"
-                </button>
+                <Button
+                    label="Connect"
+                    variant=ButtonVariant::Primary
+                    full_width=true
+                    on_click=on_connect
+                />
             }.into_any()
         }}
     }

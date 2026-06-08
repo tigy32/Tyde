@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::ui::{Button, ButtonSize, ButtonVariant};
 use crate::state::{AppState, ToolOutputMode, ToolRequestEntry};
 
 use protocol::{
@@ -267,20 +268,23 @@ fn AskUserQuestionCard(questions: Vec<AskUserQuestion>) -> impl IntoView {
             {question_views}
             <div class="ask-question-actions">
                 <button
-                    class="ask-question-submit"
+                    type="button"
+                    class="ui-button ui-button-primary ui-button-compact"
                     data-mobile-test="ask-question-submit"
-                    prop:disabled=submit_disabled
+                    disabled=submit_disabled
                     on:click=on_submit
                 >
-                    {move || {
-                        if submitted.get() {
-                            "Answer sent"
-                        } else if sending.get() {
-                            "Sending..."
-                        } else {
-                            "Submit answer"
-                        }
-                    }}
+                    <span class="ui-button-label">
+                        {move || {
+                            if submitted.get() {
+                                "Answer sent"
+                            } else if sending.get() {
+                                "Sending..."
+                            } else {
+                                "Submit answer"
+                            }
+                        }}
+                    </span>
                 </button>
                 <Show when=move || submitted.get()>
                     <span class="ask-question-sent-note" data-mobile-test="ask-question-sent" role="status">
@@ -511,11 +515,11 @@ fn ExitPlanModeCard(
         }
     };
 
-    let on_approve = {
+    let on_approve = Callback::new({
         let submit = submit.clone();
-        move |_| submit(ExitPlanModeDecision::Approve)
-    };
-    let on_reject = move |_| submit(ExitPlanModeDecision::Reject);
+        move |_: ()| submit(ExitPlanModeDecision::Approve)
+    });
+    let on_reject = Callback::new(move |_: ()| submit(ExitPlanModeDecision::Reject));
 
     let controls_disabled = move || decision_sent.get().is_some() || sending.get();
 
@@ -543,22 +547,22 @@ fn ExitPlanModeCard(
                 }
             />
             <div class="exit-plan-actions">
-                <button
-                    class="exit-plan-approve"
-                    data-mobile-test="exit-plan-approve"
-                    prop:disabled=controls_disabled
-                    on:click=on_approve
-                >
-                    "Approve"
-                </button>
-                <button
-                    class="exit-plan-reject"
-                    data-mobile-test="exit-plan-reject"
-                    prop:disabled=controls_disabled
-                    on:click=on_reject
-                >
-                    "Reject"
-                </button>
+                <Button
+                    label="Approve"
+                    variant=ButtonVariant::Primary
+                    size=ButtonSize::Compact
+                    data_mobile_test="exit-plan-approve"
+                    disabled=Signal::derive(controls_disabled)
+                    on_click=on_approve
+                />
+                <Button
+                    label="Reject"
+                    variant=ButtonVariant::Secondary
+                    size=ButtonSize::Compact
+                    data_mobile_test="exit-plan-reject"
+                    disabled=Signal::derive(controls_disabled)
+                    on_click=on_reject
+                />
                 <Show when=move || decision_sent.get().is_some()>
                     <span class="exit-plan-sent-note" data-mobile-test="exit-plan-sent" role="status">
                         {move || match decision_sent.get() {

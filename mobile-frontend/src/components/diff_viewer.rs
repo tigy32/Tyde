@@ -467,21 +467,21 @@ fn DiffFileBlock(
                 let click_root = root_for_btn.clone();
                 let click_path = path_for_btn.clone();
                 view! {
-                    <button
-                        type="button"
+                    <Button
+                        label="+ Comment"
+                        variant=ButtonVariant::Ghost
+                        size=ButtonSize::Compact
                         class="project-diff-file-comment-btn"
-                        data-mobile-test="diff-file-comment-btn"
-                        aria-label="Comment on file"
-                        on:click=move |_| {
+                        data_mobile_test="diff-file-comment-btn"
+                        aria_label="Comment on file".to_string()
+                        on_click=Callback::new(move |_: ()| {
                             composer.set(Some(MobileComposerState::open(ReviewLocation {
                                 root: click_root.clone(),
                                 relative_path: click_path.clone(),
                                 anchor: ReviewAnchor::File,
                             })));
-                        }
-                    >
-                        "+ Comment"
-                    </button>
+                        })
+                    />
                 }
                 .into_any()
             }
