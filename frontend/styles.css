@@ -3553,6 +3553,10 @@ kbd {
 
 .chat-send-menu-item {
     width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
     text-align: left;
     padding: 6px 10px;
     border-radius: 4px;
@@ -3568,6 +3572,13 @@ kbd {
 .chat-send-menu-item:hover {
     background: var(--surface-hover);
     color: var(--text-bright);
+}
+
+.chat-send-menu-shortcut {
+    flex-shrink: 0;
+    font-size: 0.7rem;
+    color: var(--text-tertiary);
+    letter-spacing: 0.04em;
 }
 
 /* ===== Markdown Rendering ===== */

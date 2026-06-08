@@ -644,7 +644,38 @@ pub fn ChatInput() -> impl IntoView {
     let on_keydown_state = state.clone();
     let on_keydown_images = pending_images;
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
-        if ev.key() == "Enter" && !ev.shift_key() {
+        if ev.key() != "Enter" {
+            return;
+        }
+        // Cmd (macOS) or Ctrl (other platforms) is the "command" modifier.
+        let command = ev.meta_key() || ev.ctrl_key();
+        if command {
+            // Explicit chord — always acts, overriding the submit-on-Enter
+            // toggle. ui_mode.0 is `send_enabled` (connected + has input).
+            ev.prevent_default();
+            if ev.shift_key() {
+                // Cmd/Ctrl+Shift+Enter → Fork + send, when available.
+                if ui_mode.get_untracked().0 && active_has_session.get_untracked() {
+                    submit_side_question(&on_keydown_state, on_keydown_images);
+                }
+            } else if is_steer.get_untracked() {
+                // Cmd/Ctrl+Enter while thinking with input → steer, mirroring
+                // the dropdown Steer item's exact gate (`can_interrupt() &&
+                // is_steer`), which excludes read-only backend-native agents.
+                // If steer isn't actionable, no-op — do NOT fall through to
+                // send (the dropdown offers nothing actionable here either).
+                if ui_mode.get_untracked().1 && !is_readonly.get_untracked() {
+                    steer_chat_input(&on_keydown_state, on_keydown_images);
+                }
+            } else if ui_mode.get_untracked().0 {
+                // Cmd/Ctrl+Enter otherwise → normal send.
+                submit_chat_input(&on_keydown_state, on_keydown_images);
+            }
+            return;
+        }
+        // Plain Enter → existing submit-on-Enter behavior. Shift+Enter (no
+        // command modifier) falls through to the browser as a newline.
+        if !ev.shift_key() {
             ev.prevent_default();
             if submit_on_enter_mode() {
                 submit_chat_input(&on_keydown_state, on_keydown_images);
@@ -1043,7 +1074,10 @@ pub fn ChatInput() -> impl IntoView {
                                     title="Interrupt current turn and redirect with your message"
                                     on:click=on_menu_steer
                                 >
-                                    "Steer"
+                                    <span class="chat-send-menu-label">"Steer"</span>
+                                    <span class="chat-send-menu-shortcut" aria-hidden="true">
+                                        "⌘↵"
+                                    </span>
                                 </button>
                             </Show>
                             <Show when=move || can_btw()>
@@ -1055,7 +1089,10 @@ pub fn ChatInput() -> impl IntoView {
                                     title="Fork + send — forks this session and sends the draft to the fork"
                                     on:click=on_menu_btw
                                 >
-                                    "Fork + send"
+                                    <span class="chat-send-menu-label">"Fork + send"</span>
+                                    <span class="chat-send-menu-shortcut" aria-hidden="true">
+                                        "⌘⇧↵"
+                                    </span>
                                 </button>
                             </Show>
                             <Show when=move || can_interrupt() && is_steer.get()>
@@ -1067,7 +1104,7 @@ pub fn ChatInput() -> impl IntoView {
                                     title="Cancel the current turn"
                                     on:click=on_menu_cancel
                                 >
-                                    "Cancel"
+                                    <span class="chat-send-menu-label">"Cancel"</span>
                                 </button>
                             </Show>
                         </div>
@@ -1180,13 +1217,42 @@ mod wasm_tests {
         next_tick().await;
     }
 
-    /// Text of every menu item in DOM order.
+    /// Label text of every menu item in DOM order. Reads the dedicated label
+    /// span so the appended keyboard-shortcut hint (e.g. "⌘↵") does not bleed
+    /// into the compared label — the assertions still verify which items render,
+    /// in what order, with what label.
     fn menu_item_texts(container: &HtmlElement) -> Vec<String> {
         let nodes = container.query_selector_all("[role='menuitem']").unwrap();
         (0..nodes.length())
             .filter_map(|i| nodes.item(i))
-            .map(|n| n.text_content().unwrap_or_default().trim().to_owned())
+            .map(|n| {
+                let el: web_sys::Element = n.dyn_into().unwrap();
+                let label = el
+                    .query_selector(".chat-send-menu-label")
+                    .unwrap()
+                    .expect("each menu item must have a label span");
+                label.text_content().unwrap_or_default().trim().to_owned()
+            })
             .collect()
+    }
+
+    /// Build and dispatch a real `keydown` on `target` with the given key and
+    /// modifiers, using the global `KeyboardEvent` constructor (the typed
+    /// `web_sys::KeyboardEvent` binding isn't an enabled feature). Returns
+    /// whether the event's default action was *not* prevented.
+    fn dispatch_keydown(target: &web_sys::Element, key: &str, meta: bool, shift: bool) {
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"key".into(), &key.into()).unwrap();
+        js_sys::Reflect::set(&init, &"metaKey".into(), &JsValue::from_bool(meta)).unwrap();
+        js_sys::Reflect::set(&init, &"shiftKey".into(), &JsValue::from_bool(shift)).unwrap();
+        js_sys::Reflect::set(&init, &"bubbles".into(), &JsValue::TRUE).unwrap();
+        js_sys::Reflect::set(&init, &"cancelable".into(), &JsValue::TRUE).unwrap();
+        let ctor = js_sys::Reflect::get(&js_sys::global(), &"KeyboardEvent".into()).unwrap();
+        let ctor: js_sys::Function = ctor.unchecked_into();
+        let args = js_sys::Array::of2(&"keydown".into(), &init);
+        let event = js_sys::Reflect::construct(&ctor, &args).unwrap();
+        let event: web_sys::Event = event.unchecked_into();
+        target.dispatch_event(&event).unwrap();
     }
 
     // ── State matrix row 1: Idle + empty ──────────────────────────────────────
@@ -1462,6 +1528,157 @@ mod wasm_tests {
         assert!(
             !items.iter().any(|t| t == "Send"),
             "Send must not appear as a menu item: {items:?}"
+        );
+    }
+
+    fn textarea(container: &HtmlElement) -> web_sys::Element {
+        query(container, "textarea").expect("textarea must be present")
+    }
+
+    /// Cmd+Enter while idle with a draft submits the message: the observable
+    /// effect is the draft being cleared, exactly as plain-Enter send does.
+    #[wasm_bindgen_test]
+    async fn cmd_enter_idle_submits_and_clears_draft() {
+        let state = AppState::new();
+        configure(&state, false, false, "hello");
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert_eq!(state.chat_input.get_untracked(), "hello");
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "",
+            "Cmd+Enter must submit and clear the draft"
+        );
+    }
+
+    /// Cmd+Shift+Enter when Fork + send is available triggers the fork path,
+    /// whose observable effect (like clicking "Fork + send") is the draft being
+    /// cleared. We can't observe the dispatched protocol frame from this
+    /// harness, so the cleared draft is the proxy for the fork being initiated.
+    #[wasm_bindgen_test]
+    async fn cmd_shift_enter_forks_and_clears_draft() {
+        let state = AppState::new();
+        // idle + session + input → Fork + send available (can_btw).
+        configure(&state, true, false, "fork this");
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert_eq!(state.chat_input.get_untracked(), "fork this");
+        dispatch_keydown(&textarea(&container), "Enter", true, true);
+        next_tick().await;
+
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "",
+            "Cmd+Shift+Enter must initiate Fork + send and clear the draft"
+        );
+    }
+
+    /// Cmd+Shift+Enter when Fork + send is NOT available is a no-op: it must not
+    /// submit (clear) the draft, and must not insert a newline.
+    #[wasm_bindgen_test]
+    async fn cmd_shift_enter_no_fork_is_noop() {
+        let state = AppState::new();
+        // idle + NO session + input → no fork available.
+        configure(&state, false, false, "keep this");
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        dispatch_keydown(&textarea(&container), "Enter", true, true);
+        next_tick().await;
+
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "keep this",
+            "Cmd+Shift+Enter with no fork available must not submit or alter the draft"
+        );
+    }
+
+    /// Cmd+Enter while thinking with input must NOT steer a read-only
+    /// backend-native agent — the shortcut mirrors the dropdown Steer item,
+    /// which is hidden in this state. Observable proxy: steer would clear the
+    /// draft, so an unchanged draft proves the shortcut no-op'd.
+    #[wasm_bindgen_test]
+    async fn cmd_enter_readonly_thinking_does_not_steer() {
+        let state = AppState::new();
+        // thinking + session + input, then mark the agent backend-native so the
+        // composer is read-only (matches `active_agent_is_backend_native`).
+        configure(&state, true, true, "redirect this");
+        state.agents.update(|agents| {
+            agents[0].origin = AgentOrigin::BackendNative;
+        });
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "redirect this",
+            "Cmd+Enter must not steer a read-only backend-native agent"
+        );
+    }
+
+    /// The Steer and Fork + send items render their keyboard-shortcut hints,
+    /// while Cancel renders none.
+    #[wasm_bindgen_test]
+    async fn menu_items_render_shortcut_hints() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // thinking + session + input → Steer, Fork + send, Cancel.
+            configure(&state, true, true, "redirect");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        open_menu(&container).await;
+
+        let steer = query(&container, "[data-test='chat-send-menu-steer']")
+            .expect("steer item must be present");
+        assert!(
+            steer.text_content().unwrap_or_default().contains("⌘↵"),
+            "Steer item must show the ⌘↵ shortcut hint"
+        );
+
+        let fork = query(&container, "[data-test='chat-send-menu-ask-aside']")
+            .expect("fork item must be present");
+        assert!(
+            fork.text_content().unwrap_or_default().contains("⌘⇧↵"),
+            "Fork + send item must show the ⌘⇧↵ shortcut hint"
+        );
+
+        let cancel = query(&container, "[data-test='chat-send-menu-cancel']")
+            .expect("cancel item must be present");
+        assert!(
+            !cancel.text_content().unwrap_or_default().contains('⌘'),
+            "Cancel item must not show a shortcut hint"
         );
     }
 }
