@@ -20,6 +20,7 @@ use protocol::{
     TeamMemberId, TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload,
     TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload,
     TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
+    WelcomePayload,
 };
 
 use crate::state::{
@@ -61,12 +62,48 @@ impl FrontendSeqValidator {
     fn forget_host(&mut self, host_id: &str) {
         self.expected.retain(|(h, _), _| h != host_id);
     }
+
+    fn forget_host_except_stream(&mut self, host_id: &str, stream: &StreamPath) {
+        self.expected
+            .retain(|(h, s), _| h != host_id || s == stream);
+    }
 }
 
-/// Drop per-host inbound sequence state. Matches the outbound counterpart in
-/// `send::clear_host_seqs` so a reconnect sees seq=0 again on both sides.
+struct PerHostProtocolValidators {
+    by_host: HashMap<String, ProtocolValidator>,
+}
+
+impl PerHostProtocolValidators {
+    fn new() -> Self {
+        Self {
+            by_host: HashMap::new(),
+        }
+    }
+
+    fn validate(&mut self, host_id: &str, envelope: &Envelope) -> Result<(), String> {
+        let validator = self.by_host.entry(host_id.to_string()).or_default();
+        validator
+            .validate_envelope(envelope)
+            .map_err(|error| error.to_string())
+    }
+
+    fn reset_host(&mut self, host_id: &str) {
+        self.by_host.remove(host_id);
+    }
+}
+
+/// Drop per-host inbound sequence state only. Tests use this to rewind seq
+/// counters while preserving protocol bootstrap state.
 pub fn clear_host_seqs(host_id: &str) {
     INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
+}
+
+/// Drop all per-host inbound validator state for a host. Production reconnect
+/// paths use this so replayed bootstraps validate as the first frames on the
+/// fresh connection.
+pub fn reset_inbound_state_for_host(host_id: &str) {
+    INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
+    INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().reset_host(host_id));
 }
 
 /// Test helper: drop the seq counter for a single `(host_id, stream)`
@@ -86,7 +123,7 @@ pub fn clear_stream_seq_for_tests(host_id: &str, stream: &StreamPath) {
 /// across independent test cases, can start each test with a clean validator.
 #[allow(dead_code)]
 pub fn reset_inbound_protocol() {
-    INBOUND_PROTOCOL.with(|validator| *validator.borrow_mut() = ProtocolValidator::new());
+    INBOUND_PROTOCOL.with(|validator| *validator.borrow_mut() = PerHostProtocolValidators::new());
 }
 
 /// Test helper: prime the inbound validators for `host_id` so subsequent
@@ -117,8 +154,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
     let host_stream = StreamPath(format!("/host/{host_id}"));
 
     // Reset both validators so we start from a known state.
-    clear_host_seqs(host_id);
-    reset_inbound_protocol();
+    reset_inbound_state_for_host(host_id);
 
     let welcome = BootstrapWelcome {
         protocol_version: PROTOCOL_VERSION,
@@ -211,7 +247,8 @@ pub fn prime_agent_stream_for_tests(
 
 thread_local! {
     static INBOUND_SEQ: RefCell<FrontendSeqValidator> = RefCell::new(FrontendSeqValidator::new());
-    static INBOUND_PROTOCOL: RefCell<ProtocolValidator> = RefCell::new(ProtocolValidator::new());
+    static INBOUND_PROTOCOL: RefCell<PerHostProtocolValidators> =
+        RefCell::new(PerHostProtocolValidators::new());
 }
 
 fn report_dispatch_error(
@@ -240,8 +277,26 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         report_dispatch_error(state, host_id, &envelope.stream, envelope.kind, error);
         return;
     }
+    if envelope.kind == FrameKind::Welcome {
+        if let Err(error) = envelope.parse_payload::<WelcomePayload>() {
+            report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse Welcome payload: {error}"),
+            );
+            return;
+        }
+        INBOUND_SEQ.with(|validator| {
+            validator
+                .borrow_mut()
+                .forget_host_except_stream(host_id, &envelope.stream);
+        });
+        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().reset_host(host_id));
+    }
     if let Err(error) =
-        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().validate_envelope(&envelope))
+        INBOUND_PROTOCOL.with(|validator| validator.borrow_mut().validate(host_id, &envelope))
     {
         report_dispatch_error(
             state,
@@ -3374,6 +3429,145 @@ mod tests {
             root: ProjectRootPath(root.to_owned()),
             entries,
         }
+    }
+
+    fn welcome_envelope(stream: &str, seq: u64) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(stream.to_owned()),
+            FrameKind::Welcome,
+            seq,
+            &protocol::WelcomePayload {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                tyde_version: protocol::TYDE_VERSION,
+            },
+        )
+        .expect("synthetic Welcome")
+    }
+
+    fn empty_host_bootstrap_envelope(stream: &str, seq: u64) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(stream.to_owned()),
+            FrameKind::HostBootstrap,
+            seq,
+            &HostBootstrapPayload {
+                settings: protocol::HostSettings {
+                    enabled_backends: Vec::new(),
+                    default_backend: None,
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                },
+                mobile_access: MobileAccessStatePayload {
+                    broker_status: protocol::MobileBrokerStatus::Disabled,
+                    pairing: MobilePairingState::Idle,
+                    paired_devices: Vec::new(),
+                },
+                backend_setup: BackendSetupPayload {
+                    backends: Vec::new(),
+                },
+                session_schemas: Vec::new(),
+                sessions: Vec::new(),
+                projects: Vec::new(),
+                mcp_servers: Vec::new(),
+                skills: Vec::new(),
+                steering: Vec::new(),
+                custom_agents: Vec::new(),
+                team_preset_catalog: protocol::TeamPresetCatalog {
+                    role_presets: Vec::new(),
+                    personality_traits: Vec::new(),
+                    personality_presets: Vec::new(),
+                    team_templates: Vec::new(),
+                },
+                team_drafts: Vec::new(),
+                teams: Vec::new(),
+                team_members: Vec::new(),
+                team_member_bindings: Vec::new(),
+                agents: Vec::new(),
+            },
+        )
+        .expect("synthetic HostBootstrap")
+    }
+
+    fn project_bootstrap_envelope(project_id: &ProjectId, name: &str, seq: u64) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(format!("/project/{}", project_id.0)),
+            FrameKind::ProjectBootstrap,
+            seq,
+            &ProjectBootstrapPayload {
+                project: protocol::Project {
+                    id: project_id.clone(),
+                    name: name.to_owned(),
+                    roots: vec!["/tmp/tyde-project".to_owned()],
+                    sort_order: 0,
+                },
+                file_list: ProjectFileListPayload {
+                    incremental: false,
+                    roots: Vec::new(),
+                },
+                git_status: ProjectGitStatusPayload { roots: Vec::new() },
+                review_summaries: Vec::new(),
+            },
+        )
+        .expect("synthetic ProjectBootstrap")
+    }
+
+    fn project_name(state: &AppState, host_id: &str, project_id: &ProjectId) -> Option<String> {
+        state.projects.with_untracked(|projects| {
+            projects
+                .iter()
+                .find(|entry| entry.host_id == host_id && entry.project.id == *project_id)
+                .map(|entry| entry.project.name.clone())
+        })
+    }
+
+    #[test]
+    fn replayed_project_bootstrap_after_host_reconnect_is_accepted() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "dispatch-reconnect-host";
+            let project_id = ProjectId("dispatch-reconnect-project".to_owned());
+
+            reset_inbound_state_for_host(host_id);
+
+            dispatch_envelope(&state, host_id, welcome_envelope("/host/reconnect-a", 0));
+            dispatch_envelope(
+                &state,
+                host_id,
+                empty_host_bootstrap_envelope("/host/reconnect-a", 1),
+            );
+            dispatch_envelope(
+                &state,
+                host_id,
+                project_bootstrap_envelope(&project_id, "First connection", 0),
+            );
+            assert_eq!(
+                project_name(&state, host_id, &project_id).as_deref(),
+                Some("First connection")
+            );
+
+            state.clear_host_runtime(host_id);
+            assert_eq!(project_name(&state, host_id, &project_id), None);
+
+            dispatch_envelope(&state, host_id, welcome_envelope("/host/reconnect-b", 0));
+            dispatch_envelope(
+                &state,
+                host_id,
+                empty_host_bootstrap_envelope("/host/reconnect-b", 1),
+            );
+            dispatch_envelope(
+                &state,
+                host_id,
+                project_bootstrap_envelope(&project_id, "Second connection", 0),
+            );
+
+            assert_eq!(
+                project_name(&state, host_id, &project_id).as_deref(),
+                Some("Second connection"),
+                "replayed ProjectBootstrap seq 0 must be validated and applied after reconnect"
+            );
+        });
     }
 
     #[test]

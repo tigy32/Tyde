@@ -1751,13 +1751,12 @@ impl AppState {
         self.host_streams.update(|streams| {
             streams.remove(host_id);
         });
-        // Drop per-host seq counters on both directions. Otherwise a reconnect
-        // keeps incrementing the outbound counter, but the server builds a
-        // fresh SeqValidator per connection and expects every stream to start
-        // at 0 — causing a panic (before we made it a soft error) or a closed
-        // connection (after).
+        // Drop per-host validator state on both directions. Otherwise a
+        // reconnect keeps stale seq/protocol stream state, but the server
+        // builds fresh validators per connection and replays bootstraps from
+        // seq 0.
         crate::send::clear_host_seqs(host_id);
-        crate::dispatch::clear_host_seqs(host_id);
+        crate::dispatch::reset_inbound_state_for_host(host_id);
         self.command_errors_by_host.update(|errors| {
             errors.remove(host_id);
         });
