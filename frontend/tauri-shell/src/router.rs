@@ -212,10 +212,21 @@ async fn router_actor(
                     continue;
                 };
 
-                let _ = connected
+                // If the connection actor is gone, the SendError carries the
+                // command back (including the `reply` oneshot). Recover it and
+                // answer the caller with an explicit error rather than dropping
+                // the reply, which would otherwise surface as a confusing
+                // "dropped send reply" with no indication the host is dead.
+                if let Err(error) = connected
                     .tx
                     .send(ConnectionCommand::SendLine { line, reply })
-                    .await;
+                    .await
+                    && let ConnectionCommand::SendLine { reply, .. } = error.0
+                {
+                    let _ = reply.send(Err(format!(
+                        "host {host_id} connection is no longer available"
+                    )));
+                }
             }
             RouterCommand::ConnectionLine {
                 host_id,
@@ -315,9 +326,9 @@ enum ConnectionCleanup {
     Child(Child),
 }
 
-async fn connection_actor<R, W>(context: ConnectionActorContext, mut reader: R, mut writer: W)
+async fn connection_actor<R, W>(context: ConnectionActorContext, reader: R, mut writer: W)
 where
-    R: AsyncBufRead + Unpin + Send,
+    R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send,
 {
     let ConnectionActorContext {
@@ -328,11 +339,23 @@ where
         mut cleanup,
     } = context;
 
-    loop {
-        let mut incoming = String::new();
-        tokio::select! {
-            read_result = reader.read_line(&mut incoming) => {
-                match read_result {
+    // The inbound read runs in its own task that solely owns the reader.
+    // `AsyncBufReadExt::read_line` is *not* cancellation-safe: if it were
+    // raced against the outbound `rx.recv()` branch in a single `select!`,
+    // an outbound send winning the race would drop the in-flight `read_line`
+    // future and discard the partially-consumed line, desyncing the newline
+    // framed JSON stream. Over SSH (where frames arrive fragmented across
+    // segments) `read_line` is frequently parked mid-line, so that race fired
+    // often enough to silently wedge the connection. Keeping the read on its
+    // own task means it is never cancelled by a send.
+    let reader_task = {
+        let host_id = host_id.clone();
+        let router_tx = router_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                let mut incoming = String::new();
+                match reader.read_line(&mut incoming).await {
                     Ok(0) => break,
                     Ok(_) => {
                         let line = trim_line_ending(incoming);
@@ -366,6 +389,16 @@ where
                     }
                 }
             }
+        })
+    };
+
+    // Writer loop: owns the writer and processes outbound commands. It only
+    // races `rx.recv()` against the reader task *finishing* (EOF/error/teardown)
+    // — never against an in-flight read — so no inbound bytes can be lost here.
+    let mut reader_task = reader_task;
+    loop {
+        tokio::select! {
+            _ = &mut reader_task => break,
             command = rx.recv() => {
                 match command {
                     Some(ConnectionCommand::SendLine { line, reply }) => {
@@ -377,6 +410,11 @@ where
             }
         }
     }
+
+    // If we exited because of a Disconnect (not because the reader finished),
+    // stop the reader task. Aborting only discards bytes for a connection we
+    // are already tearing down, so no live frame is lost.
+    reader_task.abort();
 
     match &mut cleanup {
         ConnectionCleanup::None => {}

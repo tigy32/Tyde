@@ -276,7 +276,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             .borrow_mut()
             .validate(host_id, &envelope.stream, envelope.seq, envelope.kind)
     }) {
+        // A sequence mismatch means a frame was lost or the stream desynced.
+        // The validator does not advance `expected` on mismatch, so every
+        // later frame on this stream would now also mismatch and be silently
+        // dropped — the connection is permanently wedged until reconnect.
+        // Surface it as a connection error so the user can see the host is
+        // broken and reconnect (which resets seq=0 on both sides) rather than
+        // staring at a "connected" host that silently swallows every reply.
+        let status_message = format!("stream desync — reconnect required: {error}");
         report_dispatch_error(state, host_id, &envelope.stream, envelope.kind, error);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host_id.to_string(), ConnectionStatus::Error(status_message));
+        });
         return;
     }
     if envelope.kind == FrameKind::Welcome {
